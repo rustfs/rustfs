@@ -218,6 +218,24 @@ fn attach_mutation_body_digest<T>(
     crate::cluster::rpc::set_tonic_rolling_canonical_body_digest(request, &canonical_body).map_err(Error::other)
 }
 
+fn attach_quota_mutation_body_digest<T>(
+    request: &mut Request<T>,
+    canonical_body: std::result::Result<Vec<u8>, std::num::TryFromIntError>,
+) -> Result<()> {
+    let topology = crate::services::notification_sys::configured_fleet_topology_fingerprint()
+        .ok_or_else(|| Error::other("quota mutation topology is not initialized or conflicts with startup"))?;
+    let body = canonical_body.map_err(|_| Error::other("quota request length cannot be represented"))?;
+    let body = rustfs_protos::canonical_quota_mutation_request_body(topology, &body)
+        .map_err(|_| Error::other("quota topology envelope length cannot be represented"))?;
+    request.metadata_mut().insert(
+        rustfs_protos::QUOTA_MUTATION_TOPOLOGY_HEADER,
+        topology
+            .parse()
+            .map_err(|_| Error::other("quota topology cannot be encoded"))?,
+    );
+    crate::cluster::rpc::set_tonic_canonical_body_digest(request, &body).map_err(Error::other)
+}
+
 fn decode_volume_infos(volume_infos: Vec<String>) -> Result<Vec<VolumeInfo>> {
     volume_infos
         .into_iter()
@@ -945,6 +963,16 @@ impl RemoteDisk {
             get_max_timeout_duration(),
         )
         .await
+    }
+
+    pub(crate) async fn is_plain_orphan_data_dir(&self, volume: &str, path: &str) -> Result<bool> {
+        match self
+            .recover_delete_transaction(volume, DeleteRecoveryRpcOperation::InspectOrphanDataDir { path: path.to_owned() })
+            .await?
+        {
+            DeleteRecoveryRpcReply::OrphanDataDir { plain } => Ok(plain),
+            _ => Err(Error::other("unexpected orphan data directory inspection reply")),
+        }
     }
 
     async fn recover_delete_transaction(
@@ -2348,7 +2376,13 @@ impl RemoteDisk {
                 });
                 let canonical_body = rustfs_protos::canonical_rename_data_request_body(request.get_ref());
                 let incarnation_bound = !request.get_ref().bucket_incarnation_id.is_empty();
-                if scanner_publication_lease_token.is_some() || incarnation_bound {
+                let quota_fenced = rustfs_utils::http::metadata_compat::contains_key_str(
+                    &fi.metadata,
+                    crate::disk::QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+                );
+                if quota_fenced {
+                    attach_quota_mutation_body_digest(&mut request, canonical_body)?;
+                } else if scanner_publication_lease_token.is_some() || incarnation_bound {
                     let canonical_body =
                         canonical_body.map_err(|_| Error::other("rename_data request length cannot be represented"))?;
                     crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical_body).map_err(Error::other)?;
@@ -2363,7 +2397,10 @@ impl RemoteDisk {
                 let rpc_started = rustfs_io_metrics::put_stage_timer();
                 let response = rustfs_io_metrics::observe_put_stage_future(
                     async {
-                        if incarnation_bound {
+                        if quota_fenced {
+                            // The method itself proves quota-token enforcement; an old peer must fail closed.
+                            client.rename_data_with_quota_fence(request).await
+                        } else if incarnation_bound {
                             // Older peers return Unimplemented before mutation; never downgrade.
                             client.rename_data_at_incarnation(request).await
                         } else {
@@ -3036,8 +3073,15 @@ impl DiskAPI for RemoteDisk {
                         .map_err(|_| Error::other("snapshot lease TTL cannot be represented"))?,
                 });
                 let canonical_body = rustfs_protos::canonical_snapshot_lease_request_body(request.get_ref());
-                attach_mutation_body_digest(&mut request, canonical_body, "acquire_snapshot_lease")?;
-                let response = client.acquire_snapshot_lease(request).await?.into_inner();
+                let quota_fence = volume == crate::disk::RUSTFS_META_BUCKET && crate::disk::is_quota_mutation_fence_path(path);
+                let response = if quota_fence {
+                    attach_quota_mutation_body_digest(&mut request, canonical_body)?;
+                    client.acquire_quota_mutation_fence(request).await?
+                } else {
+                    attach_mutation_body_digest(&mut request, canonical_body, "acquire_snapshot_lease")?;
+                    client.acquire_snapshot_lease(request).await?
+                }
+                .into_inner();
                 snapshot_lease_token_from_response(response)
             },
             get_max_timeout_duration(),
@@ -3078,8 +3122,15 @@ impl DiskAPI for RemoteDisk {
                     token: token.as_bytes().to_vec().into(),
                 });
                 let canonical_body = rustfs_protos::canonical_snapshot_lease_release_request_body(request.get_ref());
-                attach_mutation_body_digest(&mut request, canonical_body, "release_snapshot_lease")?;
-                let response = client.release_snapshot_lease(request).await?.into_inner();
+                let quota_fence = volume == crate::disk::RUSTFS_META_BUCKET && crate::disk::is_quota_mutation_fence_path(path);
+                let response = if quota_fence {
+                    attach_quota_mutation_body_digest(&mut request, canonical_body)?;
+                    client.release_quota_mutation_fence(request).await?
+                } else {
+                    attach_mutation_body_digest(&mut request, canonical_body, "release_snapshot_lease")?;
+                    client.release_snapshot_lease(request).await?
+                }
+                .into_inner();
                 if !response.success {
                     return Err(response.error.unwrap_or_default().into());
                 }
@@ -3274,7 +3325,7 @@ impl DiskAPI for RemoteDisk {
                     opts_bin: opts_bin.into(),
                 });
 
-                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_request();
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_request(opts);
                 if let Some(request_payload_bytes) = request_payload_bytes {
                     crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_sent_bytes(request_payload_bytes);
                 }
@@ -3352,6 +3403,7 @@ impl DiskAPI for RemoteDisk {
         record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_ENCODE, encode_started);
         let request_payload_bytes = batch_read_version_attribution_enabled
             .then(|| batch_read_version_request_payload_len(&req, &batch_read_version_req, &batch_read_version_req_bin));
+        let request_opts = req.opts;
         let batch_result = self
             .execute_with_timeout_for_op(
                 "batch_read_version",
@@ -3365,7 +3417,7 @@ impl DiskAPI for RemoteDisk {
                         batch_read_version_req_bin: batch_read_version_req_bin.into(),
                     });
 
-                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_request();
+                    crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_request(&request_opts);
                     if let Some(request_payload_bytes) = request_payload_bytes {
                         crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_sent_bytes(
                             request_payload_bytes.saturating_add(disk_len),
@@ -3904,6 +3956,21 @@ impl DiskAPI for RemoteDisk {
         }
     }
 
+    async fn has_delete_transaction_evidence(&self, volume: &str, object: &str) -> Result<bool> {
+        match self
+            .recover_delete_transaction(
+                volume,
+                DeleteRecoveryRpcOperation::Exists {
+                    object: object.to_owned(),
+                },
+            )
+            .await?
+        {
+            DeleteRecoveryRpcReply::Evidence { present } => Ok(present),
+            _ => Err(Error::other("unexpected delete recovery existence reply")),
+        }
+    }
+
     async fn discover_delete_transactions(
         &self,
         volume: &str,
@@ -4402,6 +4469,60 @@ mod tests {
     use uuid::Uuid;
 
     static INIT: Once = Once::new();
+
+    #[tokio::test]
+    async fn quota_fence_old_peer_rejects_without_legacy_fallback() {
+        runtime_sources::ensure_test_rpc_secret();
+        crate::services::notification_sys::install_cross_pool_fence_fleet_proof_for_test();
+        let _without_proof = crate::services::notification_sys::without_live_cross_pool_fence_fleet_proof_for_test();
+        assert!(crate::services::notification_sys::acquire_cross_pool_fence_fleet_proof().is_none());
+        assert!(crate::services::notification_sys::configured_fleet_topology_fingerprint().is_some());
+        let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+            .await
+            .expect("old peer must bind");
+        let remote = remote_disk_for_addr(&peer.addr).await;
+        let fence_path = crate::disk::quota_mutation_fence_path("bucket", "object");
+        assert!(
+            remote
+                .acquire_snapshot_lease(crate::disk::RUSTFS_META_BUCKET, &fence_path)
+                .await
+                .is_err()
+        );
+        assert!(
+            remote
+                .release_snapshot_lease(crate::disk::RUSTFS_META_BUCKET, &fence_path, SnapshotLeaseToken::revoke_all())
+                .await
+                .is_err()
+        );
+        let mut file_info = sample_rename_data_file_info();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut file_info.metadata,
+            crate::disk::QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+            Uuid::new_v4().to_string(),
+        );
+        assert!(
+            remote
+                .rename_data("tmp", "source", file_info, "bucket", "object")
+                .await
+                .is_err()
+        );
+        let methods = peer
+            .peer
+            .unsupported_methods
+            .lock()
+            .expect("unsupported method list lock")
+            .clone();
+        assert_eq!(
+            methods,
+            vec![
+                "/node_service.NodeService/AcquireQuotaMutationFence",
+                "/node_service.NodeService/ReleaseQuotaMutationFence",
+                "/node_service.NodeService/RenameDataWithQuotaFence",
+            ],
+            "quota operations must never fall back to snapshot or unfenced rename methods"
+        );
+        peer.stop().await;
+    }
 
     #[tokio::test]
     async fn guarded_delete_old_peer_rejects_without_legacy_fallback() {

@@ -1,5 +1,7 @@
 # Durable quota reservation protocol v2
 
+**Use this when:** operating durable hard quotas, upgrading quota-enabled clusters, or diagnosing quota writes during a node outage.
+
 Protocol v2 is an opt-in hard-quota protocol for distributed deployments. It
 keeps the quota limit authoritative in one allocator ledger while moving
 request reservations into sixteen independently locked shard ledgers.
@@ -65,6 +67,43 @@ all v2 allocator/shard ledgers first; v1 and v2 ledgers are never mixed.
 The default `BucketQuota::new` remains protocol v1. This keeps existing
 deployments compatible until an operator has completed the rollout and chosen
 the sharded protocol explicitly.
+
+## Availability and fence protocol upgrades
+
+Both reservation protocols use the same write-availability rules. Setting a
+durable quota still requires the existing whole-fleet capability proof. Once
+configured, a quota write does not require that proof to remain live. It needs
+the namespace locks, authoritative bucket configuration, quota ledger, and
+object mutation fences to satisfy their respective quorums. A failed node
+therefore does not stop quota writes when those quorums remain available.
+
+Object fences use the target erasure set's write quorum. Ledger, allocator,
+and shard fencing retains the existing per-pool set checks. An unavailable
+set that owns required quota state can still block a write even if its object
+data set is healthy; a majority of nodes across the whole cluster is not a
+substitute for these quorums.
+
+Participating disks must also agree with the coordinator's configured
+pool/set/disk topology. The dedicated quota RPCs authenticate that topology
+identity and reject a different layout, including a different pool order.
+An offline node does not change the configured topology, so this check does
+not require every node to respond.
+
+Quota mutations use the dedicated `AcquireQuotaMutationFence`,
+`ReleaseQuotaMutationFence`, and `RenameDataWithQuotaFence` RPCs. A fenced
+rename requires a valid token for that disk process and object. A restart
+discards the token registry, and revocation waits for existing claims to
+drain before returning success. Unsupported peers fail closed; clients never
+fall back to ordinary rename or lease RPCs for a quota mutation.
+
+Upgrade every node before relying on degraded quota writes. During a rolling
+upgrade, new coordinators cannot count old peers toward quota fence quorums,
+so their quota writes can temporarily fail until enough upgraded disks are
+available in every required set. Older coordinators retain their whole-fleet
+proof requirement. The same limitation applies when rolling back: avoid
+routing quota writes to a newer coordinator that lacks enough compatible
+peers. The quota and ledger formats are unchanged, including the zero-quota
+encoding that makes pre-reservation coordinators reject positive growth.
 
 ## Performance boundary
 

@@ -353,6 +353,17 @@ fn publish_scanner_cleanup_failure(reason: String, expected: u64) {
     let _ = publish_scanner_cleanup_status(status, Some(expected));
 }
 
+pub(super) fn clear_scanner_transient_cycle_recovery_status() {
+    // Snapshot the version before reading status so any concurrent publish rejects the CAS below.
+    let version = scanner_cleanup_status_version();
+    let status = scanner_cycle_recovery_status();
+    // A follower can discard its failed leadership observation. Durable recovery
+    // markers are revalidated before any later leadership claim.
+    if status.classification.is_none() && matches!(status.state.as_str(), "transient" | "paused") {
+        let _ = publish_scanner_cleanup_status(recovery_status("healthy", None, false), Some(version));
+    }
+}
+
 pub(super) fn record_scanner_usage_floor_failure(reason: String) {
     let previous = scanner_cycle_recovery_status();
     let same_failure = previous.classification.as_deref() == Some(USAGE_FLOOR_LOAD_FAILED);
@@ -1460,6 +1471,23 @@ async fn mark_cycle_recovery_cleanup_pending(
 }
 
 pub(crate) async fn load_scanner_cycle_state_for_startup(
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+) -> ScannerCycleStateStartup {
+    let load = load_scanner_cycle_state_inner(storeapi);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let load = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+        crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::ScannerCycleStateRead,
+        async {
+            crate::storage_api::ecstore_diagnostic::observe_read_version_context_boundary(
+                crate::storage_api::ecstore_diagnostic::ReadVersionContextBoundary::ScannerCycleStateLoad,
+            );
+            load.await
+        },
+    );
+    load.await
+}
+
+async fn load_scanner_cycle_state_inner(
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
 ) -> ScannerCycleStateStartup {
     let marker = match read_cycle_recovery_marker_bytes(storeapi.clone()).await {

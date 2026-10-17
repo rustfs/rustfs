@@ -89,6 +89,65 @@ pub(super) fn validate_lineage(task_id: &str, set_disk_id: &str, lineage: &[Repl
 }
 
 impl ResumeManager {
+    // RUSTFS_COMPAT_TODO(8565): recover pre-format intents stranded by historical pool topology. Remove after supported upgrades no longer admit snapshots lacking replacement_preformat_handoff_retry_done and retained affected intents are resolved.
+    pub(super) async fn rearm_preformat_handoff_retry_if_needed(
+        &self,
+        storage: &dyn crate::heal::storage::HealStorageAPI,
+    ) -> Result<bool> {
+        let state = self.get_state().await;
+        if !preformat_handoff_retry_candidate(&state) {
+            return Ok(false);
+        }
+        let identities = storage.replacement_target_identities(&state.replacement_targets).await?;
+        if identities == state.replacement_target_identities {
+            return Ok(false);
+        }
+        // Lock order: target execution leases, the store's format fence during
+        // the probe, then the intent CAS after the probe releases its fence.
+        let execution = storage.replacement_execution(&state.replacement_targets).await?;
+        if execution.identities() != identities.as_slice() {
+            return Err(Error::ReplacementTargetNotReady(
+                "target changed before pre-format recovery admission".to_string(),
+            ));
+        }
+        // A cleared summary does not prove an unstarted pass. Any checkpoint,
+        // including an empty/corrupt file or an isolated checkpoint marker,
+        // prevents this compatibility admission.
+        for suffix in [RESUME_CHECKPOINT_FILE, RESUME_CHECKPOINT_BLOCKED_FILE] {
+            let path = Path::new(BUCKET_META_PREFIX).join(format!("{}_{suffix}", state.task_id));
+            match self.disk.read_all(RUSTFS_META_BUCKET, path_to_str(&path)?).await {
+                Ok(_) => return Ok(false),
+                Err(DiskError::FileNotFound) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if Self::replacement_completion_proof_if_present(self.disk.clone(), &state.task_id)
+            .await?
+            .is_some()
+            || !storage
+                .replacement_preformat_retry_is_safe(&state.set_disk_id, &state.replacement_targets)
+                .await?
+        {
+            return Ok(false);
+        }
+        let buckets = storage.list_buckets().await?.into_iter().map(|bucket| bucket.name).collect();
+        if storage
+            .replacement_target_identities(&state.replacement_targets)
+            .await?
+            .as_slice()
+            != execution.identities()
+        {
+            return Err(Error::ReplacementTargetNotReady(
+                "target changed during pre-format recovery admission".to_string(),
+            ));
+        }
+        // Retain the execution leases through validation and the Prepared CAS.
+        // Budget admission, its one-shot marker, and its reserved successor are
+        // one durable decision, so a crash cannot grant an unbound retry.
+        self.prepare_replacement_handoff_inner(&execution, buckets, true).await?;
+        Ok(true)
+    }
+
     /// Shared startup/scanner decision. A changed mount starts a full scan in
     /// one durable successor; an unfinished transfer always reuses that UUID.
     pub(crate) async fn resolve_replacement_recovery(
@@ -186,9 +245,21 @@ impl ResumeManager {
     pub(crate) async fn prepare_replacement_handoff(
         &self,
         execution: &ReplacementExecution,
+        buckets: Vec<String>,
+    ) -> Result<ResumeManager> {
+        self.prepare_replacement_handoff_inner(execution, buckets, false).await
+    }
+
+    async fn prepare_replacement_handoff_inner(
+        &self,
+        execution: &ReplacementExecution,
         mut buckets: Vec<String>,
+        preformat_retry: bool,
     ) -> Result<ResumeManager> {
         let state = self.get_state().await;
+        if preformat_retry && !preformat_handoff_retry_candidate(&state) {
+            return Err(replacement_recovery_conflict("pre-format recovery eligibility changed"));
+        }
         if let Some(handoff) = &state.replacement_handoff {
             Self::validate_handoff(handoff, &state)?;
             let raw = Self::read_state_file(&self.disk, &state.task_id, self.state_file).await?;
@@ -219,7 +290,7 @@ impl ResumeManager {
                 "replacement generation is not eligible for an online handoff",
             ));
         }
-        if state.retry_count.saturating_add(1) >= state.max_retries {
+        if !preformat_retry && state.retry_count.saturating_add(1) >= state.max_retries {
             return Err(Error::ReplacementRetryBudgetExhausted);
         }
         if state.replacement_phase == ReplacementPhase::OwnershipPending {
@@ -279,6 +350,12 @@ impl ResumeManager {
             let mut current = self.state.write().await;
             if current.replacement_revision != state.replacement_revision {
                 return Err(replacement_recovery_conflict("replacement changed during handoff preparation"));
+            }
+            if preformat_retry {
+                current.replacement_preformat_handoff_retry_done = true;
+                // One handoff consumes one attempt; its successor must still
+                // have exactly one actual rebuild attempt under the same cap.
+                current.retry_count = current.max_retries - 2;
             }
             current.replacement_handoff = Some(ReplacementHandoff {
                 phase: ReplacementHandoffPhase::Prepared,
@@ -378,6 +455,8 @@ impl ResumeManager {
             link.targets.clone(),
         );
         state.replacement_phase = ReplacementPhase::OwnershipPending;
+        // The constructor marks this compatibility grant consumed for every
+        // successor, including descendants of a recovered older generation.
         state.replacement_predecessor = Some(predecessor.task_id.clone());
         state.retry_count = predecessor
             .retry_count
@@ -491,6 +570,31 @@ impl ResumeManager {
         }
         Ok(())
     }
+}
+
+fn preformat_handoff_retry_candidate(state: &ResumeState) -> bool {
+    replacement_retry_is_exhausted_active(state)
+        && state.replacement_generation.as_deref() == Some(state.task_id.as_str())
+        && !state.replacement_preformat_handoff_retry_done
+        && state.replacement_phase == ReplacementPhase::Intent
+        && state.replacement_execution_protocol == 1
+        && state.max_retries >= 2
+        && state.replacement_predecessor.is_none()
+        && state.replacement_handoff.is_none()
+        && state.replacement_lineage.is_empty()
+        && state.replacement_legacy_import.is_none()
+        && state.replacement_legacy_successor.is_none()
+        && state.resume_cursor.is_none()
+        && state.current_bucket.is_none()
+        && state.current_object.is_none()
+        && state.completed_buckets.is_empty()
+        && state.processed_objects == 0
+        && state.successful_objects == 0
+        && state.failed_objects == 0
+        && state.skipped_objects == 0
+        && state.skipped_new_versions == 0
+        && state.skipped_ilm_expired == 0
+        && state.processed_bytes == 0
 }
 
 fn successor_can_be_rebound(state: &ResumeState, predecessor: &str) -> bool {

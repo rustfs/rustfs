@@ -893,6 +893,8 @@ fn is_data_movement_rewritten_metadata(object_info: &ObjectInfo, key: &str, norm
         SUFFIX_ACTUAL_SIZE,
         SUFFIX_CRC,
         SUFFIX_PART_CHECKSUMS,
+        // Inline placement is local to each physical copy, like its data directory.
+        rustfs_utils::http::SUFFIX_INLINE_DATA,
         crate::object_api::ENCRYPTED_PART_LAYOUT_QUORUM_SUFFIX,
     ]
     .iter()
@@ -3530,6 +3532,23 @@ mod tests {
         assert!(!overwrite_resume_for_target(&source, target));
 
         assert!(overwrite_resume_for_target(&source, source.clone()));
+    }
+
+    #[test]
+    fn test_data_movement_identity_accepts_inline_layout_change_only() {
+        let source = overwrite_equivalence_source();
+        let mut target = source.clone();
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_INLINE_DATA,
+            "true".to_string(),
+        );
+        assert!(is_equivalent_data_movement_object(&source, &target));
+        assert!(is_equivalent_data_movement_object(&target, &source));
+
+        Arc::make_mut(&mut target.user_defined).insert("x-amz-meta-inline-data".to_string(), "user value".to_string());
+        assert!(!is_equivalent_data_movement_object(&source, &target));
+        assert!(!is_equivalent_data_movement_object(&target, &source));
     }
 
     #[test]

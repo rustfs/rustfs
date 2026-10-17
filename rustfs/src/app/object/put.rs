@@ -2076,7 +2076,7 @@ impl DefaultObjectUsecase {
         };
         #[cfg(test)]
         let injected_commit_error = injected_put_storage_failure(PutStorageTestStage::Commit);
-        let put_commit = spawn_traced_join({
+        let put_commit_future = {
             let store = Arc::clone(&store);
             let bucket = bucket.clone();
             let key = key.clone();
@@ -2248,7 +2248,14 @@ impl DefaultObjectUsecase {
 
                 Ok::<_, S3Error>(PutObjectCommitResult { obj_info, put_versioned })
             }
-        });
+        };
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let put_commit_future = crate::app::storage_api::diagnostic::with_read_version_spawn_context(
+            crate::app::storage_api::diagnostic::ReadVersionEntrySource::AppPutOwner,
+            crate::app::storage_api::diagnostic::ReadVersionContextBoundary::AppPutOwner,
+            put_commit_future,
+        );
+        let put_commit = spawn_traced_join(put_commit_future);
         let commit_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let put_commit_result = if let Some(cancellation) = eager_put_commit_cancellation {
             EagerPutCommitOwner::new(put_commit, cancellation, EAGER_PUT_COMMIT_CANCELLATION_GRACE)
@@ -4161,7 +4168,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn put_rejects_rotated_quota_capability_before_rename() {
+    async fn put_commits_after_quota_fleet_proof_loss_before_rename() {
         use crate::app::storage_api::test::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
 
         let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("rotated-proof-put-quota", 4096).await;
@@ -4175,27 +4182,18 @@ mod tests {
                 .await
         });
         barrier.wait_until_paused().await;
-        assert!(
-            crate::storage::storage_api::ecstore_notification::rotate_cross_pool_fence_fleet_proof_for_test(),
-            "the gating environment must have a current fleet proof"
-        );
+        let _without_proof = crate::storage::storage_api::ecstore_notification::without_cross_pool_fence_fleet_proof_for_test();
+        assert!(crate::storage::storage_api::ecstore_notification::acquire_cross_pool_fence_fleet_proof().is_none());
         barrier.release();
 
-        let err = put
-            .await
+        put.await
             .expect("PUT task should not panic")
-            .expect_err("a replaced fleet proof must fence the authoritative rename");
-        assert!(matches!(
-            err,
-            StorageError::NamespaceLockQuorumUnavailable {
-                mode: "quota_reservation",
-                ..
-            }
-        ));
-        store
+            .expect("fleet proof loss must not invalidate a live quota reservation and its disk fences");
+        let stored = store
             .get_object_info(&bucket, "object", &ObjectOptions::default())
             .await
-            .expect_err("proof rotation before rename must leave no committed object");
+            .expect("the committed object must remain readable after fleet proof loss");
+        assert_eq!(stored.size, 4096);
     }
 
     #[tokio::test]
@@ -4476,6 +4474,83 @@ mod tests {
             .await
             .expect_err("a refused PUT must not leave an object behind");
         assert!(is_err_object_not_found(&lookup_err), "{lookup_err}");
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[test]
+    #[serial_test::serial]
+    fn diagnostic_s3_put_preserves_api_through_app_owner_and_tier_lookup() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use rustfs_io_metrics::s3_http_metrics::{S3HttpRequestGuard, current_s3_http_operation_name};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let (store, context) = runtime.block_on(Box::pin(real_store_test_context()));
+        let bucket = format!("put-context-{}", Uuid::new_v4());
+        runtime
+            .block_on(Box::pin(store.make_bucket(&bucket, &MakeBucketOptions::default())))
+            .expect("test bucket");
+        let payload = Bytes::from_static(b"diagnostic PUT context");
+        let input = PutObjectInput::builder()
+            .bucket(bucket.clone())
+            .key("object.bin".to_string())
+            .body(Some(StreamingBlob::from(s3s::Body::from(payload.clone()))))
+            .content_length(Some(i64::try_from(payload.len()).expect("payload length")))
+            .build()
+            .expect("PUT input");
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        let mut request = S3HttpRequestGuard::new("PUT");
+        metrics::with_local_recorder(&recorder, || {
+            request.in_scope(|| {
+                runtime.block_on(async {
+                    Box::pin(usecase.execute_put_object(&FS::new(), build_request(input, Method::PUT)))
+                        .await
+                        .expect("S3 PUT must commit");
+                    assert_eq!(current_s3_http_operation_name(), Some("s3:PutObject"));
+                    assert_eq!(crate::app::storage_api::diagnostic::current_read_version_entry_source(), None);
+                })
+            });
+        });
+        let context_rows = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| key.key().name() == "rustfs_storage_diagnostic_context_transitions_total")
+            .map(|(key, _, _, value)| {
+                (
+                    key.key()
+                        .labels()
+                        .map(|l| (l.key().to_string(), l.value().to_string()))
+                        .collect::<HashMap<_, _>>(),
+                    value,
+                )
+            })
+            .collect::<Vec<_>>();
+        for boundary in ["app_put_owner", "put_commit_owner", "tier_free_version_source_lookup"] {
+            assert!(
+                context_rows.iter().any(|(labels, value)| {
+                    labels.get("entry_source").map(String::as_str) == Some("app_put_owner")
+                        && labels.get("boundary").map(String::as_str) == Some(boundary)
+                        && labels.get("parent_api_operation").map(String::as_str) == Some("s3:PutObject")
+                        && labels.get("child_api_operation").map(String::as_str) == Some("s3:PutObject")
+                        && labels.get("api_context").map(String::as_str) == Some("preserved")
+                        && matches!(value, DebugValue::Counter(count) if *count > 0)
+                }),
+                "actual S3 PUT boundary must preserve the parent API: {boundary}; {context_rows:?}"
+            );
+        }
+        let info = runtime
+            .block_on(Box::pin(store.get_object_info(&bucket, "object.bin", &ObjectOptions::default())))
+            .expect("committed object");
+        assert_eq!(info.size, i64::try_from(payload.len()).expect("payload length"));
+        assert_eq!(current_s3_http_operation_name(), None);
+        assert_eq!(crate::app::storage_api::diagnostic::current_read_version_entry_source(), None);
     }
 
     #[tokio::test]

@@ -45,9 +45,10 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::{ByteStream, DateTime};
 use aws_sdk_s3::types::{
     Checksum, ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart, ObjectAttributes, ObjectLockLegalHold,
-    ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode, Tag, Tagging,
+    ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode, ServerSideEncryption, Tag, Tagging,
 };
 use bytes::Bytes;
+use md5::{Digest as _, Md5};
 use std::error::Error;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, sleep, timeout};
@@ -73,14 +74,20 @@ enum TargetMode {
     /// land, and every version-addressed mutation must resolve the replica
     /// through the target-version ledger.
     MintOwnVersionIds,
+    /// AWS S3 and other generic S3 services: ignores the replication
+    /// source-ETag headers and reports the MD5 of the plaintext it received.
+    /// Every single-part replica ETag is therefore checked against the source
+    /// ETag for real (the other modes echo the source ETag back).
+    ComputesOwnEtags,
 }
 
 impl TargetMode {
-    const ALL: [TargetMode; 4] = [
+    const ALL: [TargetMode; 5] = [
         TargetMode::Baseline,
         TargetMode::RejectAwsChunked,
         TargetMode::RequireChecksumWithObjectLock,
         TargetMode::MintOwnVersionIds,
+        TargetMode::ComputesOwnEtags,
     ];
 
     fn apply(self, target: &FakeS3Target) {
@@ -92,6 +99,7 @@ impl TargetMode {
                 target.assign_own_version_ids(true);
                 target.reject_unknown_version_deletes(true);
             }
+            TargetMode::ComputesOwnEtags => target.ignore_source_etags(true),
         }
     }
 
@@ -101,6 +109,7 @@ impl TargetMode {
             TargetMode::RejectAwsChunked => "reject-aws-chunked",
             TargetMode::RequireChecksumWithObjectLock => "require-checksum-object-lock",
             TargetMode::MintOwnVersionIds => "mint-own-version-ids",
+            TargetMode::ComputesOwnEtags => "computes-own-etags",
         }
     }
 }
@@ -126,10 +135,14 @@ enum ObjectShape {
     /// Single-part object uploaded with `x-amz-checksum-sha256`; the replica
     /// must carry the same header (rustfs/backlog#2340).
     Checksummed,
+    /// Single-part SSE-S3 object. Its ETag is a keyed fingerprint, not the
+    /// plaintext MD5 (docs/operations/encrypted-etags.md), while the replica
+    /// travels as plaintext under `x-amz-server-side-encryption: AES256`.
+    SseS3,
 }
 
 impl ObjectShape {
-    const ALL: [ObjectShape; 8] = [
+    const ALL: [ObjectShape; 9] = [
         ObjectShape::Empty,
         ObjectShape::Plain,
         ObjectShape::Retention,
@@ -138,6 +151,7 @@ impl ObjectShape {
         ObjectShape::LockedMultipart,
         ObjectShape::OdmPreservedMd5Multipart,
         ObjectShape::Checksummed,
+        ObjectShape::SseS3,
     ];
 
     fn key(self) -> &'static str {
@@ -150,6 +164,7 @@ impl ObjectShape {
             ObjectShape::LockedMultipart => "matrix/locked-multipart.bin",
             ObjectShape::OdmPreservedMd5Multipart => "matrix/odm-preserved-md5.bin",
             ObjectShape::Checksummed => "matrix/checksummed.bin",
+            ObjectShape::SseS3 => "matrix/sse-s3.bin",
         }
     }
 
@@ -233,6 +248,24 @@ impl ObjectShape {
                     .await?;
                 Ok(body)
             }
+            ObjectShape::SseS3 => {
+                let body = payload(56 * 1024, 0x77);
+                let put = client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .body(ByteStream::from(body.clone()))
+                    .server_side_encryption(ServerSideEncryption::Aes256)
+                    .send()
+                    .await?;
+                // The cell only proves something while the source ETag is
+                // not the content MD5 a generic target reports back.
+                let plaintext_md5 = hex_simd::encode_to_string(Md5::digest(&body), hex_simd::AsciiCase::Lower);
+                if put.e_tag().map(|etag| etag.trim_matches('"')) == Some(plaintext_md5.as_str()) {
+                    return Err("SSE-S3 source ETag is the plaintext MD5; the cell no longer exercises encrypted ETags".into());
+                }
+                Ok(body)
+            }
         }
     }
 }
@@ -270,14 +303,40 @@ fn expectation(mode: TargetMode, shape: ObjectShape) -> Expectation {
 /// - the first PUT lands but its response is lost, so the object is FAILED
 ///   and the scanner heal pass re-drives it;
 /// - an existing-object resync re-drives a COMPLETED object unconditionally.
+///
+/// A permanent delete of the healed version then has to remove exactly the
+/// replica the heal pass located.
 #[tokio::test]
 async fn matrix_mint_own_version_ids_redrive_does_not_duplicate() -> TestResult {
+    run_redrive_does_not_duplicate(RedriveObjects::Plaintext).await
+}
+
+/// The same re-drives for SSE-S3 objects against a target that also computes
+/// its own ETags (AWS S3). The source ETag is a keyed fingerprint
+/// (docs/operations/encrypted-etags.md) while the replica reports the MD5 of
+/// the plaintext it received, so no exact-ETag lookup can ever find the
+/// replica: the lost-response heal, the resync and the purge must locate it
+/// without comparing ETags.
+#[tokio::test]
+async fn matrix_mint_own_version_ids_encrypted_redrive_does_not_duplicate() -> TestResult {
+    run_redrive_does_not_duplicate(RedriveObjects::SseS3OnEtagComputingTarget).await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RedriveObjects {
+    Plaintext,
+    SseS3OnEtagComputingTarget,
+}
+
+async fn run_redrive_does_not_duplicate(objects: RedriveObjects) -> TestResult {
     init_logging();
+    let encrypted = objects == RedriveObjects::SseS3OnEtagComputingTarget;
 
     let target = FakeS3Target::start().await?;
     let target_bucket = "matrix-mint-own-redrive-dst".to_string();
     target.create_bucket_with_object_lock(target_bucket.clone());
     target.assign_own_version_ids(true);
+    target.ignore_source_etags(encrypted);
 
     let mut env_vars = replication_fast_env();
     env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
@@ -291,6 +350,7 @@ async fn matrix_mint_own_version_ids_redrive_does_not_duplicate() -> TestResult 
     ]);
     let env = OdmTestEnv::start_with(OdmEnvOptions {
         env: env_vars,
+        local_kms: encrypted,
         ..OdmEnvOptions::default()
     })
     .await?;
@@ -319,45 +379,63 @@ async fn matrix_mint_own_version_ids_redrive_does_not_duplicate() -> TestResult 
         },
     )
     .await?;
-    put_bucket_replication(source_env, source_bucket, &target_arn).await?;
+    put_bucket_replication_with_delete_statuses(source_env, source_bucket, &target_arn, "Enabled", Some("Enabled")).await?;
+
+    let put = |key: &'static str, fill: u8, len: usize| {
+        let request = source_client
+            .put_object()
+            .bucket(source_bucket)
+            .key(key)
+            .body(ByteStream::from(payload(len, fill)));
+        let request = if encrypted {
+            request.server_side_encryption(ServerSideEncryption::Aes256)
+        } else {
+            request
+        };
+        async move { request.send().await }
+    };
 
     // Teach the worker the target's identity contract with one ordinary
     // write, exactly as production learns it (the PUT response carries the
     // minted id).
     let probe_key = "redrive/identity-probe.bin";
-    source_client
-        .put_object()
-        .bucket(source_bucket)
-        .key(probe_key)
-        .body(ByteStream::from(payload(4 * 1024, 0x01)))
-        .send()
-        .await?;
+    let probe = put(probe_key, 0x01, 4 * 1024).await?;
     assert_eq!(
         wait_for_terminal_replication_status(&source_client, source_bucket, probe_key).await?,
         "COMPLETED"
     );
+    if encrypted {
+        // The variant only proves something while the replica's ETag differs
+        // from the source's encrypted-ETag fingerprint.
+        let replica = single_target_version(&target, &target_bucket, probe_key)?;
+        let replica_etag = fake_source_client(&target)
+            .head_object()
+            .bucket(&target_bucket)
+            .key(probe_key)
+            .version_id(&replica)
+            .send()
+            .await?
+            .e_tag()
+            .map(str::to_string);
+        if replica_etag.is_none() || replica_etag.as_deref() == probe.e_tag() {
+            return Err(format!(
+                "the replica ETag {replica_etag:?} must differ from the source fingerprint {:?}",
+                probe.e_tag()
+            )
+            .into());
+        }
+    }
 
     // Shape 1: the PUT is stored, its response never arrives, heal re-drives.
     let heal_key = "redrive/heal.bin";
     target.inject_for_key(FakeTargetOperation::PutObject, heal_key, FakeTargetFault::DisconnectAfterResponse, 1);
-    source_client
-        .put_object()
-        .bucket(source_bucket)
-        .key(heal_key)
-        .body(ByteStream::from(payload(8 * 1024, 0x02)))
-        .send()
-        .await?;
+    let healed = put(heal_key, 0x02, 8 * 1024).await?;
+    let healed_version = healed.version_id().ok_or("source PUT returned no version id")?.to_string();
     wait_for_replication_status_and_single_version(&source_client, source_bucket, &target, &target_bucket, heal_key).await?;
 
     // Shape 2: an existing-object resync re-drives a COMPLETED object.
     let resync_key = "redrive/resync.bin";
-    source_client
-        .put_object()
-        .bucket(source_bucket)
-        .key(resync_key)
-        .body(ByteStream::from(payload(8 * 1024, 0x03)))
-        .send()
-        .await?;
+    put(resync_key, 0x03, 8 * 1024).await?;
     assert_eq!(
         wait_for_terminal_replication_status(&source_client, source_bucket, resync_key).await?,
         "COMPLETED"
@@ -387,6 +465,20 @@ async fn matrix_mint_own_version_ids_redrive_does_not_duplicate() -> TestResult 
             "{key}: a re-drive against a target that mints its own version ids must not mint another one: {versions:?}"
         );
     }
+
+    // The heal pass recorded the replica it located; a permanent delete of
+    // that version must remove exactly it.
+    source_client
+        .delete_object()
+        .bucket(source_bucket)
+        .key(heal_key)
+        .version_id(&healed_version)
+        .send()
+        .await?;
+    wait_until("permanent delete of the healed replica", || async {
+        Ok(target.stored_versions(&target_bucket, heal_key).is_empty())
+    })
+    .await?;
 
     target.shutdown().await;
     Ok(())
@@ -871,6 +963,11 @@ async fn matrix_mint_own_version_ids_target() -> TestResult {
     run_row(TargetMode::MintOwnVersionIds).await
 }
 
+#[tokio::test]
+async fn matrix_computes_own_etags_target() -> TestResult {
+    run_row(TargetMode::ComputesOwnEtags).await
+}
+
 /// Every known-red entry must name a real cell and an issue, and the lookup
 /// must round-trip, so a stale or mistyped entry cannot silently pin nothing.
 #[test]
@@ -907,6 +1004,8 @@ async fn run_row(mode: TargetMode) -> TestResult {
     env_vars.extend_from_slice(&[("NO_PROXY", "127.0.0.1,localhost"), ("HTTP_PROXY", ""), ("HTTPS_PROXY", "")]);
     let env = OdmTestEnv::start_with(OdmEnvOptions {
         env: env_vars,
+        // The SseS3 shape needs a KMS for SSE-S3.
+        local_kms: true,
         ..OdmEnvOptions::default()
     })
     .await?;
