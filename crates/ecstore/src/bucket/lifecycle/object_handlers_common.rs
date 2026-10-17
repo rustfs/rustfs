@@ -125,7 +125,11 @@ pub async fn delete_object_versions(
                 // already happened (backlog#2202).
                 emit_noncurrent_expiration_event(bucket, target, deleted_obj, false);
             }
-            if deleted_obj.replication_state.is_none() {
+            if !deleted_obj
+                .replication_state
+                .as_ref()
+                .is_some_and(|state| !state.targets.is_empty() || !state.purge_targets.is_empty())
+            {
                 continue;
             }
             replication_sink::schedule_delete(bucket.to_string(), deleted_obj.clone()).await;
