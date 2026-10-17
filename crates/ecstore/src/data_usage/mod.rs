@@ -2478,7 +2478,13 @@ async fn apply_bucket_usage_memory_overlay_if_authoritative(data_usage_info: &mu
             }
             continue;
         }
-        if !cached.stale_snapshot_pending && persisted_update.is_some_and(|persisted| cached.usage_updated_at <= persisted) {
+        // An observed scan can finish after mutations it never enumerated. Its
+        // completion time cannot supersede unreconciled single-process counts.
+        let observed_dirty_usage = data_usage_info.usage_snapshot_converged == Some(false) && cached.dirty;
+        if !cached.stale_snapshot_pending
+            && !observed_dirty_usage
+            && persisted_update.is_some_and(|persisted| cached.usage_updated_at <= persisted)
+        {
             continue;
         }
 
@@ -6788,6 +6794,117 @@ mod tests {
                 .map(|usage| (usage.objects_count, usage.size)),
             Some((0, 0))
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn observed_admin_snapshot_preserves_unreconciled_mutations() {
+        let bucket = "observed-mutations";
+        for partial in [false, true] {
+            for delete in [false, true] {
+                for timestamp_offset in [0, 10] {
+                    clear_usage_memory_cache_for_test().await;
+                    let mut baseline = data_usage_info_for_test(bucket, 2, 20, SystemTime::now() - Duration::from_secs(10));
+                    baseline.scanner_epoch = Some(4);
+                    baseline.scanner_cycle = Some(10);
+                    baseline.usage_snapshot_converged = Some(true);
+                    replace_bucket_usage_memory_from_info(&baseline).await;
+                    let (expected_count, expected_size) = if delete {
+                        record_bucket_object_delete_memory(bucket, 10, true).await;
+                        (1, 10)
+                    } else {
+                        record_bucket_object_write_memory(bucket, None, 10).await;
+                        (3, 30)
+                    };
+                    let mutation_time = memory_cache().read().await[bucket].usage_updated_at;
+                    let mut observed = baseline.clone();
+                    observed.last_update = Some(mutation_time + Duration::from_secs(timestamp_offset));
+                    observed.scanner_cycle = Some(11);
+                    observed.usage_snapshot_complete = !partial;
+                    observed.usage_snapshot_partial = partial;
+                    observed.usage_snapshot_converged = Some(false);
+                    observed.usage_snapshot_authoritative_baseline = Some(baseline.snapshot_identity());
+                    if partial {
+                        observed.usage_snapshot_set_states = vec![rustfs_data_usage::DataUsageSnapshotSetState {
+                            pool_index: 0,
+                            set_index: 0,
+                            scanner_cycle: Some(11),
+                            scanner_epoch: Some(4),
+                            scan_plan_digest: Some([1; 32]),
+                            complete: false,
+                            tombstone: false,
+                            segment_invalidation_proof: None,
+                        }];
+                        assert!(observed.is_valid_partial_snapshot());
+                    }
+
+                    // Observational saves invalidate the admin cache without reconciling
+                    // memory. Selecting that newer view must not erase local mutations.
+                    let (selected, current_format) = select_admin_data_usage_snapshot(baseline, true, Some(observed));
+                    assert_eq!(selected.scanner_cycle, Some(11));
+                    let (selected, _) = normalize_loaded_data_usage(selected, current_format).await;
+                    let mut distributed = selected.clone();
+                    apply_bucket_usage_memory_overlay_if_authoritative(&mut distributed, false).await;
+                    assert_eq!((distributed.objects_total_count, distributed.objects_total_size), (2, 20));
+
+                    let mut response = selected;
+                    apply_bucket_usage_memory_overlay_if_authoritative(&mut response, true).await;
+                    assert_eq!(
+                        (response.objects_total_count, response.objects_total_size),
+                        (expected_count, expected_size),
+                        "partial={partial}, delete={delete}, timestamp_offset={timestamp_offset}"
+                    );
+                    assert_eq!(response.versions_total_count, expected_count);
+                    assert_eq!(response.bucket_sizes[bucket], expected_size);
+                    assert_eq!(response.buckets_usage[bucket].objects_count, expected_count);
+                    assert_eq!(response.usage_snapshot_converged, Some(false));
+                    assert_eq!(response.usage_snapshot_partial, partial);
+                    let cache = memory_cache().read().await;
+                    assert!(cache[bucket].dirty, "an admin read cannot acknowledge mutations");
+                    assert!(!cache[bucket].stale_snapshot_pending);
+                    assert_eq!(cache[bucket].pending_scanner_position, None);
+                    drop(cache);
+
+                    // A later converged scan can legitimately correct the count downward;
+                    // the display fix must not retain dirty counts or a historical maximum.
+                    let mut converged = data_usage_info_for_test(bucket, 0, 0, mutation_time + Duration::from_secs(20));
+                    converged.scanner_epoch = Some(4);
+                    converged.scanner_cycle = Some(12);
+                    converged.usage_snapshot_converged = Some(true);
+                    replace_bucket_usage_memory_from_info(&converged).await;
+                    apply_bucket_usage_memory_overlay_if_authoritative(&mut converged, true).await;
+                    assert_eq!((converged.objects_total_count, converged.objects_total_size), (0, 0));
+                    assert!(!memory_cache().read().await[bucket].dirty);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn observed_admin_snapshot_does_not_overlay_clean_or_unknown_usage() {
+        let bucket = "observed-baseline";
+        for unknown in [false, true] {
+            clear_usage_memory_cache_for_test().await;
+            let baseline = data_usage_info_for_test(bucket, 2, 20, SystemTime::now() - Duration::from_secs(10));
+            replace_bucket_usage_memory_from_info(&baseline).await;
+            if unknown {
+                memory_cache().write().await.insert(
+                    bucket.to_string(),
+                    cached_bucket_usage_from_backend(BucketUsageInfo::default(), SystemTime::UNIX_EPOCH, false),
+                );
+                record_bucket_object_write_memory(bucket, None, 10).await;
+            }
+            let mutation_time = memory_cache().read().await[bucket].usage_updated_at;
+            let mut observed = data_usage_info_for_test(bucket, 100, 1_000, mutation_time + Duration::from_secs(10));
+            observed.usage_snapshot_converged = Some(false);
+            observed.usage_snapshot_authoritative_baseline = Some(baseline.snapshot_identity());
+            let (mut response, _) = select_admin_data_usage_snapshot(baseline, true, Some(observed));
+            apply_bucket_usage_memory_overlay_if_authoritative(&mut response, true).await;
+            assert_eq!((response.objects_total_count, response.objects_total_size), (100, 1_000));
+            assert_eq!(response.usage_snapshot_complete, !unknown);
+            assert_eq!(response.usage_snapshot_converged, Some(false));
+        }
     }
 
     #[tokio::test]
