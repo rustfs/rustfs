@@ -915,8 +915,7 @@ pub struct MetacacheReader<R> {
     in_entry: bool,
     err: Option<Error>,
     buf: Vec<u8>,
-    offset: usize,
-    current: Option<MetaCacheEntry>,
+    has_current: bool,
 }
 
 impl<R: AsyncRead + Unpin> MetacacheReader<R> {
@@ -927,8 +926,7 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
             in_entry: false,
             err: None,
             buf: Vec::new(),
-            offset: 0,
-            current: None,
+            has_current: false,
         }
     }
 
@@ -937,7 +935,7 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
             return Err(err.clone());
         }
 
-        let pref = self.offset;
+        let pref = self.buf.len();
         let Some(ext_size) = pref.checked_add(read_size) else {
             let err = Error::other("metacache stream: element length overflow");
             self.err = Some(err.clone());
@@ -947,18 +945,16 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
         // A whole xl.meta can legitimately exceed the limit on its individual
         // msgpack values. Grow only as payload arrives, so a corrupt length
         // prefix cannot cause a speculative allocation of the advertised size.
-        while self.offset < ext_size {
-            let end = self.offset + (ext_size - self.offset).min(METACACHE_READ_CHUNK_SIZE);
-            if self.buf.len() < end {
-                let extra = end - self.buf.len();
-                if let Err(e) = self.buf.try_reserve(extra) {
-                    let err = Error::other(format!("metacache stream: buffer allocation of {extra} bytes failed: {e}"));
-                    self.err = Some(err.clone());
-                    return Err(err);
-                }
-                self.buf.resize(end, 0);
+        while self.buf.len() < ext_size {
+            let start = self.buf.len();
+            let extra = (ext_size - start).min(METACACHE_READ_CHUNK_SIZE);
+            if let Err(e) = self.buf.try_reserve(extra) {
+                let err = Error::other(format!("metacache stream: buffer allocation of {extra} bytes failed: {e}"));
+                self.err = Some(err.clone());
+                return Err(err);
             }
-            if let Err(e) = self.rd.read_exact(&mut self.buf[self.offset..end]).await {
+            self.buf.resize(start + extra, 0);
+            if let Err(e) = self.rd.read_exact(&mut self.buf[start..]).await {
                 // Listings treat Unexpected/UnexpectedEof as clean exhaustion.
                 // An incomplete entry must not hide remaining keys. Preserve
                 // the existing empty/between-entry EOF handling.
@@ -969,7 +965,6 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
                 self.err = Some(err.clone());
                 return Err(err);
             }
-            self.offset = end;
         }
 
         Ok(&self.buf[pref..ext_size])
@@ -988,7 +983,6 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
 
     fn reset(&mut self) {
         self.buf.clear();
-        self.offset = 0;
     }
 
     async fn check_init(&mut self) -> Result<()> {
@@ -1077,9 +1071,9 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
 
         let mut n = size;
 
-        if self.current.is_some() {
+        if self.has_current {
             n -= 1;
-            self.current = None;
+            self.has_current = false;
         }
 
         while n > 0 {
@@ -1133,8 +1127,7 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
         let l = self.read_str_len().await?;
 
         let buf = self.read_more(l as usize).await?;
-        let name_buf = buf.to_vec();
-        let name = match from_utf8(&name_buf) {
+        let name = match from_utf8(buf) {
             Ok(decoded) => decoded.to_owned(),
             Err(err) => {
                 self.err = Some(Error::other(err.to_string()));
@@ -1151,15 +1144,13 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
         self.in_entry = false;
         self.reset();
 
-        let entry = Some(MetaCacheEntry {
+        self.has_current = true;
+        Ok(Some(MetaCacheEntry {
             name,
             metadata,
             cached: None,
             reusable: false,
-        });
-        self.current = entry.clone();
-
-        Ok(entry)
+        }))
     }
 
     pub async fn read_all(&mut self) -> Result<Vec<MetaCacheEntry>> {
@@ -1323,6 +1314,41 @@ mod tests {
         let nobjs = r.read_all().await.unwrap();
 
         assert_eq!(objs, nobjs);
+    }
+
+    #[tokio::test]
+    async fn test_reader_consecutive_peeks_and_mixed_skips_preserve_entries() {
+        let entries: Vec<_> = [vec![], vec![1, 2, 3], vec![], vec![4, 5], vec![]]
+            .into_iter()
+            .enumerate()
+            .map(|(i, metadata)| MetaCacheEntry {
+                name: format!("object-{i}"),
+                metadata,
+                ..Default::default()
+            })
+            .collect();
+        let mut output = Cursor::new(Vec::new());
+        let mut writer = MetacacheWriter::new(&mut output);
+        writer.write(&entries).await.expect("mixed metadata entries must encode");
+        writer.close().await.expect("stream must close");
+        let mut reader = MetacacheReader::new(Cursor::new(output.into_inner()));
+        assert_eq!(reader.peek().await.expect("first entry must decode"), Some(entries[0].clone()));
+        assert_eq!(reader.peek().await.expect("peek must advance without skip"), Some(entries[1].clone()));
+        reader.skip(0).await.expect("zero skip must preserve the current entry");
+        reader
+            .skip(2)
+            .await
+            .expect("skip must consume the current and following entry");
+        assert_eq!(reader.read_all().await.expect("remaining entries must decode"), entries[3..]);
+    }
+
+    #[tokio::test]
+    async fn test_reader_invalid_utf8_name_remains_a_sticky_error() {
+        let stream = vec![0xcc, 2, 0xc3, 0xa1, 0xff, 0xc4, 0, 0xc2];
+        let mut reader = MetacacheReader::new(Cursor::new(stream));
+        let err = reader.peek().await.expect_err("invalid UTF-8 name must be rejected");
+        assert!(err.to_string().contains("utf-8"));
+        assert_eq!(reader.peek().await.expect_err("invalid name must leave a sticky error"), err);
     }
 
     #[tokio::test]
@@ -1556,7 +1582,6 @@ mod tests {
                 .skip(0)
                 .await
                 .expect("skipping zero with a current entry must be a no-op");
-            assert_eq!(reader.current.as_ref(), Some(&entry));
             reader.skip(1).await.expect("consume current entry without reading another");
             assert!(reader.peek().await.expect("stream must terminate").is_none());
         }
