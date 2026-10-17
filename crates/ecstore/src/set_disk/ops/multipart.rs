@@ -4210,7 +4210,7 @@ mod tests {
 
     async fn non_trash_tmp_entries(temp_dirs: &[TempDir]) -> Vec<String> {
         let mut leftovers = Vec::new();
-        for temp_dir in &temp_dirs {
+        for temp_dir in temp_dirs {
             let tmp_path = temp_dir.path().join(RUSTFS_META_TMP_BUCKET);
             let mut read_dir = match tokio::fs::read_dir(&tmp_path).await {
                 Ok(read_dir) => read_dir,
