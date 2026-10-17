@@ -63,8 +63,8 @@ pub fn part_transaction_path(part_path: &str) -> String {
 use crate::cluster::rpc::RemoteDisk;
 use crate::cluster::rpc::build_internode_data_transport_from_env;
 use crate::disk::disk_store::DiskStoreRenameDataExt;
-pub use crate::disk::disk_store::LegacyFileWrite;
 use crate::disk::disk_store::LocalDiskWrapper;
+pub use crate::disk::disk_store::{LegacyFileWrite, LegacyMetadataWrite};
 use crate::disk::health_state::RuntimeDriveHealthState;
 use crate::disk::local::ScanGuard;
 use bytes::Bytes;
@@ -236,6 +236,14 @@ impl Disk {
     pub async fn begin_legacy_file_write(&self, volume: &str) -> Result<LegacyFileWrite> {
         match self {
             Self::Local(disk) => disk.begin_legacy_file_write(volume).await,
+            Self::Remote(_) => Err(DiskError::DiskNotFound),
+        }
+    }
+
+    /// Capture metadata publication admission before authoritative classification.
+    pub async fn begin_legacy_metadata_write(&self, volume: &str, path: &str) -> Result<LegacyMetadataWrite> {
+        match self {
+            Self::Local(disk) => disk.begin_legacy_metadata_write(volume, path).await,
             Self::Remote(_) => Err(DiskError::DiskNotFound),
         }
     }

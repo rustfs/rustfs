@@ -1530,7 +1530,62 @@ impl LegacyFileWrite {
     }
 }
 
+/// A single metadata publication bound to its disk, object and physical lease.
+pub struct LegacyMetadataWrite {
+    disk: LocalDiskWrapper,
+    volume: String,
+    path: String,
+    publication: Arc<super::os::NamespaceMutationLease>,
+    permit: crate::disk::io_admission::DiskIoPermit,
+}
+
+impl std::fmt::Debug for LegacyMetadataWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LegacyMetadataWrite")
+            .field("volume", &self.volume)
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LegacyMetadataWrite {
+    pub async fn write_metadata(self, fi: FileInfo) -> Result<()> {
+        crate::disk::io_admission::with_disk_io_permit(
+            Some(self.permit.clone()),
+            self.disk.track_disk_health_mutation(
+                "write_metadata",
+                DiskMetricMutation::Write,
+                || async {
+                    self.disk
+                        .disk
+                        .write_metadata_with_namespace_owner(&self.volume, &self.path, fi, None, Some(self.publication.clone()))
+                        .await
+                },
+                get_max_timeout_duration(),
+            ),
+        )
+        .await
+    }
+}
+
 impl LocalDiskWrapper {
+    pub(in crate::disk) async fn begin_legacy_metadata_write(&self, volume: &str, path: &str) -> Result<LegacyMetadataWrite> {
+        let permit = self.io_admission.foreground();
+        let publication = tokio::time::timeout(
+            get_max_timeout_duration(),
+            self.disk.begin_legacy_metadata_write(volume, path, permit.clone()),
+        )
+        .await
+        .map_err(|_| DiskError::Timeout)??;
+        Ok(LegacyMetadataWrite {
+            disk: self.clone(),
+            volume: volume.to_owned(),
+            path: path.to_owned(),
+            publication,
+            permit,
+        })
+    }
+
     pub(in crate::disk) async fn begin_legacy_file_write(&self, volume: &str) -> Result<LegacyFileWrite> {
         // Wire file mutations are foreground I/O; do not recursively enter a
         // background admission while classification reads bucket metadata.

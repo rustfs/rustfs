@@ -2338,6 +2338,11 @@ static RENAME_DATA_AFTER_FIRST_PUBLICATION: std::sync::LazyLock<
 #[cfg(test)]
 static OWNED_FILE_WRITE_BEFORE_OPEN: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, InlinePreparationHook>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+#[cfg(test)]
+type MetadataTempWriteHook = Box<dyn FnOnce(&Path) + Send>;
+#[cfg(test)]
+static METADATA_TEMP_WRITE_BEFORE_STAGE: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, MetadataTempWriteHook>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 #[cfg(all(test, windows))]
 static DESTINATION_COMMIT_DIRECTORY_PREPARATION: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, InlinePreparationHook>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
@@ -5760,6 +5765,38 @@ impl LocalDisk {
         }))
     }
 
+    pub(in crate::disk) async fn begin_legacy_metadata_write(
+        &self,
+        volume: &str,
+        path: &str,
+        permit: crate::disk::io_admission::DiskIoPermit,
+    ) -> Result<Arc<os::NamespaceMutationLease>> {
+        let volume_path = self.io_get_bucket_path(volume)?;
+        let object_path = self.get_object_path(volume, path)?;
+        let metadata_path = self.io_get_object_path(volume, &format!("{path}/{STORAGE_FORMAT_FILE}"))?;
+        let repair_scope = crate::bucket::artifact::artifact_repair_scope(volume, path);
+        if let Some(scope) = &repair_scope {
+            scope.check().map_err(Error::other)?;
+        }
+        // Pin the permit and the original Linux FD in the physical lease chain.
+        #[cfg(target_os = "linux")]
+        let owner: Arc<dyn Send + Sync> = Arc::new((permit, self.mount_lease.clone(), repair_scope));
+        #[cfg(not(target_os = "linux"))]
+        let owner: Arc<dyn Send + Sync> = Arc::new((permit, repair_scope));
+        // Metadata RMW -> final xl.meta namespace -> volume READ. Execution
+        // reuses these exact locks, including when a DeleteVolume writer queues.
+        let metadata = os::acquire_metadata_mutation_lease(&object_path, Some(owner)).await;
+        let publication =
+            os::acquire_rename_data_mutation_lease_with_owner(&self.root, volume, &metadata_path, Some(metadata)).await;
+        if !skip_access_checks(volume) {
+            let metadata = fs::symlink_metadata(volume_path).await.map_err(to_volume_error)?;
+            if !metadata.is_dir() {
+                return Err(DiskError::VolumeNotFound);
+            }
+        }
+        Ok(publication)
+    }
+
     fn volume_mutation_owner(
         &self,
         guard: tokio::sync::OwnedRwLockWriteGuard<()>,
@@ -6546,12 +6583,13 @@ impl LocalDisk {
     }
 
     #[tracing::instrument(name = "write_metadata", level = "trace", skip_all)]
-    async fn write_metadata_with_namespace_owner(
+    pub(in crate::disk) async fn write_metadata_with_namespace_owner(
         &self,
         volume: &str,
         path: &str,
         fi: FileInfo,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
+        prepared_publication: Option<Arc<os::NamespaceMutationLease>>,
     ) -> Result<()> {
         crate::hp_guard!("LocalDisk::write_metadata");
         fi.validate_for_metadata_read()?;
@@ -6579,6 +6617,7 @@ impl LocalDisk {
             &fm_data,
             true,
             namespace_owner,
+            prepared_publication,
         )
         .await?;
 
@@ -6932,6 +6971,7 @@ impl LocalDisk {
                 &buf,
                 true,
                 namespace_owner.clone(),
+                None,
             )
             .await
         } else {
@@ -7583,7 +7623,7 @@ impl LocalDisk {
                 .await?;
         }
         if let Err(err) = self
-            .write_metadata_with_namespace_owner(volume, path, fi, namespace_owner.clone())
+            .write_metadata_with_namespace_owner(volume, path, fi, namespace_owner.clone(), None)
             .await
         {
             if let Some(rollback_dir) = rollback_dir
@@ -8001,6 +8041,7 @@ impl LocalDisk {
                 &buf,
                 true,
                 namespace_owner.clone(),
+                None,
             )
             .await
         {
@@ -8165,7 +8206,8 @@ impl LocalDisk {
 
     #[cfg(test)]
     async fn write_all_meta(&self, volume: &str, path: &str, buf: &[u8], sync: bool) -> Result<()> {
-        self.write_all_meta_with_namespace_owner(volume, path, buf, sync, None).await
+        self.write_all_meta_with_namespace_owner(volume, path, buf, sync, None, None)
+            .await
     }
 
     async fn write_all_meta_with_namespace_owner(
@@ -8175,6 +8217,7 @@ impl LocalDisk {
         buf: &[u8],
         sync: bool,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
+        prepared_publication: Option<Arc<os::NamespaceMutationLease>>,
     ) -> Result<()> {
         let volume_dir = self.io_get_bucket_path(volume)?;
         let file_path = self.io_get_object_path(volume, path)?;
@@ -8183,6 +8226,17 @@ impl LocalDisk {
         let tmp_volume_dir = self.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?;
         let tmp_file_path = self.io_get_object_path(RUSTFS_META_TMP_BUCKET, Uuid::new_v4().to_string().as_str())?;
 
+        #[cfg(test)]
+        {
+            // Let the test register the existing physical-write hook for this random tmp path.
+            let hook = METADATA_TEMP_WRITE_BEFORE_STAGE
+                .lock()
+                .expect("metadata tmp observer lock")
+                .remove(&file_path);
+            if let Some(hook) = hook {
+                hook(&tmp_file_path);
+            }
+        }
         let durability = effective_durability(volume);
 
         // The tmp file is renamed to its final location right below, so only
@@ -8195,8 +8249,18 @@ impl LocalDisk {
         } else {
             SyncMode::None
         };
-        self.write_all_internal(&tmp_file_path, InternalBuf::Ref(buf), tmp_sync, &tmp_volume_dir)
-            .await?;
+        let namespace_owner = prepared_publication
+            .as_ref()
+            .map(|lease| lease.clone() as Arc<dyn Send + Sync>)
+            .or(namespace_owner);
+        self.write_all_internal_with_owner(
+            &tmp_file_path,
+            InternalBuf::Ref(buf),
+            tmp_sync,
+            &tmp_volume_dir,
+            namespace_owner.clone(),
+        )
+        .await?;
 
         // Crash-consistency injection: hard power loss after the replacement
         // xl.meta is staged in the tmp bucket but before the atomic rename that
@@ -8208,7 +8272,14 @@ impl LocalDisk {
             return Err(DiskError::Unexpected);
         }
 
-        os::rename_all_with_owner(tmp_file_path, &file_path, volume_dir, &self.publication_root, namespace_owner.clone()).await?;
+        if let Some(publication) = prepared_publication {
+            // The exact final namespace and volume were admitted before classification.
+            // Reacquiring either lock here can deadlock behind a queued bucket deletion.
+            os::rename_all_with_lease(tmp_file_path, &file_path, volume_dir, &self.publication_root, publication).await?;
+        } else {
+            os::rename_all_with_owner(tmp_file_path, &file_path, volume_dir, &self.publication_root, namespace_owner.clone())
+                .await?;
+        }
 
         if sync
             && durability.syncs_commit_metadata()
@@ -11321,6 +11392,7 @@ impl DiskAPI for LocalDisk {
                     &wbuf,
                     !opts.no_persistence,
                     namespace_owner,
+                    None,
                 )
                 .await;
         }
@@ -11336,7 +11408,7 @@ impl DiskAPI for LocalDisk {
         }
         let owner = repair_scope.map(|scope| scope as Arc<dyn Send + Sync>);
         let namespace_owner: Option<Arc<dyn Send + Sync>> = Some(os::acquire_metadata_mutation_lease(&object_path, owner).await);
-        self.write_metadata_with_namespace_owner(volume, path, fi, namespace_owner)
+        self.write_metadata_with_namespace_owner(volume, path, fi, namespace_owner, None)
             .await
     }
 
@@ -18163,7 +18235,7 @@ mod test {
         // lease. The delayed delete must read this replacement after release.
         let mut replacement = old.clone();
         replacement.set_delete_marker_incarnation(Uuid::new_v4());
-        disk.write_metadata_with_namespace_owner(bucket, object, replacement, Some(lease.clone()))
+        disk.write_metadata_with_namespace_owner(bucket, object, replacement, Some(lease.clone()), None)
             .await
             .unwrap();
         let path = dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE);
@@ -22307,6 +22379,302 @@ mod test {
             .await
             .expect("operation should succeed");
         let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_metadata_write_rejects_missing_volume_before_parent_creation() {
+        let root = tempfile::tempdir().expect("missing metadata volume root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("local endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        let volume = "legacy-metadata-missing";
+        disk.make_volume(volume).await.expect("create original volume");
+        disk.delete_volume(volume, true).await.expect("delete original volume");
+        let wrapper = crate::disk::disk_store::LocalDiskWrapper::new(disk, false);
+        let error = wrapper
+            .begin_legacy_metadata_write(volume, "nested/object")
+            .await
+            .expect_err("missing ordinary volume must fail admission");
+        assert_eq!(error, DiskError::VolumeNotFound, "LEGACY_METADATA_MISSING_VOLUME_ADMISSION");
+        assert!(!root.path().join(volume).exists(), "metadata admission must not rebuild a deleted bucket");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_metadata_write_preparation_obeys_metadata_lock_deadline() {
+        use crate::disk::disk_store::{LocalDiskWrapper, get_max_timeout_duration};
+        let root = tempfile::tempdir().expect("metadata deadline root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("local endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        let volume = "legacy-metadata-deadline";
+        disk.make_volume(volume).await.expect("ordinary volume");
+        let object = "object";
+        let metadata =
+            os::acquire_metadata_mutation_lease(&disk.get_object_path(volume, object).expect("metadata key"), None).await;
+        let wrapper = LocalDiskWrapper::new(disk.clone(), false);
+        let mut preparation = Box::pin(wrapper.begin_legacy_metadata_write(volume, object));
+        assert!(matches!(futures::poll!(preparation.as_mut()), Poll::Pending));
+        tokio::time::advance(get_max_timeout_duration() + Duration::from_secs(1)).await;
+        assert_eq!(preparation.await.expect_err("bounded preparation"), DiskError::Timeout);
+        assert_eq!(
+            wrapper.metrics_snapshot().api_calls.get("write_metadata"),
+            None,
+            "preparation must not count a second mutation"
+        );
+        drop(metadata);
+        let token = wrapper
+            .begin_legacy_metadata_write(volume, object)
+            .await
+            .expect("admission recovers after deadline");
+        drop(token);
+        assert!(
+            os::disk_volume_mutation_lock(&disk.root, volume).try_write_owned().is_ok(),
+            "timed-out preparation must not leak a READ"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_metadata_write_reuses_prepared_locks_with_queued_delete() {
+        use crate::disk::disk_store::LocalDiskWrapper;
+        let root = tempfile::tempdir().expect("queued metadata delete root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("local endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        let volume = "legacy-metadata-queued";
+        disk.make_volume(volume).await.expect("ordinary volume");
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        let object = "new-parent/object";
+        let wrapper = LocalDiskWrapper::new(disk.clone(), false);
+        let token = wrapper
+            .begin_legacy_metadata_write(volume, object)
+            .await
+            .expect("prepare publication");
+        let mut deletion = Box::pin(disk.delete_volume(volume, true));
+        assert!(
+            matches!(futures::poll!(deletion.as_mut()), Poll::Pending),
+            "delete must queue behind prepared READ"
+        );
+        let version = Uuid::new_v4();
+        let mut fi = test_file_info(object, version, Some(Uuid::new_v4()), Some(Bytes::from_static(b"prepared metadata")));
+        fi.set_inline_data();
+        timeout(Duration::from_secs(5), token.write_metadata(fi))
+            .await
+            .expect("prepared publication must not reacquire READ or namespace behind the queued writer")
+            .expect("metadata publication");
+        let raw = fs::read(root.path().join(volume).join(object).join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("published xl.meta");
+        let restored = FileMeta::load(&raw)
+            .expect("valid xl.meta")
+            .into_fileinfo(volume, object, "", true, false, true)
+            .expect("published version");
+        assert_eq!(restored.version_id, Some(version));
+        assert_eq!(restored.data, Some(Bytes::from_static(b"prepared metadata")));
+        assert_eq!(wrapper.metrics_snapshot().api_calls.get("write_metadata"), Some(&1));
+        timeout(Duration::from_secs(5), deletion)
+            .await
+            .expect("queued delete drains")
+            .expect("delete old volume");
+        assert!(!root.path().join(volume).exists());
+    }
+
+    #[tokio::test]
+    async fn legacy_metadata_write_preserves_internal_volume_and_metadata_update_semantics() {
+        use crate::disk::disk_store::LocalDiskWrapper;
+        let root = tempfile::tempdir().expect("internal metadata root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("local endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        ensure_test_volume(&disk, RUSTFS_META_BUCKET).await;
+        let wrapper = LocalDiskWrapper::new(disk.clone(), false);
+        let object = "new-parent/metadata-object";
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut original = test_file_info(object, first, Some(Uuid::new_v4()), Some(Bytes::from_static(b"internal version")));
+        original.fresh = false;
+        disk.write_metadata("ignored-origin", RUSTFS_META_BUCKET, object, original)
+            .await
+            .expect("original API ignores org_volume and creates object parents");
+        let mut replacement = test_file_info(object, second, Some(Uuid::new_v4()), Some(Bytes::from_static(b"internal version")));
+        replacement.fresh = false;
+        wrapper
+            .begin_legacy_metadata_write(RUSTFS_META_BUCKET, object)
+            .await
+            .expect("existing internal volume admission")
+            .write_metadata(replacement)
+            .await
+            .expect("internal metadata update");
+        for version in [first, second] {
+            let fi = disk
+                .read_version(
+                    RUSTFS_META_BUCKET,
+                    RUSTFS_META_BUCKET,
+                    object,
+                    &version.to_string(),
+                    &ReadOptions::default(),
+                )
+                .await
+                .expect("both versions survive RMW");
+            assert_eq!(fi.version_id, Some(version));
+        }
+        let missing = ".rustfs.sys/missing-metadata-volume";
+        let fi = test_file_info(object, Uuid::new_v4(), Some(Uuid::new_v4()), Some(Bytes::from_static(b"missing base")));
+        let direct = disk
+            .write_metadata("ignored-origin", missing, object, fi.clone())
+            .await
+            .expect_err("original missing internal base");
+        let admitted = wrapper
+            .begin_legacy_metadata_write(missing, object)
+            .await
+            .expect("internal admission skips only the live precheck")
+            .write_metadata(fi)
+            .await
+            .expect_err("prepared publication must preserve missing internal base error");
+        assert_eq!(admitted, direct);
+        assert!(
+            !root.path().join(missing).exists(),
+            "metadata publication must not create an absent internal volume"
+        );
+        disk.delete_volume(RUSTFS_META_TMP_BUCKET, true)
+            .await
+            .expect("remove existing tmp base");
+        let fi = test_file_info(
+            "missing-tmp",
+            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
+            Some(Bytes::from_static(b"missing tmp")),
+        );
+        let direct = disk
+            .write_metadata("ignored-origin", RUSTFS_META_BUCKET, "missing-tmp", fi.clone())
+            .await
+            .expect_err("original missing tmp base");
+        let admitted = wrapper
+            .begin_legacy_metadata_write(RUSTFS_META_BUCKET, "missing-tmp")
+            .await
+            .expect("existing internal destination admission")
+            .write_metadata(fi)
+            .await
+            .expect_err("prepared write preserves missing tmp base failure");
+        assert_eq!(admitted, direct);
+        assert!(
+            !root.path().join(RUSTFS_META_TMP_BUCKET).exists(),
+            "metadata staging must not create an absent tmp base"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn assert_legacy_metadata_write_physical_owner(stage: &str, cancel: bool) {
+        use crate::disk::disk_store::{LocalDiskWrapper, get_max_timeout_duration};
+        let root = tempfile::tempdir().expect("metadata physical owner root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("local endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        let volume = "legacy-metadata-physical";
+        let object = "new-parent/object";
+        disk.make_volume(volume).await.expect("ordinary volume");
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        let metadata_path = disk
+            .io_get_object_path(volume, &format!("{object}/{STORAGE_FORMAT_FILE}"))
+            .expect("physical metadata");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let pause = move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        };
+        let _publication_hook = if stage == "tmp" {
+            assert!(
+                METADATA_TEMP_WRITE_BEFORE_STAGE
+                    .lock()
+                    .expect("tmp observer lock")
+                    .insert(
+                        metadata_path.clone(),
+                        Box::new(move |tmp| {
+                            set_owned_file_write_before_open(tmp, pause);
+                        })
+                    )
+                    .is_none()
+            );
+            None
+        } else {
+            Some(os::prepared_publication_test_hooks::install_at(
+                os::prepared_publication_test_hooks::Stage::Rename,
+                &metadata_path,
+                pause,
+            ))
+        };
+        let wrapper = LocalDiskWrapper::new(disk.clone(), false);
+        let token = wrapper
+            .begin_legacy_metadata_write(volume, object)
+            .await
+            .expect("admit metadata publication");
+        let fi = test_file_info(
+            object,
+            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
+            Some(Bytes::from_static(b"old admitted metadata")),
+        );
+        let mutation = tokio::spawn(async move { token.write_metadata(fi).await });
+        timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("physical metadata worker starts")
+            .expect("worker entered");
+        if cancel {
+            mutation.abort();
+            assert!(mutation.await.expect_err("cancel outer metadata mutation").is_cancelled());
+        } else {
+            tokio::time::pause();
+            tokio::time::advance(get_max_timeout_duration() + Duration::from_secs(1)).await;
+            tokio::time::resume();
+            assert_eq!(
+                timeout(Duration::from_secs(5), mutation)
+                    .await
+                    .expect("deadline returns")
+                    .expect("metadata task"),
+                Err(DiskError::Timeout)
+            );
+            let metrics = wrapper.metrics_snapshot();
+            assert_eq!(metrics.api_calls.get("write_metadata"), Some(&1));
+            assert_eq!(metrics.total_errors_timeout, 1);
+        }
+        let held = os::disk_volume_mutation_lock(&disk.root, volume).try_write_owned().is_err();
+        let object_path = disk.get_object_path(volume, object).expect("metadata RMW key");
+        let mut metadata_waiter = Box::pin(os::acquire_metadata_mutation_lease(&object_path, None));
+        let metadata_held = matches!(futures::poll!(metadata_waiter.as_mut()), Poll::Pending);
+        drop(metadata_waiter);
+        let mut namespace_waiter = Box::pin(os::acquire_namespace_mutation_lease_with_owner(&metadata_path, None));
+        let namespace_held = matches!(futures::poll!(namespace_waiter.as_mut()), Poll::Pending);
+        drop(namespace_waiter);
+        let mut deletion = Box::pin(disk.delete_volume(volume, true));
+        let blocked = matches!(futures::poll!(deletion.as_mut()), Poll::Pending);
+        drop(release_tx);
+        let deleted = timeout(Duration::from_secs(5), deletion).await;
+        assert!(held, "{stage}, cancel={cancel}: worker must retain volume READ");
+        assert!(metadata_held, "{stage}, cancel={cancel}: worker must retain metadata RMW lock");
+        assert!(namespace_held, "{stage}, cancel={cancel}: worker must retain final namespace lock");
+        assert!(blocked, "{stage}, cancel={cancel}: delete must wait for the physical worker");
+        deleted
+            .expect("deletion drains after worker release")
+            .expect("delete old bucket");
+        disk.make_volume(volume).await.expect("recreate after physical completion");
+        let replacement = root.path().join(volume).join("new-generation");
+        fs::write(&replacement, b"new generation")
+            .await
+            .expect("new generation payload");
+        assert_eq!(fs::read(replacement).await.expect("read new generation"), b"new generation");
+        assert!(!metadata_path.exists(), "old metadata worker must not publish into the recreated bucket");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_metadata_write_cancellation_retains_prepared_lease_through_physical_workers() {
+        for stage in ["tmp", "rename"] {
+            assert_legacy_metadata_write_physical_owner(stage, true).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_metadata_write_timeout_retains_prepared_lease_through_physical_workers() {
+        for stage in ["tmp", "rename"] {
+            assert_legacy_metadata_write_physical_owner(stage, false).await;
+        }
     }
 
     #[tokio::test]

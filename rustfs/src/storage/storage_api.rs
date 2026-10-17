@@ -1392,13 +1392,6 @@ pub(crate) trait StorageDiskRpcExt {
         version_id: &str,
         opts: &ReadOptions,
     ) -> DiskResult<rustfs_filemeta::FileInfo>;
-    async fn write_metadata(
-        &self,
-        org_volume: &str,
-        volume: &str,
-        path: &str,
-        file_info: rustfs_filemeta::FileInfo,
-    ) -> DiskResult<()>;
     async fn update_metadata(
         &self,
         volume: &str,
@@ -1508,16 +1501,6 @@ where
         opts: &ReadOptions,
     ) -> DiskResult<rustfs_filemeta::FileInfo> {
         ecstore_disk::DiskAPI::read_version(self, org_volume, volume, path, version_id, opts).await
-    }
-
-    async fn write_metadata(
-        &self,
-        org_volume: &str,
-        volume: &str,
-        path: &str,
-        file_info: rustfs_filemeta::FileInfo,
-    ) -> DiskResult<()> {
-        ecstore_disk::DiskAPI::write_metadata(self, org_volume, volume, path, file_info).await
     }
 
     async fn update_metadata(

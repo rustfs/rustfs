@@ -1097,6 +1097,15 @@ impl NodeService {
             }));
         }
         if let Some(disk) = target.find_mutation_disk(&request.disk).await {
+            let write = match disk.begin_legacy_metadata_write(&request.volume, &request.path).await {
+                Ok(write) => write,
+                Err(err) => {
+                    return Ok(Response::new(WriteMetadataResponse {
+                        success: false,
+                        error: Some(err.into()),
+                    }));
+                }
+            };
             target.reject_legacy_artifact_mutation(&request.volume).await?;
             let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
                 Ok(file_info) => file_info,
@@ -1107,7 +1116,7 @@ impl NodeService {
                     }));
                 }
             };
-            match disk.write_metadata("", &request.volume, &request.path, file_info).await {
+            match write.write_metadata(file_info).await {
                 Ok(_) => Ok(Response::new(WriteMetadataResponse {
                     success: true,
                     error: None,
@@ -2665,6 +2674,107 @@ mod legacy_artifact_tests {
             Arc::new(KmsServiceManager::new()),
         ));
         super::super::make_server_for_context(Some(context))
+    }
+
+    fn metadata_request(disk: &str, volume: &str, path: &str, version: Uuid) -> Request<WriteMetadataRequest> {
+        let file_info = FileInfo {
+            volume: volume.to_owned(),
+            name: path.to_owned(),
+            version_id: Some(version),
+            deleted: true,
+            mod_time: Some(time::OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        let mut request = Request::new(WriteMetadataRequest {
+            disk: disk.to_owned(),
+            volume: volume.to_owned(),
+            path: path.to_owned(),
+            file_info: serde_json::to_string(&file_info).expect("metadata request"),
+            ..Default::default()
+        });
+        let body = rustfs_protos::canonical_write_metadata_request_body(request.get_ref()).expect("canonical metadata");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("metadata digest");
+        mark_v2_authenticated(&mut request);
+        request
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_metadata_receiver_rejects_missing_volume_with_retained_metadata() {
+        let root = tempfile::tempdir().expect("missing metadata volume root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        let bucket = "metadata-missing-volume";
+        env.make_bucket(bucket, false).await;
+        let service = service_for(&env).await;
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let target = service.local_mutation_target();
+        let disk = target.find_mutation_disk(&disk_ref).await.expect("listener local disk");
+        disk.delete_volume(bucket, true).await.expect("remove only target volume");
+        target
+            .reject_legacy_artifact_mutation(bucket)
+            .await
+            .expect("ordinary metadata still exists");
+
+        let response = service
+            .handle_write_metadata(metadata_request(&disk_ref, bucket, "nested/object", Uuid::new_v4()))
+            .await
+            .expect("metadata response")
+            .into_inner();
+        assert!(!response.success, "LEGACY_METADATA_MISSING_VOLUME_REJECTED");
+        assert_eq!(DiskError::from(response.error.expect("missing volume error")), DiskError::VolumeNotFound);
+        assert!(!env.disk_paths[0].join(bucket).exists(), "metadata must not recreate the deleted volume");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_metadata_receiver_preserves_versions_and_rejects_managed_writes() {
+        let root = tempfile::tempdir().expect("metadata receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("metadata-ordinary", false).await;
+        env.ecstore
+            .clone()
+            .make_artifact_bucket("metadata-managed", "outputs/")
+            .await
+            .expect("managed bucket");
+        let service = service_for(&env).await;
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+
+        let denied = service
+            .handle_write_metadata(metadata_request(&disk_ref, "metadata-managed", "outputs/object", Uuid::new_v4()))
+            .await
+            .expect_err("managed metadata requires artifact admission");
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert!(!env.disk_paths[0].join("metadata-managed/outputs/object").exists());
+
+        for volume in ["metadata-ordinary", ".rustfs.sys"] {
+            let path = "legacy-metadata/nested/object";
+            let versions = [Uuid::new_v4(), Uuid::new_v4()];
+            for version in versions {
+                let response = service
+                    .handle_write_metadata(metadata_request(&disk_ref, volume, path, version))
+                    .await
+                    .expect("metadata response")
+                    .into_inner();
+                assert!(response.success, "{volume}: {:?}", response.error);
+            }
+            let raw = tokio::fs::read(env.disk_paths[0].join(volume).join(path).join("xl.meta"))
+                .await
+                .expect("physical metadata");
+            let meta = rustfs_filemeta::FileMeta::load(&raw).expect("decode physical metadata");
+            for version in versions {
+                let restored = meta
+                    .into_fileinfo(volume, path, &version.to_string(), true, false, true)
+                    .expect("both versions survive metadata rewrite");
+                assert_eq!(restored.version_id, Some(version));
+                assert!(restored.deleted);
+            }
+        }
     }
 
     fn cas_request(

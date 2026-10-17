@@ -40,8 +40,14 @@ volume read owner before reading authoritative bucket metadata. Ordinary buckets
 must still have a live directory on that disk; retained metadata cannot recreate
 a missing volume. Their filesystem workers keep the owner through completion,
 even after cancellation. Internal volumes retain on-demand directory creation.
-Other legacy mutation routes and internal metadata publication still need their
-own admission boundary before distributed artifact sealing can be enabled.
+The ordinary `WriteMetadata` receiver also prepares its object metadata mutex,
+final `xl.meta` namespace mutex, and volume read lock before classification. It
+reuses those exact locks for temporary-file writes and final publication; queued
+bucket deletion cannot force a second read acquisition. Preparation and execution
+retain finite deadlines, while cancelled physical workers keep their ownership.
+The incarnation-bound heal path retains its separate admission. Other legacy
+mutation routes and internal metadata publication still need their own admission
+boundary before distributed artifact sealing can be enabled.
 
 ## Persistence and versioning
 
