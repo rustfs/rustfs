@@ -4476,6 +4476,53 @@ fn cache_root_entry_info_rejects_missing_or_dangling_roots() {
     assert!(cache_root_entry_info(&compacted_with_child).is_err());
 }
 
+#[tokio::test]
+async fn completed_bucket_results_count_distinct_current_roots_even_after_cancellation() {
+    for cancelled in [false, true] {
+        let ctx = CancellationToken::new();
+        if cancelled {
+            ctx.cancel();
+        }
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: DATA_USAGE_ROOT.to_string(),
+                tier_registry_generation: Some(7),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace(
+            "missing",
+            DATA_USAGE_ROOT,
+            DataUsageEntry {
+                size: 3,
+                ..Default::default()
+            },
+        );
+        let (tx, rx) = mpsc::channel(3);
+        for (bucket, generation, size) in [("complete", 7, 1), ("complete", 7, 2), ("missing", 8, 11)] {
+            tx.send(DataUsageEntryInfo {
+                name: bucket.to_string(),
+                parent: DATA_USAGE_ROOT.to_string(),
+                entry: DataUsageEntry {
+                    size,
+                    ..Default::default()
+                },
+                bucket_incarnation: None,
+                tier_registry_generation: Some(generation),
+            })
+            .await
+            .expect("fixture result channel");
+        }
+        drop(tx);
+        let (cache, complete) = super::io_cache::collect_completed_bucket_results(ctx, cache, rx).await;
+        assert_eq!(complete, HashSet::from(["complete".to_string()]));
+        assert!(!should_publish_completed_snapshot(complete.len(), 2, false, false));
+        assert_eq!(cache.find("complete").expect("applied root").size, 2);
+        assert_eq!(cache.find("missing").expect("retained old root").size, 3);
+    }
+}
+
 #[test]
 fn apply_bucket_result_to_cache_updates_bucket_entry() {
     let mut cache = DataUsageCache {
@@ -4496,10 +4543,12 @@ fn apply_bucket_result_to_cache_updates_bucket_entry() {
     );
 
     let update_time = SystemTime::now();
-    assert!(apply_bucket_result_to_cache(
+    let bucket = "bucket".to_string();
+    let bucket_name_ptr = bucket.as_ptr();
+    let applied_bucket = apply_bucket_result_to_cache(
         &mut cache,
         DataUsageEntryInfo {
-            name: "bucket".to_string(),
+            name: bucket,
             parent: DATA_USAGE_ROOT.to_string(),
             entry: DataUsageEntry {
                 size: 10,
@@ -4510,7 +4559,10 @@ fn apply_bucket_result_to_cache_updates_bucket_entry() {
             tier_registry_generation: None,
         },
         update_time,
-    ));
+    )
+    .expect("accepted result returns its bucket name");
+    assert_eq!(applied_bucket, "bucket");
+    assert_eq!(applied_bucket.as_ptr(), bucket_name_ptr, "reuse the result's name allocation");
 
     assert_eq!(cache.info.last_update, Some(update_time));
     let entry = cache.find("bucket").expect("bucket entry should remain present");
@@ -4553,7 +4605,7 @@ fn apply_bucket_result_to_cache_rejects_a_different_tier_generation() {
         SystemTime::now(),
     );
 
-    assert!(!applied);
+    assert!(applied.is_none());
     assert_eq!(cache.find("bucket").map(|entry| entry.size), Some(3));
     assert!(cache.info.last_update.is_none());
 }
