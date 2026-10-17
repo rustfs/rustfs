@@ -213,6 +213,55 @@ Missing, undecodable, or identity-less data is not converted to zero. It is
 reported as uninitialized, recovery-required, observed-only, or unavailable
 according to the reader's surface.
 
+## Diagnosing Incomplete Census Progress
+
+Treat bucket coverage, set-worker completion, cycle certification, and usage
+publication as separate stages. A successful save can be observational, and a
+worker finishing does not certify its namespace coverage.
+
+| Signal | Meaning and next evidence |
+| --- | --- |
+| `bucket_sweep_incomplete` | A bucket reached the end of a sweep but needs another verification pass. Inspect `coverage_gap`, `root_failed_objects`, `failed_objects`, `size_reconciliation_entries`, and `mixed_coverage` with its bucket, pool, set, and cycle. Multiple blockers can coexist. |
+| `remote_scan_partial` | The coordinator received a Partial terminal response for the named bucket and disk. Correlate the worker's bucket-sweep or checkpoint events; Partial is not a complete bucket root. |
+| `bucket_result_rejected` | A bucket result did not match the cycle's frozen tier-registry generation and was not applied. |
+| `set_cache_publish_skipped` | `completed_buckets` counts distinct bucket roots successfully applied to this set cache. Use `first_incomplete_bucket` with pool/set/cycle to locate one actual gap in this set. Inspect `unprocessed_buckets` and budget/cancellation state, then correlate that bucket's worker events. |
+| `set_scan_completed` | Set workers have finished. `coverage_complete` reports the structural coverage gate, not durable publication. This event alone does not prove a complete set snapshot. |
+| `incomplete_coverage` | The cycle did not obtain complete structural coverage. This does not identify a hot bucket or prove that ordinary writes caused the gap. |
+| `publication_proof_pending` | Publication is waiting for a retryable proof. Use cycle/stage, `pending_duration`, the preceding `publication_proof_started` kind, and the peer/purpose in the error. This event does not assert that the walk was Complete. |
+
+For a report such as 52 completed buckets out of 53, first identify whether
+the missing bucket was Partial, failed, never admitted, or rejected at merge.
+Only then inspect its worker evidence. Mixed coverage is a resumable sweep
+under a newer plan; failed objects and size reconciliation require different
+follow-up. A global dirty-generation change alone does not establish which
+bucket failed to produce a complete root.
+
+Use a bounded DEBUG window on the capacity-scanner leader and the workers
+serving the affected bucket:
+
+```text
+RUST_LOG=warn,rustfs::scanner=debug,rustfs::scanner::io=debug,rustfs::scanner::folder=debug
+```
+
+Capture one representative cycle with its effective budget configuration,
+source commit on every node, per-set completion summaries, partial-bucket
+events, remote errors, publication kind and result, and cycle-state persistence.
+The summaries report counts and bounded bucket identifiers, not object-path
+inventories. Keep logs access-controlled and redact deployment identifiers
+before sharing them.
+
+An unlimited walk budget can also leave a retryable authoritative publication
+waiting for leadership loss or a successful proof. Observational publication
+still retains the movement fence, while authoritative publication requires the
+strict namespace proof. Do not remove those fences to clear a status. Verify
+that a deployment contains the relevant fixes by commit ancestry; a newer
+release name alone is not evidence that it includes current main.
+
+Keep usage objects, checkpoint data, and recovery material intact during
+diagnosis. Acceptance requires usable census values, appropriately advancing
+dirty acknowledgements after publication, and progress across later cycles or
+leadership changes. Worker completion timestamps alone are insufficient.
+
 ## Existing Fixes As Invariants
 
 Several prior scanner fixes are consequences of this contract rather than

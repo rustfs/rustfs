@@ -1153,6 +1153,20 @@ fn apply_bucket_result_to_cache(cache: &mut DataUsageCache, result: DataUsageEnt
         // A result from another registry generation must never be folded into
         // this cycle. Leaving it unapplied makes the cycle incomplete and
         // forces the caller to re-account it under one frozen registry.
+        warn!(
+            target: "rustfs::scanner::io",
+            event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_IO,
+            state = "bucket_result_rejected",
+            bucket = %result.name,
+            pool = cache.info.source.map(|source| source.pool_index),
+            set = cache.info.source.map(|source| source.set_index),
+            cycle = cache.info.next_cycle,
+            expected_tier_registry_generation = cache.info.tier_registry_generation,
+            result_tier_registry_generation = result.tier_registry_generation,
+            "Scanner bucket result rejected because the tier registry generation differs"
+        );
         return false;
     }
     match result.bucket_incarnation {

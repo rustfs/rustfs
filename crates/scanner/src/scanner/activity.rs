@@ -262,8 +262,9 @@ where
                         stage,
                         attempt = consecutive_failures,
                         retry_delay = ?retry_delay,
+                        pending_duration = ?started_at.elapsed(),
                         error = %err,
-                        "Scanner retained a completed scan while publication proof is unavailable"
+                        "Scanner is waiting for publication proof"
                     );
                 } else {
                     debug!(

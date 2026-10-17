@@ -3847,6 +3847,15 @@ async fn test_scan_data_folder_success_clears_resume_hint() {
 #[tokio::test]
 #[serial]
 async fn test_scan_data_folder_keeps_unresolved_objects_partial() {
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
         temp_dir: Some(temp_dir.clone()),
@@ -3897,6 +3906,18 @@ async fn test_scan_data_folder_keeps_unresolved_objects_partial() {
         "corrupt object failure should remain recorded: {:?}",
         partial.info.failed_objects
     );
+    let events = logs
+        .contents()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("scanner JSON event"))
+        .filter(|event| event["fields"]["state"] == "bucket_sweep_incomplete")
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1, "the incomplete sweep must identify its blocker");
+    let fields = &events[0]["fields"];
+    assert_eq!(fields["bucket"], "bucket");
+    assert_eq!(fields["failed_objects"], 1);
+    assert_eq!(fields["mixed_coverage"], false);
+    assert!(!events[0].to_string().contains(&failed_path), "do not log individual object paths");
 }
 
 #[tokio::test]

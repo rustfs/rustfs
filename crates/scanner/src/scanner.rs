@@ -3656,6 +3656,21 @@ impl ScannerCyclePublicationPlan {
         } else {
             budget.token()
         };
+        debug!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_CYCLE_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "publication_proof_started",
+            cycle,
+            stage = "lease_acquire",
+            publication_kind = match self {
+                Self::ProgressOnly => "progress_only",
+                Self::Observational => "observational",
+                Self::Authoritative => "authoritative",
+            },
+            "Scanner is acquiring peer publication proof"
+        );
         let proof = await_scanner_publication_proof(
             &proof_ctx,
             cycle,
