@@ -115,8 +115,9 @@ check the selected version before publication, including when the caller asks
 for the latest version. Refusal is not a physical absence proof.
 
 These operations do not yet prove that every write path is permanently sealed.
-Remote physical completion and a controlled external seal interface still
-require enforcement and verification. Runner must not consume PUT sealing or
+Remote physical completion and all-writes sealing still require enforcement
+and verification. The controller API below exposes the current local storage
+facts; it does not remove those remaining requirements. Runner must not consume PUT sealing or
 version retirement alone as permanent all-writes authority. Retirement records
 must not expire by age; restoring storage from before a retirement can rewind
 that decision and requires a separate recovery contract.
