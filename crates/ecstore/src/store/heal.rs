@@ -817,20 +817,26 @@ impl ECStore {
         version_id: &str,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
-        crate::bucket::artifact::with_artifact_repair_scope(&self.ctx, bucket, object, opts, async {
-            self.handle_heal_object_with_absence(
-                bucket,
-                object,
-                version_id,
-                opts,
-                &mut None,
-                crate::set_disk::AbsenceProofRequest {
-                    retirement: None,
-                    allow_unversioned: false,
-                },
-            )
-            .await
-        })
+        crate::bucket::artifact::with_artifact_repair_scope(
+            &self.ctx,
+            bucket,
+            object,
+            opts,
+            Box::pin(async {
+                self.handle_heal_object_with_absence(
+                    bucket,
+                    object,
+                    version_id,
+                    opts,
+                    &mut None,
+                    crate::set_disk::AbsenceProofRequest {
+                        retirement: None,
+                        allow_unversioned: false,
+                    },
+                )
+                .await
+            }),
+        )
         .await
     }
 
@@ -869,7 +875,7 @@ impl ECStore {
             bucket,
             object,
             opts,
-            self.heal_object_with_absence_proof_inner(bucket, object, version_id, opts, allow_unversioned_absence),
+            Box::pin(self.heal_object_with_absence_proof_inner(bucket, object, version_id, opts, allow_unversioned_absence)),
         )
         .await
     }

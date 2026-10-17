@@ -144,8 +144,11 @@ between request classification and publication.
 `crates/ecstore/src/store/init/tests/artifact_repair_tests.rs` exercises direct
 PUT admission, sealed-version repair and stale-incarnation rejection on four
 real disks. Physical rename and metadata-replacement pauses test that cancellation
-and disk-wrapper timeouts cannot release the attempt barrier before publication
-finishes.
+cannot release the attempt barrier before publication finishes. The rename case
+also drops the repair future at a caller deadline; its guarded disk wrapper
+deliberately has no timeout. The metadata case uses public SetDisks repair to
+trigger real disk-wrapper timeouts, checks per-disk timeout counters, and verifies
+that the physical publishers still retain the attempt barrier.
 
 These checks establish bucket identity, versioning, and ordinary PUT sealing.
 They do not certify all-writes sealing, backup retention, or safe artifact

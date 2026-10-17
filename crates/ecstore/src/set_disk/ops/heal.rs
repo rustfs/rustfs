@@ -3370,7 +3370,7 @@ impl SetDisks {
             bucket,
             object,
             opts,
-            self.heal_object_with_retirement_inner(bucket, object, version_id, opts, absence, proof),
+            Box::pin(self.heal_object_with_retirement_inner(bucket, object, version_id, opts, absence, proof)),
         )
         .await
     }
