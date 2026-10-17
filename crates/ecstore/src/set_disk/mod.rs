@@ -160,9 +160,10 @@ use rustfs_utils::http::{
 use rustfs_utils::{
     HashAlgorithm,
     crypto::hex,
-    path::{SLASH_SEPARATOR, encode_dir_object, encode_dir_object_ref, has_suffix, path_join_buf},
+    path::{SLASH_SEPARATOR, encode_dir_object, encode_dir_object_ref, has_suffix, object_name_disk_identity, path_join_buf},
 };
 use sha2::Sha256;
+use std::borrow::Cow;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::{self};
 use std::pin::Pin;
@@ -4610,10 +4611,10 @@ struct GetObjectMetadataCacheKey {
     hash: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct GetObjectMetadataCacheLookupKey<'a> {
     bucket: &'a str,
-    object: &'a str,
+    object: Cow<'a, str>,
     generation: u64,
     hash: u64,
 }
@@ -4699,7 +4700,7 @@ impl GetObjectMetadataCacheKey {
     fn new(bucket: &str, object: &str, generation: GetObjectMetadataCacheGeneration) -> Self {
         Self {
             bucket: Arc::from(bucket),
-            object: Arc::from(object),
+            object: Arc::from(object_name_disk_identity(object).as_ref()),
             generation: generation.value,
             hash: generation.hash,
         }
@@ -4710,7 +4711,7 @@ impl<'a> GetObjectMetadataCacheLookupKey<'a> {
     fn new(bucket: &'a str, object: &'a str, generation: GetObjectMetadataCacheGeneration) -> Self {
         Self {
             bucket,
-            object,
+            object: object_name_disk_identity(object),
             generation: generation.value,
             hash: generation.hash,
         }
@@ -4727,7 +4728,7 @@ impl Hash for GetObjectMetadataCacheLookupKey<'_> {
 impl moka::Equivalent<GetObjectMetadataCacheKey> for GetObjectMetadataCacheLookupKey<'_> {
     fn equivalent(&self, key: &GetObjectMetadataCacheKey) -> bool {
         self.bucket == key.bucket.as_ref()
-            && self.object == key.object.as_ref()
+            && self.object.as_ref() == key.object.as_ref()
             && self.generation == key.generation
             && self.hash == key.hash
     }
@@ -4985,7 +4986,9 @@ impl SetDisks {
     fn get_object_metadata_cache_hash(&self, bucket: &str, object: &str) -> u64 {
         let mut hasher = self.get_object_metadata_cache_hash_builder.build_hasher();
         bucket.hash(&mut hasher);
-        object.hash(&mut hasher);
+        // Every spelling of one xl.meta (Windows `a\b` vs `a/b`) shares one
+        // cache identity, so a mutation through any of them retires the rest.
+        object_name_disk_identity(object).hash(&mut hasher);
         hasher.finish()
     }
 
@@ -8112,6 +8115,78 @@ mod tests {
         );
         drop(lock);
         assert_eq!(Arc::strong_count(&set.set_lock_namespace), before);
+    }
+
+    /// Spellings that a Windows disk resolves to the xl.meta of `a/b`.
+    const BACKSLASH_SPELLINGS_OF_A_B: [&str; 4] = ["a\\b", "a\\\\b", "\\a\\b", "a\\b\\"];
+
+    async fn ns_write_lock_free_while_held(set: &SetDisks, held: &str, contender: &str) -> bool {
+        let _held = set
+            .new_ns_lock("bucket", held)
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("holder write lock should be acquired");
+        set.new_ns_lock("bucket", contender)
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_millis(100))
+            .await
+            .is_ok()
+    }
+
+    async fn ns_lock_test_sets() -> [Arc<SetDisks>; 2] {
+        let local_ctx = Arc::new(InstanceContext::new());
+        local_ctx.update_erasure_type(SetupType::Erasure).await;
+        let dist_ctx = Arc::new(InstanceContext::new());
+        dist_ctx.update_erasure_type(SetupType::DistErasure).await;
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let locker: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager));
+        [
+            make_test_set_disks_with_ctx(Vec::new(), local_ctx).await,
+            make_test_set_disks_with_ctx(vec![locker], dist_ctx).await,
+        ]
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_ns_lock_keeps_backslash_and_slash_keys_distinct_off_windows() {
+        for set in ns_lock_test_sets().await {
+            assert!(
+                !ns_write_lock_free_while_held(&set, "a/b", "a/b").await,
+                "baseline: one key must conflict"
+            );
+            for spelling in BACKSLASH_SPELLINGS_OF_A_B {
+                assert!(
+                    ns_write_lock_free_while_held(&set, "a/b", spelling).await,
+                    "off Windows {spelling:?} is a different object and must not wait on `a/b`"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn windows_new_ns_lock_serializes_backslash_spellings_of_one_object() {
+        // Local and distributed lock domains: the distributed key is folded by
+        // the requester before it reaches the lock client.
+        for set in ns_lock_test_sets().await {
+            for spelling in BACKSLASH_SPELLINGS_OF_A_B {
+                assert!(
+                    !ns_write_lock_free_while_held(&set, "a/b", spelling).await,
+                    "{spelling:?} addresses the xl.meta of `a/b` and must wait on its lock"
+                );
+                assert!(
+                    !ns_write_lock_free_while_held(&set, spelling, "a/b").await,
+                    "`a/b` must wait on the lock held through {spelling:?}"
+                );
+            }
+            assert!(
+                ns_write_lock_free_while_held(&set, "a/b", "a/b/c").await,
+                "folding must not merge distinct objects"
+            );
+        }
     }
 
     fn put_object_commit_namespace_lock_wait_sample_count(snapshotter: &metrics_util::debugging::Snapshotter) -> usize {

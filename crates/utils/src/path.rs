@@ -200,6 +200,29 @@ pub fn path_join_buf(elements: &[&str]) -> String {
     dst
 }
 
+/// Object name in the segment form the local disk resolves it to.
+///
+/// Windows disks treat `\` as a path separator and `path_join_buf` drops the
+/// empty segments that leaves behind, so `a\b`, `a\\b`, `\a\b` and `a\b\`
+/// all address the xl.meta of `a/b`. In-memory identities that must agree
+/// with that file (namespace locks, metadata caches) fold through this.
+/// Elsewhere `\` is an ordinary key byte and the name is returned verbatim.
+pub fn object_name_disk_identity(object: &str) -> Cow<'_, str> {
+    fold_object_name_path_separators(object, cfg!(target_os = "windows"))
+}
+
+/// Splits on `/` and, when `backslash_is_separator`, `\`, dropping empty
+/// segments. `.` and `..` segments stay as they are: that can only leave two
+/// spellings of one file apart, never merge two different files.
+pub fn fold_object_name_path_separators(object: &str, backslash_is_separator: bool) -> Cow<'_, str> {
+    // Names without `\` already passed the `//` and leading-`/` checks.
+    if !backslash_is_separator || !object.contains('\\') {
+        return Cow::Borrowed(object);
+    }
+    let segments: Vec<&str> = object.split(['/', '\\']).filter(|segment| !segment.is_empty()).collect();
+    Cow::Owned(segments.join(SLASH_SEPARATOR))
+}
+
 /// path_needs_clean returns whether path cleaning may change the path.
 /// Will detect all cases that will be cleaned,
 /// but may produce false positives on non-trivial paths.
@@ -622,6 +645,27 @@ mod tests {
         let encoded = encode_dir_object_ref("prefix/directory/");
         assert!(matches!(encoded, Cow::Owned(ref value) if value == "prefix/directory__XLDIR__"));
         assert_eq!(encode_dir_object("prefix/directory/"), encoded);
+    }
+
+    #[test]
+    fn fold_object_name_path_separators_folds_backslash_only_as_separator() {
+        assert_eq!(fold_object_name_path_separators("a\\b\\c", true), "a/b/c");
+        assert_eq!(fold_object_name_path_separators("a/b\\c", true), "a/b/c");
+        // Empty segments collapse on disk, so these address `a/b` as well.
+        assert_eq!(fold_object_name_path_separators("a\\\\b", true), "a/b");
+        assert_eq!(fold_object_name_path_separators("a/\\b", true), "a/b");
+        assert_eq!(fold_object_name_path_separators("\\a\\b", true), "a/b");
+        assert_eq!(fold_object_name_path_separators("a\\b\\", true), "a/b");
+        assert_eq!(fold_object_name_path_separators("a\\b__XLDIR__", true), "a/b__XLDIR__");
+        assert!(matches!(fold_object_name_path_separators("a/b", true), Cow::Borrowed("a/b")));
+        assert!(matches!(fold_object_name_path_separators("a\\b", false), Cow::Borrowed("a\\b")));
+    }
+
+    #[test]
+    fn object_name_disk_identity_follows_platform_separator() {
+        let expected = if cfg!(target_os = "windows") { "a/b" } else { "a\\b" };
+        assert_eq!(object_name_disk_identity("a\\b"), expected);
+        assert!(matches!(object_name_disk_identity("a/b"), Cow::Borrowed("a/b")));
     }
 
     #[test]
