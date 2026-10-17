@@ -45,6 +45,10 @@ final `xl.meta` namespace mutex, and volume read lock before classification. It
 reuses those exact locks for temporary-file writes and final publication; queued
 bucket deletion cannot force a second read acquisition. Preparation and execution
 retain finite deadlines, while cancelled physical workers keep their ownership.
+Ordinary `UpdateMetadata` reuses that prepared publication for its read-modify-write
+operation, preserving metadata merge/replacement and durability options. Transition
+reconciliation retains its separate authorization path and is not covered by this
+admission.
 Ordinary `RenameData` similarly prepares a single-use disk-bound transaction
 before classifying either volume. It acquires the destination metadata and
 namespace mutexes, then distinct source and destination volume read locks in

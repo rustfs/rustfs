@@ -1549,6 +1549,34 @@ impl std::fmt::Debug for LegacyMetadataWrite {
 }
 
 impl LegacyMetadataWrite {
+    pub async fn update_metadata(self, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
+        if opts.transition_reconcile.is_some() {
+            return Err(DiskError::MethodNotAllowed);
+        }
+        crate::disk::io_admission::with_disk_io_permit(
+            Some(self.permit.clone()),
+            self.disk.track_disk_health_mutation(
+                "update_metadata",
+                DiskMetricMutation::Write,
+                || async {
+                    self.disk
+                        .disk
+                        .update_metadata_with_namespace_owner(
+                            &self.volume,
+                            &self.path,
+                            fi,
+                            opts,
+                            None,
+                            Some(self.publication.clone()),
+                        )
+                        .await
+                },
+                get_max_timeout_duration(),
+            ),
+        )
+        .await
+    }
+
     pub async fn write_metadata(self, fi: FileInfo) -> Result<()> {
         crate::disk::io_admission::with_disk_io_permit(
             Some(self.permit.clone()),

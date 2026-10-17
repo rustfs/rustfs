@@ -6582,6 +6582,56 @@ impl LocalDisk {
         .await
     }
 
+    pub(in crate::disk) async fn update_metadata_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        opts: &UpdateMetadataOpts,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        prepared_publication: Option<Arc<os::NamespaceMutationLease>>,
+    ) -> Result<()> {
+        if !fi.metadata.is_empty() {
+            let file_path = self.io_get_object_path(volume, path)?;
+
+            check_path_length(file_path.to_string_lossy().as_ref())?;
+
+            let buf = self
+                .read_all(volume, format!("{}/{}", path, STORAGE_FORMAT_FILE).as_str())
+                .await
+                .map_err(|e| {
+                    if e == DiskError::FileNotFound && fi.version_id.is_some() {
+                        DiskError::FileVersionNotFound
+                    } else {
+                        e
+                    }
+                })?;
+
+            if !FileMeta::is_xl2_v1_format(buf.as_ref()) {
+                return Err(DiskError::FileVersionNotFound);
+            }
+
+            let mut xl_meta = FileMeta::load(buf.as_ref())?;
+
+            xl_meta.update_object_version_with_opts(fi, opts.replace_user_metadata)?;
+
+            let wbuf = xl_meta.marshal_msg()?;
+
+            return self
+                .write_all_meta_with_namespace_owner(
+                    volume,
+                    format!("{path}/{STORAGE_FORMAT_FILE}").as_str(),
+                    &wbuf,
+                    !opts.no_persistence,
+                    namespace_owner,
+                    prepared_publication,
+                )
+                .await;
+        }
+
+        Err(Error::other("Invalid Argument"))
+    }
+
     #[tracing::instrument(name = "write_metadata", level = "trace", skip_all)]
     pub(in crate::disk) async fn write_metadata_with_namespace_owner(
         &self,
@@ -11359,45 +11409,8 @@ impl DiskAPI for LocalDisk {
                 .await;
         }
         let namespace_owner: Option<Arc<dyn Send + Sync>> = Some(os::acquire_metadata_mutation_lease(&object_path, None).await);
-        if !fi.metadata.is_empty() {
-            let file_path = self.io_get_object_path(volume, path)?;
-
-            check_path_length(file_path.to_string_lossy().as_ref())?;
-
-            let buf = self
-                .read_all(volume, format!("{}/{}", path, STORAGE_FORMAT_FILE).as_str())
-                .await
-                .map_err(|e| {
-                    if e == DiskError::FileNotFound && fi.version_id.is_some() {
-                        DiskError::FileVersionNotFound
-                    } else {
-                        e
-                    }
-                })?;
-
-            if !FileMeta::is_xl2_v1_format(buf.as_ref()) {
-                return Err(DiskError::FileVersionNotFound);
-            }
-
-            let mut xl_meta = FileMeta::load(buf.as_ref())?;
-
-            xl_meta.update_object_version_with_opts(fi, opts.replace_user_metadata)?;
-
-            let wbuf = xl_meta.marshal_msg()?;
-
-            return self
-                .write_all_meta_with_namespace_owner(
-                    volume,
-                    format!("{path}/{STORAGE_FORMAT_FILE}").as_str(),
-                    &wbuf,
-                    !opts.no_persistence,
-                    namespace_owner,
-                    None,
-                )
-                .await;
-        }
-
-        Err(Error::other("Invalid Argument"))
+        self.update_metadata_with_namespace_owner(volume, path, fi, opts, namespace_owner, None)
+            .await
     }
 
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
@@ -22916,6 +22929,295 @@ mod test {
     async fn legacy_rename_data_admission_timeout_retains_both_volumes_through_physical_workers() {
         for stage in ["inline-mkdir", "backup-mkdir", "publish", "restore"] {
             assert_legacy_rename_data_physical_owner(stage, false).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_update_metadata_preserves_options_and_reuses_admission() {
+        use crate::disk::disk_store::LocalDiskWrapper;
+        let _durability = durability_mode_override::set(DurabilityMode::Strict);
+        for replace_user_metadata in [false, true] {
+            for no_persistence in [false, true] {
+                let root = tempfile::tempdir().expect("update metadata options root");
+                let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("local endpoint");
+                let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+                let volume = "legacy-update-options";
+                let object = "object";
+                ensure_test_volume(&disk, volume).await;
+                ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+                let object_dir = disk.io_get_object_path(volume, object).expect("object directory");
+                fs::create_dir_all(&object_dir).await.expect("object parents");
+                let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
+                let version = Uuid::new_v4();
+                let other_version = Uuid::new_v4();
+                let mut original = test_file_info(object, version, None, Some(Bytes::from_static(b"complete original payload")));
+                original.set_inline_data();
+                original
+                    .metadata
+                    .insert("x-amz-meta-retain".to_owned(), "retained".to_owned());
+                original.metadata.insert("x-amz-meta-change".to_owned(), "old".to_owned());
+                let mut other =
+                    test_file_info(object, other_version, None, Some(Bytes::from_static(b"unrelated version payload")));
+                other.set_inline_data();
+                let mut metadata = FileMeta::new();
+                metadata.add_version(original.clone()).expect("target version");
+                metadata.add_version(other).expect("unrelated version");
+                let before = metadata.marshal_msg().expect("valid original metadata");
+                fs::write(&metadata_path, &before)
+                    .await
+                    .expect("seed original metadata without directory fsync");
+                let wrapper = LocalDiskWrapper::new(disk.clone(), false);
+                let opts = UpdateMetadataOpts {
+                    no_persistence,
+                    replace_user_metadata,
+                    ..Default::default()
+                };
+                let mut empty = original.clone();
+                empty.metadata.clear();
+                let direct = disk
+                    .update_metadata(volume, object, empty.clone(), &opts)
+                    .await
+                    .expect_err("original empty metadata behavior");
+                let error = wrapper
+                    .begin_legacy_metadata_write(volume, object)
+                    .await
+                    .expect("empty update admission")
+                    .update_metadata(empty, &opts)
+                    .await
+                    .expect_err("prepared update preserves empty metadata failure");
+                assert!(matches!(&error, DiskError::Io(inner) if inner.to_string() == "Invalid Argument"));
+                assert_eq!(error.to_string(), direct.to_string());
+                assert_eq!(fs::read(&metadata_path).await.expect("empty update leaves metadata"), before);
+                let special = UpdateMetadataOpts {
+                    transition_reconcile: Some(Box::new(crate::disk::TransitionStateReconcileCondition {
+                        expected_metadata_digest: String::new(),
+                        unchanged_metadata_digest: String::new(),
+                        target: rustfs_filemeta::TransitionStateReconcileTarget {
+                            state: rustfs_filemeta::TransitionVersionState::KnownDisabled,
+                            remote_version: None,
+                            destination_id: "fixture-target".to_owned(),
+                        },
+                        tier: "fixture-tier".to_owned(),
+                        topology_generation: "fixture-generation".to_owned(),
+                        verify_only: false,
+                        authority: None,
+                    })),
+                    ..Default::default()
+                };
+                let rejected = wrapper
+                    .begin_legacy_metadata_write(volume, object)
+                    .await
+                    .expect("special update admission")
+                    .update_metadata(original.clone(), &special)
+                    .await
+                    .expect_err("ordinary token cannot bypass transition authority");
+                assert_eq!(rejected, DiskError::MethodNotAllowed);
+                assert_eq!(fs::read(&metadata_path).await.expect("special update leaves metadata"), before);
+                let mut update = original.clone();
+                update.metadata.clear();
+                update.metadata.insert("x-amz-meta-change".to_owned(), "new".to_owned());
+                let missing = wrapper
+                    .begin_legacy_metadata_write(volume, "missing-object")
+                    .await
+                    .expect("missing version admission")
+                    .update_metadata(update.clone(), &opts)
+                    .await
+                    .expect_err("missing metadata retains version error mapping");
+                assert_eq!(missing, DiskError::FileVersionNotFound);
+                assert!(!root.path().join(volume).join("missing-object").exists());
+                let calls_before = wrapper
+                    .metrics_snapshot()
+                    .api_calls
+                    .get("update_metadata")
+                    .copied()
+                    .unwrap_or(0);
+                let token = wrapper
+                    .begin_legacy_metadata_write(volume, object)
+                    .await
+                    .expect("ordinary update admission");
+                let mut deletion = Box::pin(disk.delete_volume(volume, true));
+                assert!(
+                    matches!(futures::poll!(deletion.as_mut()), Poll::Pending),
+                    "delete must queue behind prepared READ"
+                );
+                timeout(Duration::from_secs(5), token.update_metadata(update, &opts))
+                    .await
+                    .expect("update must reuse metadata/namespace/READ despite queued writer")
+                    .expect("ordinary metadata update");
+                let bytes = fs::read(&metadata_path).await.expect("updated xl.meta");
+                let updated = FileMeta::load(&bytes)
+                    .expect("valid updated metadata")
+                    .into_fileinfo(volume, object, &version.to_string(), true, false, true)
+                    .expect("exact target version");
+                assert_eq!(updated.version_id, Some(version));
+                assert_eq!(updated.data.as_deref(), Some(b"complete original payload".as_slice()));
+                assert_eq!(updated.metadata.get("x-amz-meta-change").map(String::as_str), Some("new"));
+                assert_eq!(
+                    updated.metadata.get("x-amz-meta-retain").map(String::as_str),
+                    (!replace_user_metadata).then_some("retained")
+                );
+                let unrelated = FileMeta::load(&bytes)
+                    .expect("valid multi-version metadata")
+                    .into_fileinfo(volume, object, &other_version.to_string(), true, false, true)
+                    .expect("unrelated version");
+                assert_eq!(unrelated.version_id, Some(other_version));
+                assert_eq!(unrelated.data.as_deref(), Some(b"unrelated version payload".as_slice()));
+                assert_eq!(
+                    os::fsync_dir_recorder::was_fsynced(&root.path().join(volume).join(object)),
+                    !no_persistence,
+                    "no_persistence must preserve the existing directory fsync policy"
+                );
+                assert_eq!(wrapper.metrics_snapshot().api_calls.get("update_metadata"), Some(&(calls_before + 1)));
+                timeout(Duration::from_secs(5), deletion)
+                    .await
+                    .expect("queued delete drains")
+                    .expect("delete old volume");
+                assert!(!root.path().join(volume).exists());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_legacy_update_metadata_physical_owner(stage: &str, cancel: bool) {
+        use crate::disk::disk_store::{LocalDiskWrapper, get_max_timeout_duration};
+        let root = tempfile::tempdir().expect("update metadata physical owner root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("local endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        let volume = "legacy-update-owner";
+        let object = "object";
+        ensure_test_volume(&disk, volume).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        let object_dir = disk.io_get_object_path(volume, object).expect("object directory");
+        fs::create_dir_all(&object_dir).await.expect("object parents");
+        let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
+        let version = Uuid::new_v4();
+        let mut fi = test_file_info(object, version, None, Some(Bytes::from_static(b"complete preserved payload")));
+        fi.set_inline_data();
+        fi.metadata.insert("x-amz-meta-state".to_owned(), "original".to_owned());
+        let original = test_meta(fi.clone());
+        fs::write(&metadata_path, &original).await.expect("original xl.meta");
+        fi.metadata.insert("x-amz-meta-state".to_owned(), "updated".to_owned());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let pause = move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        };
+        let _publication_hook = if stage == "tmp" {
+            assert!(
+                METADATA_TEMP_WRITE_BEFORE_STAGE
+                    .lock()
+                    .expect("tmp observer lock")
+                    .insert(
+                        metadata_path.clone(),
+                        Box::new(move |tmp| {
+                            set_owned_file_write_before_open(tmp, pause);
+                        })
+                    )
+                    .is_none()
+            );
+            None
+        } else {
+            Some(os::prepared_publication_test_hooks::install_at(
+                os::prepared_publication_test_hooks::Stage::Rename,
+                &metadata_path,
+                pause,
+            ))
+        };
+        let wrapper = LocalDiskWrapper::new(disk.clone(), false);
+        let token = wrapper
+            .begin_legacy_metadata_write(volume, object)
+            .await
+            .expect("prepare update admission");
+        let mutation = tokio::spawn(async move { token.update_metadata(fi, &UpdateMetadataOpts::default()).await });
+        timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("actual metadata worker starts")
+            .expect("physical worker entered");
+        if cancel {
+            mutation.abort();
+            assert!(mutation.await.expect_err("cancel the real update waiter").is_cancelled());
+        } else {
+            tokio::time::pause();
+            tokio::time::advance(get_max_timeout_duration() + Duration::from_secs(1)).await;
+            tokio::time::resume();
+            let error = timeout(Duration::from_secs(5), mutation)
+                .await
+                .expect("update deadline returns")
+                .expect("update task")
+                .expect_err("normal update must use its finite deadline");
+            assert_eq!(error, DiskError::Timeout);
+            let metrics = wrapper.metrics_snapshot();
+            assert_eq!(metrics.api_calls.get("update_metadata"), Some(&1));
+            assert_eq!(metrics.total_errors_timeout, 1);
+        }
+        let held = os::disk_volume_mutation_lock(&disk.root, volume).try_write_owned().is_err();
+        let metadata_key = disk.get_object_path(volume, object).expect("metadata mutex key");
+        let mut metadata_waiter = Box::pin(os::acquire_metadata_mutation_lease(&metadata_key, None));
+        let metadata_held = matches!(futures::poll!(metadata_waiter.as_mut()), Poll::Pending);
+        drop(metadata_waiter);
+        let mut namespace_waiter = Box::pin(os::acquire_namespace_mutation_lease_with_owner(&metadata_path, None));
+        let namespace_held = matches!(futures::poll!(namespace_waiter.as_mut()), Poll::Pending);
+        drop(namespace_waiter);
+        let mut deletion = Box::pin(disk.delete_volume(volume, true));
+        let blocked = matches!(futures::poll!(deletion.as_mut()), Poll::Pending);
+        drop(release_tx);
+        let drained = timeout(
+            Duration::from_secs(10),
+            os::acquire_namespace_mutation_lease_with_owner(&metadata_path, None),
+        )
+        .await;
+        drop(drained.expect("actual publication worker drains"));
+        assert!(held, "{stage}, cancel={cancel}: physical update must retain volume READ");
+        assert!(metadata_held, "{stage}, cancel={cancel}: physical update must retain metadata mutex");
+        assert!(namespace_held, "{stage}, cancel={cancel}: physical update must retain final namespace");
+        assert!(blocked, "{stage}, cancel={cancel}: actual deletion must wait for worker");
+        let current = fs::read(&metadata_path)
+            .await
+            .expect("metadata before driving queued deletion");
+        if stage == "tmp" {
+            assert_eq!(current, original, "cancelled staging must not publish later");
+        }
+        let stored = FileMeta::load(&current)
+            .expect("valid current metadata")
+            .into_fileinfo(volume, object, &version.to_string(), true, false, true)
+            .expect("same version after worker");
+        assert_eq!(stored.version_id, Some(version));
+        assert_eq!(stored.data.as_deref(), Some(b"complete preserved payload".as_slice()));
+        assert_eq!(
+            stored.metadata.get("x-amz-meta-state").map(String::as_str),
+            Some(if stage == "tmp" { "original" } else { "updated" })
+        );
+        timeout(Duration::from_secs(10), deletion)
+            .await
+            .expect("queued deletion drains after physical worker")
+            .expect("delete old generation");
+        disk.make_volume(volume).await.expect("recreate after actual deletion");
+        let new_generation = root.path().join(volume).join("new-generation");
+        fs::write(&new_generation, b"complete new generation")
+            .await
+            .expect("new generation payload");
+        assert_eq!(
+            fs::read(new_generation).await.expect("new generation survives"),
+            b"complete new generation"
+        );
+        assert!(!metadata_path.exists(), "old update worker must not publish into recreated bucket");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_update_metadata_cancellation_retains_physical_owner() {
+        for stage in ["tmp", "rename"] {
+            assert_legacy_update_metadata_physical_owner(stage, true).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_update_metadata_timeout_retains_physical_owner() {
+        for stage in ["tmp", "rename"] {
+            assert_legacy_update_metadata_physical_owner(stage, false).await;
         }
     }
 

@@ -1162,16 +1162,6 @@ impl NodeService {
         let request = request.into_inner();
         let target = self.local_mutation_target();
         if let Some(disk) = target.find_mutation_disk(&request.disk).await {
-            target.reject_legacy_artifact_mutation(&request.volume).await?;
-            let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
-                Ok(file_info) => file_info,
-                Err(err) => {
-                    return Ok(Response::new(UpdateMetadataResponse {
-                        success: false,
-                        error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
-                    }));
-                }
-            };
             let opts = match decode_msgpack_or_json::<UpdateMetadataOpts>(&request.opts_bin, &request.opts, "UpdateMetadataOpts")
             {
                 Ok(opts) => opts,
@@ -1183,7 +1173,36 @@ impl NodeService {
                 }
             };
 
-            match disk.update_metadata(&request.volume, &request.path, file_info, &opts).await {
+            let prepared = if opts.transition_reconcile.is_none() {
+                match disk.begin_legacy_metadata_write(&request.volume, &request.path).await {
+                    Ok(write) => Some(write),
+                    Err(err) => {
+                        return Ok(Response::new(UpdateMetadataResponse {
+                            success: false,
+                            error: Some(err.into()),
+                        }));
+                    }
+                }
+            } else {
+                None
+            };
+            target.reject_legacy_artifact_mutation(&request.volume).await?;
+            let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
+                Ok(file_info) => file_info,
+                Err(err) => {
+                    return Ok(Response::new(UpdateMetadataResponse {
+                        success: false,
+                        error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
+                    }));
+                }
+            };
+
+            let result = if let Some(write) = prepared {
+                write.update_metadata(file_info, &opts).await
+            } else {
+                disk.update_metadata(&request.volume, &request.path, file_info, &opts).await
+            };
+            match result {
                 Ok(_) => Ok(Response::new(UpdateMetadataResponse {
                     success: true,
                     error: None,
@@ -2723,7 +2742,6 @@ mod legacy_artifact_tests {
     }
 
     const LEGACY_RENAME_AUDIENCE: &str = "127.0.0.1:24800";
-    const LEGACY_RENAME_RPC_PATH: &str = "/node_service.NodeService/RenameData";
     const LEGACY_RENAME_BODY: &[u8] = b"authenticated real inline rename body";
 
     fn inline_rename_file_info(path: &str) -> FileInfo {
@@ -2751,7 +2769,6 @@ mod legacy_artifact_tests {
         fi: &FileInfo,
         msgpack: bool,
     ) -> Request<RenameDataRequest> {
-        use crate::storage::storage_api::ecstore_rpc as rpc;
         let mut request = Request::new(RenameDataRequest {
             disk: disk.to_owned(),
             src_volume: source.0.to_owned(),
@@ -2771,7 +2788,14 @@ mod legacy_artifact_tests {
             ..Default::default()
         });
         let body = rustfs_protos::canonical_rename_data_request_body(request.get_ref()).expect("canonical rename body");
-        set_tonic_canonical_body_digest(&mut request, &body).expect("rename digest");
+        sign_legacy_rpc_request(&mut request, &body, "RenameData");
+        request
+    }
+
+    fn sign_legacy_rpc_request<T>(request: &mut Request<T>, body: &[u8], rpc_method: &str) {
+        use crate::storage::storage_api::ecstore_rpc as rpc;
+        set_tonic_canonical_body_digest(request, body).expect("canonical mutation digest");
+        let rpc_path = format!("/node_service.NodeService/{rpc_method}");
         let digest = request
             .metadata()
             .get("x-rustfs-content-sha256")
@@ -2779,7 +2803,7 @@ mod legacy_artifact_tests {
             .to_str()
             .expect("digest text");
         let mut headers =
-            rpc::gen_tonic_signature_headers(LEGACY_RENAME_AUDIENCE, "node_service.NodeService", "RenameData", Some(digest))
+            rpc::gen_tonic_signature_headers(LEGACY_RENAME_AUDIENCE, "node_service.NodeService", rpc_method, Some(digest))
                 .expect("real HMAC signature");
         let challenge = Uuid::new_v4();
         let epoch_proof = rpc::tonic_boot_epoch_response_headers(LEGACY_RENAME_AUDIENCE, challenge).expect("signed epoch proof");
@@ -2787,7 +2811,7 @@ mod legacy_artifact_tests {
             rpc::verify_tonic_boot_epoch_response(LEGACY_RENAME_AUDIENCE, challenge, &epoch_proof).expect("authenticated epoch");
         let replay = rpc::gen_tonic_replay_scope_headers(
             LEGACY_RENAME_AUDIENCE,
-            LEGACY_RENAME_RPC_PATH,
+            &rpc_path,
             headers["x-rustfs-timestamp"].to_str().expect("signed timestamp"),
             headers["x-rustfs-content-sha256"].to_str().expect("signed digest"),
             epoch,
@@ -2795,22 +2819,26 @@ mod legacy_artifact_tests {
         .expect("real replay-scoped signature");
         headers.extend(replay);
         request.metadata_mut().as_mut().extend(headers);
-        request
+    }
+
+    fn verify_legacy_rpc_request<T>(request: &Request<T>, rpc_method: &str) -> Result<(), Status> {
+        let rpc_path = format!("/node_service.NodeService/{rpc_method}");
+        // Use the same HMAC/replay verifier as production check_auth before
+        // the handler independently verifies its canonical body digest.
+        crate::storage::storage_api::ecstore_rpc::verify_tonic_rpc_signature_with_bootstrap(
+            LEGACY_RENAME_AUDIENCE,
+            &rpc_path,
+            request.metadata().as_ref(),
+            false,
+        )
+        .map_err(|_| Status::unauthenticated("legacy RPC signature rejected"))
     }
 
     async fn authenticated_legacy_rename(
         service: &NodeService,
         request: Request<RenameDataRequest>,
     ) -> Result<Response<RenameDataResponse>, Status> {
-        // This is the production HMAC/replay verifier used by check_auth. The
-        // handler then independently verifies the signed canonical body digest.
-        crate::storage::storage_api::ecstore_rpc::verify_tonic_rpc_signature_with_bootstrap(
-            LEGACY_RENAME_AUDIENCE,
-            LEGACY_RENAME_RPC_PATH,
-            request.metadata().as_ref(),
-            false,
-        )
-        .map_err(|_| Status::unauthenticated("legacy rename signature rejected"))?;
+        verify_legacy_rpc_request(&request, "RenameData")?;
         service.handle_rename_data(request).await
     }
 
@@ -3041,6 +3069,264 @@ mod legacy_artifact_tests {
             if !missing_source {
                 assert_eq!(tokio::fs::read(source_meta).await.expect("rejected source retained"), before);
             }
+        }
+    }
+
+    fn signed_legacy_update_metadata_request(
+        disk: &str,
+        volume: &str,
+        path: &str,
+        fi: &FileInfo,
+        opts: &UpdateMetadataOpts,
+        msgpack: bool,
+    ) -> Request<UpdateMetadataRequest> {
+        let mut request = Request::new(UpdateMetadataRequest {
+            disk: disk.to_owned(),
+            volume: volume.to_owned(),
+            path: path.to_owned(),
+            file_info: if msgpack {
+                "invalid JSON must not be decoded".to_owned()
+            } else {
+                serde_json::to_string(fi).expect("JSON FI")
+            },
+            opts: if msgpack {
+                "invalid JSON must not be decoded".to_owned()
+            } else {
+                serde_json::to_string(opts).expect("JSON update options")
+            },
+            file_info_bin: if msgpack {
+                encode_file_info_msgpack(fi).expect("msgpack FI").into()
+            } else {
+                Bytes::new()
+            },
+            opts_bin: if msgpack {
+                encode_msgpack(opts, "UpdateMetadataOpts")
+                    .expect("msgpack update options")
+                    .into()
+            } else {
+                Bytes::new()
+            },
+        });
+        let body = rustfs_protos::canonical_update_metadata_request_body(request.get_ref()).expect("canonical update body");
+        sign_legacy_rpc_request(&mut request, &body, "UpdateMetadata");
+        request
+    }
+
+    async fn authenticated_legacy_update_metadata(
+        service: &NodeService,
+        request: Request<UpdateMetadataRequest>,
+    ) -> Result<Response<UpdateMetadataResponse>, Status> {
+        verify_legacy_rpc_request(&request, "UpdateMetadata")?;
+        service.handle_update_metadata(request).await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_update_metadata_receiver_preserves_ordinary_internal_and_managed_semantics() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-update-receiver-test-secret".to_owned());
+        let root = tempfile::tempdir().expect("update receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("update-ordinary", true).await;
+        env.ecstore
+            .clone()
+            .make_artifact_bucket("update-managed", "outputs/")
+            .await
+            .expect("managed bucket");
+        let service = service_for(&env).await;
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let target = service.local_mutation_target();
+        let disk = target.find_mutation_disk(&disk_ref).await.expect("listener local disk");
+        for msgpack in [false, true] {
+            for volume in ["update-ordinary", ".rustfs.sys", "update-managed"] {
+                let path = if volume == "update-managed" {
+                    format!("outputs/74656e616e74/{}/{}/object-{msgpack}", Uuid::new_v4(), Uuid::new_v4())
+                } else {
+                    format!("legacy-update/object-{msgpack}")
+                };
+                let mut original = inline_rename_file_info(&path);
+                original.fresh = false;
+                original.metadata.insert("keep".to_owned(), "original".to_owned());
+                original.metadata.insert("changed".to_owned(), "before".to_owned());
+                ecstore_disk::DiskAPI::write_metadata(disk.as_ref(), "", volume, &path, original.clone())
+                    .await
+                    .expect("real original inline version");
+                let mut history = original.clone();
+                history.version_id = Some(Uuid::new_v4());
+                history.metadata.clear();
+                history.set_inline_data();
+                history.metadata.insert("history".to_owned(), "untouched".to_owned());
+                ecstore_disk::DiskAPI::write_metadata(disk.as_ref(), "", volume, &path, history.clone())
+                    .await
+                    .expect("second real inline version");
+                let version = original.version_id.expect("original version");
+                let history_version = history.version_id.expect("history version");
+                let history_before = disk
+                    .read_version(
+                        volume,
+                        volume,
+                        &path,
+                        &history_version.to_string(),
+                        &ReadOptions {
+                            read_data: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("original historical version");
+                let physical = env.disk_paths[0].join(volume).join(&path).join("xl.meta");
+                let before = tokio::fs::read(&physical).await.expect("real xl.meta");
+                for replace in [false, true] {
+                    let mut update = original.clone();
+                    update.metadata.clear();
+                    update.set_inline_data();
+                    update
+                        .metadata
+                        .insert("changed".to_owned(), if replace { "replaced" } else { "merged" }.to_owned());
+                    update.mod_time = Some(time::OffsetDateTime::now_utc());
+                    // UpdateMetadata must preserve stored bytes and geometry,
+                    // even when the incoming FileInfo carries a different body.
+                    let incoming = b"incoming metadata must not replace the stored body";
+                    update.data = Some(Bytes::from_static(incoming));
+                    update.size = i64::try_from(incoming.len()).expect("incoming size");
+                    update.parts[0].size = incoming.len();
+                    update.parts[0].actual_size = update.size;
+                    update.validate_for_metadata_read().expect("valid incoming inline FI");
+                    let opts = UpdateMetadataOpts {
+                        replace_user_metadata: replace,
+                        no_persistence: replace,
+                        transition_reconcile: None,
+                    };
+                    let result = authenticated_legacy_update_metadata(
+                        &service,
+                        signed_legacy_update_metadata_request(&disk_ref, volume, &path, &update, &opts, msgpack),
+                    )
+                    .await;
+                    if volume == "update-managed" {
+                        assert_eq!(
+                            result.expect_err("managed metadata update must reject").code(),
+                            tonic::Code::PermissionDenied
+                        );
+                        assert_eq!(tokio::fs::read(&physical).await.expect("managed metadata retained"), before);
+                        continue;
+                    }
+                    let response = result.expect("authenticated update response").into_inner();
+                    assert!(
+                        response.success,
+                        "volume={volume}, msgpack={msgpack}, replace={replace}: {:?}",
+                        response.error
+                    );
+                    assert!(response.error.is_none());
+                    let actual = disk
+                        .read_version(
+                            volume,
+                            volume,
+                            &path,
+                            &version.to_string(),
+                            &ReadOptions {
+                                read_data: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("exact updated version");
+                    assert_eq!(actual.version_id, Some(version));
+                    assert_eq!(actual.data, Some(Bytes::from_static(LEGACY_RENAME_BODY)));
+                    assert_eq!(actual.size, original.size);
+                    assert_eq!(actual.mod_time, update.mod_time);
+                    assert_eq!(
+                        actual.metadata.get("changed").map(String::as_str),
+                        Some(if replace { "replaced" } else { "merged" })
+                    );
+                    assert_eq!(
+                        actual.metadata.get("keep").map(String::as_str),
+                        if replace { None } else { Some("original") }
+                    );
+                    let historical = disk
+                        .read_version(
+                            volume,
+                            volume,
+                            &path,
+                            &history_version.to_string(),
+                            &ReadOptions {
+                                read_data: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("untouched historical version");
+                    assert_eq!(historical.version_id, Some(history_version));
+                    assert_eq!(historical.data, history_before.data);
+                    assert_eq!(historical.metadata, history_before.metadata);
+                    assert_eq!(historical.mod_time, history_before.mod_time);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_update_metadata_receiver_rejects_missing_volume_with_retained_metadata() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-update-receiver-test-secret".to_owned());
+        let root = tempfile::tempdir().expect("missing update receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        let service = service_for(&env).await;
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let target = service.local_mutation_target();
+        let disk = target.find_mutation_disk(&disk_ref).await.expect("listener local disk");
+        for msgpack in [false, true] {
+            let volume = if msgpack {
+                "update-missing-msgpack"
+            } else {
+                "update-missing-json"
+            };
+            env.make_bucket(volume, true).await;
+            let path = "nested/object";
+            let original = inline_rename_file_info(path);
+            ecstore_disk::DiskAPI::write_metadata(disk.as_ref(), "", volume, path, original.clone())
+                .await
+                .expect("real metadata before removal");
+            let incarnation = env
+                .ecstore
+                .bucket_incarnation_id(volume)
+                .await
+                .expect("authoritative incarnation");
+            disk.delete_volume(volume, true)
+                .await
+                .expect("remove only the receiver physical volume");
+            assert_eq!(env.ecstore.bucket_incarnation_id(volume).await.expect("retained authority"), incarnation);
+            target
+                .reject_legacy_artifact_mutation(volume)
+                .await
+                .expect("retained ordinary authority");
+            let mut update = original;
+            update.metadata.insert("changed".to_owned(), "must-not-publish".to_owned());
+            let opts = UpdateMetadataOpts {
+                no_persistence: msgpack,
+                replace_user_metadata: msgpack,
+                transition_reconcile: None,
+            };
+            let response = authenticated_legacy_update_metadata(
+                &service,
+                signed_legacy_update_metadata_request(&disk_ref, volume, path, &update, &opts, msgpack),
+            )
+            .await
+            .expect("missing-volume update response")
+            .into_inner();
+            assert!(!response.success, "missing physical volume must reject update admission");
+            assert_eq!(
+                DiskError::from(response.error.expect("precise missing-volume error")),
+                DiskError::VolumeNotFound
+            );
+            assert!(
+                !env.disk_paths[0].join(volume).exists(),
+                "retained authority cannot revive a missing volume or object"
+            );
         }
     }
 
