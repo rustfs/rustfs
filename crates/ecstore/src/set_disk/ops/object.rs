@@ -15002,9 +15002,14 @@ mod transition_commit_failure_tests {
                         version_id: Some(version_id.to_string()),
                         versioned,
                         version_suspended,
-                        object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
-                            ObjectLockConfigState::ConfirmedAbsent,
-                        ))),
+                        object_lock_config_snapshot: Some(
+                            crate::bucket::metadata_sys::object_store_in(&set_disks.ctx)
+                                .await
+                                .expect("restore fixture metadata owner")
+                                .object_lock_config_snapshot(bucket)
+                                .await
+                                .expect("restore fixture owned Object Lock snapshot"),
+                        ),
                         ..Default::default()
                     },
                 )
