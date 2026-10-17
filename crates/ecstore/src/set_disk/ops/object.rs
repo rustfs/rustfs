@@ -14608,12 +14608,17 @@ mod transition_commit_failure_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn multipart_restore_copies_the_stored_representation_back_verbatim() {
-        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        use crate::storage_api_contracts::bucket::BucketOperations as _;
+
+        let (_temp_dirs, _, set_disks) = hermetic_set_disks(4).await;
         let bucket = "restore-multipart-stored-coordinates-bucket";
         let object = "object.bin";
-        for disk in &disk_stores {
-            disk.make_volume(bucket).await.expect("bucket volume should be created");
-        }
+        crate::bucket::metadata_sys::object_store_in(&set_disks.ctx)
+            .await
+            .expect("multipart restore fixture metadata owner")
+            .make_bucket(bucket, &Default::default())
+            .await
+            .expect("multipart restore bucket must have authoritative quota metadata");
 
         // The minimum-part-size gate reads the PLAINTEXT length, so part one
         // clears 5 MiB there while its stored form carries encoding overhead.
