@@ -528,7 +528,7 @@ impl SetDisks {
             None
         };
         if let Some((transaction, source)) = prerequisite {
-            Box::pin(self.heal_delete_recovery_source(bucket, object, &source, can_commit)).await?;
+            Box::pin(self.heal_delete_recovery_source(bucket, object, &source, can_commit, namespace_owner.as_ref())).await?;
             let refreshed = inspect(&disks, bucket, object, transaction)
                 .await
                 .into_iter()

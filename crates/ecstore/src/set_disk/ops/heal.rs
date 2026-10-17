@@ -33,6 +33,7 @@ struct ExplicitVersionHeal<'a> {
     allow_regeneration: bool,
     preserve_unrepairable: bool,
     commit_fence: Option<&'a (dyn Fn() -> bool + Sync)>,
+    namespace_owner: Option<&'a Arc<dyn Send + Sync>>,
     retirement: Option<&'a MarkerRetirementContext<'a>>,
 }
 
@@ -775,6 +776,7 @@ impl SetDisks {
                 allow_regeneration: true,
                 preserve_unrepairable: false,
                 commit_fence: None,
+                namespace_owner: None,
                 retirement: None,
             },
             &mut None,
@@ -921,6 +923,7 @@ impl SetDisks {
             allow_regeneration: allow_explicit_version_regen,
             preserve_unrepairable,
             commit_fence,
+            namespace_owner,
             retirement,
         } = run;
         trace!(
@@ -983,10 +986,10 @@ impl SetDisks {
         // Bound, not `_`: this guard must live to the end of the scope. A bare
         // `_` would drop it here and release the namespace write lock.
         let _write_lock_guard = if !opts.no_lock && !read_repair_uses_shared_lock {
-            Some(
+            Some(Arc::new(
                 self.acquire_heal_object_lock(bucket, object, version_id, HealObjectLockKind::Write, "heal_object")
                     .await?,
-            )
+            ))
         } else {
             None
         };
@@ -1870,7 +1873,7 @@ impl SetDisks {
                                 )
                                 .await
                             {
-                                Ok(Some(guard)) => Some(guard),
+                                Ok(Some(guard)) => Some(Arc::new(guard)),
                                 Ok(None) => {
                                     let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
                                     return Ok((result, Some(DiskError::Timeout)));
@@ -1891,6 +1894,7 @@ impl SetDisks {
                         let mut rename_attempts = 0usize;
                         let mut rename_successes = 0usize;
                         let mut healed_disks = vec![None; out_dated_disks.len()];
+                        let mut backup_cleanup_owner: Option<Arc<dyn Send + Sync>> = None;
                         for (index, outdated_disk) in out_dated_disks.iter().enumerate() {
                             if let Some(disk) = outdated_disk {
                                 if let Some(scope) = &bucket_heal_scope {
@@ -1956,7 +1960,26 @@ impl SetDisks {
                                                 rustfs_utils::path::encode_dir_object_ref(object),
                                                 disk::STORAGE_FORMAT_FILE_BACKUP,
                                             );
-                                            match disk.delete(bucket, &backup_path, DeleteOptions::default()).await {
+                                            // The syscall can outlive this future; retain the exact-key
+                                            // locks until physical cleanup has finished.
+                                            let cleanup_owner = backup_cleanup_owner.get_or_insert_with(|| {
+                                                Arc::new((
+                                                    namespace_owner.cloned(),
+                                                    _write_lock_guard.clone(),
+                                                    _read_repair_write_lock_guard.clone(),
+                                                    bucket_heal_scope.clone(),
+                                                    self.ctx.begin_namespace_commit(),
+                                                ))
+                                            });
+                                            match disk
+                                                .delete_with_namespace_owner(
+                                                    bucket,
+                                                    &backup_path,
+                                                    DeleteOptions::default(),
+                                                    Some(cleanup_owner.clone()),
+                                                )
+                                                .await
+                                            {
                                                 Ok(()) | Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => {}
                                                 Err(err) => warn!(
                                                     event = EVENT_HEAL_OBJECT_RENAME,
@@ -3421,6 +3444,7 @@ impl SetDisks {
         object: &str,
         source: &crate::disk::DeleteRecoveryVersionIdentity,
         can_commit: &(dyn Fn() -> bool + Sync),
+        namespace_owner: Option<&Arc<dyn Send + Sync>>,
     ) -> disk::error::Result<()> {
         if !can_commit() {
             return Err(DiskError::DiskOngoingReq);
@@ -3466,6 +3490,7 @@ impl SetDisks {
                 allow_regeneration: false,
                 preserve_unrepairable: true,
                 commit_fence: Some(can_commit),
+                namespace_owner,
                 retirement: None,
             },
             &mut None,
@@ -3656,6 +3681,7 @@ impl SetDisks {
         let mut inner_opts = *opts;
         inner_opts.no_lock = true;
         let commit_fence = || !_write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost());
+        let namespace_owner = _write_lock_guard.as_ref().map(|guard| guard.clone() as Arc<dyn Send + Sync>);
         let (result, err) = self
             .heal_object_with_explicit_version_regen(
                 bucket,
@@ -3666,6 +3692,7 @@ impl SetDisks {
                     allow_regeneration: true,
                     preserve_unrepairable: false,
                     commit_fence: Some(&commit_fence),
+                    namespace_owner: namespace_owner.as_ref(),
                     retirement: proof.retirement,
                 },
                 absence,
@@ -3688,6 +3715,7 @@ impl SetDisks {
                                 allow_regeneration: true,
                                 preserve_unrepairable: false,
                                 commit_fence: Some(&commit_fence),
+                                namespace_owner: namespace_owner.as_ref(),
                                 retirement: proof.retirement,
                             },
                             absence,
@@ -3757,6 +3785,7 @@ mod heal_result_report_tests {
     };
     use crate::storage_api_contracts::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
     use crate::storage_api_contracts::heal::HealOperations as _;
+    use crate::storage_api_contracts::namespace::NamespaceLocking as _;
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use crate::{
         config::storageclass,
@@ -5463,6 +5492,119 @@ mod heal_result_report_tests {
         }
     }
 
+    #[cfg(not(windows))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_heal_backup_cleanup_retains_key_owner_until_unlink_finishes() {
+        use crate::disk::os::prepared_publication_test_hooks::{Stage, install_at};
+        use std::time::Duration;
+
+        for mode in ["outer", "inner", "read-repair"] {
+            let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+            let bucket = format!("heal-cleanup-cancel-{mode}");
+            let object = "object";
+            for disk in &disks {
+                disk.make_volume(&bucket).await.expect("create bucket volume");
+            }
+            let options = ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            };
+            set.put_object(&bucket, object, &mut PutObjReader::from_vec(vec![0x11; 592]), &options)
+                .await
+                .expect("write old generation on every disk");
+            let metadata_path = dirs[0].path().join(&bucket).join(object).join(STORAGE_FORMAT_FILE);
+            let old_metadata = tokio::fs::read(&metadata_path).await.expect("save stale replica");
+            let payload = vec![0x22; 592];
+            set.put_object(&bucket, object, &mut PutObjReader::from_vec(payload.clone()), &options)
+                .await
+                .expect("write current generation on every disk");
+            tokio::fs::write(&metadata_path, old_metadata)
+                .await
+                .expect("restore stale target");
+            let rollback_dir = crate::disk::local::inline_metadata_rollback_dir(Uuid::nil(), &rustfs_filemeta::FileMeta::new());
+            let backup_path = disks[0]
+                .get_object_path_for_io_if_local(
+                    &bucket,
+                    &format!("{object}/{rollback_dir}/{}", crate::disk::STORAGE_FORMAT_FILE_BACKUP),
+                )
+                .expect("fixture disk is local")
+                .expect("physical backup path");
+            let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let _hook = install_at(Stage::Remove, &backup_path, move || {
+                let _ = arrived_tx.send(());
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            });
+            let task_set = set.clone();
+            let task_bucket = bucket.clone();
+            let heal = tokio::spawn(async move {
+                let opts = HealOpts {
+                    read_repair: mode == "read-repair",
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                };
+                if mode == "outer" {
+                    let (_, error) = task_set
+                        .heal_object_with_retirement(
+                            &task_bucket,
+                            object,
+                            "",
+                            &opts,
+                            &mut None,
+                            AbsenceProofRequest {
+                                retirement: None,
+                                allow_unversioned: false,
+                            },
+                        )
+                        .await
+                        .expect("production wrapper heal should reach cleanup");
+                    assert!(error.is_none(), "production wrapper heal error: {error:?}");
+                } else {
+                    let (_, error) = task_set
+                        .heal_object(&task_bucket, object, "", &opts)
+                        .await
+                        .expect("inner/read-repair heal should reach cleanup");
+                    assert!(error.is_none(), "inner/read-repair heal error: {error:?}");
+                }
+            });
+            let arrived = tokio::time::timeout(Duration::from_secs(10), arrived_rx).await;
+            if !matches!(arrived, Ok(Ok(()))) {
+                heal.abort();
+                let outcome = heal.await;
+                let _ = release_tx.send(());
+                panic!("{mode}: cleanup must reach the owned physical unlink hook; task: {outcome:?}");
+            }
+            heal.abort();
+            assert!(heal.await.expect_err("heal must be cancelled at the unlink").is_cancelled());
+            assert!(
+                set.ctx.namespace_commits_pending(),
+                "{mode}: physical cleanup must retain namespace ownership"
+            );
+            let namespace = set.new_ns_lock(&bucket, object).await.expect("successor namespace");
+            let mut successor = Box::pin(namespace.get_write_lock(Duration::from_secs(30)));
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), &mut successor).await.is_err(),
+                "{mode}: a successor must not enter while the old unlink is pending"
+            );
+            release_tx.send(()).expect("release physical cleanup");
+            let successor = tokio::time::timeout(Duration::from_secs(10), successor)
+                .await
+                .expect("physical completion should release the key lock")
+                .expect("successor should acquire the released lock");
+            assert!(!backup_path.exists(), "{mode}: owned unlink must finish before releasing the key");
+            drop(successor);
+            let mut reader = set
+                .get_object_reader(&bucket, object, None, Default::default(), &options)
+                .await
+                .expect("committed object remains readable after cancellation");
+            let mut body = Vec::new();
+            tokio::io::copy(&mut reader, &mut body)
+                .await
+                .expect("read full committed body");
+            assert_eq!(body, payload, "{mode}: cancellation must preserve committed data");
+        }
+    }
+
     #[tokio::test]
     async fn heal_reclaims_published_inline_backup_and_preserves_child_key() {
         let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
@@ -5579,6 +5721,7 @@ mod heal_result_report_tests {
                     allow_regeneration: true,
                     preserve_unrepairable: false,
                     commit_fence: Some(&can_commit),
+                    namespace_owner: None,
                     retirement: None,
                 },
                 &mut None,
