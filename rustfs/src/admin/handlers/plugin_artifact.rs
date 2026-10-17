@@ -20,26 +20,26 @@ use uuid::Uuid;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CreateRequest {
+struct BucketIdentityRequest {
     version: u32,
     bucket: String,
     base_prefix: String,
 }
 
-impl CreateRequest {
+impl BucketIdentityRequest {
     fn validate(&self) -> S3Result<()> {
         if self.version != 1
             || crate::storage::ecstore_bucket::utils::check_valid_bucket_name_strict(&self.bucket).is_err()
             || !crate::admin::storage_api::contract::bucket::valid_artifact_base_prefix(&self.base_prefix)
         {
-            return Err(s3_error!(InvalidRequest, "invalid artifact bucket creation request"));
+            return Err(s3_error!(InvalidRequest, "invalid artifact bucket identity request"));
         }
         Ok(())
     }
 }
 
 #[derive(Serialize)]
-struct CreateReceipt {
+struct BucketIdentityReceipt {
     version: u32,
     bucket: String,
     base_prefix: String,
@@ -159,6 +159,11 @@ pub fn register_plugin_artifact_routes(router: &mut S3Router<AdminOperation>) ->
     )?;
     router.insert(
         Method::POST,
+        &format!("{ADMIN_PREFIX}/v3/plugin-artifacts/buckets/inspect"),
+        AdminOperation(&Inspect),
+    )?;
+    router.insert(
+        Method::POST,
         &format!("{ADMIN_PREFIX}/v3/plugin-artifacts/seal-attempt"),
         AdminOperation(&Seal),
     )?;
@@ -175,7 +180,7 @@ struct Create;
 impl Operation for Create {
     async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         require_builtin_authorization().await?;
-        let input: CreateRequest = request_body(&mut req).await?;
+        let input: BucketIdentityRequest = request_body(&mut req).await?;
         input.validate()?;
         let store = request_store(&req)?;
         owner_for_resource(
@@ -194,7 +199,36 @@ impl Operation for Create {
                     }
                     _ => unconfirmed(),
                 })?;
-        response(&CreateReceipt {
+        response(&BucketIdentityReceipt {
+            version: 1,
+            bucket: input.bucket,
+            base_prefix: input.base_prefix,
+            bucket_incarnation: incarnation,
+            versioning_enabled: true,
+        })
+    }
+}
+
+struct Inspect;
+#[async_trait::async_trait]
+impl Operation for Inspect {
+    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        require_builtin_authorization().await?;
+        let input: BucketIdentityRequest = request_body(&mut req).await?;
+        input.validate()?;
+        let store = request_store(&req)?;
+        owner_for_resource(
+            &req,
+            AdminAction::GetPluginArtifactBucketAction,
+            AdminResourceScope::bucket(&input.bucket),
+        )
+        .await?;
+        let incarnation =
+            tokio::time::timeout(Duration::from_secs(30), store.inspect_artifact_bucket(&input.bucket, &input.base_prefix))
+                .await
+                .map_err(|_| unconfirmed())?
+                .map_err(|_| unconfirmed())?;
+        response(&BucketIdentityReceipt {
             version: 1,
             bucket: input.bucket,
             base_prefix: input.base_prefix,
@@ -346,7 +380,7 @@ mod tests {
     async fn plugin_artifact_routes_and_body_limit() {
         let mut router = S3Router::new(false);
         register_plugin_artifact_routes(&mut router).expect("register controls");
-        for path in ["seal-attempt", "retire-version"] {
+        for path in ["buckets", "buckets/inspect", "seal-attempt", "retire-version"] {
             assert!(router.contains_route(Method::POST, &format!("{ADMIN_PREFIX}/v3/plugin-artifacts/{path}")));
         }
         let mut req = S3Request {

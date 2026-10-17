@@ -357,13 +357,30 @@ impl ECStore {
         self.observe_artifact_bucket_incarnation(bucket, base_prefix).await
     }
 
+    /// Observe an existing managed bucket without creating or migrating metadata.
+    /// This identity must still be checked by every subsequent storage operation.
+    pub async fn inspect_artifact_bucket(&self, bucket: &str, base_prefix: &str) -> Result<Uuid> {
+        require_local_put_seal_topology(self).await?;
+        if self.ctx.lock_manager().is_disabled() {
+            return Err(Error::other("artifact bucket inspection requires namespace locking"));
+        }
+        self.observe_artifact_bucket_incarnation(bucket, base_prefix).await
+    }
+
     pub(crate) async fn observe_artifact_bucket_incarnation(&self, bucket: &str, base_prefix: &str) -> Result<Uuid> {
         // The lifecycle read lock prevents replacement during this observation.
         // Metadata is one authoritative snapshot, possibly already cached after
         // a committed write; a cache miss acquires its own metadata locks.
         let lifecycle = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
-        let metadata = metadata_sys::get_bucket_incarnation_metadata_in(&self.ctx, bucket).await?;
+        // Unlike the incarnation getter, get_config never migrates a legacy
+        // identity or completes a pending creation. Fabricated defaults fail
+        // the committed identity checks below.
+        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
+        let sys = sys.read().await.clone();
+        let (metadata, _) = sys.get_config(bucket).await?;
         if metadata.name != bucket
+            || !metadata.bucket_creation_committed
+            || !metadata.bucket_incarnation_sidecar
             || metadata.bucket_incarnation_id.is_nil()
             || metadata.artifact_base_prefix.as_deref() != Some(base_prefix)
             || !metadata.versioning_config.as_ref().is_some_and(|config| {

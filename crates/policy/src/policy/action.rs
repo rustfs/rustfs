@@ -566,6 +566,8 @@ pub enum AdminAction {
     CreatePluginDelegationAction,
     #[strum(serialize = "admin:IssuePluginAttempt")]
     IssuePluginAttemptAction,
+    #[strum(serialize = "admin:GetPluginArtifactBucket")]
+    GetPluginArtifactBucketAction,
     #[strum(serialize = "admin:CreatePluginArtifactBucket")]
     CreatePluginArtifactBucketAction,
     #[strum(serialize = "admin:SealPluginArtifactAttempt")]
@@ -623,6 +625,7 @@ impl AdminAction {
         matches!(
             self,
             Self::CreatePluginArtifactBucketAction
+                | Self::GetPluginArtifactBucketAction
                 | Self::SealPluginArtifactAttemptAction
                 | Self::RetirePluginArtifactVersionAction
         )
@@ -738,6 +741,7 @@ impl AdminAction {
                 | AdminAction::GetTableCredentialsAction
                 | AdminAction::IssuePluginAttemptAction
                 | AdminAction::CreatePluginArtifactBucketAction
+                | AdminAction::GetPluginArtifactBucketAction
                 | AdminAction::SealPluginArtifactAttemptAction
                 | AdminAction::RetirePluginArtifactVersionAction
                 | AdminAction::SubmitPluginJobAction

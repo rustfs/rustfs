@@ -183,10 +183,12 @@ deletion.
 
 ## Controller API
 
-The admin router exposes three SigV4-authenticated POST operations:
+The admin router exposes four SigV4-authenticated POST operations:
 
 - `/rustfs/admin/v3/plugin-artifacts/buckets`, requiring
   `admin:CreatePluginArtifactBucket` on the bucket ARN.
+- `/rustfs/admin/v3/plugin-artifacts/buckets/inspect`, requiring
+  `admin:GetPluginArtifactBucket` on the bucket ARN.
 - `/rustfs/admin/v3/plugin-artifacts/seal-attempt`, requiring
   `admin:SealPluginArtifactAttempt` on the attempt namespace.
 - `/rustfs/admin/v3/plugin-artifacts/retire-version`, requiring
@@ -325,3 +327,39 @@ real lock-disabled instance and verifies no physical bucket is created. Local
 fast-lock guards cannot lose distributed quorum; this local-only profile does
 not claim to inject distributed guard loss. Policy coverage is
 `artifact_bucket_create_resource_requires_exact_bucket_authority`.
+
+
+### Existing bucket identity inspection
+
+POST `/rustfs/admin/v3/plugin-artifacts/buckets/inspect` accepts the same strict
+`version: 1`, `bucket`, and `base_prefix` body as creation. It requires its own
+`admin:GetPluginArtifactBucket` Allow on `arn:aws:s3:::plugin-artifacts`;
+creation permission does not authorize inspection. Original-user and
+request-instance checks are unchanged. An object ARN cannot authorize this
+bucket operation, and explicit Deny still takes precedence.
+
+Inspection requires local storage and namespace locking. Under the lifecycle
+read lock, the existing metadata loader returns one snapshot without performing
+legacy incarnation migration or completing a pending creation. The snapshot
+must have a committed creation, a non-nil sidecar-backed incarnation, the exact
+artifact prefix, and fully enabled versioning without folder or prefix
+exclusions. Ordinary buckets, missing buckets, pending intents and mismatching
+prefixes fail; the query does not create buckets or write metadata. Unsupported
+or unconfirmed storage outcomes return sanitized HTTP 503. They do not mean the
+bucket is absent, safe to recreate, or safe to delete.
+
+The HTTP 200 receipt has the same fields as creation. A restarted controller
+can observe the current managed incarnation without creating another bucket.
+It must compare that identity with its accepted configuration; a matching name
+and prefix do not establish continuity across deletion/recreation. Subsequent
+seal and retirement calls must carry this exact incarnation and revalidate it.
+The response is a current observation, not a permanent seal or GC permission.
+Runner persistence and automatic reconciliation are not implemented by this API.
+
+Three `artifact_bucket_inspect_*` handler tests reuse the real IAM/four-disk
+fixture for identity and recreation, resource and request-instance isolation,
+and rejection without retyping or creation. They dispatch the internal handler,
+not a signed network request. The storage tests reopen the store before reading,
+assert that a real pending intent's bytes stay unchanged, and verify that legacy
+volumes and missing buckets gain no metadata or incarnation records. Namespace
+locking and local-topology rejection are covered independently.

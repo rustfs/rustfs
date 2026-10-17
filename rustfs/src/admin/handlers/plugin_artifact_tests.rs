@@ -443,10 +443,14 @@ async fn artifact_handlers_bind_incarnation_and_request_instance() {
 
 impl Fixture {
     async fn grant_creation(&self, bucket: &str) {
+        self.grant_bucket_action(bucket, "admin:CreatePluginArtifactBucket").await;
+    }
+
+    async fn grant_bucket_action(&self, bucket: &str, action: &str) {
         let policy = Policy::parse_config(
             &serde_json::to_vec(&json!({
                 "Version":"2012-10-17", "Statement":[{
-                    "Effect":"Allow", "Action":"admin:CreatePluginArtifactBucket",
+                    "Effect":"Allow", "Action":action,
                     "Resource":format!("arn:aws:s3:::{bucket}")
                 }]
             }))
@@ -637,5 +641,186 @@ async fn artifact_bucket_create_topology_and_input_fail_closed() {
             .await
             .is_err(),
         "ARTIFACT_CREATE_LOCAL_ONLY"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn artifact_bucket_inspect_current_identity_and_recreation() {
+    let fixture = Fixture::new(prefix()).await;
+    fixture.grant_bucket_action(BUCKET, "admin:GetPluginArtifactBucket").await;
+    let body = json!({"version":1,"bucket":BUCKET,"base_prefix":"outputs/"});
+    let observed = receipt(Inspect.call(fixture.request(&body, Some(USER)), Params::new()).await).await;
+    assert_eq!(observed["bucket_incarnation"], json!(fixture.incarnation));
+    assert_eq!(observed["bucket"], BUCKET);
+    assert_eq!(observed["base_prefix"], "outputs/");
+    assert_eq!(observed["versioning_enabled"], true);
+    assert_eq!(observed["version"], 1);
+    for absent in ["gc_safe", "ordinary_put_sealed", "all_writes_sealed"] {
+        assert!(observed.get(absent).is_none());
+    }
+    fixture
+        .store
+        .delete_bucket(BUCKET, &DeleteBucketOptions::default())
+        .await
+        .expect("delete first generation");
+    let current = fixture
+        .store
+        .clone()
+        .make_artifact_bucket(BUCKET, "outputs/")
+        .await
+        .expect("same-prefix recreation");
+    assert_ne!(current, fixture.incarnation);
+    let observed = receipt(Inspect.call(fixture.request(&body, Some(USER)), Params::new()).await).await;
+    assert_eq!(observed["bucket_incarnation"], json!(current));
+    assert!(
+        fixture
+            .store
+            .clone()
+            .seal_artifact_attempt_puts(BUCKET, fixture.incarnation, &fixture.prefix)
+            .await
+            .is_err()
+    );
+    fixture
+        .store
+        .clone()
+        .seal_artifact_attempt_puts(BUCKET, current, &fixture.prefix)
+        .await
+        .expect("current generation accepted");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn artifact_bucket_inspect_resource_and_instance_isolation() {
+    let first = Fixture::new(prefix()).await;
+    let second = Fixture::new(prefix()).await;
+    let body = json!({"version":1,"bucket":BUCKET,"base_prefix":"outputs/"});
+    first.grant_creation(BUCKET).await;
+    assert_eq!(
+        Inspect
+            .call(first.request(&body, Some(USER)), Params::new())
+            .await
+            .expect_err("create cannot inspect")
+            .code(),
+        &s3s::S3ErrorCode::AccessDenied
+    );
+    first.grant_bucket_action(BUCKET, "admin:GetPluginArtifactBucket").await;
+    second.grant_bucket_action(BUCKET, "admin:GetPluginArtifactBucket").await;
+    let other = "inspect-other-artifacts";
+    let other_id = first
+        .store
+        .clone()
+        .make_artifact_bucket(other, "outputs/")
+        .await
+        .expect("real wrong-bucket identity exists");
+    let wrong = json!({"version":1,"bucket":other,"base_prefix":"outputs/"});
+    // The mutation must reach a real healthy identity read, not a storage failure.
+    let leaked = match Inspect.call(first.request(&wrong, Some(USER)), Params::new()).await {
+        Ok(response) => {
+            let observed = receipt(Ok(response)).await;
+            assert_eq!(observed["bucket_incarnation"], json!(other_id));
+            true
+        }
+        Err(error) => {
+            assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied);
+            false
+        }
+    };
+    assert!(!leaked, "ARTIFACT_INSPECT_RESOURCE");
+    let mut request = first.request(&body, Some(USER));
+    let slot = ServerContextSlot::new();
+    assert!(slot.install(second.context.clone()));
+    request.extensions.insert(slot);
+    let observed = receipt(Inspect.call(request, Params::new()).await).await;
+    assert_eq!(observed["bucket_incarnation"], json!(second.incarnation));
+    assert_ne!(first.incarnation, second.incarnation);
+    for user in [None, Some(ROOT)] {
+        assert_eq!(
+            Inspect
+                .call(first.request(&body, user), Params::new())
+                .await
+                .expect_err("original IAM required")
+                .code(),
+            &s3s::S3ErrorCode::AccessDenied
+        );
+    }
+    let mut unready = first.request(&body, Some(USER));
+    unready.extensions.insert(ServerContextSlot::new());
+    assert_eq!(
+        Inspect
+            .call(unready, Params::new())
+            .await
+            .expect_err("no ambient fallback")
+            .code(),
+        &s3s::S3ErrorCode::ServiceUnavailable
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn artifact_bucket_inspect_rejections_leave_storage_unchanged() {
+    use crate::storage::storage_api::ecstore_bucket::metadata::load_bucket_metadata;
+    let fixture = Fixture::new(prefix()).await;
+    let ordinary = "inspect-ordinary";
+    fixture
+        .store
+        .make_bucket(ordinary, &MakeBucketOptions::default())
+        .await
+        .expect("ordinary bucket");
+    for (bucket, base_prefix) in [(ordinary, "outputs/"), ("inspect-missing", "outputs/"), (BUCKET, "wrong/")] {
+        fixture.grant_bucket_action(bucket, "admin:GetPluginArtifactBucket").await;
+        let body = json!({"version":1,"bucket":bucket,"base_prefix":base_prefix});
+        assert_eq!(
+            Inspect
+                .call(fixture.request(&body, Some(USER)), Params::new())
+                .await
+                .expect_err("not a matching managed bucket")
+                .code(),
+            &s3s::S3ErrorCode::ServiceUnavailable
+        );
+    }
+    let ordinary_metadata = load_bucket_metadata(fixture.store.clone(), ordinary)
+        .await
+        .expect("ordinary unchanged");
+    assert!(ordinary_metadata.artifact_base_prefix.is_none());
+    assert!(ordinary_metadata.versioning_config_xml.is_empty());
+    assert!(
+        fixture
+            .store
+            .get_bucket_info("inspect-missing", &BucketOptions::default())
+            .await
+            .is_err()
+    );
+    assert_eq!(fixture.store.bucket_incarnation_id(BUCKET).await.unwrap(), fixture.incarnation);
+    fixture.grant_bucket_action(BUCKET, "admin:GetPluginArtifactBucket").await;
+    let body = json!({"version":1,"bucket":BUCKET,"base_prefix":"outputs/"});
+    for (key, value) in [
+        ("unknown", json!(true)),
+        ("version", json!(2)),
+        ("base_prefix", json!(null)),
+        ("base_prefix", json!("../")),
+    ] {
+        let mut invalid = body.clone();
+        invalid[key] = value;
+        assert_eq!(
+            Inspect
+                .call(fixture.request(&invalid, Some(USER)), Params::new())
+                .await
+                .expect_err("strict input")
+                .code(),
+            &s3s::S3ErrorCode::InvalidRequest
+        );
+    }
+    fixture
+        .instance
+        .update_erasure_type(crate::storage::storage_api::ecstore_layout::SetupType::DistErasure)
+        .await;
+    assert_eq!(
+        Inspect
+            .call(fixture.request(&body, Some(USER)), Params::new())
+            .await
+            .expect_err("unsupported topology")
+            .code(),
+        &s3s::S3ErrorCode::ServiceUnavailable
     );
 }

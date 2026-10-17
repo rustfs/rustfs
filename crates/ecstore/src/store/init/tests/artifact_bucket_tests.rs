@@ -650,3 +650,104 @@ async fn artifact_bucket_create_requires_namespace_locking_before_creation() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(storage_class_env)]
+async fn artifact_bucket_inspect_reopens_without_migrating_other_buckets() {
+    use crate::config::com::read_config;
+    let root = tempfile::tempdir().expect("inspect storage");
+    let (ctx, store, shutdown) = open_store(root.path()).await;
+    let bucket = "artifact-inspect-reopen";
+    let incarnation = store
+        .clone()
+        .make_artifact_bucket(bucket, PREFIX)
+        .await
+        .expect("managed bucket");
+    let pending = "artifact-inspect-pending";
+    let mut intent = BucketMetadata::new_with_default_durability(pending);
+    intent.artifact_base_prefix = Some(PREFIX.to_owned());
+    intent.versioning_config_xml = ENABLED.to_vec();
+    metadata_sys::set_new_bucket_metadata_intent_in(&ctx, intent)
+        .await
+        .expect("real pending intent");
+    // Physical quorum exists: a migrating reader could silently complete this intent.
+    let legacy = "artifact-inspect-legacy";
+    for disk in store.pools[0].disk_set[0].disk_inventory().await.into_iter().flatten() {
+        for name in [legacy, pending] {
+            disk.make_volume(name).await.expect("real preexisting volume");
+        }
+    }
+    let pending_path = format!("{BUCKET_META_PREFIX}/{pending}/{BUCKET_METADATA_FILE}");
+    let before = read_config(store.clone(), &pending_path).await.expect("pending bytes");
+    drain_before_reopen(&store, &shutdown, bucket).await;
+    drain_before_reopen(&store, &shutdown, pending).await;
+    drop(store);
+    drop(ctx);
+    let (_ctx, store, shutdown) = open_store(root.path()).await;
+    assert_eq!(
+        store
+            .inspect_artifact_bucket(bucket, PREFIX)
+            .await
+            .expect("fresh-instance inspection"),
+        incarnation
+    );
+    for name in [legacy, pending, "artifact-inspect-absent"] {
+        assert!(store.inspect_artifact_bucket(name, PREFIX).await.is_err(), "ARTIFACT_INSPECT_READ_ONLY");
+    }
+    assert_eq!(
+        read_config(store.clone(), &pending_path).await.expect("pending remains"),
+        before,
+        "ARTIFACT_INSPECT_READ_ONLY"
+    );
+    assert!(!persisted(&store, pending).await.bucket_creation_committed);
+    for name in [legacy, "artifact-inspect-absent"] {
+        for file in [BUCKET_METADATA_FILE, BUCKET_INCARNATION_FILE] {
+            let path = format!("{BUCKET_META_PREFIX}/{name}/{file}");
+            assert!(
+                read_config(store.clone(), &path).await.is_err(),
+                "ARTIFACT_INSPECT_READ_ONLY: no migration record"
+            );
+        }
+    }
+    for disk in 0..4 {
+        assert!(
+            !root
+                .path()
+                .join(format!("pool0/set0/disk{disk}/artifact-inspect-absent"))
+                .exists()
+        );
+    }
+    assert!(store.inspect_artifact_bucket(bucket, "wrong/").await.is_err());
+    assert_eq!(store.inspect_artifact_bucket(bucket, PREFIX).await.unwrap(), incarnation);
+    store
+        .ctx
+        .update_erasure_type(crate::layout::endpoints::SetupType::DistErasure)
+        .await;
+    let error = store
+        .inspect_artifact_bucket(bucket, PREFIX)
+        .await
+        .expect_err("remote capability unsupported");
+    assert!(error.to_string().contains("local-only storage"));
+    shutdown.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(storage_class_env)]
+async fn artifact_bucket_inspect_requires_namespace_locking() {
+    temp_env::async_with_vars([("RUSTFS_LOCK_ENABLED", Some("false"))], async {
+        let root = tempfile::tempdir().expect("disabled inspect locking");
+        let (ctx, store, shutdown) = open_store(root.path()).await;
+        assert!(ctx.lock_manager().is_disabled());
+        let error = store
+            .inspect_artifact_bucket("artifact-inspect-no-lock", PREFIX)
+            .await
+            .expect_err("locking required before reading");
+        assert!(
+            error
+                .to_string()
+                .contains("artifact bucket inspection requires namespace locking")
+        );
+        shutdown.cancel();
+    })
+    .await;
+}

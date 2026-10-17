@@ -150,3 +150,19 @@ fn artifact_bucket_create_resource_requires_exact_bucket_authority() {
     assert!(!allowed(not_resource.clone(), action, "artifacts", ""));
     assert!(allowed(not_resource, action, "another", ""));
 }
+
+#[test]
+fn artifact_bucket_inspect_resource_requires_independent_bucket_authority() {
+    let action = "admin:GetPluginArtifactBucket";
+    let scoped = json!({"Effect":"Allow","Action":action,"Resource":"arn:aws:s3:::artifacts"});
+    assert!(allowed(json!([scoped.clone()]), action, "artifacts", ""));
+    assert!(!allowed(json!([scoped.clone()]), action, "another", ""), "ARTIFACT_INSPECT_RESOURCE");
+    for grant in [
+        json!({"Effect":"Allow","Action":action}),
+        json!({"Effect":"Allow","Action":action,"Resource":"arn:aws:s3:::artifacts/*"}),
+        json!({"Effect":"Allow","Action":"admin:CreatePluginArtifactBucket","Resource":"arn:aws:s3:::artifacts"}),
+    ] {
+        assert!(!allowed(json!([grant]), action, "artifacts", ""));
+    }
+    assert!(!allowed(json!([scoped, {"Effect":"Deny","Action":"admin:*"}]), action, "artifacts", ""));
+}
