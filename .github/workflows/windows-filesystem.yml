@@ -19,11 +19,18 @@ on:
     branches: [ main ]
     paths:
       - "crates/ecstore/src/disk/**"
+      - "crates/ecstore/src/layout/**"
       - "crates/ecstore/src/store/init_format.rs"
+      - "crates/ecstore/src/bucket/utils.rs"
       - "crates/ecstore/Cargo.toml"
       - "crates/utils/src/dunce.rs"
       - "crates/utils/src/os/**"
       - "crates/utils/Cargo.toml"
+      - "rustfs/build.rs"
+      - "rustfs/Cargo.toml"
+      - "rustfs/src/main.rs"
+      - "rustfs/src/server/runtime.rs"
+      - "rustfs/src/startup_*.rs"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/actions/setup/**"
@@ -32,11 +39,18 @@ on:
     branches: [ main ]
     paths:
       - "crates/ecstore/src/disk/**"
+      - "crates/ecstore/src/layout/**"
       - "crates/ecstore/src/store/init_format.rs"
+      - "crates/ecstore/src/bucket/utils.rs"
       - "crates/ecstore/Cargo.toml"
       - "crates/utils/src/dunce.rs"
       - "crates/utils/src/os/**"
       - "crates/utils/Cargo.toml"
+      - "rustfs/build.rs"
+      - "rustfs/Cargo.toml"
+      - "rustfs/src/main.rs"
+      - "rustfs/src/server/runtime.rs"
+      - "rustfs/src/startup_*.rs"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/actions/setup/**"
@@ -108,10 +122,93 @@ jobs:
         shell: pwsh
         run: cargo test -p rustfs-ecstore --lib windows_ -- --nocapture
 
+      - name: Test endpoint path parsing
+        shell: pwsh
+        run: "cargo test -p rustfs-ecstore --lib layout::endpoint:: -- --nocapture"
+
       - name: Test startup temporary-directory cleanup
         shell: pwsh
         run: cargo test -p rustfs-ecstore --lib cleanup_tmp_on_startup_ -- --nocapture
 
+      - name: Test object key Windows admission
+        shell: pwsh
+        run: "cargo test -p rustfs-ecstore --lib bucket::utils:: -- --nocapture"
+
+      - name: Test Windows file-name rules
+        shell: pwsh
+        run: "cargo test -p rustfs-utils --no-default-features --features path --lib dunce:: -- --nocapture"
+
       - name: Test fresh format publication
         shell: pwsh
         run: cargo test -p rustfs-ecstore --lib fresh_format_load_initializes_all_disks -- --nocapture
+
+  # The native Windows main thread only gets the 1 MiB PE stack reserve, while
+  # Linux and macOS hand out 8 MiB. Startup runs the whole root future on the
+  # thread that calls `block_on`, so a debug server once overflowed before it
+  # listened on Windows only. Start a real server to keep that covered.
+  startup-smoke:
+    name: Startup Smoke
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: build-x86_64-pc-windows-msvc
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+          install-test-tools: 'false'
+
+      - name: Build debug server binary
+        shell: pwsh
+        run: cargo build --locked -p rustfs --bin rustfs
+
+      - name: Print version
+        shell: pwsh
+        run: |
+          & .\target\debug\rustfs.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "rustfs --version exited with $LASTEXITCODE" }
+
+      - name: Start server and wait for readiness
+        shell: pwsh
+        env:
+          RUSTFS_ACCESS_KEY: rustfsadmin
+          RUSTFS_SECRET_KEY: rustfsadmin
+        run: |
+          $volume = Join-Path $env:RUNNER_TEMP 'rustfs-startup-smoke'
+          $stdout = Join-Path $env:RUNNER_TEMP 'rustfs-startup-smoke.out.log'
+          $stderr = Join-Path $env:RUNNER_TEMP 'rustfs-startup-smoke.err.log'
+          New-Item -ItemType Directory -Force -Path $volume | Out-Null
+          $server = Start-Process -FilePath .\target\debug\rustfs.exe `
+            -ArgumentList @('--address', '127.0.0.1:9000', "`"$volume`"") `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr `
+            -NoNewWindow -PassThru
+          # Cache the process handle now; otherwise ExitCode reads back empty.
+          $null = $server.Handle
+          $ready = $false
+          try {
+            for ($i = 0; $i -lt 180; $i++) {
+              if ($server.HasExited) { break }
+              try {
+                $response = Invoke-WebRequest -Uri 'http://127.0.0.1:9000/health/ready' -UseBasicParsing -NoProxy -TimeoutSec 2
+                if ($response.StatusCode -eq 200) { $ready = $true; break }
+              } catch {}
+              Start-Sleep -Seconds 1
+            }
+          } finally {
+            if (-not $server.HasExited) { Stop-Process -Id $server.Id -Force }
+            $server.WaitForExit()
+            Write-Host '--- server stdout (tail) ---'
+            Get-Content $stdout -Tail 100 -ErrorAction SilentlyContinue
+            Write-Host '--- server stderr (tail) ---'
+            Get-Content $stderr -Tail 100 -ErrorAction SilentlyContinue
+          }
+          if (-not $ready) {
+            throw ("rustfs did not report ready on /health/ready (exit code: {0})" -f $server.ExitCode)
+          }
