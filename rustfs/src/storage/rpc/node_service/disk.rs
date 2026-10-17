@@ -1923,8 +1923,14 @@ impl NodeService {
             data_len,
         );
         if let Some(disk) = target.find_mutation_disk(&request.disk).await {
-            target.reject_legacy_artifact_mutation(&request.volume).await?;
-            match disk.write_all(&request.volume, &request.path, request.data).await {
+            let result = match disk.begin_legacy_file_write(&request.volume).await {
+                Ok(write) => {
+                    target.reject_legacy_artifact_mutation(&request.volume).await?;
+                    write.write_all(&request.path, request.data).await
+                }
+                Err(error) => Err(error),
+            };
+            match result {
                 Ok(_) => Ok(Response::new(WriteAllResponse {
                     success: true,
                     error: None,
@@ -1976,11 +1982,16 @@ impl NodeService {
             data_len,
         );
         if let Some(disk) = target.find_mutation_disk(&request.disk).await {
-            target.reject_legacy_artifact_mutation(&request.volume).await?;
-            match disk
-                .compare_and_update_file(&request.volume, &request.path, request.expected, request.replacement)
-                .await
-            {
+            let result = match disk.begin_legacy_file_write(&request.volume).await {
+                Ok(write) => {
+                    target.reject_legacy_artifact_mutation(&request.volume).await?;
+                    write
+                        .compare_and_update_file(&request.path, request.expected, request.replacement)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            match result {
                 Ok(outcome) => Ok(Response::new(CompareAndUpdateFileResponse {
                     success: true,
                     outcome: match outcome {
@@ -2642,6 +2653,151 @@ mod legacy_artifact_tests {
         request
     }
 
+    async fn service_for(env: &rustfs_test_utils::TestECStoreEnv) -> NodeService {
+        ObjectStore::new(env.ecstore.clone())
+            .save_iam_config(serde_json::json!({"version":1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+            .await
+            .expect("IAM format");
+        let iam = rustfs_iam::build_iam_sys(env.ecstore.clone()).await.expect("fixture IAM");
+        let context = Arc::new(crate::runtime_sources::AppContext::with_default_interfaces(
+            env.ecstore.clone(),
+            iam,
+            Arc::new(KmsServiceManager::new()),
+        ));
+        super::super::make_server_for_context(Some(context))
+    }
+
+    fn cas_request(
+        disk: &str,
+        volume: &str,
+        path: &str,
+        expected: Option<Bytes>,
+        replacement: Option<Bytes>,
+    ) -> Request<CompareAndUpdateFileRequest> {
+        let mut request = Request::new(CompareAndUpdateFileRequest {
+            disk: disk.to_owned(),
+            volume: volume.to_owned(),
+            path: path.to_owned(),
+            expected,
+            replacement,
+        });
+        let body = rustfs_protos::canonical_compare_and_update_file_request_body(request.get_ref()).expect("canonical CAS");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("CAS digest");
+        mark_v2_authenticated(&mut request);
+        request
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_file_receiver_rejects_missing_volume_with_retained_metadata() {
+        let root = tempfile::tempdir().expect("missing volume root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        let bucket = "legacy-missing-volume";
+        env.make_bucket(bucket, false).await;
+        let service = service_for(&env).await;
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let target = service.local_mutation_target();
+        let disk = target.find_mutation_disk(&disk_ref).await.expect("listener local disk");
+        disk.delete_volume(bucket, true).await.expect("remove only target volume");
+        target
+            .reject_legacy_artifact_mutation(bucket)
+            .await
+            .expect("ordinary metadata remains authoritative");
+        assert!(!env.disk_paths[0].join(bucket).exists());
+
+        let write = service
+            .handle_write_all(write_request(&disk_ref, bucket, "nested/object"))
+            .await
+            .expect("write response")
+            .into_inner();
+        assert!(!write.success, "ARTIFACT_LEGACY_MISSING_VOLUME_REJECTED");
+        assert!(!env.disk_paths[0].join(bucket).exists(), "ARTIFACT_LEGACY_MISSING_VOLUME_NOT_RECREATED");
+        let cas = service
+            .handle_compare_and_update_file(cas_request(&disk_ref, bucket, "conditional", None, Some(Bytes::from_static(b"new"))))
+            .await
+            .expect("CAS response")
+            .into_inner();
+        assert!(!cas.success, "missing target volume must also reject CAS");
+        assert!(!env.disk_paths[0].join(bucket).exists(), "CAS cannot recreate the missing volume");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_file_receiver_cas_preserves_ordinary_and_internal_semantics() {
+        let root = tempfile::tempdir().expect("CAS receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("legacy-cas-ordinary", false).await;
+        env.ecstore
+            .clone()
+            .make_artifact_bucket("legacy-cas-managed", "outputs/")
+            .await
+            .expect("managed bucket");
+        let service = service_for(&env).await;
+        let disk = env.disk_paths[0].to_string_lossy().into_owned();
+        let denied = service
+            .handle_compare_and_update_file(cas_request(
+                &disk,
+                "legacy-cas-managed",
+                "blocked",
+                None,
+                Some(Bytes::from_static(b"new")),
+            ))
+            .await
+            .expect_err("managed CAS denied");
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert!(!env.disk_paths[0].join("legacy-cas-managed/blocked").exists());
+
+        for volume in ["legacy-cas-ordinary", ".rustfs.sys"] {
+            for (expected, replacement, outcome) in [
+                (
+                    None,
+                    Some(Bytes::from_static(b"first")),
+                    CompareAndUpdateFileOutcome::CompareAndUpdateFileUpdated,
+                ),
+                (
+                    Some(Bytes::from_static(b"wrong")),
+                    Some(Bytes::from_static(b"wrong")),
+                    CompareAndUpdateFileOutcome::CompareAndUpdateFileMismatch,
+                ),
+                (
+                    Some(Bytes::from_static(b"first")),
+                    Some(Bytes::from_static(b"second")),
+                    CompareAndUpdateFileOutcome::CompareAndUpdateFileUpdated,
+                ),
+                (
+                    Some(Bytes::from_static(b"second")),
+                    None,
+                    CompareAndUpdateFileOutcome::CompareAndUpdateFileUpdated,
+                ),
+            ] {
+                let response = service
+                    .handle_compare_and_update_file(cas_request(&disk, volume, "conditional", expected, replacement.clone()))
+                    .await
+                    .expect("CAS response")
+                    .into_inner();
+                assert!(response.success, "volume={volume}: CAS must retain ordinary behavior");
+                assert_eq!(response.outcome, outcome as i32);
+                let file = env.disk_paths[0].join(volume).join("conditional");
+                let expected = if outcome == CompareAndUpdateFileOutcome::CompareAndUpdateFileMismatch {
+                    Some(Bytes::from_static(b"first"))
+                } else {
+                    replacement
+                };
+                if let Some(expected) = expected {
+                    assert_eq!(tokio::fs::read(file).await.expect("committed bytes"), expected);
+                } else {
+                    assert!(!file.exists(), "conditional deletion must remove the actual file");
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn legacy_artifact_receiver_rejects_managed_but_persists_ordinary_and_internal_writes() {
@@ -2656,17 +2812,7 @@ mod legacy_artifact_tests {
             .make_artifact_bucket("legacy-managed", "outputs/")
             .await
             .expect("managed bucket");
-        ObjectStore::new(env.ecstore.clone())
-            .save_iam_config(serde_json::json!({"version":1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
-            .await
-            .expect("IAM format");
-        let iam = rustfs_iam::build_iam_sys(env.ecstore.clone()).await.expect("fixture IAM");
-        let context = Arc::new(crate::runtime_sources::AppContext::with_default_interfaces(
-            env.ecstore.clone(),
-            iam,
-            Arc::new(KmsServiceManager::new()),
-        ));
-        let service = super::super::make_server_for_context(Some(context));
+        let service = service_for(&env).await;
         let disk = env.disk_paths[0].to_string_lossy().into_owned();
         let denied = service
             .handle_write_all(write_request(&disk, "legacy-managed", "blocked"))
@@ -2692,6 +2838,20 @@ mod legacy_artifact_tests {
             .expect("internal receiver")
             .into_inner();
         assert!(internal.success, "ARTIFACT_LEGACY_RPC_INTERNAL_COMPAT");
+        let internal_volume = ".rustfs.sys/tmp/legacy-created";
+        assert!(!env.disk_paths[0].join(internal_volume).exists());
+        let created = service
+            .handle_write_all(write_request(&disk, internal_volume, "nested/file"))
+            .await
+            .expect("internal on-demand directory response")
+            .into_inner();
+        assert!(created.success, "internal volumes retain on-demand directory creation");
+        assert_eq!(
+            tokio::fs::read(env.disk_paths[0].join(internal_volume).join("nested/file"))
+                .await
+                .expect("internal on-demand bytes"),
+            b"legacy receiver bytes"
+        );
         let mut rename = Request::new(RenameFileRequest {
             disk,
             src_volume: ".rustfs.sys".into(),

@@ -5256,6 +5256,13 @@ async fn build_local_io_backend(root: PathBuf) -> Arc<dyn LocalIoBackend> {
     Arc::new(StdBackend::new(root))
 }
 
+struct LegacyFileWriteOwner {
+    _volume: tokio::sync::OwnedRwLockReadGuard<()>,
+    _permit: crate::disk::io_admission::DiskIoPermit,
+    #[cfg(target_os = "linux")]
+    _mount: Arc<std::fs::File>,
+}
+
 struct VolumeMutationOwner {
     _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
     cache_path: PathBuf,
@@ -5569,6 +5576,188 @@ impl LocalDisk {
 
     fn io_root(&self) -> &Path {
         &self.io_root
+    }
+
+    pub(in crate::disk) async fn compare_and_update_file_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        expected: Option<Bytes>,
+        replacement: Option<Bytes>,
+        owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<ConditionalFileUpdate> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{FlockOperation, flock};
+            use std::io::Write as _;
+
+            let file_path = self.io_get_object_path(volume, path)?;
+            let path = path.to_string();
+            let sync_metadata = effective_durability(volume).syncs_commit_metadata();
+            return Ok(tokio::task::spawn_blocking(move || {
+                let _owner = owner;
+                #[cfg(test)]
+                run_owned_file_write_before_open(&file_path);
+                // A persistent directory lock bounds metadata growth. Removing
+                // per-target lock files can split flock ownership across inodes.
+                let lock_path = file_path
+                    .parent()
+                    .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "conditional file has no parent"))?
+                    .join(".rustfs-cas.lock");
+                let lock = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)
+                    .map_err(DiskError::conditional_file_not_committed)?;
+                flock(&lock, FlockOperation::NonBlockingLockExclusive)
+                    .map_err(std::io::Error::from)
+                    .map_err(DiskError::conditional_file_not_committed)?;
+                let result = (|| {
+                    let current = match std::fs::read(&file_path) {
+                        Ok(current) => Some(current),
+                        Err(err) if err.kind() == ErrorKind::NotFound => None,
+                        Err(err) => return Err(err),
+                    };
+                    let matches = match (&current, &expected) {
+                        (None, None) => true,
+                        (Some(current), Some(expected)) => current.as_slice() == expected.as_ref(),
+                        _ => false,
+                    };
+                    if !matches {
+                        return Ok(match current {
+                            None => ConditionalFileUpdate::Missing,
+                            Some(_) => ConditionalFileUpdate::Mismatch,
+                        });
+                    }
+
+                    let rollback_after_fsync_failure = |parent: &Path, current: Option<&[u8]>| -> std::io::Result<()> {
+                        match current {
+                            Some(previous) => {
+                                let rollback_temporary =
+                                    parent.join(format!(".{}.{}.rollback.tmp", path.replace('/', "_"), Uuid::new_v4()));
+                                let rollback_result = (|| -> std::io::Result<()> {
+                                    let mut staged = std::fs::OpenOptions::new()
+                                        .create_new(true)
+                                        .write(true)
+                                        .open(&rollback_temporary)?;
+                                    staged.write_all(previous)?;
+                                    staged.sync_all()?;
+                                    std::fs::rename(&rollback_temporary, &file_path)
+                                })();
+                                if let Err(err) = rollback_result {
+                                    let _ = std::fs::remove_file(&rollback_temporary);
+                                    return Err(err);
+                                }
+                            }
+                            None => match std::fs::remove_file(&file_path) {
+                                Ok(()) => {}
+                                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                                Err(err) => return Err(err),
+                            },
+                        }
+                        os::fsync_dir_std(parent)
+                    };
+
+                    match replacement {
+                        Some(replacement) => {
+                            let parent = file_path
+                                .parent()
+                                .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "conditional file has no parent"))?;
+                            let temporary = parent.join(format!(".{}.{}.tmp", path.replace('/', "_"), Uuid::new_v4()));
+                            let write_result = (|| -> std::io::Result<()> {
+                                let not_committed = DiskError::conditional_file_not_committed;
+                                let mut staged = std::fs::OpenOptions::new()
+                                    .create_new(true)
+                                    .write(true)
+                                    .open(&temporary)
+                                    .map_err(not_committed)?;
+                                staged.write_all(&replacement).map_err(not_committed)?;
+                                if sync_metadata {
+                                    staged.sync_all().map_err(not_committed)?;
+                                }
+                                std::fs::rename(&temporary, &file_path)?;
+                                Ok(())
+                            })();
+                            if let Err(err) = write_result {
+                                let _ = std::fs::remove_file(&temporary);
+                                return Err(err);
+                            }
+                            if sync_metadata && let Err(err) = os::fsync_dir_std(parent) {
+                                rollback_after_fsync_failure(parent, current.as_deref())?;
+                                return Err(err);
+                            }
+                        }
+                        None => {
+                            std::fs::remove_file(&file_path)?;
+                            if sync_metadata
+                                && let Some(parent) = file_path.parent()
+                                && let Err(err) = os::fsync_dir_std(parent)
+                            {
+                                rollback_after_fsync_failure(parent, current.as_deref())?;
+                                return Err(err);
+                            }
+                        }
+                    }
+                    Ok(ConditionalFileUpdate::Updated)
+                })();
+                let _ = flock(&lock, FlockOperation::Unlock);
+                result
+            })
+            .await
+            .map_err(DiskError::from)??);
+        }
+
+        #[cfg(windows)]
+        {
+            let file_path = self.io_get_object_path(volume, path)?;
+            let sync_metadata = effective_durability(volume).syncs_commit_metadata();
+            let publication_root = self.publication_root.clone();
+            return Ok(tokio::task::spawn_blocking(move || {
+                let _owner = owner;
+                #[cfg(test)]
+                run_owned_file_write_before_open(&file_path);
+                os::compare_and_update_control_file(
+                    &file_path,
+                    expected.as_deref(),
+                    replacement.as_deref(),
+                    sync_metadata,
+                    &publication_root,
+                )
+            })
+            .await
+            .map_err(DiskError::from)??);
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (volume, path, expected, replacement, owner);
+            Err(DiskError::MethodNotAllowed)
+        }
+    }
+
+    pub(in crate::disk) async fn begin_legacy_file_write(
+        &self,
+        volume: &str,
+        permit: crate::disk::io_admission::DiskIoPermit,
+    ) -> Result<Arc<dyn Send + Sync>> {
+        let path = self.io_get_bucket_path(volume)?;
+        // This receiver-local lock never reacquires the coordinator lifecycle
+        // lock. The caller carries this exact owner through classification.
+        let guard = os::disk_volume_mutation_lock(&self.root, volume).read_owned().await;
+        if !skip_access_checks(volume) {
+            let metadata = fs::symlink_metadata(path).await.map_err(to_volume_error)?;
+            if !metadata.is_dir() {
+                return Err(DiskError::VolumeNotFound);
+            }
+        }
+        Ok(Arc::new(LegacyFileWriteOwner {
+            _volume: guard,
+            _permit: permit,
+            #[cfg(target_os = "linux")]
+            _mount: self.mount_lease.clone(),
+        }))
     }
 
     fn volume_mutation_owner(
@@ -8035,6 +8224,16 @@ impl LocalDisk {
 
     // write_all_public for trail
     async fn write_all_public(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
+        self.write_all_with_namespace_owner(volume, path, data, None).await
+    }
+
+    pub(in crate::disk) async fn write_all_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        data: Bytes,
+        owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
         if volume == RUSTFS_META_BUCKET && path == super::FORMAT_CONFIG_FILE {
             let mut format_info = self.format_info.write().await;
             format_info.data.clone_from(&data);
@@ -8051,18 +8250,26 @@ impl LocalDisk {
         } else {
             SyncMode::None
         };
-        self.write_all_private(volume, path, data, sync, &volume_dir).await?;
+        self.write_all_private(volume, path, data, sync, &volume_dir, owner).await?;
 
         Ok(())
     }
 
     // write_all_private with check_path_length
     #[tracing::instrument(level = "trace", skip_all)]
-    async fn write_all_private(&self, volume: &str, path: &str, buf: Bytes, sync: SyncMode, skip_parent: &Path) -> Result<()> {
+    async fn write_all_private(
+        &self,
+        volume: &str,
+        path: &str,
+        buf: Bytes,
+        sync: SyncMode,
+        skip_parent: &Path,
+        owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
         let file_path = self.io_get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
-        self.write_all_internal(&file_path, InternalBuf::Owned(buf), sync, skip_parent)
+        self.write_all_internal_with_owner(&file_path, InternalBuf::Owned(buf), sync, skip_parent, owner)
             .await?;
 
         Ok(())
@@ -8077,6 +8284,24 @@ impl LocalDisk {
         sync: SyncMode,
         skip_parent: &Path,
     ) -> Result<()> {
+        self.write_all_internal_with_owner(file_path, data, sync, skip_parent, None)
+            .await
+    }
+
+    async fn write_all_internal_with_owner(
+        &self,
+        file_path: &Path,
+        data: InternalBuf<'_>,
+        sync: SyncMode,
+        skip_parent: &Path,
+        owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        // An owned caller must not hand a borrowed buffer to tokio::fs jobs
+        // whose completion can outlive its future.
+        let data = match data {
+            InternalBuf::Ref(buf) if owner.is_some() => InternalBuf::Owned(Bytes::copy_from_slice(buf)),
+            data => data,
+        };
         let skip_parent = if skip_parent.as_os_str().is_empty() {
             self.io_root()
         } else {
@@ -8104,10 +8329,15 @@ impl LocalDisk {
                 if let Some(parent) = path.parent()
                     && parent != skip_parent
                 {
-                    os::make_dir_all(parent, skip_parent).await?;
+                    if let Some(owner) = &owner {
+                        os::make_dir_all_with_owner(parent, skip_parent, owner.clone()).await?;
+                    } else {
+                        os::make_dir_all(parent, skip_parent).await?;
+                    }
                 }
 
                 tokio::task::spawn_blocking(move || {
+                    let _owner = owner;
                     #[cfg(test)]
                     run_owned_file_write_before_open(&path);
 
@@ -9877,149 +10107,8 @@ impl DiskAPI for LocalDisk {
         expected: Option<Bytes>,
         replacement: Option<Bytes>,
     ) -> Result<ConditionalFileUpdate> {
-        #[cfg(unix)]
-        {
-            use rustix::fs::{FlockOperation, flock};
-            use std::io::Write as _;
-
-            let file_path = self.io_get_object_path(volume, path)?;
-            let path = path.to_string();
-            let sync_metadata = effective_durability(volume).syncs_commit_metadata();
-            return Ok(tokio::task::spawn_blocking(move || {
-                // A persistent directory lock bounds metadata growth. Removing
-                // per-target lock files can split flock ownership across inodes.
-                let lock_path = file_path
-                    .parent()
-                    .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "conditional file has no parent"))?
-                    .join(".rustfs-cas.lock");
-                let lock = std::fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .read(true)
-                    .write(true)
-                    .open(&lock_path)
-                    .map_err(DiskError::conditional_file_not_committed)?;
-                flock(&lock, FlockOperation::NonBlockingLockExclusive)
-                    .map_err(std::io::Error::from)
-                    .map_err(DiskError::conditional_file_not_committed)?;
-                let result = (|| {
-                    let current = match std::fs::read(&file_path) {
-                        Ok(current) => Some(current),
-                        Err(err) if err.kind() == ErrorKind::NotFound => None,
-                        Err(err) => return Err(err),
-                    };
-                    let matches = match (&current, &expected) {
-                        (None, None) => true,
-                        (Some(current), Some(expected)) => current.as_slice() == expected.as_ref(),
-                        _ => false,
-                    };
-                    if !matches {
-                        return Ok(match current {
-                            None => ConditionalFileUpdate::Missing,
-                            Some(_) => ConditionalFileUpdate::Mismatch,
-                        });
-                    }
-
-                    let rollback_after_fsync_failure = |parent: &Path, current: Option<&[u8]>| -> std::io::Result<()> {
-                        match current {
-                            Some(previous) => {
-                                let rollback_temporary =
-                                    parent.join(format!(".{}.{}.rollback.tmp", path.replace('/', "_"), Uuid::new_v4()));
-                                let rollback_result = (|| -> std::io::Result<()> {
-                                    let mut staged = std::fs::OpenOptions::new()
-                                        .create_new(true)
-                                        .write(true)
-                                        .open(&rollback_temporary)?;
-                                    staged.write_all(previous)?;
-                                    staged.sync_all()?;
-                                    std::fs::rename(&rollback_temporary, &file_path)
-                                })();
-                                if let Err(err) = rollback_result {
-                                    let _ = std::fs::remove_file(&rollback_temporary);
-                                    return Err(err);
-                                }
-                            }
-                            None => match std::fs::remove_file(&file_path) {
-                                Ok(()) => {}
-                                Err(err) if err.kind() == ErrorKind::NotFound => {}
-                                Err(err) => return Err(err),
-                            },
-                        }
-                        os::fsync_dir_std(parent)
-                    };
-
-                    match replacement {
-                        Some(replacement) => {
-                            let parent = file_path
-                                .parent()
-                                .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "conditional file has no parent"))?;
-                            let temporary = parent.join(format!(".{}.{}.tmp", path.replace('/', "_"), Uuid::new_v4()));
-                            let write_result = (|| -> std::io::Result<()> {
-                                let not_committed = DiskError::conditional_file_not_committed;
-                                let mut staged = std::fs::OpenOptions::new()
-                                    .create_new(true)
-                                    .write(true)
-                                    .open(&temporary)
-                                    .map_err(not_committed)?;
-                                staged.write_all(&replacement).map_err(not_committed)?;
-                                if sync_metadata {
-                                    staged.sync_all().map_err(not_committed)?;
-                                }
-                                std::fs::rename(&temporary, &file_path)?;
-                                Ok(())
-                            })();
-                            if let Err(err) = write_result {
-                                let _ = std::fs::remove_file(&temporary);
-                                return Err(err);
-                            }
-                            if sync_metadata && let Err(err) = os::fsync_dir_std(parent) {
-                                rollback_after_fsync_failure(parent, current.as_deref())?;
-                                return Err(err);
-                            }
-                        }
-                        None => {
-                            std::fs::remove_file(&file_path)?;
-                            if sync_metadata
-                                && let Some(parent) = file_path.parent()
-                                && let Err(err) = os::fsync_dir_std(parent)
-                            {
-                                rollback_after_fsync_failure(parent, current.as_deref())?;
-                                return Err(err);
-                            }
-                        }
-                    }
-                    Ok(ConditionalFileUpdate::Updated)
-                })();
-                let _ = flock(&lock, FlockOperation::Unlock);
-                result
-            })
+        self.compare_and_update_file_with_namespace_owner(volume, path, expected, replacement, None)
             .await
-            .map_err(DiskError::from)??);
-        }
-
-        #[cfg(windows)]
-        {
-            let file_path = self.io_get_object_path(volume, path)?;
-            let sync_metadata = effective_durability(volume).syncs_commit_metadata();
-            let publication_root = self.publication_root.clone();
-            return Ok(tokio::task::spawn_blocking(move || {
-                os::compare_and_update_control_file(
-                    &file_path,
-                    expected.as_deref(),
-                    replacement.as_deref(),
-                    sync_metadata,
-                    &publication_root,
-                )
-            })
-            .await
-            .map_err(DiskError::from)??);
-        }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = (volume, path, expected, replacement);
-            Err(DiskError::MethodNotAllowed)
-        }
     }
 
     fn has_replacement_mount_lease(&self) -> bool {
@@ -22218,6 +22307,122 @@ mod test {
             .await
             .expect("operation should succeed");
         let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_file_write_rejects_missing_volume_before_parent_creation() {
+        let root = tempfile::tempdir().expect("missing legacy volume root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("local endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        let volume = "legacy-missing-volume";
+        disk.make_volume(volume).await.expect("create original volume");
+        disk.delete_volume(volume, true).await.expect("delete original volume");
+        let wrapper = crate::disk::disk_store::LocalDiskWrapper::new(disk, false);
+        let result = match wrapper.begin_legacy_file_write(volume).await {
+            Ok(write) => write.write_all("nested/object", Bytes::from_static(b"late write")).await,
+            Err(error) => Err(error),
+        };
+        assert_eq!(result, Err(DiskError::VolumeNotFound), "LEGACY_FILE_MISSING_VOLUME_ADMISSION");
+        assert!(!root.path().join(volume).exists(), "late write must not recreate the deleted volume");
+    }
+
+    #[cfg(unix)]
+    async fn assert_legacy_file_write_physical_owner(mode: &str, cancel: bool) {
+        use crate::disk::disk_store::{LocalDiskWrapper, get_max_timeout_duration};
+        let root = tempfile::tempdir().expect("legacy file owner root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("local endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        let volume = "legacy-file-owner";
+        disk.make_volume(volume).await.expect("existing ordinary volume");
+        let path = if mode == "mkdir" { "new-parent/file" } else { "file" };
+        let physical = disk.io_get_object_path(volume, path).expect("physical file path");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let pause = move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        };
+        let _mkdir_hook = if mode == "mkdir" {
+            Some(volume_mutation_test_hooks::install(
+                volume_mutation_test_hooks::Stage::Create,
+                physical.parent().expect("missing parent"),
+                pause,
+            ))
+        } else {
+            set_owned_file_write_before_open(&physical, pause);
+            None
+        };
+        let token = LocalDiskWrapper::new(disk.clone(), false)
+            .begin_legacy_file_write(volume)
+            .await
+            .expect("admit existing volume");
+        let cas = mode == "cas";
+        let mutation = tokio::spawn(async move {
+            if cas {
+                token
+                    .compare_and_update_file(path, None, Some(Bytes::from_static(b"old admitted tail")))
+                    .await
+                    .map(|_| ())
+            } else {
+                token.write_all(path, Bytes::from_static(b"old admitted tail")).await
+            }
+        });
+        timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("actual file worker starts")
+            .expect("worker entered");
+        if cancel {
+            mutation.abort();
+            assert!(mutation.await.expect_err("cancel outer mutation").is_cancelled());
+        } else {
+            tokio::time::pause();
+            tokio::time::advance(get_max_timeout_duration() + Duration::from_secs(1)).await;
+            tokio::time::resume();
+            assert_eq!(
+                timeout(Duration::from_secs(5), mutation)
+                    .await
+                    .expect("outer deadline returns")
+                    .expect("mutation task"),
+                Err(DiskError::Timeout),
+            );
+        }
+        // The token was dropped with its caller. Only the real worker can
+        // still keep this read owner and prevent physical bucket replacement.
+        let held = os::disk_volume_mutation_lock(&disk.root, volume).try_write_owned().is_err();
+        let mut deletion = Box::pin(disk.delete_volume(volume, true));
+        let blocked = matches!(futures::poll!(deletion.as_mut()), Poll::Pending);
+        drop(release_tx);
+        let deleted = timeout(Duration::from_secs(5), deletion).await;
+        assert!(held, "{mode}, cancel={cancel}: physical file worker lost its read owner");
+        assert!(blocked, "{mode}, cancel={cancel}: deletion passed the physical file worker");
+        deleted
+            .expect("bucket deletion drains after worker")
+            .expect("delete old volume");
+        disk.make_volume(volume).await.expect("recreate volume after physical drain");
+        let replacement = root.path().join(volume).join("new-generation");
+        fs::write(&replacement, b"new generation")
+            .await
+            .expect("write replacement generation");
+        assert_eq!(
+            fs::read(replacement).await.expect("old worker cannot alter replacement"),
+            b"new generation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_file_write_cancellation_retains_volume_admission_through_physical_workers() {
+        for mode in ["write", "mkdir", "cas"] {
+            assert_legacy_file_write_physical_owner(mode, true).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_file_write_timeout_retains_volume_admission_through_physical_workers() {
+        for mode in ["write", "mkdir", "cas"] {
+            assert_legacy_file_write_physical_owner(mode, false).await;
+        }
     }
 
     #[cfg(unix)]

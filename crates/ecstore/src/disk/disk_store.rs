@@ -1464,7 +1464,86 @@ pub struct LocalDiskWrapper {
     timeout_health_policy: TimeoutHealthPolicy,
 }
 
+/// A receiver-local admission bound to one disk and volume. Its physical
+/// workers retain the same read owner after the RPC waiter is cancelled.
+pub struct LegacyFileWrite {
+    disk: LocalDiskWrapper,
+    volume: String,
+    owner: Arc<dyn Send + Sync>,
+    permit: crate::disk::io_admission::DiskIoPermit,
+}
+
+impl std::fmt::Debug for LegacyFileWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LegacyFileWrite")
+            .field("volume", &self.volume)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LegacyFileWrite {
+    pub async fn write_all(&self, path: &str, data: Bytes) -> Result<()> {
+        crate::disk::io_admission::with_disk_io_permit(
+            Some(self.permit.clone()),
+            self.disk.track_disk_health_mutation(
+                "write_all",
+                DiskMetricMutation::Write,
+                || async {
+                    self.disk
+                        .disk
+                        .write_all_with_namespace_owner(&self.volume, path, data, Some(self.owner.clone()))
+                        .await
+                },
+                get_max_timeout_duration(),
+            ),
+        )
+        .await
+    }
+
+    pub async fn compare_and_update_file(
+        &self,
+        path: &str,
+        expected: Option<Bytes>,
+        replacement: Option<Bytes>,
+    ) -> Result<crate::disk::ConditionalFileUpdate> {
+        crate::disk::io_admission::with_disk_io_permit(
+            Some(self.permit.clone()),
+            self.disk.track_disk_health_mutation(
+                "compare_and_update_file",
+                DiskMetricMutation::Write,
+                || async {
+                    self.disk
+                        .disk
+                        .compare_and_update_file_with_namespace_owner(
+                            &self.volume,
+                            path,
+                            expected,
+                            replacement,
+                            Some(self.owner.clone()),
+                        )
+                        .await
+                },
+                get_max_timeout_duration(),
+            ),
+        )
+        .await
+    }
+}
+
 impl LocalDiskWrapper {
+    pub(in crate::disk) async fn begin_legacy_file_write(&self, volume: &str) -> Result<LegacyFileWrite> {
+        // Wire file mutations are foreground I/O; do not recursively enter a
+        // background admission while classification reads bucket metadata.
+        let permit = self.io_admission.foreground();
+        let owner = self.disk.begin_legacy_file_write(volume, permit.clone()).await?;
+        Ok(LegacyFileWrite {
+            disk: self.clone(),
+            volume: volume.to_owned(),
+            owner,
+            permit,
+        })
+    }
+
     pub async fn acquire_artifact_put_lease(&self, key: [u8; 32]) -> Result<Arc<super::local::ArtifactPutLease>> {
         self.disk.acquire_artifact_put_lease(key).await
     }

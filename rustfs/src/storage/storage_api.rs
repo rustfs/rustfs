@@ -1450,14 +1450,6 @@ pub(crate) trait StorageDiskRpcExt {
     async fn check_parts(&self, volume: &str, path: &str, file_info: &rustfs_filemeta::FileInfo) -> DiskResult<CheckPartsResp>;
     async fn read_parts(&self, bucket: &str, paths: &[String]) -> DiskResult<Vec<ObjectPartInfo>>;
     async fn walk_dir<W: tokio::io::AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> DiskResult<()>;
-    async fn write_all(&self, volume: &str, path: &str, data: bytes::Bytes) -> DiskResult<()>;
-    async fn compare_and_update_file(
-        &self,
-        volume: &str,
-        path: &str,
-        expected: Option<bytes::Bytes>,
-        replacement: Option<bytes::Bytes>,
-    ) -> DiskResult<ConditionalFileUpdate>;
     async fn read_all(&self, volume: &str, path: &str) -> DiskResult<bytes::Bytes>;
     async fn append_file(&self, volume: &str, path: &str) -> DiskResult<FileWriter>;
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: i64) -> DiskResult<FileWriter>;
@@ -1638,20 +1630,6 @@ where
 
     async fn walk_dir<W: tokio::io::AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> DiskResult<()> {
         ecstore_disk::DiskAPI::walk_dir(self, opts, wr).await
-    }
-
-    async fn write_all(&self, volume: &str, path: &str, data: bytes::Bytes) -> DiskResult<()> {
-        ecstore_disk::DiskAPI::write_all(self, volume, path, data).await
-    }
-
-    async fn compare_and_update_file(
-        &self,
-        volume: &str,
-        path: &str,
-        expected: Option<bytes::Bytes>,
-        replacement: Option<bytes::Bytes>,
-    ) -> DiskResult<ConditionalFileUpdate> {
-        ecstore_disk::DiskAPI::compare_and_update_file(self, volume, path, expected, replacement).await
     }
 
     async fn read_all(&self, volume: &str, path: &str) -> DiskResult<bytes::Bytes> {

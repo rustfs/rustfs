@@ -35,6 +35,14 @@ the lock. Linux workers also retain the original mount descriptor; Windows
 directory deletion closes its handle before releasing the owner. This local
 ordering does not establish the distributed legacy-write admission boundary.
 
+The legacy `WriteAll` and `CompareAndUpdateFile` receivers take a disk-bound
+volume read owner before reading authoritative bucket metadata. Ordinary buckets
+must still have a live directory on that disk; retained metadata cannot recreate
+a missing volume. Their filesystem workers keep the owner through completion,
+even after cancellation. Internal volumes retain on-demand directory creation.
+Other legacy mutation routes and internal metadata publication still need their
+own admission boundary before distributed artifact sealing can be enabled.
+
 ## Persistence and versioning
 
 `BucketMetadata` in `crates/ecstore/src/bucket/metadata.rs` stores the prefix in

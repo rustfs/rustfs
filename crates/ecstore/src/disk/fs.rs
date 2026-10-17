@@ -159,10 +159,6 @@ pub fn lstat_std(path: impl AsRef<Path>) -> io::Result<Metadata> {
     std::fs::symlink_metadata(path)
 }
 
-pub async fn make_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
-    fs::create_dir_all(path.as_ref()).await
-}
-
 fn is_dir_error(e: &io::Error) -> bool {
     e.raw_os_error() == Some(libc::EISDIR)
         || e.kind() == io::ErrorKind::IsADirectory
@@ -208,10 +204,6 @@ pub fn remove_all_std(path: impl AsRef<Path>) -> io::Result<()> {
     } else {
         std::fs::remove_file(path)
     }
-}
-
-pub async fn mkdir(path: impl AsRef<Path>) -> io::Result<()> {
-    fs::create_dir(path.as_ref()).await
 }
 
 pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
@@ -479,17 +471,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_make_dir_all() {
-        let temp_dir = TempDir::new().unwrap();
-        let nested_path = temp_dir.path().join("level1").join("level2").join("level3");
-
-        // Should create nested directories
-        assert!(make_dir_all(&nested_path).await.is_ok());
-        assert!(nested_path.exists());
-        assert!(nested_path.is_dir());
-    }
-
-    #[tokio::test]
     async fn test_remove_file() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test_remove.txt");
@@ -559,17 +540,6 @@ mod tests {
         // Remove all
         assert!(remove_all_std(&dir_path).is_ok());
         assert!(!dir_path.exists());
-    }
-
-    #[tokio::test]
-    async fn test_mkdir() {
-        let temp_dir = TempDir::new().unwrap();
-        let dir_path = temp_dir.path().join("test_mkdir");
-
-        // Create directory
-        assert!(mkdir(&dir_path).await.is_ok());
-        assert!(dir_path.exists());
-        assert!(dir_path.is_dir());
     }
 
     #[tokio::test]

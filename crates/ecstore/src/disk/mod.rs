@@ -63,6 +63,7 @@ pub fn part_transaction_path(part_path: &str) -> String {
 use crate::cluster::rpc::RemoteDisk;
 use crate::cluster::rpc::build_internode_data_transport_from_env;
 use crate::disk::disk_store::DiskStoreRenameDataExt;
+pub use crate::disk::disk_store::LegacyFileWrite;
 use crate::disk::disk_store::LocalDiskWrapper;
 use crate::disk::health_state::RuntimeDriveHealthState;
 use crate::disk::local::ScanGuard;
@@ -231,6 +232,14 @@ pub enum Disk {
 }
 
 impl Disk {
+    /// Capture local file-write admission before authoritative classification.
+    pub async fn begin_legacy_file_write(&self, volume: &str) -> Result<LegacyFileWrite> {
+        match self {
+            Self::Local(disk) => disk.begin_legacy_file_write(volume).await,
+            Self::Remote(_) => Err(DiskError::DiskNotFound),
+        }
+    }
+
     pub(crate) async fn set_disk_id_state(&self, id: Option<Uuid>) -> Result<()> {
         match self {
             Disk::Local(local_disk) => {
