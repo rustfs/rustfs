@@ -43,10 +43,10 @@ use super::super::{
     EVENT_SET_DISK_RENAME_TAIL_DRAIN_FAILED, EVENT_SET_DISK_WRITE, Error, FileInfo, FileMeta, FileMetaShallowVersion,
     GetCodecStreamingFallbackReason, GetObjectMetadataCacheEntry, HTTPPreconditions, HashAlgorithm, HealAdmissionResult,
     HealChannelPriority, HealRequestSource, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, MultipartWriteQuorumContext,
-    OBJECT_OP_IGNORED_ERRS, ObjectOptions, ObjectPartInfo, OffsetDateTime, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET,
-    RawFileInfo, ReadMultipleReq, ReadMultipleResp, Result, SLASH_SEPARATOR, STORAGE_FORMAT_FILE, SetDisks, SnapshotLeaseToken,
-    StorageError, UpdateMetadataOpts, Uuid, capacity_scope_from_disks, current_dirty_generation, debug, disk,
-    file_info_is_valid_for_metadata, info, is_object_dangling, issue3031_diag_enabled, join_all, join_errs,
+    OBJECT_OP_IGNORED_ERRS, ObjectInfo, ObjectOptions, ObjectPartInfo, OffsetDateTime, RUSTFS_META_BUCKET,
+    RUSTFS_META_MULTIPART_BUCKET, RawFileInfo, ReadMultipleReq, ReadMultipleResp, Result, SLASH_SEPARATOR, STORAGE_FORMAT_FILE,
+    SetDisks, SnapshotLeaseToken, StorageError, UpdateMetadataOpts, Uuid, capacity_scope_from_disks, current_dirty_generation,
+    debug, disk, file_info_is_valid_for_metadata, info, is_object_dangling, issue3031_diag_enabled, join_all, join_errs,
     log_multipart_write_quorum_failure, merge_file_meta_versions, path_join_buf, record_global_dirty_scope,
     reduce_read_quorum_errs, reduce_write_quorum_errs, send_heal_request_with_admission, should_prevent_write, to_object_err,
     warn,
@@ -6402,6 +6402,45 @@ impl SetDisks {
         }
     }
 
+    pub(crate) fn evaluate_write_precondition(
+        oi: Result<ObjectInfo>,
+        http_preconditions: &HTTPPreconditions,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Option<StorageError> {
+        match oi {
+            Ok(oi) => {
+                // Ordinary writes may proceed past a top-level delete marker;
+                // data movement and guarded internal writes must preserve it.
+                if oi.delete_marker {
+                    if opts.data_movement || opts.preserve_delete_marker {
+                        return Some(StorageError::PreconditionFailed);
+                    }
+                    return Self::write_precondition_lookup_error(
+                        StorageError::ObjectNotFound(bucket.to_string(), object.to_string()),
+                        http_preconditions,
+                        bucket,
+                        object,
+                    );
+                }
+                let if_none_match = http_preconditions.if_none_match_value().map(str::to_owned);
+                let if_match = http_preconditions.if_match_value().map(str::to_owned);
+                if should_prevent_write(&oi, if_none_match, if_match)
+                    && !crate::data_movement::can_replace_stale_data_movement_target(&oi, opts)
+                {
+                    return Some(StorageError::PreconditionFailed);
+                }
+            }
+
+            Err(error) => {
+                return Self::write_precondition_lookup_error(error, http_preconditions, bucket, object);
+            }
+        }
+
+        None
+    }
+
     pub(in crate::set_disk) async fn check_write_precondition(
         &self,
         bucket: &str,
@@ -6429,29 +6468,7 @@ impl SetDisks {
             },
         );
         let oi = lookup.await;
-
-        match oi {
-            Ok(oi) => {
-                // Ordinary writes may proceed past a top-level delete marker;
-                // data movement and guarded internal writes must preserve it.
-                if oi.delete_marker {
-                    return (opts.data_movement || opts.preserve_delete_marker).then_some(StorageError::PreconditionFailed);
-                }
-                let if_none_match = http_preconditions.if_none_match_value().map(str::to_owned);
-                let if_match = http_preconditions.if_match_value().map(str::to_owned);
-                if should_prevent_write(&oi, if_none_match, if_match)
-                    && !crate::data_movement::can_replace_stale_data_movement_target(&oi, opts)
-                {
-                    return Some(StorageError::PreconditionFailed);
-                }
-            }
-
-            Err(error) => {
-                return Self::write_precondition_lookup_error(error, &http_preconditions, bucket, object);
-            }
-        }
-
-        None
+        Self::evaluate_write_precondition(oi, &http_preconditions, bucket, object, opts)
     }
 }
 
