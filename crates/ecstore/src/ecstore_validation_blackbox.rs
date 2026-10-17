@@ -153,10 +153,22 @@ async fn refresh_loss_lock_client_keeps_rejection_observable_for_late_waiters() 
     );
 }
 
-/// Returns the backing [`tempfile::TempDir`]s alongside the set so callers keep
-/// them alive for the test's duration and the directories are removed on drop.
-pub(crate) async fn make_local_set_disks(drive_count: usize, parity_count: usize) -> (Vec<tempfile::TempDir>, Arc<SetDisks>) {
-    make_local_set_disks_with_ctx(drive_count, parity_count, crate::runtime::instance::bootstrap_ctx()).await
+/// Keep the real metadata owner and backing directories alive together.
+pub(crate) async fn make_local_set_disks(
+    drive_count: usize,
+    parity_count: usize,
+) -> (
+    crate::set_disk::ops::object::hermetic_set_disks_support::HermeticSetFixture,
+    Arc<SetDisks>,
+) {
+    let (fixture, _, set) =
+        crate::set_disk::ops::object::hermetic_set_disks_support::hermetic_set_disks_for_pool_with_default_parity(
+            drive_count,
+            0,
+            parity_count,
+        )
+        .await;
+    (fixture, set)
 }
 
 /// Like [`make_local_set_disks`], but binds the set to an explicit instance

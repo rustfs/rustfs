@@ -10829,7 +10829,7 @@ mod object_encryption_resolver_wiring_tests {
 }
 
 #[cfg(test)]
-pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
+pub(crate) mod hermetic_set_disks_support {
     //! Same-disk storage fixtures with an isolated metadata authority. The
     //! fixture keeps the real ECStore alive because its metadata cache holds
     //! only a weak reference back to the store.
@@ -10884,10 +10884,10 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         let store = crate::bucket::metadata_sys::object_store_in(&set.ctx)
             .await
             .expect("fixture metadata authority must be live");
-        let incarnation = store
-            .bucket_incarnation_id_from_disk(bucket)
+        let incarnation = crate::bucket::metadata_sys::get_bucket_incarnation_metadata_in(&set.ctx, bucket)
             .await
-            .expect("fixture bucket incarnation");
+            .expect("fixture bucket metadata must resolve or migrate")
+            .bucket_incarnation_id;
         let owner = Arc::new(
             store
                 .acquire_bucket_incarnation_fence(bucket, incarnation)
@@ -10935,7 +10935,7 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         hermetic_set_disks_for_pool_with_default_parity(disk_count, 0, disk_count / 2).await
     }
 
-    pub(in crate::set_disk::ops) async fn hermetic_set_disks_for_pool_with_default_parity(
+    pub(crate) async fn hermetic_set_disks_for_pool_with_default_parity(
         disk_count: usize,
         pool_index: usize,
         default_parity_count: usize,
