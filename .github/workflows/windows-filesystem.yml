@@ -20,8 +20,11 @@ on:
     paths:
       - "crates/ecstore/src/disk/**"
       - "crates/ecstore/src/store/init_format.rs"
+      - "crates/ecstore/src/set_disk/ops/locking.rs"
+      - "crates/ecstore/src/object_api/write_commit_context.rs"
       - "crates/ecstore/Cargo.toml"
       - "crates/utils/src/dunce.rs"
+      - "crates/utils/src/path.rs"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/actions/setup/**"
@@ -31,8 +34,11 @@ on:
     paths:
       - "crates/ecstore/src/disk/**"
       - "crates/ecstore/src/store/init_format.rs"
+      - "crates/ecstore/src/set_disk/ops/locking.rs"
+      - "crates/ecstore/src/object_api/write_commit_context.rs"
       - "crates/ecstore/Cargo.toml"
       - "crates/utils/src/dunce.rs"
+      - "crates/utils/src/path.rs"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/actions/setup/**"
