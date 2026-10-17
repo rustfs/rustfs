@@ -104,6 +104,7 @@ enum ReadRepairPausePhase {
     Data,
     PartStaging(usize),
     Commit,
+    IncarnationCommit,
 }
 
 #[cfg(test)]
@@ -119,7 +120,7 @@ struct ReadRepairPause {
 static READ_REPAIR_PAUSES: std::sync::Mutex<Vec<ReadRepairPause>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
-struct ReadRepairPauseScope {
+pub(crate) struct ReadRepairPauseScope {
     bucket: String,
     object: String,
     phase: ReadRepairPausePhase,
@@ -129,6 +130,13 @@ struct ReadRepairPauseScope {
 impl ReadRepairPauseScope {
     fn install(bucket: &str, object: &str) -> (Self, std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>) {
         Self::install_at(bucket, object, ReadRepairPausePhase::Commit)
+    }
+
+    pub(crate) fn install_incarnation_commit(
+        bucket: &str,
+        object: &str,
+    ) -> (Self, std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>) {
+        Self::install_at(bucket, object, ReadRepairPausePhase::IncarnationCommit)
     }
 
     fn install_at(
@@ -1345,7 +1353,13 @@ impl SetDisks {
                                 );
                             }
 
-                            if read_repair_uses_shared_lock || preserve_unrepairable {
+                            // A no-remove request cannot turn surviving same-version
+                            // data into dangling cleanup or its grace deferral.
+                            let preserve_surviving_data = !opts.remove
+                                && data_errs_by_disk
+                                    .values()
+                                    .any(|parts| !parts.is_empty() && parts.iter().all(|status| *status == CHECK_PART_SUCCESS));
+                            if read_repair_uses_shared_lock || preserve_unrepairable || preserve_surviving_data {
                                 return Ok((result, Some(cannot_heal_err)));
                             }
 
@@ -1888,6 +1902,10 @@ impl SetDisks {
                         // MinIO stops on the first RenameData error. RustFS intentionally
                         // continues per target, but reports any residue after all attempts
                         // so successful repairs survive and failed targets remain retryable.
+                        #[cfg(test)]
+                        if bucket_heal_scope.is_some() {
+                            pause_read_repair(bucket, object, ReadRepairPausePhase::IncarnationCommit).await;
+                        }
                         let mut rename_attempts = 0usize;
                         let mut rename_successes = 0usize;
                         let mut healed_disks = vec![None; out_dated_disks.len()];
@@ -3952,6 +3970,151 @@ mod heal_result_report_tests {
 
         for error in [DiskError::DiskFull, DiskError::DiskAccessDenied, DiskError::FileCorrupt] {
             assert!(!is_retryable_heal_writer_error(&error), "{error:?} should remain permanent");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn deep_heal_preserves_below_quorum_external_parts_without_remove() {
+        use tokio::io::AsyncReadExt;
+
+        for grace in ["3600", "0"] {
+            let scenario = async {
+                for versioned in [false, true] {
+                    let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+                    let bucket = "heal-below-read-quorum";
+                    let object = "external.bin";
+                    for disk in &disks {
+                        disk.make_volume(bucket).await.expect("create each bucket volume");
+                    }
+                    let body = vec![0x5a; 1024 * 1024];
+                    let version = versioned.then(|| Uuid::new_v4().to_string());
+                    let put_options = ObjectOptions {
+                        no_lock: true,
+                        versioned,
+                        version_id: version.clone(),
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    };
+                    let mut reader = PutObjReader::from_vec(body.clone());
+                    set.put_object(bucket, object, &mut reader, &put_options)
+                        .await
+                        .expect("commit every original external shard");
+                    if versioned {
+                        let mut newer = PutObjReader::from_vec(vec![0xa5; body.len()]);
+                        set.put_object(
+                            bucket,
+                            object,
+                            &mut newer,
+                            &ObjectOptions {
+                                version_id: Some(Uuid::new_v4().to_string()),
+                                ..put_options.clone()
+                            },
+                        )
+                        .await
+                        .expect("commit a distinct current version above the historical target");
+                    }
+                    let version_id = version.as_deref().unwrap_or("");
+                    let source = disks[3]
+                        .read_version("", bucket, object, version_id, &ReadOptions::default())
+                        .await
+                        .expect("read the exact source version");
+                    assert_eq!(source.erasure.data_blocks, 2, "fixture must have R=2");
+                    let part_path = format!("{object}/{}/part.1", source.data_dir.expect("external data directory"));
+                    let mut metadata = Vec::new();
+                    let mut original_parts = Vec::new();
+                    for disk in &disks {
+                        metadata.push(
+                            disk.read_all(bucket, &format!("{object}/xl.meta"))
+                                .await
+                                .expect("original metadata"),
+                        );
+                        original_parts.push(disk.read_all(bucket, &part_path).await.expect("original external part"));
+                    }
+                    for dir in temp_dirs.iter().take(3) {
+                        tokio::fs::remove_file(dir.path().join(bucket).join(&part_path))
+                            .await
+                            .expect("leave exactly R-1 external shards");
+                    }
+                    let opts = HealOpts {
+                        no_lock: true,
+                        scan_mode: HealScanMode::Deep,
+                        remove: false,
+                        ..Default::default()
+                    };
+                    let (result, error) = set
+                        .heal_object(bucket, object, version_id, &opts)
+                        .await
+                        .expect("negative deep heal");
+                    assert!(
+                        matches!(error, Some(DiskError::ErasureReadQuorum)),
+                        "a no-remove heal with surviving same-version data must retain the quorum failure, not classify cleanup grace: {error:?}"
+                    );
+                    assert!(!result.integrity_verified, "below-R data cannot carry a positive integrity proof");
+                    for (index, disk) in disks.iter().enumerate() {
+                        assert_eq!(
+                            disk.read_all(bucket, &format!("{object}/xl.meta"))
+                                .await
+                                .expect("retained metadata"),
+                            metadata[index],
+                            "negative heal must preserve every original metadata byte"
+                        );
+                        if index < 3 {
+                            assert!(
+                                disk.read_all(bucket, &part_path).await.is_err(),
+                                "below-R heal cannot invent a missing shard"
+                            );
+                        } else {
+                            assert_eq!(disk.read_all(bucket, &part_path).await.expect("surviving shard"), original_parts[index]);
+                        }
+                    }
+                    disks[0]
+                        .write_all(bucket, &part_path, original_parts[0].clone())
+                        .await
+                        .expect("restore one original source");
+                    let (_, error) = set
+                        .heal_object(bucket, object, version_id, &opts)
+                        .await
+                        .expect("fresh heal at exactly R");
+                    assert!(error.is_none(), "exactly R original sources must repair independently: {error:?}");
+                    let mut restored = set
+                        .get_object_reader(bucket, object, None, Default::default(), &put_options)
+                        .await
+                        .expect("read the repaired exact version");
+                    let mut actual = Vec::new();
+                    restored
+                        .stream
+                        .read_to_end(&mut actual)
+                        .await
+                        .expect("read every repaired payload byte");
+                    assert_eq!(actual, body, "later successful repair cannot hide data loss");
+                    if grace == "0" {
+                        drop(restored);
+                        for dir in temp_dirs.iter().take(3) {
+                            tokio::fs::remove_file(dir.path().join(bucket).join(&part_path))
+                                .await
+                                .expect("prepare the explicit removal control");
+                        }
+                        let (_, error) = set
+                            .heal_object(bucket, object, version_id, &HealOpts { remove: true, ..opts })
+                            .await
+                            .expect("explicit dangling cleanup control");
+                        assert!(
+                            error.is_none(),
+                            "explicit removal with zero grace must still clean dangling data: {error:?}"
+                        );
+                        for disk in &disks {
+                            assert!(
+                                disk.read_version("", bucket, object, version_id, &ReadOptions::default())
+                                    .await
+                                    .is_err(),
+                                "explicit cleanup must remove the target version"
+                            );
+                        }
+                    }
+                }
+            };
+            temp_env::async_with_vars([("RUSTFS_HEAL_DANGLING_DELETE_GRACE_SECS", Some(grace))], scenario).await;
         }
     }
 

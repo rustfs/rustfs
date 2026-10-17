@@ -602,6 +602,10 @@ pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
     request.source = HealRequestSource::ReadRepair;
     request.object_version_id = version_id.filter(|value| !value.is_empty()).map(str::to_string);
     request.recreate_missing = Some(true);
+    // Reader failures include checksum damage that metadata-only healing cannot detect.
+    if matches!(reason, "missing_shards" | "decode_error") {
+        request.scan_mode = Some(rustfs_heal_contracts::heal_channel::HealScanMode::Deep);
+    }
 
     let request_id = request.id.clone();
     let bucket = bucket.to_string();
@@ -13357,6 +13361,61 @@ mod tests {
         assert!(reserve_read_repair_heal("bucket", &object, None, 3, 4).await.is_none());
         let key = ReadRepairHealCacheKey::new("bucket", &object, None, 3, 4);
         release_read_repair_heal_reservation(&key).await;
+    }
+
+    #[tokio::test]
+    async fn read_repair_reader_failure_requests_deep_scan_for_the_exact_version() {
+        fn captured() -> &'static std::sync::Mutex<Option<rustfs_heal_contracts::heal_channel::HealChannelRequest>> {
+            static REQUEST: OnceLock<std::sync::Mutex<Option<rustfs_heal_contracts::heal_channel::HealChannelRequest>>> =
+                OnceLock::new();
+            REQUEST.get_or_init(|| std::sync::Mutex::new(None))
+        }
+        fn capture(request: rustfs_heal_contracts::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+            *captured().lock().expect("read-repair request capture must be available") = Some(request);
+            Box::pin(async { ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Accepted) })
+        }
+
+        for (reason, expected_scan) in [
+            ("missing_shards", Some(rustfs_heal_contracts::heal_channel::HealScanMode::Deep)),
+            ("decode_error", Some(rustfs_heal_contracts::heal_channel::HealScanMode::Deep)),
+            ("metadata_read_error", None),
+        ] {
+            let object = format!("reader-failure-{}", Uuid::new_v4());
+            let version = Uuid::new_v4().to_string();
+            submit_read_repair_heal_with_submitter(
+                ReadRepairHealSubmission {
+                    bucket: "reader-failure",
+                    object: &object,
+                    version_id: Some(&version),
+                    pool_index: 1,
+                    set_index: 2,
+                    part_number: Some(1),
+                    reason,
+                    mrf_intent: None,
+                },
+                capture,
+            )
+            .await;
+            let request = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(request) = captured().lock().expect("captured request must be readable").take() {
+                        break request;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the actual asynchronous admission must be captured");
+            assert_eq!(request.scan_mode, expected_scan, "reader damage needs payload verification");
+            assert_eq!(request.source, HealRequestSource::ReadRepair);
+            assert_eq!(request.bucket, "reader-failure");
+            assert_eq!(request.object_prefix.as_deref(), Some(object.as_str()));
+            assert_eq!(request.object_version_id.as_deref(), Some(version.as_str()));
+            assert_eq!((request.pool_index, request.set_index), (Some(1), Some(2)));
+            assert_eq!(request.recreate_missing, Some(true));
+            let key = ReadRepairHealCacheKey::new("reader-failure", &object, Some(&version), 1, 2);
+            release_read_repair_heal_reservation(&key).await;
+        }
     }
 
     // ========================================================================

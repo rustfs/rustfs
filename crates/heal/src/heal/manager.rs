@@ -628,7 +628,10 @@ fn retry_budget_for_result(task: &HealTask, result: &Result<()>, retryable_batch
     if task.retry_attempts >= MAX_RECOVERABLE_HEAL_RETRIES {
         return None;
     }
-    if task.has_batch_failure() && !retryable_batch_failure {
+    // Admin traversals already exhaust their per-object retries. Restarting
+    // the whole traversal under the same token discards those receipts and
+    // reports previously repaired objects as unchanged on the next scan.
+    if task.has_batch_failure() && (task.source == HealRequestSource::Admin || !retryable_batch_failure) {
         return None;
     }
 
