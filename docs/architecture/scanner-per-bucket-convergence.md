@@ -180,13 +180,23 @@ equality test to:
 
 `usage_snapshot_converged` becomes `pending_dirty_buckets == 0`. A `Complete`
 cycle with pending buckets publishes an authoritative snapshot: certified
-buckets are current, pending buckets carry their last certified values in
-`buckets_usage`. `DataUsageInfo` in `crates/data-usage/src/data_usage.rs`
-gains an additive, map-encoded list of pending bucket names beside
-`usage_snapshot_set_states`, so readers can tell a certified value from a
-carried one without a schema break. This replaces the behaviour where a
-superseded result is published only as an observed snapshot and never
-becomes a baseline.
+buckets are current, pending buckets carry the value the walk produced,
+which is at least as recent as the previous certified value and may miss
+the write that shaded the bucket; the next cycle rescans them. `DataUsageInfo`
+in `crates/data-usage/src/data_usage.rs` gains additive fields beside
+`usage_snapshot_set_states`: the sorted list `usage_snapshot_pending_buckets`,
+its length `usage_snapshot_pending_bucket_count`, and the routing mark
+`usage_snapshot_observational` that a vetoed cycle sets so the observed
+object is selected by an explicit mark rather than by the convergence flag.
+Readers can tell a certified value from an uncertified one without a schema
+break. This replaces the behaviour where a superseded result is published
+only as an observed snapshot and never becomes a baseline.
+
+The pending set is read after the guardrail verdict and before publication.
+Certification at finalize still compares each bucket's generation against the
+start snapshot, so a write that lands between publication and finalize keeps
+its bucket dirty even though the published list does not name it; it is the
+next cycle's work, exactly as a write after a converged publication is today.
 
 ### Guardrail
 
@@ -197,7 +207,7 @@ walk. Field roles:
 |---|---|
 | `instance_id`, `protocol_version`, `topology_digest` | veto: a peer restarted, changed version, or the topology changed |
 | `data_movement_active`, `movement_generation`, `publication_blocked` | veto: rebalance, decommission, or a pending PUT tail can make the walk describe a different generation |
-| `maintenance_generation` | veto only when the cycle published maintenance results; otherwise a shade signal |
+| `maintenance_generation` | veto: no cycle today records whether it published maintenance results, and the field is already part of the structural digest; it becomes a shade signal only once that distinction exists |
 | `namespace_generation`, `dirty_usage_generation`, `dirty_usage_pending` | shade signal: consumed per bucket; never a veto on their own |
 
 `scanner_activity_structural_digest` already separates the structural part
@@ -217,6 +227,13 @@ The guardrail is bounded in three ways:
   movement or topology veto, which describes the whole heap, defers the
   cycle. `ActivityBaselineUnavailable` therefore becomes a per-peer
   condition, not a cycle outcome, unless no peer answered at all.
+  Phase 2 ships attribution but not localisation: per-bucket certification
+  covers the local dirty map, and a remote peer whose `dirty_usage_generation`
+  or `dirty_usage_pending` moved during the walk still supersedes the whole
+  cycle (`scanner_peer_dirty_usage_moved`), because without a post-walk scoped
+  snapshot the coordinator cannot name the buckets that peer dirtied and would
+  otherwise claim convergence over them. The same rule is applied again after
+  remote leases are granted. Phase 5 lifts it with scoped acknowledgements.
 - **Retried on a bound.** A deferred cycle retries on the existing
   superseded backoff schedule with a cap, and `usage_freshness` reports the
   field and peer that caused the last deferral so the operator can tell a
@@ -335,7 +352,7 @@ require a scanner reset.
 
 | Artifact | Encoding and tolerance today | Rule in this design | Rollback behaviour |
 |---|---|---|---|
-| `.usage.v2.json` (`DataUsageInfo`) | JSON; every optional field is `serde(default)` and skipped when empty; unknown fields are ignored | The pending-bucket list is an additive optional field. `usage_snapshot_converged` keeps its meaning. No existing field changes type or semantics. | An older reader ignores the pending list and sees a complete snapshot with `usage_snapshot_converged = false`, which it already handles as an authoritative but unconverged publication. |
+| `.usage.v2.json` (`DataUsageInfo`) | JSON; every optional field is `serde(default)` and skipped when empty; unknown fields are ignored | The pending-bucket list, its count, and the observational routing mark are additive optional fields. `usage_snapshot_converged` keeps its meaning. No existing field changes type or semantics. | An older reader ignores the pending list and sees a complete snapshot with `usage_snapshot_converged = false`. Its admin and quota readers accept that as an authoritative publication; its scanner does not use it as a scoped-scan baseline and runs full walks until it publishes a converged snapshot of its own, which is today's behaviour, not a reset. |
 | `.usage-cache.bin` (`DataUsageCache`) | MessagePack; `DataUsageScanIdentity`, `DataUsageScanProgress`, and `DataUsageRawEnumerationCursor` deny unknown fields; the map-encoded cache metadata tolerates unknown keys | No field is added to a struct that denies unknown fields. Bucket color and start generation are process state in the dirty map, not cache fields. If a per-bucket value must persist, it goes into the map-encoded metadata as `scan_execution_digest` did. The old-generation sweep reuses the existing checkpoint, resume, and cursor fields unchanged. | An older reader ignores any added map key and treats the cache under its existing identity rules. |
 | `.bloomcycle.bin` and recovery markers | Versioned by `schema_version`; a mismatch is quarantined | No schema bump. Pending-bucket state is derived from the dirty map and the published snapshot, not stored in cycle state. | Unchanged. |
 | `scanner/durable-dirty-producer-replay/<owner>.json` | Strict schema; entries deny unknown fields | The barrier-hit class is not persisted. Replayed entries are treated as `Namespace` class, which can only cause an extra scoped rescan, never a missed one. | Unchanged. |
@@ -416,11 +433,15 @@ condition before merging.
 ## Surfaces
 
 - `usage_freshness` in the admin scanner status reports
-  `pending_dirty_buckets` (`Namespace` class only), plus the pacer target,
+  `dirty_pending_buckets` (`Namespace` class only; after certification the
+  dirty map holds exactly the pending set), the attributed guardrail veto
+  (`guardrail_veto_total`, `last_guardrail_veto_unix_secs`,
+  `last_guardrail_veto_reason` as `<field>@<host>`), plus the pacer target,
   achieved rate, and whether a ceiling is binding. The console marks usage
   stale only for that count or for a guardrail veto.
-- `last_cycle_result` reports `complete` for a cycle with pending buckets;
-  `superseded` is reserved for guardrail vetoes and should be rare.
+- `last_cycle_result` reports `success`, its existing label for a completed
+  cycle, for a cycle with pending buckets; `superseded` is reserved for
+  guardrail vetoes and the phase-2 peer fallback and should be rare.
 - The superseded retry schedule applies only to guardrail vetoes and to
   explicit full sweeps. A `Complete` cycle with pending buckets uses the
   ordinary dirty-usage wake and the next cycle is scoped to the pending set.
@@ -443,7 +464,10 @@ modes.
    non-converged `Complete` publication as the structural baseline, order
    grey buckets by waiting age under a per-cycle quantum, give each prefix
    inside a bucket its own quantum, and attribute and localise guardrail
-   vetoes. Oracle: a single-node deployment with one bucket written every
+   vetoes. The first change of this phase ships the termination rule:
+   certification, `Complete` with pending buckets, the baseline bootstrap
+   and guardrail attribution. Bounded remark, aging order, the per-prefix
+   quantum and guardrail localisation follow as their own changes. Oracle: a single-node deployment with one bucket written every
    few seconds reaches `Complete` on the first full walk, reports exactly
    that bucket pending, and the next cycle walks only that bucket; a
    deployment with more buckets than the quantum walks every bucket within

@@ -3065,6 +3065,23 @@ pub(crate) async fn scan_data_folder_scoped(
 
             close_disk_guard.close().await;
             if unresolved_objects || mixed_coverage {
+                debug!(
+                    target: "rustfs::scanner::folder",
+                    event = EVENT_SCANNER_FOLDER_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_FOLDER,
+                    state = "bucket_sweep_incomplete",
+                    bucket = %bucket_name,
+                    pool = new_cache.info.source.map(|source| source.pool_index),
+                    set = new_cache.info.source.map(|source| source.set_index),
+                    cycle = next_cycle,
+                    coverage_gap,
+                    root_failed_objects = root.failed_objects,
+                    failed_objects = new_cache.info.failed_objects.len(),
+                    size_reconciliation_entries = new_cache.info.size_reconciliation.len(),
+                    mixed_coverage,
+                    "Scanner bucket sweep requires another verification pass"
+                );
                 Err(ScannerError::PartialCache(Box::new(std::mem::take(new_cache))))
             } else {
                 Ok(std::mem::take(new_cache))
