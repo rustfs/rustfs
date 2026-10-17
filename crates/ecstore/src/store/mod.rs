@@ -27,6 +27,7 @@ use crate::bucket::utils::check_get_obj_args;
 use crate::bucket::utils::check_list_multipart_args;
 use crate::bucket::utils::check_list_parts_args;
 use crate::bucket::utils::check_new_multipart_args;
+use crate::bucket::utils::check_new_object_args;
 use crate::bucket::utils::check_object_args;
 use crate::bucket::utils::check_put_object_args;
 use crate::bucket::utils::check_put_object_part_args;

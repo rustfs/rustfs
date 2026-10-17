@@ -5819,8 +5819,9 @@ impl LocalDisk {
             Box::pin(async move {
                 match get_disk_info(root.clone()).await {
                     Ok((info, is_root_disk)) => {
-                        let physical_device_ids = match rustfs_utils::os::get_physical_device_ids(root.to_string_lossy().as_ref())
-                        {
+                        let physical_device_ids = match win32_volume_path(&root).and_then(|volume_path| {
+                            rustfs_utils::os::get_physical_device_ids(volume_path.to_string_lossy().as_ref())
+                        }) {
                             Ok(ids) => ids,
                             Err(err) => {
                                 warn!(
@@ -8135,6 +8136,7 @@ impl LocalDisk {
                 return Err(DiskError::ConditionalDeleteConflict);
             }
         }
+        let data_dirs = fm.delete_versions(fis)?;
         let rollback_dir = opts.old_data_dir;
         let mut reserved_version_delete = false;
         let mut recovery_target = None;
@@ -8168,15 +8170,10 @@ impl LocalDisk {
             }
         }
 
-        for fi in fis.iter() {
-            let data_dir = match fm.delete_version(fi) {
-                Ok(res) => res,
+        for dir in data_dirs.into_iter().flatten() {
+            let dir_path = match self.io_get_object_path(volume, format!("{path}/{dir}").as_str()) {
+                Ok(dir_path) => dir_path,
                 Err(err) => {
-                    let err: DiskError = err.into();
-                    if !fi.deleted && (err == DiskError::FileNotFound || err == DiskError::FileVersionNotFound) {
-                        continue;
-                    }
-
                     if reserved_version_delete && let Some(rollback_dir) = rollback_dir {
                         return Err(self
                             .abort_reserved_version_delete_with_failure(
@@ -8185,7 +8182,7 @@ impl LocalDisk {
                                 volume,
                                 path,
                                 DeleteRollbackFailure {
-                                    stage: "delete_versions_metadata_update",
+                                    stage: "delete_versions_data_path",
                                     error: err,
                                     namespace_owner: namespace_owner.clone(),
                                 },
@@ -8199,7 +8196,7 @@ impl LocalDisk {
                         volume,
                         path,
                         DeleteRollbackFailure {
-                            stage: "delete_versions_metadata_update",
+                            stage: "delete_versions_data_path",
                             error: err,
                             namespace_owner: namespace_owner.clone(),
                         },
@@ -8208,171 +8205,131 @@ impl LocalDisk {
                     .await);
                 }
             };
-
-            if let Some(dir) = data_dir {
-                let vid = fi.version_id.unwrap_or_default();
-                let _ = fm.data.remove(vec![vid, dir]);
-
-                let dir_path = match self.io_get_object_path(volume, format!("{path}/{dir}").as_str()) {
-                    Ok(dir_path) => dir_path,
-                    Err(err) => {
-                        if reserved_version_delete && let Some(rollback_dir) = rollback_dir {
-                            return Err(self
-                                .abort_reserved_version_delete_with_failure(
-                                    object_dir,
-                                    rollback_dir,
-                                    volume,
-                                    path,
-                                    DeleteRollbackFailure {
-                                        stage: "delete_versions_data_path",
-                                        error: err,
-                                        namespace_owner: namespace_owner.clone(),
-                                    },
-                                )
-                                .await);
-                        }
-                        return Err(restore_delete_rollback_after_error(
-                            object_dir,
-                            &xlpath,
-                            rollback_dir,
-                            volume,
-                            path,
-                            DeleteRollbackFailure {
-                                stage: "delete_versions_data_path",
-                                error: err,
-                                namespace_owner: namespace_owner.clone(),
-                            },
-                            &self.publication_root,
-                        )
-                        .await);
+            if let Some(rollback_dir) = rollback_dir {
+                let rollback_path = object_dir.join(rollback_dir.to_string());
+                if let Err(err) = fs::create_dir_all(&rollback_path).await {
+                    let err: DiskError = to_file_error(err).into();
+                    if reserved_version_delete {
+                        return Err(self
+                            .abort_reserved_version_delete_with_failure(
+                                object_dir,
+                                rollback_dir,
+                                volume,
+                                path,
+                                DeleteRollbackFailure {
+                                    stage: "delete_versions_rollback_dir",
+                                    error: err,
+                                    namespace_owner: namespace_owner.clone(),
+                                },
+                            )
+                            .await);
                     }
-                };
-                if let Some(rollback_dir) = rollback_dir {
-                    let rollback_path = object_dir.join(rollback_dir.to_string());
-                    if let Err(err) = fs::create_dir_all(&rollback_path).await {
-                        let err: DiskError = to_file_error(err).into();
-                        if reserved_version_delete {
-                            return Err(self
-                                .abort_reserved_version_delete_with_failure(
-                                    object_dir,
-                                    rollback_dir,
-                                    volume,
-                                    path,
-                                    DeleteRollbackFailure {
-                                        stage: "delete_versions_rollback_dir",
-                                        error: err,
-                                        namespace_owner: namespace_owner.clone(),
-                                    },
-                                )
-                                .await);
-                        }
-                        return Err(restore_delete_rollback_after_error(
-                            object_dir,
-                            &xlpath,
-                            Some(rollback_dir),
-                            volume,
-                            path,
-                            DeleteRollbackFailure {
-                                stage: "delete_versions_rollback_dir",
-                                error: err,
-                                namespace_owner: namespace_owner.clone(),
-                            },
-                            &self.publication_root,
-                        )
-                        .await);
-                    }
-                    let reserved = match self
-                        .reserve_version_delete_with_namespace_owner(volume, path, dir, rollback_dir, namespace_owner.clone())
-                        .await
-                    {
-                        Ok(reserved) => reserved,
-                        Err(err) => {
-                            return Err(self
-                                .abort_reserved_version_delete_with_failure(
-                                    object_dir,
-                                    rollback_dir,
-                                    volume,
-                                    path,
-                                    DeleteRollbackFailure {
-                                        stage: "delete_versions_reserve_data",
-                                        error: err,
-                                        namespace_owner: namespace_owner.clone(),
-                                    },
-                                )
-                                .await);
-                        }
-                    };
-                    reserved_version_delete |= reserved;
-                    let rollback_data_path = rollback_path.join(dir.to_string());
-                    if !reserved
-                        && let Err(err) = os::rename_all_ignore_missing_source_with_owner(
-                            &dir_path,
-                            &rollback_data_path,
-                            &rollback_path,
-                            &self.publication_root,
-                            namespace_owner.clone(),
-                        )
-                        .await
-                    {
-                        return Err(restore_delete_rollback_after_error(
-                            object_dir,
-                            &xlpath,
-                            Some(rollback_dir),
-                            volume,
-                            path,
-                            DeleteRollbackFailure {
-                                stage: "delete_versions_stage_data",
-                                error: err,
-                                namespace_owner: namespace_owner.clone(),
-                            },
-                            &self.publication_root,
-                        )
-                        .await);
-                    }
-                    if should_fail_after_delete_data_staged(path) {
-                        if reserved_version_delete {
-                            return Err(self
-                                .abort_reserved_version_delete_with_failure(
-                                    object_dir,
-                                    rollback_dir,
-                                    volume,
-                                    path,
-                                    DeleteRollbackFailure {
-                                        stage: "delete_versions_test_after_stage",
-                                        error: DiskError::Unexpected,
-                                        namespace_owner: namespace_owner.clone(),
-                                    },
-                                )
-                                .await);
-                        }
-                        return Err(restore_delete_rollback_after_error(
-                            object_dir,
-                            &xlpath,
-                            Some(rollback_dir),
-                            volume,
-                            path,
-                            DeleteRollbackFailure {
-                                stage: "delete_versions_test_after_stage",
-                                error: DiskError::Unexpected,
-                                namespace_owner: namespace_owner.clone(),
-                            },
-                            &self.publication_root,
-                        )
-                        .await);
-                    }
-                } else if let Err(err) = self
-                    .move_to_trash_with_namespace_owner(&dir_path, true, false, namespace_owner.clone())
+                    return Err(restore_delete_rollback_after_error(
+                        object_dir,
+                        &xlpath,
+                        Some(rollback_dir),
+                        volume,
+                        path,
+                        DeleteRollbackFailure {
+                            stage: "delete_versions_rollback_dir",
+                            error: err,
+                            namespace_owner: namespace_owner.clone(),
+                        },
+                        &self.publication_root,
+                    )
+                    .await);
+                }
+                let reserved = match self
+                    .reserve_version_delete_with_namespace_owner(volume, path, dir, rollback_dir, namespace_owner.clone())
                     .await
-                    && !(err == DiskError::FileNotFound || err == DiskError::VolumeNotFound)
                 {
-                    return Err(err);
+                    Ok(reserved) => reserved,
+                    Err(err) => {
+                        return Err(self
+                            .abort_reserved_version_delete_with_failure(
+                                object_dir,
+                                rollback_dir,
+                                volume,
+                                path,
+                                DeleteRollbackFailure {
+                                    stage: "delete_versions_reserve_data",
+                                    error: err,
+                                    namespace_owner: namespace_owner.clone(),
+                                },
+                            )
+                            .await);
+                    }
                 };
+                reserved_version_delete |= reserved;
+                let rollback_data_path = rollback_path.join(dir.to_string());
+                if !reserved
+                    && let Err(err) = os::rename_all_ignore_missing_source_with_owner(
+                        &dir_path,
+                        &rollback_data_path,
+                        &rollback_path,
+                        &self.publication_root,
+                        namespace_owner.clone(),
+                    )
+                    .await
+                {
+                    return Err(restore_delete_rollback_after_error(
+                        object_dir,
+                        &xlpath,
+                        Some(rollback_dir),
+                        volume,
+                        path,
+                        DeleteRollbackFailure {
+                            stage: "delete_versions_stage_data",
+                            error: err,
+                            namespace_owner: namespace_owner.clone(),
+                        },
+                        &self.publication_root,
+                    )
+                    .await);
+                }
+                if should_fail_after_delete_data_staged(path) {
+                    if reserved_version_delete {
+                        return Err(self
+                            .abort_reserved_version_delete_with_failure(
+                                object_dir,
+                                rollback_dir,
+                                volume,
+                                path,
+                                DeleteRollbackFailure {
+                                    stage: "delete_versions_test_after_stage",
+                                    error: DiskError::Unexpected,
+                                    namespace_owner: namespace_owner.clone(),
+                                },
+                            )
+                            .await);
+                    }
+                    return Err(restore_delete_rollback_after_error(
+                        object_dir,
+                        &xlpath,
+                        Some(rollback_dir),
+                        volume,
+                        path,
+                        DeleteRollbackFailure {
+                            stage: "delete_versions_test_after_stage",
+                            error: DiskError::Unexpected,
+                            namespace_owner: namespace_owner.clone(),
+                        },
+                        &self.publication_root,
+                    )
+                    .await);
+                }
+            } else if let Err(err) = self
+                .move_to_trash_with_namespace_owner(&dir_path, true, false, namespace_owner.clone())
+                .await
+                && !(err == DiskError::FileNotFound || err == DiskError::VolumeNotFound)
+            {
+                return Err(err);
+            };
 
-                // The version's data dir was staged or trashed; drop any cached
-                // io_uring descriptors under it so a deleted `part.N` cannot keep
-                // answering reads (rustfs/backlog#1175).
-                self.io_backend.invalidate_cached_fds_under(volume, &format!("{path}/{dir}"));
-            }
+            // The version's data dir was staged or trashed; drop any cached
+            // io_uring descriptors under it so a deleted `part.N` cannot keep
+            // answering reads (rustfs/backlog#1175).
+            self.io_backend.invalidate_cached_fds_under(volume, &format!("{path}/{dir}"));
         }
 
         // Remove xl.meta when no versions remain
@@ -12521,13 +12478,28 @@ async fn wait_for_startup_cleanup_signal(
 }
 
 #[tracing::instrument(level = "trace", skip_all)]
+/// The disk root stays non-verbatim for `/`-joined IO, but the Win32 volume
+/// APIs behind `rustfs_utils::os` only accept a path past the legacy limit in
+/// extended-length form. Shorter roots are passed unchanged so the volume
+/// identities those APIs report keep their conventional `C:\` form.
+fn win32_volume_path(path: &Path) -> std::io::Result<std::borrow::Cow<'_, Path>> {
+    // CreateDirectoryW's 248-unit limit, the lowest of the legacy path limits.
+    const LEGACY_MAX_PATH: usize = 248;
+    if path.to_string_lossy().encode_utf16().count() < LEGACY_MAX_PATH {
+        return Ok(std::borrow::Cow::Borrowed(path));
+    }
+    rustfs_utils::extended_length_path(path)
+}
+
 async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInfo, bool)> {
     let drive_path = drive_path.to_string_lossy().to_string();
     check_path_length(&drive_path)?;
 
-    let disk_info = get_info(&drive_path).inspect_err(|err| {
-        log_startup_disk_io_error("get_disk_info_stat", Path::new(&drive_path), err);
-    })?;
+    let disk_info = win32_volume_path(Path::new(&drive_path))
+        .and_then(|volume_path| get_info(&volume_path))
+        .inspect_err(|err| {
+            log_startup_disk_io_error("get_disk_info_stat", Path::new(&drive_path), err);
+        })?;
     let root_drive = if let Some(root_disk_threshold) = runtime_sources::root_disk_threshold_for_erasure_disk().await {
         if root_disk_threshold > 0 {
             disk_info.total <= root_disk_threshold
@@ -19489,6 +19461,61 @@ mod test {
         }
     }
 
+    /// Opens a disk at `root` and drives metadata and data reads and writes
+    /// through it: they extend the root by joining `/`-separated relative paths
+    /// as strings, so they all depend on the root staying non-verbatim.
+    async fn assert_local_disk_serves_objects_at(root: &Path) {
+        let endpoint = Endpoint::try_from(root.to_str().expect("disk root should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        assert!(
+            !disk.root.to_string_lossy().starts_with(r"\\?\"),
+            "the disk root must not be verbatim: {:?}",
+            disk.root
+        );
+        let bucket = "bucket";
+        ensure_test_volume(&disk, bucket).await;
+
+        let object = "dir/object";
+        let version_id = Uuid::parse_str("41414141-1111-2222-3333-444444444444").expect("version id should parse");
+        let data_dir = Uuid::parse_str("42424242-1111-2222-3333-444444444444").expect("data dir should parse");
+        let fi = test_file_info(object, version_id, Some(data_dir), Some(Bytes::from_static(b"inline")));
+        let meta = test_meta(fi);
+        disk.write_all(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"), Bytes::from(meta.clone()))
+            .await
+            .expect("metadata should be written below the disk root");
+        let raw = disk
+            .read_xl(bucket, object, true)
+            .await
+            .expect("metadata should be read back");
+        assert_eq!(raw.buf, meta);
+
+        let payload = Bytes::from_static(b"part payload");
+        disk.write_all(bucket, "dir/other/part.1", payload.clone())
+            .await
+            .expect("data should be written below the disk root");
+        assert_eq!(
+            disk.read_all(bucket, "dir/other/part.1")
+                .await
+                .expect("data should be read back"),
+            payload
+        );
+    }
+
+    // A disk root past MAX_PATH resolved to `\\?\C:\...`, where `/` is not a
+    // separator, so the first `/`-joined metadata read (pool.bin.identity)
+    // failed with ERROR_INVALID_NAME and startup never completed.
+    #[tokio::test]
+    async fn windows_and_unix_local_disk_root_beyond_max_path_serves_objects() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let mut root = dir.path().to_path_buf();
+        while root.to_str().expect("temp dir should be utf8").encode_utf16().count() <= 270 {
+            root.push("r".repeat(100));
+        }
+        fs::create_dir_all(&root).await.expect("long disk root should be created");
+
+        assert_local_disk_serves_objects_at(&root).await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_ignore_missing_source_helper_still_warns_on_real_error() {
         use tempfile::tempdir;
@@ -25298,6 +25325,22 @@ mod test {
         assert!(debug.contains("root"));
         assert!(debug.contains("format_path"));
         assert!(debug.contains("endpoint"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_local_disk_opens_url_style_drive_endpoint() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let drive_path = dir.path().to_string_lossy().replace('\\', "/");
+        let endpoint =
+            Endpoint::try_from(format!("http://127.0.0.1:9000/{drive_path}").as_str()).expect("URL endpoint should parse");
+        assert_eq!(Path::new(&endpoint.get_file_path()), dir.path());
+
+        LocalDisk::new(&endpoint, false)
+            .await
+            .expect("a URL-style drive endpoint must open as a local disk");
     }
 
     #[tokio::test]

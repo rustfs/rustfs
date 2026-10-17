@@ -15,6 +15,7 @@
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result, StorageError};
 use regex::Regex;
+use rustfs_utils::WindowsFileNameError;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use s3s::xml;
 use tracing::instrument;
@@ -178,8 +179,7 @@ pub fn is_valid_object_name(object: &str) -> bool {
     dead_code,
     reason = "live on Windows: callers sit inside the #[cfg(target_os = \"windows\")] block in check_object_name_for_length_and_slash (backlog#1823)"
 )]
-pub const WINDOWS_RESERVED_CHARACTERS_REASON: &str =
-    "object key contains characters unsupported on Windows hosts (one of ':', '*', '?', '\"', '|', '<', '>')";
+pub const WINDOWS_RESERVED_CHARACTERS_REASON: &str = "object key contains characters unsupported on Windows hosts (one of ':', '*', '?', '\"', '|', '<', '>', or a control character)";
 
 /// Client-facing reason for path segments Windows can store but not address
 /// afterwards (issue #3449): trailing dot/space or reserved DOS device names.
@@ -187,37 +187,46 @@ pub const WINDOWS_RESERVED_CHARACTERS_REASON: &str =
     dead_code,
     reason = "live on Windows: callers sit inside the #[cfg(target_os = \"windows\")] block in check_object_name_for_length_and_slash (backlog#1823)"
 )]
-pub const WINDOWS_RESERVED_SEGMENT_REASON: &str = "object key contains a path segment unsupported on Windows hosts (trailing dot or space, or a reserved device name such as NUL/CON/COM1)";
+pub const WINDOWS_RESERVED_SEGMENT_REASON: &str = "object key contains a path segment unsupported on Windows hosts (trailing dot or space, or a reserved device name such as NUL/CON/COM1/CONIN$)";
 
-/// Reserved DOS device names that shadow regular files on Windows, even when
-/// an extension is appended (e.g. `NUL.txt` resolves to the `NUL` device).
+/// Client-facing reason for keys containing `\`: Windows hosts treat it as a
+/// path separator, so `a\b` would land on the same file as `a/b`.
+pub const WINDOWS_BACKSLASH_REASON: &str =
+    "object key contains '\\', which Windows hosts treat as a path separator (it would alias the same key spelled with '/')";
+
+/// Returns the client-facing reason when `object` cannot round-trip through
+/// the Win32 path layer, or `None` when it can.
+///
+/// Each segment is checked with [`rustfs_utils::check_windows_file_name`].
+/// `\` splits segments here, like on a Windows disk, so this check never
+/// rejects it: an existing `a\b` key must stay readable and deletable. New
+/// writes reject `\` separately in [`check_new_object_args`].
 #[allow(
     dead_code,
     reason = "live on Windows: callers sit inside the #[cfg(target_os = \"windows\")] block in check_object_name_for_length_and_slash (backlog#1823)"
 )]
-const WINDOWS_RESERVED_NAMES: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3",
-    "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-];
+pub fn windows_object_key_violation(object: &str) -> Option<&'static str> {
+    // A NUL byte is rejected on every platform as ObjectNameInvalid by
+    // is_valid_object_prefix; keep that answer on Windows too.
+    if object.contains('\0') {
+        return None;
+    }
 
-/// Returns true when `object` contains a path segment that NTFS can store but
-/// the Win32 API cannot address afterwards (issue #3449): segments ending in a
-/// dot or a space, and reserved DOS device names — bare or with an extension
-/// (`NUL.txt`), matching classic Win32 path resolution semantics.
-#[allow(
-    dead_code,
-    reason = "live on Windows: callers sit inside the #[cfg(target_os = \"windows\")] block in check_object_name_for_length_and_slash (backlog#1823)"
-)]
-pub fn object_name_has_windows_incompatible_segment(object: &str) -> bool {
-    object.split(['/', '\\']).any(|segment| {
-        if segment.ends_with('.') || segment.ends_with(' ') {
-            return true;
+    let mut segment_violation = false;
+    for segment in object.split(['/', '\\']).filter(|segment| !segment.is_empty()) {
+        match rustfs_utils::check_windows_file_name(segment) {
+            Err(WindowsFileNameError::ReservedCharacter | WindowsFileNameError::ControlCharacter) => {
+                return Some(WINDOWS_RESERVED_CHARACTERS_REASON);
+            }
+            Err(WindowsFileNameError::TrailingDotOrSpace | WindowsFileNameError::ReservedDeviceName) => {
+                segment_violation = true;
+            }
+            // Segment length is enforced in bytes by object_key_segments_fit_on_disk,
+            // which is stricter than the UTF-16 limit and answers ObjectNameInvalid.
+            Ok(()) | Err(WindowsFileNameError::TooLong | WindowsFileNameError::Empty) => {}
         }
-        // Device names are matched on the part before the first dot, with
-        // trailing spaces ignored (so `NUL .txt` is also reserved).
-        let base = segment.split('.').next().unwrap_or(segment).trim_end_matches(' ');
-        WINDOWS_RESERVED_NAMES.iter().any(|name| base.eq_ignore_ascii_case(name))
-    })
+    }
+    segment_violation.then_some(WINDOWS_RESERVED_SEGMENT_REASON)
 }
 
 pub fn check_object_name_for_length_and_slash(bucket: &str, object: &str) -> Result<()> {
@@ -229,33 +238,33 @@ pub fn check_object_name_for_length_and_slash(bucket: &str, object: &str) -> Res
         return Err(StorageError::ObjectNamePrefixAsSlash(bucket.to_owned(), object.to_owned()));
     }
 
+    // Reject names that NTFS would refuse, or create but the Win32 path layer
+    // cannot read back (os error 3), e.g. `a:b`, `baddir.` or `NUL.txt`.
     #[cfg(target_os = "windows")]
-    {
-        if object.contains(':')
-            || object.contains('*')
-            || object.contains('?')
-            || object.contains('"')
-            || object.contains('|')
-            || object.contains('<')
-            || object.contains('>')
-        // || object.contains('\\')
-        {
-            return Err(StorageError::InvalidArgument(
-                bucket.to_owned(),
-                object.to_owned(),
-                WINDOWS_RESERVED_CHARACTERS_REASON.to_owned(),
-            ));
-        }
+    if let Some(reason) = windows_object_key_violation(object) {
+        return Err(StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), reason.to_owned()));
+    }
 
-        // Reject names that NTFS would happily create but the Win32 path
-        // layer cannot read back (os error 3), e.g. `baddir.` or `NUL.txt`.
-        if object_name_has_windows_incompatible_segment(object) {
-            return Err(StorageError::InvalidArgument(
-                bucket.to_owned(),
-                object.to_owned(),
-                WINDOWS_RESERVED_SEGMENT_REASON.to_owned(),
-            ));
-        }
+    Ok(())
+}
+
+/// Admission check for every request that introduces `object` into the
+/// namespace: PutObject, a CopyObject destination, and CreateMultipartUpload.
+/// Sharing one entry keeps their rejections (and S3 error codes) identical.
+///
+/// `data_movement` writes (decommission, rebalance) relocate keys that already
+/// exist, so they skip the new-key-only rules and stay able to move old data.
+/// Internal meta buckets are exempt too: their keys are produced by RustFS
+/// itself and resolve to the same path either way.
+pub fn check_new_object_args(bucket: &str, object: &str, data_movement: bool) -> Result<()> {
+    check_put_object_args(bucket, object)?;
+
+    if cfg!(target_os = "windows") && !data_movement && !is_meta_bucketname(bucket) && object.contains('\\') {
+        return Err(StorageError::InvalidArgument(
+            bucket.to_owned(),
+            object.to_owned(),
+            WINDOWS_BACKSLASH_REASON.to_owned(),
+        ));
     }
 
     Ok(())
@@ -315,10 +324,6 @@ pub fn check_bucket_and_object_names(bucket: &str, object: &str) -> Result<()> {
     if !object_key_segments_fit_on_disk(object) {
         return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
     }
-
-    // if cfg!(target_os = "windows") && object.contains('\\') {
-    //     return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
-    // }
 
     Ok(())
 }
@@ -586,103 +591,193 @@ mod tests {
     }
 
     #[test]
-    fn test_object_name_has_windows_incompatible_segment() {
+    fn test_windows_object_key_violation_segments() {
+        let segment = Some(WINDOWS_RESERVED_SEGMENT_REASON);
+
         // Segments ending in a dot are writable on NTFS but unreadable via Win32 paths.
-        assert!(object_name_has_windows_incompatible_segment("baddir."));
-        assert!(object_name_has_windows_incompatible_segment("dir1/dir2/baddir."));
-        assert!(object_name_has_windows_incompatible_segment("dir1/baddir./file.txt"));
-        assert!(object_name_has_windows_incompatible_segment("file.txt."));
+        assert_eq!(windows_object_key_violation("baddir."), segment);
+        assert_eq!(windows_object_key_violation("dir1/dir2/baddir."), segment);
+        assert_eq!(windows_object_key_violation("dir1/baddir./file.txt"), segment);
+        assert_eq!(windows_object_key_violation("file.txt."), segment);
 
         // Segments ending in a space.
-        assert!(object_name_has_windows_incompatible_segment("file.txt "));
-        assert!(object_name_has_windows_incompatible_segment("dir /file.txt"));
+        assert_eq!(windows_object_key_violation("file.txt "), segment);
+        assert_eq!(windows_object_key_violation("dir /file.txt"), segment);
 
         // Reserved DOS device names, bare and case-insensitive.
-        assert!(object_name_has_windows_incompatible_segment("NUL"));
-        assert!(object_name_has_windows_incompatible_segment("nul"));
-        assert!(object_name_has_windows_incompatible_segment("CON"));
-        assert!(object_name_has_windows_incompatible_segment("prn"));
-        assert!(object_name_has_windows_incompatible_segment("Aux"));
-        assert!(object_name_has_windows_incompatible_segment("COM1"));
-        assert!(object_name_has_windows_incompatible_segment("com9"));
-        assert!(object_name_has_windows_incompatible_segment("LPT1"));
-        assert!(object_name_has_windows_incompatible_segment("lpt9"));
-        assert!(object_name_has_windows_incompatible_segment("dir/NUL/file.txt"));
+        for object in [
+            "NUL",
+            "nul",
+            "CON",
+            "prn",
+            "Aux",
+            "COM1",
+            "com9",
+            "LPT1",
+            "lpt9",
+            "dir/NUL/file.txt",
+            // Superscript port numbers and console aliases are devices too.
+            "COM\u{b9}",
+            "dir/lpt\u{b3}",
+            "CONIN$",
+            "conout$",
+        ] {
+            assert_eq!(windows_object_key_violation(object), segment, "{object:?}");
+        }
 
         // Reserved device names with an extension still resolve to the device.
-        assert!(object_name_has_windows_incompatible_segment("NUL.txt"));
-        assert!(object_name_has_windows_incompatible_segment("dir/aux.log"));
-        assert!(object_name_has_windows_incompatible_segment("con.tar.gz"));
-        assert!(object_name_has_windows_incompatible_segment("com1.dat"));
-        assert!(object_name_has_windows_incompatible_segment("NUL .txt"));
+        for object in [
+            "NUL.txt",
+            "dir/aux.log",
+            "con.tar.gz",
+            "com1.dat",
+            "NUL .txt",
+            "COM\u{b2}.log",
+        ] {
+            assert_eq!(windows_object_key_violation(object), segment, "{object:?}");
+        }
 
         // Backslash-separated segments are checked as well.
-        assert!(object_name_has_windows_incompatible_segment("dir\\baddir.\\file.txt"));
-        assert!(object_name_has_windows_incompatible_segment("dir\\nul"));
+        assert_eq!(windows_object_key_violation("dir\\baddir.\\file.txt"), segment);
+        assert_eq!(windows_object_key_violation("dir\\nul"), segment);
 
         // Valid names must not be flagged.
-        assert!(!object_name_has_windows_incompatible_segment("file.txt"));
-        assert!(!object_name_has_windows_incompatible_segment("dir.name/file"));
-        assert!(!object_name_has_windows_incompatible_segment("path/to/file.tar.gz"));
-        assert!(!object_name_has_windows_incompatible_segment("nullable"));
-        assert!(!object_name_has_windows_incompatible_segment("CONSOLE"));
-        assert!(!object_name_has_windows_incompatible_segment("com10"));
-        assert!(!object_name_has_windows_incompatible_segment("com0"));
-        assert!(!object_name_has_windows_incompatible_segment("lpt"));
-        assert!(!object_name_has_windows_incompatible_segment("aux-data/file"));
-        assert!(!object_name_has_windows_incompatible_segment("object with spaces inside"));
-        assert!(!object_name_has_windows_incompatible_segment(""));
+        for object in [
+            "file.txt",
+            "dir.name/file",
+            "path/to/file.tar.gz",
+            "nullable",
+            "CONSOLE",
+            "com10",
+            "com0",
+            "lpt",
+            "CONIN",
+            "aux-data/file",
+            "object with spaces inside",
+            "dir/",
+            "",
+        ] {
+            assert_eq!(windows_object_key_violation(object), None, "{object:?}");
+        }
     }
 
     #[test]
-    fn test_check_object_name_windows_incompatible_segments() {
-        // Rejected on Windows (would be written but unreadable, issue #3449);
-        // valid on non-Windows platforms.
-        for object in [
-            "baddir.",
-            "dir1/dir2/baddir.",
-            "dir1/baddir./file.txt",
-            "file.txt ",
-            "NUL",
-            "nul.txt",
-            "COM1",
-            "dir/LPT9.log",
-        ] {
-            let result = check_object_name_for_length_and_slash("test-bucket", object);
-            if cfg!(target_os = "windows") {
-                assert!(
-                    matches!(&result, Err(StorageError::InvalidArgument(_, _, reason)) if reason == WINDOWS_RESERVED_SEGMENT_REASON),
-                    "object name must be rejected on Windows with a descriptive reason: {object:?}, got {result:?}"
-                );
-            } else {
-                assert!(result.is_ok(), "object name must remain valid on non-Windows: {object:?}");
-            }
+    fn test_windows_object_key_violation_characters() {
+        let characters = Some(WINDOWS_RESERVED_CHARACTERS_REASON);
+        for object in ["path/*sUt*mykey", "a:b", "what?", "pipe|name", "quote\"d", "lt<gt>"] {
+            assert_eq!(windows_object_key_violation(object), characters, "{object:?}");
         }
 
-        // Valid on every platform.
-        for object in ["file.txt", "dir.name/file", "nullable", "CONSOLE", "com10"] {
-            assert!(
-                check_object_name_for_length_and_slash("test-bucket", object).is_ok(),
-                "object name must be valid on all platforms: {object:?}"
+        // Control characters 0x01-0x1F cannot appear in a Win32 file name.
+        for object in ["a\u{1}b", "tab\tname", "dir/line\nbreak", "esc\u{1b}", "unit\u{1f}"] {
+            assert_eq!(windows_object_key_violation(object), characters, "{object:?}");
+        }
+
+        // NUL keeps its platform-independent ObjectNameInvalid answer.
+        assert_eq!(windows_object_key_violation("a\0b"), None);
+
+        // A character violation outranks a segment violation anywhere in the key.
+        assert_eq!(windows_object_key_violation("baddir./a:b"), characters);
+    }
+
+    /// Existing `a\b` keys must stay readable, deletable and abortable, so the
+    /// shared name check never rejects `\` (only new writes do, on Windows).
+    #[test]
+    fn test_backslash_passes_the_shared_name_check() {
+        assert_eq!(windows_object_key_violation("a\\b"), None);
+        assert_eq!(windows_object_key_violation("dir\\sub\\file.txt"), None);
+        assert!(check_object_name_for_length_and_slash("test-bucket", "a\\b").is_ok());
+        assert!(check_object_args("test-bucket", "a\\b").is_ok());
+        assert!(check_bucket_and_object_names("test-bucket", "a\\b").is_ok());
+        // Data movement relocates keys that already exist.
+        assert!(check_new_object_args("test-bucket", "a\\b", true).is_ok());
+        assert!(check_new_object_args(RUSTFS_META_BUCKET, "config\\a", false).is_ok());
+    }
+
+    #[test]
+    fn test_check_new_object_args_matches_put_object_args() {
+        for object in [
+            "file.txt",
+            "",
+            "/leading",
+            "a//b",
+            "x/../y",
+            &"k".repeat(1025),
+            &"s".repeat(256),
+            "baddir.",
+            "a:b",
+            "NUL.txt",
+        ] {
+            assert_eq!(
+                format!("{:?}", check_new_object_args("test-bucket", object, false)),
+                format!("{:?}", check_put_object_args("test-bucket", object)),
+                "{object:?}"
             );
         }
+        assert!(matches!(
+            check_new_object_args("Bad_Bucket", "file.txt", false),
+            Err(StorageError::BucketNameInvalid(_))
+        ));
     }
 
     #[test]
-    fn test_check_object_name_windows_reserved_characters() {
-        // Keys containing Win32-reserved characters are rejected on Windows
-        // with a descriptive reason (issue #3299); valid elsewhere.
-        for object in ["path/*sUt*mykey", "a:b", "what?", "pipe|name", "quote\"d", "lt<gt>"] {
-            let result = check_object_name_for_length_and_slash("test-bucket", object);
-            if cfg!(target_os = "windows") {
+    #[cfg(not(target_os = "windows"))]
+    fn test_check_new_object_args_keeps_full_key_set_off_windows() {
+        for object in ["a\\b", "a:b", "baddir.", "NUL", "CONIN$", "tab\tname"] {
+            assert!(check_new_object_args("test-bucket", object, false).is_ok(), "{object:?}");
+        }
+    }
+
+    /// `a\b` and `a/b` resolve to the same file on a Windows disk, so a new
+    /// `a\b` would overwrite (or be overwritten by) `a/b`.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_new_object_key_rejects_backslash_alias() {
+        assert!(check_new_object_args("test-bucket", "a/b", false).is_ok());
+        for object in ["a\\b", "dir\\", "dir/sub\\file"] {
+            assert!(
+                matches!(
+                    &check_new_object_args("test-bucket", object, false),
+                    Err(StorageError::InvalidArgument(_, _, reason)) if reason == WINDOWS_BACKSLASH_REASON
+                ),
+                "{object:?}"
+            );
+        }
+        // Reads, deletes and in-flight multipart uploads of existing keys keep working.
+        assert!(check_object_args("test-bucket", "a\\b").is_ok());
+        assert!(check_del_obj_args("test-bucket", "a\\b").is_ok());
+        assert!(check_new_object_args("test-bucket", "a\\b", true).is_ok());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_new_object_key_rejects_unaddressable_names() {
+        for (object, expected) in [
+            ("baddir.", WINDOWS_RESERVED_SEGMENT_REASON),
+            ("dir/LPT9.log", WINDOWS_RESERVED_SEGMENT_REASON),
+            ("COM\u{b9}", WINDOWS_RESERVED_SEGMENT_REASON),
+            ("CONOUT$", WINDOWS_RESERVED_SEGMENT_REASON),
+            ("a:b", WINDOWS_RESERVED_CHARACTERS_REASON),
+            ("tab\tname", WINDOWS_RESERVED_CHARACTERS_REASON),
+            ("esc\u{1b}", WINDOWS_RESERVED_CHARACTERS_REASON),
+        ] {
+            for result in [
+                check_object_name_for_length_and_slash("test-bucket", object),
+                check_put_object_args("test-bucket", object),
+                check_new_object_args("test-bucket", object, false),
+                check_object_args("test-bucket", object),
+            ] {
                 assert!(
-                    matches!(&result, Err(StorageError::InvalidArgument(_, _, reason)) if reason == WINDOWS_RESERVED_CHARACTERS_REASON),
-                    "object name must be rejected on Windows with a descriptive reason: {object:?}, got {result:?}"
+                    matches!(&result, Err(StorageError::InvalidArgument(_, _, reason)) if reason == expected),
+                    "{object:?} must be rejected with {expected:?}, got {result:?}"
                 );
-            } else {
-                assert!(result.is_ok(), "object name must remain valid on non-Windows: {object:?}");
             }
         }
+        // NUL keeps the platform-independent answer.
+        assert!(matches!(
+            check_put_object_args("test-bucket", "a\0b"),
+            Err(StorageError::ObjectNameInvalid(_, _))
+        ));
     }
 
     #[test]

@@ -998,56 +998,86 @@ mod upgrade_write_readiness_tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn waits_for_each_writer_after_metadata_is_ready() -> TestResult {
-        let target = FakeS3Target::start().await?;
-        let bucket = "distributed-upgrade-history";
-        target.create_bucket(bucket);
-        let client = fake_source_client(&target);
-        client.head_bucket().bucket(bucket).send().await?;
+        use aws_sdk_s3::config::{Credentials, Region, RequestChecksumCalculation};
+        use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+        use aws_smithy_types::body::SdkBody;
 
+        let bucket = "distributed-upgrade-history";
         let phase = "one-previous-node";
         let first_key = format!(".upgrade-readiness/{phase}/node-0");
         let second_key = format!(".upgrade-readiness/{phase}/node-1");
-        target.inject_for_key(
-            FakeTargetOperation::PutObject,
-            &first_key,
-            FaultAction::Status(StatusCode::SERVICE_UNAVAILABLE),
-            2,
+        let endpoint = "http://upgrade-readiness.example.invalid";
+        let event = |method: Method, key: &str, status: StatusCode| {
+            let (body, query) = if method == Method::PUT {
+                (SdkBody::from(UPGRADE_READINESS_BODY), "?x-id=PutObject")
+            } else {
+                (SdkBody::empty(), "")
+            };
+            ReplayEvent::new(
+                http::Request::builder()
+                    .method(method)
+                    .uri(format!("{endpoint}/{bucket}/{key}{query}"))
+                    .body(body)
+                    .unwrap(),
+                http::Response::builder()
+                    .status(status)
+                    .header("content-type", "application/xml")
+                    .body(if status == StatusCode::SERVICE_UNAVAILABLE {
+                        SdkBody::from("<Error><Code>ServiceUnavailable</Code></Error>")
+                    } else {
+                        SdkBody::empty()
+                    })
+                    .unwrap(),
+            )
+        };
+        // Keep transport scheduling outside the probe's time budget. The
+        // replay checks every writer's key and body without real network I/O.
+        let transport = StaticReplayClient::new(vec![
+            event(Method::HEAD, "", StatusCode::OK),
+            event(Method::PUT, &first_key, StatusCode::SERVICE_UNAVAILABLE),
+            event(Method::PUT, &first_key, StatusCode::SERVICE_UNAVAILABLE),
+            event(Method::PUT, &first_key, StatusCode::OK),
+            event(Method::PUT, &second_key, StatusCode::SERVICE_UNAVAILABLE),
+            event(Method::PUT, &second_key, StatusCode::OK),
+        ]);
+        let client = Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .behavior_version_latest()
+                .credentials_provider(Credentials::new(FAKE_ACCESS_KEY, FAKE_SECRET_KEY, None, None, "readiness-test"))
+                .region(Region::new("us-east-1"))
+                .endpoint_url(endpoint)
+                .force_path_style(true)
+                .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+                .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+                .http_client(transport.clone())
+                .build(),
         );
-        target.inject_for_key(
-            FakeTargetOperation::PutObject,
-            &second_key,
-            FaultAction::Status(StatusCode::SERVICE_UNAVAILABLE),
-            1,
-        );
+        client.head_bucket().bucket(bucket).send().await?;
+
         // Metadata readiness does not prove that a data write can succeed.
         let premature = client
             .put_object()
             .bucket(bucket)
             .key(&first_key)
-            .body(ByteStream::from_static(b"upgrade write readiness"))
+            .body(ByteStream::from_static(UPGRADE_READINESS_BODY))
             .send()
             .await
             .expect_err("metadata readiness does not prove write readiness");
         assert_eq!(premature.raw_response().map(|response| response.status().as_u16()), Some(503));
 
-        wait_for_upgrade_write_readiness(&[client.clone(), client.clone()], bucket, phase, Duration::from_secs(5)).await?;
-        assert_eq!(target.count_requests(FakeTargetOperation::PutObject, &first_key), 3);
-        assert_eq!(target.count_requests(FakeTargetOperation::PutObject, &second_key), 2);
-        assert!(target.has_object(bucket, &first_key));
-        assert!(target.has_object(bucket, &second_key));
-        assert!(
-            client
-                .list_objects_v2()
-                .bucket(bucket)
-                .prefix(format!("{phase}/"))
-                .send()
-                .await?
-                .contents()
-                .is_empty()
+        let started = Instant::now();
+        wait_for_upgrade_write_readiness(&[client.clone(), client], bucket, phase, Duration::from_secs(5)).await?;
+        assert_eq!(started.elapsed(), Duration::from_secs(1), "each unavailable writer must be polled again");
+        transport.assert_requests_match(&[]);
+        assert_eq!(
+            transport
+                .actual_requests()
+                .map(|request| request.method().to_string())
+                .collect::<Vec<_>>(),
+            ["HEAD", "PUT", "PUT", "PUT", "PUT", "PUT"],
         );
-        target.shutdown().await;
         Ok(())
     }
 
@@ -1805,7 +1835,7 @@ async fn stable_upgrade_deletes_foreign_reservations_without_losing_live_objects
             "key": object.key,
             "version": object.version,
             "etag": object.etag,
-            "xl_meta_sha256": hex_simd::encode_to_string(&sha2::Sha256::digest(&metadata), hex_simd::AsciiCase::Lower),
+            "xl_meta_sha256": hex_simd::encode_to_string(sha2::Sha256::digest(&metadata), hex_simd::AsciiCase::Lower),
         }));
     }
     if let Some(directory) = std::env::var_os("RUSTFS_E2E_LOG_DIR") {

@@ -274,7 +274,7 @@ Drive timeout profile preset:
   - `warn` (default): log warning and continue startup.
   - `fail`: abort startup with an error.
 
-RustFS production guidance remains direct-attached local POSIX filesystems. Network-mounted filesystems (for example `nfs`, `cifs`, `smb2`, and `fuse.*`) are treated as unsupported by this startup guard.
+RustFS production guidance remains direct-attached local POSIX filesystems. Network-mounted filesystems (for example `nfs`, `cifs`, `smb2`, and `fuse.*`) are treated as unsupported by this startup guard. On Windows, endpoints on network drives (UNC shares such as `\\server\share` and mapped drive letters) are treated the same way, even though Windows reports the server's filesystem (usually `NTFS`) for them.
 
 ## 📄 License
 
