@@ -6157,8 +6157,33 @@ impl LocalDisk {
         if age <= expiry {
             return Ok(());
         }
+        let staging = Self::meta_path(publication_root.path(), RUSTFS_META_TMP_BUCKET).join(entry.file_name());
+        let owner = os::acquire_namespace_mutation_lease_with_owner(&staging, None).await;
+        // An active publisher may have consumed or refreshed this entry while
+        // GC waited. Recheck the actual path before moving the whole prefix.
+        let metadata = match fs::symlink_metadata(entry.path()).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_dir()
+            || metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_none_or(|age| age <= expiry)
+        {
+            return Ok(());
+        }
         let target_path = Self::meta_path(root, RUSTFS_META_TMP_DELETED_BUCKET).join(Uuid::new_v4().to_string());
-        rename_all(entry.path(), target_path, Self::meta_path(root, RUSTFS_META_BUCKET), publication_root).await?;
+        os::rename_all_with_owner(
+            entry.path(),
+            target_path,
+            Self::meta_path(root, RUSTFS_META_BUCKET),
+            publication_root,
+            Some(owner),
+        )
+        .await?;
         Ok(())
     }
 
@@ -7286,6 +7311,10 @@ impl LocalDisk {
         } else {
             false
         };
+        if volume == RUSTFS_META_TMP_BUCKET && opt.recursive {
+            let staging = tmp_staging_mutation_path(&self.root, path)?;
+            namespace_owner = Some(os::acquire_namespace_mutation_lease_with_owner(&staging, namespace_owner).await);
+        }
         match self
             .delete_unleased_with_namespace_owner(volume, path, &opt, namespace_owner)
             .await
@@ -9731,6 +9760,18 @@ fn skip_access_checks(p: impl AsRef<str>) -> bool {
     }
 
     false
+}
+
+// Use the configured root rather than per-handle /proc fd paths. A nested
+// publication and cleanup of its top-level TMP entry must share one lease.
+fn tmp_staging_mutation_path(root: &Path, key: &str) -> Result<PathBuf> {
+    let (temporary, object) = build_local_disk_object_path(root, RUSTFS_META_TMP_BUCKET, key);
+    let object = normalize_path_components(object);
+    let relative = object.strip_prefix(&temporary).map_err(|_| DiskError::InvalidPath)?;
+    Ok(relative
+        .components()
+        .next()
+        .map_or_else(|| temporary.clone(), |first| temporary.join(first.as_os_str())))
 }
 
 fn local_disk_object_path(root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
@@ -18309,6 +18350,150 @@ mod test {
                 .expect("non-inline rename_data should commit over garbage metadata");
 
             assert_eq!(resp.old_current_size, None);
+        }
+    }
+
+    #[test]
+    fn tmp_staging_keys_share_top_level_prefix_and_reject_escape() {
+        let root = tempfile::tempdir().expect("staging key fixture");
+        let expected = root.path().join(RUSTFS_META_TMP_BUCKET).join("stage");
+        for path in ["stage", "stage/child", "stage/./child", "stage/child/../next"] {
+            assert_eq!(tmp_staging_mutation_path(root.path(), path).expect("contained staging key"), expected);
+        }
+        assert!(matches!(tmp_staging_mutation_path(root.path(), "../escape"), Err(DiskError::InvalidPath)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(dst_dir_fsync_group_commit)]
+    async fn inline_heal_owned_receiver_restores_metadata_when_tmp_cleanup_races_rollback() {
+        use crate::disk::{disk_store::LocalDiskWrapper, os::prepared_publication_test_hooks as hooks};
+
+        let _group_commit = os::set_dst_dir_fsync_group_commit_for_test(true);
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        for stale_gc in [false, true] {
+            let root = tempfile::tempdir().expect("owned receiver fixture directory");
+            let endpoint = Endpoint::try_from(root.path().to_str().expect("UTF-8 fixture path")).expect("endpoint");
+            let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+            let bucket = "inline-heal-owned-receiver";
+            let object = "inline-heal-owned-receiver-tmp-cleanup-rollback-object";
+            let staging = "inline-heal-owned-receiver-tmp-cleanup-stage";
+            ensure_test_volume(&disk, bucket).await;
+            ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+            let object_dir = disk.io_get_object_path(bucket, object).expect("physical object path");
+            let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
+            fs::create_dir_all(&object_dir).await.expect("object directory");
+            let version = Uuid::new_v4();
+            let mut old = test_file_info(object, version, None, Some(Bytes::from_static(b"old owned receiver payload")));
+            old.set_inline_data();
+            let old_metadata = test_meta(old);
+            fs::write(&metadata_path, &old_metadata)
+                .await
+                .expect("seed acknowledged metadata");
+            let staging_dir = disk
+                .io_get_object_path(RUSTFS_META_TMP_BUCKET, staging)
+                .expect("physical staging prefix");
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let _hook = hooks::install_at(hooks::Stage::DirFsync, &object_dir, move || {
+                let _ = entered_tx.send(());
+                // Dropping the sender also releases this executor when an assertion fails.
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            });
+            os::fsync_dir_recorder::set_grouped_failure(&object_dir, io::ErrorKind::PermissionDenied);
+            let mut repaired = test_file_info(object, version, None, Some(Bytes::from_static(b"new owned receiver payload")));
+            repaired.set_inline_data();
+            repaired.set_healing();
+            let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+            let owner = ctx.begin_namespace_commit();
+            let owner_probe = Arc::downgrade(&owner);
+            let wrapper = LocalDiskWrapper::new(Arc::clone(&disk), false);
+            let receiver = tokio::spawn(async move {
+                wrapper
+                    .rename_data_observed_with_guards(
+                        RUSTFS_META_TMP_BUCKET,
+                        staging,
+                        &repaired,
+                        bucket,
+                        object,
+                        crate::disk::RenameDataGuards {
+                            external_guard: Some(owner),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(10), entered_rx)
+                .await
+                .expect("owned receiver must reach post-publication fsync")
+                .expect("physical fsync pause");
+            assert_ne!(fs::read(&metadata_path).await.expect("published repaired metadata"), old_metadata);
+            assert_eq!(
+                fs::read(staging_dir.join(STORAGE_FORMAT_FILE_BACKUP))
+                    .await
+                    .expect("active staging rollback backup"),
+                old_metadata
+            );
+            // An incarnation-bound receiver drains even after its RPC waiter disappears.
+            receiver.abort();
+            assert!(receiver.await.err().expect("RPC waiter cancellation").is_cancelled());
+            assert!(ctx.namespace_commits_pending(), "the physical receiver must remain active");
+            let cleanup_disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("reconnected disk handle"));
+            if stale_gc {
+                std::fs::File::open(&staging_dir)
+                    .expect("staging directory")
+                    .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+                    .expect("make the active prefix eligible for stale GC");
+            }
+            let mut cleanup = tokio::spawn(async move {
+                if stale_gc {
+                    let mut entries = fs::read_dir(cleanup_disk.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?).await?;
+                    while let Some(entry) = entries.next_entry().await? {
+                        if entry.file_name() == staging {
+                            return LocalDisk::cleanup_stale_tmp_entry(
+                                entry,
+                                cleanup_disk.io_root(),
+                                &cleanup_disk.publication_root,
+                                Duration::from_secs(1),
+                            )
+                            .await;
+                        }
+                    }
+                    panic!("active staging prefix must be discoverable by GC");
+                }
+                cleanup_disk
+                    .delete(
+                        RUSTFS_META_TMP_BUCKET,
+                        staging,
+                        DeleteOptions {
+                            recursive: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), &mut cleanup).await.is_err(),
+                "request cleanup and stale GC must wait for the active receiver"
+            );
+            drop(release_tx);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while owner_probe.upgrade().is_some() || ctx.namespace_commits_pending() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("physical receiver must finish its failed-fsync rollback");
+            tokio::time::timeout(Duration::from_secs(10), cleanup)
+                .await
+                .expect("tmp cleanup must finish after physical rollback")
+                .expect("tmp cleanup task")
+                .expect("deferred tmp cleanup");
+            assert_eq!(
+                fs::read(&metadata_path).await.expect("metadata after failed-fsync rollback"),
+                old_metadata,
+                "temporary-prefix cleanup must not destroy an active receiver's rollback source"
+            );
         }
     }
 
