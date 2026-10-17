@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::filemeta::msgp_decode::MAX_MSGP_ELEMENT_SIZE;
 use crate::{
     Error, FileInfo, FileInfoOpts, FileInfoVersions, FileMeta, FileMetaShallowVersion, Result, VersionType, get_file_info,
     merge_file_meta_versions, merge_file_meta_versions_with_write_quorum,
@@ -840,6 +839,7 @@ impl MetaCacheEntriesSorted {
 }
 
 const METACACHE_STREAM_VERSION: u8 = 2;
+const METACACHE_READ_CHUNK_SIZE: usize = 64 << 10;
 
 #[derive(Debug)]
 pub struct MetacacheWriter<W> {
@@ -912,6 +912,7 @@ impl<W: AsyncWrite + Unpin> MetacacheWriter<W> {
 pub struct MetacacheReader<R> {
     rd: R,
     init: bool,
+    in_entry: bool,
     err: Option<Error>,
     buf: Vec<u8>,
     offset: usize,
@@ -923,6 +924,7 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
         Self {
             rd,
             init: false,
+            in_entry: false,
             err: None,
             buf: Vec::new(),
             offset: 0,
@@ -931,36 +933,57 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
     }
 
     pub async fn read_more(&mut self, read_size: usize) -> Result<&[u8]> {
-        // `read_size` is usually a length decoded from the stream itself, so
-        // it is untrusted: a corrupted length prefix must yield a decode
-        // error instead of a huge allocation that aborts the process
-        // (see rustfs/rustfs#2715).
-        if read_size > MAX_MSGP_ELEMENT_SIZE {
-            let err = Error::other(format!(
-                "metacache stream corrupt: element length {read_size} exceeds the {MAX_MSGP_ELEMENT_SIZE} byte limit"
-            ));
-            self.err = Some(err.clone());
-            return Err(err);
+        if let Some(err) = &self.err {
+            return Err(err.clone());
         }
 
         let pref = self.offset;
-        let ext_size = pref + read_size;
+        let Some(ext_size) = pref.checked_add(read_size) else {
+            let err = Error::other("metacache stream: element length overflow");
+            self.err = Some(err.clone());
+            return Err(err);
+        };
 
-        if self.buf.len() < ext_size {
-            let extra = ext_size - self.buf.len();
-            if let Err(e) = self.buf.try_reserve(extra) {
-                let err = Error::other(format!("metacache stream: buffer allocation of {extra} bytes failed: {e}"));
+        // A whole xl.meta can legitimately exceed the limit on its individual
+        // msgpack values. Grow only as payload arrives, so a corrupt length
+        // prefix cannot cause a speculative allocation of the advertised size.
+        while self.offset < ext_size {
+            let end = self.offset + (ext_size - self.offset).min(METACACHE_READ_CHUNK_SIZE);
+            if self.buf.len() < end {
+                let extra = end - self.buf.len();
+                if let Err(e) = self.buf.try_reserve(extra) {
+                    let err = Error::other(format!("metacache stream: buffer allocation of {extra} bytes failed: {e}"));
+                    self.err = Some(err.clone());
+                    return Err(err);
+                }
+                self.buf.resize(end, 0);
+            }
+            if let Err(e) = self.rd.read_exact(&mut self.buf[self.offset..end]).await {
+                // Listings treat Unexpected/UnexpectedEof as clean exhaustion.
+                // An incomplete entry must not hide remaining keys. Preserve
+                // the existing empty/between-entry EOF handling.
+                let err = match e.kind() {
+                    std::io::ErrorKind::UnexpectedEof if self.in_entry => Error::FileCorrupt,
+                    _ => Error::from(e),
+                };
                 self.err = Some(err.clone());
                 return Err(err);
             }
-            self.buf.resize(ext_size, 0);
+            self.offset = end;
         }
 
-        self.rd.read_exact(&mut self.buf[pref..ext_size]).await?;
-
-        self.offset += read_size;
-
         Ok(&self.buf[pref..ext_size])
+    }
+
+    async fn discard(&mut self, mut size: usize) -> Result<()> {
+        self.reset();
+        while size > 0 {
+            let chunk = size.min(METACACHE_READ_CHUNK_SIZE);
+            self.read_more(chunk).await?;
+            size -= chunk;
+            self.reset();
+        }
+        Ok(())
     }
 
     fn reset(&mut self) {
@@ -1048,6 +1071,10 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
             return Err(err.clone());
         }
 
+        if size == 0 {
+            return Ok(());
+        }
+
         let mut n = size;
 
         if self.current.is_some() {
@@ -1069,10 +1096,12 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
                 }
             };
 
+            self.in_entry = true;
             let l = self.read_str_len().await?;
-            let _ = self.read_more(l as usize).await?;
+            self.discard(usize::try_from(l).map_err(Error::other)?).await?;
             let l = self.read_bin_len().await?;
-            let _ = self.read_more(l as usize).await?;
+            self.discard(usize::try_from(l).map_err(Error::other)?).await?;
+            self.in_entry = false;
 
             n -= 1;
         }
@@ -1100,6 +1129,7 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
             }
         };
 
+        self.in_entry = true;
         let l = self.read_str_len().await?;
 
         let buf = self.read_more(l as usize).await?;
@@ -1118,6 +1148,7 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
 
         let metadata = buf.to_vec();
 
+        self.in_entry = false;
         self.reset();
 
         let entry = Some(MetaCacheEntry {
@@ -1304,6 +1335,45 @@ mod tests {
         assert!(reader.read_all().await.expect("empty stream should decode").is_empty());
     }
 
+    #[tokio::test]
+    async fn test_reader_preserves_empty_and_between_entry_eof() {
+        let mut empty = MetacacheReader::new(Cursor::new(Vec::<u8>::new()));
+        assert_eq!(empty.peek().await.expect_err("legacy empty producer must remain EOF"), Error::Unexpected);
+
+        // A complete entry without a final false marker is a supported legacy EOF.
+        let stream = vec![0xcc, 2, 0xc3, 0xa1, b'x', 0xc4, 1, 0x42];
+        let mut reader = MetacacheReader::new(Cursor::new(stream.clone()));
+        assert!(reader.peek().await.expect("complete entry must decode").is_some());
+        reader.skip(1).await.expect("current entry must advance");
+        assert_eq!(reader.peek().await.expect_err("between-entry EOF must remain EOF"), Error::Unexpected);
+
+        let mut reader = MetacacheReader::new(Cursor::new(stream));
+        reader.skip(1).await.expect("complete entry must be skippable");
+        assert_eq!(reader.peek().await.expect_err("skip must restore between-entry state"), Error::Unexpected);
+    }
+
+    #[tokio::test]
+    async fn test_reader_truncated_entry_is_corruption_at_each_field() {
+        // Missing name marker, name bytes, bin marker, bin length, or bin payload.
+        for suffix in [vec![], vec![0xa1], vec![0xa0], vec![0xa0, 0xc4], vec![0xa0, 0xc4, 1]] {
+            let mut stream = vec![0xcc, 2, 0xc3];
+            stream.extend(suffix);
+            let mut reader = MetacacheReader::new(Cursor::new(stream.clone()));
+            assert_eq!(
+                reader.peek().await.expect_err("incomplete entry must not become listing EOF"),
+                Error::FileCorrupt
+            );
+            let mut reader = MetacacheReader::new(Cursor::new(stream));
+            assert_eq!(
+                reader
+                    .skip(1)
+                    .await
+                    .expect_err("incomplete skipped entry must not become listing EOF"),
+                Error::FileCorrupt
+            );
+        }
+    }
+
     fn corrupt_stream_with_metadata_len(len_marker: u8, len: u32) -> Vec<u8> {
         let mut data = Vec::new();
         rmp::encode::write_u8(&mut data, METACACHE_STREAM_VERSION).unwrap();
@@ -1324,10 +1394,14 @@ mod tests {
         let data = corrupt_stream_with_metadata_len(0xc6, u32::MAX);
         let mut r = MetacacheReader::new(Cursor::new(data));
         let err = r.peek().await.expect_err("corrupt bin length prefix must fail to decode");
-        assert!(err.to_string().contains("exceeds"), "error should mention the exceeded limit, got: {err}");
+        assert_eq!(err, Error::FileCorrupt);
+        assert!(
+            r.buf.capacity() <= 2 * METACACHE_READ_CHUNK_SIZE,
+            "a length prefix must not reserve its payload"
+        );
 
         // The reader must stay in the error state instead of retrying.
-        assert!(r.peek().await.is_err());
+        assert_eq!(r.peek().await.expect_err("decode errors must remain sticky"), err);
     }
 
     #[tokio::test]
@@ -1341,35 +1415,151 @@ mod tests {
 
         let mut r = MetacacheReader::new(Cursor::new(data));
         let err = r.peek().await.expect_err("corrupt str length prefix must fail to decode");
-        assert!(err.to_string().contains("exceeds"), "error should mention the exceeded limit, got: {err}");
+        assert_eq!(err, Error::FileCorrupt);
+        assert!(
+            r.buf.capacity() <= 2 * METACACHE_READ_CHUNK_SIZE,
+            "a length prefix must not reserve its payload"
+        );
+        assert_eq!(r.peek().await.expect_err("decode errors must remain sticky"), err);
     }
 
     #[tokio::test]
     async fn test_reader_skip_rejects_corrupt_length_prefix() {
         let data = corrupt_stream_with_metadata_len(0xc6, u32::MAX);
         let mut r = MetacacheReader::new(Cursor::new(data));
-        assert!(r.skip(1).await.is_err(), "skip over a corrupt length prefix must fail");
+        let err = r.skip(1).await.expect_err("skip over a corrupt length prefix must fail");
+        assert_eq!(err, Error::FileCorrupt);
+        assert!(r.buf.capacity() <= METACACHE_READ_CHUNK_SIZE);
+        assert_eq!(r.skip(1).await.expect_err("skip errors must remain sticky"), err);
+        assert_eq!(r.peek().await.expect_err("skip failure must prevent decoding another entry"), err);
     }
 
-    /// Large-but-legitimate records (well above typical sizes, below the
-    /// corruption guard) must still round-trip.
+    #[tokio::test]
+    async fn test_reader_truncated_payload_after_multiple_chunks() {
+        let mut data = corrupt_stream_with_metadata_len(0xc6, u32::MAX);
+        data.extend(std::iter::repeat_n(0xab, 2 * METACACHE_READ_CHUNK_SIZE + 7));
+        let mut reader = MetacacheReader::new(Cursor::new(data));
+        let err = reader.peek().await.expect_err("partial payload must fail");
+        assert_eq!(err, Error::FileCorrupt);
+        assert!(reader.buf.capacity() <= 8 * METACACHE_READ_CHUNK_SIZE);
+        assert_eq!(reader.peek().await.expect_err("partial payload must leave a sticky error"), err);
+    }
+
+    /// The stream carries a whole xl.meta, whose aggregate size can exceed
+    /// the limit for an individual value inside its metadata.
     #[tokio::test]
     async fn test_reader_accepts_large_legitimate_metadata() {
+        for size in [16 << 20, (16 << 20) + 1] {
+            let entry = MetaCacheEntry {
+                name: "big-object".to_string(),
+                metadata: vec![0xab; size],
+                ..Default::default()
+            };
+
+            let mut f = Cursor::new(Vec::new());
+            let mut w = MetacacheWriter::new(&mut f);
+            w.write(std::slice::from_ref(&entry)).await.expect("large entry must encode");
+            w.close().await.expect("large-entry stream must close");
+
+            let mut r = MetacacheReader::new(Cursor::new(f.into_inner()));
+            let decoded = r.read_all().await.expect("large entry must decode");
+            assert_eq!(decoded, vec![entry]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reader_large_inline_version_history_remains_listable() {
+        const VERSIONS: u32 = 1700;
+        let payload = vec![0xab; 10 << 10];
+        let mut meta = FileMeta::new();
+        let mut inline = vec![1];
+        rmp::encode::write_map_len(&mut inline, VERSIONS).expect("inline version map must encode");
+        for i in 1..=VERSIONS {
+            let version_id = Uuid::from_u128(u128::from(i));
+            let mut fi = FileInfo {
+                version_id: Some(version_id),
+                mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(i64::from(i))),
+                size: i64::try_from(payload.len()).expect("test payload size must fit"),
+                ..Default::default()
+            };
+            fi.set_inline_data();
+            meta.add_version(fi).expect("inline version metadata must be valid");
+            rmp::encode::write_str(&mut inline, &version_id.to_string()).expect("inline version ID must encode");
+            rmp::encode::write_bin(&mut inline, &payload).expect("inline payload must encode");
+        }
+        // Encode the inline map once; adding payload with each version would
+        // repeatedly copy the growing map while constructing this fixture.
+        meta.data.update(&inline);
+        let metadata = meta.marshal_msg().expect("large xl.meta must encode");
+        assert!(metadata.len() > 16 << 20);
         let entry = MetaCacheEntry {
-            name: "big-object".to_string(),
-            metadata: vec![0xab; 4 << 20],
-            cached: None,
-            reusable: false,
+            name: "versioned-object".to_string(),
+            metadata,
+            ..Default::default()
         };
+        let mut output = Cursor::new(Vec::new());
+        let mut writer = MetacacheWriter::new(&mut output);
+        writer
+            .write(std::slice::from_ref(&entry))
+            .await
+            .expect("large xl.meta must enter the stream");
+        writer.close().await.expect("stream must close");
+        let mut reader = MetacacheReader::new(Cursor::new(output.into_inner()));
+        let decoded = reader
+            .peek()
+            .await
+            .expect("large xl.meta must decode")
+            .expect("object must be present");
+        assert_eq!(decoded.metadata, entry.metadata);
+        let versions = decoded
+            .file_info_versions("bucket")
+            .expect("version listing must decode xl.meta");
+        assert_eq!(versions.versions.len(), usize::try_from(VERSIONS).expect("version count must fit"));
+        let latest_id = Uuid::from_u128(u128::from(VERSIONS));
+        assert_eq!(versions.versions[0].version_id, Some(latest_id));
+        assert_eq!(versions.versions[0].size, i64::try_from(payload.len()).expect("payload size must fit"));
+        let loaded = FileMeta::load(&decoded.metadata).expect("stream must preserve valid xl.meta");
+        assert_eq!(
+            loaded.data.find(&latest_id.to_string()).expect("inline payload must decode"),
+            Some(payload)
+        );
+        assert!(reader.peek().await.expect("stream must terminate").is_none());
+    }
 
-        let mut f = Cursor::new(Vec::new());
-        let mut w = MetacacheWriter::new(&mut f);
-        w.write(std::slice::from_ref(&entry)).await.unwrap();
-        w.close().await.unwrap();
-
-        let mut r = MetacacheReader::new(Cursor::new(f.into_inner()));
-        let decoded = r.read_all().await.unwrap();
-        assert_eq!(decoded, vec![entry]);
+    #[tokio::test]
+    async fn test_reader_skip_large_entries_preserves_alignment_with_bounded_buffer() {
+        // Fixed v1/v2 framing: uint8 version, bool, fixstr name, bin32 payload.
+        // Build independently of MetacacheWriter to pin the existing wire shape.
+        for version in [1, 2] {
+            let mut stream = vec![0xcc, version];
+            for size in [0, 2 * METACACHE_READ_CHUNK_SIZE, (16 << 20) + 1] {
+                stream.extend_from_slice(&[0xc3, 0xa1, b'x', 0xc6]);
+                stream.extend_from_slice(&u32::try_from(size).expect("payload length must fit bin32").to_be_bytes());
+                stream.resize(stream.len() + size, 0xab);
+            }
+            stream.extend_from_slice(&[0xc3, 0xa1, b'y', 0xc4, 1, 0x42, 0xc2]);
+            let mut reader = MetacacheReader::new(Cursor::new(stream));
+            reader.skip(3).await.expect("large entries must be skippable");
+            assert!(reader.buf.is_empty());
+            assert!(
+                reader.buf.capacity() <= METACACHE_READ_CHUNK_SIZE,
+                "skip must not retain discarded entries"
+            );
+            let entry = reader
+                .peek()
+                .await
+                .expect("following entry must decode")
+                .expect("following entry must exist");
+            assert_eq!(entry.name, "y");
+            assert_eq!(entry.metadata, vec![0x42]);
+            reader
+                .skip(0)
+                .await
+                .expect("skipping zero with a current entry must be a no-op");
+            assert_eq!(reader.current.as_ref(), Some(&entry));
+            reader.skip(1).await.expect("consume current entry without reading another");
+            assert!(reader.peek().await.expect("stream must terminate").is_none());
+        }
     }
 
     #[test]
