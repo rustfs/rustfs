@@ -36,9 +36,10 @@ use rand::RngExt;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, S3Action};
+use rustfs_s3_types::{S3Result, s3_error};
 use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
 use rustfs_utils::{base64_decode_url_safe_no_pad, base64_encode_url_safe_no_pad};
-use s3s::{Body, S3Request, S3Response, S3Result, dto::StreamingBlob, header::CONTENT_TYPE, s3_error};
+use s3s::{Body, S3Request, S3Response, dto::StreamingBlob, header::CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -234,7 +235,7 @@ impl From<&ObjectZipDownloadAuthContext> for ObjectZipDownloadAuthContextSnapsho
 }
 
 impl TryFrom<ObjectZipDownloadAuthContextSnapshot> for ObjectZipDownloadAuthContext {
-    type Error = s3s::S3Error;
+    type Error = rustfs_s3_types::S3Error;
 
     fn try_from(snapshot: ObjectZipDownloadAuthContextSnapshot) -> S3Result<Self> {
         let mut headers = HeaderMap::new();
@@ -661,7 +662,7 @@ async fn preflight_zip_items(request: &CreateObjectZipDownloadRequest, items: &[
     Ok(())
 }
 
-fn storage_error_to_s3(err: crate::admin::storage_api::error::Error) -> s3s::S3Error {
+fn storage_error_to_s3(err: crate::admin::storage_api::error::Error) -> rustfs_s3_types::S3Error {
     ApiError::from(err).into()
 }
 
@@ -912,7 +913,7 @@ struct ZipDownloadItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use s3s::S3ErrorCode;
+    use rustfs_s3_types::S3ErrorCode;
 
     fn valid_request() -> CreateObjectZipDownloadRequest {
         CreateObjectZipDownloadRequest {

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use rustfs_s3_types::s3_error;
 
 pub struct RestTableMetadataMaintenanceHandler {}
 

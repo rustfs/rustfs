@@ -58,7 +58,7 @@ use crate::runtime_sources::{
 use crate::storage_api::site_replication::s3::{
     Body, BucketVersioningStatus, PersistedLifecycleConfiguration, PersistedLifecycleRule, PersistedOptionalReplicationStatus,
     PersistedReplicationConfiguration, PersistedReplicationDestination, PersistedReplicationRule, PersistedReplicationStatus,
-    PersistedSourceSelectionCriteria, S3Error, S3ErrorCode, S3Response, S3Result, Status, VersioningConfiguration, s3_error,
+    PersistedSourceSelectionCriteria, S3Response, Status, VersioningConfiguration,
 };
 #[cfg(test)]
 use crate::storage_api::site_replication::save_config as save_admin_config;
@@ -87,6 +87,7 @@ use rustfs_madmin::{
     SRSvcAccReplicationEnvelope, SyncStatus,
 };
 use rustfs_policy::policy::Policy;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};

@@ -24,7 +24,7 @@ there are counted in the census. A use tree that holds a comment or a literal
 is not rewritten either: it is reported and the run exits 1.
 
 Usage:
-  scripts/codemods/s3_error_to_s3_types.py [--hold FILE]... [--no-fmt] CRATE_DIR...
+  scripts/codemods/s3_error_to_s3_types.py [--hold FILE]... [--facade PATH]... [--no-fmt] CRATE_DIR...
   scripts/codemods/s3_error_to_s3_types.py --self-test
 
 CRATE_DIR is a repository-relative package directory, or a directory inside
@@ -45,6 +45,14 @@ by a crate outside this closure (for example a field of another crate's public
 struct that the file compares against); the hold is visible in the census so it
 cannot be forgotten.
 
+--facade PATH names a crate-local module that re-exports s3s's error items
+(for example crate::storage_api::site_replication::s3, kept in an allowlisted
+file). Imports and qualified paths of the four names through it are rewritten
+as if they named s3s, so code that reaches s3s only through that facade moves
+too; its other items stay on the facade. The path is matched as written, so a
+relative spelling (super::...) is only meaningful for the directory it is
+valid in. Each facade is listed in the census.
+
 Unless --no-fmt is given, rustfmt formats each rewritten file afterwards, so the
 split imports land where rustfmt sorts them.
 
@@ -56,6 +64,7 @@ rewrite (listed); 2 on a usage error or a broken input.
 from __future__ import annotations
 
 import argparse
+import functools
 import re
 import shutil
 import subprocess
@@ -77,12 +86,8 @@ CODE, COMMENT, LITERAL = 0, 1, 2
 IDENT_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
 CHAR_LITERAL = re.compile(r"'(?:\\(?:[nrt\\0'\"]|x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]{1,6}\})|[^\\'\n])'")
 RAW_STRING_START = re.compile(r'r(#*)"')
-USE_START = re.compile(
-    r"(?m)^(?P<indent>[ \t]*)(?P<attrs>(?:#\[[^\]\n]*\][ \t]*)*)(?P<vis>(?:pub(?:[ \t]*\([^)\n]*\))?[ \t]+)?)"
-    r"use[ \t]+(?P<lead>::)?" + OLD_CRATE + r"::"
-)
 NAME_PATTERN = "|".join(sorted(NAMES, key=len, reverse=True))
-QUALIFIED = re.compile(r"(?<![A-Za-z0-9_])" + OLD_CRATE + r"::(?P<name>" + NAME_PATTERN + r")(?![A-Za-z0-9_])")
+FACADE_PATH = re.compile(r"(?:crate|super|self)(?:::[A-Za-z_][A-Za-z0-9_]*)+")
 OLD_CRATE_PATH = re.compile(r"(?<![A-Za-z0-9_])" + OLD_CRATE + r"(?:::|[ \t]*;|[ \t]+as[ \t])")
 NEW_CRATE_PATH = re.compile(r"(?<![A-Za-z0-9_])" + NEW_CRATE + r"::")
 ATTR_LINE = re.compile(r"^[ \t]*#\[[^\n]*\][ \t]*$")
@@ -105,6 +110,32 @@ RUSTFS_MACRO_IMPORT = re.compile(
 
 class UsageError(Exception):
     """A broken argument or input: exit 2."""
+
+
+@functools.lru_cache(maxsize=None)
+def _patterns(facades: tuple[str, ...]) -> tuple[re.Pattern[str], re.Pattern[str]]:
+    """The use-statement and qualified-path patterns for s3s plus the given facades.
+
+    A facade is a crate-local module path that re-exports s3s's error items
+    (for example `crate::storage_api::site_replication::s3`); its paths are
+    treated exactly like `s3s::` paths for the four names and nothing else.
+    """
+    roots = "|".join(re.escape(root) for root in sorted((OLD_CRATE, *facades), key=len, reverse=True))
+    use_start = re.compile(
+        r"(?m)^(?P<indent>[ \t]*)(?P<attrs>(?:#\[[^\]\n]*\][ \t]*)*)(?P<vis>(?:pub(?:[ \t]*\([^)\n]*\))?[ \t]+)?)"
+        r"use[ \t]+(?P<lead>::)?(?P<root>" + roots + r")::"
+    )
+    qualified = re.compile(
+        r"(?<![A-Za-z0-9_])(?P<root>" + roots + r")::(?P<name>" + NAME_PATTERN + r")(?![A-Za-z0-9_])"
+    )
+    return use_start, qualified
+
+
+def check_facades(facades: list[str]) -> tuple[str, ...]:
+    for facade in facades:
+        if not FACADE_PATH.fullmatch(facade):
+            raise UsageError(f"facade '{facade}' is not a crate-relative module path such as crate::a::s3")
+    return tuple(facades)
 
 
 def classify(text: str) -> bytearray:
@@ -218,15 +249,16 @@ class FileResult:
     unsupported: list[int] = field(default_factory=list)
 
 
-def rewrite(text: str) -> FileResult:
+def rewrite(text: str, facades: tuple[str, ...] = ()) -> FileResult:
     """Rewrite one Rust source; pure, so a second pass over its output is a no-op."""
+    use_start, qualified = _patterns(facades)
     kinds = classify(text)
     out: list[str] = []
     cursor = 0
     result = FileResult(text)
     skipped_spans: list[tuple[int, int]] = []
 
-    for match in USE_START.finditer(text):
+    for match in use_start.finditer(text):
         start = match.start("indent")
         use_keyword = match.start("vis") + len(match.group("vis"))
         if start < cursor or kinds[use_keyword] != CODE:
@@ -253,12 +285,12 @@ def rewrite(text: str) -> FileResult:
             skipped_spans.append((start, end))
             continue
         kept = [item for item in items if item_head(item) not in NAMES]
-        indent, vis, lead = match.group("indent"), match.group("vis"), match.group("lead") or ""
+        indent, vis, lead, root = match.group("indent"), match.group("vis"), match.group("lead") or "", match.group("root")
         attrs = match.group("attrs")
         preceding = _preceding_attribute_lines(text, start)
         statements = [f"{indent}{attrs}{vis}use {lead}{NEW_CRATE}::{render_tree(moved)};"]
         if kept:
-            statements.append(f"{preceding}{indent}{attrs}{vis}use {lead}{OLD_CRATE}::{render_tree(kept)};")
+            statements.append(f"{preceding}{indent}{attrs}{vis}use {lead}{root}::{render_tree(kept)};")
         out.append(text[cursor:start])
         out.append("\n".join(statements))
         cursor = end + 1
@@ -270,7 +302,7 @@ def rewrite(text: str) -> FileResult:
     skipped_spans = [(a, b) for a, b in _respan(result.text, text, skipped_spans)]
     pieces: list[str] = []
     cursor = 0
-    for match in QUALIFIED.finditer(text):
+    for match in qualified.finditer(text):
         start = match.start()
         if _is_nested_module_path(text, start) or any(a <= start < b for a, b in skipped_spans):
             continue
@@ -327,14 +359,15 @@ def _is_nested_module_path(text: str, start: int) -> bool:
     return False
 
 
-def remaining_lines(text: str) -> list[int]:
-    """Lines whose code still names one of NAMES through the s3s crate."""
+def remaining_lines(text: str, facades: tuple[str, ...] = ()) -> list[int]:
+    """Lines whose code still names one of NAMES through the s3s crate or a given facade."""
+    use_start, qualified = _patterns(facades)
     kinds = classify(text)
     lines = set()
-    for match in QUALIFIED.finditer(text):
+    for match in qualified.finditer(text):
         if kinds[match.start()] == CODE and not _is_nested_module_path(text, match.start()):
             lines.add(text.count("\n", 0, match.start()) + 1)
-    for match in USE_START.finditer(text):
+    for match in use_start.finditer(text):
         if kinds[match.end() - 1] != CODE:
             continue
         end = match.end()
@@ -665,7 +698,10 @@ class CrateCensus:
     glob_unresolved: list[tuple[str, int, str]] = field(default_factory=list)
 
 
-def run(root: Path, crates: list[str], holds: list[str], fmt: bool = True, out=sys.stdout) -> int:
+def run(
+    root: Path, crates: list[str], holds: list[str], fmt: bool = True, out=sys.stdout, facades: list[str] | None = None
+) -> int:
+    facade_paths = check_facades(facades or [])
     crates = [crate.rstrip("/") for crate in crates]
     packages: dict[str, str] = {}
     for crate in crates:
@@ -690,16 +726,16 @@ def run(root: Path, crates: list[str], holds: list[str], fmt: bool = True, out=s
             text = path.read_text(encoding="utf-8")
             if relative in refused_files or relative in hold_set:
                 bucket = census.refused if relative in refused_files else census.held
-                left = remaining_lines(text)
+                left = remaining_lines(text, facade_paths)
                 if left:
                     bucket.append((relative, len(left)))
                 continue
-            result = rewrite(text)
+            result = rewrite(text, facade_paths)
             census.use_statements += result.use_statements
             census.qualified_paths += result.qualified_paths
             census.in_comments += result.in_comments
             census.in_literals += result.in_literals
-            census.remaining += [f"{relative}:{line}" for line in remaining_lines(result.text)]
+            census.remaining += [f"{relative}:{line}" for line in remaining_lines(result.text, facade_paths)]
             if result.text != text:
                 path.write_text(result.text, encoding="utf-8")
                 census.changed.append(relative)
@@ -750,6 +786,8 @@ def run(root: Path, crates: list[str], holds: list[str], fmt: bool = True, out=s
         if result.returncode != 0:
             raise UsageError("rustfmt failed on the rewritten files")
 
+    for facade in facade_paths:
+        print(f"facade   {facade}: its S3Error, S3ErrorCode, S3Result and s3_error paths are treated as s3s's", file=out)
     return _print_census(censuses, out)
 
 
@@ -802,6 +840,7 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("crates", nargs="+", metavar="CRATE_DIR")
     parser.add_argument("--hold", action="append", default=[], metavar="FILE")
+    parser.add_argument("--facade", action="append", default=[], metavar="PATH")
     parser.add_argument("--no-fmt", action="store_true")
     args = parser.parse_args(argv)
     top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=False)
@@ -809,7 +848,7 @@ def main(argv: list[str]) -> int:
         print("error: not inside a git checkout", file=sys.stderr)
         return 2
     try:
-        return run(Path(top.stdout.strip()), args.crates, args.hold, fmt=not args.no_fmt)
+        return run(Path(top.stdout.strip()), args.crates, args.hold, fmt=not args.no_fmt, facades=args.facade)
     except UsageError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -1181,6 +1220,74 @@ class SelfTest(unittest.TestCase):
         for untouched in ("crates/a/src/object/stray.rs", "crates/a/src/bin/tool.rs"):
             self.assertEqual((root / untouched).read_text(), files[untouched], untouched)
         self.assertNotIn("glob", out.text.lower())
+
+    # -- facades that re-export the s3s error items --
+
+    FACADE = "crate::storage_api::site::s3"
+
+    def test_facade_import_moves_the_error_items_and_keeps_the_rest_on_the_facade(self):
+        source = "use crate::storage_api::site::s3::{\n    Body, S3Error, S3ErrorCode as Code, S3Result, s3_error,\n};\nfn f() {}\n"
+        self.assertEqual(
+            rewrite(source, (self.FACADE,)).text,
+            "use rustfs_s3_types::{S3Error, S3ErrorCode as Code, S3Result, s3_error};\nuse crate::storage_api::site::s3::Body;\nfn f() {}\n",
+        )
+        self.assertEqual(remaining_lines(rewrite(source, (self.FACADE,)).text, (self.FACADE,)), [])
+
+    def test_facade_qualified_paths_move(self):
+        source = "fn f() -> crate::storage_api::site::s3::S3Result<()> { Err(crate::storage_api::site::s3::s3_error!(A)) }\n"
+        result = rewrite(source, (self.FACADE,))
+        self.assertEqual(result.text, "fn f() -> rustfs_s3_types::S3Result<()> { Err(rustfs_s3_types::s3_error!(A)) }\n")
+        self.assertEqual(result.qualified_paths, 2)
+
+    def test_facade_paths_are_untouched_without_the_option_and_reported_with_it(self):
+        source = "use crate::storage_api::site::s3::{S3Error, s3_error};\nlet c = crate::storage_api::site::s3::S3ErrorCode::A;\n"
+        self.assertEqual(rewrite(source).text, source)
+        self.assertEqual(remaining_lines(source), [])
+        self.assertEqual(remaining_lines(source, (self.FACADE,)), [1, 2])
+
+    def test_paths_that_are_not_the_facade_are_untouched(self):
+        for source in (
+            "use crate::storage_api::site::s3x::S3Error;\n",
+            "use crate::storage_api::other::s3::{S3Error, Body};\n",
+            "let a = my::crate::storage_api::site::s3::S3Error::new();\n",
+            "use crate::storage_api::site::s3::dto::S3Error;\n",
+            "use crate::storage_api::site::s3::{Body, S3Request};\n",
+            "// use crate::storage_api::site::s3::S3Error;\nconst A: &str = \"crate::storage_api::site::s3::S3Error\";\n",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(rewrite(source, (self.FACADE,)).text, source)
+
+    def test_driver_rejects_a_facade_that_is_not_a_crate_relative_module_path(self):
+        root = self.scratch_repo(self.base_files())
+        for facade in ("s3s", "crate", "crate::", "crate::f::s3::", "crate::f s3", "::crate::f", "s3s::dto"):
+            with self.subTest(facade=facade), self.assertRaisesRegex(UsageError, "facade"):
+                run(root, ["crates/a"], [], fmt=False, out=_Capture(), facades=[facade])
+        self.assertEqual((root / "crates/a/src/lib.rs").read_text(), self.base_files()["crates/a/src/lib.rs"])
+
+    def test_driver_rewrites_a_facade_parent_and_anchors_its_glob_children(self):
+        files = self.base_files()
+        files.update(
+            {
+                "crates/a/src/held.rs": "pub struct H;\n",
+                "crates/a/src/site/mod.rs": f"use {self.FACADE}::{{Body, S3Error, s3_error}};\nmod hooks;\n",
+                "crates/a/src/site/hooks.rs": "use super::*;\nfn f() -> S3Error { s3_error!(A) }\n",
+            }
+        )
+        root = self.scratch_repo(files)
+        out = _Capture()
+        self.assertEqual(run(root, ["crates/a/src/site"], [], fmt=False, out=out, facades=[self.FACADE]), 0, out.text)
+        self.assertIn(f"facade   {self.FACADE}", out.text)
+        self.assertEqual(
+            (root / "crates/a/src/site/mod.rs").read_text(),
+            f"use rustfs_s3_types::{{S3Error, s3_error}};\nuse {self.FACADE}::Body;\nmod hooks;\n",
+        )
+        self.assertEqual(
+            (root / "crates/a/src/site/hooks.rs").read_text(),
+            "use super::*;\nuse rustfs_s3_types::s3_error;\nfn f() -> S3Error { s3_error!(A) }\n",
+        )
+        second = _Capture()
+        self.assertEqual(run(root, ["crates/a/src/site"], [], fmt=False, out=second, facades=[self.FACADE]), 0)
+        self.assertIn("total: 0 files changed in 1 crates", second.text)
 
     def test_driver_rejects_a_bad_crate_or_hold(self):
         root = self.scratch_repo(self.base_files())

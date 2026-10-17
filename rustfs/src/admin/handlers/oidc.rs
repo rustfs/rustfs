@@ -26,7 +26,8 @@ use rustfs_config::{ENV_RUSTFS_BROWSER_REDIRECT_URL, MAX_ADMIN_REQUEST_BODY_SIZE
 use rustfs_iam::federation::{FederatedSessionBindingError, FederationError};
 use rustfs_iam::oidc::{OidcProviderConfigInput, OidcProviderValidationInput};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use time::OffsetDateTime;

@@ -20,7 +20,8 @@ use rustfs_credentials::Credentials;
 use rustfs_iam::store::Store;
 use rustfs_iam::sys::IamSys;
 use rustfs_policy::policy::{Args, action::Action};
-use s3s::{Body, S3Request, S3Result, s3_error};
+use rustfs_s3_types::{S3Result, s3_error};
+use s3s::{Body, S3Request};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -542,7 +543,7 @@ mod tests {
         let err = res.expect_err("gate should reject the request");
         assert_eq!(
             err.code(),
-            &s3s::S3ErrorCode::AccessDenied,
+            &rustfs_s3_types::S3ErrorCode::AccessDenied,
             "admin gate rejection must map to the AccessDenied S3 error code"
         );
     }
@@ -610,7 +611,7 @@ mod tests {
         let err = authorize_admin_request(&req, vec![admin_action()])
             .await
             .expect_err("a request without credentials must be rejected");
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("get cred failed"));
     }
 

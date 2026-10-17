@@ -16,11 +16,12 @@ use crate::admin::runtime_sources::object_store_from_extensions;
 use http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_utils::{
     MaskedAccessKey,
     http::{AMZ_REQUEST_ID, REQUEST_ID_HEADER},
 };
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
+use s3s::{Body, S3Request, S3Response, header::CONTENT_TYPE};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -217,7 +218,7 @@ fn endpoints_from_context() -> Option<crate::admin::storage_api::runtime::Endpoi
     current_endpoints_handle()
 }
 
-fn validate_start_decommission_guards(decommission_running: bool, rebalance_running: bool) -> s3s::S3Result<()> {
+fn validate_start_decommission_guards(decommission_running: bool, rebalance_running: bool) -> rustfs_s3_types::S3Result<()> {
     if decommission_running {
         return Err(s3_error!(InvalidRequest, "DecommissionAlreadyRunning"));
     }
@@ -238,7 +239,7 @@ fn validate_pool_mutation_leader(
     idx: usize,
     operation: &str,
     audit: PoolAuditContext<'_>,
-) -> s3s::S3Result<()> {
+) -> rustfs_s3_types::S3Result<()> {
     let endpoint = endpoints
         .as_ref()
         .get(idx)
@@ -267,7 +268,7 @@ fn decommission_peer_target(
     idx: usize,
     operation: &str,
     audit: PoolAuditContext<'_>,
-) -> s3s::S3Result<Option<PeerRestClient>> {
+) -> rustfs_s3_types::S3Result<Option<PeerRestClient>> {
     let endpoint = endpoints
         .as_ref()
         .get(idx)
@@ -1164,21 +1165,21 @@ mod pools_handler_tests {
     #[test]
     fn test_validate_start_decommission_guards_rejects_decommission_running() {
         let err = validate_start_decommission_guards(true, false).expect_err("decommission running should be rejected");
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("DecommissionAlreadyRunning"));
     }
 
     #[test]
     fn test_validate_start_decommission_guards_rejects_rebalance_running() {
         let err = validate_start_decommission_guards(false, true).expect_err("rebalance running should be rejected");
-        assert_eq!(err.code(), &s3s::S3ErrorCode::OperationAborted);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::OperationAborted);
         assert_eq!(err.message(), Some("Decommission cannot be started, rebalance is already in progress"));
     }
 
     #[test]
     fn test_validate_start_decommission_guards_prefers_decommission_over_rebalance() {
         let err = validate_start_decommission_guards(true, true).expect_err("decommission should be checked before rebalance");
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("DecommissionAlreadyRunning"));
     }
 
@@ -1214,7 +1215,7 @@ mod pools_handler_tests {
         let err = validate_pool_mutation_leader(&endpoints, 0, "cancel decommission", audit)
             .expect_err("remote first endpoint should reject mutation");
 
-        assert_eq!(err.code(), &s3s::S3ErrorCode::OperationAborted);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::OperationAborted);
         assert!(
             err.message()
                 .expect("rejection should include message")
@@ -1225,14 +1226,14 @@ mod pools_handler_tests {
     #[test]
     fn test_contextualize_admin_pool_api_error_preserves_code_and_adds_pool_context() {
         let err = crate::error::ApiError {
-            code: s3s::S3ErrorCode::InvalidRequest,
+            code: rustfs_s3_types::S3ErrorCode::InvalidRequest,
             message: "decommission already running".to_string(),
             source: None,
         };
 
         let err = contextualize_admin_pool_api_error(err, "start decommission", "pools [1, 3]");
 
-        assert_eq!(err.code, s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code, rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(
             err.message,
             "admin start decommission failed for pools [1, 3]: decommission already running"
@@ -1245,12 +1246,12 @@ mod pools_handler_tests {
 
         let err = decommission_start_api_error(err);
 
-        assert_eq!(err.code, s3s::S3ErrorCode::InternalError);
+        assert_eq!(err.code, rustfs_s3_types::S3ErrorCode::InternalError);
         assert_eq!(err.message, POOL_ACTIVATION_FLEET_PROOF_REQUIRED);
         assert!(err.source.is_some());
 
         let unrelated = decommission_start_api_error(crate::storage_api::error::StorageError::other("disk read failed"));
-        assert_eq!(unrelated.code, s3s::S3ErrorCode::InternalError);
+        assert_eq!(unrelated.code, rustfs_s3_types::S3ErrorCode::InternalError);
         assert_eq!(unrelated.message, "We encountered an internal error, please try again.");
     }
 
@@ -1271,7 +1272,7 @@ mod pools_handler_tests {
         let audit = PoolAuditContext::new("req-1", "access-key", "127.0.0.1:9000");
         let err = decommission_admin_not_initialized_error_with_audit("start decommission", audit);
 
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InternalError);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
         assert_eq!(err.message(), Some("Failed to start decommission: object layer not initialized"));
     }
 
@@ -1279,7 +1280,7 @@ mod pools_handler_tests {
     fn test_pool_admin_missing_credentials_error_formats_list_context() {
         let err = pool_admin_missing_credentials_error("list pools");
 
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("Failed to list pools: missing credentials"));
     }
 
@@ -1287,7 +1288,7 @@ mod pools_handler_tests {
     fn test_pool_admin_missing_credentials_error_formats_decommission_context() {
         let err = pool_admin_missing_credentials_error("start decommission");
 
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("Failed to start decommission: missing credentials"));
     }
 
@@ -1295,7 +1296,7 @@ mod pools_handler_tests {
     fn test_pool_admin_missing_credentials_error_with_request_preserves_response_contract() {
         let err = pool_admin_missing_credentials_error_with_request("cancel decommission", "req-1", "127.0.0.1:9000");
 
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("Failed to cancel decommission: missing credentials"));
     }
 
@@ -1303,7 +1304,7 @@ mod pools_handler_tests {
     fn test_pool_admin_query_parse_error_formats_status_context() {
         let err = pool_admin_query_parse_error("load pool status");
 
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("Failed to load pool status: invalid query parameters"));
     }
 
@@ -1321,7 +1322,7 @@ mod pools_handler_tests {
         let audit = PoolAuditContext::new("req-1", "access-key", "127.0.0.1:9000");
         let err = pool_admin_query_parse_error_with_audit("start decommission", audit);
 
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("Failed to start decommission: invalid query parameters"));
     }
 
@@ -1330,7 +1331,7 @@ mod pools_handler_tests {
         let audit = PoolAuditContext::new("req-1", "access-key", "127.0.0.1:9000");
         let err = pool_admin_pool_parse_error_with_audit("start decommission", "pool-x", audit);
 
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("Failed to start decommission: invalid pool `pool-x`"));
     }
 
@@ -1339,7 +1340,7 @@ mod pools_handler_tests {
         let audit = PoolAuditContext::new("req-1", "access-key", "127.0.0.1:9000");
         let err = pool_admin_pool_index_error_with_audit("start decommission", 4, 2, audit);
 
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
         assert_eq!(
             err.message(),
             Some("Failed to start decommission: pool index 4 is out of range for 2 pools")
@@ -1351,7 +1352,7 @@ mod pools_handler_tests {
         let audit = PoolAuditContext::new("req-1", "access-key", "127.0.0.1:9000");
         let err = pool_admin_pool_not_found_error_with_audit("cancel decommission", "pool-x", audit);
 
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("Failed to cancel decommission: pool `pool-x` was not found"));
     }
 

@@ -46,8 +46,9 @@ use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr as _;
@@ -2265,7 +2266,7 @@ mod tests {
             super::REPLICATION_MRF_MAX_STREAM_ENTRIES
         );
         let error = super::ensure_complete_mrf_stream(truncated).expect_err("partial streams must not return 200");
-        assert_eq!(error.code(), &s3s::S3ErrorCode::ServiceUnavailable);
+        assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::ServiceUnavailable);
     }
 
     #[test]

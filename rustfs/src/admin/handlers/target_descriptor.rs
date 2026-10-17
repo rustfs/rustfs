@@ -21,6 +21,7 @@ use rustfs_config::{
     MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC,
     MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, MYSQL_QUEUE_DIR, POSTGRES_QUEUE_DIR, REDIS_QUEUE_DIR,
 };
+use rustfs_s3_types::{S3Result, s3_error};
 use rustfs_targets::{
     BuiltinTargetAdminDescriptor, SharedTarget, TargetAdminMetadata, TargetDomain, TargetError, TargetHealthReason,
     TargetHealthState, TargetRequestValidator, check_amqp_broker_available, check_kafka_broker_available,
@@ -35,7 +36,7 @@ use rustfs_targets::{
     target::{TargetType, mqtt::MQTTTlsConfig},
 };
 use rustfs_utils::egress::OutboundPolicy;
-use s3s::{Body, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
+use s3s::{Body, S3Response, header::CONTENT_TYPE};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;

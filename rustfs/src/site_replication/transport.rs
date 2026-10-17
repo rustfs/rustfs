@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use rustfs_s3_types::s3_error;
 
 pub(crate) const SITE_REPLICATION_PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 

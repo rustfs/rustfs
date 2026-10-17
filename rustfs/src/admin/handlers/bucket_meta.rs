@@ -45,12 +45,12 @@ use rustfs_policy::policy::{
     BucketPolicy,
     action::{Action, AdminAction},
 };
+use rustfs_s3_types::{S3Result, s3_error};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::{
-    Body, S3Request, S3Response, S3Result,
+    Body, S3Request, S3Response,
     dto::{ObjectLockConfiguration, ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration},
     header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE},
-    s3_error,
 };
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
@@ -73,7 +73,7 @@ const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_BUCKET_META: &str = "bucket_meta";
 const EVENT_ADMIN_BUCKET_META_STATE: &str = "admin_bucket_meta_state";
 
-fn export_internal_error(message: impl Into<String>) -> s3s::S3Error {
+fn export_internal_error(message: impl Into<String>) -> rustfs_s3_types::S3Error {
     let message = message.into();
     s3_error!(InternalError, "{message}")
 }
@@ -92,7 +92,7 @@ enum ExportConfigError {
     /// already decoded. Nothing about the stored bytes is in doubt, so the
     /// export fails closed rather than reporting healthy metadata as
     /// unreadable.
-    Internal(s3s::S3Error),
+    Internal(rustfs_s3_types::S3Error),
 }
 
 impl ExportConfigError {
@@ -1540,7 +1540,7 @@ mod backup_zip_compatibility_tests {
             )
             .await
             .expect_err("persisted invalid XML must not disappear from an ordinary backup");
-        assert_eq!(ordinary.code(), &s3s::S3ErrorCode::InternalError);
+        assert_eq!(ordinary.code(), &rustfs_s3_types::S3ErrorCode::InternalError);
 
         let diagnostic = ExportBucketMetadata {}
             .call(
@@ -1676,7 +1676,7 @@ mod backup_zip_compatibility_tests {
                 )
                 .await
                 .expect_err("an ordinary backup must fail rather than omit an unreadable configuration");
-            assert_eq!(*ordinary.code(), s3s::S3ErrorCode::InternalError);
+            assert_eq!(*ordinary.code(), rustfs_s3_types::S3ErrorCode::InternalError);
             assert!(
                 ordinary
                     .message()
@@ -1731,7 +1731,7 @@ mod backup_zip_compatibility_tests {
                 )
                 .await
                 .expect_err("diagnostic exports are never backups");
-            assert_eq!(*error.code(), s3s::S3ErrorCode::InvalidRequest);
+            assert_eq!(*error.code(), rustfs_s3_types::S3ErrorCode::InvalidRequest);
             assert_eq!(
                 metadata_sys::get_config_from_disk(UNREADABLE)
                     .await
@@ -1803,7 +1803,7 @@ mod backup_zip_compatibility_tests {
                 )
                 .await
                 .expect_err("non-restorable archive preflight must reject before any config write");
-            assert_eq!(*error.code(), s3s::S3ErrorCode::InvalidRequest);
+            assert_eq!(*error.code(), rustfs_s3_types::S3ErrorCode::InvalidRequest);
             assert_eq!(
                 metadata_sys::get_config_from_disk(HEALTHY)
                     .await
@@ -1853,7 +1853,7 @@ mod backup_zip_compatibility_tests {
             )
             .await
             .expect_err("complete diagnostics must still reject import");
-        assert_eq!(*error.code(), s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(*error.code(), rustfs_s3_types::S3ErrorCode::InvalidRequest);
 
         let response = ExportBucketMetadata {}
             .call(
@@ -2039,7 +2039,7 @@ mod backup_zip_compatibility_tests {
             )
             .await
             .expect_err("one unreadable configuration must fail the ordinary whole-cluster backup");
-        assert_eq!(*cluster_export.code(), s3s::S3ErrorCode::InternalError);
+        assert_eq!(*cluster_export.code(), rustfs_s3_types::S3ErrorCode::InternalError);
         assert_eq!(
             metadata_sys::get_config_from_disk(UNREADABLE_BUCKET)
                 .await
@@ -2054,7 +2054,7 @@ mod backup_zip_compatibility_tests {
 mod shared_gate_tests {
     use super::*;
     use http::Uri;
-    use s3s::S3ErrorCode;
+    use rustfs_s3_types::S3ErrorCode;
 
     fn credential_less_request(method: Method, uri: &'static str) -> S3Request<Body> {
         S3Request {
