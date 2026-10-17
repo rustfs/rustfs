@@ -111,7 +111,7 @@ impl Fixture {
             .user(
                 BROKER,
                 json!({"Version":"2012-10-17","Statement":[{
-            "Effect":"Allow","Action":"admin:IssuePluginAttempt","Resource":"*"}]}),
+            "Effect":"Allow","Action":"admin:IssuePluginAttempt"}]}),
             )
             .await;
         fixture
