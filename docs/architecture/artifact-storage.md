@@ -121,9 +121,11 @@ prove that historical results are safe to delete.
 
 `crates/ecstore/src/store/init/tests/artifact_bucket_tests.rs` uses real four-disk
 ECStore instances for creation, restart, pending creation retry, configuration
-updates, metadata replacement, and versioning rejection. Run:
+updates, metadata replacement, and versioning rejection. Direct libtest runs
+use the same 4 MiB thread stack as the repository's ecstore nextest setup:
 
 ```sh
+export RUST_MIN_STACK=4194304
 cargo test --locked -p rustfs-storage-api --lib artifact
 cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_bucket -- --test-threads=1
 cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_put_seal -- --test-threads=1
