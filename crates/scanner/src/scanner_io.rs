@@ -955,6 +955,20 @@ fn scanner_bucket_scan_status(has_failed: bool, has_partial: bool, has_namespace
     }
 }
 
+fn scanner_partial_progress_is_usable(
+    bucket_plan_complete: bool,
+    scan_scope_matches: bool,
+    bucket_status: ScannerBucketScanStatus,
+    has_set_failure: bool,
+    has_missing_namespace: bool,
+) -> bool {
+    bucket_plan_complete
+        && scan_scope_matches
+        && bucket_status == ScannerBucketScanStatus::Partial
+        && !has_set_failure
+        && !has_missing_namespace
+}
+
 fn scanner_cycle_cold_zero_walk_oracle(
     scan_scope: &ScannerBucketScanScope,
     all_buckets: &[BucketInfo],
@@ -1463,6 +1477,7 @@ pub(crate) struct ScannerCycleResult {
     publication_epoch: Option<u64>,
     activity_digest: Option<[u8; 32]>,
     usage_update_emitted: bool,
+    partial_bucket_progress: bool,
     dirty_usage_clear: Option<DirtyUsageBuckets>,
     remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
     distributed_segment_invalidation_evidence: Option<DistributedSegmentInvalidationEvidence>,
@@ -1481,6 +1496,7 @@ impl ScannerCycleResult {
             publication_epoch: None,
             activity_digest: None,
             usage_update_emitted: false,
+            partial_bucket_progress: false,
             dirty_usage_clear,
             remote_dirty_usage_acknowledgements: Vec::new(),
             distributed_segment_invalidation_evidence: None,
@@ -1521,6 +1537,16 @@ impl ScannerCycleResult {
 
     pub(crate) fn has_usage_update(&self) -> bool {
         self.usage_update_emitted
+    }
+
+    pub(crate) fn with_partial_bucket_progress(mut self, partial_bucket_progress: bool) -> Self {
+        self.publication_expectation = None;
+        self.partial_bucket_progress = partial_bucket_progress;
+        self
+    }
+
+    pub(crate) fn has_partial_bucket_progress(&self) -> bool {
+        self.partial_bucket_progress
     }
 
     fn with_failed_dirty_usage(mut self, failed_dirty_usage: bool) -> Self {

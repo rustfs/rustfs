@@ -20,6 +20,41 @@ const TEST_PLAN_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([7; 32
 const TEST_COVERAGE_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([6; 32]);
 
 #[test]
+fn partial_progress_requires_complete_scope_and_no_hard_failure() {
+    for plan_complete in [false, true] {
+        for scope_matches in [false, true] {
+            for set_failed in [false, true] {
+                for missing_namespace in [false, true] {
+                    for status in [
+                        ScannerBucketScanStatus::Complete,
+                        ScannerBucketScanStatus::Partial,
+                        ScannerBucketScanStatus::Failed,
+                        ScannerBucketScanStatus::NamespaceNotFound,
+                    ] {
+                        let expected = plan_complete
+                            && scope_matches
+                            && !set_failed
+                            && !missing_namespace
+                            && status == ScannerBucketScanStatus::Partial;
+                        assert_eq!(
+                            scanner_partial_progress_is_usable(
+                                plan_complete,
+                                scope_matches,
+                                status,
+                                set_failed,
+                                missing_namespace
+                            ),
+                            expected,
+                            "plan={plan_complete}, scope={scope_matches}, status={status:?}, set_failed={set_failed}, missing_namespace={missing_namespace}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn scanner_bucket_inventory_requires_exact_unique_set_union() {
     let first = BucketInfo {
         name: "first".to_string(),

@@ -336,7 +336,7 @@ async fn write_delete_rollback_file(
     volume: &str,
     object_dir: &Path,
     rollback_dir: Uuid,
-    name: &str,
+    name: &'static str,
     data: &[u8],
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Result<()> {
@@ -354,17 +354,33 @@ async fn write_delete_rollback_file(
         std::fs::create_dir_all(&staging_root)?;
         #[cfg(test)]
         run_owned_file_write_before_open(&path);
+        // tempfile's Windows `persist` hands both the staged and the final path
+        // straight to `MoveFileExW`, bypassing std's long-path handling, so a
+        // deep object key failed every delete at MAX_PATH (rustfs#8545).
+        let staging_root = rustfs_utils::extended_length_path(&staging_root)?;
+        let destination = rustfs_utils::extended_length_path(&path)?;
         // Private directory staging is reclaimed by existing tmp cleanup after
         // a crash and cannot leave a regular artifact in the user's bucket.
         let staging_dir = tempfile::Builder::new()
             .prefix(".delete-rollback-")
             .tempdir_in(&staging_root)?;
-        let mut staged = tempfile::NamedTempFile::new_in(staging_dir.path())?;
+        let staged_path = staging_dir.path().join(name);
+        let mut staged_options = std::fs::OpenOptions::new();
+        staged_options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            staged_options.mode(0o600);
+        }
+        let mut staged = staged_options.open(&staged_path)?;
         std::io::Write::write_all(&mut staged, &data)?;
         if sync {
-            staged.as_file().sync_all()?;
+            staged.sync_all()?;
         }
-        staged.persist(path).map_err(|err| err.error)?;
+        // Close the writer before publishing via std::fs::rename, which applies
+        // verbatim long-path normalization and POSIX-semantics replacement on Windows.
+        drop(staged);
+        std::fs::rename(&staged_path, &destination)?;
         if sync {
             os::fsync_dir_std(&backup_dir)?;
             if let Some(parent) = backup_dir.parent() {
@@ -19417,6 +19433,62 @@ mod test {
         assert!(!logs.contents().contains("reliable_rename failed"));
     }
 
+    // rustfs#8545: the rollback backup is staged through tempfile, whose Windows
+    // `persist` calls `MoveFileExW` with the raw path; past MAX_PATH every
+    // delete of such a key failed with 500 while PUT and GET still worked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn windows_and_unix_delete_backs_up_metadata_beyond_max_path() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "bucket";
+        ensure_test_volume(&disk, bucket).await;
+
+        let deep_prefix = format!("dir/{}", "a".repeat(200));
+        let version_id = Uuid::parse_str("37373737-1111-2222-3333-444444444444").expect("version id should parse");
+        let data_dir = Uuid::parse_str("38383838-1111-2222-3333-444444444444").expect("data dir should parse");
+        let rollback_dir = Uuid::parse_str("39393939-1111-2222-3333-444444444444").expect("rollback dir should parse");
+        let opts = DeleteOptions {
+            old_data_dir: Some(rollback_dir),
+            ..Default::default()
+        };
+
+        for batch in [false, true] {
+            let object = format!("{deep_prefix}/{}", if batch { "batch" } else { "single" });
+            let object_dir = dir.path().join(bucket).join(&object);
+            let backup = object_dir.join(rollback_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+            assert!(
+                backup.to_str().expect("temp dir should be utf8").encode_utf16().count() > 260,
+                "regression path must cross the traditional Windows MAX_PATH boundary: {backup:?}"
+            );
+            fs::create_dir_all(&object_dir).await.expect("object dir should be created");
+            let fi = test_file_info(&object, version_id, Some(data_dir), Some(Bytes::from_static(b"inline")));
+            let meta = test_meta(fi.clone());
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), &meta)
+                .await
+                .expect("inline metadata should be written");
+
+            if batch {
+                disk.delete_versions_internal(bucket, &object, &[fi], &opts, None)
+                    .await
+                    .expect("batch delete of a deep key should succeed");
+            } else {
+                disk.delete_version(bucket, &object, fi, false, opts.clone())
+                    .await
+                    .expect("delete of a deep key should succeed");
+            }
+
+            assert!(!object_dir.join(STORAGE_FORMAT_FILE).exists(), "{object}: metadata should be deleted");
+            assert_eq!(
+                fs::read(&backup).await.expect("rollback backup should be published"),
+                meta,
+                "{object}: backup should hold the pre-delete metadata"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_ignore_missing_source_helper_still_warns_on_real_error() {
         use tempfile::tempdir;
@@ -21138,6 +21210,220 @@ mod test {
         .await
         .expect("repeated delete-marker undo should be a no-op");
         assert!(!object_dir.join(STORAGE_FORMAT_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn test_windows_delete_version_long_path_crosses_max_path_boundary() {
+        use super::super::DeleteRecoveryAction;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let base_len = dir.path().as_os_str().len().saturating_add(1);
+        let pad_len = 150usize.saturating_sub(base_len).max(16);
+        let root = dir.path().join("x".repeat(pad_len));
+        fs::create_dir_all(&root).await.expect("long disk root should be created");
+        let endpoint = Endpoint::try_from(root.to_str().expect("disk root should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "test-bucket";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_DELETED_BUCKET).await;
+
+        let path_code_units = |path: &Path| -> usize {
+            #[cfg(windows)]
+            {
+                use std::os::windows::ffi::OsStrExt;
+                path.as_os_str().encode_wide().count()
+            }
+            #[cfg(not(windows))]
+            {
+                path.as_os_str().len()
+            }
+        };
+        let probe_rollback_dir = Uuid::new_v4();
+        let single_char_backup_len = path_code_units(
+            &disk
+                .get_object_path(bucket, "dir/a")
+                .expect("probe object path should resolve")
+                .join(probe_rollback_dir.to_string())
+                .join(STORAGE_FORMAT_FILE_BACKUP),
+        );
+
+        for target_backup_len in [259usize, 260, 261, 300] {
+            let key_suffix_len = target_backup_len
+                .checked_sub(single_char_backup_len)
+                .and_then(|extra| extra.checked_add(1))
+                .expect("resolved disk root must leave room for the target backup path length");
+            let object = format!("dir/{}", "a".repeat(key_suffix_len));
+            let physical_object_dir = disk
+                .get_object_path(bucket, &object)
+                .expect("physical long object path should resolve");
+            let object_dir = disk
+                .io_get_object_path(bucket, &object)
+                .expect("io long object path should resolve");
+            let rollback_dir = Uuid::new_v4();
+            let physical_backup_file_path = physical_object_dir
+                .join(rollback_dir.to_string())
+                .join(STORAGE_FORMAT_FILE_BACKUP);
+            assert_eq!(
+                path_code_units(&physical_backup_file_path),
+                target_backup_len,
+                "physical backup path must hit the exact target length: {physical_backup_file_path:?}"
+            );
+            let backup_file_path = object_dir.join(rollback_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+
+            let data_dir = Uuid::new_v4();
+            let data_path = object_dir.join(data_dir.to_string());
+            fs::create_dir_all(&data_path).await.expect("long data dir should be created");
+            fs::write(data_path.join("part.1"), b"x")
+                .await
+                .expect("part data should be written");
+            let fi = test_file_info(&object, Uuid::nil(), Some(data_dir), None);
+            let meta = test_meta(fi.clone());
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), &meta)
+                .await
+                .expect("metadata should be written");
+
+            let read_fi = disk
+                .read_version(
+                    bucket,
+                    bucket,
+                    &object,
+                    "",
+                    &ReadOptions {
+                        read_data: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("read_version should succeed on long path");
+            assert_eq!(read_fi.name, object);
+
+            disk.delete_version(
+                bucket,
+                &object,
+                fi.clone(),
+                false,
+                DeleteOptions {
+                    old_data_dir: Some(rollback_dir),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delete_version should stage rollback backup across MAX_PATH");
+            assert!(backup_file_path.is_file(), "rollback backup must exist at {backup_file_path:?}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&backup_file_path)
+                    .expect("rollback backup metadata should be readable")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600, "rollback backup must retain owner-only 0o600 permissions");
+            }
+
+            disk.undo_write_with_namespace_owner(
+                bucket,
+                &object,
+                fi.clone(),
+                DeleteOptions {
+                    undo_write: true,
+                    undo_delete: true,
+                    old_data_dir: Some(rollback_dir),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("undo_write should restore metadata and data across MAX_PATH");
+            assert_eq!(
+                fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+                    .await
+                    .expect("restored metadata should be readable"),
+                meta
+            );
+            assert!(!object_dir.join(rollback_dir.to_string()).exists());
+
+            let commit_rollback_dir = Uuid::new_v4();
+            disk.delete_version(
+                bucket,
+                &object,
+                fi.clone(),
+                false,
+                DeleteOptions {
+                    old_data_dir: Some(commit_rollback_dir),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("second delete_version should succeed across MAX_PATH");
+            disk.delete_with_namespace_owner(
+                bucket,
+                &format!("{object}/{commit_rollback_dir}"),
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    old_data_dir: Some(commit_rollback_dir),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("cleanup of committed delete transaction should succeed across MAX_PATH");
+            assert!(!object_dir.join(STORAGE_FORMAT_FILE).exists());
+            assert!(!object_dir.join(commit_rollback_dir.to_string()).exists());
+
+            let mut inline_fi = test_file_info(&object, Uuid::nil(), None, Some(Bytes::from_static(b"x")));
+            inline_fi.set_inline_data();
+            let inline_meta = test_meta(inline_fi.clone());
+            fs::create_dir_all(&object_dir)
+                .await
+                .expect("object dir should be recreated for recoverable delete");
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), &inline_meta)
+                .await
+                .expect("inline metadata should be written");
+
+            let tx = Uuid::new_v4();
+            let mut delete_req = FileInfo {
+                name: object.clone(),
+                ..Default::default()
+            };
+            delete_req.set_tier_free_version_id(&Uuid::new_v4().to_string());
+            disk.delete_version_with_namespace_owner(
+                bucket,
+                &object,
+                delete_req,
+                false,
+                DeleteOptions {
+                    old_data_dir: Some(tx),
+                    recoverable_delete: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("recoverable delete_version should prepare across MAX_PATH");
+
+            let inspected = disk
+                .delete_recovery_inspect(bucket, &object, tx)
+                .await
+                .expect("delete_recovery_inspect should succeed across MAX_PATH");
+            let published = disk
+                .delete_recovery_settle(bucket, &object, tx, inspected.fingerprint, DeleteRecoveryAction::PublishCommit, None)
+                .await
+                .expect("PublishCommit should write quorum receipt across MAX_PATH");
+            let finished = disk
+                .delete_recovery_settle(bucket, &object, tx, published.fingerprint, DeleteRecoveryAction::FinishCommit, None)
+                .await
+                .expect("FinishCommit should write finished markers across MAX_PATH");
+            disk.delete_recovery_settle(bucket, &object, tx, finished.fingerprint, DeleteRecoveryAction::FinalizeCommit, None)
+                .await
+                .expect("FinalizeCommit should remove transaction directory across MAX_PATH");
+            assert!(!object_dir.join(STORAGE_FORMAT_FILE).exists());
+            assert!(!object_dir.join(tx.to_string()).exists());
+        }
     }
 
     #[tokio::test]
