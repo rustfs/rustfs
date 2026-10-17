@@ -6,7 +6,7 @@
 
 A delegation is an immutable restriction record owned by an ordinary IAM user. It is neither a permission grant nor a credential. Creating it requires that user's real signed request and `admin:CreatePluginDelegation`; reading and revoking require the corresponding `admin:GetPluginDelegation` and `admin:RevokePluginDelegation` actions. Root, temporary credentials and service accounts cannot own records.
 
-The record binds a deployment, bucket, literal input and output prefixes, and an expiry of at most 24 hours. Wildcards, control characters and IAM variable expressions are rejected. Its random ID is also its immutable revision. There is no update operation.
+The record binds a deployment, an input bucket, literal input and output prefixes, and an expiry of at most 24 hours. The v1 profile writes to that same bucket; v2 explicitly names the output bucket. Wildcards, control characters and IAM variable expressions are rejected. Its random ID is also its immutable revision. There is no update operation.
 
 The Controller is responsible for validating accepted task identity, current lease, epoch, node session and control generation before requesting credentials. RustFS authenticates the configured broker and enforces the delegation and current parent IAM. RustFS does not independently verify a remote Controller lease.
 
@@ -58,7 +58,7 @@ Manual job submission reads the active delegation before calling the Runner. A s
 
 This configuration contains public access keys, not secrets. It is immutable per process. Missing or invalid configuration disables broker issuance. The broker is a trusted Controller identity; ordinary users cannot substitute their own request fields for Controller validation.
 
-The request carries `tenant`, `run_id`, `attempt_id`, `revision`, `deployment`, `input_bucket`, `input_key`, `input_version`, `output_bucket`, `output_prefix` and `ttl_seconds`. IDs must be non-nil. The first profile accepts one exact input version, one bucket, and an output prefix equal to:
+The request carries `tenant`, `run_id`, `attempt_id`, `revision`, `deployment`, `input_bucket`, `input_key`, `input_version`, `output_bucket`, `output_prefix` and `ttl_seconds`. IDs must be non-nil. Both profiles accept one exact input version and an output prefix equal to:
 
 ```text
 <delegation-output-prefix><lowercase-hex-tenant>/<run-uuid>/<attempt-uuid>/
@@ -77,3 +77,60 @@ Successful issuance returns `version`, `delegation_id`, `delegation_revision`, `
 Missing records and records owned by a different user have the same read response. Revoked or expired records reject access. Storage failures remain errors. Post-persistence failures carry static `error_code`, `issued` and `issuance_unknown` facts without credentials; callers must reconcile an unknown outcome rather than automatically mint another credential.
 
 The route/action inventory is maintained in `rustfs/src/admin/route_policy.rs`. This contract does not imply event capture, physical container cleanup, restart reconciliation or upstream release acceptance.
+
+
+## Cross-bucket restriction profile v2
+
+The existing registration endpoint accepts this explicit v2 restriction:
+
+```json
+{
+  "version": 2,
+  "deployment": "runner-production",
+  "bucket": "source-images",
+  "input_prefix": "inputs/",
+  "output_bucket": "plugin-artifacts",
+  "output_prefix": "outputs/",
+  "expires_at_unix_seconds": 1893456000
+}
+```
+
+The example expiry must be replaced by a future value within the existing
+24-hour limit. `bucket` still identifies the input bucket. The existing
+`issue-attempt` request and credential response do not change: its
+`input_bucket` must equal `bucket`, and `output_bucket` must equal the explicit
+v2 output bucket. Neither a different bucket nor a sibling attempt prefix can
+be supplied by the broker. The exact input version and deterministic output
+prefix checks remain in force.
+
+A v1 restriction has neither `version` nor `output_bucket`; its JSON fields
+and same-bucket behavior are unchanged. V2 requires both `version: 2` and a
+nonempty, bounded, literal `output_bucket`. Missing pairs, explicit nulls,
+unknown versions and unknown fields are rejected rather than downgraded to v1.
+The immutable record envelope carries version 1 or 2 to match its restriction
+profile. Both remain in the existing IAM record namespace; no data migration
+or mutable record update is introduced. Readers reject mismatched envelope
+and restriction versions. Older readers reject v2, so deploy compatible
+readers before creating v2 records.
+
+V2 does not grant the original user additional permissions. Issuance retains
+its current-parent checks and post-persistence recheck/invalidation, and each
+S3 request still requires both the original user's current IAM policy and the
+attempt session policy to allow it. An explicit parent Deny or removal of
+output permission prevents writes even with an already issued token. No
+administrator credential substitutes for missing parent permission.
+
+Focused tests are `delegation_v1_json_remains_compatible`,
+`delegation_v2_requires_explicit_output_bucket`,
+`attempt_v2_policy_keeps_input_version_and_output_bucket` and
+`delegation_v2_persists_and_vends_with_real_parent_intersection`.
+The last uses the actual issuance handler, persistent IAM and four-disk
+storage, including a real input version and a third bucket allowed by the
+parent but forbidden by the delegation. Removing only the output-bucket
+comparison must fail `A03_CROSS_BUCKET_OUTPUT_BOUND`; parent intersection is
+checked independently with issued temporary credentials. These are internal
+handler/IAM tests, not signed HTTP or complete cross-bucket S3 execution.
+
+This profile adds no bucket-creation API, Runner binding support, credential
+endpoint or GC permission. Coordinating Runner's pinned binding with its
+result storage bucket remains a separate integration requirement.

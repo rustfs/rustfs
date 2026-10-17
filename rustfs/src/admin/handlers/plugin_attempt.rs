@@ -120,7 +120,7 @@ fn session_policy(record: &Delegation, attempt: &Attempt) -> S3Result<Policy> {
         || attempt.revision != record.revision
         || attempt.deployment != restriction.deployment
         || attempt.input_bucket != restriction.bucket
-        || attempt.output_bucket != restriction.bucket
+        || attempt.output_bucket != restriction.output_bucket().map_err(storage_error)?
         || !literal(&attempt.input_key)
         || !attempt.input_key.starts_with(&restriction.input_prefix)
         || !literal(&attempt.input_version)
@@ -322,6 +322,10 @@ impl Operation for Issue {
 }
 
 #[cfg(test)]
+#[path = "plugin_attempt_v2_tests.rs"]
+mod v2_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -385,6 +389,8 @@ mod tests {
             owner_access_key: "user".into(),
             created_at_unix_seconds: 1,
             restrictions: rustfs_iam::delegation::Restrictions {
+                version: None,
+                output_bucket: None,
                 deployment: "runner".into(),
                 bucket: "photos".into(),
                 input_prefix: "input/".into(),
@@ -447,12 +453,83 @@ mod tests {
                 "attempt policy action={action:?} object={object} version={version:?}"
             );
         }
+        attempt.output_bucket = "artifacts".into();
+        assert!(
+            session_policy(&record, &attempt).is_err(),
+            "v1 still requires the input bucket for output"
+        );
+        attempt.output_bucket = "photos".into();
         attempt.output_prefix = "output/".into();
         assert!(session_policy(&record, &attempt).is_err());
         attempt.output_prefix = output_prefix;
         attempt.input_key = "outside/photo.png".into();
         assert!(session_policy(&record, &attempt).is_err());
     }
+    #[tokio::test]
+    async fn attempt_v2_policy_keeps_input_version_and_output_bucket() {
+        let record: Delegation = serde_json::from_value(serde_json::json!({
+            "version":2,"id":"a".repeat(32),"revision":"a".repeat(32),"owner_access_key":"user",
+            "created_at_unix_seconds":1,"restrictions":{"version":2,"deployment":"runner","bucket":"photos",
+            "input_prefix":"input/","output_bucket":"artifacts","output_prefix":"output/","expires_at_unix_seconds":1000}
+        }))
+        .expect("explicit v2 delegation");
+        let run_id = uuid::Uuid::new_v4();
+        let attempt_id = uuid::Uuid::new_v4();
+        let output = format!("output/74656e616e74/{run_id}/{attempt_id}/");
+        let mut attempt = Attempt {
+            tenant: "tenant".into(),
+            run_id,
+            attempt_id,
+            revision: record.revision.clone(),
+            deployment: "runner".into(),
+            input_bucket: "photos".into(),
+            input_key: "input/photo.png".into(),
+            input_version: "version-1".into(),
+            output_bucket: "artifacts".into(),
+            output_prefix: output.clone(),
+            ttl_seconds: 60,
+        };
+        let policy = session_policy(&record, &attempt).expect("v2 scope");
+        let result = format!("{output}result");
+        for (action, bucket, object, version, expected) in [
+            (S3Action::GetObjectVersionAction, "photos", "input/photo.png", Some("version-1"), true),
+            (S3Action::GetObjectVersionAction, "photos", "input/photo.png", Some("version-2"), false),
+            (S3Action::GetObjectVersionAction, "artifacts", "input/photo.png", Some("version-1"), false),
+            (S3Action::PutObjectAction, "artifacts", result.as_str(), None, true),
+            (S3Action::PutObjectAction, "photos", result.as_str(), None, false),
+            (S3Action::PutObjectAction, "third", result.as_str(), None, false),
+            (S3Action::PutObjectAction, "artifacts", "output/other/result", None, false),
+        ] {
+            let conditions = version
+                .map(|v| HashMap::from([("versionid".into(), vec![v.into()])]))
+                .unwrap_or_default();
+            assert_eq!(
+                policy
+                    .is_allowed(&Args {
+                        account: "user",
+                        groups: &None,
+                        action: Action::S3Action(action),
+                        bucket,
+                        object,
+                        conditions: &conditions,
+                        claims: &HashMap::new(),
+                        is_owner: false,
+                        deny_only: false
+                    })
+                    .await,
+                expected,
+                "A03_CROSS_BUCKET_SCOPE: bucket={bucket} object={object}"
+            );
+        }
+        attempt.output_bucket = "third".into();
+        assert!(session_policy(&record, &attempt).is_err(), "A03_CROSS_BUCKET_OUTPUT_BOUND");
+        attempt.output_bucket = "photos".into();
+        assert!(session_policy(&record, &attempt).is_err(), "A03_CROSS_BUCKET_OUTPUT_BOUND");
+        attempt.output_bucket = "artifacts".into();
+        attempt.input_bucket = "artifacts".into();
+        assert!(session_policy(&record, &attempt).is_err(), "A03_CROSS_BUCKET_INPUT_BOUND");
+    }
+
     #[tokio::test]
     async fn actual_policy_variable_resolution_is_rejected_by_literal_scope() {
         let resource = rustfs_policy::policy::resource::Resource::S3("photos/input/${aws:username}.png".into());
@@ -473,6 +550,8 @@ mod tests {
             "C07_LITERAL_SCOPE_BOUND: requested resources must stay literal"
         );
         let restriction = rustfs_iam::delegation::Restrictions {
+            version: None,
+            output_bucket: None,
             deployment: "runner".into(),
             bucket: "photos".into(),
             input_prefix: "input/${aws:username}/".into(),

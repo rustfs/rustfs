@@ -517,6 +517,8 @@ mod tests {
             owner_access_key: "owner".into(),
             created_at_unix_seconds: 1,
             restrictions: Restrictions {
+                version: None,
+                output_bucket: None,
                 deployment: "prod".into(),
                 bucket: "b".into(),
                 input_prefix: "a/".into(),

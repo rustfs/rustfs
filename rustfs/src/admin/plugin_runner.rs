@@ -849,6 +849,8 @@ mod tests {
             owner_access_key: "owner".into(),
             created_at_unix_seconds: 1,
             restrictions: rustfs_iam::delegation::Restrictions {
+                version: None,
+                output_bucket: None,
                 deployment: "prod".into(),
                 bucket: "images".into(),
                 input_prefix: "source/".into(),
