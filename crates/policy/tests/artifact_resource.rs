@@ -23,7 +23,7 @@ fn allowed(statements: Value, action: &str, bucket: &str, object: &str) -> bool 
 #[test]
 fn artifact_resource_allow_is_scoped_to_bucket_and_attempt() {
     for action in ["admin:SealPluginArtifactAttempt", "admin:RetirePluginArtifactVersion"] {
-        let policy = json!([{"Effect":"Allow","Action":action,"Resource":"arn:aws:s3:::artifacts/out/attempt-a/*"}]);
+        let policy = json!([{"Effect":"Allow","Action":action,"Resource":["arn:aws:s3:::artifacts/out/attempt-a", "arn:aws:s3:::artifacts/out/attempt-a/*"]}]);
         assert!(allowed(policy.clone(), action, "artifacts", "out/attempt-a/"));
         assert!(allowed(policy.clone(), action, "artifacts", "out/attempt-a/image.png"));
         assert!(
@@ -56,24 +56,24 @@ fn artifact_resource_deny_and_not_resource_are_enforced() {
             json!([scoped_allow.clone(), except_public.clone()]),
             action,
             "artifacts",
-            "out/public/"
+            "out/public/image"
         ));
         assert!(!allowed(
             json!([scoped_allow.clone(), except_public]),
             action,
             "artifacts",
-            "out/private/"
+            "out/private/image"
         ));
         let allow_except_private =
             json!([{"Effect":"Allow","Action":action,"NotResource":"arn:aws:s3:::artifacts/out/private/*"}]);
-        assert!(!allowed(allow_except_private.clone(), action, "artifacts", "out/private/"));
-        assert!(allowed(allow_except_private, action, "artifacts", "out/public/"));
+        assert!(!allowed(allow_except_private.clone(), action, "artifacts", "out/private/image"));
+        assert!(allowed(allow_except_private, action, "artifacts", "out/public/image"));
         assert!(
             !allowed(
                 json!([scoped_allow, {"Effect":"Deny","Action":"admin:*"}]),
                 action,
                 "artifacts",
-                "out/public/"
+                "out/public/image"
             ),
             "ARTIFACT_GLOBAL_DENY"
         );
@@ -101,5 +101,22 @@ fn artifact_resource_empty_allow_is_rejected_without_changing_old_admin() {
         "admin:IssuePluginAttempt",
         "",
         ""
+    ));
+}
+
+#[test]
+fn artifact_resource_single_object_does_not_authorize_attempt_seal() {
+    let action = "admin:SealPluginArtifactAttempt";
+    assert!(!allowed(
+        json!([{"Effect":"Allow","Action":action,"Resource":"arn:aws:s3:::artifacts/out/attempt-a/image.png"}]),
+        action,
+        "artifacts",
+        "out/attempt-a/"
+    ));
+    assert!(allowed(
+        json!([{"Effect":"Allow","Action":action,"Resource":"arn:aws:s3:::artifacts/out/attempt-a"}]),
+        action,
+        "artifacts",
+        "out/attempt-a/"
     ));
 }
