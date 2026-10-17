@@ -9756,20 +9756,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 vr.set_delete_marker_incarnation(incarnation);
             }
 
-            let v = {
-                if vers_map.contains_key(&dobj.object_name) {
-                    let val = vers_map.get_mut(&dobj.object_name).unwrap();
-                    val.versions.push(vr.clone());
-                    val.clone()
-                } else {
-                    FileInfoVersions {
-                        name: vr.name.clone(),
-                        versions: vec![vr.clone()],
-                        ..Default::default()
-                    }
-                }
-            };
-
             if vr.deleted || removed_delete_marker {
                 del_objects[i] = DeletedObject {
                     delete_marker: true,
@@ -9824,7 +9810,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
             // Only add to vers_map if we hold the lock
             if locked_objects.contains(lock_names[i].as_ref()) {
-                vers_map.insert(&dobj.object_name, v);
+                vers_map
+                    .entry(&dobj.object_name)
+                    .or_insert_with(|| FileInfoVersions {
+                        name: vr.name.clone(),
+                        ..Default::default()
+                    })
+                    .versions
+                    .push(vr);
             }
         }
 
