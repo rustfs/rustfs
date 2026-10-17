@@ -27,10 +27,48 @@ impl Operation for RestTableMetadataMaintenanceHandler {
         ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let request = read_json_body::<TableMetadataMaintenanceRequest>(req.input).await?;
         let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
-        let store = table_catalog_object_store_from_extensions(&req.extensions)?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
         let response =
-            table_metadata_maintenance_response(&store, &metadata_backend, &warehouse, &namespace, &table, request).await?;
+            configured_table_metadata_maintenance_response(&store, &metadata_backend, &warehouse, &namespace, &table, request)
+                .await?;
         build_json_response(StatusCode::OK, &response)
+    }
+}
+
+async fn configured_table_metadata_maintenance_response<B>(
+    store: &crate::table_catalog::ConfiguredTableCatalogStore<B>,
+    metadata_backend: &B,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    request: TableMetadataMaintenanceRequest,
+) -> S3Result<crate::table_catalog::TableMetadataMaintenanceReport>
+where
+    B: crate::table_catalog::TableCatalogObjectBackend + Clone,
+{
+    match store {
+        crate::table_catalog::ConfiguredTableCatalogStore::ObjectBacked(store) => {
+            table_metadata_maintenance_response(store, metadata_backend, bucket, namespace, table, request).await
+        }
+        crate::table_catalog::ConfiguredTableCatalogStore::DurableStrong(store) => {
+            if request.delete || request.commit_snapshot_expiration || request.commit_compaction {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "metadata maintenance deletion and snapshot expiration or compaction commits are not supported with durable-strong table catalog backing"
+                ));
+            }
+            store
+                .run_table_metadata_maintenance_planning(
+                    bucket,
+                    &namespace.public_name(),
+                    table,
+                    request.retain_recent_metadata_files,
+                    request.snapshot_expiration,
+                    request.compaction,
+                )
+                .await
+                .map_err(catalog_store_error)
+        }
     }
 }
 

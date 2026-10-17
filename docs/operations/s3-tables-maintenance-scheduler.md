@@ -1,8 +1,42 @@
-# Table Maintenance Periodic Queueing
+# Table Maintenance Planning and Periodic Queueing
 
-**Use this when:** enabling automatic maintenance job admission or recovering a stalled queue.
+**Use this when:** planning table maintenance, enabling automatic job admission, or recovering a stalled queue.
 
 The server can periodically **queue** maintenance jobs for explicitly selected table buckets. It does not run workers, delete objects, expire snapshots, or compact data automatically. Workers remain an explicit operator action. Both object-backed and durable-strong catalogs use the existing maintenance configuration and job format.
+
+## Read-only Metadata Maintenance Planning
+
+Both backings accept authenticated planning requests at:
+
+```text
+POST /iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata
+```
+
+For example:
+
+```json
+{
+  "retain-recent-metadata-files": 2,
+  "snapshot-expiration": {
+    "min-snapshots-to-keep": 1,
+    "max-snapshot-age-ms": 86400000
+  },
+  "compaction": {
+    "target-file-size-bytes": 536870912,
+    "small-file-threshold-bytes": 67108864,
+    "min-input-files": 2,
+    "max-rewrite-bytes-per-job": 1073741824
+  }
+}
+```
+
+The optional snapshot-expiration and compaction fields request plans, not commits. An empty JSON object requests ordinary metadata planning. A nonzero retention value overrides the effective maintenance configuration for this request; omission or zero uses the effective configured retention.
+
+In durable-strong mode, successful planning returns HTTP 200 with a completed `DRY_RUN` job and persists its named, current, and latest reports with audit events. Read-only means that table data, metadata pointers, and catalog generations are unchanged; the request still writes maintenance report sidecars and requires the table-scoped `admin:RunTableMaintenance` permission. Inspect the returned plan and any manual-review state before taking further action.
+
+This direct endpoint rejects `delete=true`, `commit-snapshot-expiration=true`, or `commit-compaction=true` with HTTP 400 in durable-strong mode, without publishing a job or changing table objects. The existing object-backed mutation behavior is unchanged. These restrictions do not change the separate explicit maintenance worker or quarantine APIs.
+
+A queued, running, or failed job, active quarantine, or inconsistent current/latest aliases or their named report returns HTTP 409 instead of replacing the existing job or discarding its retry budget. Inspect that state before retrying or taking explicit worker/recovery action. A failed publication that saved only a completed named dry-run report leaves harmless history: no alias advertises a running claim, and replanning is safe because there were no table-object effects. Planning revalidates table identity, metadata pointer, configuration, and the prior report before publication; concurrent changes also conflict. It does not introduce automatic workers, snapshot-expiration commits, or compaction commits on durable-strong backing.
 
 ## Enablement
 

@@ -18,6 +18,9 @@ use datafusion::{
 use std::assert_matches;
 use std::sync::Arc;
 
+mod strong_maintenance_planning;
+mod strong_maintenance_planning_paths;
+
 const TABLE_CATALOG_TEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 #[test]

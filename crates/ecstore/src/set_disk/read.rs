@@ -535,6 +535,7 @@ impl SetDisks {
                     let version_id = version_id.clone();
                     let task_opts = opts;
                     #[cfg(feature = "diagnostic-read-version-caller")]
+                    #[allow(clippy::redundant_locals)]
                     let api_operation = api_operation;
 
                     async move {

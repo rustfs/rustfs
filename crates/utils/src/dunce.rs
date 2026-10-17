@@ -190,6 +190,64 @@ pub fn is_simplified(path: &Path) -> bool {
 #[doc(hidden)]
 pub use self::canonicalize as realpath;
 
+/// Why a single path segment cannot be used as a regular Win32 file name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsFileNameError {
+    /// The segment is empty.
+    Empty,
+    /// The segment exceeds 255 UTF-16 code units.
+    TooLong,
+    /// The segment contains one of `< > : " / \ | ? *`.
+    ReservedCharacter,
+    /// The segment contains a control character (0x00-0x1F).
+    ControlCharacter,
+    /// The segment ends with `.` or a space, which Win32 path parsing strips.
+    TrailingDotOrSpace,
+    /// The segment names a DOS device (e.g. `NUL`, `COM1`, `CONIN$`), bare or
+    /// with an extension.
+    ReservedDeviceName,
+}
+
+/// Checks whether `name` can be created *and* addressed again as a single
+/// path segment through the Win32 API.
+///
+/// This is the one rule set for Windows file-name validity: it backs
+/// [`simplified()`] and the object-key admission checks in ecstore. The rules
+/// apply on every platform so callers can evaluate them without a Windows
+/// host; whether to enforce them is the caller's decision.
+pub fn check_windows_file_name(name: &str) -> Result<(), WindowsFileNameError> {
+    // Windows filename limit is 255 characters (UTF-16 code units)
+    // We check byte length first as a fast path optimization.
+    if name.len() > 255 && name.encode_utf16().count() > 255 {
+        return Err(WindowsFileNameError::TooLong);
+    }
+
+    if name.is_empty() {
+        return Err(WindowsFileNameError::Empty);
+    }
+
+    // Only ASCII subset is checked, and WTF-8/UTF-8 is safe for that
+    // Invalid chars: < > : " / \ | ? * and control chars (0-31)
+    let byte_str = name.as_bytes();
+    if byte_str
+        .iter()
+        .any(|&c| matches!(c, b'<' | b'>' | b':' | b'"' | b'/' | b'\\' | b'|' | b'?' | b'*'))
+    {
+        return Err(WindowsFileNameError::ReservedCharacter);
+    }
+    if byte_str.iter().any(|&c| c <= 31) {
+        return Err(WindowsFileNameError::ControlCharacter);
+    }
+    // Filename can't end with . or space
+    if matches!(byte_str.last(), Some(b' ' | b'.')) {
+        return Err(WindowsFileNameError::TrailingDotOrSpace);
+    }
+    if is_reserved_name(name) {
+        return Err(WindowsFileNameError::ReservedDeviceName);
+    }
+    Ok(())
+}
+
 /// Checks if the filename is valid for a regular Windows path.
 ///
 /// This checks for:
@@ -205,30 +263,7 @@ fn is_valid_filename(file_name: &OsStr) -> bool {
         None => return false,
     };
 
-    // Windows filename limit is 255 characters (UTF-16 code units)
-    // We check byte length first as a fast path optimization.
-    if s.len() > 255 && s.encode_utf16().count() > 255 {
-        return false;
-    }
-
-    if s.is_empty() {
-        return false;
-    }
-
-    // Only ASCII subset is checked, and WTF-8/UTF-8 is safe for that
-    // Invalid chars: < > : " / \ | ? * and control chars (0-31)
-    let byte_str = s.as_bytes();
-    if byte_str
-        .iter()
-        .any(|&c| matches!(c, 0..=31 | b'<' | b'>' | b':' | b'"' | b'/' | b'\\' | b'|' | b'?' | b'*'))
-    {
-        return false;
-    }
-    // Filename can't end with . or space
-    if matches!(byte_str.last(), Some(b' ' | b'.')) {
-        return false;
-    }
-    true
+    matches!(check_windows_file_name(s), Ok(()) | Err(WindowsFileNameError::ReservedDeviceName))
 }
 
 /// Checks if the filename is a reserved DOS device name (e.g., CON, PRN, COM1).
@@ -236,11 +271,13 @@ fn is_valid_filename(file_name: &OsStr) -> bool {
 /// Reserved names are case-insensitive and apply even if an extension is present (e.g., "CON.txt" is reserved).
 #[cfg(any(windows, test))]
 fn is_reserved<P: AsRef<OsStr>>(file_name: P) -> bool {
-    let s = match file_name.as_ref().to_str() {
-        Some(s) => s,
-        None => return false, // Reserved names are all ASCII
-    };
+    match file_name.as_ref().to_str() {
+        Some(s) => is_reserved_name(s),
+        None => false, // Reserved names are all ASCII
+    }
+}
 
+fn is_reserved_name(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }
@@ -256,25 +293,26 @@ fn is_reserved<P: AsRef<OsStr>>(file_name: P) -> bool {
     // Trim trailing spaces (Windows ignores them, so "CON " is "CON")
     let stem = stem.trim_end();
 
-    // Reserved names are 3 or 4 chars
-    if stem.len() != 3 && stem.len() != 4 {
+    if ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+        .iter()
+        .any(|name| stem.eq_ignore_ascii_case(name))
+    {
+        return true;
+    }
+
+    // Check COM1-9, LPT1-9, and the ISO 8859-1 superscript digits Windows
+    // also accepts as port numbers (COM¹, LPT³, ...).
+    let (Some(base), Some(suffix)) = (stem.get(..3), stem.get(3..)) else {
+        return false;
+    };
+    if !base.eq_ignore_ascii_case("COM") && !base.eq_ignore_ascii_case("LPT") {
         return false;
     }
-
-    if stem.len() == 3 {
-        return stem.eq_ignore_ascii_case("CON")
-            || stem.eq_ignore_ascii_case("PRN")
-            || stem.eq_ignore_ascii_case("AUX")
-            || stem.eq_ignore_ascii_case("NUL");
+    let mut digits = suffix.chars();
+    match (digits.next(), digits.next()) {
+        (Some(digit), None) => matches!(digit, '1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'),
+        _ => false,
     }
-
-    // Check COM1-9, LPT1-9
-    let (base, suffix) = stem.split_at(3);
-    if base.eq_ignore_ascii_case("COM") || base.eq_ignore_ascii_case("LPT") {
-        return suffix.chars().next().map(|c| c.is_ascii_digit() && c != '0').unwrap_or(false);
-    }
-
-    false
 }
 
 #[cfg(not(windows))]
@@ -362,14 +400,39 @@ mod tests {
             "CON.tar.gz",
             "con.",
             "con .",
+            "COM\u{b9}",
+            "com\u{b2}.txt",
+            "LPT\u{b3}",
+            "CONIN$",
+            "conout$",
+            "CONIN$.txt",
         ];
         for name in reserved {
             assert!(is_reserved(name), "Should be reserved: {}", name);
         }
 
         let not_reserved = [
-            "CON0", "COM0", "LPT0", "COM10", "LPT10", "CONsole", "PrNter", "NuLly", "not_con", "con_not", ".CON", "@CON",
-            "CON。", "foo.con",
+            "CON0",
+            "COM0",
+            "LPT0",
+            "COM10",
+            "LPT10",
+            "CONsole",
+            "PrNter",
+            "NuLly",
+            "not_con",
+            "con_not",
+            ".CON",
+            "@CON",
+            "CON。",
+            "foo.con",
+            "COM\u{b9}0",
+            "COM\u{bd}",
+            "CONIN",
+            "CONIN$$",
+            "中文名",
+            "é12",
+            "COMé",
         ];
         for name in not_reserved {
             assert!(!is_reserved(name), "Should NOT be reserved: {}", name);
@@ -421,6 +484,25 @@ mod tests {
         assert!(!is_valid_filename(OsStr::new(&long_name)));
         let ok_name = "a".repeat(255);
         assert!(is_valid_filename(OsStr::new(&ok_name)));
+    }
+
+    #[test]
+    fn test_check_windows_file_name_reports_the_violated_rule() {
+        assert_eq!(check_windows_file_name("file.txt"), Ok(()));
+        assert_eq!(check_windows_file_name(""), Err(WindowsFileNameError::Empty));
+        assert_eq!(check_windows_file_name(&"a".repeat(256)), Err(WindowsFileNameError::TooLong));
+        for name in ["a:b", "a\\b", "a/b", "a*b", "a?b", "a\"b", "a<b", "a>b", "a|b"] {
+            assert_eq!(check_windows_file_name(name), Err(WindowsFileNameError::ReservedCharacter), "{name:?}");
+        }
+        for name in ["a\0b", "a\x01b", "tab\there", "a\x1fb"] {
+            assert_eq!(check_windows_file_name(name), Err(WindowsFileNameError::ControlCharacter), "{name:?}");
+        }
+        for name in ["dir.", "file ", "..", "CON."] {
+            assert_eq!(check_windows_file_name(name), Err(WindowsFileNameError::TrailingDotOrSpace), "{name:?}");
+        }
+        for name in ["NUL", "nul.txt", "COM\u{b9}", "CONOUT$"] {
+            assert_eq!(check_windows_file_name(name), Err(WindowsFileNameError::ReservedDeviceName), "{name:?}");
+        }
     }
 
     #[test]

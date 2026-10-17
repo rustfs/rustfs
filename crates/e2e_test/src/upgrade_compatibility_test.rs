@@ -1805,7 +1805,7 @@ async fn stable_upgrade_deletes_foreign_reservations_without_losing_live_objects
             "key": object.key,
             "version": object.version,
             "etag": object.etag,
-            "xl_meta_sha256": hex_simd::encode_to_string(&sha2::Sha256::digest(&metadata), hex_simd::AsciiCase::Lower),
+            "xl_meta_sha256": hex_simd::encode_to_string(sha2::Sha256::digest(&metadata), hex_simd::AsciiCase::Lower),
         }));
     }
     if let Some(directory) = std::env::var_os("RUSTFS_E2E_LOG_DIR") {

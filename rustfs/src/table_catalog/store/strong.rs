@@ -2193,6 +2193,186 @@ where
         result
     }
 
+    // A dry-run may publish its audit record, but must not replace pending work
+    // or hide an incomplete sidecar publication.
+    async fn maintenance_planning_predecessor(
+        sidecar: &ObjectTableCatalogStore<B>,
+        entry: &TableEntry,
+    ) -> TableCatalogStoreResult<Option<TableMetadataMaintenanceReport>> {
+        let namespace = parse_namespace_for_store(&entry.namespace)?;
+        let table = parse_table_for_store(&entry.table)?;
+        let current = sidecar
+            .get_table_metadata_maintenance_report_for_entry_unlocked(
+                &entry.table_bucket,
+                &namespace,
+                &table,
+                &entry.table_id,
+                MAINTENANCE_JOB_ALIAS_CURRENT,
+            )
+            .await?;
+        let latest = sidecar
+            .get_table_metadata_maintenance_report_for_entry_unlocked(
+                &entry.table_bucket,
+                &namespace,
+                &table,
+                &entry.table_id,
+                MAINTENANCE_JOB_ALIAS_LATEST,
+            )
+            .await?;
+        if current != latest {
+            return Err(TableCatalogStoreError::Conflict(
+                "maintenance report publication requires recovery before planning".to_string(),
+            ));
+        }
+        if let Some(report) = &current {
+            let persisted = sidecar
+                .get_table_metadata_maintenance_report_for_entry_unlocked(
+                    &entry.table_bucket,
+                    &namespace,
+                    &table,
+                    &entry.table_id,
+                    &report.job.job_id,
+                )
+                .await?;
+            if persisted.as_ref() != Some(report) {
+                return Err(TableCatalogStoreError::Conflict(
+                    "maintenance job publication requires recovery before planning".to_string(),
+                ));
+            }
+            if matches!(
+                report.job.status,
+                TableMetadataMaintenanceJobStatus::Queued
+                    | TableMetadataMaintenanceJobStatus::Running
+                    | TableMetadataMaintenanceJobStatus::Failed
+            ) || report.job.quarantined_object_count > 0
+            {
+                return Err(TableCatalogStoreError::Conflict(
+                    "pending maintenance work or quarantine must be resolved before planning".to_string(),
+                ));
+            }
+        }
+        Ok(current)
+    }
+
+    pub(crate) async fn run_table_metadata_maintenance_planning(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        retain_recent_metadata_files: usize,
+        snapshot_expiration: Option<TableSnapshotExpirationConfig>,
+        compaction: Option<TableCompactionPlanningConfig>,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let publication = self.table_maintenance_publication().await?;
+        publication.begin_table_bucket(table_bucket).await?;
+        publication
+            .prepare(table_bucket, &namespace.public_name(), table.as_str())
+            .await?;
+        Self::require_table_maintenance_publication(
+            &publication,
+            table_bucket,
+            &namespace.public_name(),
+            table.as_str(),
+            "planning",
+        )?;
+        let _completion = TableCommitPublicationCompletion::new(&publication);
+        let sidecar = ObjectTableCatalogStore::new(self.object_backend.clone());
+        let entry = self
+            .maintenance_cleanup_entry(table_bucket, &namespace.public_name(), table.as_str())
+            .await?;
+        let planned_effective = sidecar
+            .get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
+            .await?;
+        let planned_job = Self::maintenance_planning_predecessor(&sidecar, &entry).await?;
+        let mut effective = planned_effective.clone();
+        if retain_recent_metadata_files > 0 {
+            effective.config.retain_recent_metadata_files = retain_recent_metadata_files;
+        }
+
+        // Keep the migration permit while reading potentially large manifests;
+        // unrelated catalog commits need not wait for the object traversal.
+        publication.release_publication_locks();
+        let mut report = sidecar
+            .plan_table_metadata_maintenance_for_entry(&entry, effective.config.retain_recent_metadata_files)
+            .await?;
+        report.snapshot_expiration = match snapshot_expiration {
+            Some(config) => Some(
+                sidecar
+                    .plan_table_snapshot_expiration_for_entry_with_backend(&self.object_backend, &entry, config)
+                    .await?,
+            ),
+            None => None,
+        };
+        report.compaction = match compaction {
+            Some(config) => Some(sidecar.plan_table_compaction_for_entry(&entry, config).await?),
+            None => None,
+        };
+
+        publication.begin_table_bucket(table_bucket).await?;
+        publication
+            .prepare(table_bucket, &namespace.public_name(), table.as_str())
+            .await?;
+        Self::require_table_maintenance_publication(
+            &publication,
+            table_bucket,
+            &namespace.public_name(),
+            table.as_str(),
+            "planning revalidation",
+        )?;
+        if self
+            .maintenance_cleanup_entry(table_bucket, &namespace.public_name(), table.as_str())
+            .await?
+            != entry
+        {
+            return Err(TableCatalogStoreError::Conflict("table changed during maintenance planning".to_string()));
+        }
+        let current_effective = sidecar
+            .get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
+            .await?;
+        if current_effective != planned_effective {
+            return Err(TableCatalogStoreError::Conflict("maintenance config changed during planning".to_string()));
+        }
+        if Self::maintenance_planning_predecessor(&sidecar, &entry).await? != planned_job {
+            return Err(TableCatalogStoreError::Conflict(
+                "current maintenance job changed during planning".to_string(),
+            ));
+        }
+
+        let now = OffsetDateTime::now_utc();
+        let timestamp = maintenance_timestamp(now);
+        let before_status = Some(report.job.status.clone());
+        report.job.operation = TableMetadataMaintenanceOperation::DryRun;
+        report.job.status = TableMetadataMaintenanceJobStatus::Running;
+        report.job.failure_reason = None;
+        report.job.config_source = effective.source;
+        report.job.worker_id = Some("rustfs-admin".to_string());
+        report.job.lease_id = Uuid::new_v4().to_string();
+        report.job.attempt = 1;
+        report.job.max_retry_attempts = effective.config.max_retry_attempts;
+        report.job.next_retry_after = None;
+        report.job.quarantine_enabled = effective.config.quarantine_enabled;
+        report.job.quarantine_retention_seconds = effective.config.quarantine_retention_seconds;
+        report.job.heartbeat_at = Some(timestamp.clone());
+        report.job.started_at = Some(timestamp);
+        report.job.finished_at = None;
+        push_table_maintenance_audit_event(
+            &mut report,
+            now,
+            TableMaintenanceAuditActor::Worker,
+            TableMaintenanceAuditAction::WorkerStarted,
+            None,
+            before_status,
+            Some(0),
+        );
+        // Planning has no object side effects, so publish only the completed
+        // report. There is no Running lease to strand if the request is lost.
+        sidecar
+            .finish_table_metadata_maintenance_run_for_entry_with_publication(&entry, false, &effective, report, &publication)
+            .await
+    }
+
     pub(crate) async fn run_table_maintenance_scheduler_once(
         &self,
         table_bucket: &str,
