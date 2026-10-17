@@ -473,3 +473,163 @@ async fn artifact_bucket_real_delete_recreate_allows_new_namespace_and_incarnati
     }
     shutdown.cancel();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn artifact_bucket_create_observes_current_generation() {
+    let root = tempfile::tempdir().expect("creation observation storage");
+    let (ctx, store, shutdown) = open_store(root.path()).await;
+    let bucket = "artifact-create-observation";
+    dedicated_bucket(&store, bucket).await;
+    let initial = persisted(&store, bucket).await.bucket_incarnation_id;
+    store
+        .delete_bucket(bucket, &DeleteBucketOptions::default())
+        .await
+        .expect("delete before observation");
+    dedicated_bucket(&store, bucket).await;
+    let current = persisted(&store, bucket).await.bucket_incarnation_id;
+    assert_ne!(initial, current);
+    // Invoke the exact observation phase consumed by make_artifact_bucket,
+    // after real replacement between its creation and observation phases.
+    assert_eq!(
+        store
+            .observe_artifact_bucket_incarnation(bucket, PREFIX)
+            .await
+            .expect("observe replacement"),
+        current,
+        "ARTIFACT_CREATE_CURRENT_GENERATION"
+    );
+    assert!(
+        store.observe_artifact_bucket_incarnation(bucket, "other/").await.is_err(),
+        "ARTIFACT_CREATE_CURRENT_GENERATION: mismatched namespace cannot produce a receipt"
+    );
+    let attempt = format!("{PREFIX}61/{}/{}/", Uuid::new_v4(), Uuid::new_v4());
+    assert!(
+        store
+            .clone()
+            .seal_artifact_attempt_puts(bucket, initial, &attempt)
+            .await
+            .is_err(),
+        "ARTIFACT_CREATE_CURRENT_GENERATION: old incarnation cannot seal same prefix"
+    );
+    store
+        .clone()
+        .seal_artifact_attempt_puts(bucket, current, &attempt)
+        .await
+        .expect("current identity seals");
+    drain_before_reopen(&store, &shutdown, bucket).await;
+    drop(store);
+    drop(ctx);
+    let (_ctx, reopened, stop) = open_store(root.path()).await;
+    assert_eq!(
+        reopened
+            .observe_artifact_bucket_incarnation(bucket, PREFIX)
+            .await
+            .expect("reopen observed identity"),
+        current,
+        "ARTIFACT_CREATE_CURRENT_GENERATION"
+    );
+    stop.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn artifact_bucket_create_observation_rejects_corrupt_authority() {
+    use crate::{
+        config::com::{read_config, save_config_with_opts},
+        object_api::{ObjectOptions, WriteCompletion},
+    };
+    let root = tempfile::tempdir().expect("creation observation faults");
+    let (ctx, store, shutdown) = open_store(root.path()).await;
+    let bucket = "artifact-create-corruption";
+    let incarnation = store
+        .clone()
+        .make_artifact_bucket(bucket, PREFIX)
+        .await
+        .expect("actual create and observation");
+    let original = persisted(&store, bucket).await;
+    let sys = ctx.bucket_metadata_sys().expect("actual metadata authority");
+    // These faults target the authoritative cache branch actually read by the
+    // observation. Public metadata updates reject them before publication.
+    for fault in 0..6 {
+        let mut damaged = original.clone();
+        match fault {
+            0 => damaged.name = "wrong-bucket".into(),
+            1 => damaged.artifact_base_prefix = Some("other/".into()),
+            2 => damaged.versioning_config = None,
+            3 => damaged.versioning_config.as_mut().expect("versioning").exclude_folders = Some(true),
+            4 => damaged.versioning_config = Some(crate::bucket::utils::deserialize(SUSPENDED).expect("suspended XML")),
+            _ => {
+                damaged.versioning_config = Some(crate::bucket::utils::deserialize(EXCLUDED_PREFIX).expect("excluded prefix XML"))
+            }
+        }
+        sys.read().await.set_for_test(bucket.into(), Arc::new(damaged)).await;
+        assert!(
+            store.observe_artifact_bucket_incarnation(bucket, PREFIX).await.is_err(),
+            "ARTIFACT_CREATE_CURRENT_GENERATION: corrupt cached authority fault={fault}"
+        );
+        sys.read().await.set_for_test(bucket.into(), Arc::new(original.clone())).await;
+    }
+    for (file, corrupt) in [
+        (BUCKET_METADATA_FILE, b"corrupt metadata".to_vec()),
+        (BUCKET_INCARNATION_FILE, Uuid::nil().as_bytes().to_vec()),
+    ] {
+        let path = format!("{BUCKET_META_PREFIX}/{bucket}/{file}");
+        let saved = read_config(store.clone(), &path).await.expect("real persisted record");
+        let opts = ObjectOptions {
+            max_parity: true,
+            write_completion: WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        save_config_with_opts(store.clone(), &path, corrupt, &opts)
+            .await
+            .expect("inject physical record fault");
+        sys.read().await.remove(bucket).await;
+        assert!(
+            store.observe_artifact_bucket_incarnation(bucket, PREFIX).await.is_err(),
+            "ARTIFACT_CREATE_CURRENT_GENERATION: corrupt physical authority {file}"
+        );
+        save_config_with_opts(store.clone(), &path, saved, &opts)
+            .await
+            .expect("restore physical record");
+        sys.read().await.remove(bucket).await;
+        assert_eq!(
+            store
+                .observe_artifact_bucket_incarnation(bucket, PREFIX)
+                .await
+                .expect("restored observation"),
+            incarnation
+        );
+    }
+    shutdown.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(storage_class_env)]
+async fn artifact_bucket_create_requires_namespace_locking_before_creation() {
+    temp_env::async_with_vars([("RUSTFS_LOCK_ENABLED", Some("false"))], async {
+        let root = tempfile::tempdir().expect("disabled lock storage");
+        let (ctx, store, shutdown) = open_store(root.path()).await;
+        assert!(ctx.lock_manager().is_disabled());
+        let bucket = "artifact-create-no-lock";
+        let error = store
+            .clone()
+            .make_artifact_bucket(bucket, PREFIX)
+            .await
+            .expect_err("creation requires real locks");
+        assert!(
+            error
+                .to_string()
+                .contains("artifact bucket creation requires namespace locking")
+        );
+        assert!(
+            store
+                .get_bucket_info(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
+                .await
+                .is_err(),
+            "ARTIFACT_CREATE_LOCK_REQUIRED: rejection precedes physical creation"
+        );
+        shutdown.cancel();
+    })
+    .await;
+}

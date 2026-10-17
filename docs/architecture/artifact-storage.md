@@ -304,6 +304,23 @@ The `artifact_bucket_create_*` handler tests reuse the four-disk S4 fixture and
 real IAM. They cover creation and persisted identity, existing-bucket failures
 without changing type, bucket-resource authorization, request-instance isolation,
 distributed-topology rejection before creation, and actual delete/recreate with
-old-receipt rejection. The recreation test performs two completed creations;
-it does not inject the narrower creation-to-observation race. Policy coverage is
+old-receipt rejection. The handler recreation test performs two completed creations with the same
+prefix, and checks both rejection of the old incarnation and acceptance of the
+current one. The storage test `artifact_bucket_create_observes_current_generation`
+performs real replacement between creation and the same internal observation
+function consumed by the public helper, then reopens storage and verifies the
+persisted identity. This is directed coverage of the production observation
+phase, not an injected HTTP handler race.
+
+`artifact_bucket_create_observation_rejects_corrupt_authority` checks the
+observation's actual authoritative-cache path with damaged name, namespace and
+versioning data, plus physical metadata and nil-sidecar corruption after cache
+eviction. The authoritative snapshot may already be cached from a committed
+write; observation always holds the lifecycle read lock but does not acquire
+metadata and bucket locks on every cache hit. Removing its identity/versioning
+validation must fail `ARTIFACT_CREATE_CURRENT_GENERATION` at runtime.
+`artifact_bucket_create_requires_namespace_locking_before_creation` uses a
+real lock-disabled instance and verifies no physical bucket is created. Local
+fast-lock guards cannot lose distributed quorum; this local-only profile does
+not claim to inject distributed guard loss. Policy coverage is
 `artifact_bucket_create_resource_requires_exact_bucket_authority`.

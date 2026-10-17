@@ -461,14 +461,14 @@ impl Fixture {
 #[serial_test::serial]
 async fn artifact_bucket_create_persists_current_identity_and_recreation() {
     use crate::admin::storage_api::AdminVersioningConfigExt as _;
-    use crate::storage::storage_api::ecstore_bucket::metadata::load_bucket_metadata_parse;
+    use crate::storage::storage_api::ecstore_bucket::metadata::load_bucket_metadata;
     let fixture = Fixture::new(prefix()).await;
     let bucket = "new-handler-artifacts";
     fixture.grant_creation(bucket).await;
-    let mut body = json!({"version":1,"bucket":bucket,"base_prefix":"outputs/"});
+    let body = json!({"version":1,"bucket":bucket,"base_prefix":"outputs/"});
     let first = receipt(Create.call(fixture.request(&body, Some(USER)), Params::new()).await).await;
     let first_id = Uuid::parse_str(first["bucket_incarnation"].as_str().expect("receipt UUID")).expect("UUID");
-    let metadata = load_bucket_metadata_parse(fixture.store.clone(), bucket, true)
+    let metadata = load_bucket_metadata(fixture.store.clone(), bucket)
         .await
         .expect("read persistent metadata");
     assert_eq!(first_id, metadata.bucket_incarnation_id, "ARTIFACT_CREATE_CURRENT_GENERATION");
@@ -487,15 +487,14 @@ async fn artifact_bucket_create_persists_current_identity_and_recreation() {
         .delete_bucket(bucket, &DeleteBucketOptions::default())
         .await
         .expect("delete first empty generation");
-    body["base_prefix"] = json!("next/");
     let second = receipt(Create.call(fixture.request(&body, Some(USER)), Params::new()).await).await;
     let second_id = Uuid::parse_str(second["bucket_incarnation"].as_str().expect("new UUID")).expect("UUID");
     assert_ne!(first_id, second_id, "ARTIFACT_CREATE_CURRENT_GENERATION");
-    let current = load_bucket_metadata_parse(fixture.store.clone(), bucket, true)
+    let current = load_bucket_metadata(fixture.store.clone(), bucket)
         .await
         .expect("read current metadata");
     assert_eq!(second_id, current.bucket_incarnation_id, "ARTIFACT_CREATE_CURRENT_GENERATION");
-    assert_eq!(current.artifact_base_prefix.as_deref(), Some("next/"));
+    assert_eq!(current.artifact_base_prefix.as_deref(), Some("outputs/"));
     assert!(
         fixture
             .store
@@ -505,12 +504,18 @@ async fn artifact_bucket_create_persists_current_identity_and_recreation() {
             .is_err(),
         "old receipt cannot seal replacement"
     );
+    fixture
+        .store
+        .clone()
+        .seal_artifact_attempt_puts(bucket, second_id, &fixture.prefix)
+        .await
+        .expect("current incarnation with the same prefix seals successfully");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn artifact_bucket_create_existing_bucket_preserves_type() {
-    use crate::storage::storage_api::ecstore_bucket::metadata::load_bucket_metadata_parse;
+    use crate::storage::storage_api::ecstore_bucket::metadata::load_bucket_metadata;
     let fixture = Fixture::new(prefix()).await;
     let ordinary = "ordinary-handler-bucket";
     fixture
@@ -520,7 +525,7 @@ async fn artifact_bucket_create_existing_bucket_preserves_type() {
         .expect("ordinary bucket");
     for bucket in [ordinary, BUCKET] {
         fixture.grant_creation(bucket).await;
-        let before = load_bucket_metadata_parse(fixture.store.clone(), bucket, true)
+        let before = load_bucket_metadata(fixture.store.clone(), bucket)
             .await
             .expect("initial metadata");
         for base_prefix in ["outputs/", "different/"] {
@@ -529,7 +534,7 @@ async fn artifact_bucket_create_existing_bucket_preserves_type() {
                 Create.call(fixture.request(&body, Some(USER)), Params::new()).await.is_err(),
                 "ARTIFACT_CREATE_NO_RETYPE"
             );
-            let after = load_bucket_metadata_parse(fixture.store.clone(), bucket, true)
+            let after = load_bucket_metadata(fixture.store.clone(), bucket)
                 .await
                 .expect("unchanged metadata");
             assert_eq!(before.bucket_incarnation_id, after.bucket_incarnation_id);

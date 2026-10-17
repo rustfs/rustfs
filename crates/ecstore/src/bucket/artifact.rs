@@ -354,8 +354,13 @@ impl ECStore {
         )
         .await?;
 
-        // Creation has released its locks. Observe one current generation under
-        // lifecycle -> metadata transaction -> bucket namespace read locks.
+        self.observe_artifact_bucket_incarnation(bucket, base_prefix).await
+    }
+
+    pub(crate) async fn observe_artifact_bucket_incarnation(&self, bucket: &str, base_prefix: &str) -> Result<Uuid> {
+        // The lifecycle read lock prevents replacement during this observation.
+        // Metadata is one authoritative snapshot, possibly already cached after
+        // a committed write; a cache miss acquires its own metadata locks.
         let lifecycle = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
         let metadata = metadata_sys::get_bucket_incarnation_metadata_in(&self.ctx, bucket).await?;
         if metadata.name != bucket
