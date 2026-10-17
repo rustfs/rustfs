@@ -3,9 +3,10 @@
 use super::{build_isolated_test_store, run_large_stack_async_test, without_storage_class_env};
 use crate::{
     bucket::{
-        artifact::{ArtifactPutTarget, artifact_put_seal_record_path},
+        artifact::{ArtifactPutTarget, artifact_put_seal_record_path, artifact_repair_seal_record_path},
         metadata_sys,
     },
+    config::com,
     disk::{DiskAPI as _, DiskStore, RUSTFS_META_BUCKET, ReadOptions, STORAGE_FORMAT_FILE, os},
     object_api::{ObjectOptions, PutObjReader, ShardIntegrityWriteMode, WriteCompletion},
     runtime::instance::InstanceContext,
@@ -180,6 +181,77 @@ async fn assert_exact_payload(store: &ECStore, bucket: &str, object: &str, versi
     );
 }
 
+async fn metadata_files(store: &ECStore, bucket: &str, object: &str) -> Vec<Option<Vec<u8>>> {
+    let mut result = Vec::new();
+    for disk in disks(store).await {
+        match tokio::fs::read(object_path(&disk, bucket, object).join(STORAGE_FORMAT_FILE)).await {
+            Ok(bytes) => result.push(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => result.push(None),
+            Err(error) => panic!("read physical metadata snapshot: {error}"),
+        }
+    }
+    result
+}
+
+async fn payload_part(disk: &DiskStore, bucket: &str, object: &str, version: Uuid) -> PathBuf {
+    let info = disk
+        .read_version("", bucket, object, &version.to_string(), &ReadOptions::default())
+        .await
+        .expect("read exact metadata to locate its physical shard");
+    object_path(disk, bucket, object)
+        .join(info.data_dir.expect("non-inline payload has a data directory").to_string())
+        .join("part.1")
+}
+
+async fn assert_repair_seal_denied(store: &ECStore, bucket: &str, object: &str, version: &str) {
+    use crate::{error::Error, storage_api_contracts::heal::HealOperations};
+
+    for result in [
+        HealOperations::heal_object(store, bucket, object, version, &heal_options()).await,
+        HealOperations::heal_object(store.pools[0].disk_set[0].as_ref(), bucket, object, version, &heal_options()).await,
+    ] {
+        let error = match result {
+            Err(error) | Ok((_, Some(error))) => error,
+            Ok((item, None)) => panic!("ARTIFACT_ATTEMPT_REPAIR_SEAL: closed attempt admitted repair: {item:?}"),
+        };
+        assert!(
+            !matches!(
+                error,
+                Error::FileNotFound | Error::FileVersionNotFound | Error::ObjectNotFound(_, _) | Error::VersionNotFound(_, _, _)
+            ),
+            "ARTIFACT_ATTEMPT_REPAIR_SEAL: repair refusal must not claim physical absence: {error:?}"
+        );
+    }
+    if let Ok(result) = store.heal_object_with_proof(bucket, object, version, &heal_options()).await {
+        assert!(result.error.is_some(), "ARTIFACT_ATTEMPT_REPAIR_SEAL: proof API rejects repair");
+        assert!(result.absence.is_none(), "repair seal does not produce an absence proof");
+    }
+}
+
+async fn assert_payload_readable(store: &ECStore, bucket: &str, object: &str, version: Uuid) {
+    let mut reader = store
+        .get_object_reader(
+            bucket,
+            object,
+            None,
+            Default::default(),
+            &ObjectOptions {
+                version_id: Some(version.to_string()),
+                ..put_options()
+            },
+        )
+        .await
+        .expect("sealed version remains readable with data quorum");
+    assert_eq!(reader.object_info.version_id, Some(version));
+    let mut body = Vec::new();
+    reader.stream.read_to_end(&mut body).await.expect("read sealed version bytes");
+    assert_eq!(
+        body,
+        vec![0xA5; PAYLOAD_SIZE],
+        "ARTIFACT_ATTEMPT_REPAIR_SEAL: seal preserves committed bytes"
+    );
+}
+
 #[test]
 #[serial_test::serial(storage_class_env)]
 fn artifact_repair_low_level_put_requires_matching_target() {
@@ -279,6 +351,291 @@ fn artifact_repair_preserves_existing_versions_after_seal() {
 
 #[test]
 #[serial_test::serial(storage_class_env)]
+fn artifact_attempt_repair_seal_covers_all_versions_and_survives_reopen() {
+    run_large_stack_async_test("artifact-attempt-repair-seal", || async {
+        let root = tempfile::tempdir().expect("attempt repair seal fixture directory");
+        let (ctx, store, shutdown) = open_store(root.path()).await;
+        let bucket = "artifact-attempt-repair-seal";
+        let incarnation = create_bucket(&store, bucket, true).await;
+        let prefix = attempt_prefix();
+        let object = format!("{prefix}image.png");
+        let old = put_payload(&store, bucket, &object, RepairKind::Rename).await;
+        let latest = put_payload(&store, bucket, &object, RepairKind::Rename).await;
+        assert_ne!(old, latest);
+        let minority_object = format!("{prefix}legacy.png");
+        let minority = put_payload(&store, bucket, &minority_object, RepairKind::Metadata).await;
+        let other_prefix = attempt_prefix();
+        let other_object = format!("{other_prefix}image.png");
+        let other = put_payload(&store, bucket, &other_object, RepairKind::Rename).await;
+        for prefix in [&prefix, &other_prefix] {
+            store
+                .clone()
+                .seal_artifact_attempt_puts(bucket, incarnation, prefix)
+                .await
+                .expect("seal ordinary PUTs");
+        }
+        let intact_metadata = metadata_files(&store, bucket, &object).await;
+        store
+            .clone()
+            .seal_artifact_attempt_repairs(bucket, incarnation, &prefix)
+            .await
+            .expect("close attempt repairs");
+        assert_eq!(
+            metadata_files(&store, bucket, &object).await,
+            intact_metadata,
+            "ARTIFACT_ATTEMPT_REPAIR_SEAL: closing repairs does not edit object metadata"
+        );
+        let record = artifact_repair_seal_record_path(bucket, incarnation, &prefix);
+        let persisted = com::read_config(store.clone(), &record)
+            .await
+            .expect("read durable repair seal");
+        store
+            .clone()
+            .seal_artifact_attempt_repairs(bucket, incarnation, &prefix)
+            .await
+            .expect("repair seal is idempotent");
+        assert_eq!(
+            com::read_config(store.clone(), &record).await.expect("read repeated seal"),
+            persisted,
+            "ARTIFACT_ATTEMPT_REPAIR_SEAL: retry preserves the exact durable fact"
+        );
+
+        let disk = disks(&store).await.remove(0);
+        let mut missing = Vec::new();
+        for version in [old, latest] {
+            let part = payload_part(&disk, bucket, &object, version).await;
+            damage_for_repair(&store, bucket, &object, version, RepairKind::Rename).await;
+            missing.push(part);
+        }
+        damage_for_repair(&store, bucket, &minority_object, minority, RepairKind::Metadata).await;
+        let before = metadata_files(&store, bucket, &object).await;
+        let minority_before = metadata_files(&store, bucket, &minority_object).await;
+        for selected in [old.to_string(), latest.to_string(), String::new()] {
+            assert_repair_seal_denied(&store, bucket, &object, &selected).await;
+            assert_eq!(
+                missing.iter().map(|part| part.exists()).collect::<Vec<_>>(),
+                vec![false, false],
+                "ARTIFACT_ATTEMPT_REPAIR_SEAL: every version's missing shard stays absent"
+            );
+            assert_eq!(
+                metadata_files(&store, bucket, &object).await,
+                before,
+                "ARTIFACT_ATTEMPT_REPAIR_SEAL: rejected repair publishes no metadata"
+            );
+        }
+        for selected in [minority.to_string(), String::new()] {
+            assert_repair_seal_denied(&store, bucket, &minority_object, &selected).await;
+            assert_eq!(
+                metadata_files(&store, bucket, &minority_object).await,
+                minority_before,
+                "ARTIFACT_ATTEMPT_REPAIR_SEAL: minority recovery cannot regenerate missing metadata"
+            );
+        }
+        for version in [old, latest] {
+            assert_payload_readable(&store, bucket, &object, version).await;
+        }
+        shutdown.cancel();
+        assert!(ctx.wait_for_detached_mutations(DEADLINE).await);
+        drop(store);
+        drop(ctx);
+
+        let (ctx, store, shutdown) = open_store(root.path()).await;
+        assert_eq!(store.bucket_incarnation_id(bucket).await.expect("reopened incarnation"), incarnation);
+        store
+            .clone()
+            .seal_artifact_attempt_repairs(bucket, incarnation, &prefix)
+            .await
+            .expect("confirm seal after reopen");
+        for selected in [old.to_string(), latest.to_string(), String::new()] {
+            assert_repair_seal_denied(&store, bucket, &object, &selected).await;
+        }
+        assert_repair_seal_denied(&store, bucket, &minority_object, &minority.to_string()).await;
+        assert_eq!(
+            missing.iter().map(|part| part.exists()).collect::<Vec<_>>(),
+            vec![false, false],
+            "ARTIFACT_ATTEMPT_REPAIR_SEAL: reopen preserves whole-attempt shard refusal"
+        );
+        assert_eq!(
+            metadata_files(&store, bucket, &object).await,
+            before,
+            "ARTIFACT_ATTEMPT_REPAIR_SEAL: reopen preserves object metadata"
+        );
+        assert_eq!(
+            metadata_files(&store, bucket, &minority_object).await,
+            minority_before,
+            "ARTIFACT_ATTEMPT_REPAIR_SEAL: reopen preserves minority metadata refusal"
+        );
+        for version in [old, latest] {
+            assert_payload_readable(&store, bucket, &object, version).await;
+        }
+        let other_disk = damage_for_repair(&store, bucket, &other_object, other, RepairKind::Rename).await;
+        let other_part = payload_part(&other_disk, bucket, &other_object, other).await;
+        let repaired = store
+            .heal_object_with_proof(bucket, &other_object, &other.to_string(), &heal_options())
+            .await
+            .expect("another ordinary-sealed attempt remains repairable");
+        assert!(repaired.error.is_none(), "other-attempt repair failed: {:?}", repaired.error);
+        assert_eq!(
+            other_part.exists(),
+            true,
+            "ARTIFACT_ATTEMPT_REPAIR_SEAL: another attempt restores its physical shard"
+        );
+        assert_exact_payload(&store, bucket, &other_object, other).await;
+        assert_eq!(
+            missing.iter().map(|part| part.exists()).collect::<Vec<_>>(),
+            vec![false, false],
+            "ARTIFACT_ATTEMPT_REPAIR_SEAL: another attempt cannot restore closed versions"
+        );
+        shutdown.cancel();
+        assert!(ctx.wait_for_detached_mutations(DEADLINE).await);
+    });
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_attempt_repair_seal_requires_ordinary_seal_and_matching_identity() {
+    run_large_stack_async_test("artifact-repair-seal-prerequisite", || async {
+        let root = tempfile::tempdir().expect("repair seal prerequisite fixture directory");
+        let (ctx, store, shutdown) = open_store(root.path()).await;
+        let bucket = "artifact-repair-seal-prerequisite";
+        let incarnation = create_bucket(&store, bucket, true).await;
+        let prefix = attempt_prefix();
+        let object = format!("{prefix}image.png");
+        let version = put_payload(&store, bucket, &object, RepairKind::Rename).await;
+        let record = artifact_repair_seal_record_path(bucket, incarnation, &prefix);
+        assert!(
+            store
+                .clone()
+                .seal_artifact_attempt_repairs(bucket, incarnation, &prefix)
+                .await
+                .is_err(),
+            "repair close requires the separate ordinary PUT seal"
+        );
+        assert!(matches!(
+            com::read_config(store.clone(), &record).await,
+            Err(crate::error::Error::ConfigNotFound)
+        ));
+        damage_for_repair(&store, bucket, &object, version, RepairKind::Rename).await;
+        let repaired = store
+            .heal_object_with_proof(bucket, &object, &version.to_string(), &heal_options())
+            .await
+            .expect("a rejected close leaves repair admission open");
+        assert!(repaired.error.is_none(), "repair after rejected close failed: {:?}", repaired.error);
+        assert_exact_payload(&store, bucket, &object, version).await;
+        store
+            .clone()
+            .seal_artifact_attempt_puts(bucket, incarnation, &prefix)
+            .await
+            .expect("seal ordinary PUTs");
+        for (identity, prefix) in [
+            (Uuid::nil(), prefix.clone()),
+            (Uuid::new_v4(), prefix.clone()),
+            (incarnation, object),
+        ] {
+            assert!(
+                store
+                    .clone()
+                    .seal_artifact_attempt_repairs(bucket, identity, &prefix)
+                    .await
+                    .is_err(),
+                "repair close requires exact bucket incarnation and attempt prefix"
+            );
+        }
+        assert!(matches!(
+            com::read_config(store.clone(), &record).await,
+            Err(crate::error::Error::ConfigNotFound)
+        ));
+        store
+            .clone()
+            .seal_artifact_attempt_repairs(bucket, incarnation, &prefix)
+            .await
+            .expect("matching sealed attempt closes");
+        shutdown.cancel();
+        assert!(ctx.wait_for_detached_mutations(DEADLINE).await);
+    });
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_attempt_repair_seal_corrupt_or_wrong_identity_records_fail_closed() {
+    run_large_stack_async_test("artifact-repair-seal-records", || async {
+        let root = tempfile::tempdir().expect("repair seal record fixture directory");
+        let (ctx, store, shutdown) = open_store(root.path()).await;
+        let bucket = "artifact-repair-seal-records";
+        let incarnation = create_bucket(&store, bucket, true).await;
+        let prefix = attempt_prefix();
+        let object = format!("{prefix}image.png");
+        let version = put_payload(&store, bucket, &object, RepairKind::Rename).await;
+        store
+            .clone()
+            .seal_artifact_attempt_puts(bucket, incarnation, &prefix)
+            .await
+            .expect("seal ordinary PUTs");
+        store
+            .clone()
+            .seal_artifact_attempt_repairs(bucket, incarnation, &prefix)
+            .await
+            .expect("persist genuine repair seal");
+        let record = artifact_repair_seal_record_path(bucket, incarnation, &prefix);
+        let original = com::read_config(store.clone(), &record).await.expect("read repair seal JSON");
+        let decoded: serde_json::Value = serde_json::from_slice(&original).expect("repair seal is JSON");
+        let mut invalid = vec![Vec::new(), b"not-json".to_vec()];
+        for (field, value) in [
+            ("format_version", serde_json::json!(2)),
+            ("bucket", serde_json::json!("different-bucket")),
+            ("base_prefix", serde_json::json!("other/")),
+            ("incarnation_id", serde_json::json!(Uuid::new_v4())),
+            ("attempt_prefix", serde_json::json!(attempt_prefix())),
+            ("unexpected_field", serde_json::json!(true)),
+        ] {
+            let mut changed = decoded.clone();
+            changed
+                .as_object_mut()
+                .expect("repair seal is an identity object")
+                .insert(field.to_owned(), value);
+            invalid.push(serde_json::to_vec(&changed).expect("encode invalid repair seal identity"));
+        }
+        let disk = damage_for_repair(&store, bucket, &object, version, RepairKind::Rename).await;
+        let missing = payload_part(&disk, bucket, &object, version).await;
+        let before = metadata_files(&store, bucket, &object).await;
+        for bytes in invalid {
+            com::with_config_object_write_lock(store.clone(), record.clone(), {
+                let store = store.clone();
+                let record = record.clone();
+                move |guard| async move { com::save_config_no_lock(store, &record, bytes, &guard).await }
+            })
+            .await
+            .expect("acquire matching repair record guard")
+            .expect("persist invalid repair seal on real disks");
+            assert!(
+                store
+                    .clone()
+                    .seal_artifact_attempt_repairs(bucket, incarnation, &prefix)
+                    .await
+                    .is_err(),
+                "invalid persisted seal cannot confirm an idempotent close"
+            );
+            assert_repair_seal_denied(&store, bucket, &object, &version.to_string()).await;
+            assert_repair_seal_denied(&store, bucket, &object, "").await;
+            assert_eq!(
+                missing.exists(),
+                false,
+                "ARTIFACT_ATTEMPT_REPAIR_SEAL: invalid seal never admits shard publication"
+            );
+            assert_eq!(
+                metadata_files(&store, bucket, &object).await,
+                before,
+                "ARTIFACT_ATTEMPT_REPAIR_SEAL: invalid seal never admits metadata publication"
+            );
+            assert_payload_readable(&store, bucket, &object, version).await;
+        }
+        shutdown.cancel();
+        assert!(ctx.wait_for_detached_mutations(DEADLINE).await);
+    });
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
 fn artifact_repair_rejects_previous_bucket_incarnation() {
     run_large_stack_async_test("artifact-repair-incarnation", || async {
         let root = tempfile::tempdir().expect("incarnation fixture directory");
@@ -324,7 +681,7 @@ fn artifact_repair_rejects_previous_bucket_incarnation() {
     });
 }
 
-fn run_physical_repair_case(kind: RepairKind, cancel: bool) {
+fn run_physical_repair_case(kind: RepairKind, cancel: bool, close_repairs: bool) {
     // Retain the large fixture stack and the current-thread clock needed to expire deadlines.
     std::thread::Builder::new()
         .name(format!("artifact-repair-{kind:?}-{cancel}"))
@@ -334,14 +691,14 @@ fn run_physical_repair_case(kind: RepairKind, cancel: bool) {
                 .enable_all()
                 .build()
                 .expect("physical repair runtime")
-                .block_on(physical_repair_case(kind, cancel));
+                .block_on(physical_repair_case(kind, cancel, close_repairs));
         })
         .expect("physical repair test thread")
         .join()
         .expect("physical repair test completes");
 }
 
-async fn physical_repair_case(kind: RepairKind, cancel: bool) {
+async fn physical_repair_case(kind: RepairKind, cancel: bool, close_repairs: bool) {
     temp_env::async_with_vars(
         [
             (rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("60")),
@@ -349,7 +706,7 @@ async fn physical_repair_case(kind: RepairKind, cancel: bool) {
         ],
         async {
             if matches!(kind, RepairKind::Metadata) && !cancel {
-                metadata_repair_disk_timeout_case().await;
+                metadata_repair_disk_timeout_case(close_repairs).await;
                 return;
             }
             let root = tempfile::tempdir().expect("physical repair fixture directory");
@@ -359,6 +716,13 @@ async fn physical_repair_case(kind: RepairKind, cancel: bool) {
             let prefix = attempt_prefix();
             let object = format!("{prefix}image.png");
             let version = put_payload(&store, bucket, &object, kind).await;
+            if close_repairs {
+                store
+                    .clone()
+                    .seal_artifact_attempt_puts(bucket, incarnation, &prefix)
+                    .await
+                    .expect("ordinary seal precedes active repair");
+            }
             let disk = damage_for_repair(&store, bucket, &object, version, kind).await;
             let destination = object_path(&disk, bucket, &object);
             let metadata_path = destination.join(STORAGE_FORMAT_FILE);
@@ -416,8 +780,15 @@ async fn physical_repair_case(kind: RepairKind, cancel: bool) {
             let retained = lock.get_write_lock(Duration::from_secs(1)).await.is_err();
             let seal_store = store.clone();
             let seal_prefix = prefix.clone();
-            let mut seal =
-                tokio::spawn(async move { seal_store.seal_artifact_attempt_puts(bucket, incarnation, &seal_prefix).await });
+            let mut seal = tokio::spawn(async move {
+                if close_repairs {
+                    seal_store
+                        .seal_artifact_attempt_repairs(bucket, incarnation, &seal_prefix)
+                        .await
+                } else {
+                    seal_store.seal_artifact_attempt_puts(bucket, incarnation, &seal_prefix).await
+                }
+            });
             let blocked = tokio::time::timeout(Duration::from_millis(200), &mut seal).await.is_err();
 
             // Release and drain before regression assertions, so a RED run also cleans up.
@@ -454,12 +825,16 @@ async fn physical_repair_case(kind: RepairKind, cancel: bool) {
                 blocked,
                 "ARTIFACT_REPAIR_TAIL_BARRIER: seal cannot finish while physical repair publication remains paused"
             );
-            let repaired = store
-                .heal_object_with_proof(bucket, &object, &version.to_string(), &heal_options())
-                .await
-                .expect("finish remaining repair after seal");
-            assert!(repaired.error.is_none(), "remaining repair failed: {:?}", repaired.error);
-            assert_exact_payload(&store, bucket, &object, version).await;
+            if close_repairs {
+                assert_closed_attempt_cannot_repair(&store, bucket, &object, version, kind).await;
+            } else {
+                let repaired = store
+                    .heal_object_with_proof(bucket, &object, &version.to_string(), &heal_options())
+                    .await
+                    .expect("finish remaining repair after seal");
+                assert!(repaired.error.is_none(), "remaining repair failed: {:?}", repaired.error);
+                assert_exact_payload(&store, bucket, &object, version).await;
+            }
             shutdown.cancel();
             assert!(ctx.wait_for_detached_mutations(DEADLINE).await);
         },
@@ -467,7 +842,7 @@ async fn physical_repair_case(kind: RepairKind, cancel: bool) {
     .await;
 }
 
-async fn metadata_repair_disk_timeout_case() {
+async fn metadata_repair_disk_timeout_case(close_repairs: bool) {
     use crate::storage_api_contracts::heal::HealOperations;
 
     let root = tempfile::tempdir().expect("metadata timeout fixture directory");
@@ -477,6 +852,13 @@ async fn metadata_repair_disk_timeout_case() {
     let prefix = attempt_prefix();
     let object = format!("{prefix}image.png");
     let version = put_payload(&store, bucket, &object, RepairKind::Metadata).await;
+    if close_repairs {
+        store
+            .clone()
+            .seal_artifact_attempt_puts(bucket, incarnation, &prefix)
+            .await
+            .expect("ordinary seal precedes metadata repair");
+    }
     damage_for_repair(&store, bucket, &object, version, RepairKind::Metadata).await;
     let disks = disks(&store).await;
     let mut hooks = Vec::new();
@@ -540,7 +922,13 @@ async fn metadata_repair_disk_timeout_case() {
         .expect("actual repair/seal lock");
     let retained = lock.get_write_lock(Duration::from_secs(1)).await.is_err();
     let seal_store = store.clone();
-    let mut seal = tokio::spawn(async move { seal_store.seal_artifact_attempt_puts(bucket, incarnation, &prefix).await });
+    let mut seal = tokio::spawn(async move {
+        if close_repairs {
+            seal_store.seal_artifact_attempt_repairs(bucket, incarnation, &prefix).await
+        } else {
+            seal_store.seal_artifact_attempt_puts(bucket, incarnation, &prefix).await
+        }
+    });
     let blocked = tokio::time::timeout(Duration::from_millis(200), &mut seal).await.is_err();
 
     drop(releases);
@@ -569,7 +957,11 @@ async fn metadata_repair_disk_timeout_case() {
         blocked,
         "ARTIFACT_REPAIR_TAIL_BARRIER: seal waits for the timed-out physical metadata workers"
     );
-    assert_exact_payload(&store, bucket, &object, version).await;
+    if close_repairs {
+        assert_closed_attempt_cannot_repair(&store, bucket, &object, version, RepairKind::Metadata).await;
+    } else {
+        assert_exact_payload(&store, bucket, &object, version).await;
+    }
     shutdown.cancel();
     assert!(ctx.wait_for_detached_mutations(DEADLINE).await);
 }
@@ -577,25 +969,87 @@ async fn metadata_repair_disk_timeout_case() {
 #[test]
 #[serial_test::serial(storage_class_env)]
 fn artifact_repair_rename_owner_survives_cancellation() {
-    run_physical_repair_case(RepairKind::Rename, true);
+    run_physical_repair_case(RepairKind::Rename, true, false);
 }
 
 #[test]
 #[serial_test::serial(storage_class_env)]
 fn artifact_repair_rename_owner_survives_caller_deadline() {
-    run_physical_repair_case(RepairKind::Rename, false);
+    run_physical_repair_case(RepairKind::Rename, false, false);
 }
 
 #[test]
 #[serial_test::serial(storage_class_env)]
 fn artifact_repair_metadata_owner_survives_cancellation() {
-    run_physical_repair_case(RepairKind::Metadata, true);
+    run_physical_repair_case(RepairKind::Metadata, true, false);
 }
 
 #[test]
 #[serial_test::serial(storage_class_env)]
 fn artifact_repair_metadata_owner_survives_disk_timeout() {
-    run_physical_repair_case(RepairKind::Metadata, false);
+    run_physical_repair_case(RepairKind::Metadata, false, false);
+}
+
+async fn assert_closed_attempt_cannot_repair(store: &ECStore, bucket: &str, object: &str, version: Uuid, kind: RepairKind) {
+    let disks = disks(store).await;
+    let missing = match kind {
+        RepairKind::Rename => Some(payload_part(&disks[0], bucket, object, version).await),
+        RepairKind::Metadata => None,
+    };
+    let paths = match &missing {
+        Some(part) => vec![part.clone()],
+        None => disks[1..]
+            .iter()
+            .map(|disk| object_path(disk, bucket, object).join(STORAGE_FORMAT_FILE))
+            .collect(),
+    };
+    for path in paths {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("damage the closed attempt after its physical repair drains: {error}"),
+        }
+    }
+    let before = metadata_files(store, bucket, object).await;
+    for selected in [version.to_string(), String::new()] {
+        assert_repair_seal_denied(store, bucket, object, &selected).await;
+        assert_eq!(
+            metadata_files(store, bucket, object).await,
+            before,
+            "ARTIFACT_ATTEMPT_REPAIR_SEAL: closed repair cannot publish after the old physical tail drains"
+        );
+        if let Some(part) = &missing {
+            assert_eq!(
+                part.exists(),
+                false,
+                "ARTIFACT_ATTEMPT_REPAIR_SEAL: closed repair cannot restore a shard after the old physical tail drains"
+            );
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_attempt_repair_seal_waits_for_cancelled_rename() {
+    run_physical_repair_case(RepairKind::Rename, true, true);
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_attempt_repair_seal_waits_for_rename_caller_deadline() {
+    run_physical_repair_case(RepairKind::Rename, false, true);
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_attempt_repair_seal_waits_for_cancelled_metadata() {
+    run_physical_repair_case(RepairKind::Metadata, true, true);
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_attempt_repair_seal_waits_for_metadata_disk_timeout() {
+    run_physical_repair_case(RepairKind::Metadata, false, true);
 }
 
 #[test]
