@@ -877,6 +877,7 @@ mod tests {
         run_local_decommission_watchdog, save_validated_pool_meta_for_startup, should_auto_start_rebalance_after_init,
         should_defer_rebalance_auto_start, should_retry_format_load, wait_for_local_decommission_resume_delay,
     };
+    use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
     use crate::core::pools::PoolMetaBootstrapAuthority;
     #[cfg(feature = "test-util")]
     use crate::disk::DiskAPI;
@@ -938,7 +939,7 @@ mod tests {
             },
             validate_durable_ilm_record,
         },
-        bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_VERSIONING_CONFIG},
+        bucket::metadata::BUCKET_VERSIONING_CONFIG,
         config::com,
         core::pools::DecomBucketInfo,
         data_movement::SourceCleanupDeleteBarrier,
