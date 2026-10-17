@@ -15,6 +15,7 @@
 use crate::runtime_sources::{AppContext, ServerContextSlot, current_action_credentials, current_ready_iam_handle};
 use http::HeaderMap;
 use http::Uri;
+use http::header::{IF_MATCH, IF_NONE_MATCH};
 use rustfs_credentials::Credentials;
 use rustfs_iam::error::Error as IamError;
 use rustfs_iam::sys::{
@@ -769,6 +770,21 @@ pub fn get_condition_values_with_query_and_client_info(
             args.insert((*grant_header).to_string(), values);
         }
         clone_header.remove(*grant_header);
+    }
+
+    // `s3:if-none-match` / `s3:if-match` must describe the precondition the write
+    // enforces, which ignores a blank header. A raw copy would let `If-None-Match:`
+    // with no value satisfy `Null: false` while the object is overwritten.
+    for conditional_header in [IF_NONE_MATCH, IF_MATCH] {
+        if let Some(value) = clone_header
+            .get(&conditional_header)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            args.insert(conditional_header.as_str().to_string(), vec![value.to_string()]);
+        }
+        clone_header.remove(&conditional_header);
     }
 
     // Claims and group membership are part of the verified identity, so they are
@@ -2037,6 +2053,45 @@ mod tests {
             conditions.get("x-amz-grant-read"),
             Some(&vec!["uri=http://acs.amazonaws.com/groups/global/AllUsers".to_string()])
         );
+    }
+
+    #[test]
+    fn test_get_condition_values_with_conditional_write_headers() {
+        let cred = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert("If-None-Match", HeaderValue::from_static(" * "));
+        headers.insert("If-Match", HeaderValue::from_static("\"9b2cf535f27731c974343645a3985328\""));
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get("if-none-match"), Some(&vec!["*".to_string()]));
+        assert_eq!(
+            conditions.get("if-match"),
+            Some(&vec!["\"9b2cf535f27731c974343645a3985328\"".to_string()])
+        );
+    }
+
+    /// Storage ignores a blank precondition, and s3s rejects a non-UTF-8 one, so
+    /// neither may satisfy a `Null: false` check on `s3:if-none-match` / `s3:if-match`.
+    #[test]
+    fn test_get_condition_values_without_conditional_write_headers() {
+        let cred = create_test_credentials();
+        let mut blank = HeaderMap::new();
+        blank.insert("If-None-Match", HeaderValue::from_static(""));
+        blank.insert("If-Match", HeaderValue::from_static(""));
+        let mut non_utf8 = HeaderMap::new();
+        non_utf8.insert(
+            "If-None-Match",
+            HeaderValue::from_bytes(b"\xff").expect("obs-text is a valid header value"),
+        );
+        non_utf8.insert("If-Match", HeaderValue::from_bytes(b"\xff").expect("obs-text is a valid header value"));
+
+        for headers in [HeaderMap::new(), blank, non_utf8] {
+            let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+            assert!(!conditions.contains_key("if-none-match"), "headers {headers:?}");
+            assert!(!conditions.contains_key("if-match"), "headers {headers:?}");
+        }
     }
 
     #[test]

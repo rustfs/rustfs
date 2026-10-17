@@ -1261,6 +1261,7 @@ impl DefaultObjectUsecase {
         {
             return Err(s3_error!(InvalidStorageClass));
         }
+        reject_non_wildcard_write_if_none_match(req.input.if_none_match.as_ref())?;
         // An authorized inbound replication PUT must store the replica verbatim.
         // Legacy snowball-extracted members may still carry the auto-extract
         // metadata, which replication replays as a header. Do not interpret that

@@ -72,7 +72,7 @@ use super::storage_api::multipart_usecase::{
 use super::trailer_adapter::trailer_source;
 use crate::app::object::{
     ConcurrencyManager, ForegroundWriteAdmission, get_concurrency_manager, guard_put_object_body_read_timeout,
-    put_object_body_read_timeout, reject_oversize_single_upload,
+    put_object_body_read_timeout, reject_non_wildcard_write_if_none_match, reject_oversize_single_upload,
 };
 use crate::app::object_data_cache::{
     ObjectDataCacheAdapter, invalidate_object_data_cache_after_complete_multipart_success,
@@ -580,6 +580,7 @@ impl DefaultMultipartUsecase {
             ..
         } = input;
 
+        reject_non_wildcard_write_if_none_match(if_none_match.as_ref())?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         if if_match.is_some() || if_none_match.is_some() {
