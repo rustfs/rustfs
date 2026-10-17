@@ -20,6 +20,7 @@ on:
     paths:
       - "crates/ecstore/src/disk/**"
       - "crates/ecstore/src/store/init_format.rs"
+      - "crates/ecstore/src/bucket/utils.rs"
       - "crates/ecstore/Cargo.toml"
       - "crates/utils/src/dunce.rs"
       - "Cargo.toml"
@@ -31,6 +32,7 @@ on:
     paths:
       - "crates/ecstore/src/disk/**"
       - "crates/ecstore/src/store/init_format.rs"
+      - "crates/ecstore/src/bucket/utils.rs"
       - "crates/ecstore/Cargo.toml"
       - "crates/utils/src/dunce.rs"
       - "Cargo.toml"
@@ -90,6 +92,14 @@ jobs:
       - name: Test startup temporary-directory cleanup
         shell: pwsh
         run: cargo test -p rustfs-ecstore --lib cleanup_tmp_on_startup_ -- --nocapture
+
+      - name: Test object key Windows admission
+        shell: pwsh
+        run: "cargo test -p rustfs-ecstore --lib bucket::utils:: -- --nocapture"
+
+      - name: Test Windows file-name rules
+        shell: pwsh
+        run: "cargo test -p rustfs-utils --no-default-features --features path --lib dunce:: -- --nocapture"
 
       - name: Test fresh format publication
         shell: pwsh
