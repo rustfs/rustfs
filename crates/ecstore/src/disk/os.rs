@@ -1924,6 +1924,15 @@ pub async fn make_dir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Path>) ->
     Ok(())
 }
 
+/// Keep the physical directory workers tied to their volume mutation owner.
+pub(crate) async fn make_dir_all_with_owner(path: &Path, base_dir: &Path, owner: Arc<dyn Send + Sync>) -> Result<()> {
+    check_path_length(path.to_string_lossy().as_ref())?;
+    reliable_mkdir_all_with_owner(path, base_dir, Some(owner))
+        .await
+        .map_err(to_file_error)?;
+    Ok(())
+}
+
 /// Check if a directory is empty.
 /// Only reads one entry to determine if the directory is empty.
 #[tracing::instrument(level = "debug", skip_all)]
@@ -4384,11 +4393,15 @@ fn should_retry_prepare(err: &io::Error, attempt: usize, prune_budget: usize) ->
 }
 
 pub async fn reliable_mkdir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> io::Result<()> {
+    reliable_mkdir_all_with_owner(path.as_ref(), base_dir.as_ref(), None).await
+}
+
+async fn reliable_mkdir_all_with_owner(path: &Path, base_dir: &Path, owner: Option<Arc<dyn Send + Sync>>) -> io::Result<()> {
     let mut i = 0;
 
-    let mut base_dir = base_dir.as_ref();
+    let mut base_dir = base_dir;
     loop {
-        if let Err(e) = os_mkdir_all(path.as_ref(), base_dir).await {
+        if let Err(e) = os_mkdir_all(path, base_dir, owner.clone()).await {
             if e.kind() == io::ErrorKind::NotFound && i == 0 {
                 i += 1;
 
@@ -4410,16 +4423,34 @@ pub async fn reliable_mkdir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Pat
     Ok(())
 }
 
+async fn mkdir_with_owner(path: &Path, recursive: bool, owner: Option<Arc<dyn Send + Sync>>) -> io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let _owner = owner;
+        #[cfg(test)]
+        super::local::volume_mutation_test_hooks::run(super::local::volume_mutation_test_hooks::Stage::Create, &path);
+        let result = if recursive {
+            std::fs::create_dir_all(&path)
+        } else {
+            std::fs::create_dir(&path)
+        };
+        #[cfg(test)]
+        super::local::volume_mutation_test_hooks::run(super::local::volume_mutation_test_hooks::Stage::CreateComplete, &path);
+        result
+    })
+    .await?
+}
+
 /// Create a directory and all its parent components if they are missing.
 /// Without recursion support, fall back to create_dir_all
 /// This function will not create directories under base_dir.
 #[tracing::instrument(level = "debug", skip_all)]
-pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> io::Result<()> {
-    if !base_dir.as_ref().to_string_lossy().is_empty() && base_dir.as_ref().starts_with(dir_path.as_ref()) {
+async fn os_mkdir_all(dir_path: &Path, base_dir: &Path, owner: Option<Arc<dyn Send + Sync>>) -> io::Result<()> {
+    if !base_dir.to_string_lossy().is_empty() && base_dir.starts_with(dir_path) {
         return Ok(());
     }
 
-    if let Err(e) = super::fs::mkdir(dir_path.as_ref()).await {
+    if let Err(e) = mkdir_with_owner(dir_path, false, owner.clone()).await {
         if e.kind() == io::ErrorKind::AlreadyExists {
             return Ok(());
         }
@@ -4428,16 +4459,16 @@ pub async fn os_mkdir_all(dir_path: impl AsRef<Path>, base_dir: impl AsRef<Path>
             return Err(e);
         }
 
-        if let Some(parent) = dir_path.as_ref().parent() {
+        if let Some(parent) = dir_path.parent() {
             // Fall back to creating the missing parent chain only when the direct mkdir proves it is required.
-            if let Err(parent_err) = super::fs::make_dir_all(parent).await
+            if let Err(parent_err) = mkdir_with_owner(parent, true, owner.clone()).await
                 && parent_err.kind() != io::ErrorKind::AlreadyExists
             {
                 return Err(parent_err);
             }
         }
 
-        if let Err(retry_err) = super::fs::mkdir(dir_path.as_ref()).await
+        if let Err(retry_err) = mkdir_with_owner(dir_path, false, owner.clone()).await
             && retry_err.kind() != io::ErrorKind::AlreadyExists
         {
             return Err(retry_err);

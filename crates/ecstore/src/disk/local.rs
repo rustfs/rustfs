@@ -507,6 +507,49 @@ fn classify_delete_volume_error(err: std::io::Error) -> DiskError {
     }
 }
 
+#[cfg(test)]
+pub(super) mod volume_mutation_test_hooks {
+    use super::*;
+    #[derive(Clone, Copy, Eq, Hash, PartialEq)]
+    pub(in crate::disk) enum Stage {
+        Create,
+        CreateComplete,
+        Delete,
+        DeleteComplete,
+    }
+    type Key = (Stage, PathBuf);
+    type Hook = Box<dyn FnOnce() + Send>;
+    static HOOKS: std::sync::LazyLock<ParkingLotMutex<HashMap<Key, Hook>>> = std::sync::LazyLock::new(Default::default);
+    fn key(stage: Stage, path: &Path) -> Option<Key> {
+        let parent = path.parent()?.canonicalize().ok()?;
+        Some((stage, parent.join(path.file_name()?)))
+    }
+
+    pub(super) struct Guard(Key);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOKS.lock().remove(&self.0);
+        }
+    }
+    pub(super) fn install(stage: Stage, path: &Path, hook: impl FnOnce() + Send + 'static) -> Guard {
+        let key = key(stage, path).expect("existing physical volume parent");
+        assert!(HOOKS.lock().insert(key.clone(), Box::new(hook)).is_none());
+        Guard(key)
+    }
+    pub(in crate::disk) fn run(stage: Stage, path: &Path) {
+        if HOOKS.lock().is_empty() {
+            return;
+        }
+        let Some(key) = key(stage, path) else {
+            return;
+        };
+        let hook = HOOKS.lock().remove(&key);
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 #[cfg(unix)]
 struct EmptyDirectoryFrame {
     path: PathBuf,
@@ -632,11 +675,18 @@ async fn remove_empty_directory_tree_under_mount_lease(
     mount_lease: &std::fs::File,
     volume: &str,
     root: PathBuf,
+    owner: Arc<dyn Send + Sync>,
 ) -> std::io::Result<()> {
     let root_parent = mount_lease.try_clone()?;
     let root_name = std::ffi::CString::new(volume.as_bytes()).map_err(|_| std::io::Error::from(ErrorKind::DirectoryNotEmpty))?;
     tokio::task::spawn_blocking(move || {
-        remove_empty_directory_tree_unix_at(&root_parent, root_name.as_c_str(), &root, |_| Ok(()), |_| Ok(()))
+        let _owner = owner;
+        #[cfg(test)]
+        volume_mutation_test_hooks::run(volume_mutation_test_hooks::Stage::Delete, &root);
+        let result = remove_empty_directory_tree_unix_at(&root_parent, root_name.as_c_str(), &root, |_| Ok(()), |_| Ok(()));
+        #[cfg(test)]
+        volume_mutation_test_hooks::run(volume_mutation_test_hooks::Stage::DeleteComplete, &root);
+        result
     })
     .await?
 }
@@ -652,15 +702,26 @@ async fn remove_empty_directory_tree_with(
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-async fn remove_empty_directory_tree(root: &Path) -> std::io::Result<()> {
+async fn remove_empty_directory_tree(root: &Path, owner: Arc<dyn Send + Sync>) -> std::io::Result<()> {
     let root = root.to_path_buf();
-    tokio::task::spawn_blocking(move || remove_empty_directory_tree_unix_with(&root, |_| Ok(()), |_| Ok(()))).await?
+    tokio::task::spawn_blocking(move || {
+        let _owner = owner;
+        #[cfg(test)]
+        volume_mutation_test_hooks::run(volume_mutation_test_hooks::Stage::Delete, &root);
+        let result = remove_empty_directory_tree_unix_with(&root, |_| Ok(()), |_| Ok(()));
+        #[cfg(test)]
+        volume_mutation_test_hooks::run(volume_mutation_test_hooks::Stage::DeleteComplete, &root);
+        result
+    })
+    .await?
 }
 
 #[cfg(windows)]
 #[derive(Debug)]
 struct LockedEmptyDirectory {
     handle: winapi_util::Handle,
+    #[cfg(test)]
+    path: PathBuf,
 }
 
 #[cfg(windows)]
@@ -697,22 +758,40 @@ async fn lock_windows_empty_directory(path: &Path, canonical_root: Option<&Path>
         let info = winapi_util::file::information(&handle)?;
         validate_windows_empty_directory(info.file_attributes())?;
         if let Some(canonical_root) = canonical_root {
-            let canonical_path = std::fs::canonicalize(path)?;
+            let canonical_path = std::fs::canonicalize(&path)?;
             if !canonical_path.starts_with(canonical_root) {
                 return Err(std::io::Error::from(ErrorKind::DirectoryNotEmpty));
             }
         }
-        Ok::<_, std::io::Error>(LockedEmptyDirectory { handle })
+        Ok::<_, std::io::Error>(LockedEmptyDirectory {
+            handle,
+            #[cfg(test)]
+            path,
+        })
     })
     .await?
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 // SAFETY: This helper only passes an owned live handle and one initialized
 // FILE_DISPOSITION_INFO to the synchronous Windows deletion API.
 #[allow(unsafe_code)]
 async fn remove_windows_empty_directory(directory: LockedEmptyDirectory) -> std::io::Result<()> {
+    remove_windows_empty_directory_with_owner(directory, None).await
+}
+
+#[cfg(windows)]
+// SAFETY: identical handle-relative deletion, with an additional retained owner.
+#[allow(unsafe_code)]
+async fn remove_windows_empty_directory_with_owner(
+    directory: LockedEmptyDirectory,
+    owner: Option<Arc<dyn Send + Sync>>,
+) -> std::io::Result<()> {
     tokio::task::spawn_blocking(move || {
+        let _owner = owner;
+        let directory = directory;
+        #[cfg(test)]
+        volume_mutation_test_hooks::run(volume_mutation_test_hooks::Stage::Delete, &directory.path);
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::{FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle};
 
@@ -745,8 +824,18 @@ struct WindowsEmptyDirectoryFrame {
 #[cfg(windows)]
 async fn remove_empty_directory_tree_with(
     root: &Path,
+    before_descend: impl FnMut(&Path) -> std::io::Result<()>,
+    before_remove: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    remove_empty_directory_tree_with_owner(root, before_descend, before_remove, None).await
+}
+
+#[cfg(windows)]
+async fn remove_empty_directory_tree_with_owner(
+    root: &Path,
     mut before_descend: impl FnMut(&Path) -> std::io::Result<()>,
     mut before_remove: impl FnMut(&Path) -> std::io::Result<()>,
+    owner: Option<Arc<dyn Send + Sync>>,
 ) -> std::io::Result<()> {
     let root_directory = lock_windows_empty_directory(root, None).await?;
     let canonical_root = fs::canonicalize(root).await?;
@@ -794,7 +883,7 @@ async fn remove_empty_directory_tree_with(
             Ok(None) => {
                 before_remove(&frame.path)?;
                 drop(frame.entries);
-                match remove_windows_empty_directory(frame.directory).await {
+                match remove_windows_empty_directory_with_owner(frame.directory, owner.clone()).await {
                     Ok(()) => {}
                     Err(err) if err.kind() == ErrorKind::NotFound => {}
                     Err(err) if err.kind() == ErrorKind::NotADirectory => {
@@ -812,13 +901,18 @@ async fn remove_empty_directory_tree_with(
 }
 
 #[cfg(windows)]
-async fn remove_empty_directory_tree(root: &Path) -> std::io::Result<()> {
-    remove_empty_directory_tree_with(root, |_| Ok(()), |_| Ok(())).await
+async fn remove_empty_directory_tree(root: &Path, owner: Arc<dyn Send + Sync>) -> std::io::Result<()> {
+    remove_empty_directory_tree_with_owner(root, |_| Ok(()), |_| Ok(()), Some(owner)).await
 }
 
 #[cfg(all(not(unix), not(windows)))]
-async fn remove_empty_directory_tree(root: &Path) -> std::io::Result<()> {
-    fs::remove_dir(root).await
+async fn remove_empty_directory_tree(root: &Path, owner: Arc<dyn Send + Sync>) -> std::io::Result<()> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let _owner = owner;
+        std::fs::remove_dir(root)
+    })
+    .await?
 }
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -5162,6 +5256,24 @@ async fn build_local_io_backend(root: PathBuf) -> Arc<dyn LocalIoBackend> {
     Arc::new(StdBackend::new(root))
 }
 
+struct VolumeMutationOwner {
+    _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+    cache_path: PathBuf,
+    volume: String,
+    io_backend: Arc<dyn LocalIoBackend>,
+    #[cfg(target_os = "linux")]
+    _mount: Arc<std::fs::File>,
+}
+
+impl Drop for VolumeMutationOwner {
+    fn drop(&mut self) {
+        // Invalidate before the write guard is released, including when the
+        // async waiter has disappeared. Invalidating a failed mutation is safe.
+        self.io_backend.invalidate_cached_fds_for_volume(&self.volume);
+        invalidate_bucket_cache(&self.cache_path);
+    }
+}
+
 #[allow(
     dead_code,
     reason = "path cache and cwd slots retained beside the disk root they derive from (backlog#1823)"
@@ -5175,7 +5287,7 @@ pub struct LocalDisk {
     /// pathname is later covered by another mount.
     io_root: PathBuf,
     #[cfg(target_os = "linux")]
-    mount_lease: std::fs::File,
+    mount_lease: Arc<std::fs::File>,
     #[cfg(target_os = "linux")]
     mount_lease_mount_id: Option<u64>,
     /// Public path for callers that need the configured disk layout. Internal
@@ -5459,6 +5571,22 @@ impl LocalDisk {
         &self.io_root
     }
 
+    fn volume_mutation_owner(
+        &self,
+        guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+        volume: &str,
+        cache_path: PathBuf,
+    ) -> Arc<dyn Send + Sync> {
+        Arc::new(VolumeMutationOwner {
+            _guard: guard,
+            cache_path,
+            volume: volume.to_owned(),
+            io_backend: self.io_backend.clone(),
+            #[cfg(target_os = "linux")]
+            _mount: self.mount_lease.clone(),
+        })
+    }
+
     /// Auto-replacement is destructive, so it is admitted only when the
     /// configured endpoint still names the directory held by `mount_lease`.
     pub fn has_replacement_mount_lease(&self) -> bool {
@@ -5684,7 +5812,7 @@ impl LocalDisk {
             publication_root,
             io_root: io_root.clone(),
             #[cfg(target_os = "linux")]
-            mount_lease,
+            mount_lease: Arc::new(mount_lease),
             #[cfg(target_os = "linux")]
             mount_lease_mount_id,
             endpoint: ep.clone(),
@@ -9493,7 +9621,12 @@ impl LocalDisk {
     /// with `VolumeNotEmpty` on those remnants even though the bucket is
     /// logically empty. The still-active readers keep their open descriptors;
     /// only path-based reopens observe the removal.
+    #[cfg(test)]
     async fn settle_pending_snapshot_deletes(&self, volume: &str) {
+        self.settle_pending_snapshot_deletes_with_owner(volume, None).await;
+    }
+
+    async fn settle_pending_snapshot_deletes_with_owner(&self, volume: &str, owner: Option<Arc<dyn Send + Sync>>) {
         let pending: Vec<(SnapshotLeaseKey, DeleteOptions)> = {
             let mut registry = self.snapshot_leases.lock();
             registry
@@ -9512,7 +9645,9 @@ impl LocalDisk {
             .collect();
 
         for (claim, opts) in pending {
-            let result = self.delete_unleased(&claim.key.volume, &claim.key.path, &opts).await;
+            let result = self
+                .delete_unleased_with_namespace_owner(&claim.key.volume, &claim.key.path, &opts, owner.clone())
+                .await;
             if let Err(err) = &result {
                 warn!(
                     volume = %claim.key.volume,
@@ -10824,14 +10959,16 @@ impl DiskAPI for LocalDisk {
             return Err(Error::other("Invalid arguments specified"));
         }
 
-        let volume_dir = self.io_get_bucket_path(volume)?;
+        let cache_path = self.io_get_bucket_path(volume)?;
+        let guard = os::disk_volume_mutation_lock(&self.root, volume).write_owned().await;
+        let owner = self.volume_mutation_owner(guard, volume, cache_path.clone());
+        let volume_dir = cache_path;
 
         // Volume creation is a mutation boundary, so it must observe the live
         // filesystem rather than a potentially stale existence-cache entry.
         if let Err(e) = access(&volume_dir).await {
             if e.kind() == ErrorKind::NotFound {
-                os::make_dir_all(&volume_dir, self.io_root()).await?;
-                invalidate_bucket_cache(&volume_dir);
+                os::make_dir_all_with_owner(&volume_dir, self.io_root(), owner.clone()).await?;
                 return Ok(());
             }
             error!(
@@ -11365,8 +11502,10 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()> {
-        let p = self.io_get_bucket_path(volume)?;
-        let _volume_mutation_guard = os::disk_volume_mutation_lock(&self.root, volume).write_owned().await;
+        let cache_path = self.io_get_bucket_path(volume)?;
+        let guard = os::disk_volume_mutation_lock(&self.root, volume).write_owned().await;
+        let owner = self.volume_mutation_owner(guard, volume, cache_path.clone());
+        let p = cache_path;
 
         // A streaming reader's snapshot lease defers the physical cleanup of
         // data dirs whose version delete already committed. Those remnants are
@@ -11374,22 +11513,35 @@ impl DiskAPI for LocalDisk {
         // the non-force removal below fail closed on them (the s3-tests SSE-C
         // teardown races exactly this way: DeleteObjects, then DeleteBucket
         // while an abandoned GET body still pins the lease).
-        self.settle_pending_snapshot_deletes(volume).await;
+        self.settle_pending_snapshot_deletes_with_owner(volume, Some(owner.clone()))
+            .await;
 
         // Non-force removes empty directory remnants children-first with
         // non-recursive rmdir calls. A file that exists during the scan, or
         // appears before its parent is removed, fails closed with
         // VolumeNotEmpty. Only an explicit force delete removes recursively.
         let res = if force_delete {
-            fs::remove_dir_all(&p).await
+            let path = p.clone();
+            let owner = owner.clone();
+            tokio::task::spawn_blocking(move || {
+                let _owner = owner;
+                #[cfg(test)]
+                volume_mutation_test_hooks::run(volume_mutation_test_hooks::Stage::Delete, &path);
+                let result = std::fs::remove_dir_all(&path);
+                #[cfg(test)]
+                volume_mutation_test_hooks::run(volume_mutation_test_hooks::Stage::DeleteComplete, &path);
+                result
+            })
+            .await
+            .map_err(DiskError::from)?
         } else {
             #[cfg(target_os = "linux")]
             {
-                remove_empty_directory_tree_under_mount_lease(&self.mount_lease, volume, p.clone()).await
+                remove_empty_directory_tree_under_mount_lease(&self.mount_lease, volume, p.clone(), owner.clone()).await
             }
             #[cfg(not(target_os = "linux"))]
             {
-                remove_empty_directory_tree(&p).await
+                remove_empty_directory_tree(&p, owner.clone()).await
             }
         };
 
@@ -11399,13 +11551,6 @@ impl DiskAPI for LocalDisk {
                 return Err(e);
             }
         }
-
-        // The whole bucket tree is gone; drop every cached io_uring descriptor
-        // for it so a cache hit cannot keep serving a removed object (the read
-        // hit path skips the volume-access check, so nothing else would notice)
-        // (rustfs/backlog#1177).
-        self.io_backend.invalidate_cached_fds_for_volume(volume);
-        invalidate_bucket_cache(&p);
 
         Ok(())
     }
@@ -22073,6 +22218,270 @@ mod test {
             .await
             .expect("operation should succeed");
         let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn volume_delete_cancellation_retains_physical_lock_before_recreate() {
+        use volume_mutation_test_hooks::{Stage, install};
+        for force in [false, true] {
+            let root = tempfile::tempdir().expect("volume cancellation root");
+            let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("local endpoint");
+            let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+            let volume = "cancelled-volume-delete";
+            disk.make_volume(volume).await.expect("create original volume");
+            let cache_path = disk.io_get_bucket_path(volume).expect("original volume cache key");
+            cached_access(&cache_path).await.expect("populate positive bucket cache");
+            fs::create_dir_all(root.path().join(volume).join("old/empty"))
+                .await
+                .expect("old empty tree");
+            if force {
+                fs::write(root.path().join(volume).join("old/payload"), b"old")
+                    .await
+                    .expect("force deletion has real old data");
+            }
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let path = root.path().join(volume);
+            let _pause = install(Stage::Delete, &path, move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            });
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let _complete = install(Stage::DeleteComplete, &path, move || {
+                let _ = done_tx.send(());
+            });
+            let deleting = disk.clone();
+            let waiter = tokio::spawn(async move { deleting.delete_volume(volume, force).await });
+            timeout(Duration::from_secs(5), entered_rx)
+                .await
+                .expect("physical delete starts")
+                .expect("delete entered");
+            waiter.abort();
+            assert!(waiter.await.expect_err("cancel delete waiter").is_cancelled());
+            let held = os::disk_volume_mutation_lock(&disk.root, volume).try_write_owned().is_err();
+            let mut recreate = Box::pin(disk.make_volume(volume));
+            let blocked = matches!(futures::poll!(recreate.as_mut()), Poll::Pending);
+            drop(release_tx);
+            timeout(Duration::from_secs(5), done_rx)
+                .await
+                .expect("physical delete drains")
+                .expect("delete completed");
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    if cached_access(&cache_path)
+                        .await
+                        .is_err_and(|error| error.kind() == ErrorKind::NotFound)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("physical delete invalidates its positive volume cache despite waiter cancellation");
+            assert!(held, "force={force}: cancellation released the physical volume lock");
+            assert!(blocked, "force={force}: recreation did not wait for the physical deletion");
+            timeout(Duration::from_secs(5), recreate)
+                .await
+                .expect("recreation finishes")
+                .expect("recreate volume");
+            fs::write(path.join("new-data"), b"new generation")
+                .await
+                .expect("write new generation");
+            assert_eq!(
+                fs::read(path.join("new-data"))
+                    .await
+                    .expect("new generation survives old deletion"),
+                b"new generation"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn volume_create_cancellation_retains_physical_lock() {
+        use volume_mutation_test_hooks::{Stage, install};
+        let root = tempfile::tempdir().expect("volume cancellation root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("local endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        let volume = "cancelled-volume-create";
+        let path = root.path().join(volume);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let _pause = install(Stage::Create, &path, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let _complete = install(Stage::CreateComplete, &path, move || {
+            let _ = done_tx.send(());
+        });
+        let creating = disk.clone();
+        let waiter = tokio::spawn(async move { creating.make_volume(volume).await });
+        timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("physical creation starts")
+            .expect("create entered");
+        waiter.abort();
+        assert!(waiter.await.expect_err("cancel create waiter").is_cancelled());
+        let held = os::disk_volume_mutation_lock(&disk.root, volume).try_write_owned().is_err();
+        let mut deletion = Box::pin(disk.delete_volume(volume, false));
+        let blocked = matches!(futures::poll!(deletion.as_mut()), Poll::Pending);
+        drop(release_tx);
+        timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("physical creation drains")
+            .expect("create completed");
+        assert!(held, "cancellation released the volume lock before mkdir completed");
+        assert!(blocked, "deletion passed the pending physical mkdir");
+        timeout(Duration::from_secs(5), deletion)
+            .await
+            .expect("delete finishes")
+            .expect("delete created volume");
+        assert!(!path.exists(), "late mkdir must not recreate an already-deleted volume");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn volume_cleanup_cancellation_keeps_original_mount_path_after_local_disk_drop() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        let root = tempfile::tempdir().expect("pending cleanup disk root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("local endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        let volume = "cancelled-volume-cleanup";
+        let data_dir = format!("object/{}", Uuid::new_v4());
+        let part = format!("{data_dir}/part.1");
+        ensure_test_volume(&disk, volume).await;
+        disk.write_all(volume, &part, Bytes::from_static(b"pending cleanup payload"))
+            .await
+            .expect("write real deferred shard");
+        let _snapshot = disk
+            .acquire_snapshot_lease(volume, &data_dir)
+            .await
+            .expect("pin shard directory");
+        assert_eq!(
+            disk.delete_data_dir(
+                volume,
+                &data_dir,
+                DeleteOptions {
+                    recursive: true,
+                    ..Default::default()
+                }
+            )
+            .await
+            .expect("defer physical shard cleanup"),
+            DataDirDeleteStatus::Deferred,
+        );
+        let original_root = disk.io_root().to_path_buf();
+        let source = disk
+            .io_get_object_path(volume, &data_dir)
+            .expect("original FD-relative data path");
+        let (destination_tx, destination_rx) = tokio::sync::oneshot::channel();
+        let _destination = hooks::observe_rename_destination(&source, move |path| {
+            let _ = destination_tx.send(path.to_path_buf());
+        });
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let _pause = hooks::install_at(hooks::Stage::Rename, &source, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let disk_probe = Arc::downgrade(&disk);
+        let deleting = disk.clone();
+        let waiter = tokio::spawn(async move { deleting.delete_volume(volume, false).await });
+        timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("pending cleanup enters actual rename")
+            .expect("cleanup entered");
+        let destination = destination_rx.await.expect("actual trash destination");
+        let physical_destination = root.path().join(
+            destination
+                .strip_prefix(&original_root)
+                .expect("destination stays on original mount"),
+        );
+        waiter.abort();
+        assert!(waiter.await.expect_err("cancel cleanup waiter").is_cancelled());
+        drop(disk);
+        assert!(disk_probe.upgrade().is_none(), "the LocalDisk itself must be released");
+        assert_eq!(
+            fs::read(original_root.join(volume).join(&part))
+                .await
+                .expect("original FD-relative path remains open in physical worker"),
+            b"pending cleanup payload",
+        );
+        drop(release_tx);
+        timeout(Duration::from_secs(5), hooks::drain_namespace_key(&destination))
+            .await
+            .expect("actual cleanup worker drains");
+        assert!(
+            !root.path().join(volume).join(&data_dir).exists(),
+            "cleanup must consume the original data directory"
+        );
+        assert_eq!(
+            fs::read(physical_destination.join("part.1"))
+                .await
+                .expect("actual deferred cleanup publishes the shard into trash"),
+            b"pending cleanup payload",
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn volume_delete_cancellation_closes_handle_before_releasing_physical_owner() {
+        struct RecreateOnOwnerDrop {
+            _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+            path: PathBuf,
+            result: Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>,
+        }
+        impl Drop for RecreateOnOwnerDrop {
+            fn drop(&mut self) {
+                let result = std::fs::create_dir(&self.path);
+                if let Some(sender) = self.result.take() {
+                    let _ = sender.send(result);
+                }
+            }
+        }
+        let root = tempfile::tempdir().expect("Windows deletion root");
+        let path = root.path().join("locked-volume");
+        fs::create_dir(&path).await.expect("create real directory");
+        let directory = lock_windows_empty_directory(&path, None)
+            .await
+            .expect("lock real Windows directory");
+        let lock = Arc::new(RwLock::new(()));
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let owner = Arc::new(RecreateOnOwnerDrop {
+            _guard: lock.clone().write_owned().await,
+            path: path.clone(),
+            result: Some(result_tx),
+        });
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let _pause = volume_mutation_test_hooks::install(volume_mutation_test_hooks::Stage::Delete, &path, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let waiter = tokio::spawn(remove_windows_empty_directory_with_owner(directory, Some(owner)));
+        timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("physical Windows deletion starts")
+            .expect("delete entered");
+        waiter.abort();
+        assert!(waiter.await.expect_err("cancel Windows delete waiter").is_cancelled());
+        let held = lock.clone().try_write_owned().is_err();
+        drop(release_tx);
+        timeout(Duration::from_secs(5), result_rx)
+            .await
+            .expect("physical owner drains")
+            .expect("owner completion")
+            .expect("the deletion handle must close before the owner can recreate the directory");
+        assert!(held, "the actual Windows executor must retain the owner after cancellation");
+        drop(
+            timeout(Duration::from_secs(5), lock.write_owned())
+                .await
+                .expect("volume lock releases"),
+        );
+        assert!(path.is_dir(), "recreation after handle close must persist");
     }
 
     #[tokio::test]

@@ -27,6 +27,14 @@ bucket creation. If only some disks contain a bucket volume, the existing
 incomplete-generation guard requires administrator recovery; this change does
 not bypass that guard to finish creation automatically.
 
+On each local disk, volume creation and deletion take the write side of the
+existing volume publication lock. Physical filesystem workers retain this
+lock after their caller is cancelled, including deferred snapshot cleanup.
+Their last owner invalidates volume and file-descriptor caches before releasing
+the lock. Linux workers also retain the original mount descriptor; Windows
+directory deletion closes its handle before releasing the owner. This local
+ordering does not establish the distributed legacy-write admission boundary.
+
 ## Persistence and versioning
 
 `BucketMetadata` in `crates/ecstore/src/bucket/metadata.rs` stores the prefix in
