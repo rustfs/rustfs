@@ -1065,18 +1065,25 @@ impl LocalDisk {
                 let backup_path = dst_parent
                     .join(rollback_data_dir.to_string())
                     .join(STORAGE_FORMAT_FILE_BACKUP);
-                // rename_all acquires the backup path's namespace lease. Do not
-                // hold a disk admission while acquiring another namespace lock.
+                // Keep backup mutations serialized, but never wait for a second
+                // namespace while holding the volume READ: its owner can be
+                // queued behind a volume DELETE that is waiting for this commit.
                 drop(file_sync_admission.take());
-                if let Err(err) = os::rename_all_with_owner(
-                    staged_backup,
-                    &backup_path,
-                    &dst_volume_dir,
-                    commit.publication_root,
-                    Some(commit.mutation_lease.clone()),
-                )
-                .await
-                {
+                let backup_result =
+                    match os::try_acquire_namespace_mutation_lease_with_owner(&backup_path, commit.mutation_lease.clone()) {
+                        Ok(lease) => {
+                            os::rename_all_with_lease(
+                                staged_backup,
+                                &backup_path,
+                                &dst_volume_dir,
+                                commit.publication_root,
+                                lease,
+                            )
+                            .await
+                        }
+                        Err(err) => Err(err),
+                    };
+                if let Err(err) = backup_result {
                     let _ = remove_file_if_exists(staged_backup);
                     return Err(err);
                 }

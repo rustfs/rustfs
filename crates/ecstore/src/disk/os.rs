@@ -1513,6 +1513,23 @@ pub(in crate::disk) async fn acquire_namespace_mutation_lease_with_owner(
     })
 }
 
+/// A transaction holding a volume READ must not queue for another namespace:
+/// its owner may already be waiting behind a queued volume WRITE.
+pub(in crate::disk) fn try_acquire_namespace_mutation_lease_with_owner(
+    path: &Path,
+    namespace_owner: Arc<dyn Send + Sync>,
+) -> Result<Arc<NamespaceMutationLease>> {
+    let guard = disk_namespace_mutation_lock(path)
+        .try_lock_owned()
+        .map_err(|_| DiskError::Io(io::Error::from(io::ErrorKind::WouldBlock)))?;
+    Ok(Arc::new(NamespaceMutationLease {
+        _namespace_guard: guard,
+        _volume_guard: None,
+        external_guard: Mutex::new(None),
+        _namespace_owner: Some(namespace_owner),
+    }))
+}
+
 /// Acquire object serialization before the volume read lock. Bucket deletion
 /// only acquires the volume write lock, so this order cannot form a lock cycle.
 pub(crate) async fn acquire_rename_data_mutation_lease(

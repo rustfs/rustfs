@@ -17926,6 +17926,127 @@ mod test {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rename_data_inline_backup_rejects_contention_with_queued_volume_delete() {
+        use futures::FutureExt;
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk should be created"));
+        let bucket = "inline-backup-lock-order";
+        let object = "queued-backup-object";
+        let version_id = Uuid::new_v4();
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        let object_dir = disk.get_object_path(bucket, object).expect("object path should resolve");
+        fs::create_dir_all(&object_dir)
+            .await
+            .expect("object directory should be created");
+        let initial_meta = test_meta(test_file_info(object, version_id, None, Some(Bytes::from_static(b"old"))));
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), &initial_meta)
+            .await
+            .expect("old metadata should be written");
+        let rollback_dir =
+            inline_metadata_rollback_dir(version_id, &FileMeta::load(&initial_meta).expect("metadata should parse"));
+        let backup_object = format!("{object}/{rollback_dir}/{STORAGE_FORMAT_FILE_BACKUP}");
+        let backup_path = disk
+            .io_get_object_path(bucket, &backup_object)
+            .expect("backup path should resolve");
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        set_inline_preparation_before_backup(object, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let writer_disk = Arc::clone(&disk);
+        let mut writer = tokio::spawn(async move {
+            writer_disk
+                .rename_data(
+                    RUSTFS_META_TMP_BUCKET,
+                    "queued-backup-stage",
+                    test_file_info(object, version_id, None, Some(Bytes::from_static(b"new"))),
+                    bucket,
+                    object,
+                )
+                .await
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(10)))
+            .await
+            .expect("preparation waiter should run")
+            .expect("writer should reach backup preparation");
+
+        // Poll the real delete before the second rename: Tokio queues its WRITE
+        // ahead of the second READ, while the second rename owns the backup key.
+        let mut delete = Box::pin(disk.delete_volume(bucket, true));
+        assert!(delete.as_mut().now_or_never().is_none(), "delete must wait for the first writer");
+        let mut competing = Box::pin(disk.rename_data(
+            RUSTFS_META_TMP_BUCKET,
+            "competing-backup-stage",
+            test_file_info(&backup_object, Uuid::new_v4(), None, Some(Bytes::from_static(b"competing"))),
+            bucket,
+            &backup_object,
+        ));
+        assert!(
+            competing.as_mut().now_or_never().is_none(),
+            "competing rename must wait for the queued delete"
+        );
+        assert!(
+            os::acquire_namespace_mutation_lease_with_owner(&backup_path, None)
+                .now_or_never()
+                .is_none(),
+            "the competing rename must own the exact backup namespace key"
+        );
+        release_tx.send(()).expect("release backup preparation");
+        let completed = tokio::time::timeout(Duration::from_secs(5), &mut writer).await;
+        // Break the competing wait before reporting a regression, so the test
+        // never leaves a blocked task or physical worker behind.
+        drop(competing);
+        if completed.is_err() {
+            drop(delete);
+            tokio::time::timeout(Duration::from_secs(10), writer)
+                .await
+                .expect("writer must drain after removing contention")
+                .expect("writer task must join")
+                .expect("writer must complete after removing contention");
+            panic!("inline backup contention must return while volume deletion is queued");
+        }
+        let error = completed
+            .expect("writer completed")
+            .expect("writer task must join")
+            .expect_err("backup contention must reject publication");
+        assert!(matches!(error, DiskError::Io(ref inner) if inner.kind() == ErrorKind::WouldBlock));
+        assert_eq!(
+            fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("old metadata should remain"),
+            initial_meta
+        );
+        assert!(!backup_path.exists(), "contention must not publish a rollback backup");
+        let staging_backup = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("queued-backup-stage/{STORAGE_FORMAT_FILE_BACKUP}"))
+            .expect("staging path should resolve");
+        assert!(!staging_backup.exists(), "rejected publication must clean its staged backup");
+        drop(delete);
+
+        disk.rename_data(
+            RUSTFS_META_TMP_BUCKET,
+            "queued-backup-stage",
+            test_file_info(object, version_id, None, Some(Bytes::from_static(b"new"))),
+            bucket,
+            object,
+        )
+        .await
+        .expect("retry should commit after contention is removed");
+        assert_eq!(fs::read(&backup_path).await.expect("rollback backup should exist"), initial_meta);
+        tokio::time::timeout(Duration::from_secs(10), disk.delete_volume(bucket, true))
+            .await
+            .expect("delete should finish after publication drains")
+            .expect("volume should be deleted");
+        assert!(!object_dir.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)]
     async fn windows_and_unix_cancelled_inline_preparation_serializes_newer_commit() {
         use std::sync::mpsc;

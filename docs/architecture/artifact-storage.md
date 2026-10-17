@@ -49,6 +49,14 @@ The incarnation-bound heal path retains its separate admission. Other legacy
 mutation routes and internal metadata publication still need their own admission
 boundary before distributed artifact sealing can be enabled.
 
+Inline `RenameData` retains the backup namespace mutex during rollback-backup
+publication. Because it already owns a volume read lock, it acquires this second
+namespace only without waiting: contention returns `Io(WouldBlock)` through the
+existing failure cleanup, leaving the old object metadata intact. This prevents
+a competing rename and queued bucket deletion from forming a lock cycle while
+preserving exclusion against a delayed backup unlink. The caller may retry after
+contention clears; this path does not add automatic retries.
+
 ## Persistence and versioning
 
 `BucketMetadata` in `crates/ecstore/src/bucket/metadata.rs` stores the prefix in
