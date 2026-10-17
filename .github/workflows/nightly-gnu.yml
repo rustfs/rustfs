@@ -80,13 +80,24 @@ jobs:
       - name: Setup Rust environment
         uses: ./.github/actions/setup
         with:
-          cache-shared-key: build-x86_64-unknown-linux-gnu
+          cache-shared-key: build-x86_64-unknown-linux-gnu-glibc-2.31
           cache-save-if: 'false'
+          install-cross-tools: 'true'
+          target: x86_64-unknown-linux-gnu
           install-build-packaging-tools: 'false'
           install-test-tools: 'false'
 
       - name: Build RustFS
-        run: cargo build --release --locked --target x86_64-unknown-linux-gnu -p rustfs --bins
+        # Pin the glibc baseline (`<target>.<glibc>` for cargo-zigbuild) so
+        # nightlies run on older distros such as RHEL/Rocky 9 (glibc 2.34); #8062.
+        run: cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.31 -p rustfs --bins
+
+      - name: Verify glibc symbol baseline
+        run: |
+          python3 scripts/release/check_glibc.py 2.31 \
+            target/x86_64-unknown-linux-gnu/release/rustfs \
+            target/x86_64-unknown-linux-gnu/release/rustfs-cli
+          target/x86_64-unknown-linux-gnu/release/rustfs --version | grep -Fx 'build target : x86_64-unknown-linux-gnu'
 
       - name: Build DEB package
         id: deb

@@ -167,6 +167,12 @@ pub enum DiskError {
     #[error("method not allowed")]
     MethodNotAllowed,
 
+    #[error("conditional delete object generation changed")]
+    ConditionalDeleteConflict,
+
+    #[error("guarded batch deletion is not supported by this disk")]
+    GuardedDeleteUnsupported,
+
     #[error("erasure write quorum")]
     ErasureWriteQuorum,
 
@@ -762,6 +768,8 @@ impl Clone for DiskError {
             DiskError::PartMissingOrCorrupt => DiskError::PartMissingOrCorrupt,
             DiskError::NoHealRequired => DiskError::NoHealRequired,
             DiskError::MethodNotAllowed => DiskError::MethodNotAllowed,
+            DiskError::ConditionalDeleteConflict => DiskError::ConditionalDeleteConflict,
+            DiskError::GuardedDeleteUnsupported => DiskError::GuardedDeleteUnsupported,
             DiskError::ErasureWriteQuorum => DiskError::ErasureWriteQuorum,
             DiskError::ErasureReadQuorum => DiskError::ErasureReadQuorum,
             DiskError::ShortWrite => DiskError::ShortWrite,
@@ -819,6 +827,8 @@ impl DiskError {
             DiskError::Timeout => 0x29,
             DiskError::InvalidPath => 0x2A,
             DiskError::RemoteClientUnavailable(_) => 0x2B,
+            DiskError::ConditionalDeleteConflict => 0x2C,
+            DiskError::GuardedDeleteUnsupported => 0x2D,
         }
     }
 
@@ -867,6 +877,8 @@ impl DiskError {
             0x29 => Some(DiskError::Timeout),
             0x2A => Some(DiskError::InvalidPath),
             0x2B => Some(DiskError::RemoteClientUnavailable(String::new())),
+            0x2C => Some(DiskError::ConditionalDeleteConflict),
+            0x2D => Some(DiskError::GuardedDeleteUnsupported),
             _ => None,
         }
     }
@@ -1643,6 +1655,21 @@ mod tests {
         let rendered = err.to_string();
         assert!(rendered.contains("remote rpc client unavailable"));
         assert!(rendered.contains("transport error: connection refused"));
+    }
+
+    #[test]
+    fn guarded_delete_errors_preserve_wire_and_io_types() {
+        for (error, code) in [
+            (DiskError::ConditionalDeleteConflict, 0x2C),
+            (DiskError::GuardedDeleteUnsupported, 0x2D),
+        ] {
+            assert_eq!(error.to_u32(), code);
+            assert_eq!(DiskError::from_u32(code), Some(error.clone()));
+            let wire: rustfs_protos::proto_gen::node_service::Error = error.clone().into();
+            assert_eq!(DiskError::from(wire), error);
+            let io_error: std::io::Error = error.clone().into();
+            assert_eq!(DiskError::from(io_error), error);
+        }
     }
 
     #[test]

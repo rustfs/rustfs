@@ -154,6 +154,10 @@ Merges (in order of increasing precedence):
 }}
 {{- $annotations = merge $annotations $mtls }}
 {{- end }}
+{{- $tls := .Values.tls | default dict -}}
+{{- if and ($tls.enabled | default false) (eq .Values.ingress.className "traefik") -}}
+{{- $_ := set $annotations "traefik.ingress.kubernetes.io/service.serversscheme" "https" -}}
+{{- end -}}
 {{- if $annotations }}
 {{- toYaml $annotations }}
 {{- end }}
@@ -188,6 +192,10 @@ Merges (in order of increasing precedence):
 {{- end }}
 {{- $annotations = merge $annotations (default (dict) .Values.ingress.customAnnotations) }}
 {{- $annotations = merge $annotations (default (dict) .Values.ingress.annotations) }}
+{{- $tls := .Values.tls | default dict -}}
+{{- if and ($tls.enabled | default false) (eq .Values.ingress.className "nginx") -}}
+{{- $_ := set $annotations "nginx.ingress.kubernetes.io/backend-protocol" "HTTPS" -}}
+{{- end -}}
 {{- if $annotations }}
 {{- toYaml $annotations }}
 {{- end }}
@@ -285,7 +293,8 @@ RUSTFS_VOLUMES on spaces, one pool per expression).
 */}}
 {{- define "rustfs.volumes" -}}
 {{- $protocol := "http" -}}
-{{- if .Values.mtls.enabled -}}
+{{- $tls := .Values.tls | default dict -}}
+{{- if or .Values.mtls.enabled ($tls.enabled | default false) -}}
   {{- $protocol = "https" -}}
 {{- end -}}
 {{- $headless := printf "%s-headless" (include "rustfs.fullname" .) -}}
@@ -347,17 +356,17 @@ Render liveness and readiness probe for http and https
 */}}
 
 {{- define "rustfs.probes" -}}
+{{- $tls := .Values.tls | default dict -}}
 {{- if .Values.livenessProbe.enabled }}
 livenessProbe:
-  {{- if .Values.mtls.enabled }}
-  exec:
-    command:
-{{ include "rustfs.probeCommand" (dict "root" . "endpointPath" "/health") | nindent 6 }}
+  {{- if or .Values.mtls.enabled ($tls.enabled | default false) }}
+  tcpSocket:
+    port: {{ .Values.service.endpoint.port | default 9000 }}
   {{- else }}
   httpGet:
     path: /health
     port: {{ .Values.service.endpoint.port | default 9000 }}
-    scheme: {{ if .Values.mtls.enabled }}HTTPS{{ else }}HTTP{{ end }}
+    scheme: {{ if or .Values.mtls.enabled ($tls.enabled | default false) }}HTTPS{{ else }}HTTP{{ end }}
   {{- end }}
   initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds | default 60 }}
   periodSeconds: {{ .Values.livenessProbe.periodSeconds | default 5 }}
@@ -376,7 +385,7 @@ readinessProbe:
   httpGet:
     path: /health/ready
     port: {{ .Values.service.endpoint.port | default 9000 }}
-    scheme: {{ if .Values.mtls.enabled }}HTTPS{{ else }}HTTP{{ end }}
+    scheme: {{ if or .Values.mtls.enabled ($tls.enabled | default false) }}HTTPS{{ else }}HTTP{{ end }}
   {{- end }}
   initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds | default 60 }}
   periodSeconds: {{ .Values.readinessProbe.periodSeconds | default 5 }}

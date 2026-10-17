@@ -21,6 +21,26 @@ pub(crate) fn is_object_locked_by_metadata(user_defined: &HashMap<String, String
     rustfs_lifecycle::object_lock::is_object_locked_by_metadata(user_defined, is_delete_marker)
 }
 
+pub(crate) fn lifecycle_object_lock_config(
+    config: &s3s::dto::ObjectLockConfiguration,
+) -> rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+    rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+        object_lock_enabled: config.object_lock_enabled.as_ref().map(|value| value.as_str().to_owned()),
+        rule: config
+            .rule
+            .as_ref()
+            .map(|rule| rustfs_gateway_types::persistence::PersistedObjectLockRule {
+                default_retention: rule.default_retention.as_ref().map(|retention| {
+                    rustfs_gateway_types::persistence::PersistedDefaultRetention {
+                        mode: retention.mode.as_ref().map(|value| value.as_str().to_owned()),
+                        days: retention.days,
+                        years: retention.years,
+                    }
+                }),
+            }),
+    }
+}
+
 pub(crate) fn check_object_lock_for_deletion_with_config(
     config: Option<&s3s::dto::ObjectLockConfiguration>,
     obj_info: &ObjectInfo,

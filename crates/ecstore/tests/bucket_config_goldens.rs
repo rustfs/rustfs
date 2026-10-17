@@ -26,7 +26,9 @@
 //! metadata store, or choosing a canonical shape.
 //!
 //! Upstream: the bucket-config `deserialize`/`serialize` pair, reached through the
-//! integration-test facade `tests/storage_api.rs`, and the s3s DTOs they are generic over. Downstream: the DTO/codec
+//! integration-test facade `tests/storage_api.rs`, and the configuration types they are
+//! generic over (`BucketConfigXml`: the gateway persistence shapes for the families that
+//! have moved, the s3s DTOs for the rest). Downstream: the DTO/codec
 //! replacement (T1.4) and the persisted-bytes comparison (T3.7), which must
 //! keep every golden green without regenerating it. Regeneration is reserved
 //! to `scripts/gen_bucket_config_goldens.sh`, which sets
@@ -35,23 +37,24 @@
 
 mod storage_api;
 
-use s3s::dto::{
-    AbortIncompleteMultipartUpload, AccelerateConfiguration, BucketAccelerateStatus, BucketLifecycleConfiguration,
-    BucketLoggingStatus, BucketVersioningStatus, CORSConfiguration, CORSRule, Condition, DefaultRetention, DelMarkerExpiration,
-    DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication, DeleteReplicationStatus, Destination,
-    ErrorDocument, Event, ExcludedPrefix, ExistingObjectReplication, ExistingObjectReplicationStatus, ExpirationStatus,
-    FilterRule, FilterRuleName, IndexDocument, LifecycleExpiration, LifecycleRule, LifecycleRuleAndOperator, LifecycleRuleFilter,
-    LoggingEnabled, NoncurrentVersionExpiration, NotificationConfiguration, NotificationConfigurationFilter,
-    ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, Payer, PublicAccessBlockConfiguration,
-    QueueConfiguration, Redirect, ReplicaModifications, ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule,
-    ReplicationRuleAndOperator, ReplicationRuleFilter, ReplicationRuleStatus, RequestPaymentConfiguration, RoutingRule,
-    S3KeyFilter, ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
-    ServerSideEncryptionRule, SourceSelectionCriteria, StorageClass, Tag, Tagging, Transition, TransitionStorageClass,
-    VersioningConfiguration, WebsiteConfiguration,
+use rustfs_gateway_types::dto::{Status, StorageClass};
+use rustfs_gateway_types::persistence::{
+    PersistedAbortIncompleteMultipartUpload, PersistedDelMarkerExpiration, PersistedLifecycleAnd,
+    PersistedLifecycleConfiguration, PersistedLifecycleExpiration, PersistedLifecycleFilter, PersistedLifecycleRule,
+    PersistedLifecycleTag, PersistedNoncurrentVersionExpiration, PersistedOptionalReplicationStatus, PersistedReplicationAnd,
+    PersistedReplicationConfiguration, PersistedReplicationDestination, PersistedReplicationFilter, PersistedReplicationRule,
+    PersistedReplicationStatus, PersistedReplicationTag, PersistedSourceSelectionCriteria, PersistedTransition,
 };
-use s3s::xml;
+use s3s::dto::{
+    AccelerateConfiguration, BucketAccelerateStatus, BucketLoggingStatus, BucketVersioningStatus, CORSConfiguration, CORSRule,
+    Condition, DefaultRetention, ErrorDocument, Event, ExcludedPrefix, FilterRule, FilterRuleName, IndexDocument, LoggingEnabled,
+    NotificationConfiguration, NotificationConfigurationFilter, ObjectLockConfiguration, ObjectLockEnabled,
+    ObjectLockRetentionMode, ObjectLockRule, Payer, PublicAccessBlockConfiguration, QueueConfiguration, Redirect,
+    RequestPaymentConfiguration, RoutingRule, S3KeyFilter, ServerSideEncryption, ServerSideEncryptionByDefault,
+    ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Tagging, VersioningConfiguration, WebsiteConfiguration,
+};
 use std::path::{Path, PathBuf};
-use storage_api::bucket_config_codec::{deserialize, serialize};
+use storage_api::bucket_config_codec::{BucketConfigXml, deserialize, serialize};
 
 /// Set only by `scripts/gen_bucket_config_goldens.sh`. Every pair test then
 /// writes its `.out.xml` (and, for the `rustfs` shape, its `.in.xml`) and
@@ -83,7 +86,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 fn round_trip<T>(input: &[u8], label: &str) -> Vec<u8>
 where
-    T: for<'xml> xml::Deserialize<'xml> + xml::Serialize,
+    T: BucketConfigXml,
 {
     let parsed: T = deserialize(input).unwrap_or_else(|err| panic!("{label}: deserialize failed: {err}"));
     serialize(&parsed).unwrap_or_else(|err| panic!("{label}: serialize failed: {err}"))
@@ -106,7 +109,7 @@ fn assert_bytes_eq(actual: &[u8], expected: &[u8], context: &str) {
 /// the `rustfs` shape; the `aws` and `minio` shapes pass `None`.
 fn check_pair<T>(family: &str, shape: &str, typed: Option<&T>)
 where
-    T: for<'xml> xml::Deserialize<'xml> + xml::Serialize,
+    T: BucketConfigXml,
 {
     let in_path = pair_path(family, shape, "in");
     let out_path = pair_path(family, shape, "out");
@@ -189,40 +192,43 @@ mod rustfs_values {
         }
     }
 
-    pub(super) fn lifecycle() -> BucketLifecycleConfiguration {
-        BucketLifecycleConfiguration {
+    pub(super) fn lifecycle() -> PersistedLifecycleConfiguration {
+        PersistedLifecycleConfiguration {
             rules: vec![
-                LifecycleRule {
-                    abort_incomplete_multipart_upload: Some(AbortIncompleteMultipartUpload {
+                PersistedLifecycleRule {
+                    abort_incomplete_multipart_upload: Some(PersistedAbortIncompleteMultipartUpload {
                         days_after_initiation: Some(3),
                     }),
-                    del_marker_expiration: Some(DelMarkerExpiration { days: Some(7) }),
-                    expiration: Some(LifecycleExpiration {
+                    del_marker_expiration: Some(PersistedDelMarkerExpiration { days: Some(7) }),
+                    expiration: Some(PersistedLifecycleExpiration {
                         days: Some(30),
                         ..Default::default()
                     }),
-                    filter: Some(LifecycleRuleFilter {
+                    filter: Some(PersistedLifecycleFilter {
                         prefix: Some("tmp/".to_owned()),
                         ..Default::default()
                     }),
                     id: Some("expire-tmp".to_owned()),
-                    noncurrent_version_expiration: Some(NoncurrentVersionExpiration {
+                    noncurrent_version_expiration: Some(PersistedNoncurrentVersionExpiration {
                         newer_noncurrent_versions: Some(2),
                         noncurrent_days: Some(7),
                     }),
                     noncurrent_version_transitions: None,
                     prefix: None,
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                    status: "Enabled".to_owned(),
                     transitions: None,
                 },
-                LifecycleRule {
+                PersistedLifecycleRule {
                     abort_incomplete_multipart_upload: None,
                     del_marker_expiration: None,
                     expiration: None,
-                    filter: Some(LifecycleRuleFilter {
-                        and: Some(LifecycleRuleAndOperator {
+                    filter: Some(PersistedLifecycleFilter {
+                        and: Some(PersistedLifecycleAnd {
                             prefix: Some("archive/".to_owned()),
-                            tags: Some(vec![tag("tier", "cold")]),
+                            tags: Some(vec![PersistedLifecycleTag {
+                                key: Some("tier".to_owned()),
+                                value: Some("cold".to_owned()),
+                            }]),
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -231,10 +237,10 @@ mod rustfs_values {
                     noncurrent_version_expiration: None,
                     noncurrent_version_transitions: None,
                     prefix: None,
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                    transitions: Some(vec![Transition {
+                    status: "Enabled".to_owned(),
+                    transitions: Some(vec![PersistedTransition {
                         days: Some(90),
-                        storage_class: Some(TransitionStorageClass::from_static("COLDTIER")),
+                        storage_class: Some("COLDTIER".to_owned()),
                         ..Default::default()
                     }]),
                 },
@@ -291,41 +297,44 @@ mod rustfs_values {
         }
     }
 
-    pub(super) fn replication() -> ReplicationConfiguration {
-        ReplicationConfiguration {
+    pub(super) fn replication() -> PersistedReplicationConfiguration {
+        PersistedReplicationConfiguration {
             role: String::new(),
-            rules: vec![ReplicationRule {
-                delete_marker_replication: Some(DeleteMarkerReplication {
-                    status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+            rules: vec![PersistedReplicationRule {
+                delete_marker_replication: Some(PersistedOptionalReplicationStatus {
+                    status: Some(Status::ENABLED.to_string()),
                 }),
-                delete_replication: Some(DeleteReplication {
-                    status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+                delete_replication: Some(PersistedReplicationStatus {
+                    status: Status::ENABLED.to_string(),
                 }),
-                destination: Destination {
+                destination: PersistedReplicationDestination {
                     bucket: "arn:rustfs:replication::0b6f3c2a-5e6a-4d2b-9c1e-7a8f9d0e1b2c:interop-dr".to_owned(),
-                    storage_class: Some(StorageClass::from_static(StorageClass::STANDARD)),
+                    storage_class: Some(StorageClass::STANDARD.to_string()),
                     ..Default::default()
                 },
-                existing_object_replication: Some(ExistingObjectReplication {
-                    status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+                existing_object_replication: Some(PersistedReplicationStatus {
+                    status: Status::ENABLED.to_string(),
                 }),
-                filter: Some(ReplicationRuleFilter {
-                    and: Some(ReplicationRuleAndOperator {
+                filter: Some(PersistedReplicationFilter {
+                    and: Some(PersistedReplicationAnd {
                         prefix: Some("docs/".to_owned()),
-                        tags: Some(vec![tag("replicate", "yes")]),
+                        tags: Some(vec![PersistedReplicationTag {
+                            key: Some("replicate".to_owned()),
+                            value: Some("yes".to_owned()),
+                        }]),
                     }),
                     ..Default::default()
                 }),
                 id: Some("rustfs-dr".to_owned()),
                 prefix: None,
                 priority: Some(1),
-                source_selection_criteria: Some(SourceSelectionCriteria {
-                    replica_modifications: Some(ReplicaModifications {
-                        status: ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED),
+                source_selection_criteria: Some(PersistedSourceSelectionCriteria {
+                    replica_modifications: Some(PersistedReplicationStatus {
+                        status: Status::ENABLED.to_string(),
                     }),
                     sse_kms_encrypted_objects: None,
                 }),
-                status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                status: Status::ENABLED.to_string(),
             }],
         }
     }
@@ -424,8 +433,8 @@ mod bucket_config_goldens {
     golden!(notification_minio, "notification", "minio", NotificationConfiguration);
     golden!(notification_rustfs, "notification", rustfs = rustfs_values::notification());
 
-    golden!(lifecycle_aws, "lifecycle", "aws", BucketLifecycleConfiguration);
-    golden!(lifecycle_minio, "lifecycle", "minio", BucketLifecycleConfiguration);
+    golden!(lifecycle_aws, "lifecycle", "aws", PersistedLifecycleConfiguration);
+    golden!(lifecycle_minio, "lifecycle", "minio", PersistedLifecycleConfiguration);
     golden!(lifecycle_rustfs, "lifecycle", rustfs = rustfs_values::lifecycle());
 
     golden!(object_lock_aws, "object_lock", "aws", ObjectLockConfiguration);
@@ -451,7 +460,7 @@ mod bucket_config_goldens {
     /// element is skipped on read and never re-emitted on write.
     #[test]
     fn replication_aws() {
-        check_pair::<ReplicationConfiguration>("replication", "aws", None);
+        check_pair::<PersistedReplicationConfiguration>("replication", "aws", None);
         let input = read(&pair_path("replication", "aws", "in"));
         let output = read(&pair_path("replication", "aws", "out"));
         assert!(
@@ -464,7 +473,7 @@ mod bucket_config_goldens {
             String::from_utf8_lossy(&output)
         );
     }
-    golden!(replication_minio, "replication", "minio", ReplicationConfiguration);
+    golden!(replication_minio, "replication", "minio", PersistedReplicationConfiguration);
     golden!(replication_rustfs, "replication", rustfs = rustfs_values::replication());
 
     golden!(cors_aws, "cors", "aws", CORSConfiguration);
@@ -494,4 +503,92 @@ mod bucket_config_goldens {
         "public_access_block",
         rustfs = rustfs_values::public_access_block()
     );
+}
+
+mod bucket_config_lifecycle_date_compat {
+    use super::*;
+    use rustfs_lifecycle::core::format_lifecycle_date;
+    use time::OffsetDateTime;
+
+    const DATES: [&str; 3] = [
+        "2023-11-14T22:13:20.123456789Z",
+        "2023-11-14T22:13:20.123456789+05:30",
+        "2025-01-02T00:00:00+02:00",
+    ];
+
+    fn document(date: &str) -> Vec<u8> {
+        format!(
+            "<LifecycleConfiguration><ExpiryUpdatedAt>{date}</ExpiryUpdatedAt><Rule><ID>date-compat</ID><Status>Enabled</Status><Expiration><Date>{date}</Date></Expiration><Transition><Date>{date}</Date><StorageClass>GLACIER</StorageClass></Transition></Rule></LifecycleConfiguration>"
+        )
+        .into_bytes()
+    }
+
+    fn legacy_read(input: &[u8]) -> s3s::dto::BucketLifecycleConfiguration {
+        let mut reader = s3s::xml::Deserializer::new(input);
+        let value = s3s::xml::Deserialize::deserialize(&mut reader).expect("the actual old lifecycle reader accepts the date");
+        reader.expect_eof().expect("the old reader consumes the entire date fixture");
+        value
+    }
+
+    #[test]
+    fn lifecycle_xml_reader_preserves_legacy_date_precision_and_offset() {
+        for date in DATES {
+            let input = document(date);
+            let old = legacy_read(&input);
+            let new: PersistedLifecycleConfiguration = deserialize(&input).expect("read persisted lifecycle date");
+            let old_date = |value: &s3s::dto::Timestamp| {
+                format_lifecycle_date(OffsetDateTime::from(value.clone())).expect("format the original old-reader date")
+            };
+            assert_eq!(
+                [
+                    new.expiry_updated_at.clone(),
+                    new.rules[0].expiration.as_ref().and_then(|value| value.date.clone()),
+                    new.rules[0].transitions.as_ref().unwrap()[0].date.clone(),
+                ],
+                [
+                    Some(old_date(old.expiry_updated_at.as_ref().unwrap())),
+                    Some(old_date(old.rules[0].expiration.as_ref().unwrap().date.as_ref().unwrap())),
+                    Some(old_date(old.rules[0].transitions.as_ref().unwrap()[0].date.as_ref().unwrap())),
+                ],
+                "the lifecycle reader must retain the old date representation for {date}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_xml_writer_preserves_legacy_date_bytes() {
+        for date in DATES {
+            let old = legacy_read(&document(date));
+            let mut old_xml = Vec::new();
+            s3s::xml::Serialize::serialize(&old, &mut s3s::xml::Serializer::new(&mut old_xml))
+                .expect("the actual old lifecycle writer emits the date");
+            let new = PersistedLifecycleConfiguration {
+                expiry_updated_at: Some(date.to_owned()),
+                rules: vec![PersistedLifecycleRule {
+                    abort_incomplete_multipart_upload: None,
+                    del_marker_expiration: None,
+                    expiration: Some(PersistedLifecycleExpiration {
+                        date: Some(date.to_owned()),
+                        ..Default::default()
+                    }),
+                    filter: None,
+                    id: Some("date-compat".to_owned()),
+                    noncurrent_version_expiration: None,
+                    noncurrent_version_transitions: None,
+                    prefix: None,
+                    status: "Enabled".to_owned(),
+                    transitions: Some(vec![PersistedTransition {
+                        date: Some(date.to_owned()),
+                        days: None,
+                        storage_class: Some("GLACIER".to_owned()),
+                    }]),
+                }],
+            };
+            assert_eq!(
+                serialize(&new).expect("write persisted lifecycle date"),
+                old_xml,
+                "legacy date bytes for {date}"
+            );
+        }
+    }
 }

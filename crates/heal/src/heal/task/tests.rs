@@ -24,6 +24,59 @@ mod canonical_outcome {
     use super::*;
     use crate::heal::outcome::{HealExecutionOutcome, HealTraversalCoverage};
 
+    #[tokio::test]
+    async fn admin_bucket_discovery_incomplete_cannot_finish_an_empty_cluster() {
+        for dry_run in [false, true] {
+            let storage = Arc::new(MockStorage {
+                listed_buckets: Mutex::new(Some(Vec::new())),
+                bucket_discovery_incomplete: true,
+                ..Default::default()
+            });
+            let mut request = HealRequest::new(
+                HealType::Cluster,
+                HealOptions {
+                    dry_run,
+                    recursive: true,
+                    ..Default::default()
+                },
+                HealPriority::Normal,
+            );
+            request.source = HealRequestSource::Admin;
+            let task = HealTask::from_request(request, storage.clone());
+            assert!(matches!(task.execute().await, Err(Error::BucketDiscoveryIncomplete)));
+            let outcome = task.get_outcome().await;
+            assert_eq!(outcome.execution, HealExecutionOutcome::Aborted(HealAbortReason::Untraversable));
+            assert_eq!(outcome.coverage, HealTraversalCoverage::Partial);
+            assert_eq!(outcome.counters.processed, 0);
+            assert_eq!(outcome.counters.failed, 0);
+            assert!(storage.bucket_heal_calls.lock().expect("bucket calls").is_empty());
+            assert!(storage.heal_object_calls.lock().expect("object calls").is_empty());
+            let wire = serde_json::to_value(&outcome).expect("outcome serializes");
+            assert_eq!(
+                crate::heal::outcome::legacy_wire_status("finished", &wire, false)
+                    .expect("legacy status")
+                    .0,
+                "stopped"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_bucket_discovery_complete_empty_cluster_finishes() {
+        let storage = Arc::new(MockStorage {
+            listed_buckets: Mutex::new(Some(Vec::new())),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::Normal);
+        request.source = HealRequestSource::Admin;
+        let task = HealTask::from_request(request, storage);
+        task.execute().await.expect("complete empty namespace is valid");
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
+        assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
+        assert_eq!(outcome.counters.processed, 0);
+    }
+
     fn bucket_task(storage: Arc<MockStorage>) -> HealTask {
         HealTask::from_request(
             HealRequest::new(
@@ -1481,6 +1534,7 @@ struct MockStorage {
     truncate_without_token: Mutex<bool>,
     include_object_dir_candidate: Mutex<bool>,
     listed_buckets: Mutex<Option<Vec<String>>>,
+    bucket_discovery_incomplete: bool,
     bucket_heal_errors: Mutex<HashMap<String, VecDeque<&'static str>>>,
     bucket_heal_calls: Mutex<Vec<String>>,
     block_heal_object: Mutex<bool>,
@@ -1978,6 +2032,16 @@ impl HealStorageAPI for MockStorage {
             return Err(Error::Other("usage baseline unavailable".to_string()));
         }
         Ok(*self.usage_baseline.lock().unwrap())
+    }
+
+    async fn list_buckets_for_admin_heal(
+        &self,
+        _selector: Option<crate::heal::storage_api::storage::DiskSetSelector>,
+    ) -> Result<Vec<BucketInfo>> {
+        if self.bucket_discovery_incomplete {
+            return Err(Error::BucketDiscoveryIncomplete);
+        }
+        self.list_buckets().await
     }
 
     async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {

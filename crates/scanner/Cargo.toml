@@ -31,6 +31,7 @@ workspace = true
 
 [features]
 default = []
+diagnostic-read-version-caller = ["rustfs-ecstore/diagnostic-read-version-caller"]
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",
@@ -98,6 +99,7 @@ rustfs-ecstore = { workspace = true }
 rustfs-storage-api = { workspace = true }
 http = { workspace = true }
 rand = { workspace = true, features = ["serde"] }
+rustfs-gateway-types.workspace = true
 s3s = { workspace = true, features = ["minio"] }
 metrics = { workspace = true }
 rustfs-data-usage = { workspace = true }

@@ -38,11 +38,7 @@ impl Serialize for ResourceSet {
 
         let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
         for resource in &self.0 {
-            let resource_str = match resource {
-                Resource::S3(value) => format!("{}{}", Resource::S3_PREFIX, value),
-                Resource::Kms(value) => format!("{}{}", Resource::KMS_PREFIX, value),
-            };
-            seq.serialize_element(&resource_str)?;
+            seq.serialize_element(resource)?;
         }
         seq.end()
     }
@@ -165,6 +161,7 @@ impl<'de> Deserialize<'de> for ResourceSet {
 
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 pub enum Resource {
+    All,
     S3(String),
     Kms(String),
 }
@@ -197,6 +194,7 @@ impl Resource {
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
         let pattern = match self {
+            Resource::All => return true,
             Resource::S3(s) => s.to_owned(),
             Resource::Kms(s) => s.to_owned(),
         };
@@ -242,7 +240,9 @@ impl Resource {
 impl TryFrom<&str> for Resource {
     type Error = Error;
     fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
-        let resource = if let Some(suffix) = value.strip_prefix(Self::S3_PREFIX) {
+        let resource = if value == "*" {
+            Resource::All
+        } else if let Some(suffix) = value.strip_prefix(Self::S3_PREFIX) {
             Resource::S3(suffix.into())
         } else if let Some(suffix) = value.strip_prefix(Self::KMS_PREFIX) {
             Resource::Kms(suffix.into())
@@ -259,6 +259,7 @@ impl Validator for Resource {
     type Error = Error;
     fn is_valid(&self) -> std::result::Result<(), Error> {
         match self {
+            Self::All => {}
             Self::S3(pattern) => {
                 if pattern.is_empty() || pattern.starts_with('/') {
                     return Err(IamError::InvalidResource("s3".into(), pattern.into()).into());
@@ -290,6 +291,7 @@ impl Serialize for Resource {
         S: serde::Serializer,
     {
         match self {
+            Resource::All => serializer.serialize_str("*"),
             Resource::S3(s) => serializer.serialize_str(&format!("{}{}", Self::S3_PREFIX, s)),
             Resource::Kms(s) => serializer.serialize_str(&format!("{}{}", Self::KMS_PREFIX, s)),
         }
@@ -312,6 +314,10 @@ mod tests {
     use std::collections::HashMap;
     use test_case::test_case;
 
+    #[test_case("*", "mybucket" => true; "all buckets")]
+    #[test_case("*", "mybucket/myobject" => true; "all objects")]
+    #[test_case("*", "key/mykey" => true; "all keys")]
+    #[test_case("*", "" => true; "unscoped action")]
     #[test_case("arn:aws:s3:::*","mybucket" => true; "1")]
     #[test_case("arn:aws:s3:::*","mybucket/myobject" => true; "2")]
     #[test_case("arn:aws:s3:::mybucket*","mybucket" => true; "3")]
@@ -344,6 +350,32 @@ mod tests {
         let resource: Resource = resource.try_into().unwrap();
 
         pollster::block_on(resource.is_match(object, &HashMap::new()))
+    }
+
+    #[test]
+    fn test_wildcard_resource_serialization_round_trip() {
+        use crate::policy::resource::ResourceSet;
+
+        let resource: Resource = serde_json::from_str(r#""*""#).expect("wildcard resource should parse");
+        assert_eq!(serde_json::to_string(&resource).expect("resource should serialize"), r#""*""#);
+
+        for json in [r#""*""#, r#"["*"]"#, r#"["*","*"]"#] {
+            let set: ResourceSet = serde_json::from_str(json).expect("wildcard resource set should parse");
+            assert_eq!(set.len(), 1, "duplicate wildcard resources should be removed");
+            let serialized = serde_json::to_string(&set).expect("resource set should serialize");
+            assert_eq!(serialized, r#"["*"]"#);
+            let round_trip: ResourceSet = serde_json::from_str(&serialized).expect("resource set should parse again");
+            assert_eq!(round_trip, set);
+        }
+    }
+
+    #[test_case(""; "empty resource")]
+    #[test_case("**"; "multiple wildcards")]
+    #[test_case("*/*"; "unqualified path")]
+    #[test_case(" *"; "leading whitespace")]
+    #[test_case("arn:aws:unknown:::*"; "unknown service")]
+    fn test_invalid_resource_is_rejected(resource: &str) {
+        assert!(Resource::try_from(resource).is_err(), "invalid resource must not become a wildcard");
     }
 
     #[test_case("arn:aws:kms:::key/mykey" => true; "key id parses")]

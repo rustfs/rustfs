@@ -63,6 +63,10 @@ pub(crate) const METRIC_SSEC_PLAINTEXT_REQUESTS_TOTAL: &str = "rustfs_ssec_plain
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>;
 
+/// Set only by the listener stack; proxy protocol assertions do not establish this marker.
+#[derive(Clone, Copy)]
+pub(crate) struct NativeTlsTransport(pub(crate) bool);
+
 /// Every header that carries, or announces, a customer-provided key: the
 /// object's own triple and the copy-source triple that CopyObject and
 /// UploadPartCopy use to read an SSE-C source.
@@ -191,7 +195,8 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+    fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
+        req.extensions_mut().insert(NativeTlsTransport(self.connection_is_tls));
         if !carries_ssec_headers(req.headers())
             || is_secure_transport(self.connection_is_tls, req.extensions().get::<ClientInfo>())
         {

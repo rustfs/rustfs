@@ -19,9 +19,6 @@ no-default-features = false
 version = 2
 yanked = "deny"
 ignore = [
-    # `paste 1.0.15` — unmaintained. No direct dependency.
-    # owner: rustfs-maintainers  review: 2026-07
-    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; transitive only; tracked for upgrade" },
     # `rsa` Marvin timing sidechannel (RUSTSEC-2023-0071). Pulled in via
     # `openidconnect` (transitive) and historically used directly. No upstream
     # fix is available yet. Tracked separately for follow-up; remove this
@@ -39,6 +36,10 @@ allow-git = [
     # Official s3s repository pinned for Iceberg SigV4 path encoding support.
     # owner: GatewayJ  review: 2026-10
     "https://github.com/s3s-project/s3s",
+    # rustfs-gateway-types, pinned to one gateway commit in the workspace
+    # dependencies while the engine crates move off s3s (rustfs/backlog#2745).
+    # owner: rustfs-maintainers  review: 2027-01
+    "https://github.com/rustfs/gateway",
     # RustFS io_uring backend is now consumed from crates.io at 0.3.0.
     # owner: rustfs-maintainers  review: 2026-10
     # "https://github.com/rustfs/uring",

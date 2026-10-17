@@ -28,7 +28,8 @@ pub mod state;
 pub use certs::{
     CertDirectoryLoadOptions, TlsCertPairInspection, TlsCertPairStatus, TlsDirectoryInspection, TlsDomainInspection,
     WebPkiClientVerifierOptions, build_webpki_client_verifier, create_multi_cert_resolver, inspect_cert_directory,
-    load_all_certs_from_directory, load_cert_bundle_der_bytes, load_certs, load_private_key,
+    load_all_certs_from_directory, load_all_certs_from_directory_strict, load_cert_bundle_der_bytes, load_certs,
+    load_private_key, validate_certified_key,
 };
 pub use config::{ReloadApplyHint, ReloadDetectMode, TlsReloadOptions};
 pub use coordinator::{TlsConsumer, TlsReloadCoordinator};
@@ -45,7 +46,7 @@ pub use outbound::{
     load_global_outbound_tls_state, publish_global_outbound_tls_state, summarize_global_outbound_tls_state,
 };
 pub use server::{ReloadableServerCertResolver, spawn_server_cert_reload_loop};
-pub use source::{TlsFileLayout, TlsSource, TlsSourceKind};
+pub use source::{TlsFileLayout, TlsSource, TlsSourceKind, TlsSourceSnapshot};
 pub use state::OutboundOnlySnapshotArgs;
 pub use state::{TlsGeneration, TlsPublishedState, TlsReloadRuntimeState, TlsRuntimeStatusSnapshot};
 pub use state::{TlsRuntimeConsumerSection, TlsRuntimeOutboundSection, TlsRuntimeRuntimeSection, TlsRuntimeServerSection};
@@ -111,6 +112,8 @@ mod tests {
         let coordinator = TlsReloadCoordinator::new(source.clone(), TlsReloadOptions::default());
         let snapshot = TlsMaterialSnapshot {
             source,
+            server_client_ca_pem: None,
+            material_files: std::collections::BTreeSet::new(),
             server: Some(ServerTlsMaterial::MultiCert {
                 cert_key_pairs: HashMap::new(),
             }),

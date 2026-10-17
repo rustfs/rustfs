@@ -23,12 +23,15 @@ use tokio::sync::Notify;
 
 pub(crate) use rustfs_ecstore::with_background_disk_io as ecstore_with_background_disk_io;
 
+#[cfg(test)]
+pub(crate) use rustfs_gateway_types::persistence::PersistedLifecycleRule as EcstoreLifecycleRule;
+pub(crate) use rustfs_gateway_types::persistence::{
+    PersistedLifecycleConfiguration as EcstoreBucketLifecycleConfiguration,
+    PersistedLifecycleFilter as EcstoreLifecycleRuleFilter,
+};
 pub(crate) use s3s::dto::{
-    BucketLifecycleConfiguration as EcstoreBucketLifecycleConfiguration, LifecycleRuleFilter as EcstoreLifecycleRuleFilter,
     ObjectLockConfiguration as EcstoreObjectLockConfiguration, VersioningConfiguration as EcstoreVersioningConfiguration,
 };
-#[cfg(test)]
-pub(crate) use s3s::dto::{ExpirationStatus as EcstoreExpirationStatus, LifecycleRule as EcstoreLifecycleRule};
 
 pub(crate) use rustfs_ecstore::api::data_usage::{
     MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPlan,
@@ -101,6 +104,7 @@ pub(crate) use rustfs_ecstore::api::event::{EventArgs as EcstoreEventArgs, send_
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::layout::{
     EndpointServerPools as EcstoreEndpointServerPools, Endpoints as EcstoreEndpoints, PoolEndpoints as EcstorePoolEndpoints,
+    SetupType as EcstoreSetupType,
 };
 pub(crate) use rustfs_ecstore::api::notification::NotificationSys as EcstoreNotificationSys;
 pub(crate) use rustfs_ecstore::api::notification::scanner_peer_transport_error_message_is_retryable;
@@ -140,10 +144,21 @@ pub(crate) use rustfs_lifecycle::{
 };
 use rustfs_storage_api as storage_contracts;
 
+#[cfg(feature = "diagnostic-read-version-caller")]
+pub(crate) mod ecstore_diagnostic {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::diagnostic::current_read_version_entry_source;
+    pub(crate) use rustfs_ecstore::api::diagnostic::{
+        ReadVersionContextBoundary, ReadVersionEntrySource, observe_read_version_context_boundary, with_read_version_entry,
+    };
+}
+
 #[cfg(test)]
 pub(crate) type EcstoreHealResultItem = <EcstoreStore as storage_contracts::HealOperations>::HealResultItem;
 
 pub(crate) mod owner {
+    #[cfg(test)]
+    pub(crate) use super::storage_contracts::DiskSetSelector;
     pub(crate) use super::{
         MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPlan,
         ScannerPauseBacklogRetirementReplica, register_scanner_pause_backlog_retirement_planner,
@@ -187,9 +202,9 @@ pub(crate) mod owner {
     #[cfg(test)]
     pub(crate) use super::{
         EcstoreDiskOption, EcstoreDiskStore, EcstoreEndpoint, EcstoreEndpointServerPools, EcstoreEndpoints,
-        EcstoreExpirationStatus, EcstoreInstanceContext, EcstoreLifecycleRule, EcstorePoolDecommissionInfo, EcstorePoolEndpoints,
-        EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats, ecstore_config_init,
-        ecstore_init_bucket_metadata_sys, ecstore_init_local_disks_with_instance_ctx, ecstore_new_disk,
+        EcstoreInstanceContext, EcstoreLifecycleRule, EcstorePoolDecommissionInfo, EcstorePoolEndpoints, EcstoreRebalStatus,
+        EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats, ecstore_config_init, ecstore_init_bucket_metadata_sys,
+        ecstore_init_local_disks_with_instance_ctx, ecstore_new_disk,
     };
 }
 
@@ -197,7 +212,10 @@ pub(crate) mod owner {
 pub struct ScannerReplicationConfig(EcstoreReplicationConfig);
 
 impl ScannerReplicationConfig {
-    pub(crate) fn new(config: Option<s3s::dto::ReplicationConfiguration>, remotes: Option<EcstoreBucketTargets>) -> Self {
+    pub(crate) fn new(
+        config: Option<rustfs_gateway_types::persistence::PersistedReplicationConfiguration>,
+        remotes: Option<EcstoreBucketTargets>,
+    ) -> Self {
         Self(EcstoreReplicationConfig::new(config, remotes))
     }
 

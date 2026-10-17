@@ -294,7 +294,8 @@ impl ScannerIOCache for SetDisks {
             };
             cache.info.last_update = Some(now);
             cache.info.snapshot_complete = true;
-            cache.info.scan_execution_digest = Some(execution_digest);
+            let replication_execution = super::cache::scanner_replication_execution_digest(execution_digest, &cache);
+            cache.info.scan_execution_digest = Some(replication_execution);
             cache.info.segment_invalidation_proof = completed_segment_invalidation_proof;
             cache.info.lkg_snapshot_complete = false;
             cache.info.lkg_next_cycle = None;
@@ -469,21 +470,22 @@ impl ScannerIOCache for SetDisks {
                 "Scanner set assigned remote disks without namespace scanner support to coordinator-driven workers"
             );
         }
-        let disk_scan_limit = scanner_budgeted_concurrency_limit(
-            scanner_max_concurrent_disk_scans(workers.len()),
-            budget.requires_serial_progress_accounting(),
-        );
+        let dispatch_limit = scanner_max_concurrent_disk_scans(workers.len());
+        let serial_progress_accounting = budget.requires_serial_progress_accounting();
+        let disk_scan_limit = scanner_budgeted_concurrency_limit(dispatch_limit, serial_progress_accounting);
         record_disk_scan_concurrency_limit(&pool_label, &set_label, disk_scan_limit);
-        debug!(
+        tracing::info!(
             target: "rustfs::scanner::io",
             event = EVENT_SCANNER_SET_STATE,
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_IO,
+            state = "disk_concurrency_budget",
+            reason = if serial_progress_accounting { "count_budget" } else { "configured_or_available_work" },
             pool = self.pool_index,
             set = self.set_index,
             online_disks = workers.len(),
+            dispatch_limit,
             concurrency_limit = disk_scan_limit,
-            state = "disk_concurrency_budget",
             "Scanner disk concurrency budget resolved"
         );
         let disk_scan_semaphore = Arc::new(Semaphore::new(disk_scan_limit));
@@ -1565,7 +1567,8 @@ impl ScannerIOCache for SetDisks {
                 cache.info.next_cycle = want_cycle;
                 cache.info.last_update.get_or_insert_with(SystemTime::now);
                 cache.info.snapshot_complete = true;
-                cache.info.scan_execution_digest = Some(execution_digest);
+                let replication_execution = super::cache::scanner_replication_execution_digest(execution_digest, &cache);
+                cache.info.scan_execution_digest = Some(replication_execution);
                 cache.info.segment_invalidation_proof = completed_segment_invalidation_proof;
                 cache.info.lkg_snapshot_complete = false;
                 cache.info.lkg_next_cycle = None;

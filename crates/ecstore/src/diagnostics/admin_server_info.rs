@@ -15,7 +15,9 @@
 use crate::cluster::rpc::{
     ScannerBucketListing, TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client,
 };
-use crate::data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, load_data_usage_from_backend_cached};
+use crate::data_usage::{
+    DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, load_admin_data_usage_from_backend_cached as load_server_info_usage_snapshot,
+};
 use crate::error::{Error, Result};
 use crate::{
     disk::endpoint::{Endpoint, EndpointType},
@@ -37,12 +39,16 @@ use rustfs_protos::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    time::Duration,
+    time::{Duration, Instant},
 };
-use time::OffsetDateTime;
 use tokio::time::timeout;
 use tonic::Request;
-use tracing::warn;
+use tracing::{error, trace, warn};
+
+const EVENT_SERVER_PING: &str = "server_ping";
+const EVENT_SERVER_INFO: &str = "server_info";
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_DIAGNOSTICS: &str = "diagnostics";
 
 use shadow_rs::shadow;
 
@@ -157,11 +163,22 @@ async fn is_server_resolvable(endpoint: &Endpoint) -> Result<()> {
 
         let response: PingResponse = client.ping(request).await?.into_inner();
 
-        let ping_response_body = flatbuffers::root::<PingBody>(&response.body);
-        if let Err(e) = ping_response_body {
-            eprintln!("{e}");
+        if flatbuffers::root::<PingBody>(&response.body).is_err() {
+            error!(
+                event = EVENT_SERVER_PING,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DIAGNOSTICS,
+                result = "invalid_response",
+                "Server ping response decoding failed"
+            );
         } else {
-            println!("ping_resp:body(flatbuffer): {ping_response_body:?}");
+            trace!(
+                event = EVENT_SERVER_PING,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DIAGNOSTICS,
+                result = "success",
+                "Server ping completed"
+            );
         }
 
         Ok(())
@@ -259,15 +276,9 @@ fn collect_runtime_server_stats() -> (MemStats, u64, u64) {
 }
 
 pub async fn get_server_info(get_pools: bool) -> InfoMessage {
-    let nowt: OffsetDateTime = OffsetDateTime::now_utc();
-
-    warn!("get_server_info start {:?}", nowt);
+    let started = tracing::enabled!(tracing::Level::TRACE).then(Instant::now);
 
     let local = get_local_server_property().await;
-
-    let after1 = OffsetDateTime::now_utc();
-
-    warn!("get_local_server_property end {:?}", after1 - nowt);
 
     let mut servers = {
         if let Some(sys) = runtime_sources::notification_sys() {
@@ -277,9 +288,6 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
         }
     };
 
-    let after2 = OffsetDateTime::now_utc();
-
-    warn!("server_info end {:?}", after2 - after1);
     servers.push(local);
 
     let mut buckets = rustfs_madmin::Buckets::default();
@@ -294,7 +302,7 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
     if let Some(store) = runtime_sources::object_store_handle() {
         mode = ITEM_ONLINE;
         apply_data_usage_result(
-            load_data_usage_from_backend_cached(store.clone()).await,
+            load_server_info_usage_snapshot(store.clone()).await,
             &mut buckets,
             &mut objects,
             &mut versions,
@@ -314,15 +322,8 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
             );
         }
 
-        let after3 = OffsetDateTime::now_utc();
-
-        warn!("load_data_usage_from_backend end {:?}", after3 - after2);
-
         let backend_info = StorageAdminApi::backend_info(store.as_ref()).await;
 
-        let after4 = OffsetDateTime::now_utc();
-
-        warn!("backend_info end {:?}", after4 - after3);
         if let Some(endpoints) = runtime_sources::endpoint_pools() {
             let (added, report) = reconcile_servers_with_endpoint_topology(&mut servers, &endpoints);
             if added > 0 || !report.is_complete() {
@@ -344,9 +345,6 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
         }
         let (online_disks, offline_disks, unknown_disks) = get_online_offline_disks_stats(&all_disks);
 
-        let after5 = OffsetDateTime::now_utc();
-
-        warn!("get_online_offline_disks_stats end {:?}", after5 - after4);
         backend = rustfs_madmin::ErasureBackend {
             backend_type: rustfs_madmin::BackendType::ErasureType,
             online_disks: online_disks.sum(),
@@ -359,13 +357,23 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
         };
         if get_pools {
             pools = get_pools_info(&all_disks).await.unwrap_or_default();
-            let after6 = OffsetDateTime::now_utc();
-
-            warn!("get_pools_info end {:?}", after6 - after5);
         }
     }
 
     let services = rustfs_madmin::Services::default();
+
+    if let Some(started) = started {
+        trace!(
+            event = EVENT_SERVER_INFO,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DIAGNOSTICS,
+            state = "completed",
+            mode,
+            include_pools = get_pools,
+            duration_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "Server info collected"
+        );
+    }
 
     InfoMessage {
         mode: Some(mode.to_string()),
@@ -678,12 +686,16 @@ async fn get_pools_info(all_disks: &[Disk]) -> Result<HashMap<i32, HashMap<i32, 
 
         if erasure_set.id == 0 {
             erasure_set.id = d.set_index;
-            match load_data_usage_cache(
+            let load = load_data_usage_cache(
                 store.pools[d.pool_index as usize].disk_set[d.set_index as usize].as_ref(),
                 DATA_USAGE_CACHE_NAME,
-            )
-            .await
-            {
+            );
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            let load = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+                rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::ServerInfoPools,
+                load,
+            );
+            match load.await {
                 Ok(cache) => apply_erasure_set_usage(&cache, erasure_set),
                 Err(_) => erasure_set.usage_error = Some(DATA_USAGE_UNAVAILABLE_ERROR.to_string()),
             }
@@ -965,6 +977,93 @@ mod tests {
         assert_eq!(versions.count, 4);
         assert_eq!(delete_markers.count, 5);
         assert_eq!(usage.size, 6);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn server_info_reads_complete_observation_without_promoting_authority() {
+        use crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
+        use crate::config::com::{read_config, save_config};
+        use crate::data_usage::{
+            DATA_USAGE_OBJ_NAME_PATH, DATA_USAGE_OBSERVED_OBJ_NAME_PATH, invalidate_data_usage_snapshot_cache,
+            load_data_usage_from_backend_cached,
+        };
+        use rustfs_data_usage::{BucketUsageInfo, DataUsageInfo};
+        use std::time::{Duration, SystemTime};
+
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        let primary = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            scanner_epoch: Some(1),
+            usage_snapshot_bootstrap_pending: true,
+            usage_snapshot_converged: Some(false),
+            ..Default::default()
+        };
+        let observed = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2)),
+            scanner_epoch: Some(1),
+            scanner_cycle: Some(1),
+            buckets_count: 1,
+            objects_total_count: 3,
+            versions_total_count: 4,
+            delete_markers_total_count: 1,
+            objects_total_size: 6,
+            buckets_usage: [(
+                "bucket".to_string(),
+                BucketUsageInfo {
+                    objects_count: 3,
+                    versions_count: 4,
+                    delete_markers_count: 1,
+                    size: 6,
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            usage_snapshot_complete: true,
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_authoritative_baseline: Some(primary.snapshot_identity()),
+            ..Default::default()
+        };
+        let primary_bytes = serde_json::to_vec(&primary).expect("bootstrap should encode");
+        save_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), primary_bytes.clone())
+            .await
+            .expect("bootstrap should persist");
+        save_config(
+            store.clone(),
+            DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
+            serde_json::to_vec(&observed).expect("observation should encode"),
+        )
+        .await
+        .expect("observation should persist");
+        invalidate_data_usage_snapshot_cache().await;
+
+        let displayed = super::load_server_info_usage_snapshot(store.clone())
+            .await
+            .expect("server info should load the complete observation");
+        assert_eq!(displayed.usage_snapshot_converged, Some(false));
+        let mut buckets = rustfs_madmin::Buckets::default();
+        let mut objects = rustfs_madmin::Objects::default();
+        let mut versions = rustfs_madmin::Versions::default();
+        let mut delete_markers = rustfs_madmin::DeleteMarkers::default();
+        let mut usage = rustfs_madmin::Usage::default();
+        apply_data_usage_result(Ok(displayed), &mut buckets, &mut objects, &mut versions, &mut delete_markers, &mut usage);
+        assert!(objects.error.is_none());
+        assert_eq!(
+            (buckets.count, objects.count, versions.count, delete_markers.count, usage.size),
+            (1, 3, 4, 1, 6)
+        );
+        let quota = load_data_usage_from_backend_cached(store.clone())
+            .await
+            .expect("quota should retain its bootstrap state");
+        assert!(!quota.is_complete_bucket_usage_snapshot());
+        assert_eq!(
+            read_config(store, DATA_USAGE_OBJ_NAME_PATH.as_str())
+                .await
+                .expect("primary should remain readable"),
+            primary_bytes
+        );
+        invalidate_data_usage_snapshot_cache().await;
     }
 
     #[test]

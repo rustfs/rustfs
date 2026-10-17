@@ -36,13 +36,15 @@ use crate::{
 };
 use rustfs_common::GlobalReadiness;
 use std::{collections::BTreeSet, io::Result, sync::Arc};
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
 const EVENT_DRIVE_UNAVAILABLE: &str = "drive_unavailable";
 const LOG_COMPONENT_CONNECT: &str = "connect";
 const LOG_SUBSYSTEM_INVENTORY: &str = "inventory";
 
 pub(crate) struct StartupServiceRuntime {
+    pub(crate) table_maintenance: Option<crate::table_catalog::PeriodicMaintenanceRuntime>,
+    pub(crate) oidc_recovery: Option<AbortOnDropHandle<()>>,
     pub(crate) optional_runtimes: OptionalRuntimeServices,
     pub(crate) heartbeat: Option<HeartbeatRuntime>,
     pub(crate) inventory: Option<InventoryRuntime>,
@@ -82,6 +84,7 @@ pub(crate) async fn init_startup_runtime_services(
     state_manager: Arc<ServiceStateManager>,
     server_ctx: Arc<ServerContextSlot>,
 ) -> Result<StartupServiceRuntime> {
+    let maintenance_config = crate::table_catalog::PeriodicMaintenanceConfig::from_env().map_err(std::io::Error::other)?;
     init_kms_system(config, store.clone()).await?;
 
     let optional_runtimes = init_optional_runtime_services(server_ctx.clone()).await?;
@@ -101,7 +104,7 @@ pub(crate) async fn init_startup_runtime_services(
     init_deadlock_detector_runtime();
 
     let buckets = init_bucket_metadata_runtime(store.clone(), ctx.clone()).await?;
-    let iam_bootstrap = init_iam_runtime(store.clone(), ctx.clone(), readiness, state_manager, server_ctx).await?;
+    let iam_bootstrap = init_iam_runtime(store.clone(), ctx.clone(), readiness, state_manager, server_ctx.clone()).await?;
 
     // Audit initialization requires the AppContext (server config + object store)
     // which is published by ensure_startup_after_iam inside init_iam_runtime.
@@ -111,14 +114,19 @@ pub(crate) async fn init_startup_runtime_services(
     // self-pointing replication rules until the next restart. The task waits for IAM and
     // bucket metadata itself, and its first pass runs off this path.
     spawn_site_replication_reconcile_task(ctx.clone());
-    init_auth_integrations().await?;
+    let oidc_recovery = init_auth_integrations(ctx.child_token()).await?;
     init_notification_runtime(endpoint_pools, buckets).await?;
     let enable_scanner = init_background_service_runtime(store.clone()).await?;
     init_observability_runtime(store.clone(), ctx.clone()).await;
     let heartbeat = start_heartbeat_runtime(heartbeat_config.clone(), heartbeat_nodes, &ctx)?;
     let inventory = start_inventory_runtime(heartbeat_config, heartbeat_nodes, inventory_drives, store, &ctx)?;
 
+    let table_maintenance =
+        maintenance_config.map(|config| crate::table_catalog::PeriodicMaintenanceRuntime::spawn(config, server_ctx, &ctx));
+
     Ok(StartupServiceRuntime {
+        table_maintenance,
+        oidc_recovery,
         optional_runtimes,
         heartbeat,
         inventory,

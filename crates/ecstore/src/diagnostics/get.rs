@@ -182,6 +182,7 @@ pub(crate) const GET_METADATA_CACHE_REASON_DELETE_MARKER: &str = "delete_marker"
 pub(crate) const GET_METADATA_CACHE_REASON_DIST_ERASURE: &str = "dist_erasure";
 pub(crate) const GET_METADATA_CACHE_REASON_INCL_FREE_VERSIONS: &str = "incl_free_versions";
 pub(crate) const GET_METADATA_CACHE_REASON_INSUFFICIENT_CACHED_QUORUM: &str = "insufficient_cached_quorum";
+pub(crate) const GET_METADATA_CACHE_REASON_BODY_LAYOUT_REQUIRED: &str = "body_layout_required";
 pub(crate) const GET_METADATA_CACHE_REASON_META_BUCKET: &str = "meta_bucket";
 pub(crate) const GET_METADATA_CACHE_REASON_NO_LOCK: &str = "no_lock";
 pub(crate) const GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED: &str = "not_found_or_expired";

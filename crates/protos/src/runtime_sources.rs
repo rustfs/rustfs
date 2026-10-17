@@ -22,6 +22,10 @@ pub(crate) async fn outbound_tls_state() -> GlobalPublishedOutboundTlsState {
     load_global_outbound_tls_state().await
 }
 
+pub(crate) fn outbound_tls_generation() -> u64 {
+    rustfs_tls_runtime::load_global_outbound_tls_generation().0
+}
+
 pub(crate) fn record_stale_grpc_channel_tls_generation() {
     record_tls_consumer_stale_generation(PROTOS_GRPC_CHANNEL_TLS_CONSUMER);
 }

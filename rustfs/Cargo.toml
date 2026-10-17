@@ -77,6 +77,10 @@ rio-v2 = ["rustfs-ecstore/rio-v2"]
 pyroscope = ["rustfs-obs/pyroscope", "dep:pyroscope", "dep:object", "dep:symbolic-demangle"]
 # Tokio runtime telemetry. Requires `--cfg tokio_unstable`; use `make build-profiling`.
 dial9 = ["rustfs-obs/dial9"]
+# Diagnostic-only Rust GlobalAlloc live-byte accounting; adds per-allocation atomic updates.
+diagnostic-allocator-live = []
+# Diagnostic-only S3-operation attribution for internode ReadVersion and list-walker metrics.
+diagnostic-read-version-caller = ["rustfs-ecstore/diagnostic-read-version-caller", "rustfs-io-metrics/diagnostic-read-version-caller", "rustfs-scanner/diagnostic-read-version-caller"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn"]
 hotpath = [
     "hotpath/hotpath",
@@ -246,6 +250,7 @@ rustfs-notify = { workspace = true }
 rustfs-obs = { workspace = true }
 rustfs-policy = { workspace = true }
 rustfs-protocols = { workspace = true }
+rustfs-gateway-types = { workspace = true }
 rustfs-protos = { workspace = true }
 rustfs-rio = { workspace = true }
 rustfs-s3-client = { workspace = true }

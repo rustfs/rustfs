@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
+use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration as BucketLifecycleConfiguration;
+use s3s::dto::ObjectLockConfiguration;
 use serde::{Deserialize, Serialize, ser::SerializeMap};
 use sha2::{Digest, Sha256};
 use std::{
@@ -100,19 +101,17 @@ pub(crate) async fn read_config_with_revision<S: ScannerObjectIO>(
     store: Arc<S>,
     path: &str,
 ) -> StorageResult<(Option<Vec<u8>>, DataUsageCacheRevision)> {
-    match store
-        .get_object_reader(
-            RUSTFS_META_BUCKET,
-            path,
-            None,
-            HeaderMap::new(),
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
-        )
-        .await
-    {
+    let opts = ObjectOptions {
+        no_lock: true,
+        ..Default::default()
+    };
+    let read = store.get_object_reader(RUSTFS_META_BUCKET, path, None, HeaderMap::new(), &opts);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let read = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+        crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::ScannerRevisionRead,
+        read,
+    );
+    match read.await {
         Ok(mut reader) => {
             let revision = reader
                 .object_info
@@ -170,19 +169,17 @@ fn error_chain_has_usage_floor_corruption_signature(error: &(dyn std::error::Err
 
 /// Read only the object revision without materializing its body.
 pub(crate) async fn read_config_revision<S: ScannerObjectIO>(store: Arc<S>, path: &str) -> StorageResult<DataUsageCacheRevision> {
-    match store
-        .get_object_reader(
-            RUSTFS_META_BUCKET,
-            path,
-            None,
-            HeaderMap::new(),
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
-        )
-        .await
-    {
+    let opts = ObjectOptions {
+        no_lock: true,
+        ..Default::default()
+    };
+    let read = store.get_object_reader(RUSTFS_META_BUCKET, path, None, HeaderMap::new(), &opts);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let read = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+        crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::ScannerRevisionRead,
+        read,
+    );
+    match read.await {
         Ok(reader) => reader
             .object_info
             .etag
@@ -596,6 +593,7 @@ pub struct DataUsageCacheInfo {
     pub next_cycle: u64,
     pub last_update: Option<SystemTime>,
     pub skip_healing: bool,
+    #[serde(default, deserialize_with = "crate::lifecycle_cache::deserialize")]
     pub lifecycle: Option<Arc<BucketLifecycleConfiguration>>,
     pub replication: Option<Arc<ReplicationConfig>>,
     #[serde(default)]
@@ -699,7 +697,7 @@ impl Serialize for DataUsageCacheInfo {
         state.serialize_entry("leader_epoch", &self.leader_epoch)?;
         state.serialize_entry("last_update", &self.last_update)?;
         state.serialize_entry("skip_healing", &self.skip_healing)?;
-        state.serialize_entry("lifecycle", &self.lifecycle)?;
+        state.serialize_entry("lifecycle", &crate::lifecycle_cache::LifecycleCache(&self.lifecycle))?;
         state.serialize_entry("replication", &self.replication)?;
         state.serialize_entry("failed_objects", &self.failed_objects)?;
         state.serialize_entry("scan_resume_after", &self.scan_resume_after)?;

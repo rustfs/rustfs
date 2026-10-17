@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::storage_api::site_replication::parse_lifecycle_date;
 use rustfs_s3_types::s3_error;
 
 pub(crate) const SITE_REPLICATION_PEER_BUCKET_OPS_PATH: &str = "/rustfs/admin/v3/site-replication/peer/bucket-ops";
@@ -620,7 +621,7 @@ fn retry_bucket_metadata_is_redundant(item: &SRBucketMeta) -> bool {
             })
         }),
         "replication-config" => item.replication_config.as_deref().is_some_and(|raw| {
-            deserialize::<ReplicationConfiguration>(&decode_bucket_meta_wire_value(raw))
+            deserialize::<PersistedReplicationConfiguration>(&decode_bucket_meta_wire_value(raw))
                 .is_ok_and(|config| config.role.trim().is_empty() && config.rules.iter().all(is_derived_site_replication_rule))
         }),
         // `Some("")` is the in-memory sentinel used when the bucket is lock
@@ -1278,7 +1279,9 @@ pub(crate) fn bucket_target_matches_peer(target: &BucketTarget, peer: &PeerInfo)
     bucket_target_endpoint(target) == canonical_endpoint(&peer.endpoint)
 }
 
-pub(crate) fn site_replication_target_arns_by_peer(config: Option<&ReplicationConfiguration>) -> HashMap<String, String> {
+pub(crate) fn site_replication_target_arns_by_peer(
+    config: Option<&PersistedReplicationConfiguration>,
+) -> HashMap<String, String> {
     let mut arns_by_peer = HashMap::new();
     let Some(config) = config else {
         return arns_by_peer;
@@ -1365,7 +1368,7 @@ pub(crate) fn reconcile_site_replication_bucket_targets(
     bucket: &str,
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
-    config: Option<&ReplicationConfiguration>,
+    config: Option<&PersistedReplicationConfiguration>,
     service_account_secret_key: &str,
 ) -> S3Result<BucketTargets> {
     if !state.enabled() || state.service_account_access_key.is_empty() || service_account_secret_key.is_empty() {
@@ -1455,7 +1458,7 @@ fn is_site_replication_owned_target(
 /// already-resolved client map rather than rebuilding clients, so it stays cheap enough for
 /// the status path.
 pub(crate) async fn site_replication_targets_online(bucket: &str, replication_config_xml: &[u8]) -> bool {
-    let Ok(config) = deserialize::<ReplicationConfiguration>(replication_config_xml) else {
+    let Ok(config) = deserialize::<PersistedReplicationConfiguration>(replication_config_xml) else {
         return true;
     };
 
@@ -1477,13 +1480,13 @@ pub(crate) async fn site_replication_targets_online(bucket: &str, replication_co
 /// excluded: MinIO's sender never emits them (`CloneNonTransition` drops
 /// both), so treating them as traveling state would let a MinIO peer's
 /// broadcast delete this site's del-marker-only rules.
-pub(crate) fn lifecycle_rule_has_expiry(rule: &LifecycleRule) -> bool {
+pub(crate) fn lifecycle_rule_has_expiry(rule: &PersistedLifecycleRule) -> bool {
     rule.expiration.is_some() || rule.noncurrent_version_expiration.is_some()
 }
 
 /// Remove the fields that never travel between sites (MinIO
 /// `CloneNonTransition` parity).
-pub(crate) fn strip_site_local_lifecycle_fields(rule: &mut LifecycleRule) {
+pub(crate) fn strip_site_local_lifecycle_fields(rule: &mut PersistedLifecycleRule) {
     rule.transitions = None;
     rule.noncurrent_version_transitions = None;
     rule.abort_incomplete_multipart_upload = None;
@@ -1502,7 +1505,7 @@ pub(crate) fn lifecycle_expiry_subset_xml(raw: &[u8]) -> Option<Vec<u8>> {
     if raw.is_empty() {
         return None;
     }
-    let config: BucketLifecycleConfiguration = match deserialize(raw) {
+    let config: PersistedLifecycleConfiguration = match deserialize(raw) {
         Ok(config) => config,
         Err(err) => {
             warn!("failed to parse local lifecycle config for expiry replication; forwarding unfiltered: {err}");
@@ -1510,7 +1513,7 @@ pub(crate) fn lifecycle_expiry_subset_xml(raw: &[u8]) -> Option<Vec<u8>> {
         }
     };
     let expiry_updated_at = config.expiry_updated_at.clone();
-    let rules: Vec<LifecycleRule> = config
+    let rules: Vec<PersistedLifecycleRule> = config
         .rules
         .into_iter()
         .filter_map(|mut rule| {
@@ -1521,7 +1524,7 @@ pub(crate) fn lifecycle_expiry_subset_xml(raw: &[u8]) -> Option<Vec<u8>> {
     if rules.is_empty() {
         return None;
     }
-    let subset = BucketLifecycleConfiguration {
+    let subset = PersistedLifecycleConfiguration {
         rules,
         expiry_updated_at,
     };
@@ -1542,10 +1545,16 @@ pub(crate) fn lifecycle_expiry_updated_at(raw: &[u8]) -> Option<OffsetDateTime> 
     if raw.is_empty() {
         return None;
     }
-    deserialize::<BucketLifecycleConfiguration>(raw)
+    deserialize::<PersistedLifecycleConfiguration>(raw)
         .ok()
         .and_then(|config| config.expiry_updated_at)
-        .map(OffsetDateTime::from)
+        .and_then(|axis| match parse_lifecycle_date(&axis) {
+            Ok(axis) => Some(axis),
+            Err(error) => {
+                warn!("failed to parse lifecycle expiry timestamp: {error}");
+                None
+            }
+        })
 }
 
 /// The ILM expiry statement this site contributes to its SRInfo bucket entry
@@ -1586,36 +1595,36 @@ pub(crate) fn lifecycle_expiry_statement(
 /// keep only the current peers' rules and treat a leftover as operator state
 /// the edit replaces. An operator-authored `site-repl-*` id on an operator
 /// ARN is outside the shape and survives every pass.
-pub(crate) fn is_derived_site_replication_rule(rule: &ReplicationRule) -> bool {
+pub(crate) fn is_derived_site_replication_rule(rule: &PersistedReplicationRule) -> bool {
     site_replication_rule_deployment_id(rule).is_some()
 }
 
-pub(crate) fn build_site_replication_rule(arn: &str, priority: i32, rule_id: &str) -> ReplicationRule {
-    ReplicationRule {
-        delete_marker_replication: Some(DeleteMarkerReplication {
-            status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+pub(crate) fn build_site_replication_rule(arn: &str, priority: i32, rule_id: &str) -> PersistedReplicationRule {
+    PersistedReplicationRule {
+        delete_marker_replication: Some(PersistedOptionalReplicationStatus {
+            status: Some(Status::ENABLED.to_string()),
         }),
-        delete_replication: Some(DeleteReplication {
-            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        delete_replication: Some(PersistedReplicationStatus {
+            status: Status::ENABLED.to_string(),
         }),
-        destination: Destination {
+        destination: PersistedReplicationDestination {
             bucket: arn.to_string(),
             ..Default::default()
         },
-        existing_object_replication: Some(ExistingObjectReplication {
-            status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+        existing_object_replication: Some(PersistedReplicationStatus {
+            status: Status::ENABLED.to_string(),
         }),
         filter: None,
         id: Some(rule_id.to_string()),
         prefix: None,
         priority: Some(priority),
-        source_selection_criteria: Some(SourceSelectionCriteria {
-            replica_modifications: Some(ReplicaModifications {
-                status: ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED),
+        source_selection_criteria: Some(PersistedSourceSelectionCriteria {
+            replica_modifications: Some(PersistedReplicationStatus {
+                status: Status::ENABLED.to_string(),
             }),
             sse_kms_encrypted_objects: None,
         }),
-        status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+        status: Status::ENABLED.to_string(),
     }
 }
 
@@ -1624,8 +1633,8 @@ pub(crate) fn build_site_replication_config(
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
     service_account_secret_key: &str,
-    existing: Option<&ReplicationConfiguration>,
-) -> S3Result<Option<ReplicationConfiguration>> {
+    existing: Option<&PersistedReplicationConfiguration>,
+) -> S3Result<Option<PersistedReplicationConfiguration>> {
     // Reuse the ARN already recorded for a peer so the rule keeps pointing at the same
     // bucket target `reconcile_site_replication_bucket_targets` keys off (a MinIO-era
     // `arn:minio:...` target would otherwise be orphaned by a freshly minted ARN).
@@ -1656,7 +1665,7 @@ pub(crate) fn build_site_replication_config(
     if rules.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(ReplicationConfiguration {
+        Ok(Some(PersistedReplicationConfiguration {
             role: String::new(),
             rules,
         }))
@@ -1705,7 +1714,7 @@ pub(crate) async fn ensure_site_replication_bucket_targets_with_runtime(
     bucket: &str,
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
-    config: Option<&ReplicationConfiguration>,
+    config: Option<&PersistedReplicationConfiguration>,
     service_account_secret_key: &str,
     expected_incarnation_id: Uuid,
 ) -> S3Result<bool> {
@@ -1737,7 +1746,9 @@ pub(crate) async fn ensure_site_replication_bucket_targets_with_runtime(
     Ok(true)
 }
 
-pub(crate) async fn bucket_replication_config_for_target_refresh(bucket: &str) -> S3Result<Option<ReplicationConfiguration>> {
+pub(crate) async fn bucket_replication_config_for_target_refresh(
+    bucket: &str,
+) -> S3Result<Option<PersistedReplicationConfiguration>> {
     match metadata_sys::get_replication_config(bucket).await {
         Ok((config, _)) => Ok(Some(config)),
         Err(StorageError::ConfigNotFound) => Ok(None),
@@ -1772,7 +1783,7 @@ pub(crate) async fn ensure_site_replication_bucket_replication_config_with_runti
     let (existing_role, existing_rules) = existing
         .map(|config| (config.role, config.rules))
         .unwrap_or_else(|| (String::new(), Vec::new()));
-    let mut rules: Vec<ReplicationRule> = existing_rules
+    let mut rules: Vec<PersistedReplicationRule> = existing_rules
         .iter()
         .filter(|rule| !is_derived_site_replication_rule(rule))
         .cloned()
@@ -1796,7 +1807,7 @@ pub(crate) async fn ensure_site_replication_bucket_replication_config_with_runti
         return Ok(false);
     }
 
-    let data = serialize(&ReplicationConfiguration { role, rules })
+    let data = serialize(&PersistedReplicationConfiguration { role, rules })
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize replication failed: {e}")))?;
     metadata_sys::update_if_incarnation(bucket, BUCKET_REPLICATION_CONFIG, data, expected_incarnation_id)
         .await

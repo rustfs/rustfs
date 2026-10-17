@@ -301,14 +301,16 @@ impl<K: Hash + Eq + Clone> RateLimiter<K> {
 /// Resolve the client identity for rate limiting.
 ///
 /// Only trusted sources are consulted: `ClientInfo` is inserted by the
-/// trusted-proxy layer after validating the proxy chain, and `RemoteAddr` is
-/// the raw socket peer. Spoofable headers (`X-Forwarded-For`, `X-Real-IP`)
-/// are deliberately never read here.
+/// trusted-proxy layer after validating the proxy chain, and `Option<RemoteAddr>`
+/// carries the socket peer injected by the external HTTP stack. Spoofable
+/// headers (`X-Forwarded-For`, `X-Real-IP`) are deliberately never read here.
 pub(crate) fn client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
     if let Some(info) = req.extensions().get::<ClientInfo>() {
         return Some(info.real_ip);
     }
-    req.extensions().get::<RemoteAddr>().map(|remote| remote.0.ip())
+    req.extensions()
+        .get::<Option<RemoteAddr>>()
+        .and_then(|remote| remote.map(|remote| remote.0.ip()))
 }
 
 /// Resolve the host a request addresses, for virtual-hosted-style bucket
@@ -929,7 +931,7 @@ mod tests {
 
     fn request_from(peer: IpAddr, path: &str) -> Request<()> {
         let mut req = Request::builder().uri(path).body(()).expect("request");
-        req.extensions_mut().insert(RemoteAddr(SocketAddr::new(peer, 51000)));
+        req.extensions_mut().insert(Some(RemoteAddr(SocketAddr::new(peer, 51000))));
         req
     }
 
@@ -1047,7 +1049,11 @@ mod tests {
     async fn missing_client_identity_fails_open() {
         let mut service = service_with_quota(60, 1);
         for _ in 0..3 {
-            let req = Request::builder().uri("/bucket/object").body(()).expect("request");
+            let mut req = Request::builder().uri("/bucket/object").body(()).expect("request");
+            req.extensions_mut().insert(None::<RemoteAddr>);
+            req.headers_mut()
+                .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.1"));
+            req.headers_mut().insert("x-real-ip", HeaderValue::from_static("203.0.113.2"));
             assert_eq!(service.call(req).await.expect("ok").status(), StatusCode::OK);
         }
     }
