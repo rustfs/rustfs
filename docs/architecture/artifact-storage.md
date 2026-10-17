@@ -45,6 +45,15 @@ final `xl.meta` namespace mutex, and volume read lock before classification. It
 reuses those exact locks for temporary-file writes and final publication; queued
 bucket deletion cannot force a second read acquisition. Preparation and execution
 retain finite deadlines, while cancelled physical workers keep their ownership.
+Ordinary `RenameData` similarly prepares a single-use disk-bound transaction
+before classifying either volume. It acquires the destination metadata and
+namespace mutexes, then distinct source and destination volume read locks in
+path order. Both ordinary volume directories must still exist. Commit consumes
+the sanitized metadata and the same leases, including the quota claim and
+captured instance owner; staging, publication and source restoration keep that
+ownership through physical completion even after cancellation. Internal staging
+retains on-demand directory creation. Preparation and execution have finite
+deadlines, and scanner/incarnation-bound requests retain their existing paths.
 The incarnation-bound heal path retains its separate admission. Other legacy
 mutation routes and internal metadata publication still need their own admission
 boundary before distributed artifact sealing can be enabled.

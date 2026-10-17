@@ -19,7 +19,9 @@ use crate::storage::storage_api::rpc_consumer::node_service::{
     validate_batch_read_version_item_count,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
-use crate::storage::storage_api::{PartTransactionAction, RenameDataResp, SnapshotLeaseToken, verify_tonic_mutation_body_digest};
+use crate::storage::storage_api::{
+    LegacyRenameData, PartTransactionAction, RenameDataResp, SnapshotLeaseToken, verify_tonic_mutation_body_digest,
+};
 use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
 use rustfs_io_metrics::internode_metrics::{
@@ -83,6 +85,20 @@ impl LocalMutationTarget {
             Ok(())
         } else {
             Err(Status::permission_denied("legacy artifact mutation is not permitted"))
+        }
+    }
+
+    async fn begin_legacy_local_rename_data(
+        &self,
+        disk_ref: &str,
+        source: (&str, &str),
+        fi: &FileInfo,
+        destination: (&str, &str),
+    ) -> Result<LegacyRenameData, DiskError> {
+        match self {
+            Self::Ready(store) => store.begin_legacy_local_rename_data(disk_ref, source, fi, destination).await,
+            Self::Bootstrap(target) => target.begin_legacy_local_rename_data(disk_ref, source, fi, destination).await,
+            Self::Unbound => Err(DiskError::other("target disk instance is unavailable")),
         }
     }
 
@@ -1438,20 +1454,49 @@ impl NodeService {
             Some(token)
         };
         let request_decoded_from_msgpack = decoded_file_info.from_msgpack;
+        // Bind ordinary mutations to the captured instance and both live volumes
+        // before consulting bucket authority; commit consumes those exact locks.
+        let prepared = if scanner_publication_lease_token.is_none() && bucket_incarnation.is_none() {
+            match target
+                .begin_legacy_local_rename_data(
+                    &request.disk,
+                    (&request.src_volume, &request.src_path),
+                    &decoded_file_info.value,
+                    (&request.dst_volume, &request.dst_path),
+                )
+                .await
+            {
+                Ok(rename) => Some(rename),
+                Err(err) => {
+                    return Ok(Response::new(RenameDataResponse {
+                        success: false,
+                        rename_data_resp: String::new(),
+                        rename_data_resp_bin: Vec::new().into(),
+                        error: Some(err.into()),
+                    }));
+                }
+            }
+        } else {
+            None
+        };
         target.reject_legacy_artifact_mutation(&request.src_volume).await?;
         target.reject_legacy_artifact_mutation(&request.dst_volume).await?;
         #[cfg(feature = "e2e-test-hooks")]
         let observation = startup_cas_rename_observation(&target, &request, &decoded_file_info.value);
-        let result = target
-            .rename_local_data(
-                &request.disk,
-                (&request.src_volume, &request.src_path),
-                &decoded_file_info.value,
-                (&request.dst_volume, &request.dst_path),
-                scanner_publication_lease_token,
-                bucket_incarnation,
-            )
-            .await;
+        let result = if let Some(rename) = prepared {
+            rename.commit().await
+        } else {
+            target
+                .rename_local_data(
+                    &request.disk,
+                    (&request.src_volume, &request.src_path),
+                    &decoded_file_info.value,
+                    (&request.dst_volume, &request.dst_path),
+                    scanner_publication_lease_token,
+                    bucket_incarnation,
+                )
+                .await
+        };
         #[cfg(feature = "e2e-test-hooks")]
         if let Some(mut observation) = observation {
             observation["ok"] = serde_json::json!(result.is_ok());
@@ -2635,6 +2680,7 @@ mod tests {
 #[cfg(test)]
 mod legacy_artifact_tests {
     use super::*;
+    use crate::storage::storage_api::ecstore_disk;
     use crate::storage::storage_api::set_tonic_canonical_body_digest;
     use rustfs_iam::store::{
         Store as _,
@@ -2674,6 +2720,328 @@ mod legacy_artifact_tests {
             Arc::new(KmsServiceManager::new()),
         ));
         super::super::make_server_for_context(Some(context))
+    }
+
+    const LEGACY_RENAME_AUDIENCE: &str = "127.0.0.1:24800";
+    const LEGACY_RENAME_RPC_PATH: &str = "/node_service.NodeService/RenameData";
+    const LEGACY_RENAME_BODY: &[u8] = b"authenticated real inline rename body";
+
+    fn inline_rename_file_info(path: &str) -> FileInfo {
+        let mut fi = FileInfo::new(path, 1, 0);
+        fi.erasure.index = 1;
+        fi.version_id = Some(Uuid::new_v4());
+        fi.mod_time = Some(time::OffsetDateTime::now_utc());
+        fi.size = i64::try_from(LEGACY_RENAME_BODY.len()).expect("inline fixture size");
+        fi.parts = vec![rustfs_filemeta::ObjectPartInfo {
+            number: 1,
+            size: LEGACY_RENAME_BODY.len(),
+            actual_size: fi.size,
+            ..Default::default()
+        }];
+        fi.data = Some(Bytes::from_static(LEGACY_RENAME_BODY));
+        fi.set_inline_data();
+        fi.validate_for_metadata_read().expect("real inline metadata");
+        fi
+    }
+
+    fn signed_legacy_rename_request(
+        disk: &str,
+        source: (&str, &str),
+        destination: (&str, &str),
+        fi: &FileInfo,
+        msgpack: bool,
+    ) -> Request<RenameDataRequest> {
+        use crate::storage::storage_api::ecstore_rpc as rpc;
+        let mut request = Request::new(RenameDataRequest {
+            disk: disk.to_owned(),
+            src_volume: source.0.to_owned(),
+            src_path: source.1.to_owned(),
+            dst_volume: destination.0.to_owned(),
+            dst_path: destination.1.to_owned(),
+            file_info: if msgpack {
+                "invalid JSON must not be decoded".to_owned()
+            } else {
+                serde_json::to_string(fi).expect("JSON FI")
+            },
+            file_info_bin: if msgpack {
+                encode_file_info_msgpack(fi).expect("msgpack FI").into()
+            } else {
+                Bytes::new()
+            },
+            ..Default::default()
+        });
+        let body = rustfs_protos::canonical_rename_data_request_body(request.get_ref()).expect("canonical rename body");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("rename digest");
+        let digest = request
+            .metadata()
+            .get("x-rustfs-content-sha256")
+            .expect("digest metadata")
+            .to_str()
+            .expect("digest text");
+        let mut headers =
+            rpc::gen_tonic_signature_headers(LEGACY_RENAME_AUDIENCE, "node_service.NodeService", "RenameData", Some(digest))
+                .expect("real HMAC signature");
+        let challenge = Uuid::new_v4();
+        let epoch_proof = rpc::tonic_boot_epoch_response_headers(LEGACY_RENAME_AUDIENCE, challenge).expect("signed epoch proof");
+        let epoch =
+            rpc::verify_tonic_boot_epoch_response(LEGACY_RENAME_AUDIENCE, challenge, &epoch_proof).expect("authenticated epoch");
+        let replay = rpc::gen_tonic_replay_scope_headers(
+            LEGACY_RENAME_AUDIENCE,
+            LEGACY_RENAME_RPC_PATH,
+            headers["x-rustfs-timestamp"].to_str().expect("signed timestamp"),
+            headers["x-rustfs-content-sha256"].to_str().expect("signed digest"),
+            epoch,
+        )
+        .expect("real replay-scoped signature");
+        headers.extend(replay);
+        request.metadata_mut().as_mut().extend(headers);
+        request
+    }
+
+    async fn authenticated_legacy_rename(
+        service: &NodeService,
+        request: Request<RenameDataRequest>,
+    ) -> Result<Response<RenameDataResponse>, Status> {
+        // This is the production HMAC/replay verifier used by check_auth. The
+        // handler then independently verifies the signed canonical body digest.
+        crate::storage::storage_api::ecstore_rpc::verify_tonic_rpc_signature_with_bootstrap(
+            LEGACY_RENAME_AUDIENCE,
+            LEGACY_RENAME_RPC_PATH,
+            request.metadata().as_ref(),
+            false,
+        )
+        .map_err(|_| Status::unauthenticated("legacy rename signature rejected"))?;
+        service.handle_rename_data(request).await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_rename_data_receiver_preserves_authenticated_inline_versions_and_rejects_managed_volumes() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-rename-receiver-test-secret".to_owned());
+        let root = tempfile::tempdir().expect("rename receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        for bucket in ["rename-ordinary-a", "rename-ordinary-b"] {
+            env.make_bucket(bucket, true).await;
+        }
+        env.ecstore
+            .clone()
+            .make_artifact_bucket("rename-managed", "outputs/")
+            .await
+            .expect("managed bucket");
+        let service = service_for(&env).await;
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let target = service.local_mutation_target();
+        let disk = target.find_mutation_disk(&disk_ref).await.expect("listener local disk");
+
+        let fi = inline_rename_file_info("bad-auth-destination");
+        ecstore_disk::DiskAPI::write_metadata(disk.as_ref(), "", "rename-ordinary-a", "bad-auth-source", fi.clone())
+            .await
+            .expect("real auth negative source");
+        let mut bad_auth = signed_legacy_rename_request(
+            &disk_ref,
+            ("rename-ordinary-a", "bad-auth-source"),
+            ("rename-ordinary-b", "bad-auth-destination"),
+            &fi,
+            false,
+        );
+        bad_auth
+            .metadata_mut()
+            .insert("x-rustfs-rpc-signature-v3", "00".repeat(32).parse().expect("invalid HMAC metadata"));
+        let error = authenticated_legacy_rename(&service, bad_auth)
+            .await
+            .expect_err("bad HMAC must fail before the handler");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert!(!env.disk_paths[0].join("rename-ordinary-b/bad-auth-destination").exists());
+
+        for msgpack in [false, true] {
+            for (case, (source_volume, destination_volume)) in [
+                ("rename-ordinary-a", "rename-ordinary-a"),
+                ("rename-ordinary-a", "rename-ordinary-b"),
+                (".rustfs.sys", ".rustfs.sys"),
+                (".rustfs.sys/tmp", ".rustfs.sys"),
+                (".rustfs.sys/tmp", "rename-ordinary-a"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let source_path = format!("rename-source-{case}-{msgpack}");
+                let destination_path = format!("rename-destination-{case}-{msgpack}");
+                let fi = inline_rename_file_info(&destination_path);
+                let version = fi.version_id.expect("non-nil inline version");
+                ecstore_disk::DiskAPI::write_metadata(disk.as_ref(), "", source_volume, &source_path, fi.clone())
+                    .await
+                    .expect("real staged inline metadata");
+                let response = authenticated_legacy_rename(
+                    &service,
+                    signed_legacy_rename_request(
+                        &disk_ref,
+                        (source_volume, &source_path),
+                        (destination_volume, &destination_path),
+                        &fi,
+                        msgpack,
+                    ),
+                )
+                .await
+                .expect("authenticated rename response")
+                .into_inner();
+                assert!(response.success, "case={case}, msgpack={msgpack}: {:?}", response.error);
+                assert!(response.error.is_none());
+                let _: RenameDataResp =
+                    decode_msgpack_or_json(&response.rename_data_resp_bin, &response.rename_data_resp, "RenameDataResp")
+                        .expect("real rename result codec");
+                let actual = disk
+                    .read_version(
+                        destination_volume,
+                        destination_volume,
+                        &destination_path,
+                        &version.to_string(),
+                        &ReadOptions {
+                            read_data: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("read exact physical renamed version");
+                assert_eq!(actual.version_id, Some(version));
+                assert_eq!(actual.data, Some(Bytes::from_static(LEGACY_RENAME_BODY)));
+            }
+        }
+
+        let attempt = format!("outputs/74656e616e74/{}/{}/", Uuid::new_v4(), Uuid::new_v4());
+        for source_managed in [false, true] {
+            let source_volume = if source_managed {
+                "rename-managed"
+            } else {
+                "rename-ordinary-a"
+            };
+            let destination_volume = if source_managed {
+                "rename-ordinary-b"
+            } else {
+                "rename-managed"
+            };
+            let source_path = if source_managed {
+                format!("{attempt}source")
+            } else {
+                "managed-denial-source".to_owned()
+            };
+            let destination_path = if source_managed {
+                "managed-source-denied".to_owned()
+            } else {
+                format!("{attempt}denied")
+            };
+            let fi = inline_rename_file_info(&destination_path);
+            ecstore_disk::DiskAPI::write_metadata(disk.as_ref(), "", source_volume, &source_path, fi.clone())
+                .await
+                .expect("managed denial source fixture");
+            let source_meta = env.disk_paths[0].join(source_volume).join(&source_path).join("xl.meta");
+            let before = tokio::fs::read(&source_meta).await.expect("original source metadata");
+            let error = authenticated_legacy_rename(
+                &service,
+                signed_legacy_rename_request(
+                    &disk_ref,
+                    (source_volume, &source_path),
+                    (destination_volume, &destination_path),
+                    &fi,
+                    source_managed,
+                ),
+            )
+            .await
+            .expect_err("managed source or destination must reject legacy rename");
+            assert_eq!(error.code(), tonic::Code::PermissionDenied);
+            assert_eq!(tokio::fs::read(&source_meta).await.expect("denied source retained"), before);
+            assert!(
+                !env.disk_paths[0].join(destination_volume).join(&destination_path).exists(),
+                "managed denial must not publish or create destination parents"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_rename_data_receiver_rejects_missing_physical_volumes_with_retained_metadata() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-rename-receiver-test-secret".to_owned());
+        let root = tempfile::tempdir().expect("missing rename receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        let service = service_for(&env).await;
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let target = service.local_mutation_target();
+        let disk = target.find_mutation_disk(&disk_ref).await.expect("listener local disk");
+        for missing_source in [false, true] {
+            let source_volume = if missing_source { "missing-source" } else { "retained-source" };
+            let destination_volume = if missing_source {
+                "retained-destination"
+            } else {
+                "missing-destination"
+            };
+            for bucket in [source_volume, destination_volume] {
+                env.make_bucket(bucket, true).await;
+            }
+            let source_path = "source";
+            let destination_path = "nested/destination";
+            let fi = inline_rename_file_info(destination_path);
+            ecstore_disk::DiskAPI::write_metadata(disk.as_ref(), "", source_volume, source_path, fi.clone())
+                .await
+                .expect("real missing-volume source");
+            let source_meta = env.disk_paths[0].join(source_volume).join(source_path).join("xl.meta");
+            let before = tokio::fs::read(&source_meta)
+                .await
+                .expect("source metadata before physical removal");
+            let missing = if missing_source { source_volume } else { destination_volume };
+            let incarnation = env
+                .ecstore
+                .bucket_incarnation_id(missing)
+                .await
+                .expect("authoritative incarnation before removal");
+            disk.delete_volume(missing, true)
+                .await
+                .expect("remove only the receiver physical volume");
+            assert_eq!(
+                env.ecstore
+                    .bucket_incarnation_id(missing)
+                    .await
+                    .expect("bucket metadata retained"),
+                incarnation
+            );
+            target
+                .reject_legacy_artifact_mutation(missing)
+                .await
+                .expect("ordinary authority still classifies retained metadata");
+            let response = authenticated_legacy_rename(
+                &service,
+                signed_legacy_rename_request(
+                    &disk_ref,
+                    (source_volume, source_path),
+                    (destination_volume, destination_path),
+                    &fi,
+                    missing_source,
+                ),
+            )
+            .await
+            .expect("missing-volume rename response")
+            .into_inner();
+            assert!(!response.success, "missing source or destination must reject admission");
+            assert_eq!(
+                DiskError::from(response.error.expect("explicit missing-volume error")),
+                DiskError::VolumeNotFound
+            );
+            assert!(
+                !env.disk_paths[0].join(missing).exists(),
+                "retained metadata must not revive the missing physical volume"
+            );
+            assert!(
+                !env.disk_paths[0].join(destination_volume).join(destination_path).exists(),
+                "missing-volume rename must not publish a destination"
+            );
+            if !missing_source {
+                assert_eq!(tokio::fs::read(source_meta).await.expect("rejected source retained"), before);
+            }
+        }
     }
 
     fn metadata_request(disk: &str, volume: &str, path: &str, version: Uuid) -> Request<WriteMetadataRequest> {
