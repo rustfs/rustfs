@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(in crate::disk) use self::commit::LocalRenamePreflightRejection;
 #[cfg(test)]
 use self::commit::lock_rename_commit_directories;
+pub(in crate::disk) use self::commit::{LocalRenamePreflightRejection, PreparedRenameData};
 
 mod artifact_lease;
 mod commit;
@@ -22500,6 +22500,423 @@ mod test {
             .await
             .expect("operation should succeed");
         let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_rename_data_admission_rejects_missing_source_or_destination_volume() {
+        use crate::disk::disk_store::LocalDiskWrapper;
+        for missing in ["source", "destination"] {
+            let root = tempfile::tempdir().expect("missing rename volume root");
+            let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("local endpoint");
+            let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+            for volume in ["source", "destination"] {
+                disk.make_volume(volume).await.expect("original ordinary volume");
+            }
+            disk.delete_volume(missing, true).await.expect("delete original volume");
+            let wrapper = LocalDiskWrapper::new(disk.clone(), false);
+            let mut fi = test_file_info("object", Uuid::new_v4(), None, Some(Bytes::from_static(b"late admitted data")));
+            fi.set_inline_data();
+            let error = wrapper
+                .begin_legacy_rename_data(("source", "stage"), &fi, ("destination", "object"), None)
+                .await
+                .expect_err("missing physical volume must reject before classification");
+            assert_eq!(error, DiskError::VolumeNotFound, "LEGACY_RENAME_LIVE_VOLUME: {missing}");
+            assert!(!root.path().join(missing).exists(), "missing {missing} volume must not be recreated");
+            for volume in ["source", "destination"] {
+                assert!(
+                    os::disk_volume_mutation_lock(&disk.root, volume).try_write_owned().is_ok(),
+                    "failed admission must release both READs"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_rename_data_admission_reuses_deduplicated_volume_reads_with_queued_delete() {
+        use crate::disk::disk_store::LocalDiskWrapper;
+        for (source, destination) in [
+            ("same", "same"),
+            ("aa-source", "zz-destination"),
+            ("zz-destination", "aa-source"),
+        ] {
+            for delete_source in [true, false] {
+                if source == destination && !delete_source {
+                    continue;
+                }
+                let root = tempfile::tempdir().expect("queued rename delete root");
+                let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("local endpoint");
+                let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+                ensure_test_volume(&disk, source).await;
+                ensure_test_volume(&disk, destination).await;
+                let wrapper = LocalDiskWrapper::new(disk.clone(), false);
+                let version = Uuid::new_v4();
+                let mut fi = test_file_info("object", version, None, Some(Bytes::from_static(b"admitted complete payload")));
+                fi.set_inline_data();
+                let token = wrapper
+                    .begin_legacy_rename_data((source, "staging/object"), &fi, (destination, "object"), None)
+                    .await
+                    .expect("prepare both physical volumes");
+                let deleted = if delete_source { source } else { destination };
+                let mut deletion = Box::pin(disk.delete_volume(deleted, true));
+                assert!(
+                    matches!(futures::poll!(deletion.as_mut()), Poll::Pending),
+                    "delete must queue behind the captured READ"
+                );
+                timeout(Duration::from_secs(5), token.commit())
+                    .await
+                    .expect("commit must not reacquire a captured READ")
+                    .expect("prepared rename");
+                let bytes = fs::read(root.path().join(destination).join("object").join(STORAGE_FORMAT_FILE))
+                    .await
+                    .expect("published metadata");
+                let restored = FileMeta::load(&bytes)
+                    .expect("valid metadata")
+                    .into_fileinfo(destination, "object", "", true, false, true)
+                    .expect("published FileInfo");
+                assert_eq!(restored.version_id, Some(version));
+                assert_eq!(restored.data.as_deref(), Some(b"admitted complete payload".as_slice()));
+                assert_eq!(wrapper.metrics_snapshot().api_calls.get("rename_data"), Some(&1));
+                timeout(Duration::from_secs(5), deletion)
+                    .await
+                    .expect("delete drains after commit")
+                    .expect("delete admitted volume");
+                assert!(!root.path().join(deleted).exists());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_rename_data_admission_preparation_obeys_lock_deadline() {
+        use crate::disk::disk_store::{LocalDiskWrapper, get_max_timeout_duration};
+        let root = tempfile::tempdir().expect("rename preparation deadline root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("local endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        for volume in ["source", "destination"] {
+            disk.make_volume(volume).await.expect("ordinary volume");
+        }
+        let wrapper = LocalDiskWrapper::new(disk.clone(), false);
+        let mut fi = test_file_info("object", Uuid::new_v4(), None, Some(Bytes::from_static(b"deadline payload")));
+        fi.set_inline_data();
+        for blocked in ["metadata", "namespace", "source", "destination"] {
+            let guard: Arc<dyn Send + Sync> = match blocked {
+                "metadata" => {
+                    os::acquire_metadata_mutation_lease(
+                        &disk.get_object_path("destination", "object").expect("metadata key"),
+                        None,
+                    )
+                    .await
+                }
+                "namespace" => {
+                    os::acquire_namespace_mutation_lease_with_owner(
+                        &disk.io_get_object_path("destination", "object").expect("namespace key"),
+                        None,
+                    )
+                    .await
+                }
+                volume => Arc::new(os::disk_volume_mutation_lock(&disk.root, volume).write_owned().await),
+            };
+            let mut preparation =
+                Box::pin(wrapper.begin_legacy_rename_data(("source", "stage"), &fi, ("destination", "object"), None));
+            assert!(
+                matches!(futures::poll!(preparation.as_mut()), Poll::Pending),
+                "must actually wait for {blocked}"
+            );
+            tokio::time::advance(get_max_timeout_duration() + Duration::from_secs(1)).await;
+            assert_eq!(
+                preparation.await.expect_err("preparation must have a finite deadline"),
+                DiskError::Timeout,
+                "{blocked}"
+            );
+            drop(guard);
+            for volume in ["source", "destination"] {
+                assert!(
+                    os::disk_volume_mutation_lock(&disk.root, volume).try_write_owned().is_ok(),
+                    "{blocked}: timeout must release captured READs"
+                );
+            }
+        }
+        assert_eq!(
+            wrapper.metrics_snapshot().api_calls.get("rename_data"),
+            None,
+            "preparation must not double-count a mutation"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn assert_legacy_rename_data_physical_owner(stage: &str, cancel: bool) {
+        use crate::disk::disk_store::{LocalDiskWrapper, get_max_timeout_duration};
+        let root = tempfile::tempdir().expect("rename physical owner root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("local endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        let source = "aa-source";
+        let destination = "zz-destination";
+        let object = "object";
+        let source_object = "staging/object";
+        for volume in [source, destination, RUSTFS_META_TMP_BUCKET] {
+            ensure_test_volume(&disk, volume).await;
+        }
+        // Only the destination object exists. The inline source mkdir hook has
+        // a real missing child whose parent is already on this same mount.
+        let source_parent = disk.io_get_object_path(source, source_object).expect("source parent");
+        fs::create_dir_all(source_parent.parent().expect("source parent ancestor"))
+            .await
+            .expect("source staging ancestor");
+        let destination_object = disk.io_get_object_path(destination, object).expect("destination object");
+        let destination_meta = destination_object.join(STORAGE_FORMAT_FILE);
+        let version = Uuid::new_v4();
+        let old_data = Uuid::new_v4();
+        let new_data = Uuid::new_v4();
+        let non_inline = matches!(stage, "backup-mkdir" | "restore");
+        let mut fi = if non_inline {
+            let data_path = source_parent.join(new_data.to_string());
+            fs::create_dir_all(&data_path).await.expect("source data directory");
+            fs::write(data_path.join("part.1"), b"complete staged shard")
+                .await
+                .expect("source data payload");
+            let mut fi = test_file_info(object, version, Some(new_data), None);
+            fi.size = i64::try_from(b"complete staged shard".len()).expect("fixture size");
+            fi.parts[0].size = b"complete staged shard".len();
+            fi.parts[0].actual_size = fi.size;
+            fi
+        } else {
+            let mut fi = test_file_info(object, version, None, Some(Bytes::from_static(b"complete inline payload")));
+            fi.set_inline_data();
+            fi
+        };
+        let original_metadata = if stage == "backup-mkdir" {
+            fs::create_dir_all(&destination_object).await.expect("old object directory");
+            let metadata = test_meta(test_file_info(object, version, Some(old_data), None));
+            fs::write(&destination_meta, &metadata)
+                .await
+                .expect("old metadata with rollback directory");
+            Some(metadata)
+        } else {
+            None
+        };
+        let fence_path = quota_mutation_fence_path(destination, object);
+        let fence_token = disk
+            .acquire_snapshot_lease(RUSTFS_META_BUCKET, &fence_path)
+            .await
+            .expect("quota fence");
+        let fence = disk
+            .snapshot_leases
+            .lock()
+            .entries
+            .get(&SnapshotLeaseKey {
+                volume: RUSTFS_META_BUCKET.to_owned(),
+                path: fence_path,
+            })
+            .and_then(|entry| entry.mutation_fence.clone())
+            .expect("real quota fence state");
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut fi.metadata,
+            super::super::QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+            fence_token.as_uuid().to_string(),
+        );
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let owner = ctx.begin_namespace_commit();
+        let owner_probe = Arc::downgrade(&owner);
+        let wrapper = LocalDiskWrapper::new(disk.clone(), false);
+        let token = wrapper
+            .begin_legacy_rename_data((source, source_object), &fi, (destination, object), Some(owner.clone()))
+            .await
+            .expect("prepare both volumes once");
+        drop(owner);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let pause = move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        };
+        let _mkdir_hook;
+        let _publication_hook;
+        let restore_hook = Arc::new(std::sync::Mutex::new(None));
+        match stage {
+            "inline-mkdir" => {
+                _mkdir_hook = Some(volume_mutation_test_hooks::install(
+                    volume_mutation_test_hooks::Stage::Create,
+                    &source_parent,
+                    pause,
+                ));
+                _publication_hook = None;
+            }
+            "backup-mkdir" => {
+                _mkdir_hook = Some(volume_mutation_test_hooks::install(
+                    volume_mutation_test_hooks::Stage::Create,
+                    &destination_object.join(old_data.to_string()),
+                    pause,
+                ));
+                _publication_hook = None;
+            }
+            "publish" => {
+                _mkdir_hook = None;
+                _publication_hook = Some(os::prepared_publication_test_hooks::install(&destination_meta, pause));
+            }
+            "restore" => {
+                _mkdir_hook = None;
+                _publication_hook = None;
+                let source_metadata = source_parent.join(STORAGE_FORMAT_FILE);
+                let source_data = source_parent.join(new_data.to_string());
+                let restore_hook = restore_hook.clone();
+                set_rename_data_after_first_publication(&disk.root, destination, object, move || {
+                    // Force the actual final source-identity check to fail only
+                    // after data publication, so production must restore it.
+                    std::fs::remove_file(source_metadata).expect("remove staged metadata after data publication");
+                    let hook = os::prepared_publication_test_hooks::install_at(
+                        os::prepared_publication_test_hooks::Stage::Rename,
+                        &source_data,
+                        pause,
+                    );
+                    *restore_hook.lock().expect("restore publication hook") = Some(hook);
+                });
+            }
+            _ => panic!("unknown real physical stage"),
+        }
+        let mutation = tokio::spawn(async move { token.commit().await });
+        timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("real rename worker starts")
+            .expect("worker entered");
+        if cancel {
+            mutation.abort();
+            assert!(mutation.await.expect_err("cancel caller").is_cancelled());
+        } else {
+            tokio::time::pause();
+            tokio::time::advance(get_max_timeout_duration() + Duration::from_secs(1)).await;
+            tokio::time::resume();
+            assert_eq!(
+                timeout(Duration::from_secs(5), mutation)
+                    .await
+                    .expect("deadline returns")
+                    .expect("mutation task")
+                    .expect_err("the pending worker must outlive the caller deadline"),
+                DiskError::Timeout
+            );
+            let metrics = wrapper.metrics_snapshot();
+            assert_eq!(metrics.api_calls.get("rename_data"), Some(&1));
+            assert_eq!(metrics.total_errors_timeout, 1);
+        }
+        let source_held = os::disk_volume_mutation_lock(&disk.root, source).try_write_owned().is_err();
+        let destination_held = os::disk_volume_mutation_lock(&disk.root, destination)
+            .try_write_owned()
+            .is_err();
+        let owner_held = owner_probe.upgrade().is_some();
+        let quota_running = fence.running.load(Ordering::Acquire);
+        let mut source_delete = Box::pin(disk.delete_volume(source, true));
+        let mut destination_delete = Box::pin(disk.delete_volume(destination, true));
+        let source_blocked = matches!(futures::poll!(source_delete.as_mut()), Poll::Pending);
+        let destination_blocked = matches!(futures::poll!(destination_delete.as_mut()), Poll::Pending);
+        drop(release_tx);
+        let drained = timeout(
+            Duration::from_secs(10),
+            os::acquire_namespace_mutation_lease_with_owner(&destination_object, None),
+        )
+        .await;
+        drop(drained.expect("physical operation releases its exact outer namespace"));
+        assert!(source_held, "{stage}, cancel={cancel}: actual worker must retain SOURCE READ");
+        assert!(destination_held, "{stage}, cancel={cancel}: actual worker must retain destination READ");
+        assert!(source_blocked && destination_blocked, "both physical deletions must await the worker");
+        assert!(owner_held, "actual worker must retain captured instance owner");
+        assert_eq!(quota_running, 1, "quota claim must occur once and survive the caller");
+        timeout(Duration::from_secs(5), async {
+            while fence.running.load(Ordering::Acquire) != 0 || owner_probe.upgrade().is_some() || ctx.namespace_commits_pending()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("physical drain releases quota and captured instance owner");
+        match stage {
+            "inline-mkdir" => {
+                assert!(source_parent.is_dir(), "the admitted mkdir must finish");
+                assert!(!source_parent.join(STORAGE_FORMAT_FILE).exists());
+                assert!(!destination_meta.exists(), "cancelled staging cannot publish metadata");
+            }
+            "backup-mkdir" => {
+                assert_eq!(
+                    fs::read(&destination_meta).await.expect("old metadata retained"),
+                    original_metadata.expect("backup fixture metadata")
+                );
+                assert_eq!(
+                    fs::read(destination_object.join(new_data.to_string()).join("part.1"))
+                        .await
+                        .expect("published shard before backup cancellation"),
+                    b"complete staged shard"
+                );
+            }
+            "publish" => {
+                let metadata = fs::read(&destination_meta).await.expect("physical publication completes");
+                let published = FileMeta::load(&metadata)
+                    .expect("published metadata")
+                    .into_fileinfo(destination, object, &version.to_string(), true, false, true)
+                    .expect("exact published version");
+                assert_eq!(published.version_id, Some(version));
+                assert_eq!(published.data.as_deref(), Some(b"complete inline payload".as_slice()));
+            }
+            "restore" => {}
+            _ => unreachable!("validated physical stage"),
+        }
+        if stage == "restore" {
+            assert_eq!(
+                fs::read(source_parent.join(new_data.to_string()).join("part.1"))
+                    .await
+                    .expect("restored source shard"),
+                b"complete staged shard"
+            );
+            assert!(
+                !destination_object.join(new_data.to_string()).exists(),
+                "restore removes published destination data"
+            );
+            assert!(!destination_meta.exists(), "failed final commit cannot publish metadata");
+        }
+        timeout(Duration::from_secs(10), source_delete)
+            .await
+            .expect("source deletion drains")
+            .expect("delete source");
+        timeout(Duration::from_secs(10), destination_delete)
+            .await
+            .expect("destination deletion drains")
+            .expect("delete destination");
+        for volume in [source, destination] {
+            disk.make_volume(volume).await.expect("recreate after physical drain");
+            let new_generation = root.path().join(volume).join("new-generation");
+            fs::write(&new_generation, b"new generation payload")
+                .await
+                .expect("write new generation");
+            assert_eq!(fs::read(new_generation).await.expect("new generation remains"), b"new generation payload");
+            let mut entries = fs::read_dir(root.path().join(volume))
+                .await
+                .expect("recreated volume entries");
+            assert_eq!(
+                entries
+                    .next_entry()
+                    .await
+                    .expect("read new generation entry")
+                    .expect("sentinel")
+                    .file_name(),
+                "new-generation"
+            );
+            assert!(
+                entries.next_entry().await.expect("read remaining entries").is_none(),
+                "old staging or metadata cannot reappear"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_rename_data_admission_cancellation_retains_both_volumes_through_physical_workers() {
+        for stage in ["inline-mkdir", "backup-mkdir", "publish", "restore"] {
+            assert_legacy_rename_data_physical_owner(stage, true).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_rename_data_admission_timeout_retains_both_volumes_through_physical_workers() {
+        for stage in ["inline-mkdir", "backup-mkdir", "publish", "restore"] {
+            assert_legacy_rename_data_physical_owner(stage, false).await;
+        }
     }
 
     #[tokio::test]

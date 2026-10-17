@@ -15,7 +15,7 @@
 use super::*;
 use crate::bucket::utils::has_bad_path_component;
 use crate::disk::error::{DiskError, Result as DiskResult};
-use crate::disk::{DeleteOptions, Disk, RenameDataGuards, RenameDataResp};
+use crate::disk::{DeleteOptions, Disk, LegacyRenameData, RenameDataGuards, RenameDataResp};
 use crate::runtime::instance::{InstanceContext, NamespaceCommitGuard};
 use crate::runtime::sources as runtime_sources;
 use tracing::{debug, error};
@@ -44,6 +44,18 @@ impl BootstrapLocalTarget {
 
     pub fn is_for_store(&self, store: &ECStore) -> bool {
         Arc::ptr_eq(&self.ctx, &store.ctx)
+    }
+
+    pub async fn begin_legacy_local_rename_data(
+        &self,
+        disk_ref: &str,
+        source: (&str, &str),
+        fi: &FileInfo,
+        destination: (&str, &str),
+    ) -> DiskResult<LegacyRenameData> {
+        validate_bootstrap_volume(source.0)?;
+        validate_bootstrap_volume(destination.0)?;
+        begin_legacy_local_rename_data_with_ctx(&self.ctx, disk_ref, source, fi, destination).await
     }
 
     pub async fn rename_local_data(
@@ -87,6 +99,16 @@ fn validate_bootstrap_volume(volume: &str) -> DiskResult<()> {
 impl ECStore {
     pub async fn local_mutation_disk(&self, disk_ref: &str) -> DiskResult<DiskStore> {
         local_mutation_disk(&self.ctx, disk_ref).await
+    }
+
+    pub async fn begin_legacy_local_rename_data(
+        &self,
+        disk_ref: &str,
+        source: (&str, &str),
+        fi: &FileInfo,
+        destination: (&str, &str),
+    ) -> DiskResult<LegacyRenameData> {
+        begin_legacy_local_rename_data_with_ctx(&self.ctx, disk_ref, source, fi, destination).await
     }
 
     /// Admit an artifact publication on the receiving instance, retaining its
@@ -417,6 +439,20 @@ async fn admit_local_disk(
     // Admission linearizes under the registry read: replacement/quarantine
     // before this point rejects; later changes do not revoke physical I/O.
     Ok(mutates_namespace.then(|| ctx.begin_namespace_commit()))
+}
+
+async fn begin_legacy_local_rename_data_with_ctx(
+    ctx: &Arc<InstanceContext>,
+    disk_ref: &str,
+    source: (&str, &str),
+    fi: &FileInfo,
+    destination: (&str, &str),
+) -> DiskResult<LegacyRenameData> {
+    let (disk, disk_id) = local_disk_candidate(ctx, disk_ref).await?;
+    let mutates_namespace = !is_meta_bucketname(source.0) || !is_meta_bucketname(destination.0);
+    let owner = admit_local_disk(ctx, &disk, disk_id, mutates_namespace).await?;
+    disk.begin_legacy_rename_data(source, fi, destination, owner.map(|owner| owner as Arc<dyn Send + Sync>))
+        .await
 }
 
 async fn rename_local_data_with_ctx(
@@ -917,6 +953,14 @@ mod tests {
             ".minio.sys/../victim",
         ] {
             for (src, dst) in [(invalid, ".rustfs.sys/tmp"), (".rustfs.sys/tmp", invalid)] {
+                assert_eq!(
+                    target
+                        .begin_legacy_local_rename_data(&disk.endpoint().to_string(), (src, "staged"), &fi, (dst, "destination"))
+                        .await
+                        .expect_err("bootstrap prepare must validate both raw volumes"),
+                    DiskError::FileAccessDenied,
+                    "src={src}, dst={dst}"
+                );
                 assert!(
                     target
                         .rename_local_data(&disk.endpoint().to_string(), (src, "staged"), &fi, (dst, "destination"), None)
@@ -998,6 +1042,34 @@ mod tests {
                 .await
                 .expect("read bootstrap result");
             assert_eq!(read.data, fi.data);
+            seed_target(&disk, volume, "prepared-staged", fi.clone()).await;
+            BootstrapLocalTarget::new(ctx.clone())
+                .begin_legacy_local_rename_data(
+                    &disk.endpoint().to_string(),
+                    (volume, "prepared-staged"),
+                    &fi,
+                    (volume, "prepared-destination"),
+                )
+                .await
+                .expect("legitimate bootstrap preparation")
+                .commit()
+                .await
+                .expect("legitimate prepared bootstrap commit");
+            let prepared_read = disk
+                .read_version(
+                    volume,
+                    volume,
+                    "prepared-destination",
+                    &fi.version_id.expect("version").to_string(),
+                    &crate::disk::ReadOptions {
+                        read_data: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("read prepared bootstrap result");
+            assert_eq!(prepared_read.version_id, fi.version_id);
+            assert_eq!(prepared_read.data, fi.data);
             assert_eq!(ctx.namespace_commit_generation(), 0);
             assert!(!ctx.namespace_commits_pending());
         }

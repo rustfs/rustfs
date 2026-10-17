@@ -282,24 +282,23 @@ pub(in crate::disk) struct LocalRenamePreflightRejection(());
 pub(super) struct RenameDataState {
     namespace_owner: Option<Arc<dyn Send + Sync>>,
     preflight_rejection: Option<LocalRenamePreflightRejection>,
+    prepared: Option<Arc<os::NamespaceMutationLease>>,
+}
+
+pub(in crate::disk) struct PreparedRenameData {
+    file_info: FileInfo,
+    mutation_lease: Arc<os::NamespaceMutationLease>,
 }
 
 impl LocalDisk {
-    #[tracing::instrument(name = "rename_data", target = "rustfs_ecstore::disk::local", level = "trace", skip_all)]
-    pub(super) async fn rename_data_inner(
+    async fn prepare_rename_data_admission(
         &self,
-        src_volume: &str,
-        src_path: &str,
         fi: FileInfo,
-        dst_volume: &str,
-        dst_path: &str,
-        state: &mut RenameDataState,
-    ) -> Result<RenameDataResp> {
-        crate::hp_guard!("LocalDisk::rename_data");
-        #[cfg(feature = "e2e-test-hooks")]
-        if fi.is_healing() {
-            wait_for_heal_commit_test_barrier(&self.root, dst_volume, dst_path).await?;
-        }
+        destination: (&str, &str),
+        source_volume: Option<&str>,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<PreparedRenameData> {
+        let (dst_volume, dst_path) = destination;
         let mut fi = fi;
         // A non-force DeleteBucket must not remove a directory while a local
         // object commit is publishing into it. The peer's empty scan remains
@@ -328,14 +327,25 @@ impl LocalDisk {
         };
         // Quota admission -> metadata RMW -> namespace/volume publication.
         let metadata_lease =
-            os::acquire_metadata_mutation_lease(&self.get_object_path(dst_volume, dst_path)?, state.namespace_owner.take()).await;
-        let mutation_lease = os::acquire_rename_data_mutation_lease_with_owner(
-            &self.root,
-            dst_volume,
-            &destination_object_path,
-            Some(metadata_lease),
-        )
-        .await;
+            os::acquire_metadata_mutation_lease(&self.get_object_path(dst_volume, dst_path)?, namespace_owner).await;
+        let mutation_lease = if let Some(source_volume) = source_volume {
+            os::acquire_rename_data_mutation_lease_for_volumes(
+                &self.root,
+                source_volume,
+                dst_volume,
+                &destination_object_path,
+                Some(metadata_lease),
+            )
+            .await
+        } else {
+            os::acquire_rename_data_mutation_lease_with_owner(
+                &self.root,
+                dst_volume,
+                &destination_object_path,
+                Some(metadata_lease),
+            )
+            .await
+        };
         if let Some(claim) = quota_fence_claim {
             mutation_lease.attach_external_guard(claim);
         }
@@ -343,6 +353,91 @@ impl LocalDisk {
             fi.erasure.index = 0;
         }
         fi.validate_for_metadata_read()?;
+        Ok(PreparedRenameData {
+            file_info: fi,
+            mutation_lease,
+        })
+    }
+
+    pub(in crate::disk) async fn begin_legacy_rename_data(
+        &self,
+        source: (&str, &str),
+        fi: &FileInfo,
+        destination: (&str, &str),
+        permit: crate::disk::io_admission::DiskIoPermit,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<PreparedRenameData> {
+        // Capture the same permit, mount FD and listener-instance owner before
+        // quota -> metadata -> namespace -> sorted volume READ admission.
+        #[cfg(target_os = "linux")]
+        let owner: Arc<dyn Send + Sync> = Arc::new((permit, self.mount_lease.clone(), namespace_owner));
+        #[cfg(not(target_os = "linux"))]
+        let owner: Arc<dyn Send + Sync> = Arc::new((permit, namespace_owner));
+        let prepared = self
+            .prepare_rename_data_admission(fi.clone(), destination, Some(source.0), Some(owner))
+            .await?;
+        for volume in [Some(source.0), (source.0 != destination.0).then_some(destination.0)]
+            .into_iter()
+            .flatten()
+        {
+            if !skip_access_checks(volume) {
+                let path = self.io_get_bucket_path(volume)?;
+                let metadata = fs::symlink_metadata(path)
+                    .await
+                    .map_err(crate::disk::error_conv::to_volume_error)?;
+                if !metadata.is_dir() {
+                    return Err(DiskError::VolumeNotFound);
+                }
+            }
+        }
+        Ok(prepared)
+    }
+
+    pub(in crate::disk) async fn rename_data_prepared(
+        &self,
+        source: (&str, &str),
+        destination: (&str, &str),
+        prepared: PreparedRenameData,
+    ) -> Result<RenameDataResp> {
+        let PreparedRenameData {
+            file_info,
+            mutation_lease,
+        } = prepared;
+        let mut state = RenameDataState {
+            prepared: Some(mutation_lease),
+            ..Default::default()
+        };
+        self.rename_data_inner(source.0, source.1, file_info, destination.0, destination.1, &mut state)
+            .await
+    }
+
+    #[tracing::instrument(name = "rename_data", target = "rustfs_ecstore::disk::local", level = "trace", skip_all)]
+    pub(super) async fn rename_data_inner(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        state: &mut RenameDataState,
+    ) -> Result<RenameDataResp> {
+        crate::hp_guard!("LocalDisk::rename_data");
+        #[cfg(feature = "e2e-test-hooks")]
+        if fi.is_healing() {
+            wait_for_heal_commit_test_barrier(&self.root, dst_volume, dst_path).await?;
+        }
+        let PreparedRenameData {
+            file_info: fi,
+            mutation_lease,
+        } = if let Some(mutation_lease) = state.prepared.take() {
+            PreparedRenameData {
+                file_info: fi,
+                mutation_lease,
+            }
+        } else {
+            self.prepare_rename_data_admission(fi, (dst_volume, dst_path), None, state.namespace_owner.take())
+                .await?
+        };
         // Snapshot the destination part paths before `fi` is consumed below. These
         // are the descriptors a reader may hold for the version this call is about
         // to replace (backlog#1145); readers build the identical string in
@@ -450,7 +545,14 @@ impl LocalDisk {
             .parent()
             .ok_or_else(|| DiskError::other("missing object metadata parent"))?;
         if !no_inline {
-            fs::create_dir_all(src_file_parent).await.map_err(to_file_error)?;
+            let source_parent = src_file_parent.to_path_buf();
+            os::run_blocking_namespace_operation(mutation_lease.clone(), move || {
+                #[cfg(test)]
+                super::volume_mutation_test_hooks::run(super::volume_mutation_test_hooks::Stage::Create, &source_parent);
+                std::fs::create_dir_all(source_parent)
+            })
+            .await
+            .map_err(to_file_error)?;
         }
         // Acquire the common trees before reading destination metadata. On
         // Windows this pins the object directory identity across metadata
@@ -689,7 +791,7 @@ impl LocalDisk {
             if let (Some(old_data_dir), Some(dst_buf)) = (rollback_data_dir, has_dst_buf.as_ref()) {
                 let backup_parent = dst_file_parent.join(old_data_dir.to_string());
                 #[cfg(not(windows))]
-                if let Err(err) = os::make_dir_all(&backup_parent, &skip_parent).await {
+                if let Err(err) = os::make_dir_all_with_owner(&backup_parent, &skip_parent, commit.mutation_lease.clone()).await {
                     commit.restore_published_data_source().await?;
                     return Err(err);
                 }

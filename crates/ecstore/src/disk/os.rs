@@ -1486,6 +1486,7 @@ pub(crate) async fn acquire_metadata_mutation_lease(
 pub(crate) struct NamespaceMutationLease {
     _namespace_guard: OwnedMutexGuard<()>,
     _volume_guard: Option<OwnedRwLockReadGuard<()>>,
+    _secondary_volume_guard: Option<OwnedRwLockReadGuard<()>>,
     external_guard: Mutex<Option<Arc<dyn Send + Sync>>>,
     // Independent of the quota claim; both survive cancellation of the waiter.
     _namespace_owner: Option<Arc<dyn Send + Sync>>,
@@ -1508,6 +1509,7 @@ pub(in crate::disk) async fn acquire_namespace_mutation_lease_with_owner(
     Arc::new(NamespaceMutationLease {
         _namespace_guard: disk_namespace_mutation_lock(path).lock_owned().await,
         _volume_guard: None,
+        _secondary_volume_guard: None,
         external_guard: Mutex::new(None),
         _namespace_owner: namespace_owner,
     })
@@ -1525,6 +1527,7 @@ pub(in crate::disk) fn try_acquire_namespace_mutation_lease_with_owner(
     Ok(Arc::new(NamespaceMutationLease {
         _namespace_guard: guard,
         _volume_guard: None,
+        _secondary_volume_guard: None,
         external_guard: Mutex::new(None),
         _namespace_owner: Some(namespace_owner),
     }))
@@ -1551,6 +1554,39 @@ pub(crate) async fn acquire_rename_data_mutation_lease_with_owner(
     Arc::new(NamespaceMutationLease {
         _namespace_guard: namespace_guard,
         _volume_guard: Some(volume_guard),
+        _secondary_volume_guard: None,
+        external_guard: Mutex::new(None),
+        _namespace_owner: namespace_owner,
+    })
+}
+
+/// Admit both physical volumes after the destination namespace, never taking
+/// the same READ twice when a bucket deletion is already queued.
+pub(in crate::disk) async fn acquire_rename_data_mutation_lease_for_volumes(
+    root: &Path,
+    source_volume: &str,
+    destination_volume: &str,
+    destination_object: &Path,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> Arc<NamespaceMutationLease> {
+    let namespace_guard = disk_namespace_mutation_lock(destination_object).lock_owned().await;
+    let source_key = root.join(source_volume);
+    let destination_key = root.join(destination_volume);
+    let (first, second) = if source_key <= destination_key {
+        (source_volume, destination_volume)
+    } else {
+        (destination_volume, source_volume)
+    };
+    let first_guard = disk_volume_mutation_lock(root, first).read_owned().await;
+    let second_guard = if source_key == destination_key {
+        None
+    } else {
+        Some(disk_volume_mutation_lock(root, second).read_owned().await)
+    };
+    Arc::new(NamespaceMutationLease {
+        _namespace_guard: namespace_guard,
+        _volume_guard: Some(first_guard),
+        _secondary_volume_guard: second_guard,
         external_guard: Mutex::new(None),
         _namespace_owner: namespace_owner,
     })

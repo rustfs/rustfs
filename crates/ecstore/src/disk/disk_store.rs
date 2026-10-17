@@ -1568,7 +1568,77 @@ impl LegacyMetadataWrite {
     }
 }
 
+/// A single rename bound to both captured volumes and their physical admission.
+pub struct LegacyRenameData {
+    disk: LocalDiskWrapper,
+    source: (String, String),
+    destination: (String, String),
+    prepared: super::local::PreparedRenameData,
+    permit: crate::disk::io_admission::DiskIoPermit,
+}
+
+impl std::fmt::Debug for LegacyRenameData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LegacyRenameData")
+            .field("source", &self.source)
+            .field("destination", &self.destination)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LegacyRenameData {
+    pub async fn commit(self) -> Result<RenameDataResp> {
+        let Self {
+            disk,
+            source,
+            destination,
+            prepared,
+            permit,
+        } = self;
+        crate::disk::io_admission::with_disk_io_permit(
+            Some(permit),
+            disk.track_disk_health_mutation(
+                "rename_data",
+                DiskMetricMutation::Write,
+                || async {
+                    Box::pin(
+                        disk.disk
+                            .rename_data_prepared((&source.0, &source.1), (&destination.0, &destination.1), prepared),
+                    )
+                    .await
+                },
+                get_max_timeout_duration(),
+            ),
+        )
+        .await
+    }
+}
+
 impl LocalDiskWrapper {
+    pub(in crate::disk) async fn begin_legacy_rename_data(
+        &self,
+        source: (&str, &str),
+        fi: &FileInfo,
+        destination: (&str, &str),
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<LegacyRenameData> {
+        let permit = self.io_admission.foreground();
+        let prepared = tokio::time::timeout(
+            get_max_timeout_duration(),
+            self.disk
+                .begin_legacy_rename_data(source, fi, destination, permit.clone(), namespace_owner),
+        )
+        .await
+        .map_err(|_| DiskError::Timeout)??;
+        Ok(LegacyRenameData {
+            disk: self.clone(),
+            source: (source.0.to_owned(), source.1.to_owned()),
+            destination: (destination.0.to_owned(), destination.1.to_owned()),
+            prepared,
+            permit,
+        })
+    }
+
     pub(in crate::disk) async fn begin_legacy_metadata_write(&self, volume: &str, path: &str) -> Result<LegacyMetadataWrite> {
         let permit = self.io_admission.foreground();
         let publication = tokio::time::timeout(
