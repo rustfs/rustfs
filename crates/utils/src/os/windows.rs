@@ -21,7 +21,8 @@ use std::path::{Component, Path, Prefix};
 use windows::Win32::Foundation::{HANDLE, MAX_PATH};
 use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_BACKUP_SEMANTICS, FILE_REMOTE_PROTOCOL_INFO, FileRemoteProtocolInfo, GetDiskFreeSpaceExW, GetDiskFreeSpaceW,
-    GetDriveTypeW, GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW,
+    GetDriveTypeW, GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationW, GetVolumePathNameW,
+    VOLUME_NAME_NT,
 };
 use windows::core::PCWSTR;
 
@@ -163,7 +164,9 @@ pub fn get_info(p: impl AsRef<Path>) -> std::io::Result<DiskInfo> {
         fstype: get_volume_information(&volume)
             .map(|info| info.file_system_name)
             .unwrap_or_default(),
-        remote: is_remote_directory(p.as_ref()) || is_remote_volume(&volume)?,
+        // A failed handle probe is not conclusive; the volume's drive type
+        // still covers mapped drives and UNC shares.
+        remote: is_remote_directory(p.as_ref()).unwrap_or(false) || is_remote_volume(&volume)?,
         ..Default::default()
     })
 }
@@ -204,39 +207,81 @@ fn get_volume_information(volume: &WidePath) -> std::io::Result<VolumeInformatio
     })
 }
 
-/// Reports whether `path` is served by a network redirector, following
-/// symlinks and junctions to their target.
-///
-/// `FileRemoteProtocolInfo` only succeeds on handles opened through a network
-/// redirector (e.g. SMB, including a loopback `\\localhost\C$`) and fails
-/// with `ERROR_INVALID_PARAMETER` on local volumes. Any failure,
-/// including opening the directory, is reported as not remote so the drive
-/// type of the volume root decides.
-// SAFETY: `GetFileInformationByHandleEx` receives a handle owned by `directory`
-// for the whole call and a pointer/size pair describing `info`.
-#[allow(unsafe_code)]
-fn is_remote_directory(path: &Path) -> bool {
-    let Ok(directory) = std::fs::OpenOptions::new()
+/// NT namespace prefix of paths served by the Multiple UNC Provider, which
+/// fronts every network redirector (UNC paths and mapped drive letters).
+const MUP_DEVICE_PREFIX: &str = r"\Device\Mup\";
+
+/// Opens `path` for metadata queries only, following symlinks and junctions.
+fn open_directory(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
         .access_mode(0)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
         .open(path)
-    else {
-        return false;
-    };
+}
+
+/// Reports whether `path` is served by a network redirector, following
+/// symlinks and junctions to their target.
+///
+/// Either signal is sufficient: `FileRemoteProtocolInfo` only succeeds on
+/// handles opened through a redirector, and the handle's final NT path lies
+/// under `\Device\Mup\` for every UNC or mapped-drive target.
+fn is_remote_directory(path: &Path) -> std::io::Result<bool> {
+    let directory = open_directory(path)?;
+    let handle = HANDLE(directory.as_raw_handle());
+    if remote_protocol_info(handle).is_ok() {
+        return Ok(true);
+    }
+    let final_path = final_nt_path(handle)?;
+    Ok(final_path
+        .get(..MUP_DEVICE_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(MUP_DEVICE_PREFIX)))
+}
+
+/// Queries the remote protocol behind `handle`; local volumes fail with
+/// `ERROR_INVALID_PARAMETER`.
+// SAFETY: `GetFileInformationByHandleEx` receives a caller-owned open handle
+// and a pointer/size pair describing a local `FILE_REMOTE_PROTOCOL_INFO`.
+#[allow(unsafe_code)]
+fn remote_protocol_info(handle: HANDLE) -> std::io::Result<FILE_REMOTE_PROTOCOL_INFO> {
     let mut info = FILE_REMOTE_PROTOCOL_INFO::default();
     // SAFETY:
-    // 1. The handle stays open until `directory` is dropped after the call.
+    // 1. The caller keeps `handle` open for the whole call.
     // 2. `info` is a writable, initialized `FILE_REMOTE_PROTOCOL_INFO` and its
     //    exact size is passed as the buffer size.
     unsafe {
         GetFileInformationByHandleEx(
-            HANDLE(directory.as_raw_handle()),
+            handle,
             FileRemoteProtocolInfo,
             (&raw mut info).cast(),
             size_of::<FILE_REMOTE_PROTOCOL_INFO>() as u32,
         )
+        .map_err(win32_error)?;
     }
-    .is_ok()
+    Ok(info)
+}
+
+/// Returns the NT namespace path of `handle`, e.g. `\Device\HarddiskVolume3\x`
+/// or `\Device\Mup\server\share\x`.
+// SAFETY: `GetFinalPathNameByHandleW` receives a caller-owned open handle and
+// a writable slice whose length the bindings pass as the buffer size.
+#[allow(unsafe_code)]
+fn final_nt_path(handle: HANDLE) -> std::io::Result<String> {
+    let mut buffer = vec![0u16; MAX_PATH as usize + 1];
+    loop {
+        // SAFETY:
+        // 1. The caller keeps `handle` open for the whole call.
+        // 2. `buffer` is writable and its length is passed as `cchFilePath`.
+        let len = unsafe { GetFinalPathNameByHandleW(handle, &mut buffer, VOLUME_NAME_NT) } as usize;
+        if len == 0 {
+            return Err(Error::last_os_error());
+        }
+        // On success the length excludes the NUL; a length that does not fit
+        // is the required size including it.
+        if len < buffer.len() {
+            return Ok(String::from_utf16_lossy(&buffer[..len]));
+        }
+        buffer.resize(len, 0);
+    }
 }
 
 /// Reports whether `volume`, a root returned by [`get_volume_path`], is a
@@ -364,6 +409,17 @@ mod tests {
         s.encode_utf16().collect()
     }
 
+    /// Describes both handle signals for `path`, for assertion messages.
+    fn handle_probe(path: &Path) -> String {
+        let directory = match open_directory(path) {
+            Ok(directory) => directory,
+            Err(err) => return format!("open failed: {err:?}"),
+        };
+        let handle = HANDLE(directory.as_raw_handle());
+        let protocol = remote_protocol_info(handle).map(|info| (info.Protocol, info.ProtocolMajorVersion, info.Flags));
+        format!("remote protocol {protocol:?}, final NT path {:?}", final_nt_path(handle))
+    }
+
     /// Creates a directory whose absolute path is well beyond `MAX_PATH`.
     fn long_directory(root: &Path) -> PathBuf {
         let mut dir = root.to_path_buf();
@@ -443,6 +499,11 @@ mod tests {
         assert!(info.total > 0);
         assert!(!info.fstype.is_empty(), "GetVolumeInformationW must name the filesystem");
         assert!(!info.remote, "the temp dir is on a local volume");
+        assert!(
+            !is_remote_directory(temp_dir.path()).unwrap(),
+            "local handle: {}",
+            handle_probe(temp_dir.path())
+        );
 
         let ids = get_physical_device_ids(temp_dir.path().to_str().unwrap()).unwrap();
         assert_eq!(ids.len(), 1);
@@ -493,6 +554,13 @@ mod tests {
         // The share reports the server's filesystem, so only the drive type
         // reveals that it is reached over SMB.
         assert!(share_info.remote, "{share} is a network share: {share_info:?}");
+        // The handle probe alone must recognize the share, since it is the
+        // only signal for links whose volume root is local.
+        assert!(
+            is_remote_directory(Path::new(&share)).unwrap(),
+            "share handle: {}",
+            handle_probe(Path::new(&share))
+        );
 
         let long = long_directory(&PathBuf::from(format!(r"{share}\{rest}")));
         let long_info = get_info(&long).unwrap();
@@ -523,7 +591,11 @@ mod tests {
         // The link itself lives on a local volume, so its volume root alone
         // need not reveal that the target is a share.
         let info = get_info(&link).unwrap();
-        assert!(info.remote, "{link:?} -> {target:?} resolves to a network share: {info:?}");
+        assert!(
+            info.remote,
+            "{link:?} -> {target:?} resolves to a network share: {info:?}; link handle: {}",
+            handle_probe(&link)
+        );
     }
 
     /// Set by the Windows filesystem workflow after mapping a drive letter to
