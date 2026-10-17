@@ -206,6 +206,10 @@ impl Operation for Retire {
 }
 
 #[cfg(test)]
+#[path = "plugin_artifact_tests.rs"]
+mod integration_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::{Value, json};
@@ -277,7 +281,17 @@ mod tests {
         for path in ["seal-attempt", "retire-version"] {
             assert!(router.contains_route(Method::POST, &format!("{ADMIN_PREFIX}/v3/plugin-artifacts/{path}")));
         }
-        let mut req = S3Request::new(Body::from(vec![b' '; 16 * 1024 + 1]));
+        let mut req = S3Request {
+            input: Body::from(vec![b' '; 16 * 1024 + 1]),
+            method: Method::POST,
+            uri: http::Uri::default(),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
         assert!(request_body::<SealRequest>(&mut req).await.is_err());
         assert!(request_store(&req).is_err(), "ARTIFACT_REQUIRES_REQUEST_INSTANCE");
         req.extensions.insert(Arc::new(ServerContextSlot::default()));

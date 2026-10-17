@@ -162,9 +162,18 @@ impl Fixture {
     fn request(&self, body: &Value, user: Option<&str>) -> S3Request<Body> {
         let slot = ServerContextSlot::new();
         assert!(slot.install(self.context.clone()));
-        let mut req = S3Request::new(Body::from(serde_json::to_vec(body).unwrap()));
+        let mut req = S3Request {
+            input: Body::from(serde_json::to_vec(body).unwrap()),
+            method: Method::POST,
+            uri: http::Uri::default(),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
         req.extensions.insert(slot);
-        req.method = Method::POST;
         req.credentials = user.map(|access_key| s3s::auth::Credentials {
             access_key: access_key.to_owned(),
             secret_key: s3s::auth::SecretKey::from(if access_key == ROOT { ROOT_SECRET } else { SECRET }.to_owned()),
@@ -234,7 +243,13 @@ async fn receipt(response: S3Result<S3Response<(StatusCode, Body)>>) -> Value {
     let response = response.expect("authorized handler succeeds");
     assert_eq!(response.output.0, StatusCode::OK);
     assert_eq!(response.headers[http::header::CACHE_CONTROL], "no-store");
-    serde_json::from_slice(&response.output.1.collect().await.expect("response body").to_bytes()).expect("receipt JSON")
+    serde_json::from_slice(
+        &http_body_util::BodyExt::collect(response.output.1)
+            .await
+            .expect("response body")
+            .to_bytes(),
+    )
+    .expect("receipt JSON")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
