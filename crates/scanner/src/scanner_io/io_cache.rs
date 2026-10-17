@@ -16,9 +16,9 @@ use super::*;
 
 pub(super) async fn collect_completed_bucket_results(
     ctx: CancellationToken,
-    cache: Arc<Mutex<DataUsageCache>>,
+    mut cache: DataUsageCache,
     mut results: mpsc::Receiver<DataUsageEntryInfo>,
-) -> HashSet<String> {
+) -> (DataUsageCache, HashSet<String>) {
     let mut cancelled = false;
     let mut completed = HashSet::new();
     loop {
@@ -26,11 +26,9 @@ pub(super) async fn collect_completed_bucket_results(
             _ = ctx.cancelled(), if !cancelled => cancelled = true,
             result = results.recv() => {
                 let Some(result) = result else {
-                    return completed;
+                    return (cache, completed);
                 };
-                let bucket = result.name.clone();
-                let mut cache = cache.lock().await;
-                if apply_bucket_result_to_cache(&mut cache, result, SystemTime::now()) {
+                if let Some(bucket) = apply_bucket_result_to_cache(&mut cache, result, SystemTime::now()) {
                     completed.insert(bucket);
                 }
             }
@@ -663,14 +661,9 @@ impl ScannerIOCache for SetDisks {
             }
         }
 
-        let cache_mutex: Arc<Mutex<DataUsageCache>> = Arc::new(Mutex::new(cache));
-
         let (bucket_result_tx, bucket_result_rx) = mpsc::channel::<DataUsageEntryInfo>(walkers.len());
-        let collect_bucket_results_fut = AbortOnDropHandle::new(tokio::spawn(collect_completed_bucket_results(
-            ctx.clone(),
-            Arc::clone(&cache_mutex),
-            bucket_result_rx,
-        )));
+        let collect_bucket_results_fut =
+            AbortOnDropHandle::new(tokio::spawn(collect_completed_bucket_results(ctx.clone(), cache, bucket_result_rx)));
 
         let mut futs = Vec::new();
 
@@ -1585,7 +1578,7 @@ impl ScannerIOCache for SetDisks {
         record_disk_bucket_scans_queued(0, &pool_label, &set_label);
         record_disk_bucket_scans_active(0, &pool_label, &set_label);
 
-        let completed_buckets = collect_bucket_results_fut
+        let (mut cache, completed_buckets) = collect_bucket_results_fut
             .await
             .map_err(|err| scanner_task_join_error("scanner bucket result collector", err))?;
 
@@ -1599,35 +1592,31 @@ impl ScannerIOCache for SetDisks {
         if coverage_complete {
             let completed_segment_invalidation_proof =
                 scanner_completed_set_segment_invalidation_proof(&segment_invalidation_proof, cold_zero_walk_reuse_candidate);
-            let cache_snapshot = {
-                let mut cache = cache_mutex.lock().await;
-                cache.info.next_cycle = want_cycle;
-                cache.info.last_update.get_or_insert_with(SystemTime::now);
-                cache.info.snapshot_complete = true;
-                let replication_execution = super::cache::scanner_replication_execution_digest(execution_digest, &cache);
-                cache.info.scan_execution_digest = Some(replication_execution);
-                cache.info.segment_invalidation_proof = completed_segment_invalidation_proof;
-                cache.info.lkg_snapshot_complete = false;
-                cache.info.lkg_next_cycle = None;
-                cache.info.lkg_last_update = None;
-                cache.info.lkg_leader_epoch = None;
-                cache.info.lkg_scan_plan_digest = None;
-                if cold_zero_walk_reuse_candidate {
-                    cold_zero_walk_reuse_observed.store(true, Ordering::Release);
-                }
-                cache.clone()
-            };
+            cache.info.next_cycle = want_cycle;
+            cache.info.last_update.get_or_insert_with(SystemTime::now);
+            cache.info.snapshot_complete = true;
+            let replication_execution = super::cache::scanner_replication_execution_digest(execution_digest, &cache);
+            cache.info.scan_execution_digest = Some(replication_execution);
+            cache.info.segment_invalidation_proof = completed_segment_invalidation_proof;
+            cache.info.lkg_snapshot_complete = false;
+            cache.info.lkg_next_cycle = None;
+            cache.info.lkg_last_update = None;
+            cache.info.lkg_leader_epoch = None;
+            cache.info.lkg_scan_plan_digest = None;
+            if cold_zero_walk_reuse_candidate {
+                cold_zero_walk_reuse_observed.store(true, Ordering::Release);
+            }
             let _ = persist_and_publish_cache_snapshot(
                 self.clone(),
                 &updates,
-                cache_snapshot,
+                cache,
                 initial_revisions.as_ref(),
                 cache_cycle_floor.as_ref(),
                 expected_publication_epoch,
             )
             .await;
         } else {
-            let mut incomplete_scope = cache_mutex.lock().await.clone();
+            let mut incomplete_scope = cache;
             incomplete_scope.info.name = DATA_USAGE_ROOT.to_string();
             incomplete_scope.info.next_cycle = want_cycle;
             incomplete_scope.info.last_update = None;

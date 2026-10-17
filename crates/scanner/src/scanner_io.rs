@@ -1148,7 +1148,11 @@ pub(crate) fn cache_root_entry_info(cache: &DataUsageCache) -> std::result::Resu
     })
 }
 
-fn apply_bucket_result_to_cache(cache: &mut DataUsageCache, result: DataUsageEntryInfo, update_time: SystemTime) -> bool {
+fn apply_bucket_result_to_cache(
+    cache: &mut DataUsageCache,
+    result: DataUsageEntryInfo,
+    update_time: SystemTime,
+) -> Option<String> {
     if cache.info.tier_registry_generation != result.tier_registry_generation {
         // A result from another registry generation must never be folded into
         // this cycle. Leaving it unapplied makes the cycle incomplete and
@@ -1167,7 +1171,7 @@ fn apply_bucket_result_to_cache(cache: &mut DataUsageCache, result: DataUsageEnt
             result_tier_registry_generation = result.tier_registry_generation,
             "Scanner bucket result rejected because the tier registry generation differs"
         );
-        return false;
+        return None;
     }
     match result.bucket_incarnation {
         Some(incarnation) if !incarnation.is_nil() => {
@@ -1179,7 +1183,7 @@ fn apply_bucket_result_to_cache(cache: &mut DataUsageCache, result: DataUsageEnt
     }
     cache.replace(&result.name, &result.parent, result.entry);
     cache.info.last_update = Some(update_time);
-    true
+    Some(result.name)
 }
 
 fn should_publish_completed_snapshot(completed_count: usize, total_count: usize, budget_elapsed: bool, cancelled: bool) -> bool {
