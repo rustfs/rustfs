@@ -146,4 +146,6 @@ zip.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 
 [dev-dependencies]
+aws-smithy-http-client = { workspace = true, default-features = false, features = ["test-util"] }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

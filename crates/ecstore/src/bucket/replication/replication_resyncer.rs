@@ -2427,6 +2427,51 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
         dobj.delete_object.version_id
     };
 
+    let dsc = match parse_replicate_decision(
+        &bucket,
+        &dobj
+            .delete_object
+            .replication_state
+            .as_ref()
+            .map(|v| v.replicate_decision_str.clone())
+            .unwrap_or_default(),
+    ) {
+        Ok(dsc) => dsc,
+        Err(err) => {
+            debug!(
+                event = EVENT_REPLICATION_DELETE_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket = %bucket,
+                arn = %dobj.target_arn,
+                error = %err,
+                reason = "replicate_decision_parse_failed",
+                "Failed to parse replicate decision"
+            );
+            send_local_event(EventArgs {
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
+                bucket_name: bucket.clone(),
+                object: ObjectInfo {
+                    bucket: bucket.clone(),
+                    name: dobj.delete_object.object_name.clone(),
+                    version_id,
+                    delete_marker: dobj.delete_object.delete_marker,
+                    ..Default::default()
+                },
+                user_agent: "Internal: [Replication]".to_string(),
+                ..Default::default()
+            });
+            return false;
+        }
+    };
+    let target_arns = dobj.admitted_target_arns();
+    if !dsc.replicate_any() && target_arns.is_empty() {
+        // Batch expiry can return an empty state after removing the source.
+        // It owes no remote work or local writeback. Persisted target admission
+        // must still be honored even when the live configuration is gone.
+        return true;
+    }
+
     if dobj.delete_object.delete_marker
         && let Some(delete_marker_version_id) = dobj.delete_object.delete_marker_version_id
     {
@@ -2513,43 +2558,6 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
         }
     }
 
-    let dsc = match parse_replicate_decision(
-        &bucket,
-        &dobj
-            .delete_object
-            .replication_state
-            .as_ref()
-            .map(|v| v.replicate_decision_str.clone())
-            .unwrap_or_default(),
-    ) {
-        Ok(dsc) => dsc,
-        Err(err) => {
-            debug!(
-                event = EVENT_REPLICATION_DELETE_SKIPPED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                bucket = %bucket,
-                arn = %dobj.target_arn,
-                error = %err,
-                reason = "replicate_decision_parse_failed",
-                "Failed to parse replicate decision"
-            );
-            send_local_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.to_string(),
-                bucket_name: bucket.clone(),
-                object: ObjectInfo {
-                    bucket: bucket.clone(),
-                    name: dobj.delete_object.object_name.clone(),
-                    version_id,
-                    delete_marker: dobj.delete_object.delete_marker,
-                    ..Default::default()
-                },
-                user_agent: "Internal: [Replication]".to_string(),
-                ..Default::default()
-            });
-            return false;
-        }
-    };
     let ns_lock = match storage
         .new_ns_lock(&bucket, format!("/[replicate]/{}", dobj.delete_object.object_name).as_str())
         .await
@@ -2629,7 +2637,6 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
     let mut join_set = JoinSet::new();
 
     // Process each target
-    let target_arns = dobj.admitted_target_arns();
     let expected_targets = dsc
         .targets_map
         .values()
