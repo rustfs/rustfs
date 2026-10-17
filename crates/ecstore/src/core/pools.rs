@@ -6799,53 +6799,59 @@ async fn execute_pool_meta_object_cas<S>(
 where
     S: EcstoreObjectIO,
 {
-    if object != POOL_META_IDENTITY_NAME {
-        return execute_pool_meta_object_cas_once(pool, object, data, opts, fence, phase).await;
-    }
-    // Keep the exact identity owned by this transaction. A quorum read alone
-    // cannot discharge repair responsibility for a missing disk replica.
-    let identity = data;
-    let mut outcome = execute_pool_meta_object_cas_once(pool.clone(), object, identity.clone(), opts, fence, phase).await;
-    for delay_secs in [1, 2, 4] {
-        if !outcome.source.as_deref().is_some_and(|err| {
-            matches!(err, Error::Io(inner) if inner.get_ref().is_some_and(|source| source.is::<crate::set_disk::SystemMetadataRepairRequired>()))
-        }) {
-            break;
+    // Bound the CAS state retained by callers, including ordinary metadata
+    // transactions that never enter identity repair. Large inline retry states
+    // otherwise propagate through startup and cross-crate storage futures.
+    Box::pin(async move {
+        if object != POOL_META_IDENTITY_NAME {
+            return execute_pool_meta_object_cas_once(pool, object, data, opts, fence, phase).await;
         }
-        // The caller's transaction arm remains live across reconnect waits,
-        // verification and repair. Cancellation must retain its sticky gate.
-        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-        let repair_options = async {
-            fence.ensure_held()?;
-            let (current, info) = read_config_no_lock_preserve_empty_with_metadata(pool.clone(), object).await?;
-            if current != identity {
-                return Err(Error::PreconditionFailed);
+        // Keep the exact identity owned by this transaction. A quorum read alone
+        // cannot discharge repair responsibility for a missing disk replica.
+        let identity = data;
+        let mut outcome = execute_pool_meta_object_cas_once(pool.clone(), object, identity.clone(), opts, fence, phase).await;
+        for delay_secs in [1, 2, 4] {
+            if !outcome.source.as_deref().is_some_and(|err| {
+                matches!(err, Error::Io(inner) if inner.get_ref().is_some_and(|source| source.is::<crate::set_disk::SystemMetadataRepairRequired>()))
+            }) {
+                break;
             }
-            let token = info
-                .etag
-                .filter(|etag| !etag.trim().is_empty())
-                .map(PoolMetaCasToken::Existing)
-                .unwrap_or(PoolMetaCasToken::Unsafe);
-            pool_meta_cas_options(object, &token, fence)
+            // The caller's transaction arm remains live across reconnect waits,
+            // verification and repair. Cancellation must retain its sticky gate.
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+            let repair_options = async {
+                fence.ensure_held()?;
+                let (current, info) = read_config_no_lock_preserve_empty_with_metadata(pool.clone(), object).await?;
+                if current != identity {
+                    return Err(Error::PreconditionFailed);
+                }
+                let token = info
+                    .etag
+                    .filter(|etag| !etag.trim().is_empty())
+                    .map(PoolMetaCasToken::Existing)
+                    .unwrap_or(PoolMetaCasToken::Unsafe);
+                pool_meta_cas_options(object, &token, fence)
+            }
+            .await;
+            outcome = match repair_options {
+                Ok(opts) => execute_pool_meta_object_cas_once(pool.clone(), object, identity.clone(), opts, fence, phase).await,
+                Err(err) => PoolMetaCasWriteOutcome::not_dispatched(err),
+            };
+            // A rejected repair cannot turn the preceding committed write into a
+            // harmless CAS conflict that the outer loop could accept on readback.
+            outcome.may_have_mutated = true;
+            outcome.result = outcome.result.map_err(|err| {
+                let original = outcome.source.get_or_insert_with(|| Arc::new(err));
+                Error::other(pool_metadata_error(
+                    crate::error::PoolMetadataFailure::TransactionUnknown,
+                    phase,
+                    Some(Arc::clone(original)),
+                ))
+            });
         }
-        .await;
-        outcome = match repair_options {
-            Ok(opts) => execute_pool_meta_object_cas_once(pool.clone(), object, identity.clone(), opts, fence, phase).await,
-            Err(err) => PoolMetaCasWriteOutcome::not_dispatched(err),
-        };
-        // A rejected repair cannot turn the preceding committed write into a
-        // harmless CAS conflict that the outer loop could accept on readback.
-        outcome.may_have_mutated = true;
-        outcome.result = outcome.result.map_err(|err| {
-            let original = outcome.source.get_or_insert_with(|| Arc::new(err));
-            Error::other(pool_metadata_error(
-                crate::error::PoolMetadataFailure::TransactionUnknown,
-                phase,
-                Some(Arc::clone(original)),
-            ))
-        });
-    }
-    outcome
+        outcome
+    })
+    .await
 }
 
 async fn execute_pool_meta_object_cas_once<S>(
@@ -24368,6 +24374,34 @@ mod pools_tests {
         revision: AtomicUsize,
         stored: StdMutex<Option<(Vec<u8>, String)>>,
         identity: StdMutex<Option<(Vec<u8>, String)>>,
+    }
+
+    #[test]
+    fn pool_meta_cas_future_remains_stack_bounded() {
+        let pool = Arc::new(PartialPoolMetaWriteStorage::default());
+        let fence = PoolMetaPersistenceFence::OfflineRecovery;
+        let future = super::execute_pool_meta_object_cas(
+            pool.clone(),
+            POOL_META_IDENTITY_NAME,
+            b"owned-identity".to_vec(),
+            ObjectOptions::default(),
+            &fence,
+            "identity_cas",
+        );
+        let original = super::execute_pool_meta_object_cas_once(
+            pool,
+            POOL_META_IDENTITY_NAME,
+            b"owned-identity".to_vec(),
+            ObjectOptions::default(),
+            &fence,
+            "identity_cas",
+        );
+        let future_size = std::mem::size_of_val(&future);
+        let original_size = std::mem::size_of_val(&original);
+        assert!(
+            future_size <= 4 * 1024,
+            "pool metadata CAS future must remain stack-bounded; measured {future_size} bytes versus {original_size} without repair"
+        );
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
