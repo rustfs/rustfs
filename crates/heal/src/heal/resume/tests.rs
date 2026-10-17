@@ -2440,6 +2440,62 @@ async fn signed_checkpoint_rejects_duplicate_fields() {
 }
 
 #[tokio::test]
+async fn checkpoint_writer_preserves_base_reader_canonicalization() {
+    use sha2::{Digest, Sha256};
+
+    for admin in [false, true] {
+        let (temp_dir, disk) = schema_test_disk().await;
+        let task_id = ResumeUtils::generate_task_id();
+        let manager = CheckpointManager::new(disk.clone(), task_id.clone())
+            .await
+            .expect("create rollback-compatible checkpoint");
+        if admin {
+            manager
+                .set_admin(AdminErasureCheckpoint {
+                    set_disk_id: "pool_0_set_0".to_string(),
+                    options: Default::default(),
+                    buckets: [("bucket".to_string(), Some(uuid::Uuid::new_v4()))].into(),
+                    outcome: Default::default(),
+                    completed: false,
+                })
+                .await
+                .expect("save nested administrator checkpoint");
+        }
+        manager.add_processed_object("b".to_string()).await.expect("record object b");
+        manager.add_processed_object("a".to_string()).await.expect("record object a");
+        manager.update_position(2, 9).await.expect("flush rollback fixture");
+        let path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+        let bytes = disk
+            .read_all(RUSTFS_META_BUCKET, &path)
+            .await
+            .expect("read real writer output");
+        let mut wire: serde_json::Value = serde_json::from_slice(&bytes).expect("decode writer output");
+        wire.sort_all_objects();
+        assert_eq!(
+            bytes.as_ref(),
+            serde_json::to_vec(&wire).expect("encode recursively sorted payload"),
+            "persisted keys must have the production base writer's order, including nested admin fields"
+        );
+        let signature = wire["integrity_digest"].take();
+        let unsigned = serde_json::to_vec(&wire).expect("encode base reader signing representation");
+        assert_eq!(
+            signature,
+            base64_simd::STANDARD.encode_to_string(Sha256::digest(&unsigned)),
+            "the production base reader must accept this writer's signature"
+        );
+        let restored = CheckpointManager::load_from_disk(disk, &task_id)
+            .await
+            .expect("same-version control must also load")
+            .get_checkpoint()
+            .await;
+        assert_eq!(restored.current_bucket_index, 2);
+        assert_eq!(restored.current_object_index, 9);
+        assert_eq!(restored.admin.is_some(), admin);
+        temp_dir.close().expect("remove rollback canonicalization fixture");
+    }
+}
+
+#[tokio::test]
 async fn downgraded_unsigned_checkpoint_resets_untrusted_progress() {
     let (temp_dir, disk) = schema_test_disk().await;
     let task_id = ResumeUtils::generate_task_id();

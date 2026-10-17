@@ -89,7 +89,7 @@ tokio-util = { workspace = true, features = ["io", "compat"] }
 tonic = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true, features = ["raw_value", "preserve_order"] }
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde", "fast-rng", "macro-diagnostics"] }
 async-trait = { workspace = true }
