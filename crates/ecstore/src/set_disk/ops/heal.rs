@@ -7370,7 +7370,9 @@ mod shard_integrity_rollout_tests;
 mod shard_identity_tests {
     use crate::disk::{DiskAPI as _, ReadOptions};
     use crate::object_api::{ObjectOptions, PutObjReader};
-    use crate::set_disk::ops::object::hermetic_set_disks_support::hermetic_set_disks_for_pool_with_default_parity_isolated;
+    use crate::set_disk::ops::object::hermetic_set_disks_support::{
+        hermetic_set_disks_for_pool_with_default_parity_isolated, lifecycle_owned_put_options,
+    };
     use crate::storage_api_contracts::multipart::MultipartOperations as _;
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use crate::storage_api_contracts::range::HTTPRangeSpec;
