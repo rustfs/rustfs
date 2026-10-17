@@ -4858,6 +4858,7 @@ async fn run_full_cycle(store: &Arc<ECStore>, cycle: u64) -> ScannerCycleStatus 
                 requires_full_scan: true,
                 resolved_scope_observer: None,
                 service_cohort: None,
+                post_walk_gate: None,
             },
         ),
     )
