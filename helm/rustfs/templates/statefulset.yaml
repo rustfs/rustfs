@@ -1,3 +1,5 @@
+{{- $tls := .Values.tls | default dict -}}
+{{- $tlsEnabled := $tls.enabled | default false -}}
 {{- $logDir := .Values.config.rustfs.obs_log_directory }}
 {{- $logDirEnabled := ne $logDir "" }}
 {{- $poolsEnabled := and .Values.pools .Values.pools.enabled }}
@@ -217,25 +219,10 @@ spec:
             {{- toYaml $.Values.resources | nindent 12 }}
           {{- include "rustfs.probes" $ | nindent 10 }}
           volumeMounts:
-            {{- if $.Values.mtls.enabled }}
-            - name: client-cert
-              mountPath: /opt/tls/client_cert.pem
-              subPath: client_cert.pem
-            - name: client-cert
-              mountPath: /opt/tls/client_key.pem
-              subPath: client_key.pem
-            - name: client-cert
-              mountPath: /opt/tls/client_ca.crt
-              subPath: client_ca.crt
-            - name: server-cert
-              mountPath: /opt/tls/rustfs_cert.pem
-              subPath: rustfs_cert.pem
-            - name: server-cert
-              mountPath: /opt/tls/rustfs_key.pem
-              subPath: rustfs_key.pem
-            - name: server-cert
-              mountPath: /opt/tls/ca.crt
-              subPath: ca.crt
+            {{- if or $.Values.mtls.enabled $tlsEnabled }}
+            - name: tls-material
+              mountPath: /opt/tls
+              readOnly: true
             {{- end }}
             {{- with $.Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
@@ -254,29 +241,42 @@ spec:
             - name: data
               mountPath: /data
             {{- end }}
-      {{- if or $.Values.mtls.enabled $.Values.extraVolumes }}
+      {{- if or $.Values.mtls.enabled $tlsEnabled $.Values.extraVolumes }}
       volumes:
-        {{- if $.Values.mtls.enabled }}
-        - name: server-cert
-          secret:
-            secretName: {{ include "rustfs.fullname" $ }}-server-tls
-            items:
-              - key: tls.crt
-                path: rustfs_cert.pem
-              - key: tls.key
-                path: rustfs_key.pem
-              - key: ca.crt
-                path: ca.crt
-        - name: client-cert
-          secret:
-            secretName: {{ include "rustfs.fullname" $ }}-client-tls
-            items:
-              - key: tls.crt
-                path: client_cert.pem
-              - key: tls.key
-                path: client_key.pem
-              - key: ca.crt
-                path: client_ca.crt
+        {{- if or $.Values.mtls.enabled $tlsEnabled }}
+        - name: tls-material
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: {{ if $.Values.mtls.enabled }}{{ include "rustfs.fullname" $ }}-server-tls{{ else }}{{ required "tls.existingSecret is required when tls.enabled=true" $tls.existingSecret }}{{ end }}
+                  items:
+                    - key: tls.crt
+                      path: rustfs_cert.pem
+                    - key: tls.key
+                      path: rustfs_key.pem
+                    {{- if $.Values.mtls.enabled }}
+                    - key: ca.crt
+                      path: ca.crt
+                    {{- end }}
+              {{- if $.Values.mtls.enabled }}
+              - secret:
+                  name: {{ include "rustfs.fullname" $ }}-client-tls
+                  items:
+                    - key: tls.crt
+                      path: client_cert.pem
+                    - key: tls.key
+                      path: client_key.pem
+                    - key: ca.crt
+                      path: client_ca.crt
+              {{- end }}
+              {{- if and $tlsEnabled $tls.trustSecret }}
+              - secret:
+                  name: {{ $tls.trustSecret }}
+                  items:
+                    - key: ca.crt
+                      path: public.crt
+              {{- end }}
         {{- end }}
         {{- with $.Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}

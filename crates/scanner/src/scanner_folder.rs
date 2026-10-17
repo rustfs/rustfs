@@ -34,13 +34,13 @@ use crate::scanner_io::{
     SCANNER_SKIP_FILE_ERROR, ScannerIODisk as _, is_scanner_metadata_corrupt_error, is_scanner_metadata_transient_error,
 };
 use crate::sleeper::DynamicSleeper;
+#[cfg(test)]
+use crate::storage_api::owner::EcstoreLifecycleRule as LifecycleRule;
 use crate::storage_api::owner::{
     EcstoreBucketLifecycleConfiguration as BucketLifecycleConfiguration, EcstoreEventArgs,
     EcstoreLifecycleRuleFilter as LifecycleRuleFilter, EcstoreObjectLockConfiguration as ObjectLockConfiguration,
     EcstoreVersioningConfiguration as VersioningConfiguration, ecstore_send_event,
 };
-#[cfg(test)]
-use crate::storage_api::owner::{EcstoreExpirationStatus as ExpirationStatus, EcstoreLifecycleRule as LifecycleRule};
 use metrics::{counter, describe_counter};
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit, trace_subscriber_count};
 use rustfs_filemeta::{
@@ -2294,6 +2294,12 @@ impl FolderScanner {
                         // Usage sampling is not proof that a Deep check ran.
                         if self.scan_mode != HealScanMode::Deep
                             && !forward_sweep
+                            && !self
+                                .old_cache
+                                .info
+                                .replication
+                                .as_ref()
+                                .is_some_and(|config| config.has_active_rules("", true))
                             && !into.compacted
                             && self.old_cache.is_compacted(&h)
                         {

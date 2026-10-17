@@ -817,8 +817,8 @@ where
                 }
                 TableCatalogEntryState::Active => {}
             }
-            let namespace = parse_namespace_for_store(&entry.namespace)?;
-            let table = parse_table_for_store(&entry.table)?;
+            parse_namespace_for_store(&entry.namespace)?;
+            parse_table_for_store(&entry.table)?;
             if !is_valid_table_metadata_location_for_entry(entry, &entry.metadata_location) {
                 return Err(TableCatalogStoreError::Invalid(format!(
                     "table backup metadata location is invalid for {}/{}/{}",
@@ -892,11 +892,9 @@ where
                     let kind = StrongTableCatalogBackupObjectKind::from_statistics_kind(reference.kind);
                     insert_backup_object_kind(&mut keys, &entry.table_bucket, &object_key, kind)?;
                 }
-                let referenced = metadata_maintenance_referenced_object_reports(
+                let referenced = metadata_maintenance_referenced_object_reports_for_entry(
                     &self.object_backend,
-                    &entry.table_bucket,
-                    &namespace,
-                    &table,
+                    &metadata_entry,
                     Some(warehouse_prefix.as_str()),
                     &metadata,
                     std::slice::from_ref(&metadata_location),
@@ -1435,6 +1433,8 @@ where
         let mutation_fence = fence.mutation_fence();
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
+        self.recover_table_maintenance_rename_unlocked(table_bucket, Some(&mutation_fence))
+            .await?;
         if self.read_restore_intent(table_bucket).await?.is_some() {
             return Err(TableCatalogStoreError::Conflict(
                 "catalog backup requires pending restore recovery before sealing".to_string(),
@@ -1584,6 +1584,8 @@ where
         Self::validate_maintenance_backup_objects(table_bucket, &backup.snapshot, &backup.maintenance_objects)?;
 
         self.hydrate_state().await?;
+        self.recover_table_maintenance_rename_unlocked(table_bucket, Some(&mutation_fence))
+            .await?;
         let existing_intent = self.read_restore_intent(table_bucket).await?;
         if let Some((intent, _)) = existing_intent.as_ref()
             && intent.backup_id != backup_id

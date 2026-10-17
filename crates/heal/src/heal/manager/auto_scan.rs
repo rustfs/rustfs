@@ -13,6 +13,18 @@
 // limitations under the License.
 /// The automatic disk scanner: replacement discovery and unformatted-disk enqueue.
 use super::*;
+use crate::heal::DiskStore;
+use std::collections::BTreeMap;
+
+pub(super) fn extend_replacement_recovery_disks(
+    inventory: &mut BTreeMap<String, DiskStore>,
+    disks: impl IntoIterator<Item = DiskStore>,
+) {
+    for disk in disks {
+        // Preserve the local snapshot when later inventory repeats its endpoint.
+        inventory.entry(disk.endpoint().to_string()).or_insert(disk);
+    }
+}
 
 impl HealManager {
     /// Start background task to auto scan local disks and enqueue erasure set heal requests
@@ -87,7 +99,20 @@ impl HealManager {
                             let local_disk_map = local_disk_map_read().await;
                             local_disk_map.values().flatten().cloned().collect::<Vec<_>>()
                         };
-                        let local_endpoints = local_disks.iter().map(|disk| disk.endpoint()).collect::<Vec<_>>();
+                        let mut local_endpoints = HashMap::with_capacity(local_disks.len());
+                        for disk in &local_disks {
+                            let endpoint = disk.endpoint();
+                            local_endpoints.entry(endpoint.to_string()).or_insert(endpoint);
+                        }
+                        // Formatting removes a target from blank-disk discovery, but its
+                        // unfinished intent may still live on a remote survivor.
+                        let mut recovery_sets = local_disks
+                            .iter()
+                            .filter_map(|disk| {
+                                let endpoint = disk.endpoint();
+                                crate::heal::utils::format_set_disk_id_from_i32(endpoint.pool_idx, endpoint.set_idx)
+                            })
+                            .collect::<HashSet<_>>();
                         let blocked_sets = replacement_recovery_blocked_sets
                             .lock()
                             .expect("replacement recovery blocked set lock poisoned")
@@ -97,6 +122,7 @@ impl HealManager {
                             let mut retry_succeeded = HashSet::new();
                             let mut retry_failed = HashSet::new();
                             for set_disk_id in blocked_sets {
+                                recovery_sets.remove(&set_disk_id);
                                 let disks = match storage.replacement_intent_disks(&set_disk_id).await {
                                     Ok(disks) => disks,
                                     Err(error) => {
@@ -235,11 +261,12 @@ impl HealManager {
                             }
                         }
 
-                        let mut recovery_disks = local_disks.clone();
-                        recovery_disks.extend(retry_recovery_disks);
-                        for set_disk_id in endpoints.keys() {
+                        let mut recovery_disks = BTreeMap::new();
+                        extend_replacement_recovery_disks(&mut recovery_disks, local_disks.iter().cloned());
+                        extend_replacement_recovery_disks(&mut recovery_disks, retry_recovery_disks);
+                        for set_disk_id in &recovery_sets {
                             match storage.replacement_intent_disks(set_disk_id).await {
-                                Ok(disks) => recovery_disks.extend(disks),
+                                Ok(disks) => extend_replacement_recovery_disks(&mut recovery_disks, disks),
                                 Err(error) => {
                                     conflicted_recovery_sets.insert(set_disk_id.clone());
                                     warn!(
@@ -254,10 +281,6 @@ impl HealManager {
                                 }
                             }
                         }
-                        recovery_disks.sort_by_key(|disk| disk.endpoint().to_string());
-                        recovery_disks
-                            .dedup_by(|left, right| left.endpoint().to_string() == right.endpoint().to_string());
-
                         // Once formatting succeeds a replacement is no longer
                         // discoverable as UnformattedDisk. Re-admit exactly one
                         // incomplete durable generation per set within its
@@ -265,7 +288,7 @@ impl HealManager {
                         // verified terminal cleanup. Multiple generations are a
                         // durable conflict: leave every marker/state intact and
                         // require reconciliation rather than choosing one.
-                        for disk in &recovery_disks {
+                        for (anchor, disk) in &recovery_disks {
                             let endpoint = disk.endpoint();
                             let disk_set_disk_id =
                                 crate::heal::utils::format_set_disk_id_from_i32(endpoint.pool_idx, endpoint.set_idx);
@@ -351,7 +374,7 @@ impl HealManager {
                                 // A remote survivor may own the durable intent, but only the
                                 // node mounting every replacement target may advance or replay it.
                                 if state.replacement_targets.iter().any(|target| {
-                                    !local_endpoints.iter().any(|endpoint| endpoint.to_string() == *target)
+                                    !local_endpoints.contains_key(target)
                                 }) {
                                     deferred_recovery_sets.insert(state.set_disk_id.clone());
                                     continue;
@@ -361,19 +384,20 @@ impl HealManager {
                                 }
                                 let mut selected = durable_recovery_candidates.remove(&task_id);
                                 let previous_set = selected.as_ref().map(|candidate| candidate.state.set_disk_id.clone());
+                                let candidate_set = state.set_disk_id.clone();
                                 let candidate = match ReplacementRecoveryCandidate::new(
-                                    state.clone(),
-                                    disk.endpoint().to_string(),
-                                    disk.endpoint().is_local,
+                                    state,
+                                    anchor.clone(),
+                                    endpoint.is_local,
                                 ) {
                                     Ok(candidate) => candidate,
                                     Err(error) => {
                                         conflicted_recovery_tasks.insert(task_id.clone());
-                                        conflicted_recovery_sets.insert(state.set_disk_id.clone());
+                                        conflicted_recovery_sets.insert(candidate_set.clone());
                                         if let Some(previous_set) = &previous_set {
                                             conflicted_recovery_sets.insert(previous_set.clone());
                                         }
-                                        block_recovery_set(&state.set_disk_id);
+                                        block_recovery_set(&candidate_set);
                                         if let Some(previous_set) = &previous_set {
                                             block_recovery_set(previous_set);
                                         }
@@ -432,12 +456,7 @@ impl HealManager {
                             {
                                 continue;
                             }
-                            let Some(anchor_disk) = local_disks
-                                .iter()
-                                .chain(recovery_disks.iter())
-                                .find(|disk| disk.endpoint().to_string() == candidate.anchor)
-                                .cloned()
-                            else {
+                            let Some(anchor_disk) = recovery_disks.get(&candidate.anchor).cloned() else {
                                 deferred_recovery_sets.insert(candidate.state.set_disk_id.clone());
                                 continue;
                             };
@@ -530,12 +549,7 @@ impl HealManager {
                             let targets = state
                                 .replacement_targets
                                 .iter()
-                                .filter_map(|target| {
-                                    local_endpoints
-                                        .iter()
-                                        .find(|endpoint| endpoint.to_string() == *target)
-                                        .cloned()
-                                })
+                                .filter_map(|target| local_endpoints.get(target).cloned())
                                 .collect::<Vec<_>>();
                             if targets.len() != state.replacement_targets.len() {
                                 deferred_recovery_sets.insert(state.set_disk_id.clone());
@@ -607,20 +621,9 @@ impl HealManager {
                         }
 
                         for (set_disk_id, (_, targets, _, _)) in &durable_recoveries {
-                            let expected = targets.iter().map(ToString::to_string).collect::<HashSet<_>>();
-                            let observed = endpoints
-                                .get(set_disk_id)
-                                .map(|endpoints| endpoints.iter().map(ToString::to_string).collect::<HashSet<_>>())
-                                .unwrap_or_default();
-                            if !observed.is_subset(&expected) {
-                                replacement_recovery_blocked_sets
-                                    .lock()
-                                    .expect("replacement recovery blocked set lock poisoned")
-                                    .insert(set_disk_id.clone());
-                                conflicted_recovery_sets.insert(set_disk_id.clone());
-                                continue;
-                            }
-                            endpoints.entry(set_disk_id.clone()).or_default().extend(targets.clone());
+                            // The durable owner must finish its exact target scope before
+                            // newly discovered replacements can start another generation.
+                            endpoints.insert(set_disk_id.clone(), targets.clone());
                         }
                         for set_disk_id in &conflicted_recovery_sets {
                             durable_recoveries.remove(set_disk_id);

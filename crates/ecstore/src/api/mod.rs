@@ -14,6 +14,15 @@
 
 //! Explicit ECStore public facades for outer crate compatibility boundaries.
 
+#[cfg(feature = "diagnostic-read-version-caller")]
+pub mod diagnostic {
+    pub use crate::cluster::rpc::runtime_sources::{
+        current_read_version_entry_source, observe_read_version_context_boundary, with_read_version_entry,
+        with_read_version_spawn_context,
+    };
+    pub use rustfs_io_metrics::internode_metrics::{ReadVersionContextBoundary, ReadVersionEntrySource};
+}
+
 pub mod admin {
     pub use crate::diagnostics::admin_server_info::{get_local_server_property, get_server_info};
 }
@@ -53,6 +62,8 @@ pub mod bucket {
         }
 
         pub mod bucket_lifecycle_ops {
+            pub use rustfs_lifecycle::{RestoreOutputLocation, RestoreRequest, RestoreS3Location, RestoreTag, RestoreTagging};
+
             pub use crate::bucket::lifecycle::bucket_lifecycle_ops::{
                 ExpiryState, LifecycleOps, ManualTransitionCancelCheck, ManualTransitionProgressSink,
                 ManualTransitionQueueSnapshot, ManualTransitionRunExecution, ManualTransitionRunOptions,
@@ -124,7 +135,7 @@ pub mod bucket {
             pub use crate::bucket::lifecycle::lifecycle::{
                 Event, ExpirationOptions, IlmAction, LIFECYCLE_MALFORMED_XML_ERROR_KIND, Lifecycle, LifecycleCalculate,
                 ObjectOpts, RuleValidate, TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions, expected_expiry_time,
-                object_opts_from_object_info,
+                format_lifecycle_date, object_opts_from_object_info, parse_lifecycle_date,
             };
         }
 
@@ -199,10 +210,10 @@ pub mod bucket {
             get_object_lock_config, get_object_lock_config_state, get_on_demand_migration_config,
             get_on_demand_migration_config_in, get_public_access_block_config, get_quota_config, get_replication_config,
             get_request_payment_config, get_sse_config, get_tagging_config, get_versioning_config, get_website_config,
-            init_bucket_metadata_sys, list_bucket_targets, reload_bucket_metadata, remove_bucket_metadata, set_bucket_metadata,
-            update, update_bucket_targets_under_transaction_lock, update_config_with, update_if_incarnation,
-            update_if_incarnation_at, update_quota_if_incarnation, update_quota_if_incarnation_at, update_under_transaction_lock,
-            update_under_transaction_lock_at,
+            init_bucket_metadata_sys, list_bucket_targets, reload_bucket_metadata, remove_bucket_metadata,
+            remove_bucket_metadata_if_absent, set_bucket_metadata, update, update_bucket_targets_under_transaction_lock,
+            update_config_with, update_if_incarnation, update_if_incarnation_at, update_quota_if_incarnation,
+            update_quota_if_incarnation_at, update_under_transaction_lock, update_under_transaction_lock_at,
         };
         #[cfg(feature = "test-util")]
         pub use crate::bucket::metadata_sys::{ConfigWriteLockProbe, test_support};
@@ -423,8 +434,11 @@ pub mod disk {
     pub use crate::disk::os::{LocalPublicationPause, LocalPublicationStage};
     pub use crate::disk::{
         BATCH_READ_VERSION_MAX_ITEMS, BUCKET_META_PREFIX, BatchReadVersionItem, BatchReadVersionReq, BatchReadVersionResp,
-        CheckPartsResp, ConditionalFileUpdate, DeleteOptions, Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption,
-        DiskStore, FileInfoVersions, FileReader, FileWriter, HEALING_MARKER_PATH, NsScannerOpenRequest, OldCurrentSize,
+        CheckPartsResp, ConditionalFileUpdate, CurrentDeleteGeneration, CurrentDeleteTransition,
+        DELETE_RECOVERY_PROTOCOL_VERSION, DeleteOptions, DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest,
+        DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DeleteRecoveryState,
+        Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, DiskStore, FileInfoVersions, FileReader, FileWriter,
+        GuardedDeleteVersionsPayload, GuardedFileInfoVersions, HEALING_MARKER_PATH, NsScannerOpenRequest, OldCurrentSize,
         PartTransactionAction, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
         STORAGE_FORMAT_FILE, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, new_disk,
         validate_batch_read_version_item_count,
@@ -520,13 +534,14 @@ pub mod integrity {
 pub mod object {
     pub use crate::object_api::{
         BLOCK_SIZE_V2, ERASURE_ALGORITHM, EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook,
-        GetObjectBodyCacheHookLookup, GetObjectBodySource, GetObjectReader, NamespaceLockFence, ObjectEncryptionResolver,
-        ObjectInfo, ObjectLockConfigSnapshot, ObjectMutationHook, ObjectOptions, PutObjReader, QuotaAdmission,
-        RangedDecompressReader, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
+        GetObjectBodyCacheHookLookup, GetObjectBodySource, GetObjectReadCondition, GetObjectReadMetadata, GetObjectReader,
+        NamespaceLockFence, ObjectEncryptionResolver, ObjectInfo, ObjectLockConfigSnapshot, ObjectMutationHook, ObjectOptions,
+        PutObjReader, QuotaAdmission, RangedDecompressReader, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
         SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY, ScannerPublicationCommitScope, ScannerPublicationCommitStartError,
         ScannerPublicationCommitState, ShardIntegrityWriteMode, StreamConsumer, WriteCommitGuard, WriteCompletion,
         get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
         register_object_mutation_hook, unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
+        with_get_object_read_condition,
     };
     pub use crate::store::{
         PrepareSelectObjectSnapshotError, PreparedGetObjectReader, SelectObjectSnapshot, SelectObjectSnapshotReadError,
@@ -591,6 +606,7 @@ pub mod set_disk {
     #[cfg(feature = "test-util")]
     pub mod test_util {
         pub use crate::bucket::quota::reservation::fail_next_quota_ledger_save_for_test;
+        pub use crate::set_disk::ConditionalReadBenchmarkMetadataGuard;
         pub use crate::set_disk::{MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause};
 
         /// Keep a namespace commit pending until the returned owner is dropped.

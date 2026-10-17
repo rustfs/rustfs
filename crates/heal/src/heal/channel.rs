@@ -853,6 +853,13 @@ mod tests {
         async fn get_bucket_info(&self, _bucket: &str) -> crate::Result<Option<crate::heal::storage_api::status::BucketInfo>> {
             Ok(None)
         }
+        async fn list_buckets_for_admin_heal(
+            &self,
+            _selector: Option<crate::heal::storage_api::storage::DiskSetSelector>,
+        ) -> crate::Result<Vec<crate::heal::storage_api::status::BucketInfo>> {
+            self.list_buckets().await
+        }
+
         async fn list_buckets(&self) -> crate::Result<Vec<crate::heal::storage_api::status::BucketInfo>> {
             Ok(vec![])
         }

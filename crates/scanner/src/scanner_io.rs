@@ -29,6 +29,7 @@ use rand::seq::SliceRandom as _;
 use rustfs_config::{ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS};
 use rustfs_data_usage::{BucketTargetUsageInfo, BucketUsageInfo, observed_data_usage_is_newer};
 use rustfs_filemeta::FileMeta;
+use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration as BucketLifecycleConfiguration;
 use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 use rustfs_heal_contracts::heal_channel::HealScanMode;
 use rustfs_lock::{LockError, NamespaceLockGuard};
@@ -36,7 +37,7 @@ use rustfs_scanner_metrics::metrics::{
     Metric, Metrics, emit_scan_bucket_drive_complete, emit_scan_bucket_drive_partial, global_metrics,
 };
 use rustfs_utils::path::path_join_buf;
-use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
+use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -1425,7 +1426,7 @@ pub(crate) struct ScannerCycleResult {
     pub(crate) status: ScannerCycleStatus,
     publication_epoch: Option<u64>,
     activity_digest: Option<[u8; 32]>,
-    observational_snapshot_published: bool,
+    usage_update_emitted: bool,
     dirty_usage_clear: Option<DirtyUsageBuckets>,
     remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
     distributed_segment_invalidation_evidence: Option<DistributedSegmentInvalidationEvidence>,
@@ -1443,7 +1444,7 @@ impl ScannerCycleResult {
             status,
             publication_epoch: None,
             activity_digest: None,
-            observational_snapshot_published: false,
+            usage_update_emitted: false,
             dirty_usage_clear,
             remote_dirty_usage_acknowledgements: Vec::new(),
             distributed_segment_invalidation_evidence: None,
@@ -1476,14 +1477,14 @@ impl ScannerCycleResult {
         self.activity_digest
     }
 
-    pub(crate) fn with_observational_snapshot_published(mut self, published: bool) -> Self {
+    pub(crate) fn with_usage_update_emitted(mut self, emitted: bool) -> Self {
         self.publication_expectation = None;
-        self.observational_snapshot_published = published;
+        self.usage_update_emitted = emitted;
         self
     }
 
-    pub(crate) fn has_observational_snapshot(&self) -> bool {
-        self.observational_snapshot_published
+    pub(crate) fn has_usage_update(&self) -> bool {
+        self.usage_update_emitted
     }
 
     fn with_failed_dirty_usage(mut self, failed_dirty_usage: bool) -> Self {
@@ -1619,9 +1620,9 @@ pub use dirty_usage::{
     acknowledge_scoped_dirty_usage, clear_dirty_usage_bucket, encode_durable_dirty_usage_producer_replay_record,
     record_dirty_usage_bucket, record_dirty_usage_bucket_from_producer, record_dirty_usage_bucket_from_producers,
     record_dirty_usage_object, record_dirty_usage_object_from_producer, record_scanner_maintenance_change,
-    replay_durable_dirty_usage_producer_record, scanner_activity_epoch, scanner_dirty_usage_bucket_generation,
-    scanner_dirty_usage_snapshot, scanner_dirty_usage_state, scanner_maintenance_generation,
-    set_scanner_dirty_usage_clear_observer, set_scanner_dirty_usage_mutation_observer,
+    record_status_class_mutation, replay_durable_dirty_usage_producer_record, scanner_activity_epoch,
+    scanner_dirty_usage_bucket_generation, scanner_dirty_usage_snapshot, scanner_dirty_usage_state,
+    scanner_maintenance_generation, set_scanner_dirty_usage_clear_observer, set_scanner_dirty_usage_mutation_observer,
 };
 #[cfg(test)]
 pub(crate) use dirty_usage::{clear_dirty_usage_buckets_for_tests, dirty_usage_buckets_for_tests};

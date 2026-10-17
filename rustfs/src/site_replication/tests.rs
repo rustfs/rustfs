@@ -22,10 +22,8 @@ use super::*;
 
 use super::identity::site_identity_key;
 use crate::storage_api::site_replication::merge_incoming_replication_config;
-use crate::storage_api::site_replication::s3::{
-    ExpirationStatus, LifecycleExpiration, Timestamp, Transition, TransitionStorageClass,
-};
-use crate::storage_api::site_replication::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
+use crate::storage_api::site_replication::s3::{PersistedLifecycleExpiration, PersistedTransition};
+use crate::storage_api::site_replication::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, format_lifecycle_date};
 use rustfs_madmin::{BucketBandwidth, SiteReplicationInfo};
 use serial_test::serial;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2273,7 +2271,7 @@ fn test_lifecycle_expiry_statement_matrix() {
     // Present with expiry rules and the axis: subset + axis travel.
     let expiry_axis = created + time::Duration::seconds(50);
     let mut config = lc_config(vec![lc_rule("e1", Some(7), None)]);
-    config.expiry_updated_at = Some(Timestamp::from(expiry_axis));
+    config.expiry_updated_at = Some(format_lifecycle_date(expiry_axis).expect("format expiry axis"));
     meta.lifecycle_config_xml = serialize(&config).expect("serialize config");
     let (subset, axis) = lifecycle_expiry_statement(&meta).expect("expiry config is a statement");
     assert!(subset.is_some());
@@ -2287,7 +2285,7 @@ fn test_lifecycle_expiry_statement_matrix() {
     // Transition-only WITH an axis: expiry rules were properly removed —
     // the delete travels at that axis.
     let mut transition_only = lc_config(vec![lc_rule("t1", None, Some(30))]);
-    transition_only.expiry_updated_at = Some(Timestamp::from(expiry_axis));
+    transition_only.expiry_updated_at = Some(format_lifecycle_date(expiry_axis).expect("format expiry axis"));
     meta.lifecycle_config_xml = serialize(&transition_only).expect("serialize config");
     let (subset, axis) = lifecycle_expiry_statement(&meta).expect("removed expiry state is a statement");
     assert!(subset.is_none());
@@ -3246,19 +3244,19 @@ fn test_merge_incoming_replication_config_returns_none_when_nothing_remains() {
     );
 }
 
-fn lc_rule(id: &str, expiry_days: Option<i32>, transition_days: Option<i32>) -> LifecycleRule {
-    LifecycleRule {
+fn lc_rule(id: &str, expiry_days: Option<i32>, transition_days: Option<i32>) -> PersistedLifecycleRule {
+    PersistedLifecycleRule {
         id: Some(id.to_string()),
-        status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+        status: "Enabled".to_owned(),
         prefix: Some(String::new()),
-        expiration: expiry_days.map(|days| LifecycleExpiration {
+        expiration: expiry_days.map(|days| PersistedLifecycleExpiration {
             days: Some(days),
             ..Default::default()
         }),
         transitions: transition_days.map(|days| {
-            vec![Transition {
+            vec![PersistedTransition {
                 days: Some(days),
-                storage_class: Some(TransitionStorageClass::from_static(TransitionStorageClass::GLACIER)),
+                storage_class: Some("GLACIER".to_owned()),
                 date: None,
             }]
         }),
@@ -3270,14 +3268,14 @@ fn lc_rule(id: &str, expiry_days: Option<i32>, transition_days: Option<i32>) -> 
     }
 }
 
-fn lc_config(rules: Vec<LifecycleRule>) -> BucketLifecycleConfiguration {
-    BucketLifecycleConfiguration {
+fn lc_config(rules: Vec<PersistedLifecycleRule>) -> PersistedLifecycleConfiguration {
+    PersistedLifecycleConfiguration {
         rules,
         expiry_updated_at: None,
     }
 }
 
-fn rule_ids(config: &BucketLifecycleConfiguration) -> Vec<&str> {
+fn rule_ids(config: &PersistedLifecycleConfiguration) -> Vec<&str> {
     config.rules.iter().filter_map(|rule| rule.id.as_deref()).collect()
 }
 
@@ -3290,7 +3288,7 @@ fn test_lifecycle_expiry_subset_xml_strips_transitions() {
         .expect("serialize full config");
 
     let subset = lifecycle_expiry_subset_xml(&full).expect("expiry subset should remain");
-    let parsed: BucketLifecycleConfiguration = deserialize(&subset).expect("subset should parse");
+    let parsed: PersistedLifecycleConfiguration = deserialize(&subset).expect("subset should parse");
     assert_eq!(rule_ids(&parsed), vec!["mixed"]);
     assert!(parsed.rules[0].transitions.is_none(), "transition side must not travel");
 

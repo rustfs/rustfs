@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::storage_api::site_replication::parse_lifecycle_date;
 
 pub(crate) const SITE_REPLICATION_PEER_BUCKET_OPS_PATH: &str = "/rustfs/admin/v3/site-replication/peer/bucket-ops";
 
@@ -1478,13 +1479,13 @@ pub(crate) async fn site_replication_targets_online(bucket: &str, replication_co
 /// excluded: MinIO's sender never emits them (`CloneNonTransition` drops
 /// both), so treating them as traveling state would let a MinIO peer's
 /// broadcast delete this site's del-marker-only rules.
-pub(crate) fn lifecycle_rule_has_expiry(rule: &LifecycleRule) -> bool {
+pub(crate) fn lifecycle_rule_has_expiry(rule: &PersistedLifecycleRule) -> bool {
     rule.expiration.is_some() || rule.noncurrent_version_expiration.is_some()
 }
 
 /// Remove the fields that never travel between sites (MinIO
 /// `CloneNonTransition` parity).
-pub(crate) fn strip_site_local_lifecycle_fields(rule: &mut LifecycleRule) {
+pub(crate) fn strip_site_local_lifecycle_fields(rule: &mut PersistedLifecycleRule) {
     rule.transitions = None;
     rule.noncurrent_version_transitions = None;
     rule.abort_incomplete_multipart_upload = None;
@@ -1503,7 +1504,7 @@ pub(crate) fn lifecycle_expiry_subset_xml(raw: &[u8]) -> Option<Vec<u8>> {
     if raw.is_empty() {
         return None;
     }
-    let config: BucketLifecycleConfiguration = match deserialize(raw) {
+    let config: PersistedLifecycleConfiguration = match deserialize(raw) {
         Ok(config) => config,
         Err(err) => {
             warn!("failed to parse local lifecycle config for expiry replication; forwarding unfiltered: {err}");
@@ -1511,7 +1512,7 @@ pub(crate) fn lifecycle_expiry_subset_xml(raw: &[u8]) -> Option<Vec<u8>> {
         }
     };
     let expiry_updated_at = config.expiry_updated_at.clone();
-    let rules: Vec<LifecycleRule> = config
+    let rules: Vec<PersistedLifecycleRule> = config
         .rules
         .into_iter()
         .filter_map(|mut rule| {
@@ -1522,7 +1523,7 @@ pub(crate) fn lifecycle_expiry_subset_xml(raw: &[u8]) -> Option<Vec<u8>> {
     if rules.is_empty() {
         return None;
     }
-    let subset = BucketLifecycleConfiguration {
+    let subset = PersistedLifecycleConfiguration {
         rules,
         expiry_updated_at,
     };
@@ -1543,10 +1544,16 @@ pub(crate) fn lifecycle_expiry_updated_at(raw: &[u8]) -> Option<OffsetDateTime> 
     if raw.is_empty() {
         return None;
     }
-    deserialize::<BucketLifecycleConfiguration>(raw)
+    deserialize::<PersistedLifecycleConfiguration>(raw)
         .ok()
         .and_then(|config| config.expiry_updated_at)
-        .map(OffsetDateTime::from)
+        .and_then(|axis| match parse_lifecycle_date(&axis) {
+            Ok(axis) => Some(axis),
+            Err(error) => {
+                warn!("failed to parse lifecycle expiry timestamp: {error}");
+                None
+            }
+        })
 }
 
 /// The ILM expiry statement this site contributes to its SRInfo bucket entry

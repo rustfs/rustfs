@@ -25,7 +25,7 @@ use crate::auth::{
     parse_presigned_multipart_max_total_object_size, parse_presigned_put_max_content_length,
     reject_unsigned_amz_headers_on_sigv4_request,
 };
-use crate::error::ApiError;
+use crate::error::{ApiError, normalize_put_read_quorum_error};
 use crate::license::license_check;
 use crate::shared_types::RemoteAddr;
 use crate::storage::request_context::RequestContext;
@@ -426,6 +426,11 @@ type ObjectGenerationTestHook = (String, tokio::sync::oneshot::Sender<()>, tokio
 
 #[cfg(test)]
 static OBJECT_GENERATION_TEST_HOOK: OnceLock<std::sync::Mutex<Option<ObjectGenerationTestHook>>> = OnceLock::new();
+
+#[cfg(test)]
+tokio::task_local! {
+    static PUT_GENERATION_READ_QUORUM_FAILURE: ();
+}
 
 #[cfg(test)]
 fn install_object_generation_test_hook(
@@ -1793,11 +1798,7 @@ fn table_catalog_store_for_data_plane<T>(
 }
 
 fn table_publication_guard_error(err: crate::table_catalog::TableCatalogStoreError) -> S3Error {
-    let code = match &err {
-        crate::table_catalog::TableCatalogStoreError::Unavailable(_) => S3ErrorCode::ServiceUnavailable,
-        _ => S3ErrorCode::InternalError,
-    };
-    S3Error::with_message(code, format!("failed to acquire table publication guard: {err}"))
+    S3Error::from(ApiError::from(err))
 }
 
 async fn retain_table_data_plane_publication_guard<T>(
@@ -1933,8 +1934,8 @@ fn table_list_cursor_key<T>(req: &S3Request<T>) -> S3Result<[u8; 32]> {
 }
 
 fn table_list_catalog_error(err: crate::table_catalog::TableCatalogStoreError) -> S3Error {
-    if matches!(err, crate::table_catalog::TableCatalogStoreError::Unavailable(_)) {
-        S3Error::from(ApiError::service_unavailable())
+    if err.is_unavailable() {
+        S3Error::from(ApiError::from(err))
     } else {
         S3Error::from(ApiError::access_denied())
     }
@@ -2075,11 +2076,7 @@ async fn table_data_plane_resource_for_request<T>(
             error = %err,
             "failed to resolve table data-plane resource"
         );
-        if matches!(err, crate::table_catalog::TableCatalogStoreError::Unavailable(_)) {
-            S3Error::from(ApiError::service_unavailable())
-        } else {
-            s3_error!(AccessDenied, "Access Denied")
-        }
+        table_list_catalog_error(err)
     })?;
     let resource = require_owned_reserved_table_object(object, resource)?;
     let bucket_fence_key = (bucket.to_string(), crate::table_catalog::default_table_bucket_publication_lock_path());
@@ -3344,40 +3341,50 @@ impl S3Access for FS {
     /// This method returns `Ok(())` by default.
     async fn put_object(&self, req: &mut S3Request<PutObjectInput>) -> S3Result<()> {
         crate::hp_guard!("S3Access::put_object");
-        let req_info = ext_req_info_mut(&mut req.extensions)?;
-        req_info.bucket = Some(req.input.bucket.clone());
-        req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
+        async {
+            let req_info = ext_req_info_mut(&mut req.extensions)?;
+            req_info.bucket = Some(req.input.bucket.clone());
+            req_info.object = Some(req.input.key.clone());
+            req_info.version_id = req.input.version_id.clone();
 
-        if has_write_offset_bytes_header(&req.headers) {
-            return Err(S3Error::with_message(
-                S3ErrorCode::NotImplemented,
-                ApiError::error_code_to_message(&S3ErrorCode::NotImplemented),
-            ));
+            if has_write_offset_bytes_header(&req.headers) {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::NotImplemented,
+                    ApiError::error_code_to_message(&S3ErrorCode::NotImplemented),
+                ));
+            }
+
+            let bucket = req.input.bucket.clone();
+            // Snapshot before authorization, but preserve AccessDenied precedence
+            // by exposing any bucket-state error only after authorization succeeds.
+            let bucket_generation = load_bucket_generation(self, req, &bucket).await;
+            #[cfg(test)]
+            let bucket_generation = if PUT_GENERATION_READ_QUORUM_FAILURE.try_with(|_| ()).is_ok() {
+                Err(ApiError::from(StorageError::ErasureReadQuorum).into())
+            } else {
+                bucket_generation
+            };
+            let requested_retain_until = req.input.object_lock_retain_until_date.clone();
+            set_requested_object_lock_retain_until(req, requested_retain_until.as_ref());
+            authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
+            req.extensions.insert(bucket_generation?);
+
+            if req.method != http::Method::POST {
+                authorize_replication_only_put_headers(req).await?;
+            }
+
+            if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
+                authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
+            }
+
+            if retention_write_requested(req.input.object_lock_mode.as_ref(), req.input.object_lock_retain_until_date.as_ref()) {
+                authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
+            }
+
+            Ok(())
         }
-
-        let bucket = req.input.bucket.clone();
-        // Snapshot before authorization, but preserve AccessDenied precedence
-        // by exposing any bucket-state error only after authorization succeeds.
-        let bucket_generation = load_bucket_generation(self, req, &bucket).await;
-        let requested_retain_until = req.input.object_lock_retain_until_date.clone();
-        set_requested_object_lock_retain_until(req, requested_retain_until.as_ref());
-        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
-        req.extensions.insert(bucket_generation?);
-
-        if req.method != http::Method::POST {
-            authorize_replication_only_put_headers(req).await?;
-        }
-
-        if legal_hold_write_requested(req.input.object_lock_legal_hold_status.as_ref()) {
-            authorize_request(req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
-        }
-
-        if retention_write_requested(req.input.object_lock_mode.as_ref(), req.input.object_lock_retain_until_date.as_ref()) {
-            authorize_request(req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
-        }
-
-        Ok(())
+        .await
+        .map_err(normalize_put_read_quorum_error)
     }
 
     /// Checks whether the PutObjectAcl request has accesses to the resources.
@@ -3861,7 +3868,7 @@ mod tests {
             "",
         ] {
             let error = TableCatalogStoreError::Unavailable(message.to_string());
-            let expected_message = format!("failed to acquire table publication guard: {error}");
+            let expected_message = ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable);
             let err = table_publication_guard_error(error);
             assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable, "{message}");
             assert_eq!(
@@ -3869,6 +3876,8 @@ mod tests {
                 Some(http::StatusCode::SERVICE_UNAVAILABLE)
             );
             assert_eq!(err.message(), Some(expected_message.as_str()));
+            let response = err.to_http_response().expect("serialize catalog failure");
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
         }
     }
 
@@ -3887,7 +3896,7 @@ mod tests {
             TableCatalogStoreError::AlreadyExists(message.clone()),
             TableCatalogStoreError::Conflict(message),
         ] {
-            let expected_message = format!("failed to acquire table publication guard: {error}");
+            let expected_message = ApiError::error_code_to_message(&S3ErrorCode::InternalError);
             let err = table_publication_guard_error(error);
             assert_eq!(err.code(), &S3ErrorCode::InternalError);
             assert_eq!(
@@ -3895,13 +3904,16 @@ mod tests {
                 Some(http::StatusCode::INTERNAL_SERVER_ERROR)
             );
             assert_eq!(err.message(), Some(expected_message.as_str()));
+            let response = err.to_http_response().expect("serialize catalog failure");
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
         }
     }
 
     #[tokio::test]
     #[serial]
-    async fn table_publication_guard_timeout_blocks_put_and_multipart_authorization() {
+    async fn table_publication_guard_timeout_blocks_put_delete_and_multipart_authorization() {
         use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
+        use http_body_util::BodyExt as _;
         use std::time::Duration;
 
         let store = crate::app::gating_test_env::shared_gating_ecstore().await;
@@ -3914,7 +3926,7 @@ mod tests {
             .await
             .expect("test bucket should be created");
         let policy_json = format!(
-            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:PutObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:PutObject","s3:DeleteObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
         );
         let mut metadata = (*crate::storage::get_bucket_metadata(&bucket)
             .await
@@ -3950,6 +3962,16 @@ mod tests {
                 .expect("multipart input should build"),
             Method::POST,
         );
+        let mut delete_req = build_request(
+            DeleteObjectInput::builder()
+                .bucket(bucket.clone())
+                .key("object".to_string())
+                .build()
+                .expect("DELETE input should build"),
+            Method::DELETE,
+        );
+        ensure_req_info(&mut delete_req);
+        delete_req.extensions.insert(fs.server_ctx().clone());
         ensure_req_info(&mut put_req);
         ensure_req_info(&mut multipart_req);
         put_req.extensions.insert(fs.server_ctx().clone());
@@ -3963,6 +3985,12 @@ mod tests {
                     .expect_err("PUT must wait for the publication writer"),
             ),
             (
+                "DeleteObject",
+                fs.delete_object(&mut delete_req)
+                    .await
+                    .expect_err("DELETE must wait for the publication writer"),
+            ),
+            (
                 "CreateMultipartUpload",
                 fs.create_multipart_upload(&mut multipart_req)
                     .await
@@ -3970,8 +3998,24 @@ mod tests {
             ),
         ] {
             assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable, "{operation}: {err}");
+            let source = err.source().expect("retain the typed publication lock failure");
+            let storage = source
+                .downcast_ref::<crate::storage_api::error::StorageError>()
+                .expect("use the canonical storage error boundary");
+            assert!(matches!(
+                storage,
+                crate::storage_api::error::StorageError::Lock(rustfs_lock::LockError::Timeout { .. })
+            ));
+            let response = err.to_http_response().expect("serialize publication failure");
+            assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
+            let body = response.into_body().collect().await.expect("read error XML").to_bytes();
+            let body = String::from_utf8(body.to_vec()).expect("S3 XML is UTF-8");
+            assert!(body.contains("<Code>ServiceUnavailable</Code>"));
+            assert!(!body.contains(&bucket));
+            assert!(!body.contains(&lock_object));
         }
-        for extensions in [&put_req.extensions, &multipart_req.extensions] {
+        for extensions in [&put_req.extensions, &delete_req.extensions, &multipart_req.extensions] {
             assert!(extensions.get::<TableDataPlanePublicationGuards>().is_none());
         }
 
@@ -3983,7 +4027,10 @@ mod tests {
             fs.create_multipart_upload(&mut multipart_req)
                 .await
                 .expect("multipart initialization may retry after publication finishes");
-            for extensions in [&put_req.extensions, &multipart_req.extensions] {
+            fs.delete_object(&mut delete_req)
+                .await
+                .expect("DELETE may retry after publication finishes");
+            for extensions in [&put_req.extensions, &delete_req.extensions, &multipart_req.extensions] {
                 let retained = extensions
                     .get::<TableDataPlanePublicationGuards>()
                     .expect("successful admission retains the guard");
@@ -3994,6 +4041,7 @@ mod tests {
         }
         drop(put_req);
         drop(multipart_req);
+        drop(delete_req);
         lock.get_write_lock(Duration::from_secs(1))
             .await
             .expect("dropping the request must release its publication guard");
@@ -5283,6 +5331,60 @@ mod tests {
             sys.remove(&bucket);
             sys.set_module_enabled(enabled_before);
         });
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn put_read_quorum_access_keeps_authorization_precedence() {
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let server_ctx = ServerContextSlot::new();
+        assert!(server_ctx.install(Arc::new(AppContext::new(Arc::clone(&store), Arc::new(UnreadyIam), Arc::new(TestKms)))));
+        let fs = FS::with_server_ctx(server_ctx);
+
+        for effect in ["Allow", "Deny"] {
+            let bucket = format!("put-quorum-access-{}", uuid::Uuid::new_v4());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("authorization precedence bucket must be created");
+            let policy_json = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"{effect}","Principal":{{"AWS":"*"}},"Action":["s3:PutObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+            );
+            let mut metadata = (*crate::storage::get_bucket_metadata(&bucket)
+                .await
+                .expect("test bucket metadata must be cached"))
+            .clone();
+            metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("test policy must parse"));
+            metadata.policy_config_json = policy_json.into_bytes();
+            crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
+                .await
+                .expect("test policy must be installed");
+
+            let input = PutObjectInput::builder()
+                .bucket(bucket)
+                .key("object".into())
+                .build()
+                .expect("access probe input must build");
+            let mut req = build_request(input, Method::PUT);
+            ensure_req_info(&mut req);
+            req.extensions.insert(fs.server_ctx().clone());
+            let err = super::PUT_GENERATION_READ_QUORUM_FAILURE
+                .scope((), fs.put_object(&mut req))
+                .await
+                .expect_err("a generation failure must never admit a write");
+            if effect == "Allow" {
+                assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+                assert_eq!(err.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
+                assert!(matches!(
+                    err.source().and_then(|source| source.downcast_ref::<StorageError>()),
+                    Some(StorageError::ErasureReadQuorum)
+                ));
+            } else {
+                assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+                assert_eq!(err.status_code(), Some(http::StatusCode::FORBIDDEN));
+            }
+            assert!(req.extensions.get::<BucketGenerationGuard>().is_none());
+        }
     }
 
     #[tokio::test]

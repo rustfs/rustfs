@@ -3945,7 +3945,15 @@ async fn test_bucket_replication_version_purge_of_non_inline_object_releases_sou
         (sse_key, sse_put.version_id().ok_or("SSE PUT omitted version ID")?.to_string()),
         (large_key, large_put.version_id().ok_or("large PUT omitted version ID")?.to_string()),
     ];
-    assert_replication_converged(&source_client, &source_bucket, &target_client, &target_bucket).await?;
+    // Managed-SSE listings may omit ETags. Check the replicated version's body
+    // before deleting it rather than comparing keyless listing fingerprints.
+    for (key, version_id) in &purged {
+        let source_body = get_version_body(&source_client, &source_bucket, key, version_id).await?;
+        let expected_sha256: [u8; 32] = Sha256::digest(&source_body).into();
+        wait_for_replicated_sha256(&target_client, &target_bucket, key, expected_sha256).await?;
+        let target_body = get_version_body(&target_client, &target_bucket, key, version_id).await?;
+        assert_eq!(target_body, source_body, "replicated version body differs for {key}/{version_id}");
+    }
 
     for (key, version_id) in &purged {
         source_client
@@ -3956,10 +3964,6 @@ async fn test_bucket_replication_version_purge_of_non_inline_object_releases_sou
             .send()
             .await?;
     }
-    assert_replication_converged(&source_client, &source_bucket, &target_client, &target_bucket).await?;
-    let target_state = list_replication_state(&target_client, &target_bucket).await?;
-    assert!(target_state.is_empty(), "target retained an explicitly purged version: {target_state:?}");
-
     // The purge state is applied on the source asynchronously after the target
     // acknowledges the delete; only then does the retained version go away and
     // the bucket become deletable. A listing that is empty while DeleteBucket
@@ -3983,6 +3987,9 @@ async fn test_bucket_replication_version_purge_of_non_inline_object_releases_sou
             Err(err) => return Err(err.into()),
         }
     }
+
+    let target_state = list_replication_state(&target_client, &target_bucket).await?;
+    assert!(target_state.is_empty(), "target retained an explicitly purged version: {target_state:?}");
 
     Ok(())
 }

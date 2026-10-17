@@ -180,6 +180,8 @@ pub(crate) mod server {
     }
 
     pub(crate) mod http {
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::ecstore_disk::{DiskAPI, DiskOption, new_disk};
         pub(crate) use crate::storage::storage_api::{
             ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, tonic_boot_epoch_challenge,
             tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason, verify_tonic_rpc_signature_with_bootstrap,
@@ -308,6 +310,9 @@ pub(crate) mod connect {
 pub(crate) mod site_replication {
     pub(crate) use super::storage_contracts::{BucketOperations, BucketOptions};
     pub(crate) use crate::storage::storage_api::ecstore_bucket::bucket_target_sys::BucketTargetSys;
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::lifecycle::lifecycle::{
+        format_lifecycle_date, parse_lifecycle_date,
+    };
     pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::{
         BUCKET_REPLICATION_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BucketMetadata,
     };
@@ -346,12 +351,13 @@ pub(crate) mod site_replication {
     pub(crate) mod s3 {
         pub(crate) use rustfs_gateway_types::dto::Status;
         pub(crate) use rustfs_gateway_types::persistence::{
-            PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
-            PersistedReplicationRule, PersistedReplicationStatus, PersistedSourceSelectionCriteria,
+            PersistedLifecycleConfiguration, PersistedLifecycleRule, PersistedOptionalReplicationStatus,
+            PersistedReplicationConfiguration, PersistedReplicationDestination, PersistedReplicationRule,
+            PersistedReplicationStatus, PersistedSourceSelectionCriteria,
         };
-        pub(crate) use s3s::dto::{BucketLifecycleConfiguration, BucketVersioningStatus, LifecycleRule, VersioningConfiguration};
         #[cfg(test)]
-        pub(crate) use s3s::dto::{ExpirationStatus, LifecycleExpiration, Timestamp, Transition, TransitionStorageClass};
+        pub(crate) use rustfs_gateway_types::persistence::{PersistedLifecycleExpiration, PersistedTransition};
+        pub(crate) use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
         pub(crate) use s3s::{Body, S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
     }
 }
@@ -466,6 +472,7 @@ pub(crate) mod workload {
 }
 
 pub(crate) mod table {
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::utils::check_valid_bucket_name_strict;
     pub(crate) use crate::storage::storage_api::ecstore_object::{WriteCommitGuard, WriteCompletion};
     pub(crate) mod contract {
         pub(crate) mod http {

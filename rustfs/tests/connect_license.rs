@@ -126,8 +126,8 @@ fn tamper_foreign_scope_and_expiry_are_structured_and_preserve_installed_state()
     let payload = URL_SAFE_NO_PAD
         .decode_to_vec(envelope["payload"].as_str().expect("payload").as_bytes())
         .expect("decode payload");
-    let mut claims: Value = serde_json::from_slice(&payload).expect("decode claims");
-    claims["deployment"] = Value::String(OTHER_DEPLOYMENT.to_owned());
+    let mut claims: LicenseClaims = serde_json::from_slice(&payload).expect("decode claims");
+    claims.deployment = OTHER_DEPLOYMENT.to_owned();
     envelope["payload"] = Value::String(URL_SAFE_NO_PAD.encode_to_string(serde_json::to_vec(&claims).unwrap()));
     let tampered = write_artifact(temporary.path(), "tampered.json", &serde_json::to_string(&envelope).unwrap());
     let error = apply_license_artifact(&tampered, &state, &valid).expect_err("tampered artifact must fail");

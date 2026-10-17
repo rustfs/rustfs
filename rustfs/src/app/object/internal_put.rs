@@ -37,7 +37,7 @@ use crate::app::storage_api::object_usecase::sse::{
 use crate::capacity::record_capacity_write;
 use crate::runtime_sources::NotifyInterface;
 use crate::table_catalog::{
-    EcStoreTableCatalogObjectBackend, TableCatalogLockGuard, TableCatalogObjectBackend, TableCatalogStoreError,
+    EcStoreTableCatalogObjectBackend, TableCatalogLockGuard, TableCatalogObjectBackend,
     default_table_bucket_publication_lock_path,
 };
 use http::HeaderName;
@@ -250,13 +250,7 @@ impl DefaultObjectUsecase {
         let guard = backend
             .acquire_read_lock(bucket, &default_table_bucket_publication_lock_path())
             .await
-            .map_err(|err: TableCatalogStoreError| {
-                let code = match err {
-                    TableCatalogStoreError::Unavailable(_) => S3ErrorCode::ServiceUnavailable,
-                    _ => S3ErrorCode::InternalError,
-                };
-                api_error_from_s3(S3Error::with_message(code, "failed to acquire table publication guard"))
-            })?;
+            .map_err(ApiError::from)?;
         Ok(Some(guard))
     }
 

@@ -389,9 +389,15 @@ async fn successful_result_has_signed_bounded_private_offline_export() {
 
     let mut archive = zip::ZipArchive::new(Cursor::new(&export.archive_bytes)).expect("three-file archive");
     assert_eq!(archive.len(), 3);
-    assert_eq!(archive.by_index(0).expect("envelope").name(), "envelope.json");
-    assert_eq!(archive.by_index(1).expect("signature").name(), "envelope.sig");
-    assert_eq!(archive.by_index(2).expect("result").name(), "result.json");
+    assert_eq!(
+        archive.by_index(0).expect("envelope").name().expect("archive entry name"),
+        "envelope.json"
+    );
+    assert_eq!(
+        archive.by_index(1).expect("signature").name().expect("archive entry name"),
+        "envelope.sig"
+    );
+    assert_eq!(archive.by_index(2).expect("result").name().expect("archive entry name"), "result.json");
 
     let envelope: serde_json::Value = serde_json::from_slice(&export.envelope_json).expect("envelope JSON");
     assert_eq!(envelope["toolId"], "performance.drive");
@@ -535,7 +541,14 @@ fn production_cli_measures_and_signs_exact_binary_provenance() {
     let archive_bytes = fs::read(&output).expect("saved archive");
     let mut archive = zip::ZipArchive::new(Cursor::new(archive_bytes.as_slice())).expect("signed archive");
     let names = (0..archive.len())
-        .map(|index| archive.by_index(index).expect("archive member").name().to_owned())
+        .map(|index| {
+            archive
+                .by_index(index)
+                .expect("archive member")
+                .name()
+                .expect("archive entry name")
+                .into_owned()
+        })
         .collect::<Vec<_>>();
     assert_eq!(names, ["envelope.json", "envelope.sig", "result.json"]);
     let envelope_bytes = read_archive_member(&mut archive, "envelope.json");

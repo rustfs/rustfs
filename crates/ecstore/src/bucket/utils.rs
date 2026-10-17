@@ -16,7 +16,8 @@ use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result, StorageError};
 use regex::Regex;
 use rustfs_gateway_types::persistence::{
-    PersistedReplicationConfiguration, PersistenceCodecError, parse_replication, serialize_replication,
+    PersistedLifecycleConfiguration, PersistedReplicationConfiguration, PersistenceCodecError, parse_lifecycle_legacy_dates,
+    parse_replication, serialize_lifecycle_legacy_dates, serialize_replication,
 };
 use rustfs_utils::path::SLASH_SEPARATOR;
 use s3s::xml;
@@ -127,6 +128,16 @@ impl BucketConfigXml for PersistedReplicationConfiguration {
     }
 }
 
+impl BucketConfigXml for PersistedLifecycleConfiguration {
+    fn decode_config_xml(input: &[u8]) -> std::result::Result<Self, BucketConfigXmlError> {
+        Ok(parse_lifecycle_legacy_dates(input)?)
+    }
+
+    fn encode_config_xml(&self) -> std::result::Result<Vec<u8>, BucketConfigXmlError> {
+        Ok(serialize_lifecycle_legacy_dates(self)?)
+    }
+}
+
 // RUSTFS_COMPAT_TODO(s3gate-metadata-xml): the s3s codec reads persisted XML during migration. Remove after every supported writer uses the gateway codec and every retained metadata object and backup archive is verified or rewritten.
 macro_rules! legacy_s3s_bucket_config_xml {
     ($($ty:ty),+ $(,)?) => {$(
@@ -152,7 +163,6 @@ macro_rules! legacy_s3s_bucket_config_xml {
 
 legacy_s3s_bucket_config_xml!(
     s3s::dto::AccelerateConfiguration,
-    s3s::dto::BucketLifecycleConfiguration,
     s3s::dto::BucketLoggingStatus,
     s3s::dto::CORSConfiguration,
     s3s::dto::NotificationConfiguration,

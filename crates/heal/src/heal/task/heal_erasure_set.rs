@@ -490,6 +490,16 @@ impl HealTask {
                     return Err(err);
                 }
             }
+            // Adopt delete proofs only after their publication bucket exists.
+            if let Some(result) = self
+                .await_with_control(
+                    self.storage
+                        .recover_delete_transactions(bucket, None, None, &bucket_heal_opts),
+                )
+                .await?
+            {
+                self.record_result_item(result).await;
+            }
         }
 
         // Create erasure set healer with resume support

@@ -3959,39 +3959,63 @@ fn scanner_concurrency_limit_handles_no_available_work() {
 
 #[test]
 #[serial]
-fn scanner_concurrency_limit_yields_to_foreground_reads() {
+fn scanner_concurrency_limit_is_stable_across_foreground_read_transitions() {
     crate::reset_foreground_read_activity_for_test();
     crate::workload_admission::clear_scanner_workload_admission_snapshot_provider_for_test();
-    crate::set_foreground_read_activity(8);
-    assert_eq!(scanner_concurrency_limit(0, 4), 1);
-    assert_eq!(scanner_concurrency_limit(3, 4), 1);
+    for foreground_activity in [0, 1, 8, 0] {
+        crate::set_foreground_read_activity(foreground_activity);
+        assert_eq!(scanner_concurrency_limit(0, 4), 4);
+        assert_eq!(scanner_concurrency_limit(3, 4), 3);
+        assert_eq!(scanner_concurrency_limit(1, 4), 1);
+        assert_eq!(scanner_concurrency_limit(8, 0), 0);
+        assert_eq!(scanner_budgeted_concurrency_limit(scanner_concurrency_limit(3, 4), true), 1);
+        assert_eq!(scanner_budgeted_concurrency_limit(scanner_concurrency_limit(3, 4), false), 3);
+    }
     crate::reset_foreground_read_activity_for_test();
 }
 
 #[test]
 #[serial]
-fn scanner_concurrency_limit_yields_to_shared_foreground_pressure() {
+fn scanner_concurrency_limit_is_stable_across_shared_foreground_pressure() {
     crate::reset_foreground_read_activity_for_test();
     crate::workload_admission::clear_scanner_workload_admission_snapshot_provider_for_test();
-    install_scanner_workload_provider(WorkloadAdmissionRegistrySnapshot::new(vec![
-        WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundWrite, AdmissionState::Open).with_counts(Some(2), None, Some(16)),
-    ]));
-
-    assert_eq!(scanner_concurrency_limit(0, 4), 1);
-    assert_eq!(scanner_concurrency_limit(3, 4), 1);
-
+    for (state, active) in [
+        (AdmissionState::Open, Some(0)),
+        (AdmissionState::Open, Some(2)),
+        (AdmissionState::Saturated, None),
+        (AdmissionState::Open, Some(0)),
+    ] {
+        install_scanner_workload_provider(WorkloadAdmissionRegistrySnapshot::new(vec![
+            WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundWrite, state).with_counts(active, None, Some(16)),
+        ]));
+        assert_eq!(scanner_concurrency_limit(0, 4), 4);
+        assert_eq!(scanner_concurrency_limit(3, 4), 3);
+    }
     crate::workload_admission::clear_scanner_workload_admission_snapshot_provider_for_test();
 }
 
 #[test]
 #[serial]
-fn scanner_concurrency_limit_yields_to_streaming_reads() {
+fn scanner_dispatch_limits_preserve_configured_caps_during_streaming_reads() {
     crate::reset_foreground_read_activity_for_test();
     crate::workload_admission::clear_scanner_workload_admission_snapshot_provider_for_test();
-    let _guard = crate::ForegroundReadGuard::new();
-
-    assert_eq!(scanner_concurrency_limit(0, 4), 1);
-    assert_eq!(scanner_concurrency_limit(3, 4), 1);
+    temp_env::with_vars(
+        [
+            (ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, Some("3")),
+            (ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, Some("2")),
+        ],
+        || {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+            for streaming in [false, true, false] {
+                let _guard = streaming.then(crate::ForegroundReadGuard::new);
+                assert_eq!(scanner_max_concurrent_set_scans(4), 3);
+                assert_eq!(scanner_max_concurrent_disk_scans(4), 2);
+                assert_eq!(scanner_budgeted_concurrency_limit(scanner_max_concurrent_set_scans(4), true), 1);
+                assert_eq!(scanner_budgeted_concurrency_limit(scanner_max_concurrent_disk_scans(4), true), 1);
+            }
+        },
+    );
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
 }
 
 #[test]
@@ -4449,4 +4473,181 @@ fn apply_bucket_result_to_cache_rejects_a_different_tier_generation() {
     assert!(!applied);
     assert_eq!(cache.find("bucket").map(|entry| entry.size), Some(3));
     assert!(cache.info.last_update.is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn replication_maintenance_refreshes_compacted_stats_across_cycles_and_retries() {
+    use crate::storage_api::owner::ObjectOperations as _;
+    for same_cycle in [false, true] {
+        let (_temp_dir, store) = setup_local_scanner_store(1, 1).await;
+        clear_dirty_usage_buckets_for_tests();
+        let bucket = "status-bucket";
+        let object = "cold/object";
+        let set = store.pools[0].disk_set[0].clone();
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create status bucket");
+        let mut reader = ScannerPutObjReader::from_vec(b"initial".to_vec());
+        set.put_object(
+            bucket,
+            object,
+            &mut reader,
+            &ScannerObjectOptions {
+                versioned: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("persist initial object");
+        wait_for_namespace_commit_tails(store.as_ref()).await;
+
+        let ctx = CancellationToken::new();
+        let (updates, mut receiver) = mpsc::channel(1);
+        let initial = nsscanner_with_storage_status_scoped(
+            store.as_ref(),
+            ScannerCycleRequest {
+                budget: ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default()),
+                ctx,
+                updates,
+                want_cycle: 1,
+                leader_epoch: 11,
+                scan_mode: HealScanMode::Normal,
+                scan_scope: ScannerBucketScanScope::default(),
+                persisted_usage_baseline: None,
+                observed_usage_candidate: None,
+                requires_full_scan: true,
+                service_cohort: None,
+                resolved_scope_observer: None,
+            },
+        )
+        .await
+        .expect("initial full usage scan");
+        assert_eq!(initial.status, ScannerCycleStatus::Complete);
+        let baseline = receiver.recv().await.expect("initial usage publication");
+        assert!(baseline.buckets_usage[bucket].replication_info.is_empty());
+
+        let cache_name = path_join_buf(&[bucket, DATA_USAGE_CACHE_NAME]);
+        let mut cache = DataUsageCache::default();
+        cache
+            .load(set.clone(), &cache_name)
+            .await
+            .expect("load complete bucket cache");
+        assert!(cache.info.snapshot_complete);
+        // Keep an accounting context with no remote work in this local fixture.
+        let replication: ReplicationConfig = serde_json::from_value(serde_json::json!({
+            "config": {
+                "role": "",
+                "rules": [{
+                    "destination": { "bucket": "arn:test" },
+                    "id": "status",
+                    "prefix": "",
+                    "priority": 1,
+                    "status": "Enabled"
+                }]
+            },
+            "remotes": crate::storage_api::EcstoreBucketTargets::default(),
+        }))
+        .expect("decode the local replication accounting fixture");
+        cache.info.replication = Some(Arc::new(replication));
+        // A complete compacted prefix is eligible for normal usage sampling.
+        let mut compacted = cache.checked_flatten(bucket).expect("complete cached usage");
+        compacted.children.clear();
+        compacted.compacted = true;
+        cache.cache.clear();
+        cache.replace(bucket, "", DataUsageEntry::default());
+        cache.replace("status-bucket/cold", bucket, compacted);
+        cache
+            .save(set.clone(), &cache_name)
+            .await
+            .expect("persist compacted prefix fixture");
+        let cycle = (2..18)
+            .find(|cycle| {
+                !rustfs_data_usage::hash_path("status-bucket/cold")
+                    .mod_(*cycle, crate::scanner_folder::data_usage_update_dir_cycles())
+            })
+            .expect("choose a cycle outside the compacted prefix sampling window");
+
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_REPLICATION_STATUS,
+            "arn:test=COMPLETED;".to_string(),
+        );
+        let updated = set
+            .put_object_metadata(
+                bucket,
+                object,
+                &ScannerObjectOptions {
+                    eval_metadata: Some(metadata),
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("persist replication-only metadata update");
+        assert_eq!(updated.replication_status.as_str(), "COMPLETED");
+        assert!(updated.version_id.is_some_and(|version| !version.is_nil()));
+        let persisted = set
+            .get_object_info(
+                bucket,
+                object,
+                &ScannerObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read back status writeback");
+        assert_eq!(persisted.replication_status.as_str(), "COMPLETED");
+        let namespace_generation = dirty_usage_generation();
+        record_status_class_mutation(
+            bucket,
+            object,
+            crate::segment_invalidation::SegmentInvalidationProducerIdentity::Replication,
+        );
+        assert_eq!(dirty_usage_generation(), namespace_generation);
+
+        let ctx = CancellationToken::new();
+        let (updates, mut receiver) = mpsc::channel(1);
+        let result = nsscanner_with_storage_status_scoped(
+            store.as_ref(),
+            ScannerCycleRequest {
+                budget: ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default()),
+                ctx,
+                updates,
+                want_cycle: if same_cycle { 1 } else { u64::from(cycle) },
+                leader_epoch: 11,
+                scan_mode: HealScanMode::Normal,
+                scan_scope: ScannerBucketScanScope::default(),
+                persisted_usage_baseline: None,
+                observed_usage_candidate: None,
+                requires_full_scan: true,
+                service_cohort: None,
+                resolved_scope_observer: None,
+            },
+        )
+        .await
+        .expect("normal scan must refresh the status bucket");
+        assert_eq!(result.status, ScannerCycleStatus::Complete);
+        let refreshed = receiver.recv().await.expect("refreshed usage publication");
+        assert_eq!(refreshed.buckets_usage[bucket].objects_count, 1);
+        assert_eq!(refreshed.buckets_usage[bucket].size, 7);
+        assert_eq!(
+            refreshed.buckets_usage[bucket]
+                .replication_info
+                .get("arn:test")
+                .map_or(0, |target| target.replicated_size),
+            7,
+            "a replication maintenance walk must refresh compacted statistics before publishing"
+        );
+        clear_dirty_usage_buckets_for_tests();
+    }
 }

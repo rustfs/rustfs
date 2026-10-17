@@ -21,7 +21,7 @@ use crate::{
     startup_iam::{IamBootstrapDisposition, publish_ready_for_iam_bootstrap},
     startup_runtime_sources,
     startup_services::StartupServiceRuntime,
-    startup_shutdown::run_startup_shutdown_sequence,
+    startup_shutdown::{StartupBackgroundTasks, run_startup_shutdown_sequence},
 };
 use rustfs_common::GlobalReadiness;
 use rustfs_object_capacity::capacity_manager::CapacityBackgroundTasks;
@@ -130,6 +130,8 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         readiness,
     } = lifecycle;
     let StartupServiceRuntime {
+        table_maintenance,
+        oidc_recovery,
         optional_runtimes,
         heartbeat,
         inventory,
@@ -162,10 +164,25 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         s3_shutdown_tx,
         console_shutdown_tx,
         optional_runtimes,
-        capacity_tasks,
+        StartupBackgroundTasks {
+            capacity: capacity_tasks,
+            table_maintenance,
+        },
         shutdown_token,
     )
     .await;
+    if let Some(recovery) = oidc_recovery
+        && let Err(error) = recovery.await
+    {
+        tracing::warn!(
+            event = EVENT_SERVER_SHUTDOWN_STATE,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            result = "oidc_discovery_recovery_join_failed",
+            error = %error,
+            "OIDC discovery recovery task failed to join"
+        );
+    }
     shutdown_connect_runtimes(heartbeat, inventory).await;
     if let Some(runtime) = local_trace_capture {
         runtime.shutdown().await;

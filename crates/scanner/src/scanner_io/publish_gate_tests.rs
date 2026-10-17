@@ -1528,3 +1528,55 @@ async fn requeued_bucket_remains_pending_for_another_worker() {
     assert!(!complete.is_cancelled());
     assert_eq!(rx.recv().await.expect("requeued bucket").name, "photos");
 }
+
+#[test]
+fn replication_execution_digest_is_canonical_and_tracks_statistics() {
+    use rustfs_data_usage::{ReplicationAllStats, ReplicationTargetUsage};
+    let execution = DataUsageScanPlanDigest([9; 32]);
+    let mut cache = DataUsageCache::default();
+    assert_eq!(super::cache::scanner_replication_execution_digest(execution, &cache), execution);
+    let first = ReplicationTargetUsage {
+        replicated_size: 7,
+        replicated_count: 1,
+        ..Default::default()
+    };
+    let second = ReplicationTargetUsage {
+        pending_size: 3,
+        pending_count: 1,
+        ..Default::default()
+    };
+    cache.cache.insert(
+        "photos".to_string(),
+        DataUsageEntry {
+            replication_stats: Some(ReplicationAllStats {
+                replica_size: 0,
+                replica_count: 0,
+                targets: HashMap::from([("arn:a".to_string(), first.clone()), ("arn:b".to_string(), second.clone())]),
+            }),
+            ..Default::default()
+        },
+    );
+    let digest = super::cache::scanner_replication_execution_digest(execution, &cache);
+    assert_ne!(digest, execution);
+    let stats = cache
+        .cache
+        .get_mut("photos")
+        .expect("cached bucket")
+        .replication_stats
+        .as_mut()
+        .expect("replication stats");
+    stats.targets = HashMap::from([("arn:b".to_string(), second), ("arn:a".to_string(), first)]);
+    assert_eq!(super::cache::scanner_replication_execution_digest(execution, &cache), digest);
+    cache
+        .cache
+        .get_mut("photos")
+        .expect("cached bucket")
+        .replication_stats
+        .as_mut()
+        .expect("replication stats")
+        .targets
+        .get_mut("arn:a")
+        .expect("target stats")
+        .failed_count = 1;
+    assert_ne!(super::cache::scanner_replication_execution_digest(execution, &cache), digest);
+}

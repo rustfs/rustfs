@@ -30,6 +30,10 @@ use std::collections::{BTreeMap, HashMap};
 use time::{Duration, OffsetDateTime};
 use tracing::{debug, warn};
 
+const LOG_COMPONENT_ADMIN: &str = "admin";
+const LOG_SUBSYSTEM_OIDC: &str = "oidc";
+const EVENT_ADMIN_OIDC_POLICY: &str = "admin_oidc_policy";
+
 pub(crate) struct DefaultFederatedSessionBinding;
 
 // Legacy receivers reject an empty parsed mapping; current receivers ignore it when the virtual-parent marker is present.
@@ -104,34 +108,33 @@ fn select_oidc_policies(
 
 fn build_oidc_token_claims(transaction: &FederatedSessionTransaction) -> HashMap<String, Value> {
     let authorization = &transaction.authorization;
-    let claims = &authorization.claims;
     let mut token_claims = HashMap::new();
-    token_claims.insert("sub".to_string(), Value::String(claims.sub.clone()));
+    token_claims.insert("sub".to_string(), Value::String(authorization.subject().to_string()));
     token_claims.insert("iss".to_string(), Value::String("rustfs-oidc".to_string()));
-    token_claims.insert("oidc_provider".to_string(), Value::String(authorization.provider_id.clone()));
+    token_claims.insert("oidc_provider".to_string(), Value::String(authorization.provider_id().to_string()));
 
-    if !claims.email.is_empty() {
-        token_claims.insert("email".to_string(), Value::String(claims.email.clone()));
+    if !authorization.email().is_empty() {
+        token_claims.insert("email".to_string(), Value::String(authorization.email().to_string()));
     }
-    if !claims.username.is_empty() {
-        token_claims.insert("preferred_username".to_string(), Value::String(claims.username.clone()));
+    if !authorization.username().is_empty() {
+        token_claims.insert("preferred_username".to_string(), Value::String(authorization.username().to_string()));
     }
-    if !authorization.groups.is_empty() {
+    if !authorization.mapped_iam_groups().is_empty() {
         token_claims.insert(
             "groups".to_string(),
             Value::Array(
                 authorization
-                    .groups
+                    .mapped_iam_groups()
                     .iter()
                     .map(|group| Value::String(group.clone()))
                     .collect(),
             ),
         );
     }
-    if !authorization.roles.is_empty() {
+    if !authorization.roles().is_empty() {
         token_claims.insert(
             "roles".to_string(),
-            Value::Array(authorization.roles.iter().cloned().map(Value::String).collect()),
+            Value::Array(authorization.roles().iter().cloned().map(Value::String).collect()),
         );
     }
 
@@ -242,7 +245,6 @@ fn issue_credentials(
     secret: Option<&str>,
 ) -> Result<rustfs_credentials::Credentials, FederatedSessionBindingError> {
     let authorization = &transaction.authorization;
-    let claims = &authorization.claims;
     let parent_user = authorization.oidc_virtual_parent().ok_or_else(|| {
         FederatedSessionBindingError::InvalidRequest("verified OIDC identity is missing issuer or subject".to_string())
     })?;
@@ -262,16 +264,19 @@ fn issue_credentials(
         ));
     }
     debug!(
-        provider_id = %authorization.provider_id,
+        event = EVENT_ADMIN_OIDC_POLICY,
+        component = LOG_COMPONENT_ADMIN,
+        subsystem = LOG_SUBSYSTEM_OIDC,
+        provider_id = %authorization.provider_id(),
         parent_user = %parent_user,
-        email = %claims.email,
-        username = %claims.username,
-        sub = %claims.sub,
-        policy_count = authorization.policies.len(),
-        group_count = authorization.groups.len(),
-        policies = ?authorization.policies,
-        groups = ?authorization.groups,
-        roles_claim_key = ?authorization.roles_claim_key,
+        email = %authorization.email(),
+        username = %authorization.username(),
+        sub = %authorization.subject(),
+        policy_count = authorization.policies().len(),
+        group_count = authorization.mapped_iam_groups().len(),
+        policies = ?authorization.policies(),
+        groups = ?authorization.mapped_iam_groups(),
+        roles_claim_key = ?authorization.roles_claim_key(),
         has_session_policy = transaction.session_policy.is_some(),
         "OIDC STS credential claims prepared"
     );
@@ -291,7 +296,7 @@ fn issue_credentials(
     let mut credentials = get_new_credentials_with_metadata(&token_claims, secret)
         .map_err(|error| FederatedSessionBindingError::Internal(format!("credential generation failed: {error}")))?;
     credentials.parent_user = parent_user;
-    credentials.groups = Some(authorization.groups.clone());
+    credentials.groups = Some(authorization.mapped_iam_groups().to_vec());
     Ok(credentials)
 }
 
@@ -325,12 +330,12 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
             FederatedSessionBindingError::InvalidRequest("verified OIDC identity is missing issuer or subject".to_string())
         })?;
         let (selected_policy_names, ignorable_policy_names) = match iam_store
-            .sts_policy_db_get(&parent_user, &Some(authorization.groups.clone()))
+            .sts_policy_db_get(&parent_user, &Some(authorization.mapped_iam_groups().to_vec()))
             .await
             .map_err(|_| FederatedSessionBindingError::Internal("failed to resolve OIDC policy mapping".to_string()))?
         {
             mapped_policy_names if !mapped_policy_names.is_empty() => (mapped_policy_names, &[][..]),
-            _ => (authorization.policies.clone(), authorization.group_claim_policies.as_slice()),
+            _ => (authorization.policies().to_vec(), authorization.group_claim_policies()),
         };
         // A name may be skipped only after storage confirms the policy is absent. A failed lookup
         // must not be mistaken for absence, or an unreadable Deny policy would be dropped from the
@@ -339,7 +344,10 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
         for policy_name in &selected_policy_names {
             let exists = iam_store.policy_exists(policy_name).await.map_err(|err| {
                 warn!(
-                    provider_id = %authorization.provider_id,
+                    event = EVENT_ADMIN_OIDC_POLICY,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    provider_id = %authorization.provider_id(),
                     parent_user = %parent_user,
                     policy = %policy_name,
                     error = %err,
@@ -367,7 +375,10 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
         .map_err(|rejection| match rejection {
             OidcPolicyRejection::Unsupported(policy_names) => {
                 warn!(
-                    provider_id = %authorization.provider_id,
+                    event = EVENT_ADMIN_OIDC_POLICY,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    provider_id = %authorization.provider_id(),
                     parent_user = %parent_user,
                     unsupported_policies = ?policy_names,
                     "OIDC STS rejected existing policies whose names are not allowed in session claims"
@@ -376,7 +387,10 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
             }
             OidcPolicyRejection::Unresolved(policy_names) => {
                 debug!(
-                    provider_id = %authorization.provider_id,
+                    event = EVENT_ADMIN_OIDC_POLICY,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    provider_id = %authorization.provider_id(),
                     parent_user = %parent_user,
                     unresolved_policies = ?policy_names,
                     "OIDC STS rejected required policies without a current policy"
@@ -389,7 +403,10 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
         })?;
         if !selection.ignored.is_empty() {
             debug!(
-                provider_id = %authorization.provider_id,
+                event = EVENT_ADMIN_OIDC_POLICY,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_OIDC,
+                provider_id = %authorization.provider_id(),
                 parent_user = %parent_user,
                 ignored_group_policies = ?selection.ignored,
                 "OIDC STS ignoring group claim values without a matching policy"
@@ -402,10 +419,10 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
         if tracing::enabled!(tracing::Level::DEBUG) {
             log_oidc_policy_diagnostics(
                 &iam_store,
-                &authorization.provider_id,
+                authorization.provider_id(),
                 &credentials.parent_user,
                 &selected_policy_names,
-                &authorization.groups,
+                authorization.mapped_iam_groups(),
             )
             .await;
         }
@@ -428,7 +445,7 @@ mod tests {
     use super::*;
     use crate::admin::runtime_sources::{AppContext, current_object_store_handle, publish_test_app_context};
     use hmac::{Hmac, KeyInit, Mac};
-    use rustfs_iam::federation::{FederatedAuthorization, FederatedClaims};
+    use rustfs_iam::federation::FederatedAuthorizationFixture;
     use rustfs_iam::store::{
         Store, UserType,
         object::{IAM_CONFIG_POLICIES_PREFIX, IAM_CONFIG_PREFIX},
@@ -443,29 +460,35 @@ mod tests {
     use sha2::Sha512;
     use std::sync::Arc;
 
-    fn transaction() -> FederatedSessionTransaction {
+    fn authorization_fixture() -> FederatedAuthorizationFixture {
+        FederatedAuthorizationFixture {
+            provider_id: "default".to_string(),
+            sub: "subject".to_string(),
+            email: "user@example.com".to_string(),
+            username: "user".to_string(),
+            source_groups: vec!["source-group".to_string()],
+            attributes: HashMap::from([
+                ("iss".to_string(), serde_json::json!("https://idp.example.test")),
+                ("raw_poison".to_string(), serde_json::json!("must-not-leak")),
+            ]),
+            policies: vec!["readwrite".to_string()],
+            group_claim_policies: Vec::new(),
+            mapped_iam_groups: vec!["devs".to_string()],
+            roles_claim_key: Some("roles".to_string()),
+            roles: vec!["admin".to_string(), "reader".to_string()],
+        }
+    }
+
+    fn transaction_from_fixture(authorization: FederatedAuthorizationFixture) -> FederatedSessionTransaction {
         FederatedSessionTransaction {
-            authorization: FederatedAuthorization {
-                provider_id: "default".to_string(),
-                claims: FederatedClaims {
-                    sub: "subject".to_string(),
-                    email: "user@example.com".to_string(),
-                    username: "user".to_string(),
-                    groups: vec!["source-group".to_string()],
-                    raw: HashMap::from([
-                        ("iss".to_string(), serde_json::json!("https://idp.example.test")),
-                        ("raw_poison".to_string(), serde_json::json!("must-not-leak")),
-                    ]),
-                },
-                policies: vec!["readwrite".to_string()],
-                group_claim_policies: Vec::new(),
-                groups: vec!["devs".to_string()],
-                roles_claim_key: Some("roles".to_string()),
-                roles: vec!["admin".to_string(), "reader".to_string()],
-            },
+            authorization: authorization.into_authorization(),
             duration_seconds: 3600,
             session_policy: None,
         }
+    }
+
+    fn transaction() -> FederatedSessionTransaction {
+        transaction_from_fixture(authorization_fixture())
     }
 
     async fn ready_test_iam() -> Arc<IamSys<ObjectStore>> {
@@ -531,11 +554,12 @@ mod tests {
 
     #[test]
     fn token_claims_omit_empty_optional_oidc_fields() {
-        let mut transaction = transaction();
-        transaction.authorization.claims.email.clear();
-        transaction.authorization.claims.username.clear();
-        transaction.authorization.groups.clear();
-        transaction.authorization.roles.clear();
+        let mut authorization = authorization_fixture();
+        authorization.email.clear();
+        authorization.username.clear();
+        authorization.mapped_iam_groups.clear();
+        authorization.roles.clear();
+        let transaction = transaction_from_fixture(authorization);
 
         assert_eq!(
             build_oidc_token_claims(&transaction),
@@ -634,9 +658,10 @@ mod tests {
     #[serial]
     async fn binding_uses_sts_policy_when_regular_mapping_collides() {
         let iam = ready_test_iam().await;
-        let mut transaction = transaction();
-        transaction.authorization.claims.sub = "binding-sts-policy-subject".to_string();
-        transaction.authorization.policies = vec!["readwrite".to_string()];
+        let mut authorization = authorization_fixture();
+        authorization.sub = "binding-sts-policy-subject".to_string();
+        authorization.policies = vec!["readwrite".to_string()];
+        let transaction = transaction_from_fixture(authorization);
         let parent = transaction
             .authorization
             .oidc_virtual_parent()
@@ -750,7 +775,7 @@ mod tests {
         let mut transaction = transaction();
         transaction.session_policy = Some("not-json".to_string());
 
-        let error = issue_credentials(&transaction, &transaction.authorization.policies, None)
+        let error = issue_credentials(&transaction, transaction.authorization.policies(), None)
             .expect_err("invalid policy should fail first");
         assert!(matches!(error, FederatedSessionBindingError::InvalidRequest(_)));
     }
@@ -782,10 +807,11 @@ mod tests {
 
     #[test]
     fn missing_oidc_issuer_fails_closed_before_credential_issuance() {
-        let mut transaction = transaction();
-        transaction.authorization.claims.raw.clear();
+        let mut authorization = authorization_fixture();
+        authorization.attributes.clear();
+        let transaction = transaction_from_fixture(authorization);
 
-        let error = issue_credentials(&transaction, &transaction.authorization.policies, Some("signing-secret"))
+        let error = issue_credentials(&transaction, transaction.authorization.policies(), Some("signing-secret"))
             .expect_err("credential issuance should reject a missing issuer");
         assert!(matches!(error, FederatedSessionBindingError::InvalidRequest(_)));
     }
@@ -865,12 +891,12 @@ mod tests {
     }
 
     fn group_claim_transaction(subject: &str, groups: &[&str]) -> FederatedSessionTransaction {
-        let mut transaction = transaction();
-        transaction.authorization.claims.sub = subject.to_string();
-        transaction.authorization.groups = names(groups);
-        transaction.authorization.policies = names(groups);
-        transaction.authorization.group_claim_policies = names(groups);
-        transaction
+        let mut authorization = authorization_fixture();
+        authorization.sub = subject.to_string();
+        authorization.mapped_iam_groups = names(groups);
+        authorization.policies = names(groups);
+        authorization.group_claim_policies = names(groups);
+        transaction_from_fixture(authorization)
     }
 
     fn assert_binding_rejected(error: FederatedSessionBindingError, expected_message: &str) {
@@ -898,7 +924,7 @@ mod tests {
             .expect("issued session token should verify");
 
         assert_eq!(claims.get("policy"), Some(&serde_json::json!("readonly")));
-        assert_eq!(credentials.groups.as_deref(), Some(transaction.authorization.groups.as_slice()));
+        assert_eq!(credentials.groups.as_deref(), Some(transaction.authorization.mapped_iam_groups()));
 
         let groups = credentials.groups.clone();
         let conditions = HashMap::new();
@@ -987,10 +1013,11 @@ mod tests {
     #[serial]
     async fn binding_keeps_role_policy_strict() {
         ready_test_iam().await;
-        let mut transaction = transaction();
-        transaction.authorization.claims.sub = "binding-strict-role-policy-subject".to_string();
-        transaction.authorization.policies = names(&["readonly", "missing-role-policy"]);
-        transaction.authorization.group_claim_policies = Vec::new();
+        let mut authorization = authorization_fixture();
+        authorization.sub = "binding-strict-role-policy-subject".to_string();
+        authorization.policies = names(&["readonly", "missing-role-policy"]);
+        authorization.group_claim_policies = Vec::new();
+        let transaction = transaction_from_fixture(authorization);
 
         let error = DefaultFederatedSessionBinding
             .bind(&transaction)

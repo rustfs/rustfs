@@ -65,9 +65,9 @@ use super::replication_target_boundary::{
     SsecPassthroughGate, TargetClient, VersionIdentityCapability, is_replication_target_offline_error,
     replication_action_for_target_head, replication_complete_multipart_options, replication_delete_marker_purge_remove_options,
     replication_delete_remove_options, replication_force_delete_remove_options, replication_object_is_ssec_encrypted,
-    replication_put_object_header_size, replication_put_object_options, replication_target_head_is_newer_null_version,
-    resolve_read_api_version_id, ssec_passthrough_evidence_present, ssec_passthrough_gate, version_identity_capability_from_put,
-    version_identity_drifted,
+    replication_put_object_header_size, replication_put_object_options, replication_source_etag_is_comparable,
+    replication_target_head_is_newer_null_version, resolve_read_api_version_id, ssec_passthrough_evidence_present,
+    ssec_passthrough_gate, version_identity_capability_from_put, version_identity_drifted,
 };
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
@@ -349,15 +349,23 @@ fn replica_etag_verification_enabled() -> bool {
 /// target that stores a transformed payload (e.g. undecoded `aws-chunked`
 /// frames, #6853) returns the ETag of what it actually wrote. Reporting
 /// COMPLETED over such a replica is silent corruption, so a decidable
-/// mismatch fails the replication instead. An SSE-C ciphertext passthrough
-/// transfer is exempt: the wire bytes are ciphertext while the source ETag is
-/// the plaintext MD5, and that path has its own HEAD-back audit.
+/// mismatch fails the replication instead. Encrypted sources are exempt: an
+/// SSE-C ciphertext passthrough sends ciphertext while the source ETag is the
+/// plaintext MD5 (that path has its own HEAD-back audit), and a managed-SSE
+/// (SSE-S3 / SSE-KMS) source stores a keyed fingerprint, or a legacy plaintext
+/// MD5, that the ETag of the target's re-encrypted replica can neither confirm
+/// nor refute. A managed-SSE source forwards no checksum either
+/// (`replication_put_object_options`), so its replica has no post-PUT
+/// content audit.
 fn verify_single_part_replica(
     object_info: &ObjectInfo,
     response: &RemotePutObjectResponse,
     ciphertext_passthrough: bool,
 ) -> std::result::Result<(), std::io::Error> {
-    if ciphertext_passthrough || !replica_etag_verification_enabled() {
+    if ciphertext_passthrough
+        || !replication_source_etag_is_comparable(&object_info.user_defined)
+        || !replica_etag_verification_enabled()
+    {
         return Ok(());
     }
     if single_part_replica_etag_mismatch(object_info.etag.as_deref(), response.etag.as_deref()) {
@@ -446,6 +454,26 @@ fn is_version_id_format_mismatch(err: &SdkError<HeadObjectError>) -> bool {
     let code = err.as_service_error().and_then(|se| se.code());
     let raw_status = err.raw_response().map(|r| r.status().as_u16());
     is_version_id_mismatch(code, raw_status)
+}
+
+/// A version-addressed HEAD rejected because the target cannot address the
+/// source version id (AWS S3: bodiless 400). Narrower than
+/// [`is_version_id_format_mismatch`]: a bodiless 403 may be a genuine
+/// `s3:GetObjectVersion` denial, so it is not accepted where a mutation or a
+/// completion verdict follows instead of another non-destructive HEAD.
+fn rejects_source_version_id(err: &SdkError<HeadObjectError>) -> bool {
+    is_version_id_format_mismatch(err) && !has_raw_status(err, 403)
+}
+
+/// Whether the target's latest version of `object` is a delete marker. For
+/// targets that mint their own version ids, which cannot be asked about the
+/// source marker id: S3 answers a versionless HEAD on such a key with 404
+/// (405 on some targets) plus `x-amz-delete-marker: true`.
+async fn latest_target_version_is_delete_marker(tgt_client: &TargetClient, object: &str) -> bool {
+    match head_object_for_worker(tgt_client, &tgt_client.bucket, object, None).await {
+        Ok(head) => head.delete_marker == Some(true),
+        Err(e) => raw_header_value(e.as_ref(), "x-amz-delete-marker").as_deref() == Some("true"),
+    }
 }
 
 async fn mark_replication_target_offline_if_needed(target_client: &Arc<TargetClient>, err: &(impl Display + ?Sized)) {
@@ -1846,7 +1874,17 @@ async fn verify_resync_head_result(
             // only absence proves completion. All other outcomes remain
             // failed (backlog#862 / #799 B13).
             let retryable = if roi.version_purge_status.is_empty() {
-                matches!(classify_delete_marker_head_error(&err), DeleteMarkerHeadOutcome::Ambiguous)
+                match classify_delete_marker_head_error(&err) {
+                    // A target that mints its own version ids never holds the
+                    // source marker id; verify the marker on the latest version.
+                    DeleteMarkerHeadOutcome::Ambiguous => {
+                        let mints_own = rejects_source_version_id(&err)
+                            || ReplicationTargetStore::version_identity_capability(&target_client.arn)
+                                .version_addressing_unreliable();
+                        !(mints_own && latest_target_version_is_delete_marker(target_client, &roi.name).await)
+                    }
+                    DeleteMarkerHeadOutcome::Exists | DeleteMarkerHeadOutcome::Missing => false,
+                }
             } else {
                 !matches!(classify_delete_marker_head_error(&err), DeleteMarkerHeadOutcome::Missing)
             };
@@ -3567,7 +3605,16 @@ async fn replicate_delete_to_target(
         }
     }
 
-    if !is_version_purge && dobj.delete_object.delete_marker && dobj.delete_object.delete_marker_version_id.is_some() {
+    // A target that mints its own version ids never holds the source marker
+    // id, so a version-addressed pre-check cannot succeed there; the marker
+    // is created by the versionless DELETE below.
+    let version_addressable =
+        !ReplicationTargetStore::version_identity_capability(&tgt_client.arn).version_addressing_unreliable();
+    if version_addressable
+        && !is_version_purge
+        && dobj.delete_object.delete_marker
+        && dobj.delete_object.delete_marker_version_id.is_some()
+    {
         match head_object_for_worker(
             tgt_client.as_ref(),
             &tgt_client.bucket,
@@ -3576,6 +3623,11 @@ async fn replicate_delete_to_target(
         )
         .await
         {
+            // The verdict is not known yet (e.g. no PUT since restart) and the
+            // target rejected the source id: learn it as the PUT path does.
+            Err(e) if rejects_source_version_id(e.as_ref()) => {
+                ReplicationTargetStore::record_version_identity_capability(&tgt_client.arn, VersionIdentityCapability::MintsOwn);
+            }
             Ok(head) if head.delete_marker == Some(true) => {
                 // Some targets expose an existing marker as a successful HEAD
                 // with the marker bit instead of the usual 405. Treat that as
@@ -5827,6 +5879,57 @@ mod tests {
     use super::super::replication_object_decision_boundary::ReplicationMultipartPlanError;
 
     #[test]
+    fn verify_single_part_replica_exempts_managed_sse_sources() {
+        // A new encrypted write stores a keyed fingerprint; a target that
+        // computes its own ETag answers with the MD5 of the plaintext it
+        // received. Both are 32 hex characters, so without the exemption the
+        // audit would fail every SSE-S3 / SSE-KMS replica (rustfs/backlog).
+        let fingerprint = "00112233445566778899aabbccddeeff";
+        let replica_md5 = "ffeeddccbbaa99887766554433221100";
+        let response = RemotePutObjectResponse {
+            version_id: None,
+            etag: Some(replica_md5.to_string()),
+        };
+        for sse in ["AES256", "aws:kms"] {
+            let object_info = ObjectInfo {
+                bucket: "source".to_string(),
+                name: "encrypted".to_string(),
+                etag: Some(fingerprint.to_string()),
+                user_defined: HashMap::from([("x-amz-server-side-encryption".to_string(), sse.to_string())]).into(),
+                ..Default::default()
+            };
+            verify_single_part_replica(&object_info, &response, false)
+                .unwrap_or_else(|err| panic!("{sse}: a managed-SSE source must not be audited against the replica MD5: {err}"));
+        }
+    }
+
+    #[test]
+    fn verify_single_part_replica_still_fails_plaintext_mismatch() {
+        if !replica_etag_verification_enabled() {
+            return;
+        }
+        let object_info = ObjectInfo {
+            bucket: "source".to_string(),
+            name: "plain".to_string(),
+            etag: Some("00112233445566778899aabbccddeeff".to_string()),
+            ..Default::default()
+        };
+        let mismatch = RemotePutObjectResponse {
+            version_id: None,
+            etag: Some("ffeeddccbbaa99887766554433221100".to_string()),
+        };
+        let err = verify_single_part_replica(&object_info, &mismatch, false)
+            .expect_err("a plaintext source whose replica MD5 differs must fail the replication");
+        assert_eq!(err.to_string(), REPLICA_ETAG_MISMATCH_ERROR);
+
+        let matching = RemotePutObjectResponse {
+            version_id: None,
+            etag: object_info.etag.clone(),
+        };
+        verify_single_part_replica(&object_info, &matching, false).expect("matching plaintext MD5s pass the audit");
+    }
+
+    #[test]
     fn multipart_read_plan_preserves_legacy_plain_part_ranges() {
         const MIB: usize = 1024 * 1024;
         let object_info = ObjectInfo {
@@ -6676,6 +6779,93 @@ mod tests {
         assert!(seen[0].starts_with("HEAD "), "{seen:?}");
     }
 
+    /// AWS S3 answers a HEAD for a version id it did not mint with a bodiless
+    /// 400. On a target with no verdict yet, that teaches `MintsOwn` and the
+    /// marker is still created with one versionless DELETE.
+    #[tokio::test]
+    async fn live_delete_marker_worker_learns_mints_own_from_bodiless_400() {
+        let (endpoint, server) = spawn_scripted_target_server(2, |line| {
+            if line.starts_with("HEAD ") {
+                empty_response("400 Bad Request")
+            } else if line.starts_with("DELETE ") {
+                empty_response("204 No Content")
+            } else {
+                empty_response("500 Unexpected")
+            }
+        });
+        let target = test_target_client(endpoint);
+        register_test_target(&target).await;
+        let dobj = marker_creation_dobj(&target.arn);
+
+        let rinfo = replicate_delete_to_target(&dobj, target.clone(), None).await;
+
+        assert_eq!(rinfo.replication_status, ReplicationStatusType::Completed, "{rinfo:?}");
+        assert_eq!(
+            ReplicationTargetStore::version_identity_capability(&target.arn),
+            VersionIdentityCapability::MintsOwn
+        );
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen[0].starts_with("HEAD "), "{seen:?}");
+        assert!(seen[1].starts_with("DELETE "), "{seen:?}");
+        assert!(!seen[1].contains("versionId="), "marker creation must remain versionless: {seen:?}");
+    }
+
+    /// A bodiless 403 on the version-addressed HEAD may be a genuine
+    /// GetObjectVersion denial on an id-adopting target. It must fail closed:
+    /// no DELETE, and no `MintsOwn` verdict cached for the ARN.
+    #[tokio::test]
+    async fn live_delete_marker_worker_keeps_bodiless_403_failure_closed() {
+        let (endpoint, server) = spawn_scripted_target_server(1, |line| {
+            if line.starts_with("HEAD ") {
+                empty_response("403 Forbidden")
+            } else if line.starts_with("DELETE ") {
+                empty_response("204 No Content")
+            } else {
+                empty_response("500 Unexpected")
+            }
+        });
+        let target = test_target_client(endpoint);
+        register_test_target(&target).await;
+        let dobj = marker_creation_dobj(&target.arn);
+
+        let rinfo = replicate_delete_to_target(&dobj, target.clone(), None).await;
+
+        assert_eq!(rinfo.replication_status, ReplicationStatusType::Failed, "{rinfo:?}");
+        assert_ne!(
+            ReplicationTargetStore::version_identity_capability(&target.arn),
+            VersionIdentityCapability::MintsOwn
+        );
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(seen.len(), 1, "a denied HEAD must not trigger DELETE: {seen:?}");
+        assert!(seen[0].starts_with("HEAD "), "{seen:?}");
+    }
+
+    /// A target already known to mint its own version ids is never asked for
+    /// the source marker id: the marker is created by the versionless DELETE.
+    #[tokio::test]
+    async fn live_delete_marker_worker_skips_version_head_on_mints_own_target() {
+        let (endpoint, server) = spawn_scripted_target_server(1, |line| {
+            if line.starts_with("DELETE ") {
+                empty_response("204 No Content")
+            } else {
+                empty_response("500 Unexpected")
+            }
+        });
+        let target = test_target_client(endpoint);
+        register_test_target(&target).await;
+        ReplicationTargetStore::record_version_identity_capability(&target.arn, VersionIdentityCapability::MintsOwn);
+        let dobj = marker_creation_dobj(&target.arn);
+
+        let rinfo = replicate_delete_to_target(&dobj, target.clone(), None).await;
+
+        assert_eq!(rinfo.replication_status, ReplicationStatusType::Completed, "{rinfo:?}");
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(seen.len(), 1, "no version-addressed HEAD on a MintsOwn target: {seen:?}");
+        assert!(seen[0].starts_with("DELETE "), "{seen:?}");
+        assert!(!seen[0].contains("versionId="), "marker creation must remain versionless: {seen:?}");
+    }
+
     /// A target answers `HEAD ?versionId=<delete marker>` with a bodiless
     /// 405, so the SDK reports no error code. That is the marker having
     /// propagated, not a failure (rustfs/backlog#2479).
@@ -6764,6 +6954,76 @@ mod tests {
         assert!(err.is_some(), "a 503 must not count as a propagated delete marker");
         assert_eq!((size, st.replicated_count, st.failed_count), (0, 0, 1));
         server.join().expect("test HTTP server should finish");
+    }
+
+    /// AWS answers `HEAD ?versionId=<source marker id>` with a bodiless 400.
+    /// The marker is verified through the latest version instead: a
+    /// versionless 404 with `x-amz-delete-marker: true` proves it propagated.
+    #[tokio::test]
+    async fn resync_verification_accepts_latest_delete_marker_when_target_rejects_source_id() {
+        let (endpoint, server) = spawn_scripted_target_server(2, |line| {
+            if line.contains("versionId=") {
+                empty_response("400 Bad Request")
+            } else {
+                "HTTP/1.1 404 Not Found\r\nX-Amz-Delete-Marker: true\r\nX-Amz-Version-Id: target-marker\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string()
+            }
+        });
+        let target = test_target_client(endpoint);
+        let roi = delete_marker_roi();
+        let mut st = TargetReplicationResyncStatus::default();
+
+        let head_result =
+            head_object_for_worker(target.as_ref(), &target.bucket, &roi.name, roi.version_id.map(|v| v.to_string())).await;
+        let (size, err) = verify_resync_head_result(head_result, &roi, &mut st, &target).await;
+
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!((size, st.replicated_count, st.failed_count), (0, 1, 0));
+        let seen = server.join().expect("test HTTP server should finish");
+        assert!(!seen[1].contains("versionId="), "the re-check must address the latest version: {seen:?}");
+    }
+
+    /// A live latest version on a target that rejects the source id means the
+    /// marker has not propagated: the verification stays failed.
+    #[tokio::test]
+    async fn resync_verification_fails_delete_marker_when_latest_target_version_is_live() {
+        let (endpoint, server) = spawn_scripted_target_server(2, |line| {
+            if line.contains("versionId=") {
+                empty_response("400 Bad Request")
+            } else {
+                empty_response("200 OK")
+            }
+        });
+        let target = test_target_client(endpoint);
+        let roi = delete_marker_roi();
+        let mut st = TargetReplicationResyncStatus::default();
+
+        let head_result =
+            head_object_for_worker(target.as_ref(), &target.bucket, &roi.name, roi.version_id.map(|v| v.to_string())).await;
+        let (size, err) = verify_resync_head_result(head_result, &roi, &mut st, &target).await;
+
+        assert!(err.is_some(), "a live latest version must not verify the marker");
+        assert_eq!((size, st.replicated_count, st.failed_count), (0, 0, 1));
+        server.join().expect("test HTTP server should finish");
+    }
+
+    /// A bodiless 403 may be a genuine permission denial: it is not evidence
+    /// that the target mints its own ids, so no latest-version re-check runs.
+    #[tokio::test]
+    async fn resync_verification_keeps_delete_marker_failed_on_bodiless_403() {
+        let (endpoint, server) = spawn_scripted_target_server(1, |_| empty_response("403 Forbidden"));
+        let target = test_target_client(endpoint);
+        let roi = delete_marker_roi();
+        let mut st = TargetReplicationResyncStatus::default();
+
+        let head_result =
+            head_object_for_worker(target.as_ref(), &target.bucket, &roi.name, roi.version_id.map(|v| v.to_string())).await;
+        let (size, err) = verify_resync_head_result(head_result, &roi, &mut st, &target).await;
+
+        assert!(err.is_some(), "a 403 must not count as a propagated delete marker");
+        assert_eq!((size, st.replicated_count, st.failed_count), (0, 0, 1));
+        let seen = server.join().expect("test HTTP server should finish");
+        assert_eq!(seen.len(), 1, "{seen:?}");
     }
 
     /// Serves exactly `requests` connections, answering each from

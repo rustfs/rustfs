@@ -14,7 +14,8 @@
 
 use std::sync::Arc;
 
-use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, ObjectLockEnabled};
+use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration;
+use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
 use time::OffsetDateTime;
 use tracing::info;
 
@@ -34,13 +35,13 @@ const EVENT_LIFECYCLE_VERSION_SCAN_SKIPPED: &str = "lifecycle_version_scan_skipp
 /// Evaluator - evaluates lifecycle policy on objects for the given lifecycle
 /// configuration and lock retention configuration.
 pub struct Evaluator {
-    policy: Arc<BucketLifecycleConfiguration>,
+    policy: Arc<PersistedLifecycleConfiguration>,
     lock_retention: Option<Arc<ObjectLockConfiguration>>,
 }
 
 impl Evaluator {
     /// NewEvaluator - creates a new evaluator with the given lifecycle
-    pub fn new(policy: Arc<BucketLifecycleConfiguration>) -> Self {
+    pub fn new(policy: Arc<PersistedLifecycleConfiguration>) -> Self {
         Self {
             policy,
             lock_retention: None,
@@ -94,11 +95,11 @@ impl Evaluator {
                         // Skip if bucket has object locking enabled; To prevent the
                         // possibility of violating an object retention on one of the
                         // noncurrent versions of this object.
-                        if self.lock_retention.as_ref().is_some_and(|v| {
-                            v.object_lock_enabled
-                                .as_ref()
-                                .is_some_and(|v| v.as_str() == ObjectLockEnabled::ENABLED)
-                        }) || objs.iter().any(|obj| self.is_object_locked(obj))
+                        if self
+                            .lock_retention
+                            .as_ref()
+                            .is_some_and(|v| v.object_lock_enabled.as_ref().is_some_and(|v| v == "Enabled"))
+                            || objs.iter().any(|obj| self.is_object_locked(obj))
                             || self.any_version_has_pending_replication(objs)
                         {
                             event = Event::default();
@@ -205,13 +206,16 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use rustfs_gateway_types::persistence::{
+        PersistedDefaultRetention as DefaultRetention, PersistedObjectLockConfiguration as ObjectLockConfiguration,
+        PersistedObjectLockRule as ObjectLockRule,
+    };
+    use rustfs_gateway_types::persistence::{
+        PersistedLifecycleConfiguration, PersistedLifecycleExpiration, PersistedLifecycleRule,
+        PersistedNoncurrentVersionExpiration, PersistedTransition,
+    };
     use rustfs_scanner_metrics::metrics::IlmAction;
     use rustfs_storage_api::metadata_keys;
-    use s3s::dto::{
-        BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, LifecycleExpiration, LifecycleRule,
-        NoncurrentVersionExpiration, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule,
-        Transition, TransitionStorageClass,
-    };
     use time::OffsetDateTime;
     use uuid::Uuid;
 
@@ -221,7 +225,7 @@ mod tests {
     #[tokio::test]
     async fn adversarial_restore_expiry_survives_legal_hold() {
         let mut policy = (*latest_expiration_lifecycle()).clone();
-        policy.rules[0].status = ExpirationStatus::from_static(ExpirationStatus::DISABLED);
+        policy.rules[0].status = "Disabled".to_owned();
         let policy = Arc::new(policy);
         policy
             .validate(&lock_enabled_without_default_retention())
@@ -264,7 +268,7 @@ mod tests {
         );
 
         let mut expiring_policy = (*latest_expiration_lifecycle()).clone();
-        expiring_policy.rules[0].noncurrent_version_expiration = Some(NoncurrentVersionExpiration {
+        expiring_policy.rules[0].noncurrent_version_expiration = Some(PersistedNoncurrentVersionExpiration {
             noncurrent_days: Some(1),
             newer_noncurrent_versions: None,
         });
@@ -306,12 +310,12 @@ mod tests {
         }
     }
 
-    fn expired_marker_lifecycle() -> Arc<BucketLifecycleConfiguration> {
-        Arc::new(BucketLifecycleConfiguration {
+    fn expired_marker_lifecycle() -> Arc<PersistedLifecycleConfiguration> {
+        Arc::new(PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     expired_object_delete_marker: Some(true),
                     ..Default::default()
                 }),
@@ -327,12 +331,12 @@ mod tests {
         })
     }
 
-    fn latest_expiration_lifecycle() -> Arc<BucketLifecycleConfiguration> {
-        Arc::new(BucketLifecycleConfiguration {
+    fn latest_expiration_lifecycle() -> Arc<PersistedLifecycleConfiguration> {
+        Arc::new(PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(1),
                     ..Default::default()
                 }),
@@ -348,11 +352,11 @@ mod tests {
         })
     }
 
-    fn latest_transition_lifecycle() -> Arc<BucketLifecycleConfiguration> {
-        Arc::new(BucketLifecycleConfiguration {
+    fn latest_transition_lifecycle() -> Arc<PersistedLifecycleConfiguration> {
+        Arc::new(PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
@@ -361,21 +365,21 @@ mod tests {
                 noncurrent_version_expiration: None,
                 noncurrent_version_transitions: None,
                 prefix: None,
-                transitions: Some(vec![Transition {
+                transitions: Some(vec![PersistedTransition {
                     days: Some(1),
                     date: None,
-                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                    storage_class: Some("WARM".to_owned()),
                 }]),
             }],
         })
     }
 
-    fn all_versions_expiration_lifecycle() -> Arc<BucketLifecycleConfiguration> {
-        Arc::new(BucketLifecycleConfiguration {
+    fn all_versions_expiration_lifecycle() -> Arc<PersistedLifecycleConfiguration> {
+        Arc::new(PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(1),
                     expired_object_all_versions: Some(true),
                     ..Default::default()
@@ -394,35 +398,35 @@ mod tests {
 
     fn lock_enabled_without_default_retention() -> Arc<ObjectLockConfiguration> {
         Arc::new(ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: None,
         })
     }
 
     fn lock_enabled_with_default_retention(days: i32) -> Arc<ObjectLockConfiguration> {
         Arc::new(ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: Some(ObjectLockRule {
                 default_retention: Some(DefaultRetention {
                     days: Some(days),
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+                    mode: Some("GOVERNANCE".to_owned()),
                     years: None,
                 }),
             }),
         })
     }
 
-    fn noncurrent_expiration_lifecycle() -> Arc<BucketLifecycleConfiguration> {
-        Arc::new(BucketLifecycleConfiguration {
+    fn noncurrent_expiration_lifecycle() -> Arc<PersistedLifecycleConfiguration> {
+        Arc::new(PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("expire-noncurrent".to_string()),
-                noncurrent_version_expiration: Some(NoncurrentVersionExpiration {
+                noncurrent_version_expiration: Some(PersistedNoncurrentVersionExpiration {
                     noncurrent_days: Some(1),
                     newer_noncurrent_versions: None,
                 }),
@@ -433,12 +437,12 @@ mod tests {
         })
     }
 
-    fn current_and_noncurrent_expiration_lifecycle() -> Arc<BucketLifecycleConfiguration> {
-        Arc::new(BucketLifecycleConfiguration {
+    fn current_and_noncurrent_expiration_lifecycle() -> Arc<PersistedLifecycleConfiguration> {
+        Arc::new(PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                expiration: Some(LifecycleExpiration {
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
                     days: Some(30),
                     ..Default::default()
                 }),
@@ -446,7 +450,7 @@ mod tests {
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("expire-current-and-noncurrent".to_string()),
-                noncurrent_version_expiration: Some(NoncurrentVersionExpiration {
+                noncurrent_version_expiration: Some(PersistedNoncurrentVersionExpiration {
                     noncurrent_days: Some(1),
                     newer_noncurrent_versions: None,
                 }),
@@ -506,10 +510,7 @@ mod tests {
             .format(&time::format_description::well_known::Rfc3339)
             .expect("future retain-until date should format");
         let mut user_defined = HashMap::new();
-        user_defined.insert(
-            metadata_keys::OBJECT_LOCK_MODE.to_string(),
-            s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
-        );
+        user_defined.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_owned());
         user_defined.insert(metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), retain_until);
 
         ObjectOpts {

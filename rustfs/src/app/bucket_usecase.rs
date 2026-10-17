@@ -69,7 +69,8 @@ use crate::app::object::shared::mark_on_demand_migration_list_local_only;
 use crate::app::object_data_cache::invalidate_object_data_cache_bucket_after_delete;
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_encryption_service, current_notification_system,
-    current_notify_interface_for_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
+    current_notification_system_for_context, current_notify_interface_for_context, current_object_data_cache_for_context,
+    current_object_store_handle_for_context,
 };
 use crate::app::table_list_isolation;
 use crate::auth::get_condition_values_with_client_info;
@@ -83,7 +84,7 @@ use crate::storage::storage_api::lock_bucket_targets_metadata;
 use http::StatusCode;
 use metrics::counter;
 use rustfs_config::RUSTFS_REGION;
-use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
+use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedReplicationConfiguration};
 use rustfs_io_metrics::record_s3_op;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
@@ -99,13 +100,13 @@ use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::{force_delete_header, get_header};
 use rustfs_utils::obj::extract_user_defined_metadata;
 use s3s::dto::{
-    BucketLifecycleConfiguration, BucketLocationConstraint, BucketVersioningStatus, CommonPrefix, CreateBucketInput,
-    CreateBucketOutput, DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput,
-    DeleteBucketInput, DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, DeleteBucketOutput, DeleteBucketPolicyInput,
+    BucketLocationConstraint, BucketVersioningStatus, CommonPrefix, CreateBucketInput, CreateBucketOutput, DeleteBucketCorsInput,
+    DeleteBucketCorsOutput, DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput, DeleteBucketInput,
+    DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, DeleteBucketOutput, DeleteBucketPolicyInput,
     DeleteBucketPolicyOutput, DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteBucketTaggingInput,
     DeleteBucketTaggingOutput, DeleteMarkerEntry, DeletePublicAccessBlockInput, DeletePublicAccessBlockOutput, EncodingType,
     ExpirationStatus, GetBucketCorsInput, GetBucketCorsOutput, GetBucketEncryptionInput, GetBucketEncryptionOutput,
-    GetBucketLifecycleConfigurationInput, GetBucketLifecycleConfigurationOutput, GetBucketLocationInput, GetBucketLocationOutput,
+    GetBucketLifecycleConfigurationInput, GetBucketLocationInput, GetBucketLocationOutput,
     GetBucketNotificationConfigurationInput, GetBucketNotificationConfigurationOutput, GetBucketPolicyInput,
     GetBucketPolicyOutput, GetBucketPolicyStatusInput, GetBucketPolicyStatusOutput, GetBucketReplicationInput,
     GetBucketTaggingInput, GetBucketTaggingOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
@@ -151,6 +152,7 @@ static BUCKET_OPERATION_ADMISSION: LazyLock<Arc<BucketOperationAdmission>> = Laz
 struct BucketOperationAdmission {
     active: Arc<Semaphore>,
     waiting: Semaphore,
+    in_flight: Arc<Semaphore>,
 }
 
 impl BucketOperationAdmission {
@@ -158,12 +160,19 @@ impl BucketOperationAdmission {
         Self {
             active: Arc::new(Semaphore::new(concurrency)),
             waiting: Semaphore::new(queue_capacity),
+            in_flight: Arc::new(Semaphore::new(concurrency + queue_capacity)),
         }
     }
 
-    async fn acquire(&self, operation: &'static str) -> S3Result<OwnedSemaphorePermit> {
+    async fn acquire(&self, operation: &'static str) -> S3Result<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
+        // Reserve the entire operation before mutation, including post-commit
+        // work that can outlive both its execution slot and the request.
+        let in_flight = self.in_flight.clone().try_acquire_owned().map_err(|err| match err {
+            TryAcquireError::NoPermits => bucket_admission_slow_down(operation, "in-flight limit reached"),
+            TryAcquireError::Closed => bucket_admission_closed(operation),
+        })?;
         match self.active.clone().try_acquire_owned() {
-            Ok(permit) => return Ok(permit),
+            Ok(permit) => return Ok((permit, in_flight)),
             Err(TryAcquireError::Closed) => return Err(bucket_admission_closed(operation)),
             Err(TryAcquireError::NoPermits) => {}
         }
@@ -174,10 +183,11 @@ impl BucketOperationAdmission {
             TryAcquireError::NoPermits => bucket_admission_slow_down(operation, "queue is full"),
             TryAcquireError::Closed => bucket_admission_closed(operation),
         })?;
-        tokio::time::timeout(BUCKET_OPERATION_QUEUE_TIMEOUT, self.active.clone().acquire_owned())
+        let active = tokio::time::timeout(BUCKET_OPERATION_QUEUE_TIMEOUT, self.active.clone().acquire_owned())
             .await
             .map_err(|_| bucket_admission_slow_down(operation, "queue wait timed out"))?
-            .map_err(|_| bucket_admission_closed(operation))
+            .map_err(|_| bucket_admission_closed(operation))?;
+        Ok((active, in_flight))
     }
 }
 
@@ -616,11 +626,26 @@ async fn notify_bucket_metadata_reload(
     request_context: Option<request_context::RequestContext>,
     scanner_maintenance_change: bool,
 ) {
+    notify_bucket_metadata_reload_with_context(bucket, operation, request_context, scanner_maintenance_change, None).await;
+}
+
+async fn notify_bucket_metadata_reload_with_context(
+    bucket: String,
+    operation: &'static str,
+    request_context: Option<request_context::RequestContext>,
+    scanner_maintenance_change: bool,
+    app_context: Option<Arc<AppContext>>,
+) {
     record_local_scanner_maintenance_reload(&bucket, scanner_maintenance_change);
     // Keep reload detached across request cancellation, but wait before a healthy peer can serve the previous config.
     let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
     spawn_background_with_context(request_context, async move {
-        if let Some(notification_sys) = current_notification_system() {
+        let notification_sys = if let Some(context) = app_context.as_deref() {
+            current_notification_system_for_context(Some(context))
+        } else {
+            current_notification_system()
+        };
+        if let Some(notification_sys) = notification_sys {
             let result = if scanner_maintenance_change {
                 notification_sys.load_bucket_metadata_for_scanner_maintenance(&bucket).await
             } else {
@@ -1232,15 +1257,19 @@ fn build_list_objects_v2_metadata_output(
     }
 }
 
-fn create_bucket_exists_response(is_owner: bool) -> S3Result<S3Response<CreateBucketOutput>> {
-    if is_owner {
+fn create_bucket_exists_response(is_owner: bool, region: &str) -> S3Result<S3Response<CreateBucketOutput>> {
+    if is_owner && region == RUSTFS_REGION {
+        // AWS preserves the legacy idempotent response for buckets recreated in
+        // us-east-1 (the default RustFS region).
         return Ok(S3Response::new(CreateBucketOutput::default()));
     }
 
-    Err(s3_error!(
-        BucketAlreadyExists,
-        "The requested bucket name is not available. The bucket namespace is shared by all users of the system. Please select a different name and try again."
-    ))
+    let error_code = if is_owner {
+        S3ErrorCode::BucketAlreadyOwnedByYou
+    } else {
+        S3ErrorCode::BucketAlreadyExists
+    };
+    Err(S3Error::with_message(error_code, "The requested bucket already exists."))
 }
 
 fn resolve_notification_region(global_region: Option<Region>, request_region: Option<Region>) -> String {
@@ -1304,9 +1333,9 @@ fn lifecycle_validation_error(err: &std::io::Error) -> S3Error {
     s3_error!(InvalidArgument, "{err}")
 }
 
-fn lifecycle_has_transition_rules(config: &BucketLifecycleConfiguration) -> bool {
+fn lifecycle_has_transition_rules(config: &PersistedLifecycleConfiguration) -> bool {
     config.rules.iter().any(|rule| {
-        rule.status == ExpirationStatus::from_static(ExpirationStatus::ENABLED)
+        rule.status == "Enabled"
             && (rule.transitions.as_ref().is_some_and(|transitions| {
                 transitions.iter().any(|transition| {
                     transition
@@ -1325,9 +1354,9 @@ fn lifecycle_has_transition_rules(config: &BucketLifecycleConfiguration) -> bool
     })
 }
 
-fn lifecycle_has_expiry_rules(config: &BucketLifecycleConfiguration) -> bool {
+fn lifecycle_has_expiry_rules(config: &PersistedLifecycleConfiguration) -> bool {
     config.rules.iter().any(|rule| {
-        rule.status == ExpirationStatus::from_static(ExpirationStatus::ENABLED)
+        rule.status == "Enabled"
             && (rule.expiration.is_some() || rule.del_marker_expiration.is_some() || rule.noncurrent_version_expiration.is_some())
     })
 }
@@ -1338,18 +1367,18 @@ fn lifecycle_has_expiry_rules(config: &BucketLifecycleConfiguration) -> bool {
 /// filters on ENABLED for scanner scheduling — editing a Disabled expiry rule
 /// must still advance the replication axis. Del-marker expiration and
 /// abort-multipart are site-local and never travel.
-fn lifecycle_rules_have_expiry(config: &BucketLifecycleConfiguration) -> bool {
+fn lifecycle_rules_have_expiry(config: &PersistedLifecycleConfiguration) -> bool {
     config
         .rules
         .iter()
         .any(|rule| rule.expiration.is_some() || rule.noncurrent_version_expiration.is_some())
 }
 
-fn lifecycle_has_abort_multipart_rules(config: &BucketLifecycleConfiguration) -> bool {
-    config.rules.iter().any(|rule| {
-        rule.status == ExpirationStatus::from_static(ExpirationStatus::ENABLED)
-            && rule.abort_incomplete_multipart_upload.is_some()
-    })
+fn lifecycle_has_abort_multipart_rules(config: &PersistedLifecycleConfiguration) -> bool {
+    config
+        .rules
+        .iter()
+        .any(|rule| rule.status == "Enabled" && rule.abort_incomplete_multipart_upload.is_some())
 }
 
 #[derive(Clone, Default)]
@@ -1357,28 +1386,30 @@ pub struct DefaultBucketUsecase {
     context: Option<Arc<AppContext>>,
 }
 
-async fn await_bucket_usecase_on_fresh_task<T, F>(operation: &'static str, future: F) -> S3Result<T>
+async fn await_bucket_usecase_on_fresh_task<T, F, MakeFuture>(operation: &'static str, make_future: MakeFuture) -> S3Result<T>
 where
     T: Send + 'static,
     F: Future<Output = S3Result<T>> + Send + 'static,
+    MakeFuture: FnOnce(OwnedSemaphorePermit) -> F + Send + 'static,
 {
-    await_bucket_usecase_on_fresh_task_with_admission(operation, Arc::clone(&BUCKET_OPERATION_ADMISSION), future).await
+    await_bucket_usecase_on_fresh_task_with_admission(operation, Arc::clone(&BUCKET_OPERATION_ADMISSION), make_future).await
 }
 
-async fn await_bucket_usecase_on_fresh_task_with_admission<T, F>(
+async fn await_bucket_usecase_on_fresh_task_with_admission<T, F, MakeFuture>(
     operation: &'static str,
     admission: Arc<BucketOperationAdmission>,
-    future: F,
+    make_future: MakeFuture,
 ) -> S3Result<T>
 where
     T: Send + 'static,
     F: Future<Output = S3Result<T>> + Send + 'static,
+    MakeFuture: FnOnce(OwnedSemaphorePermit) -> F + Send + 'static,
 {
-    let permit = admission.acquire(operation).await?;
+    let (mutation_permit, in_flight) = admission.acquire(operation).await?;
     tokio::spawn(
         async move {
-            let _permit = permit;
-            future.await
+            let _in_flight = in_flight;
+            make_future(mutation_permit).await
         }
         .in_current_span(),
     )
@@ -1421,11 +1452,19 @@ impl DefaultBucketUsecase {
     )]
     pub async fn execute_create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
         let usecase = self.clone();
-        await_bucket_usecase_on_fresh_task("bucket creation", async move { usecase.execute_create_bucket_inner(req).await }).await
+        await_bucket_usecase_on_fresh_task("bucket creation", move |mutation_permit| async move {
+            usecase.execute_create_bucket_inner(req, mutation_permit).await
+        })
+        .await
     }
 
-    async fn execute_create_bucket_inner(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
+    async fn execute_create_bucket_inner(
+        &self,
+        req: S3Request<CreateBucketInput>,
+        mutation_permit: OwnedSemaphorePermit,
+    ) -> S3Result<S3Response<CreateBucketOutput>> {
         let helper = OperationHelper::new(&req, EventName::BucketCreated, S3Operation::CreateBucket);
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let requester_is_owner = match req_info_ref(&req) {
             Ok(r) => r.is_owner,
             Err(_) => {
@@ -1469,12 +1508,35 @@ impl DefaultBucketUsecase {
         })
         .await?;
 
+        // The storage/site mutation and its lock fences have finished. Keep
+        // the operation's in-flight slot while peers reload, without holding
+        // an execution slot needed by other creates and deletes.
+        drop(mutation_permit);
+
         match make_result {
-            Ok(()) => {}
+            Ok(()) => {
+                // A peer may have cached this bucket as missing before the
+                // create. Refresh peer metadata after the namespace and
+                // metadata commit fences are released so the peer reload can
+                // acquire its bucket namespace read lock without an ABBA
+                // interleaving with creation.
+                notify_bucket_metadata_reload_with_context(
+                    bucket.clone(),
+                    "create bucket",
+                    request_context,
+                    false,
+                    self.context.clone(),
+                )
+                .await;
+            }
             Err(StorageError::BucketExists(_)) => {
-                // Per S3 spec: bucket namespace is global. Owner recreating returns 200 OK;
-                // non-owner gets 409 BucketAlreadyExists.
-                let result = create_bucket_exists_response(requester_is_owner);
+                // Match AWS CreateBucket semantics: an owned bucket is idempotent in
+                // us-east-1 and returns BucketAlreadyOwnedByYou elsewhere.
+                let region = self
+                    .global_region()
+                    .map(|region| region.to_string())
+                    .unwrap_or_else(|| RUSTFS_REGION.to_string());
+                let result = create_bucket_exists_response(requester_is_owner, &region);
                 let _ = helper.complete(&result);
                 return result;
             }
@@ -1495,7 +1557,11 @@ impl DefaultBucketUsecase {
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
         let usecase = self.clone();
-        await_bucket_usecase_on_fresh_task("bucket deletion", async move { usecase.execute_delete_bucket_inner(req).await }).await
+        await_bucket_usecase_on_fresh_task("bucket deletion", move |mutation_permit| async move {
+            let _mutation_permit = mutation_permit;
+            usecase.execute_delete_bucket_inner(req).await
+        })
+        .await
     }
 
     async fn execute_delete_bucket_inner(
@@ -1994,7 +2060,7 @@ impl DefaultBucketUsecase {
     pub async fn execute_get_bucket_lifecycle_configuration(
         &self,
         req: S3Request<GetBucketLifecycleConfigurationInput>,
-    ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
+    ) -> S3Result<PersistedLifecycleConfiguration> {
         let GetBucketLifecycleConfigurationInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -2006,8 +2072,8 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let rules = match metadata_sys::get_lifecycle_config(&bucket).await {
-            Ok((cfg, _)) => cfg.rules,
+        let config = match metadata_sys::get_lifecycle_config(&bucket).await {
+            Ok((cfg, _)) => cfg,
             Err(StorageError::ConfigNotFound) => {
                 return Err(s3_error!(NoSuchLifecycleConfiguration));
             }
@@ -2015,10 +2081,7 @@ impl DefaultBucketUsecase {
             Err(err) => return Err(ApiError::from(err).into()),
         };
 
-        Ok(S3Response::new(GetBucketLifecycleConfigurationOutput {
-            rules: Some(rules),
-            ..Default::default()
-        }))
+        Ok(config)
     }
 
     pub async fn execute_get_bucket_notification_configuration(
@@ -2391,6 +2454,7 @@ impl DefaultBucketUsecase {
     pub async fn execute_put_bucket_lifecycle_configuration(
         &self,
         req: S3Request<PutBucketLifecycleConfigurationInput>,
+        prepared_configuration: std::io::Result<Option<PersistedLifecycleConfiguration>>,
     ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
@@ -2400,9 +2464,9 @@ impl DefaultBucketUsecase {
             ..
         } = req.input;
 
-        let Some(mut input_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
-        assign_lifecycle_rule_ids(&mut input_cfg.rules);
-        if let Err(err) = validate_lifecycle_rule_status(&input_cfg.rules) {
+        let Some(mut wire_cfg) = lifecycle_configuration else { return Err(s3_error!(InvalidArgument)) };
+        assign_lifecycle_rule_ids(&mut wire_cfg.rules);
+        if let Err(err) = validate_lifecycle_rule_status(&wire_cfg.rules) {
             return Err(S3Error::with_message(S3ErrorCode::MalformedXML, format!("Malformed XML: {err}")));
         }
 
@@ -2422,6 +2486,20 @@ impl DefaultBucketUsecase {
             }
         };
 
+        // Keep conversion failures behind the request-boundary status and Object Lock checks.
+        let Some(mut input_cfg) = prepared_configuration.map_err(to_internal_error)? else {
+            return Err(rustfs_s3_types::s3_error!(InvalidArgument).into());
+        };
+        if input_cfg.rules.len() != wire_cfg.rules.len() {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "lifecycle conversion changed the rule count",
+            ));
+        }
+        for (rule, wire_rule) in input_cfg.rules.iter_mut().zip(&wire_cfg.rules) {
+            rule.id.clone_from(&wire_rule.id);
+        }
+
         if let Err(err) = validate_lifecycle_config(&input_cfg, &rcfg).await {
             return Err(lifecycle_validation_error(&err));
         }
@@ -2438,14 +2516,28 @@ impl DefaultBucketUsecase {
         let previous_expiry_updated_at = match metadata_sys::get_lifecycle_config(&bucket).await {
             Ok((previous, _)) => {
                 if lifecycle_rules_have_expiry(&input_cfg) || lifecycle_rules_have_expiry(&previous) {
-                    Some(Timestamp::from(time::OffsetDateTime::now_utc()))
+                    Some(
+                        time::OffsetDateTime::now_utc()
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .map_err(to_internal_error)?,
+                    )
                 } else {
                     previous.expiry_updated_at
                 }
             }
             // No previous config (or unreadable): stamping is the
             // conservative pre-existing behavior.
-            Err(_) => lifecycle_rules_have_expiry(&input_cfg).then(|| Timestamp::from(time::OffsetDateTime::now_utc())),
+            Err(_) => {
+                if lifecycle_rules_have_expiry(&input_cfg) {
+                    Some(
+                        time::OffsetDateTime::now_utc()
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .map_err(to_internal_error)?,
+                    )
+                } else {
+                    None
+                }
+            }
         };
         input_cfg.expiry_updated_at = previous_expiry_updated_at;
         let data = serialize_config(&input_cfg)?;
@@ -2463,8 +2555,10 @@ impl DefaultBucketUsecase {
         // out-rank newer peer expiry state at the receivers.
         item.expiry_updated_at = input_cfg
             .expiry_updated_at
-            .clone()
-            .map(time::OffsetDateTime::from)
+            .as_deref()
+            .map(|value| time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339))
+            .transpose()
+            .map_err(to_internal_error)?
             .or(Some(time::OffsetDateTime::UNIX_EPOCH));
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
             warn!(bucket = %bucket, error = ?err, "site replication bucket lifecycle hook failed");
@@ -3223,8 +3317,8 @@ mod tests {
         PersistedEncryptionConfiguration, PersistedReplicationDestination, PersistedReplicationRule,
     };
     use s3s::dto::{
-        BucketVersioningStatus, CORSConfiguration, ExcludedPrefix, FilterRule, FilterRuleName, LifecycleExpiration,
-        NoncurrentVersionTransition, PublicAccessBlockConfiguration, QueueConfiguration, S3KeyFilter,
+        BucketLifecycleConfiguration, BucketVersioningStatus, CORSConfiguration, ExcludedPrefix, FilterRule, FilterRuleName,
+        LifecycleExpiration, NoncurrentVersionTransition, PublicAccessBlockConfiguration, QueueConfiguration, S3KeyFilter,
         ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Transition,
         TransitionStorageClass,
     };
@@ -3321,7 +3415,8 @@ mod tests {
         let parent = tokio::spawn(await_bucket_usecase_on_fresh_task_with_admission(
             "test bucket operation",
             admission.clone(),
-            async move {
+            move |mutation_permit| async move {
+                drop(mutation_permit);
                 committed_for_task.notify_one();
                 release_hook_for_task.notified().await;
                 hook_ran_for_task.store(true, Ordering::SeqCst);
@@ -3333,6 +3428,8 @@ mod tests {
 
         parent.abort();
         let _ = parent.await;
+        assert_eq!(admission.active.available_permits(), 1);
+        assert_eq!(admission.in_flight.available_permits(), 1, "cancelled post-commit work stays bounded");
         release_hook.notify_waiters();
         tokio::time::timeout(Duration::from_secs(1), finished_wait)
             .await
@@ -3343,6 +3440,137 @@ mod tests {
             "the fresh task must own both the storage mutation and its post-commit hooks"
         );
         assert_eq!(admission.active.available_permits(), 1);
+        assert_eq!(admission.in_flight.available_permits(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bucket_usecase_admission_releases_execution_during_slow_post_commit_work() {
+        let admission = Arc::new(BucketOperationAdmission::new(
+            BUCKET_OPERATION_CONCURRENCY,
+            BUCKET_OPERATION_QUEUE_CAPACITY,
+        ));
+        let active_mutations = Arc::new(AtomicUsize::new(0));
+        let peak_mutations = Arc::new(AtomicUsize::new(0));
+        let (committed_tx, mut committed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = Vec::new();
+        for _ in 0..100 {
+            let active = active_mutations.clone();
+            let peak = peak_mutations.clone();
+            let committed = committed_tx.clone();
+            tasks.push(tokio::spawn(await_bucket_usecase_on_fresh_task_with_admission(
+                "bucket creation",
+                admission.clone(),
+                move |mutation_permit| async move {
+                    let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(count, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    drop(mutation_permit);
+                    committed.send(()).expect("record commit");
+                    tokio::time::sleep(Duration::from_secs(4)).await;
+                    Ok(())
+                },
+            )));
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for _ in 0..100 {
+                committed_rx.recv().await.expect("every mutation commits");
+            }
+        })
+        .await
+        .expect("peer reloads must not serialize subsequent mutations");
+        assert_eq!(peak_mutations.load(Ordering::SeqCst), BUCKET_OPERATION_CONCURRENCY);
+        assert!(
+            tasks.iter().all(|task| !task.is_finished()),
+            "requests must still await their post-commit work"
+        );
+        assert_eq!(admission.active.available_permits(), BUCKET_OPERATION_CONCURRENCY);
+        assert_eq!(
+            admission.in_flight.available_permits(),
+            BUCKET_OPERATION_CONCURRENCY + BUCKET_OPERATION_QUEUE_CAPACITY - 100
+        );
+
+        await_bucket_usecase_on_fresh_task_with_admission("bucket deletion", admission.clone(), |mutation_permit| async move {
+            let _mutation_permit = mutation_permit;
+            Ok(())
+        })
+        .await
+        .expect("deletion can execute while creates await peer reloads");
+        for task in tasks {
+            task.await.expect("request joins").expect("queued creation succeeds");
+        }
+        assert_eq!(
+            admission.in_flight.available_permits(),
+            BUCKET_OPERATION_CONCURRENCY + BUCKET_OPERATION_QUEUE_CAPACITY
+        );
+    }
+
+    #[tokio::test]
+    async fn bucket_usecase_admission_bounds_post_commit_work_after_request_cancellation() {
+        let admission = Arc::new(BucketOperationAdmission::new(1, 1));
+        let release = Arc::new(Semaphore::new(0));
+        let (committed_tx, mut committed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (finished_tx, mut finished_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut parents = Vec::new();
+        for _ in 0..2 {
+            let release = release.clone();
+            let committed = committed_tx.clone();
+            let finished = finished_tx.clone();
+            parents.push(tokio::spawn(await_bucket_usecase_on_fresh_task_with_admission(
+                "bucket creation",
+                admission.clone(),
+                move |mutation_permit| async move {
+                    drop(mutation_permit);
+                    committed.send(()).expect("record commit");
+                    release.acquire().await.expect("release hook").forget();
+                    finished.send(()).expect("record completion");
+                    Ok(())
+                },
+            )));
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for _ in 0..2 {
+                committed_rx.recv().await.expect("operation commits");
+            }
+        })
+        .await
+        .expect("both operations reach post-commit work");
+        for parent in parents {
+            parent.abort();
+            assert!(parent.await.expect_err("caller cancelled").is_cancelled());
+        }
+        assert_eq!(admission.active.available_permits(), 1);
+        assert_eq!(admission.in_flight.available_permits(), 0);
+        let started = Arc::new(AtomicBool::new(false));
+        let started_for_task = started.clone();
+        let error = await_bucket_usecase_on_fresh_task_with_admission(
+            "bucket creation",
+            admission.clone(),
+            move |mutation_permit| async move {
+                let _mutation_permit = mutation_permit;
+                started_for_task.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("unfinished hooks consume the total operation budget");
+        assert_eq!(error.code(), &S3ErrorCode::SlowDown);
+        assert_eq!(error.message(), Some("bucket creation in-flight limit reached; retry later"));
+        assert_eq!(error.headers().expect("retry headers")[http::header::RETRY_AFTER], "1");
+        assert!(!started.load(Ordering::SeqCst));
+        release.add_permits(2);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for _ in 0..2 {
+                finished_rx.recv().await.expect("detached hook completes");
+            }
+            while admission.in_flight.available_permits() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("capacity recovers after hooks complete");
+        let permits = admission.acquire("bucket deletion").await.expect("new operation is admitted");
+        drop(permits);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3351,16 +3579,22 @@ mod tests {
         let held = admission.active.clone().acquire_owned().await.expect("hold active slot");
         let started = Arc::new(AtomicBool::new(false));
         let started_for_task = started.clone();
-        let result = await_bucket_usecase_on_fresh_task_with_admission("test bucket operation", admission.clone(), async move {
-            started_for_task.store(true, Ordering::SeqCst);
-            Ok(())
-        })
+        let result = await_bucket_usecase_on_fresh_task_with_admission(
+            "test bucket operation",
+            admission.clone(),
+            move |mutation_permit| async move {
+                let _mutation_permit = mutation_permit;
+                started_for_task.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
         .await;
         let error = result.expect_err("queued request must time out");
         assert_eq!(error.code(), &S3ErrorCode::SlowDown);
         assert_eq!(error.headers().expect("retry headers")[http::header::RETRY_AFTER], "1");
         assert!(!started.load(Ordering::SeqCst), "timed-out work must not start");
         assert_eq!(admission.waiting.available_permits(), 1);
+        assert_eq!(admission.in_flight.available_permits(), 2);
         drop(held);
         assert_eq!(admission.active.available_permits(), 1);
     }
@@ -3381,7 +3615,8 @@ mod tests {
             tasks.push(tokio::spawn(await_bucket_usecase_on_fresh_task_with_admission(
                 "test bucket operation",
                 admission_for_task,
-                async move {
+                move |mutation_permit| async move {
+                    let _mutation_permit = mutation_permit;
                     started_for_task.fetch_add(1, Ordering::SeqCst);
                     release_for_task.acquire().await.expect("release gate").forget();
                     Ok(())
@@ -3416,7 +3651,8 @@ mod tests {
         let queued = tokio::spawn(await_bucket_usecase_on_fresh_task_with_admission(
             "test bucket operation",
             admission.clone(),
-            async move {
+            move |mutation_permit| async move {
+                let _mutation_permit = mutation_permit;
                 started_for_task.store(true, Ordering::SeqCst);
                 Ok(())
             },
@@ -3443,35 +3679,58 @@ mod tests {
         queued.abort();
         assert!(queued.await.expect_err("queued request was cancelled").is_cancelled());
         assert_eq!(admission.waiting.available_permits(), 1);
+        assert_eq!(admission.in_flight.available_permits(), 2);
         drop(held);
         assert!(!started.load(Ordering::SeqCst), "cancelled waiter must not mutate storage");
-        await_bucket_usecase_on_fresh_task_with_admission("test bucket operation", admission, async { Ok(()) })
-            .await
-            .expect("admission recovers after cancellation");
+        await_bucket_usecase_on_fresh_task_with_admission("test bucket operation", admission, |mutation_permit| async move {
+            let _mutation_permit = mutation_permit;
+            Ok(())
+        })
+        .await
+        .expect("admission recovers after cancellation");
     }
 
     #[tokio::test]
     async fn bucket_usecase_admission_maps_closed_semaphore_to_internal_error() {
-        let admission = BucketOperationAdmission::new(1, 1);
-        admission.active.close();
-        let error = admission
-            .acquire("test bucket operation")
-            .await
-            .expect_err("closed admission must fail");
-        assert_eq!(error.code(), &S3ErrorCode::InternalError);
+        for close_in_flight in [false, true] {
+            let admission = BucketOperationAdmission::new(1, 1);
+            if close_in_flight {
+                admission.in_flight.close();
+            } else {
+                admission.active.close();
+            }
+            let error = admission
+                .acquire("test bucket operation")
+                .await
+                .expect_err("closed admission must fail");
+            assert_eq!(error.code(), &S3ErrorCode::InternalError);
+            assert_eq!(admission.in_flight.available_permits(), 2);
+        }
     }
 
     #[tokio::test]
     async fn bucket_usecase_task_maps_panics_to_internal_errors() {
-        async fn panicking_bucket_operation() -> S3Result<()> {
-            panic!("injected bucket task panic");
+        for post_commit in [false, true] {
+            let admission = Arc::new(BucketOperationAdmission::new(1, 1));
+            let result: S3Result<()> = await_bucket_usecase_on_fresh_task_with_admission(
+                "test bucket operation",
+                admission.clone(),
+                move |mutation_permit| async move {
+                    let mut mutation_permit = Some(mutation_permit);
+                    if post_commit {
+                        drop(mutation_permit.take());
+                    }
+                    panic!("injected bucket task panic");
+                },
+            )
+            .await;
+
+            let err = result.expect_err("a bucket task panic must be returned as an error");
+            assert_eq!(err.code(), &S3ErrorCode::InternalError);
+            assert!(err.message().is_some_and(|message| message.contains("task failed")));
+            assert_eq!(admission.active.available_permits(), 1);
+            assert_eq!(admission.in_flight.available_permits(), 2);
         }
-
-        let result = await_bucket_usecase_on_fresh_task("test bucket operation", panicking_bucket_operation()).await;
-
-        let err = result.expect_err("a bucket task panic must be returned as an error");
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-        assert!(err.message().is_some_and(|message| message.contains("task failed")));
     }
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
@@ -3495,30 +3754,46 @@ mod tests {
     }
 
     fn usecase_method_source<'a>(source: &'a str, method: &str) -> &'a str {
-        let start_marker = format!("pub async fn {method}");
-        let start = source.find(&start_marker).expect("method should exist");
-        let rest = &source[start + start_marker.len()..];
-        let end = rest.find("\n    pub async fn ").unwrap_or(rest.len());
+        let public_start_marker = format!("pub async fn {method}");
+        let private_start_marker = format!("async fn {method}");
+        let (start, marker_len) = if let Some(start) = source.find(&public_start_marker) {
+            (start, public_start_marker.len())
+        } else {
+            let start = source.find(&private_start_marker).expect("method should exist");
+            (start, private_start_marker.len())
+        };
+        let rest = &source[start + marker_len..];
+        let end = [rest.find("\n    pub async fn "), rest.find("\n    async fn ")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(rest.len());
         &rest[..end]
     }
 
     #[test]
     fn bucket_create_and_delete_use_admitted_fresh_tasks() {
         let source = include_str!("bucket_usecase.rs");
-        for (method, operation, inner_method) in [
-            ("execute_create_bucket", "bucket creation", "execute_create_bucket_inner"),
-            ("execute_delete_bucket", "bucket deletion", "execute_delete_bucket_inner"),
+        for (method, operation, inner_call) in [
+            (
+                "execute_create_bucket",
+                "bucket creation",
+                "execute_create_bucket_inner(req, mutation_permit).await",
+            ),
+            ("execute_delete_bucket", "bucket deletion", "execute_delete_bucket_inner(req).await"),
         ] {
             let body = usecase_method_source(source, method);
             assert!(
                 body.contains(&format!("await_bucket_usecase_on_fresh_task(\"{operation}\"")),
                 "{method} must use bounded detached-task admission"
             );
-            assert!(
-                body.contains(&format!("{inner_method}(req).await")),
-                "{method} must run its mutation inside the admitted task"
-            );
+            assert!(body.contains(inner_call), "{method} must run its mutation inside the admitted task");
         }
+        let create_body = usecase_method_source(source, "execute_create_bucket_inner");
+        assert!(
+            create_body.contains("notify_bucket_metadata_reload_with_context("),
+            "a successful bucket creation must refresh peer metadata caches"
+        );
     }
 
     #[test]
@@ -4073,14 +4348,20 @@ mod tests {
 
     #[test]
     fn create_bucket_exists_response_returns_ok_for_owner() {
-        let response = create_bucket_exists_response(true).expect("owner recreate should succeed");
+        let response = create_bucket_exists_response(true, RUSTFS_REGION).expect("owner recreate in us-east-1 should succeed");
         assert_eq!(response.output.location, None);
     }
 
     #[test]
     fn create_bucket_exists_response_returns_bucket_already_exists_for_non_owner() {
-        let err = create_bucket_exists_response(false).expect_err("non-owner recreate should fail");
+        let err = create_bucket_exists_response(false, RUSTFS_REGION).expect_err("non-owner recreate should fail");
         assert_eq!(err.code(), &S3ErrorCode::BucketAlreadyExists);
+    }
+
+    #[test]
+    fn create_bucket_exists_response_returns_owned_by_you_outside_us_east_1() {
+        let err = create_bucket_exists_response(true, "eu-west-1").expect_err("owner recreate outside us-east-1 should fail");
+        assert_eq!(err.code(), &S3ErrorCode::BucketAlreadyOwnedByYou);
     }
 
     #[test]
@@ -4379,18 +4660,18 @@ mod tests {
         // the real validator here, so the mapping cannot drift from it
         // (backlog#2201).
         let malformed = validate_lifecycle_config(
-            &BucketLifecycleConfiguration {
+            &rustfs_gateway_types::persistence::PersistedLifecycleConfiguration {
                 expiry_updated_at: None,
-                rules: vec![LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
-                    expiration: Some(LifecycleExpiration {
+                rules: vec![rustfs_gateway_types::persistence::PersistedLifecycleRule {
+                    status: "Enabled".to_owned(),
+                    expiration: Some(rustfs_gateway_types::persistence::PersistedLifecycleExpiration {
                         days: Some(1),
                         ..Default::default()
                     }),
                     abort_incomplete_multipart_upload: None,
                     del_marker_expiration: None,
-                    filter: Some(s3s::dto::LifecycleRuleFilter {
-                        and: Some(s3s::dto::LifecycleRuleAndOperator {
+                    filter: Some(rustfs_gateway_types::persistence::PersistedLifecycleFilter {
+                        and: Some(rustfs_gateway_types::persistence::PersistedLifecycleAnd {
                             prefix: Some("logs/".to_string()),
                             ..Default::default()
                         }),
@@ -4410,19 +4691,21 @@ mod tests {
         assert_eq!(*lifecycle_validation_error(&malformed).code(), S3ErrorCode::MalformedXML);
 
         let invalid_value = validate_lifecycle_config(
-            &BucketLifecycleConfiguration {
+            &rustfs_gateway_types::persistence::PersistedLifecycleConfiguration {
                 expiry_updated_at: None,
-                rules: vec![LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                rules: vec![rustfs_gateway_types::persistence::PersistedLifecycleRule {
+                    status: "Enabled".to_owned(),
                     expiration: None,
                     abort_incomplete_multipart_upload: None,
                     del_marker_expiration: None,
                     filter: None,
                     id: Some("negative-count".to_string()),
-                    noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
-                        noncurrent_days: Some(30),
-                        newer_noncurrent_versions: Some(-1),
-                    }),
+                    noncurrent_version_expiration: Some(
+                        rustfs_gateway_types::persistence::PersistedNoncurrentVersionExpiration {
+                            noncurrent_days: Some(30),
+                            newer_noncurrent_versions: Some(-1),
+                        },
+                    ),
                     noncurrent_version_transitions: None,
                     prefix: None,
                     transitions: None,
@@ -4478,7 +4761,9 @@ mod tests {
             }],
         };
 
-        assert!(!lifecycle_has_transition_rules(&config));
+        assert!(!lifecycle_has_transition_rules(
+            &crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s(config).unwrap()
+        ));
     }
 
     #[test]
@@ -4503,7 +4788,9 @@ mod tests {
             }],
         };
 
-        assert!(lifecycle_has_transition_rules(&config));
+        assert!(lifecycle_has_transition_rules(
+            &crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s(config).unwrap()
+        ));
     }
 
     #[test]
@@ -4526,8 +4813,12 @@ mod tests {
             }],
         };
 
-        assert!(lifecycle_has_abort_multipart_rules(&config));
-        assert!(!lifecycle_has_expiry_rules(&config));
+        assert!(lifecycle_has_abort_multipart_rules(
+            &crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s(config.clone()).unwrap()
+        ));
+        assert!(!lifecycle_has_expiry_rules(
+            &crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s(config).unwrap()
+        ));
     }
 
     #[tokio::test]
@@ -5121,7 +5412,16 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_put_bucket_lifecycle_configuration(req).await.unwrap_err();
+        let prepared = req
+            .input
+            .lifecycle_configuration
+            .clone()
+            .map(crate::storage::s3_compat::lifecycle::lifecycle_configuration_from_s3s)
+            .transpose();
+        let err = usecase
+            .execute_put_bucket_lifecycle_configuration(req, prepared)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 

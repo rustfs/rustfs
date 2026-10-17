@@ -17,7 +17,8 @@ use crate::storage::storage_api::rpc_consumer::node_service::contract::bucket::{
     BucketOptions, DeleteBucketOptions, MakeBucketOptions,
 };
 use crate::storage::storage_api::rpc_consumer::node_service::{
-    DiskError, StoragePeerS3ClientExt as _, decode_heal_bucket_rpc_options, reload_bucket_metadata, remove_bucket_metadata,
+    DiskError, StoragePeerS3ClientExt as _, decode_heal_bucket_rpc_options, reload_bucket_metadata,
+    remove_bucket_metadata_if_absent,
 };
 use rustfs_protos::proto_gen::node_service::*;
 use tonic::{Request, Response, Status};
@@ -38,9 +39,16 @@ impl NodeService {
             }));
         }
 
-        // Drop the bucket's cached metadata on this peer so it stops serving
-        // stale configuration after the bucket has been deleted.
-        match remove_bucket_metadata(&bucket).await {
+        // Drop the bucket's cached metadata only if the namespace is still
+        // absent. A delayed delete notification must not erase metadata for a
+        // same-name bucket that has already been recreated.
+        let Some(store) = self.resolve_object_store() else {
+            return Ok(Response::new(DeleteBucketMetadataResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
+        };
+        match remove_bucket_metadata_if_absent(store, &bucket).await {
             Ok(_) => Ok(Response::new(DeleteBucketMetadataResponse {
                 success: true,
                 error_info: None,

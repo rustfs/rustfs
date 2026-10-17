@@ -56,8 +56,8 @@ metrics.workspace = true
 rustfs-scanner-metrics.workspace = true
 rustfs-config = { workspace = true, features = ["constants"] }
 rustfs-replication.workspace = true
+rustfs-gateway-types.workspace = true
 rustfs-storage-api.workspace = true
-s3s = { workspace = true, features = ["minio"] }
 time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
 tracing.workspace = true
 uuid = { workspace = true, features = ["v4", "serde", "fast-rng", "macro-diagnostics"] }

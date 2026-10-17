@@ -92,3 +92,125 @@ impl TlsSource {
         Ok(self.base_dir.as_path())
     }
 }
+
+/// A directory generation resolved once before loading any TLS material.
+///
+/// Projected Kubernetes volumes are read through their physical `..data`
+/// directory. Ordinary directory and certificate-file symlinks remain supported
+/// for layouts such as Certbot. Writers must keep pinned generations immutable.
+#[derive(Debug, Clone)]
+pub struct TlsSourceSnapshot {
+    source: TlsSource,
+    resolved_source: TlsSource,
+}
+
+impl TlsSource {
+    pub fn snapshot(&self) -> Result<TlsSourceSnapshot, TlsRuntimeError> {
+        self.validate_directory()?;
+        let mut resolved_source = self.clone();
+        let root = std::fs::canonicalize(&self.base_dir).map_err(|source| TlsRuntimeError::SourceIo {
+            path: self.base_dir.clone(),
+            source,
+        })?;
+        let projection = root.join("..data");
+        resolved_source.base_dir = match std::fs::symlink_metadata(&projection) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                std::fs::canonicalize(&projection).map_err(|source| TlsRuntimeError::SourceIo {
+                    path: projection,
+                    source,
+                })?
+            }
+            Ok(_) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => root,
+            Err(source) => {
+                return Err(TlsRuntimeError::SourceIo {
+                    path: projection,
+                    source,
+                });
+            }
+        };
+        resolved_source.validate_directory()?;
+        Ok(TlsSourceSnapshot {
+            source: self.clone(),
+            resolved_source,
+        })
+    }
+}
+
+impl TlsSourceSnapshot {
+    pub fn source(&self) -> &TlsSource {
+        &self.source
+    }
+
+    pub fn resolved_source(&self) -> &TlsSource {
+        &self.resolved_source
+    }
+
+    pub fn base_dir(&self) -> &Path {
+        &self.resolved_source.base_dir
+    }
+
+    /// Missing optional files are allowed only while the pinned source exists.
+    pub(crate) fn validate_available(&self) -> Result<(), TlsRuntimeError> {
+        std::fs::read_dir(self.base_dir()).map_err(|source| TlsRuntimeError::SourceIo {
+            path: self.base_dir().to_path_buf(),
+            source,
+        })?;
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use tempfile::TempDir;
+
+    #[test]
+    fn source_snapshot_pins_kubernetes_projection_generation() {
+        let dir = TempDir::new().expect("create projection directory");
+        for generation in ["..generation-a", "..generation-b"] {
+            fs::create_dir(dir.path().join(generation)).expect("create generation");
+            fs::write(dir.path().join(generation).join("marker"), generation).expect("write generation marker");
+        }
+        symlink("..generation-a", dir.path().join("..data")).expect("link initial generation");
+        symlink("..data/marker", dir.path().join("marker")).expect("link projected file");
+        let pinned = TlsSource::from_directory(dir.path()).snapshot().expect("pin projection");
+        symlink("..generation-b", dir.path().join("..next-data")).expect("link next generation");
+        fs::rename(dir.path().join("..next-data"), dir.path().join("..data")).expect("swap projection");
+        assert_eq!(
+            fs::read_to_string(pinned.base_dir().join("marker")).expect("read pinned file"),
+            "..generation-a"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("marker")).expect("read current projection"),
+            "..generation-b"
+        );
+    }
+
+    #[test]
+    fn source_snapshot_pins_tls_path_directory_symlink() {
+        let dir = TempDir::new().expect("create TLS directory");
+        fs::create_dir(dir.path().join("a")).expect("create generation A");
+        fs::create_dir(dir.path().join("b")).expect("create generation B");
+        symlink("a", dir.path().join("live")).expect("link generation A");
+        let pinned = TlsSource::from_directory(dir.path().join("live"))
+            .snapshot()
+            .expect("pin TLS source");
+        fs::remove_file(dir.path().join("live")).expect("unlink source");
+        symlink("b", dir.path().join("live")).expect("link generation B");
+        assert_eq!(pinned.base_dir(), fs::canonicalize(dir.path().join("a")).expect("resolve generation A"));
+    }
+
+    #[test]
+    fn source_snapshot_rejects_disappeared_generation() {
+        let dir = TempDir::new().expect("create TLS directory");
+        let generation = dir.path().join("..generation");
+        fs::create_dir(&generation).expect("create generation");
+        symlink("..generation", dir.path().join("..data")).expect("link generation");
+        let pinned = TlsSource::from_directory(dir.path()).snapshot().expect("pin TLS source");
+        fs::remove_dir(&generation).expect("remove pinned generation");
+        assert!(matches!(pinned.validate_available(), Err(TlsRuntimeError::SourceIo { .. })));
+    }
+}

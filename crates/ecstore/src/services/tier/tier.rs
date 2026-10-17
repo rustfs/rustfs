@@ -80,11 +80,11 @@ use crate::{
     store::ECStore,
 };
 use rustfs_filemeta::FileInfo;
+use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration;
 use rustfs_rio::HashReader;
 use rustfs_s3_client::{admin_handler_utils::AdminError, provider_versions::ProviderVersionCapabilities};
 use rustfs_s3_types::S3ErrorCode;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join};
-use s3s::dto::BucketLifecycleConfiguration;
 
 use super::{
     tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_PERM_ERR},
@@ -1037,7 +1037,7 @@ trait TierReferenceProofStore:
         .await
     }
 
-    async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<BucketLifecycleConfiguration>>;
+    async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<PersistedLifecycleConfiguration>>;
 
     async fn authoritative_bucket_tier_reference(
         self: Arc<Self>,
@@ -1077,7 +1077,7 @@ impl TierReferenceProofStore for ECStore {
         Ok(buckets.into_values().collect())
     }
 
-    async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<BucketLifecycleConfiguration>> {
+    async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<PersistedLifecycleConfiguration>> {
         match get_lifecycle_config(bucket).await {
             Ok((config, _updated_at)) => Ok(Some(config)),
             Err(Error::ConfigNotFound) => Ok(None),
@@ -1339,7 +1339,7 @@ struct TierLifecycleReference<'a> {
 }
 
 fn lifecycle_config_target_reference<'a>(
-    config: &'a BucketLifecycleConfiguration,
+    config: &'a PersistedLifecycleConfiguration,
     targets: &[TierMutationIntentTarget],
 ) -> Option<TierLifecycleReference<'a>> {
     for rule in &config.rules {
@@ -2271,7 +2271,7 @@ pub(crate) fn tier_destination_id_from_metadata(metadata: &HashMap<String, Strin
         }
         return Ok(None);
     };
-    if encoded.len() != 64 {
+    if encoded.len() != 64 || !encoded.is_ascii() {
         return Err(io::Error::other("transition tier backend identity has an invalid length"));
     }
     let mut identity = [0_u8; 32];
@@ -4722,6 +4722,23 @@ impl TierConfigMgr {
             + NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
             + ListOperations<Error = Error, ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>>,
     {
+        // Periodic and committed-mutation refreshes call this shared entry directly.
+        let reload = Self::reload_handle_inner(handle, api);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let reload = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::TierConfigReload,
+            reload,
+        );
+        reload.await
+    }
+
+    async fn reload_handle_inner<S>(handle: &Arc<RwLock<Self>>, api: Arc<S>) -> io::Result<()>
+    where
+        S: EcstoreObjectIO
+            + EcstoreObjectOperations
+            + NamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
+            + ListOperations<Error = Error, ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>>,
+    {
         // Lock order matches update_candidate_with_config_lock: namespace tier-config lock before admin_updates.
         let mut config_lock: Option<rustfs_lock::NamespaceLockGuard> = None;
         let (snapshot, candidate, recovery_plan, update) = loop {
@@ -6908,9 +6925,8 @@ mod tests {
         endpoints::{Endpoints, PoolEndpoints, SetupType},
     };
     use crate::services::tier::tier_mutation_intent::TIER_MUTATION_INTENT_RECORD_PREFIX;
-    use s3s::dto::{
-        BucketLifecycleConfiguration, ExpirationStatus, LifecycleRule, NoncurrentVersionTransition, Transition,
-        TransitionStorageClass,
+    use rustfs_gateway_types::persistence::{
+        PersistedLifecycleConfiguration, PersistedLifecycleRule, PersistedNoncurrentVersionTransition, PersistedTransition,
     };
 
     #[test]
@@ -7737,7 +7753,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TierReferenceProofStore for LockingTierConfigStore {
-        async fn lifecycle_config_for_reference_proof(&self, _bucket: &str) -> Result<Option<BucketLifecycleConfiguration>> {
+        async fn lifecycle_config_for_reference_proof(&self, _bucket: &str) -> Result<Option<PersistedLifecycleConfiguration>> {
             Ok(None)
         }
     }
@@ -10315,6 +10331,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn intent_advance_retries_cas_conflict_reload_lock_timeout() {
+        let store = Arc::new(CasConfigStore::default());
+        let mutation_id = uuid::Uuid::from_u128(39);
+        let prepared = prepared_remove_intent("COLD-A", mutation_id);
+        crate::services::tier::tier_mutation_intent::save_tier_mutation_intent_record(store.clone(), &prepared)
+            .await
+            .expect("prepared intent fixture should persist");
+
+        let committed = committed_remove_intent("COLD-A", mutation_id, "etag-new");
+        let committed_bytes = committed.encode().expect("committed intent fixture should encode");
+        let object = crate::services::tier::tier_mutation_intent::tier_mutation_intent_record_object_name(mutation_id)
+            .expect("record object should build");
+        let winning_etag = format!("etag-{}", store.next_etag.load(Ordering::SeqCst) + 1);
+        store.rewrite_on_next_if_match(object.clone(), committed_bytes.clone()).await;
+        *store.read_timeout_after_if_match_race.lock().await = Some(object.clone());
+
+        let (observed, applied) = crate::services::tier::tier_mutation_intent::advance_tier_mutation_intent_record_idempotent(
+            store.clone(),
+            mutation_id,
+            TierMutationIntentState::Committed,
+            Some("etag-new".to_string()),
+        )
+        .await
+        .expect("CAS conflict reload should retry its typed lock timeout");
+
+        assert!(!applied);
+        assert_eq!(observed, committed);
+        assert!(store.read_timeout_after_if_match_race.lock().await.is_none());
+        assert_eq!(
+            store.objects.lock().await.get(&object).cloned(),
+            Some((committed_bytes, winning_etag)),
+            "retry must preserve the complete winning record and its object ETag"
+        );
+    }
+
+    #[tokio::test]
     async fn intent_advance_reconciles_matching_commit_after_final_cas_race() {
         let store = Arc::new(CasConfigStore::default());
         let mutation_id = uuid::Uuid::from_u128(37);
@@ -12534,6 +12586,51 @@ mod tests {
         assert!(reloaded.iter().any(|intent| intent.mutation_id == prepared_id));
     }
 
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn diagnostic_reload_shared_entry_preserves_source_and_api() {
+        use crate::api::diagnostic::{ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry};
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, with_isolated_s3_http_operation_context,
+        };
+
+        let store = Arc::new(CasConfigStore::default());
+        empty_mgr()
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("empty tier config fixture should persist");
+        let mut request = S3HttpRequestGuard::new("GET");
+        let get = request.in_scope(|| {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
+            current_s3_http_operation_context().expect("GetObject context should be captured")
+        });
+
+        for (earlier, api) in [(None, None), (Some(ReadVersionEntrySource::ConfigRead), Some(get))] {
+            store.reload_contexts.lock().expect("context recorder").clear();
+            let handle = TierConfigMgr::new();
+            with_isolated_s3_http_operation_context(api, async {
+                let reload = TierConfigMgr::reload_handle_with(&handle, store.clone());
+                if let Some(source) = earlier {
+                    with_read_version_entry(source, reload).await
+                } else {
+                    reload.await
+                }
+            })
+            .await
+            .expect("shared reload entry should load config and scan intents");
+
+            let observed = store.reload_contexts.lock().expect("context recorder");
+            assert!(observed.iter().any(|(boundary, _, _)| *boundary == "reader"));
+            assert!(observed.iter().any(|(boundary, _, _)| *boundary == "list"));
+            let expected = earlier.unwrap_or(ReadVersionEntrySource::TierConfigReload);
+            assert!(observed.iter().all(|(_, source, operation)| {
+                *source == Some(expected) && *operation == api.map(|context| context.operation_name())
+            }));
+            assert_eq!(current_read_version_entry_source(), None);
+            assert_eq!(current_s3_http_operation_context(), None);
+        }
+    }
+
     #[tokio::test]
     async fn reload_handle_keeps_committed_block_until_publish_swaps_generation() {
         let store = Arc::new(CasConfigStore::default());
@@ -14726,11 +14823,21 @@ mod tests {
         release: tokio::sync::Notify,
     }
 
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    type ReloadDiagnosticObservation = (
+        &'static str,
+        Option<rustfs_io_metrics::internode_metrics::ReadVersionEntrySource>,
+        Option<&'static str>,
+    );
+
     #[derive(Debug)]
     struct CasConfigStore {
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        reload_contexts: Mutex<Vec<ReloadDiagnosticObservation>>,
         objects: tokio::sync::Mutex<HashMap<String, (Vec<u8>, String)>>,
         legacy_state: tokio::sync::Mutex<Option<Vec<u8>>>,
         if_match_race_rewrite: tokio::sync::Mutex<std::collections::VecDeque<(String, Vec<u8>)>>,
+        read_timeout_after_if_match_race: tokio::sync::Mutex<Option<String>>,
         next_etag: AtomicUsize,
         content_derived_etags: AtomicBool,
         fail_put: AtomicBool,
@@ -14745,15 +14852,18 @@ mod tests {
         lock_manager: Arc<rustfs_lock::GlobalLockManager>,
         lock_requests: Mutex<Vec<(String, String)>>,
         listed_versions: Mutex<Vec<ObjectInfo>>,
-        lifecycle_configs: Mutex<HashMap<String, BucketLifecycleConfiguration>>,
+        lifecycle_configs: Mutex<HashMap<String, PersistedLifecycleConfiguration>>,
     }
 
     impl Default for CasConfigStore {
         fn default() -> Self {
             Self {
+                #[cfg(feature = "diagnostic-read-version-caller")]
+                reload_contexts: Mutex::new(Vec::new()),
                 objects: tokio::sync::Mutex::new(HashMap::new()),
                 legacy_state: tokio::sync::Mutex::new(None),
                 if_match_race_rewrite: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
+                read_timeout_after_if_match_race: tokio::sync::Mutex::new(None),
                 next_etag: AtomicUsize::new(0),
                 content_derived_etags: AtomicBool::new(false),
                 fail_put: AtomicBool::new(false),
@@ -14802,7 +14912,7 @@ mod tests {
                 .retain(|version| version.bucket != bucket || version.name != object);
         }
 
-        fn add_lifecycle_config(&self, bucket: &str, config: BucketLifecycleConfiguration) {
+        fn add_lifecycle_config(&self, bucket: &str, config: PersistedLifecycleConfiguration) {
             self.lifecycle_configs
                 .lock()
                 .expect("tier reference fixture should not poison")
@@ -14905,6 +15015,25 @@ mod tests {
             _headers: Self::HeaderMap,
             _opts: &Self::ObjectOptions,
         ) -> Result<Self::GetObjectReader> {
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            self.reload_contexts.lock().expect("context recorder").push((
+                "reader",
+                crate::api::diagnostic::current_read_version_entry_source(),
+                rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(),
+            ));
+            {
+                // The queued rewrite keeps the initial read successful. Only
+                // the first target read after that CAS race consumes the fault.
+                let race_completed = self.if_match_race_rewrite.lock().await.is_empty();
+                let mut timeout = self.read_timeout_after_if_match_race.lock().await;
+                if race_completed && timeout.as_deref() == Some(object) {
+                    timeout.take();
+                    return Err(Error::Lock(rustfs_lock::LockError::Timeout {
+                        resource: format!("{bucket}/{object}@latest"),
+                        timeout: std::time::Duration::from_secs(5),
+                    }));
+                }
+            }
             let legacy_config_path = tier_config_path(TIER_CONFIG_LEGACY_FILE);
             let (data, etag) = if object == legacy_config_path {
                 let state = self.legacy_state.lock().await;
@@ -15260,6 +15389,12 @@ mod tests {
             _start_after: Option<String>,
             _incl_deleted: bool,
         ) -> Result<Self::ListObjectsV2Info> {
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            self.reload_contexts.lock().expect("context recorder").push((
+                "list",
+                crate::api::diagnostic::current_read_version_entry_source(),
+                rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(),
+            ));
             if matches!(
                 prefix,
                 crate::services::tier::tier_mutation_intent::TIER_MUTATION_INTENT_RECORD_PREFIX
@@ -15480,7 +15615,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TierReferenceProofStore for CasConfigStore {
-        async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<BucketLifecycleConfiguration>> {
+        async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<PersistedLifecycleConfiguration>> {
             Ok(self
                 .lifecycle_configs
                 .lock()
@@ -15612,10 +15747,10 @@ mod tests {
         });
         store.add_lifecycle_config(
             "photos",
-            BucketLifecycleConfiguration {
+            PersistedLifecycleConfiguration {
                 expiry_updated_at: None,
-                rules: vec![LifecycleRule {
-                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                rules: vec![PersistedLifecycleRule {
+                    status: "Enabled".to_owned(),
                     expiration: None,
                     abort_incomplete_multipart_upload: None,
                     del_marker_expiration: None,
@@ -15624,10 +15759,10 @@ mod tests {
                     noncurrent_version_expiration: None,
                     noncurrent_version_transitions: None,
                     prefix: None,
-                    transitions: Some(vec![Transition {
+                    transitions: Some(vec![PersistedTransition {
                         days: Some(1),
                         date: None,
-                        storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                        storage_class: Some("COLD-A".to_owned()),
                     }]),
                 }],
             },
@@ -16222,10 +16357,10 @@ mod tests {
             .save_tiering_config_if_current(store.clone(), None)
             .await
             .expect("reference proof fixture should persist");
-        let config = BucketLifecycleConfiguration {
+        let config = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
@@ -16234,10 +16369,10 @@ mod tests {
                 noncurrent_version_expiration: None,
                 noncurrent_version_transitions: None,
                 prefix: None,
-                transitions: Some(vec![Transition {
+                transitions: Some(vec![PersistedTransition {
                     days: Some(1),
                     date: None,
-                    storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                    storage_class: Some("COLD-A".to_owned()),
                 }]),
             }],
         };
@@ -16394,10 +16529,10 @@ mod tests {
             old_backend_identity: Some(current_identity),
             new_backend_identity: None,
         };
-        let config = BucketLifecycleConfiguration {
+        let config = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
@@ -16406,10 +16541,10 @@ mod tests {
                 noncurrent_version_expiration: None,
                 noncurrent_version_transitions: None,
                 prefix: None,
-                transitions: Some(vec![Transition {
+                transitions: Some(vec![PersistedTransition {
                     days: Some(1),
                     date: None,
-                    storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                    storage_class: Some("COLD-A".to_owned()),
                 }]),
             }],
         };
@@ -16439,20 +16574,20 @@ mod tests {
             old_backend_identity: Some(current_identity),
             new_backend_identity: None,
         };
-        let config = BucketLifecycleConfiguration {
+        let config = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
                 filter: None,
                 id: Some("move-noncurrent".to_string()),
                 noncurrent_version_expiration: None,
-                noncurrent_version_transitions: Some(vec![NoncurrentVersionTransition {
+                noncurrent_version_transitions: Some(vec![PersistedNoncurrentVersionTransition {
                     noncurrent_days: Some(1),
                     newer_noncurrent_versions: None,
-                    storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                    storage_class: Some("COLD-A".to_owned()),
                 }]),
                 prefix: None,
                 transitions: None,
@@ -16488,10 +16623,10 @@ mod tests {
             old_backend_identity: Some(current_identity),
             new_backend_identity: None,
         };
-        let config = BucketLifecycleConfiguration {
+        let config = PersistedLifecycleConfiguration {
             expiry_updated_at: None,
-            rules: vec![LifecycleRule {
-                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
                 expiration: None,
                 abort_incomplete_multipart_upload: None,
                 del_marker_expiration: None,
@@ -16500,10 +16635,10 @@ mod tests {
                 noncurrent_version_expiration: None,
                 noncurrent_version_transitions: None,
                 prefix: None,
-                transitions: Some(vec![Transition {
+                transitions: Some(vec![PersistedTransition {
                     days: Some(1),
                     date: None,
-                    storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                    storage_class: Some("COLD-A".to_owned()),
                 }]),
             }],
         };

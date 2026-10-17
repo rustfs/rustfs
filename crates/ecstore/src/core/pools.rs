@@ -79,13 +79,13 @@ use rand::RngExt as _;
 use rmp_serde::Deserializer;
 use rmp_serde::Serializer;
 use rustfs_filemeta::{FileInfo, FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
+use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedReplicationConfiguration};
 use rustfs_heal_contracts::heal_channel::HealOpts;
 use rustfs_utils::crypto::{hex_sha256, is_sha256_checksum};
 use rustfs_utils::path::{
     decode_dir_object, encode_dir_object, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path,
 };
-use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
+use s3s::dto::ObjectLockConfiguration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -3692,6 +3692,55 @@ fn activation_pool_meta_lock_error(err: rustfs_lock::LockError) -> Error {
     }
 }
 
+fn rebalance_worker_read_lock_error(err: rustfs_lock::LockError, object: &str) -> Error {
+    match err {
+        rustfs_lock::LockError::QuorumNotReached { required, achieved } => Error::NamespaceLockQuorumUnavailable {
+            mode: "read",
+            bucket: RUSTFS_META_BUCKET.to_string(),
+            object: object.to_string(),
+            required,
+            achieved,
+        },
+        other => Error::Lock(other),
+    }
+}
+
+/// Read-only admission to an already durable rebalance run. Keeping this
+/// separate from the activation writer prevents admission from authorizing a
+/// pool or rebalance metadata write under shared namespace locks.
+pub(crate) struct PoolRebalanceWorkerFence {
+    pool_meta_guard: rustfs_lock::NamespaceLockGuard,
+    rebalance_meta_guard: rustfs_lock::NamespaceLockGuard,
+    fleet_proof: Option<crate::services::notification_sys::CrossPoolFenceFleetProofToken>,
+}
+
+impl PoolRebalanceWorkerFence {
+    pub(crate) fn set_fleet_proof(
+        &mut self,
+        fleet_proof: Option<crate::services::notification_sys::CrossPoolFenceFleetProofToken>,
+    ) {
+        self.fleet_proof = fleet_proof;
+    }
+
+    pub(crate) fn ensure_held(&self) -> Result<()> {
+        if self.pool_meta_guard.is_lock_lost()
+            || self.pool_meta_guard.is_released()
+            || self.rebalance_meta_guard.is_lock_lost()
+            || self.rebalance_meta_guard.is_released()
+        {
+            return Err(Error::other("worker admission lock lost before rebalance activation"));
+        }
+        if self
+            .fleet_proof
+            .as_ref()
+            .is_some_and(|proof| !crate::services::notification_sys::cross_pool_fence_fleet_proof_matches(proof))
+        {
+            return Err(Error::other(POOL_ACTIVATION_FLEET_PROOF_EXPIRED));
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct PoolRebalanceActivationFence {
     pool_meta_guard: Arc<rustfs_lock::NamespaceLockGuard>,
     rebalance_meta_guard: Arc<rustfs_lock::NamespaceLockGuard>,
@@ -3761,6 +3810,35 @@ impl PoolRebalanceActivationFence {
 #[cfg(test)]
 tokio::task_local! {
     pub(crate) static REBALANCE_ACTIVATION_LOCK_ATTEMPT: Arc<tokio::sync::Notify>;
+}
+
+pub(crate) async fn acquire_pool_rebalance_worker_locks<S>(pool: Arc<S>) -> Result<PoolRebalanceWorkerFence>
+where
+    S: crate::storage_api_contracts::namespace::NamespaceLocking<
+            Error = Error,
+            NamespaceLock = rustfs_lock::NamespaceLockWrapper,
+        >,
+{
+    // Match activation and entry admission: rebalance.bin -> pool.bin. Joining
+    // the same durable run must coexist with entries retaining their run fence.
+    let rebalance_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, REBAL_META_NAME).await?;
+    #[cfg(test)]
+    let _ = REBALANCE_ACTIVATION_LOCK_ATTEMPT.try_with(|attempted| attempted.notify_one());
+    let rebalance_meta_guard = rebalance_meta_lock
+        .get_read_lock(get_lock_acquire_timeout())
+        .await
+        .map_err(|err| rebalance_worker_read_lock_error(err, REBAL_META_NAME))?;
+    let pool_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
+    let pool_meta_guard = pool_meta_lock
+        .get_read_lock(get_lock_acquire_timeout())
+        .await
+        .map_err(|err| rebalance_worker_read_lock_error(err, POOL_META_NAME))?;
+
+    Ok(PoolRebalanceWorkerFence {
+        pool_meta_guard,
+        rebalance_meta_guard,
+        fleet_proof: None,
+    })
 }
 
 pub(crate) async fn acquire_pool_rebalance_activation_locks<S>(
@@ -6686,12 +6764,12 @@ fn pool_meta_cas_options(object: &str, token: &PoolMetaCasToken, fence: &PoolMet
     fence.ensure_held()?;
     let mut opts = ObjectOptions {
         max_parity: true,
-        write_completion: crate::object_api::WriteCompletion::TailDrained,
         no_lock: true,
         http_preconditions: Some(pool_meta_cas_preconditions(token, object)?),
         ..Default::default()
     };
     fence.add_to_options(&mut opts, object);
+    opts.write_completion = crate::object_api::WriteCompletion::TailDrainedWithOwnerRepair;
     Ok(opts)
 }
 
@@ -6736,7 +6814,11 @@ where
             "payload_sha256": rustfs_utils::crypto::hex(Sha256::digest(&data)),
             "if_match": opts.http_preconditions.as_ref().and_then(|p| p.if_match.as_deref()),
             "if_none_match": opts.http_preconditions.as_ref().and_then(|p| p.if_none_match.as_deref()),
-            "tail_drained": opts.write_completion == crate::object_api::WriteCompletion::TailDrained,
+            "tail_drained": matches!(
+                opts.write_completion,
+                crate::object_api::WriteCompletion::TailDrained
+                    | crate::object_api::WriteCompletion::TailDrainedWithOwnerRepair
+            ),
             "no_lock": opts.no_lock,
         })
     });
@@ -10724,7 +10806,7 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
     store: Arc<ECStore>,
     bucket: &str,
     version: &rustfs_filemeta::FileInfo,
-    lifecycle_config: Option<&BucketLifecycleConfiguration>,
+    lifecycle_config: Option<&PersistedLifecycleConfiguration>,
     object_lock_config: Option<&ObjectLockConfiguration>,
     apply_actions: bool,
     event_source: &LcEventSrc,
@@ -12431,6 +12513,18 @@ impl ECStore {
         Ok(pool_meta)
     }
 
+    pub(crate) async fn load_runtime_pool_meta_under_worker_fence(
+        &self,
+        write_state: &mut PoolMetaWriteState,
+        worker_fence: &PoolRebalanceWorkerFence,
+        operation: &str,
+    ) -> Result<PoolMeta> {
+        worker_fence.ensure_held()?;
+        let pool_meta = self.load_runtime_pool_meta_observing(write_state, operation).await?;
+        worker_fence.ensure_held()?;
+        Ok(pool_meta)
+    }
+
     pub(crate) async fn load_runtime_pool_meta_under_activation_fence(
         &self,
         write_state: &mut PoolMetaWriteState,
@@ -13944,7 +14038,7 @@ impl ECStore {
         generation: OffsetDateTime,
         bucket: String,
         set: Arc<SetDisks>,
-        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        lifecycle_config: Option<PersistedLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
         replication_config: Option<(PersistedReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
@@ -14114,7 +14208,7 @@ impl ECStore {
         mut deferred_entry: DeferredDecommissionEntry,
         bucket: String,
         set: Arc<SetDisks>,
-        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        lifecycle_config: Option<PersistedLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
         replication_config: Option<(PersistedReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
@@ -14222,7 +14316,7 @@ impl ECStore {
         generation: OffsetDateTime,
         set: Arc<SetDisks>,
         bi: DecomBucketInfo,
-        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        lifecycle_config: Option<PersistedLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
         replication_config: Option<(PersistedReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
@@ -14847,7 +14941,7 @@ impl ECStore {
         entry: MetaCacheEntry,
         bucket: String,
         set: Arc<SetDisks>,
-        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        lifecycle_config: Option<PersistedLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
         replication_config: Option<(PersistedReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
@@ -15004,7 +15098,7 @@ impl ECStore {
         entry: MetaCacheEntry,
         bucket: String,
         set: Arc<SetDisks>,
-        lifecycle_config: Option<BucketLifecycleConfiguration>,
+        lifecycle_config: Option<PersistedLifecycleConfiguration>,
         object_lock_config: Option<ObjectLockConfiguration>,
         replication_config: Option<(PersistedReplicationConfiguration, OffsetDateTime)>,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
@@ -24693,7 +24787,7 @@ mod pools_tests {
                     _ => panic!("phase fixture must receive valid pool metadata"),
                 };
                 assert!(opts.max_parity && opts.no_lock);
-                assert_eq!(opts.write_completion, crate::object_api::WriteCompletion::TailDrained);
+                assert_eq!(opts.write_completion, crate::object_api::WriteCompletion::TailDrainedWithOwnerRepair);
                 self.trace.calls.lock().expect("trace lock").push(WriteCall {
                     pool: self.pool,
                     phase,
