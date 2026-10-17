@@ -4210,7 +4210,7 @@ mod tests {
 
     async fn non_trash_tmp_entries(temp_dirs: &[TempDir]) -> Vec<String> {
         let mut leftovers = Vec::new();
-        for temp_dir in temp_dirs {
+        for temp_dir in &temp_dirs {
             let tmp_path = temp_dir.path().join(RUSTFS_META_TMP_BUCKET);
             let mut read_dir = match tokio::fs::read_dir(&tmp_path).await {
                 Ok(read_dir) => read_dir,
@@ -6307,7 +6307,7 @@ mod tests {
             set_disks.check_upload_id_exists(bucket, object, &upload_id, false).await,
             Err(StorageError::InvalidUploadID(..))
         ));
-        for temp_dir in temp_dirs {
+        for temp_dir in &temp_dirs {
             assert!(
                 !temp_dir
                     .path()
@@ -7308,7 +7308,7 @@ mod tests {
         use futures::FutureExt;
 
         temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("60"))], async {
-            let (dirs, disks, set_disks) = hermetic_set_disks(4).await;
+            let (mut dirs, disks, set_disks) = hermetic_set_disks(4).await;
             let bucket = "multipart-physical-namespace";
             let object = if undo { "undo-tail" } else { "publication-tail" };
             let old_body = vec![0x41; 1024];
@@ -7478,7 +7478,7 @@ mod tests {
             if !coordinator_drained || !physical_drained || owner_drained.is_err() {
                 // A bounded cleanup failure cannot justify deleting roots that a
                 // detached executor might still use. Keep them for diagnosis.
-                let retained = dirs.into_iter().map(TempDir::keep).collect::<Vec<_>>();
+                let retained = dirs.keep_dirs();
                 eprintln!("MPU cleanup incomplete: coordinator={coordinator_drained}, physical={physical_drained}, retained={retained:?}");
                 if let Err(panic) = observations {
                     std::panic::resume_unwind(panic);

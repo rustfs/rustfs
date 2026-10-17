@@ -10846,6 +10846,13 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         shutdown: tokio_util::sync::CancellationToken,
     }
 
+    impl HermeticSetFixture {
+        /// Preserve failed-test roots without dropping their live metadata owner.
+        pub(in crate::set_disk::ops) fn keep_dirs(&mut self) -> Vec<std::path::PathBuf> {
+            self.dirs.drain(..).map(TempDir::keep).collect()
+        }
+    }
+
     impl std::ops::Deref for HermeticSetFixture {
         type Target = [TempDir];
 
@@ -23282,7 +23289,7 @@ mod single_delete_namespace_owner_tests {
     #[tokio::test]
     #[serial_test::serial(capacity_dirty_scope)]
     async fn single_delete_advances_namespace_generation_through_cleanup() {
-        let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let (mut dirs, disks, set) = hermetic_set_disks_isolated(4).await;
         let bucket = "single-delete-namespace";
         let object = "last-version";
         for disk in &disks {
@@ -23301,7 +23308,7 @@ mod single_delete_namespace_owner_tests {
         let result =
             tokio::time::timeout(Duration::from_secs(10), set.delete_object_version(bucket, object, &request, false)).await;
         if !matches!(result, Ok(Ok(()))) {
-            let retained = dirs.into_iter().map(tempfile::TempDir::keep).collect::<Vec<_>>();
+            let retained = dirs.keep_dirs();
             panic!("single delete and cleanup did not finish: {result:?}; retained roots: {retained:?}");
         }
         for (disk, dir) in disks.iter().zip(&dirs) {
@@ -23328,7 +23335,7 @@ mod single_delete_namespace_owner_tests {
         use futures::FutureExt;
 
         temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("60"))], async {
-            let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+            let (mut dirs, disks, set) = hermetic_set_disks_isolated(4).await;
             let bucket = "single-delete-physical-owner";
             let first = Uuid::new_v4();
             let second = Uuid::new_v4();
@@ -23537,7 +23544,7 @@ mod single_delete_namespace_owner_tests {
             .await
             .is_ok();
             if physical_keys.len() != 4 || !coordinator_drained || !owner_drained || drains.iter().any(|result| result.is_err()) {
-                let retained = dirs.into_iter().map(tempfile::TempDir::keep).collect::<Vec<_>>();
+                let retained = dirs.keep_dirs();
                 eprintln!("single delete cleanup incomplete; retained roots: {retained:?}");
                 if let Err(panic) = observations {
                     std::panic::resume_unwind(panic);
