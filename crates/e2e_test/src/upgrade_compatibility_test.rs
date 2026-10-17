@@ -25,11 +25,11 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    BucketLifecycleConfiguration, BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, DefaultRetention,
-    ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter, ObjectAttributes, ObjectLockConfiguration,
-    ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, PublicAccessBlockConfiguration, ServerSideEncryption,
-    ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Tagging,
-    VersioningConfiguration,
+    BucketLifecycleConfiguration, BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, DefaultRetention, Delete,
+    ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter, ObjectAttributes, ObjectIdentifier,
+    ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, PublicAccessBlockConfiguration,
+    ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
+    StorageClass, Tag, Tagging, VersioningConfiguration,
 };
 use http::{Method, StatusCode};
 use serde_json::Value;
@@ -46,6 +46,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 const SOURCE_BINARY_ENV: &str = "RUSTFS_UPGRADE_SOURCE_BINARY";
 const G09_EVIDENCE_DIR_ENV: &str = "RUSTFS_SCANNER_HEAL_G09_EVIDENCE_DIR";
 const RC5_COMMIT: &str = "40a2470feb567201165a5b809b7598bb4b1f68f5";
+const STABLE_1_0_1_COMMIT: &str = "6de965ae3c965a78ff819fbcd7acd4aa44177d92";
 const SSE_MASTER_KEY_ENV: &str = "RUSTFS_SSE_S3_MASTER_KEY";
 const SSE_MASTER_KEY: &str = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=";
 const PLAIN_BUCKET: &str = "upgrade-plain-data";
@@ -66,6 +67,16 @@ const MIXED_MULTIPART_UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 // probe_interval (2s) x success_threshold (3) after it comes back; 30s
 // comfortably covers that window plus CI scheduling jitter.
 const LISTING_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
+// Parity 0 for the reduced-redundancy class only. A parity-0 write on the
+// four-drive set needs all four drives (`write_quorum = data_drives`), so a
+// PUT with that class succeeds only once the serving node writes through every
+// one of its own drive handles. Standard-class objects keep the default layout.
+const ALL_DRIVES_STORAGE_CLASS_ENV: (&str, &str) = ("RUSTFS_STORAGE_CLASS_RRS", "EC:0");
+// A peer drops a restarted node's drive to Offline after two failed
+// operations and only re-admits it through probe_interval (2s) x
+// success_threshold (3) once the node answers again. The budget covers that
+// for every node after the slowest restart in the sequence, plus CI jitter.
+const DRIVE_READMISSION_TIMEOUT: Duration = Duration::from_secs(60);
 
 // Bucket-configuration upgrade/rollback scenarios (rustfs#7172, #7183, #7089).
 const CONFIG_PLAIN_BUCKET: &str = "upgrade-config-plain";
@@ -509,6 +520,9 @@ async fn observe_mixed_multipart_failure(
         let network_deadline = started + Duration::from_secs(4);
         let path = format!("/{MIXED_BUCKET}/{}", failure.key);
         let _ = tokio::time::timeout_at(deadline, async {
+            // Every node keeps its own lock table, and the writer that stalls is
+            // usually a previous-release node; the current node's snapshot alone
+            // cannot show which holder blocks the upload.
             let (heads, locks) = tokio::join!(
                 futures::future::join_all((0..cluster.nodes.len()).map(|node| probe_mixed_multipart_failure(
                     cluster,
@@ -517,7 +531,13 @@ async fn observe_mixed_multipart_failure(
                     true,
                     network_deadline
                 ))),
-                probe_mixed_multipart_failure(cluster, 0, "/rustfs/admin/v3/top/locks?count=1000", false, network_deadline),
+                futures::future::join_all((0..cluster.nodes.len()).map(|node| probe_mixed_multipart_failure(
+                    cluster,
+                    node,
+                    "/rustfs/admin/v3/top/locks?count=1000",
+                    false,
+                    network_deadline
+                ))),
             );
             let snapshot = serde_json::json!({
                 "phase": phase, "bucket": MIXED_BUCKET, "key": failure.key,
@@ -579,6 +599,7 @@ async fn exercise_mixed_cluster(
 ) -> TestResult {
     let clients = cluster.create_all_clients()?;
     wait_for_upgrade_write_readiness(&clients, MIXED_BUCKET, phase, LISTING_CONVERGENCE_TIMEOUT).await?;
+    wait_for_drive_readmission(&clients, MIXED_BUCKET, phase, DRIVE_READMISSION_TIMEOUT).await?;
     let current_client = &clients[current_node];
     let previous_client = &clients[previous_node];
 
@@ -633,6 +654,26 @@ async fn exercise_mixed_cluster(
         vec![u8::try_from(MULTIPART_WORKERS - 1)?; 64 * 1024]
     );
 
+    // Every online participant must understand the delete decision protocol.
+    // An upgrade phase can serve reads/writes while intentionally refusing a
+    // modern DELETE; rejecting it must leave the old writer's seed intact.
+    let error = upgrade_probe_client(current_client)
+        .delete_object()
+        .bucket(MIXED_BUCKET)
+        .key(PREVIOUS_RELEASE_SEED_KEY)
+        .send()
+        .await
+        .expect_err("a modern DELETE must fail closed while an old participant is online");
+    assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(503), "{error:?}");
+    assert_eq!(error.as_service_error().and_then(ProvideErrorMetadata::code), Some("ServiceUnavailable"));
+    for (node, client) in clients.iter().enumerate() {
+        assert_eq!(
+            read_object(client, MIXED_BUCKET, PREVIOUS_RELEASE_SEED_KEY, None).await?.1,
+            UPGRADE_READINESS_BODY,
+            "{phase}: rejected DELETE must preserve the seed through node {node}"
+        );
+    }
+
     Ok(())
 }
 
@@ -656,16 +697,51 @@ pub(crate) async fn wait_for_upgrade_write_readiness(
     // health also accepts Returning disks whose write health is still FAULTY.
     // Probe every writer outside the asserted phase prefix; compatibility
     // writes still execute once and retain their original assertions.
+    wait_for_upgrade_writes(clients, bucket, phase, "write readiness", None, budget).await
+}
+
+/// Block until every node commits a parity-0 write, which needs all of the
+/// node's own drive handles.
+///
+/// Write readiness proves that a node accepts a standard write at quorum; it
+/// does not prove that the node has re-admitted the drives it marked Offline
+/// while a peer restarted. A writer that still excludes one drive commits at
+/// exactly three of four drives and cannot ride out any other slow drive. The
+/// cluster must run with [`ALL_DRIVES_STORAGE_CLASS_ENV`]; a write with the
+/// reduced-redundancy class then fails with 503 `ServiceUnavailable` until the
+/// serving node writes through every drive, on the previous release and on
+/// the current build alike.
+async fn wait_for_drive_readmission(clients: &[Client], bucket: &str, context: &str, budget: Duration) -> TestResult {
+    wait_for_upgrade_writes(
+        clients,
+        bucket,
+        context,
+        "drive re-admission",
+        Some(StorageClass::ReducedRedundancy),
+        budget,
+    )
+    .await
+}
+
+async fn wait_for_upgrade_writes(
+    clients: &[Client],
+    bucket: &str,
+    phase: &str,
+    probe: &str,
+    storage_class: Option<StorageClass>,
+    budget: Duration,
+) -> TestResult {
     let deadline = Instant::now() + budget;
     for (node, client) in clients.iter().enumerate() {
         let client = upgrade_probe_client(client);
-        let key = format!(".upgrade-readiness/{phase}/node-{node}");
+        let key = match storage_class {
+            Some(_) => format!(".upgrade-readiness/{phase}/all-drives/node-{node}"),
+            None => format!(".upgrade-readiness/{phase}/node-{node}"),
+        };
         let mut last_response = "no response".to_string();
         loop {
             if Instant::now() >= deadline {
-                return Err(
-                    format!("{phase}: node {node} write readiness deadline exceeded; last response: {last_response}").into(),
-                );
+                return Err(format!("{phase}: node {node} {probe} deadline exceeded; last response: {last_response}").into());
             }
             let response = tokio::time::timeout_at(
                 deadline,
@@ -673,6 +749,7 @@ pub(crate) async fn wait_for_upgrade_write_readiness(
                     .put_object()
                     .bucket(bucket)
                     .key(&key)
+                    .set_storage_class(storage_class.clone())
                     .body(ByteStream::from_static(UPGRADE_READINESS_BODY))
                     .send(),
             )
@@ -683,13 +760,13 @@ pub(crate) async fn wait_for_upgrade_write_readiness(
                     if error.raw_response().map(|response| response.status().as_u16()) != Some(503)
                         || error.as_service_error().and_then(ProvideErrorMetadata::code) != Some("ServiceUnavailable")
                     {
-                        return Err(format!("{phase}: node {node} write readiness failed: {error:?}").into());
+                        return Err(format!("{phase}: node {node} {probe} failed: {error:?}").into());
                     }
                     last_response = format!("{error:?}");
                 }
                 Err(_) => {
                     return Err(format!(
-                        "{phase}: node {node} write readiness deadline exceeded during PutObject; last response: {last_response}"
+                        "{phase}: node {node} {probe} deadline exceeded during PutObject; last response: {last_response}"
                     )
                     .into());
                 }
@@ -700,6 +777,18 @@ pub(crate) async fn wait_for_upgrade_write_readiness(
     Ok(())
 }
 
+fn previous_baseline_writers(clients: &[Client], restarted_node: usize) -> &[Client] {
+    // Node 0 has persisted the seed. With restart order [1, 2, 3, 0], only
+    // this prefix has also cleared rc.5's startup write fence. Every RRS
+    // probe still needs all drives, including those of not-yet-restarted peers.
+    let ready_end = if restarted_node == 0 {
+        clients.len()
+    } else {
+        restarted_node + 1
+    };
+    &clients[..ready_end]
+}
+
 async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnvironment, previous_binary: &Path) -> TestResult {
     let clients: Vec<_> = cluster.create_all_clients()?.iter().map(upgrade_probe_client).collect();
     // rc.5 can latch a non-elected node's write fence while its first startup
@@ -707,14 +796,28 @@ async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnviro
     // persist data, then restart each old process once with three peers still
     // readable. This preparation ends before any current binary is started.
     wait_for_upgrade_write_readiness(&clients[..1], MIXED_BUCKET, "previous-seed", LISTING_CONVERGENCE_TIMEOUT).await?;
+    // A node that just came back is still replaying its startup traffic against
+    // every peer. Killing the next node during that burst gives the fresh node
+    // two failures in a row and it drops that peer's drive to Offline, where
+    // only the slow recovery probe can bring it back. Let every writable node
+    // re-admit every drive before the next kill. Nodes still awaiting their
+    // restart may retain the startup write fence and cannot coordinate a PUT.
     for node in [1, 2, 3, 0] {
         cluster.stop_node(node)?;
         cluster.start_node_from_binary(node, previous_binary).await?;
+        let context = format!("previous-restart-{node}");
         wait_for_upgrade_write_readiness(
             std::slice::from_ref(&clients[node]),
             MIXED_BUCKET,
-            &format!("previous-restart-{node}"),
+            &context,
             LISTING_CONVERGENCE_TIMEOUT,
+        )
+        .await?;
+        wait_for_drive_readmission(
+            previous_baseline_writers(&clients, node),
+            MIXED_BUCKET,
+            &context,
+            DRIVE_READMISSION_TIMEOUT,
         )
         .await?;
     }
@@ -738,10 +841,162 @@ async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnviro
     Ok(())
 }
 
+/// The drive re-admission gate assumes that a parity-0 write needs every
+/// drive. Prove it on the workspace build: with one node down a standard
+/// write still commits, the reduced-redundancy write fails with 503, and once
+/// the node is back the gate converges within its budget.
+#[tokio::test]
+async fn parity_zero_write_needs_every_drive() -> TestResult {
+    init_logging();
+    let mut cluster = RustFSTestClusterEnvironment::new(MIXED_NODE_COUNT).await?;
+    cluster.set_env("RUST_LOG", "rustfs=warn,rustfs_notify=warn");
+    cluster.set_env(ALL_DRIVES_STORAGE_CLASS_ENV.0, ALL_DRIVES_STORAGE_CLASS_ENV.1);
+    cluster.start().await?;
+    cluster.create_test_bucket(MIXED_BUCKET).await?;
+    let clients = cluster.create_all_clients()?;
+    wait_for_upgrade_write_readiness(&clients, MIXED_BUCKET, "parity-zero-seed", LISTING_CONVERGENCE_TIMEOUT).await?;
+    wait_for_drive_readmission(&clients, MIXED_BUCKET, "parity-zero-healthy", DRIVE_READMISSION_TIMEOUT).await?;
+
+    cluster.stop_node(3)?;
+    let writer = upgrade_probe_client(&clients[0]);
+    writer
+        .put_object()
+        .bucket(MIXED_BUCKET)
+        .key("parity-zero/standard-with-one-node-down")
+        .body(ByteStream::from_static(UPGRADE_READINESS_BODY))
+        .send()
+        .await?;
+    let error = writer
+        .put_object()
+        .bucket(MIXED_BUCKET)
+        .key("parity-zero/all-drives-with-one-node-down")
+        .storage_class(StorageClass::ReducedRedundancy)
+        .body(ByteStream::from_static(UPGRADE_READINESS_BODY))
+        .send()
+        .await
+        .expect_err("a parity-0 write must not commit at three of four drives");
+    assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(503), "{error:?}");
+    assert_eq!(
+        error.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("ServiceUnavailable"),
+        "{error:?}"
+    );
+
+    cluster.start_node(3).await?;
+    wait_for_drive_readmission(&clients, MIXED_BUCKET, "parity-zero-returned", DRIVE_READMISSION_TIMEOUT).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod upgrade_write_readiness_tests {
     use super::*;
     use crate::fake_s3_target::FaultAction;
+    use aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextRef;
+    use aws_sdk_s3::config::{ConfigBag, Intercept, RuntimeComponents};
+
+    #[derive(Debug)]
+    struct RequireAllDrivesProbe;
+
+    impl Intercept for RequireAllDrivesProbe {
+        fn name(&self) -> &'static str {
+            "require-all-drives-probe"
+        }
+
+        fn read_before_transmit(
+            &self,
+            context: &BeforeTransmitInterceptorContextRef<'_>,
+            _runtime_components: &RuntimeComponents,
+            _cfg: &mut ConfigBag,
+        ) -> Result<(), BoxError> {
+            assert_eq!(context.request().method(), "PUT");
+            assert_eq!(
+                context.request().headers().get("x-amz-storage-class"),
+                Some("REDUCED_REDUNDANCY"),
+                "every admitted coordinator must use the all-drive storage class"
+            );
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn previous_baseline_probes_only_writable_coordinators_until_all_restart() -> TestResult {
+        let mut targets = Vec::new();
+        let mut clients = Vec::new();
+        for _ in 0..MIXED_NODE_COUNT {
+            let target = FakeS3Target::start().await?;
+            target.create_bucket(MIXED_BUCKET);
+            clients.push(Client::from_conf(
+                fake_source_client(&target)
+                    .config()
+                    .to_builder()
+                    .interceptor(RequireAllDrivesProbe)
+                    .build(),
+            ));
+            targets.push(target);
+        }
+        for target in &targets[2..] {
+            target.inject(FakeTargetOperation::PutObject, FaultAction::Status(StatusCode::INTERNAL_SERVER_ERROR), 10);
+        }
+
+        // Reproduce the original all-coordinator gate: node 0 and restarted
+        // node 1 can write, but unrestarted node 2 still returns a latched 500.
+        let error = wait_for_drive_readmission(&clients, MIXED_BUCKET, "premature", Duration::from_secs(5))
+            .await
+            .expect_err("an unrestarted coordinator must retain its startup write failure");
+        assert!(error.to_string().contains("node 2 drive re-admission failed"), "{error}");
+        let failed = targets[2].requests();
+        assert_eq!(failed.len(), 1, "the startup 500 must fail without retrying");
+        assert_eq!(failed[0].fault, Some(FaultAction::Status(StatusCode::INTERNAL_SERVER_ERROR)));
+        for target in &targets {
+            target.take_requests();
+        }
+
+        for (restarted_node, expected_writers) in [(1, 2), (2, 3), (3, 4), (0, 4)] {
+            // A restart clears only this process's startup write fence.
+            targets[restarted_node].clear_faults();
+            let phase = format!("previous-restart-{restarted_node}");
+            wait_for_drive_readmission(
+                previous_baseline_writers(&clients, restarted_node),
+                MIXED_BUCKET,
+                &phase,
+                Duration::from_secs(5),
+            )
+            .await?;
+            for (node, target) in targets.iter().enumerate() {
+                let key = format!(".upgrade-readiness/{phase}/all-drives/node-{node}");
+                let admitted = node < expected_writers;
+                assert_eq!(
+                    target.count_requests(FakeTargetOperation::PutObject, &key),
+                    usize::from(admitted),
+                    "{phase}: only writable node {node} may coordinate an all-drive probe"
+                );
+                assert_eq!(target.has_object(MIXED_BUCKET, &key), admitted);
+                assert_eq!(target.take_requests().len(), usize::from(admitted));
+            }
+        }
+
+        // Once every node is admitted, its permanent errors must still fail
+        // the full gate immediately rather than being skipped or retried.
+        let phase = "previous-ready-error";
+        let key = format!(".upgrade-readiness/{phase}/all-drives/node-3");
+        targets[3].inject_for_key(
+            FakeTargetOperation::PutObject,
+            &key,
+            FaultAction::Status(StatusCode::INTERNAL_SERVER_ERROR),
+            1,
+        );
+        let error =
+            wait_for_drive_readmission(previous_baseline_writers(&clients, 0), MIXED_BUCKET, phase, Duration::from_secs(5))
+                .await
+                .expect_err("a recovered coordinator's 500 must still fail the final gate");
+        assert!(error.to_string().contains("node 3 drive re-admission failed"), "{error}");
+        assert_eq!(targets[3].count_requests(FakeTargetOperation::PutObject, &key), 1);
+        assert!(!targets[3].has_object(MIXED_BUCKET, &key));
+        for target in targets {
+            target.shutdown().await;
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn waits_for_each_writer_after_metadata_is_ready() -> TestResult {
@@ -963,7 +1218,14 @@ mod upgrade_write_readiness_tests {
         );
         assert_eq!(target.count_requests(FakeTargetOperation::HeadObject, stalled_key), MIXED_NODE_COUNT);
         assert_eq!(target.count_requests(FakeTargetOperation::CompleteMultipartUpload, stalled_key), 1);
-        assert_eq!(snapshot["top_locks"]["observation"], "unknown", "the fake peer has no admin lock API");
+        let locks = snapshot["top_locks"]
+            .as_array()
+            .expect("failure artifact must retain every node's lock probe");
+        assert_eq!(locks.len(), MIXED_NODE_COUNT);
+        for (node, probe) in locks.iter().enumerate() {
+            assert_eq!(probe["node"], node);
+            assert_eq!(probe["observation"], "unknown", "the fake peer has no admin lock API");
+        }
 
         let locks: MixedLockSnapshot = serde_json::from_value(serde_json::json!({
             "total": 1, "truncated": true, "capability_note": "partial snapshot",
@@ -1082,7 +1344,7 @@ async fn rc5_rollback_requires_restoring_odm_configuration() -> TestResult {
 
 #[tokio::test]
 #[ignore = "requires a pinned previous RustFS release binary"]
-async fn direct_upgrade_from_rc2_preserves_object_contracts() -> TestResult {
+async fn direct_upgrade_from_previous_release_preserves_object_contracts() -> TestResult {
     init_logging();
     let previous_binary = source_binary()?;
     let mut env = RustFSTestEnvironment::new().await?;
@@ -1232,13 +1494,14 @@ async fn direct_upgrade_from_rc2_preserves_object_contracts() -> TestResult {
 
 #[tokio::test]
 #[ignore = "requires a pinned previous RustFS release binary"]
-async fn rolling_upgrade_from_rc2_preserves_mixed_version_contracts() -> TestResult {
+async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts() -> TestResult {
     init_logging();
     let previous_binary = source_binary()?;
     let evidence_context = g09_evidence_context(&previous_binary).await?;
     let current_binary = rustfs_binary_path();
     let mut cluster = RustFSTestClusterEnvironment::new(MIXED_NODE_COUNT).await?;
     cluster.set_env("RUST_LOG", "rustfs=warn,rustfs_notify=warn");
+    cluster.set_env(ALL_DRIVES_STORAGE_CLASS_ENV.0, ALL_DRIVES_STORAGE_CLASS_ENV.1);
     configure_cluster_logs(&mut cluster)?;
     cluster.start_with_binary(&previous_binary).await?;
     cluster.create_test_bucket(MIXED_BUCKET).await?;
@@ -1248,22 +1511,24 @@ async fn rolling_upgrade_from_rc2_preserves_mixed_version_contracts() -> TestRes
     cluster.start_node_from_binary(0, &current_binary).await?;
     exercise_mixed_cluster(&cluster, "one-current-node", 0, 1).await?;
 
-    for node_idx in [1, 2] {
+    for (node_idx, phase) in [(1, "two-current-nodes"), (2, "one-previous-node")] {
         cluster.stop_node(node_idx)?;
         cluster.start_node_from_binary(node_idx, &current_binary).await?;
+        exercise_mixed_cluster(&cluster, phase, 0, 3).await?;
     }
-    exercise_mixed_cluster(&cluster, "one-previous-node", 0, 3).await?;
 
     cluster.stop_node(3)?;
     cluster.start_node_from_binary(3, &current_binary).await?;
+    let clients = cluster.create_all_clients()?;
+    wait_for_drive_readmission(&clients, MIXED_BUCKET, "homogeneous-current", DRIVE_READMISSION_TIMEOUT).await?;
 
-    for (node_idx, client) in cluster.create_all_clients()?.iter().enumerate() {
+    for (node_idx, client) in clients.iter().enumerate() {
         assert_eq!(
             read_object(client, MIXED_BUCKET, PREVIOUS_RELEASE_SEED_KEY, None).await?.1,
             UPGRADE_READINESS_BODY,
             "current node {node_idx} must retain the previous-release seed"
         );
-        for phase in ["one-current-node", "one-previous-node"] {
+        for phase in ["one-current-node", "two-current-nodes", "one-previous-node"] {
             wait_for_phase_listing(
                 client,
                 phase,
@@ -1275,14 +1540,14 @@ async fn rolling_upgrade_from_rc2_preserves_mixed_version_contracts() -> TestRes
     }
 
     if let Some(context) = evidence_context.as_ref() {
-        let phases = ["one-current-node", "one-previous-node"];
+        let phases = ["one-current-node", "two-current-nodes", "one-previous-node"];
         let objects_per_phase = MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER + 2;
         write_g09_evidence(
             context,
             "mixed_version_reader_evidence",
             "mixed-version-reader",
             &["old-writer-new-reader", "new-writer-old-reader"],
-            "upgrade_compatibility_test::rolling_upgrade_from_rc2_preserves_mixed_version_contracts",
+            "upgrade_compatibility_test::rolling_upgrade_from_previous_release_preserves_mixed_version_contracts",
             serde_json::json!({
                 "bucket": MIXED_BUCKET,
                 "phases": phases,
@@ -1300,7 +1565,7 @@ async fn rolling_upgrade_from_rc2_preserves_mixed_version_contracts() -> TestRes
             "mixed_version_writer_evidence",
             "mixed-version-writer",
             &["old-reader-new-writer", "new-reader-old-writer"],
-            "upgrade_compatibility_test::rolling_upgrade_from_rc2_preserves_mixed_version_contracts",
+            "upgrade_compatibility_test::rolling_upgrade_from_previous_release_preserves_mixed_version_contracts",
             serde_json::json!({
                 "bucket": MIXED_BUCKET,
                 "phases": phases,
@@ -1308,12 +1573,337 @@ async fn rolling_upgrade_from_rc2_preserves_mixed_version_contracts() -> TestRes
                 "assertions": [
                     "current writer publishes objects readable by previous-release node",
                     "previous-release writer publishes objects readable by current node",
-                    "multipart writers continue under one-current-node and one-previous-node layouts"
+                    "multipart writers continue at every individual node upgrade",
+                    "modern DELETE fails closed and preserves every byte while old peers remain"
                 ],
             }),
         )?;
     }
 
+    let clients = cluster.create_all_clients()?;
+    wait_for_upgrade_write_readiness(&clients, MIXED_BUCKET, "all-current", LISTING_CONVERGENCE_TIMEOUT).await?;
+    clients[0]
+        .delete_object()
+        .bucket(MIXED_BUCKET)
+        .key(PREVIOUS_RELEASE_SEED_KEY)
+        .send()
+        .await?;
+    for (node, client) in clients.iter().enumerate() {
+        let error = client
+            .get_object()
+            .bucket(MIXED_BUCKET)
+            .key(PREVIOUS_RELEASE_SEED_KEY)
+            .send()
+            .await
+            .expect_err("the homogeneous cluster must apply the previously blocked DELETE");
+        assert_eq!(
+            error.as_service_error().and_then(ProvideErrorMetadata::code),
+            Some("NoSuchKey"),
+            "node {node}"
+        );
+    }
+
+    Ok(())
+}
+
+struct LegacyDeleteObject {
+    bucket: String,
+    key: String,
+    version: Option<String>,
+    etag: String,
+    body: Vec<u8>,
+    data_dirs: Vec<PathBuf>,
+}
+
+fn legacy_payload_directories(object_dir: &Path) -> Result<Vec<PathBuf>, BoxError> {
+    let entries = match std::fs::read_dir(object_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut directories = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() && uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_ok() {
+            for child in std::fs::read_dir(entry.path())? {
+                let child = child?;
+                if child.file_type()?.is_file() && child.file_name().to_string_lossy().starts_with("part.") {
+                    directories.push(entry.path());
+                    break;
+                }
+            }
+        }
+    }
+    Ok(directories)
+}
+
+async fn seed_legacy_delete_object(
+    env: &RustFSTestEnvironment,
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    seed: u64,
+) -> Result<LegacyDeleteObject, BoxError> {
+    let object_dir = Path::new(&env.temp_dir).join(bucket).join(key);
+    let before = legacy_payload_directories(&object_dir)?;
+    // Incompressible external shards ensure the regression exercises payload
+    // reclamation, rather than only the inline xl.meta path.
+    let body = layout_noise(1024 * 1024 + 17, seed);
+    let response = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from(body.clone()))
+        .send()
+        .await?;
+    let data_dirs: Vec<_> = legacy_payload_directories(&object_dir)?
+        .into_iter()
+        .filter(|path| !before.contains(path))
+        .collect();
+    assert_eq!(data_dirs.len(), 1, "the old binary must create one external payload for {bucket}/{key}");
+    // A suspended PUT can omit the version header while reads identify the
+    // stored generation as "null". Preserve the old reader's exact identity.
+    let head = client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .set_version_id(response.version_id().map(str::to_owned))
+        .send()
+        .await?;
+    assert_eq!(head.e_tag(), response.e_tag(), "old writer and reader agree on the stored bytes");
+    if let Some(version) = response.version_id() {
+        assert_eq!(head.version_id(), Some(version), "old reader resolves the written version");
+    }
+    Ok(LegacyDeleteObject {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        version: head.version_id().map(str::to_owned),
+        etag: response.e_tag().ok_or("the old writer omitted its ETag")?.to_owned(),
+        body,
+        data_dirs,
+    })
+}
+
+async fn assert_legacy_delete_object(client: &Client, object: &LegacyDeleteObject) -> TestResult {
+    let response = client
+        .get_object()
+        .bucket(&object.bucket)
+        .key(&object.key)
+        .set_version_id(object.version.clone())
+        .send()
+        .await
+        .map_err(|error| format!("GET {}/{} version {:?}: {error:?}", object.bucket, object.key, object.version))?;
+    assert_eq!(
+        response.e_tag(),
+        Some(object.etag.as_str()),
+        "{}/{}: original ETag",
+        object.bucket,
+        object.key
+    );
+    assert_eq!(
+        response.version_id(),
+        object.version.as_deref(),
+        "{}/{}: original version",
+        object.bucket,
+        object.key
+    );
+    assert_eq!(response.body.collect().await?.into_bytes().as_ref(), object.body);
+    Ok(())
+}
+
+fn preserve_legacy_upgrade_volume(env: &RustFSTestEnvironment, label: &str) -> TestResult {
+    let Some(log_dir) = std::env::var_os("RUSTFS_E2E_LOG_DIR") else { return Ok(()) };
+    let root = Path::new(&env.temp_dir);
+    let destination = Path::new(&log_dir).join(label);
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        let target = destination.join(entry.path().strip_prefix(root)?);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(target)?;
+        } else if entry.file_type().is_file() {
+            std::fs::copy(entry.path(), target)?;
+        } else {
+            return Err("the stopped upgrade fixture contains a non-regular entry".into());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned stable 1.0.1 release binary"]
+async fn stable_upgrade_deletes_foreign_reservations_without_losing_live_objects() -> TestResult {
+    use sha2::Digest;
+
+    init_logging();
+    let previous_binary = source_binary()?;
+    assert_eq!(binary_source_revision(&previous_binary).await?, STABLE_1_0_1_COMMIT);
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_from_binary(&previous_binary, vec![], &[]).await?;
+    let old_client = env.create_s3_client();
+    let plain_bucket = "legacy-delete-plain";
+    let versioned_bucket = "legacy-delete-versioned";
+    let suspended_bucket = "legacy-delete-suspended";
+    for bucket in [plain_bucket, versioned_bucket, suspended_bucket] {
+        env.create_test_bucket(bucket).await?;
+    }
+    enable_versioning(&old_client, versioned_bucket).await?;
+    enable_versioning(&old_client, suspended_bucket).await?;
+    old_client
+        .put_bucket_versioning()
+        .bucket(suspended_bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Suspended)
+                .build(),
+        )
+        .send()
+        .await?;
+
+    let mut deleted = Vec::new();
+    for (index, (bucket, key)) in [
+        (plain_bucket, "single"),
+        (plain_bucket, "batch-one"),
+        (plain_bucket, "batch-two"),
+        (versioned_bucket, "versioned"),
+        (suspended_bucket, "suspended"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        deleted.push(seed_legacy_delete_object(&env, &old_client, bucket, key, index as u64 + 1).await?);
+    }
+    let successor = seed_legacy_delete_object(&env, &old_client, versioned_bucket, "versioned", 20).await?;
+    let child_key = format!("single/{}/child", uuid::Uuid::new_v4());
+    let child = seed_legacy_delete_object(&env, &old_client, plain_bucket, &child_key, 21).await?;
+    for object in deleted.iter().chain([&successor, &child]) {
+        assert_legacy_delete_object(&old_client, object).await?;
+    }
+    env.stop_server();
+
+    // The stable release produced the complete volume and every xl.meta/part
+    // byte above. Only the empty legacy marker is fault-injected after stop;
+    // this deterministically models an interrupted reservation, not a claimed
+    // reproduction of the old binary's SIGKILL timing window.
+    let mut evidence = Vec::new();
+    for object in &deleted {
+        let metadata_path = Path::new(&env.temp_dir)
+            .join(&object.bucket)
+            .join(&object.key)
+            .join("xl.meta");
+        let metadata = std::fs::read(&metadata_path)?;
+        for directory in &object.data_dirs {
+            let marker = directory.join(format!("reserve-delete-data.{}", uuid::Uuid::new_v4()));
+            std::fs::File::create(marker)?.sync_all()?;
+        }
+        assert_eq!(
+            std::fs::read(&metadata_path)?,
+            metadata,
+            "fault injection must preserve the old xl.meta bytes"
+        );
+        evidence.push(serde_json::json!({
+            "bucket": object.bucket,
+            "key": object.key,
+            "version": object.version,
+            "etag": object.etag,
+            "xl_meta_sha256": hex_simd::encode_to_string(sha2::Sha256::digest(&metadata), hex_simd::AsciiCase::Lower),
+        }));
+    }
+    if let Some(directory) = std::env::var_os("RUSTFS_E2E_LOG_DIR") {
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(
+            Path::new(&directory).join("stable-delete-source.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "writer_revision": STABLE_1_0_1_COMMIT,
+                "candidate_revision": current_source_revision()?,
+                "fault_injection": "empty foreign reservation marker after stopping the genuine old writer",
+                "objects": evidence,
+            }))?,
+        )?;
+    }
+
+    preserve_legacy_upgrade_volume(&env, "stable-source-volume")?;
+    env.restart_server_preserving_data(vec![], &[]).await?;
+    let client = env.create_s3_client();
+    for object in deleted.iter().chain([&successor, &child]) {
+        if let Err(error) = assert_legacy_delete_object(&client, object).await {
+            env.stop_server();
+            preserve_legacy_upgrade_volume(&env, "failed-upgrade-volume")?;
+            return Err(error);
+        }
+    }
+    client.delete_object().bucket(plain_bucket).key("single").send().await?;
+    let response = client
+        .delete_objects()
+        .bucket(plain_bucket)
+        .delete(
+            Delete::builder()
+                .objects(ObjectIdentifier::builder().key("batch-one").build()?)
+                .objects(ObjectIdentifier::builder().key("batch-two").build()?)
+                .build()?,
+        )
+        .send()
+        .await?;
+    assert!(response.errors().is_empty(), "batch deletion must converge: {:?}", response.errors());
+    assert_eq!(response.deleted().len(), 2);
+    for object in &deleted[3..] {
+        client
+            .delete_object()
+            .bucket(&object.bucket)
+            .key(&object.key)
+            .set_version_id(object.version.clone())
+            .send()
+            .await?;
+    }
+
+    // Repeat recovery across process restarts, then retry the same requests.
+    // The old committed payload must disappear while the successor and the
+    // UUID-shaped prefix child remain intact through every pass.
+    for pass in 0..2 {
+        env.restart_server_preserving_data(vec![], &[]).await?;
+        let client = env.create_s3_client();
+        for object in &deleted {
+            let error = client
+                .get_object()
+                .bucket(&object.bucket)
+                .key(&object.key)
+                .set_version_id(object.version.clone())
+                .send()
+                .await
+                .expect_err("an acknowledged deletion must not resurrect after restart");
+            assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(404));
+            for directory in &object.data_dirs {
+                assert!(
+                    !directory.exists(),
+                    "pass {pass}: deleted payload and foreign reservation must be physically reclaimed"
+                );
+            }
+            client
+                .delete_object()
+                .bucket(&object.bucket)
+                .key(&object.key)
+                .set_version_id(object.version.clone())
+                .send()
+                .await?;
+        }
+        for object in [&successor, &child] {
+            assert_legacy_delete_object(&client, object).await?;
+        }
+        assert_eq!(
+            read_object(&client, versioned_bucket, "versioned", None).await?.1,
+            successor.body,
+            "deleting the old version must preserve the current successor"
+        );
+        let versions = client.list_object_versions().bucket(versioned_bucket).send().await?;
+        assert_eq!(versions.versions().len(), 1);
+        assert_eq!(versions.versions()[0].version_id(), successor.version.as_deref());
+        assert!(versions.delete_markers().is_empty());
+        let listed = client.list_objects_v2().bucket(plain_bucket).send().await?;
+        assert_eq!(listed.contents().len(), 1);
+        assert_eq!(listed.contents()[0].key(), Some(child_key.as_str()));
+    }
+
+    client.delete_object().bucket(plain_bucket).key(&child_key).send().await?;
+    client.delete_bucket().bucket(plain_bucket).send().await?;
     Ok(())
 }
 
@@ -2028,14 +2618,14 @@ async fn rollback_to_previous_release_reads_current_bucket_metadata() -> TestRes
 }
 
 // ---------------------------------------------------------------------------
-// rc.5 multipart layouts under the current build (backlog#2147 follow-up to
+// Previous-release multipart layouts under the current build (backlog#2147 follow-up to
 // rustfs#7305)
 // ---------------------------------------------------------------------------
 //
 // rustfs#7305 changed `ObjectInfo::is_multipart` to consult the stored part
 // list before the ETag shape. Every earlier check of that change used
 // synthetic metadata; this scenario writes the layouts with the published
-// rc.5 binary and then reads, describes, and replicates them with the
+// previous-release binary and then reads, describes, and replicates them with the
 // current build on the same data directory.
 
 const LAYOUT_PLAIN_BUCKET: &str = "upgrade-layout-plain";
@@ -2056,10 +2646,10 @@ struct LayoutCase {
     /// `false` for layouts whose replication is a known pre-existing failure;
     /// their outcome is logged, not asserted.
     assert_replication: bool,
-    /// Recorded from the rc.5 writer.
-    rc5_etag: String,
-    /// Whether rc.5 reported `ObjectParts` for the object.
-    rc5_reported_parts: Option<usize>,
+    /// Recorded from the previous-release writer.
+    source_etag: String,
+    /// Whether the previous release reported `ObjectParts` for the object.
+    source_reported_parts: Option<usize>,
 }
 
 impl LayoutCase {
@@ -2164,7 +2754,7 @@ async fn layout_attributes(
     Ok(request.send().await?)
 }
 
-/// Write `case` with the rc.5 client; single PUT when `part_sizes` is empty.
+/// Write `case` with the source client; single PUT when `part_sizes` is empty.
 async fn layout_write(client: &Client, case: &LayoutCase) -> Result<(), BoxError> {
     let content_type = "text/plain";
     if case.part_sizes.is_empty() {
@@ -2251,8 +2841,8 @@ fn layout_cases() -> Vec<LayoutCase> {
         body,
         ssec,
         assert_replication: true,
-        rc5_etag: String::new(),
-        rc5_reported_parts: None,
+        source_etag: String::new(),
+        source_reported_parts: None,
     };
     vec![
         case(LAYOUT_PLAIN_BUCKET, "plain/single.bin", vec![], layout_noise(1024 * 1024 + 17, 1), false),
@@ -2295,7 +2885,7 @@ fn layout_cases() -> Vec<LayoutCase> {
         // compressible first part is stored well below 5 MiB, so the sender
         // declares each part's plaintext length and the target validates the
         // 5 MiB minimum against it (rustfs/backlog#2363). rc.5 as the sender
-        // still fails this layout (see `rc5_baseline_replicates_multipart_layouts`).
+        // still fails this layout (see `previous_release_baseline_replicates_multipart_layouts`).
         case(
             LAYOUT_PLAIN_BUCKET,
             "plain/ssec-compressed-multipart-2.txt",
@@ -2350,8 +2940,8 @@ async fn assert_layout_full_body(client: &Client, case: &LayoutCase, context: &s
     let head = layout_head(client, case).await?;
     assert_eq!(
         head.e_tag().map(|etag| etag.trim_matches('"')),
-        Some(case.rc5_etag.as_str()),
-        "{context}: {label}: the ETag written by rc.5 must be reported unchanged"
+        Some(case.source_etag.as_str()),
+        "{context}: {label}: the ETag written by the previous release must be reported unchanged"
     );
     assert_eq!(
         head.content_length(),
@@ -2361,7 +2951,10 @@ async fn assert_layout_full_body(client: &Client, case: &LayoutCase, context: &s
 
     let full = layout_get(client, case, None, None).await?.body.collect().await?.into_bytes();
     assert_eq!(full.len(), case.body.len(), "{context}: {label}: full GET length");
-    assert!(full == case.body, "{context}: {label}: full GET body must equal the rc.5 upload");
+    assert!(
+        full == case.body,
+        "{context}: {label}: full GET body must equal the previous-release upload"
+    );
     Ok(())
 }
 
@@ -2403,7 +2996,7 @@ async fn assert_layout_attributes(client: &Client, case: &LayoutCase, context: &
     let attributes = layout_attributes(client, case).await?;
     assert_eq!(
         attributes.e_tag().map(|etag| etag.trim_matches('"')),
-        Some(case.rc5_etag.as_str()),
+        Some(case.source_etag.as_str()),
         "{context}: {label}: attributes ETag"
     );
     assert_eq!(
@@ -2602,13 +3195,13 @@ async fn replicate_layouts(
     Ok((target, transports))
 }
 
-/// rc.5 writes single-PUT, multipart, compressed, SSE-C and SSE-S3 layouts;
+/// The previous release writes single-PUT, multipart, compressed, SSE-C and SSE-S3 layouts;
 /// the current build must read every byte, expose the stored part layout
 /// through GetObjectAttributes and partNumber reads, and replicate the objects
 /// with the transport that matches their stored parts.
 #[tokio::test]
-#[ignore = "requires the pinned 1.0.0-rc.5 release binary"]
-async fn direct_upgrade_from_rc5_preserves_multipart_layouts() -> TestResult {
+#[ignore = "requires a pinned previous RustFS release binary"]
+async fn direct_upgrade_from_previous_release_preserves_multipart_layouts() -> TestResult {
     init_logging();
     let previous_binary = source_binary()?;
     let server_env = layout_server_env();
@@ -2622,18 +3215,18 @@ async fn direct_upgrade_from_rc5_preserves_multipart_layouts() -> TestResult {
     enable_versioning(&old_client, LAYOUT_PLAIN_BUCKET).await?;
     enable_versioning(&old_client, LAYOUT_ENCRYPTED_BUCKET).await?;
     put_default_sse_s3_encryption(&old_client, LAYOUT_ENCRYPTED_BUCKET).await?;
-    assert_default_sse_s3_encryption(&old_client, LAYOUT_ENCRYPTED_BUCKET, "rc.5").await?;
+    assert_default_sse_s3_encryption(&old_client, LAYOUT_ENCRYPTED_BUCKET, "previous release").await?;
 
     let mut cases = layout_cases();
     for case in cases.iter_mut() {
         layout_write(&old_client, case).await?;
         let head = layout_head(&old_client, case).await?;
-        case.rc5_etag = head
+        case.source_etag = head
             .e_tag()
-            .ok_or_else(|| format!("{}: rc.5 HEAD omitted the ETag", case.label()))?
+            .ok_or_else(|| format!("{}: previous-release HEAD omitted the ETag", case.label()))?
             .trim_matches('"')
             .to_string();
-        case.rc5_reported_parts = layout_attributes(&old_client, case)
+        case.source_reported_parts = layout_attributes(&old_client, case)
             .await
             .ok()
             .and_then(|a| layout_reported_parts(&a));
@@ -2641,16 +3234,16 @@ async fn direct_upgrade_from_rc5_preserves_multipart_layouts() -> TestResult {
             target: "e2e_test::upgrade_compatibility_test",
             object = %case.label(),
             parts = case.part_sizes.len(),
-            etag = %case.rc5_etag,
-            rc5_reported_parts = ?case.rc5_reported_parts,
-            "rc.5 wrote a legacy layout"
+            etag = %case.source_etag,
+            source_reported_parts = ?case.source_reported_parts,
+            "previous release wrote a layout"
         );
     }
-    // Prove the rc.5 writer persisted every original byte before upgrading.
+    // Prove the previous-release writer persisted every original byte before upgrading.
     // Its compressed cross-part range reader has a legacy limitation; the
     // upgraded reader must still satisfy every range and partNumber assertion.
     for case in &cases {
-        assert_layout_full_body(&old_client, case, "rc.5").await?;
+        assert_layout_full_body(&old_client, case, "previous release").await?;
     }
 
     // Upgrade in place.
@@ -2705,19 +3298,19 @@ async fn direct_upgrade_from_rc5_preserves_multipart_layouts() -> TestResult {
                 .await?
                 .into_bytes();
             assert_eq!(replica.len(), case.body.len(), "{label}: replica length");
-            assert!(replica == case.body, "{label}: replica body must equal the rc.5 upload");
+            assert!(replica == case.body, "{label}: replica body must equal the previous-release upload");
         }
     }
     Ok(())
 }
 
-/// The same layouts replicated by rc.5 itself, without an upgrade. This is the
+/// The same layouts replicated by the previous release itself, without an upgrade. This is the
 /// baseline that tells a pre-existing transport failure apart from one the
 /// current build introduced; it records the outcome per layout and only fails
 /// when the fixture cannot run.
 #[tokio::test]
-#[ignore = "requires the pinned 1.0.0-rc.5 release binary"]
-async fn rc5_baseline_replicates_multipart_layouts() -> TestResult {
+#[ignore = "requires a pinned previous RustFS release binary"]
+async fn previous_release_baseline_replicates_multipart_layouts() -> TestResult {
     init_logging();
     let previous_binary = source_binary()?;
     let server_env = layout_server_env();
@@ -2736,9 +3329,9 @@ async fn rc5_baseline_replicates_multipart_layouts() -> TestResult {
     for case in cases.iter_mut() {
         layout_write(&client, case).await?;
         let head = layout_head(&client, case).await?;
-        case.rc5_etag = head
+        case.source_etag = head
             .e_tag()
-            .ok_or_else(|| format!("{}: rc.5 HEAD omitted the ETag", case.label()))?
+            .ok_or_else(|| format!("{}: previous-release HEAD omitted the ETag", case.label()))?
             .trim_matches('"')
             .to_string();
     }
@@ -2756,7 +3349,7 @@ async fn rc5_baseline_replicates_multipart_layouts() -> TestResult {
             )
         })
         .collect();
-    tracing::info!(target: "e2e_test::upgrade_compatibility_test", ?summary, "rc.5 baseline replication outcomes");
+    tracing::info!(target: "e2e_test::upgrade_compatibility_test", ?summary, "previous-release baseline replication outcomes");
     Ok(())
 }
 
@@ -2783,7 +3376,7 @@ async fn existing_object_replication_drives_each_layout_once() -> TestResult {
     for case in cases.iter_mut() {
         layout_write(&writer, case).await?;
         let head = layout_head(&writer, case).await?;
-        case.rc5_etag = head
+        case.source_etag = head
             .e_tag()
             .ok_or_else(|| format!("{}: HEAD omitted the ETag", case.label()))?
             .trim_matches('"')

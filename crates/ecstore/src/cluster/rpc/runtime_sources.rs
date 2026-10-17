@@ -69,9 +69,10 @@ pub(crate) fn read_version_request_caller_from_location(file: &str) -> ReadVersi
         ReadVersionRequestCaller::Peer
     } else if path_ends_with(file, "/store/init.rs") {
         ReadVersionRequestCaller::Startup
-    } else if path_ends_with(file, "/store/heal.rs") || path_ends_with(file, "/set_disk/ops/heal.rs") {
-        ReadVersionRequestCaller::Heal
-    } else if path_ends_with(file, "/set_disk/ops/heal_walk.rs") {
+    } else if path_ends_with(file, "/store/heal.rs")
+        || path_ends_with(file, "/set_disk/ops/heal.rs")
+        || path_ends_with(file, "/set_disk/ops/heal_walk.rs")
+    {
         ReadVersionRequestCaller::Heal
     } else if path_ends_with(file, "/store/list_objects.rs") {
         ReadVersionRequestCaller::ListObjects
@@ -752,6 +753,7 @@ pub(crate) fn internode_msgpack_json_decode_error_total_for_test() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "diagnostic-read-version-caller")]
     use super::*;
 
     #[cfg(feature = "diagnostic-read-version-caller")]

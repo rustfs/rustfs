@@ -85,6 +85,13 @@ fn validate_bootstrap_volume(volume: &str) -> DiskResult<()> {
 }
 
 impl ECStore {
+    /// Resolve a quota lease against this request's captured storage instance.
+    pub async fn quota_mutation_fence_disk(&self, disk_ref: &str) -> DiskResult<DiskStore> {
+        let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
+        let _owner = admit_local_disk(&self.ctx, &disk, id, false).await?;
+        Ok(disk)
+    }
+
     pub async fn write_local_metadata_at_incarnation(
         self: &Arc<Self>,
         disk_ref: &str,

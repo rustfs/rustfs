@@ -66,6 +66,9 @@ const MAX_OBJECT_RESPONSE_BYTES: usize = 16_384;
 const CLEANUP_RESERVE_MAX: Duration = Duration::from_millis(250);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_MODE: u32 = 0o600;
+const LOG_COMPONENT_CONNECT: &str = "connect";
+const LOG_SUBSYSTEM_PERFORMANCE_OBJECT: &str = "performance_object";
+const EVENT_OBJECT_CLEANUP_FAILED: &str = "connect_object_cleanup_failed";
 
 static OBJECT_COLLECTOR_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -483,15 +486,59 @@ impl S3ObjectProbe {
     }
 
     async fn cleanup(&self, object_url: Url, bucket_url: Url, deadline: Instant) -> Result<(), ObjectProbeError> {
-        let object = self.send(Method::DELETE, object_url, Bytes::new(), deadline, None).await?;
+        let started = Instant::now();
+        let object = self
+            .send(Method::DELETE, object_url, Bytes::new(), deadline, None)
+            .await
+            .inspect_err(|reason| Self::log_cleanup_failure("object_delete", None, *reason, started, deadline))?;
         if !object.status().is_success() && object.status() != StatusCode::NOT_FOUND {
+            Self::log_cleanup_failure(
+                "object_delete",
+                Some(object.status().as_u16()),
+                ObjectProbeError::CleanupFailed,
+                started,
+                deadline,
+            );
             return Err(ObjectProbeError::CleanupFailed);
         }
-        let bucket = self.send(Method::DELETE, bucket_url, Bytes::new(), deadline, None).await?;
+        let bucket = self
+            .send(Method::DELETE, bucket_url, Bytes::new(), deadline, None)
+            .await
+            .inspect_err(|reason| Self::log_cleanup_failure("bucket_delete", None, *reason, started, deadline))?;
         if !bucket.status().is_success() {
+            Self::log_cleanup_failure(
+                "bucket_delete",
+                Some(bucket.status().as_u16()),
+                ObjectProbeError::CleanupFailed,
+                started,
+                deadline,
+            );
             return Err(ObjectProbeError::CleanupFailed);
         }
         Ok(())
+    }
+
+    fn log_cleanup_failure(
+        stage: &'static str,
+        http_status: Option<u16>,
+        reason: ObjectProbeError,
+        started: Instant,
+        deadline: Instant,
+    ) {
+        // Only bounded local classifications are logged, never the signed URL,
+        // credentials, response body, or a transport error containing them.
+        tracing::error!(
+            event = EVENT_OBJECT_CLEANUP_FAILED,
+            component = LOG_COMPONENT_CONNECT,
+            subsystem = LOG_SUBSYSTEM_PERFORMANCE_OBJECT,
+            result = "failed",
+            stage,
+            reason = ?reason,
+            http_status,
+            elapsed_ms = started.elapsed().as_millis(),
+            remaining_ms = deadline.saturating_duration_since(Instant::now()).as_millis(),
+            "Object diagnostic cleanup failed"
+        );
     }
 
     async fn send(

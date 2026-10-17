@@ -602,6 +602,18 @@ impl CheckpointManager {
         self.save_checkpoint_throttled().await
     }
 
+    pub(crate) async fn reset_after_delete_recovery(&self) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.reset_for_retry();
+        if let Some(admin) = checkpoint.admin.as_mut() {
+            admin.completed = false;
+            admin.outcome = Default::default();
+            admin.outcome.start();
+        }
+        drop(checkpoint);
+        self.save_checkpoint().await
+    }
+
     /// Add a processed object. Called once per healed object, so persistence
     /// is batched (`PERSIST_EVERY_MUTATIONS` / `PERSIST_INTERVAL`); positions
     /// and page boundaries still persist unconditionally.

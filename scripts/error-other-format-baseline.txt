@@ -68,4 +68,4 @@
 10|crates/ecstore/src/store/init.rs
 3|crates/ecstore/src/store/multipart.rs
 6|crates/ecstore/src/store/object.rs
-5|crates/ecstore/src/store/rebalance/support.rs
+3|crates/ecstore/src/store/rebalance/support.rs

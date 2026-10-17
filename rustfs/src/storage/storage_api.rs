@@ -495,9 +495,9 @@ pub(crate) mod ecstore_disk {
         DELETE_RECOVERY_PROTOCOL_VERSION, DeleteOptions, DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest,
         DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DiskAPI, DiskInfo,
         DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, GuardedDeleteVersionsPayload,
-        GuardedFileInfoVersions, OldCurrentSize, PartTransactionAction, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp,
-        ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-        get_object_disk_read_timeout, validate_batch_read_version_item_count,
+        GuardedFileInfoVersions, OldCurrentSize, PartTransactionAction, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET,
+        ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo,
+        WalkDirOptions, get_object_disk_read_timeout, is_quota_mutation_fence_path, validate_batch_read_version_item_count,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::disk::{CurrentDeleteGeneration, DiskOption, new_disk};
@@ -541,12 +541,14 @@ pub(crate) mod ecstore_metrics {
 
 #[allow(unused_imports)]
 pub(crate) mod ecstore_notification {
-    #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::notification::rotate_cross_pool_fence_fleet_proof_for_test;
     pub(crate) use rustfs_ecstore::api::notification::{
         ClusterTierDailyStats, CrossPoolFenceFleetProofToken, NotificationSys, acquire_cross_pool_fence_fleet_proof,
-        cross_pool_fence_fleet_proof_matches, get_global_notification_sys, ilm_recovery_export_local_process_epoch,
-        new_global_notification_sys, start_remote_version_state_fleet_probe,
+        configured_fleet_topology_fingerprint, cross_pool_fence_fleet_proof_matches, get_global_notification_sys,
+        ilm_recovery_export_local_process_epoch, new_global_notification_sys, start_remote_version_state_fleet_probe,
+    };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::notification::{
+        rotate_cross_pool_fence_fleet_proof_for_test, without_cross_pool_fence_fleet_proof_for_test,
     };
 }
 
@@ -1513,6 +1515,7 @@ pub(crate) trait StorageDiskRpcExt {
         versions: Vec<FileInfoVersions>,
         opts: DeleteOptions,
     ) -> Vec<Option<DiskError>>;
+    async fn has_delete_transaction_evidence(&self, volume: &str, object: &str) -> DiskResult<bool>;
     async fn discover_delete_transactions(
         &self,
         volume: &str,
@@ -1734,6 +1737,10 @@ where
         opts: DeleteOptions,
     ) -> Vec<Option<DiskError>> {
         ecstore_disk::DiskAPI::delete_versions_recoverable(self, volume, versions, opts).await
+    }
+
+    async fn has_delete_transaction_evidence(&self, volume: &str, object: &str) -> DiskResult<bool> {
+        ecstore_disk::DiskAPI::has_delete_transaction_evidence(self, volume, object).await
     }
 
     async fn discover_delete_transactions(

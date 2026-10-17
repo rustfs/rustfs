@@ -7733,10 +7733,21 @@ pub fn e_tag_matches(etag: &str, condition: &str) -> bool {
     canonicalize_etag(etag) == canonicalize_etag(condition)
 }
 
-/// `If-None-Match` on a write means create-only (`*`); the S3 handlers reject any
-/// other value with 501 before it reaches the store. Any non-blank value therefore
-/// blocks the overwrite instead of being compared as an ETag, so a caller that skips
-/// that check still cannot turn the precondition into a weaker one.
+fn weak_etag_matches(etag: &str, condition: &str) -> bool {
+    let condition = condition.trim();
+    if condition == "*" {
+        return true;
+    }
+    fn strip_weak(value: &str) -> &str {
+        let trimmed = value.trim();
+        trimmed
+            .strip_prefix("W/")
+            .or_else(|| trimmed.strip_prefix("w/"))
+            .unwrap_or(trimmed)
+    }
+    canonicalize_etag(strip_weak(etag)) == canonicalize_etag(strip_weak(condition))
+}
+
 pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<String>, if_match: Option<String>) -> bool {
     let if_none_match = if_none_match
         .as_deref()
@@ -7746,7 +7757,9 @@ pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<String>, if_m
 
     match &oi.etag {
         Some(etag) => {
-            if if_none_match.is_some() {
+            if let Some(if_none_match) = if_none_match
+                && weak_etag_matches(etag, if_none_match)
+            {
                 return true;
             }
             if let Some(if_match) = if_match
@@ -10426,6 +10439,13 @@ mod tests {
             .expect("orphan part should be written");
 
         let set = make_set_disks_with(vec![Some(disk)]).await;
+        assert_eq!(
+            set.dry_run_reclaim_orphan_data_dirs("bucket", "obj")
+                .await
+                .expect("dry-run orphan cleanup"),
+            1
+        );
+        assert!(object_dir.join(orphan.to_string()).exists(), "dry run must retain the orphan payload");
         let removed = set
             .reclaim_orphan_data_dirs("bucket", "obj")
             .await
@@ -10435,6 +10455,67 @@ mod tests {
         assert!(object_dir.join(live.to_string()).exists(), "referenced data dir must be preserved");
         assert!(!object_dir.join(orphan.to_string()).exists(), "orphaned data dir must be removed");
         assert!(object_dir.join(STORAGE_FORMAT_FILE).exists(), "metadata must be preserved");
+    }
+
+    #[tokio::test]
+    async fn reclaim_orphan_data_dirs_drains_empty_discovery_pages() {
+        let (dir, disk) = make_single_local_disk().await;
+        let live = Uuid::new_v4();
+        let orphan = Uuid::new_v4();
+        let object_dir = dir.path().join("bucket/obj");
+        write_object_meta_with_data_dirs(&object_dir, "bucket", "obj", &[live]).await;
+        let live_dir = object_dir.join(live.to_string());
+        let orphan_dir = object_dir.join(orphan.to_string());
+        fs::create_dir_all(&live_dir).await.expect("create live multipart directory");
+        fs::create_dir_all(&orphan_dir).await.expect("create orphan directory");
+        fs::write(orphan_dir.join("part.1"), b"stale")
+            .await
+            .expect("write orphan payload");
+        let parts_dir = live_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            for part in 1..=4200 {
+                std::fs::write(parts_dir.join(format!("part.{part}")), b"live").expect("write live multipart entry");
+            }
+        })
+        .await
+        .expect("create multipart fixture");
+
+        let first = disk
+            .discover_delete_transactions("bucket", Some("obj"), None, 1)
+            .await
+            .expect("read first discovery page");
+        assert!(first.transactions.is_empty());
+        assert!(first.next.is_some(), "ordinary multipart entries must exhaust the first scan budget");
+        let last = disk
+            .discover_delete_transactions("bucket", Some("obj"), first.next, 1)
+            .await
+            .expect("finish fixture discovery");
+        assert!(
+            last.transactions.is_empty() && last.next.is_none(),
+            "the complete inventory has no transaction evidence"
+        );
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        assert_eq!(
+            set.dry_run_reclaim_orphan_data_dirs("bucket", "obj")
+                .await
+                .expect("dry-run paginated orphan cleanup"),
+            1
+        );
+        assert!(orphan_dir.exists(), "dry-run must retain the orphan");
+        assert_eq!(
+            set.reclaim_orphan_data_dirs("bucket", "obj")
+                .await
+                .expect("reclaim after complete discovery"),
+            1
+        );
+        assert!(!orphan_dir.exists(), "both the set preflight and final disk guard must drain empty pages");
+        assert_eq!(
+            fs::read(live_dir.join("part.4200"))
+                .await
+                .expect("read referenced multipart tail"),
+            b"live"
+        );
     }
 
     async fn recv_abandoned_parts_trace(
@@ -10650,7 +10731,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reclaim_orphan_data_dirs_recovers_committed_delete_marker_without_meta() {
+    async fn reclaim_orphan_data_dirs_defers_delete_marker_without_meta() {
         let (dir, disk) = make_single_local_disk().await;
         let stale = Uuid::new_v4();
         let transaction = Uuid::new_v4();
@@ -10675,8 +10756,105 @@ mod tests {
             .await
             .expect("upgrade reclaim should succeed");
 
-        assert_eq!(removed, 1, "the committed delete residue should be reclaimed");
-        assert!(!stale_dir.exists(), "the committed stale data dir should be removed");
+        assert_eq!(removed, 0, "a local marker is not a set-level commit decision");
+        assert_eq!(fs::read(stale_dir.join("part.1")).await.expect("read retained payload"), b"stale");
+    }
+
+    #[tokio::test]
+    async fn reclaim_orphan_data_dirs_preserves_uuid_prefix_children() {
+        let (dir, disk) = make_single_local_disk().await;
+        let live = Uuid::new_v4();
+        let prefix = Uuid::new_v4();
+        let child_data = Uuid::new_v4();
+        let object_dir = dir.path().join("bucket/obj");
+        write_object_meta_with_data_dirs(&object_dir, "bucket", "obj", &[live]).await;
+        let child_dir = object_dir.join(prefix.to_string()).join("child");
+        write_object_meta_with_data_dirs(&child_dir, "bucket", &format!("obj/{prefix}/child"), &[child_data]).await;
+        let data_dir = child_dir.join(child_data.to_string());
+        fs::create_dir_all(&data_dir).await.expect("create child payload directory");
+        fs::write(data_dir.join("part.1"), b"live child payload")
+            .await
+            .expect("write child payload");
+        let parent_meta = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("read parent metadata");
+        let child_meta = fs::read(child_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("read child metadata");
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        assert_eq!(set.dry_run_reclaim_orphan_data_dirs("bucket", "obj").await.expect("dry run"), 0);
+        assert_eq!(set.reclaim_orphan_data_dirs("bucket", "obj").await.expect("reclaim"), 0);
+        assert_eq!(
+            fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("read parent metadata"),
+            parent_meta
+        );
+        assert_eq!(
+            fs::read(child_dir.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("read child metadata"),
+            child_meta
+        );
+        assert_eq!(
+            fs::read(data_dir.join("part.1")).await.expect("read child payload"),
+            b"live child payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaim_orphan_data_dirs_waits_for_complete_participant_inventory() {
+        let (dir, disk) = make_single_local_disk().await;
+        let live = Uuid::new_v4();
+        let orphan = Uuid::new_v4();
+        let object_dir = dir.path().join("bucket/obj");
+        write_object_meta_with_data_dirs(&object_dir, "bucket", "obj", &[live]).await;
+        let payload_dir = object_dir.join(orphan.to_string());
+        fs::create_dir_all(&payload_dir).await.expect("create orphan directory");
+        fs::write(payload_dir.join("part.1"), b"potentially referenced payload")
+            .await
+            .expect("write payload");
+        let set = make_set_disks_with(vec![Some(disk), None]).await;
+        assert_eq!(set.dry_run_reclaim_orphan_data_dirs("bucket", "obj").await.expect("dry run"), 0);
+        assert_eq!(set.reclaim_orphan_data_dirs("bucket", "obj").await.expect("reclaim"), 0);
+        assert_eq!(
+            fs::read(payload_dir.join("part.1")).await.expect("read retained payload"),
+            b"potentially referenced payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaim_orphan_data_dirs_defers_payload_referenced_by_neighboring_journal() {
+        let (dir, disk) = make_single_local_disk().await;
+        let live = Uuid::new_v4();
+        let old = Uuid::new_v4();
+        let transaction = Uuid::new_v4();
+        let object_dir = dir.path().join("bucket/obj");
+        write_object_meta_with_data_dirs(&object_dir, "bucket", "obj", &[live]).await;
+        let payload_dir = object_dir.join(old.to_string());
+        fs::create_dir_all(&payload_dir).await.expect("create old payload directory");
+        fs::write(payload_dir.join("part.1"), b"rollback payload")
+            .await
+            .expect("write old payload");
+        let transaction_dir = object_dir.join(transaction.to_string());
+        write_object_meta_with_data_dirs(&transaction_dir, "bucket", "obj", &[old]).await;
+        fs::rename(
+            transaction_dir.join(STORAGE_FORMAT_FILE),
+            transaction_dir.join(STORAGE_FORMAT_FILE_BACKUP),
+        )
+        .await
+        .expect("retain rollback metadata");
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        assert_eq!(set.dry_run_reclaim_orphan_data_dirs("bucket", "obj").await.expect("dry run"), 0);
+        assert_eq!(set.reclaim_orphan_data_dirs("bucket", "obj").await.expect("reclaim"), 0);
+        assert_eq!(
+            fs::read(payload_dir.join("part.1")).await.expect("read rollback payload"),
+            b"rollback payload"
+        );
+        assert!(
+            transaction_dir.join(STORAGE_FORMAT_FILE_BACKUP).exists(),
+            "canonical recovery owns the journal"
+        );
     }
 
     // Cross-replica union: a data dir referenced by ANOTHER disk's xl.meta must be
@@ -13494,19 +13672,17 @@ mod tests {
         let if_match = Some("*".to_string());
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
 
-        // A non-wildcard If-None-Match is not an ETag comparison on writes: it never
-        // lets an existing object be overwritten, whatever the value.
         let if_none_match = Some("def".to_string());
         let if_match = None;
-        assert!(should_prevent_write(&oi, if_none_match, if_match));
+        assert!(!should_prevent_write(&oi, if_none_match, if_match));
 
         let if_none_match = Some("def".to_string());
         let if_match = Some("*".to_string());
-        assert!(should_prevent_write(&oi, if_none_match, if_match));
+        assert!(!should_prevent_write(&oi, if_none_match, if_match));
 
         let if_none_match = Some("def".to_string());
         let if_match = Some("\"abc\"".to_string());
-        assert!(should_prevent_write(&oi, if_none_match, if_match));
+        assert!(!should_prevent_write(&oi, if_none_match, if_match));
 
         let if_none_match = Some("*".to_string());
         let if_match = Some("\"abc\"".to_string());
@@ -13527,6 +13703,14 @@ mod tests {
         let if_none_match = Some(String::new());
         let if_match = Some(" ".to_string());
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
+
+        let oi = ObjectInfo {
+            etag: Some("abc".to_string()),
+            ..Default::default()
+        };
+        assert!(should_prevent_write(&oi, Some("W/\"abc\"".to_string()), None));
+        assert!(!should_prevent_write(&oi, Some("W/\"def\"".to_string()), None));
+        assert!(should_prevent_write(&oi, None, Some("W/\"abc\"".to_string())));
     }
 
     #[test]
@@ -16073,6 +16257,34 @@ mod tests {
             set_disks.check_write_precondition(bucket, object, &create_only).await,
             Some(StorageError::PreconditionFailed),
             "data movement must not replace a target delete marker"
+        );
+        let ordinary_create_only = ObjectOptions {
+            versioned: true,
+            http_preconditions: Some(HTTPPreconditions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            set_disks
+                .check_write_precondition(bucket, object, &ordinary_create_only)
+                .await,
+            None,
+            "ordinary If-None-Match: * must proceed past a top-level delete marker"
+        );
+        let ordinary_if_match = ObjectOptions {
+            versioned: true,
+            http_preconditions: Some(HTTPPreconditions {
+                if_match: Some("*".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            set_disks.check_write_precondition(bucket, object, &ordinary_if_match).await,
+            Some(StorageError::ObjectNotFound(bucket.to_string(), object.to_string())),
+            "ordinary If-Match must treat a top-level delete marker as absent"
         );
         let err = match set_disks
             .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)

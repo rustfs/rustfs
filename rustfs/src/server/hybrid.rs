@@ -39,7 +39,9 @@ pub(crate) fn is_grpc_request<B>(req: &Request<B>) -> bool {
 fn rename_data_grpc_stage(path: &str) -> bool {
     matches!(
         path,
-        "/node_service.NodeService/RenameData" | "/node_service.NodeService/RenameDataAtIncarnation"
+        "/node_service.NodeService/RenameData"
+            | "/node_service.NodeService/RenameDataAtIncarnation"
+            | "/node_service.NodeService/RenameDataWithQuotaFence"
     )
 }
 

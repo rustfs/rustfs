@@ -5166,7 +5166,6 @@ impl SetDisks {
                     pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::BeforeQuotaRename).await;
                     let first_fence_check_started = rustfs_io_metrics::put_stage_timer();
                     if quota_reservation.is_lock_lost()
-                        || !quota_reservation.capability_proof_matches()
                         || write_context.is_lock_lost()
                         || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                         || _decommission_object_lock_guard
@@ -5241,7 +5240,6 @@ impl SetDisks {
                     }
                     let second_fence_check_started = rustfs_io_metrics::put_stage_timer();
                     if quota_reservation.is_lock_lost()
-                        || !quota_reservation.capability_proof_matches()
                         || write_context.is_lock_lost()
                         || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                         || _decommission_object_lock_guard
@@ -8753,6 +8751,21 @@ impl SetDisks {
         // quorum-minus-one delete into an apparent success.
         let write_quorum = self.set_drive_count / 2 + 1;
         let rollback_dir = Uuid::new_v4();
+        // Register before preparation: cancellation and response loss can
+        // leave a durable journal even when publication never returns.
+        let recovery_ticket = (!is_meta_bucketname(bucket))
+            .then(|| {
+                self.ctx
+                    .delete_recovery_hints()
+                    .register(crate::store::delete_recovery_runtime::DeleteRecoveryKey {
+                        pool: self.pool_index,
+                        set: self.set_index,
+                        bucket: bucket.to_owned(),
+                        object: object.to_owned(),
+                        incarnation: source_bucket_incarnation_id,
+                    })
+            })
+            .flatten();
 
         let mut futures = Vec::with_capacity(disks.len());
         let mut errs = Vec::with_capacity(disks.len());
@@ -8823,6 +8836,7 @@ impl SetDisks {
                 &disks,
                 write_quorum,
                 DeleteRecoveryContext {
+                    recovery_ticket,
                     namespace_owner: namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>),
                     ..DeleteRecoveryContext::new(source_bucket_incarnation_id, &|| commit_context.can_commit(bucket, object))
                 },
@@ -9892,6 +9906,24 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             fi_vers.versions.retain(|fi| del_errs[fi.idx].is_none());
         }
         vers.retain(|fi_vers| !fi_vers.versions.is_empty());
+        let recovery_tickets: Vec<_> = vers
+            .iter()
+            .map(|group| {
+                (!is_meta_bucketname(bucket))
+                    .then(|| {
+                        self.ctx
+                            .delete_recovery_hints()
+                            .register(crate::store::delete_recovery_runtime::DeleteRecoveryKey {
+                                pool: self.pool_index,
+                                set: self.set_index,
+                                bucket: bucket.to_owned(),
+                                object: group.name.clone(),
+                                incarnation: opts.expected_bucket_incarnation_id,
+                            })
+                    })
+                    .flatten()
+            })
+            .collect();
         let mut futures = Vec::with_capacity(disks.len());
         let lock_lost_during_commit = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -10072,6 +10104,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             published_groups.extend(groups.iter().map(|index| vers[*index].name.clone()));
             let publications = futures::stream::iter(groups.into_iter().map(|index: usize| {
                 let group = &vers[index];
+                let recovery_ticket = recovery_tickets[index].clone();
                 let namespace_owner = namespace_owner.clone();
                 let disks = &disks;
                 let opts = &opts;
@@ -10091,6 +10124,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                             disks,
                             self.set_drive_count / 2 + 1,
                             DeleteRecoveryContext {
+                                recovery_ticket,
                                 namespace_owner,
                                 ..DeleteRecoveryContext::new(opts.expected_bucket_incarnation_id, &can_commit)
                             },

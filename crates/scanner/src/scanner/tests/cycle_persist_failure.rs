@@ -24,6 +24,17 @@ static FAILURE: StdMutex<Option<Failure>> = StdMutex::new(None);
 
 struct FailureGuard;
 
+pub(super) fn fail_next_save(epoch: u64, after_commit: bool) -> impl Drop {
+    let mut slot = FAILURE.lock().expect("failure injection lock");
+    assert!(slot.is_none(), "state failure injection must not replace another test's fault");
+    *slot = Some(Failure {
+        epoch,
+        successful_saves: 0,
+        after_commit,
+    });
+    FailureGuard
+}
+
 impl Drop for FailureGuard {
     fn drop(&mut self) {
         *FAILURE.lock().expect("failure injection lock") = None;

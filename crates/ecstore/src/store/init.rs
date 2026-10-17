@@ -831,6 +831,8 @@ impl ECStore {
             }
         });
 
+        super::delete_recovery_runtime::start_delete_recovery(self.clone(), rx.clone());
+
         runtime_sources::init_bucket_monitor_for_current_endpoints();
         crate::bucket::bucket_target_sys::BucketTargetSys::get().start_heartbeat();
 
@@ -2714,6 +2716,106 @@ mod tests {
         (instance_ctx, store, shutdown)
     }
 
+    /// CopyObject destinations and CreateMultipartUpload create keys, so they
+    /// must reject exactly the keys PutObject rejects, with the same error.
+    /// The copy path reaches the pools' put_object directly and used to admit
+    /// keys PutObject refused (e.g. over 1024 bytes, or Windows-unaddressable).
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn copy_destination_and_multipart_create_share_put_object_admission() {
+        let temp_dir = tempfile::tempdir().expect("create key-admission store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "key-admission", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+
+        let bucket = format!("key-admission-{}", Uuid::new_v4());
+        let source_object = "source.bin";
+        let payload = b"key admission source".to_vec();
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("key-admission bucket should be created");
+        store
+            .put_object(
+                &bucket,
+                source_object,
+                &mut PutObjReader::from_vec(payload.clone()),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("source object should be written");
+        let source_info = store
+            .get_object_info(&bucket, source_object, &ObjectOptions::default())
+            .await
+            .expect("source metadata should be readable");
+
+        // Every segment fits NAME_MAX, but the key exceeds S3's 1024 bytes.
+        let too_long = vec!["s".repeat(210); 5].join("/");
+        let mut rejected = vec![too_long];
+        if cfg!(target_os = "windows") {
+            rejected.extend(["a:b", "a\\b", "NUL.txt", "tab\tname"].map(str::to_owned));
+        }
+        for dst_object in &rejected {
+            let put_err = store
+                .put_object(
+                    &bucket,
+                    dst_object,
+                    &mut PutObjReader::from_vec(payload.clone()),
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect_err("PutObject must reject the key");
+            let mut copy_source = source_info.clone();
+            copy_source.put_object_reader = Some(PutObjReader::from_vec(payload.clone()));
+            let copy_err = store
+                .copy_object(
+                    &bucket,
+                    source_object,
+                    &bucket,
+                    dst_object,
+                    &mut copy_source,
+                    &ObjectOptions::default(),
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect_err("CopyObject must reject the destination key");
+            assert_eq!(format!("{copy_err:?}"), format!("{put_err:?}"), "{dst_object:?}");
+            let multipart_err = store
+                .new_multipart_upload(&bucket, dst_object, &ObjectOptions::default())
+                .await
+                .expect_err("CreateMultipartUpload must reject the key");
+            assert_eq!(format!("{multipart_err:?}"), format!("{put_err:?}"), "{dst_object:?}");
+        }
+
+        // A segment over NAME_MAX used to be admitted by CreateMultipartUpload
+        // and only fail at completion with ENAMETOOLONG (rustfs#5785).
+        let oversized_segment = "m".repeat(256);
+        assert!(matches!(
+            store
+                .new_multipart_upload(&bucket, &oversized_segment, &ObjectOptions::default())
+                .await,
+            Err(StorageError::ObjectNameInvalid(_, _))
+        ));
+
+        // In-place copies rewrite an existing key and keep the copy-only check.
+        let mut in_place = source_info.clone();
+        in_place.metadata_only = true;
+        store
+            .copy_object(
+                &bucket,
+                source_object,
+                &bucket,
+                source_object,
+                &mut in_place,
+                &ObjectOptions::default(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("in-place copy of an existing key should succeed");
+
+        shutdown.cancel();
+    }
+
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
@@ -4161,6 +4263,178 @@ mod tests {
             assert_eq!(disk.runtime_state(), crate::disk::health_state::RuntimeDriveHealthState::Offline);
         }
         OfflineTestDisks { disks }
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn durable_quota_writes_with_one_offline_disk(sharded: bool) {
+        use crate::bucket::quota::BucketQuota;
+        use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+
+        let temp_dir = tempfile::tempdir().expect("create degraded quota store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "degraded-quota", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = format!("degraded-quota-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create degraded quota bucket");
+        let quota = if sharded {
+            BucketQuota::new_sharded(16_384)
+        } else {
+            BucketQuota::new(Some(16_384))
+        };
+        crate::bucket::metadata_sys::update_in(
+            &ctx,
+            &bucket,
+            crate::bucket::metadata::BUCKET_QUOTA_CONFIG_FILE,
+            serde_json::to_vec(&quota).expect("encode durable quota"),
+        )
+        .await
+        .expect("configure durable quota before losing a disk");
+
+        let set = &store.pools[0].disk_set[0];
+        assert_eq!(set.disks.read().await.len(), 4);
+        let offline_disk = force_set_disk_range_offline_for_test(set, 0..1).await;
+        let _without_proof = crate::services::notification_sys::without_cross_pool_fence_fleet_proof_for_test();
+        assert!(crate::services::notification_sys::acquire_cross_pool_fence_fleet_proof().is_none());
+
+        let payload = vec![0x51; 4096];
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        store
+            .put_object(&bucket, "put", &mut reader, &ObjectOptions::default())
+            .await
+            .expect("three healthy disks must admit a quota PUT without fleet proof");
+
+        let upload = store
+            .new_multipart_upload(&bucket, "multipart", &ObjectOptions::default())
+            .await
+            .expect("create multipart upload with one disk offline");
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let part = store
+            .put_object_part(&bucket, "multipart", &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("stage multipart part with one disk offline");
+        Arc::clone(&store)
+            .complete_multipart_upload(
+                &bucket,
+                "multipart",
+                &upload.upload_id,
+                vec![crate::storage_api_contracts::multipart::CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("three healthy disks must complete a quota multipart upload without fleet proof");
+
+        let source = store
+            .get_object_reader(&bucket, "put", None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("read degraded copy source");
+        let mut copy_info = source.object_info.clone();
+        let size = copy_info.get_actual_size().expect("copy source logical size");
+        copy_info.put_object_reader = Some(PutObjReader::new(
+            rustfs_rio::HashReader::from_stream(source.stream, size, size, None, None, false)
+                .expect("construct copy source reader"),
+        ));
+        store
+            .copy_object(
+                &bucket,
+                "put",
+                &bucket,
+                "copy",
+                &mut copy_info,
+                &ObjectOptions::default(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("three healthy disks must copy into a quota bucket without fleet proof");
+
+        // Hold the last available credit before publication so the competing
+        // writer must account for an outstanding reservation, not just objects.
+        let barrier = PutObjectCommitBarrier::install(&bucket, "reserved", PutObjectCommitPause::BeforeQuotaRename);
+        let first_store = Arc::clone(&store);
+        let first_bucket = bucket.clone();
+        let first = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![0x52; 4096]);
+            first_store
+                .put_object(&first_bucket, "reserved", &mut reader, &ObjectOptions::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+            .await
+            .expect("the last within-limit writer must reach its commit barrier");
+        let mut reader = PutObjReader::from_vec(vec![0x53; 4096]);
+        let denied = store
+            .put_object(&bucket, "over-limit", &mut reader, &ObjectOptions::default())
+            .await
+            .expect_err("an outstanding reservation must prevent concurrent quota oversubscription");
+        assert!(matches!(denied, StorageError::QuotaExceeded { limit: 16_384, .. }));
+        barrier.release();
+        first
+            .await
+            .expect("reserved PUT task should not panic")
+            .expect("the reserved writer must commit while one disk is offline");
+
+        for object in ["put", "multipart", "copy", "reserved"] {
+            let mut reader = store
+                .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("degraded quota writes must be readable");
+            let mut body = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("read committed quota object");
+            let expected = if object == "reserved" {
+                vec![0x52; 4096]
+            } else {
+                payload.clone()
+            };
+            assert_eq!(body, expected, "committed body for {object}");
+        }
+        store
+            .get_object_info(&bucket, "over-limit", &ObjectOptions::default())
+            .await
+            .expect_err("the over-limit writer must not publish an object");
+
+        let second_offline_disk = force_set_disk_range_offline_for_test(set, 1..2).await;
+        let mut reader = PutObjReader::from_vec(vec![0x54; 4096]);
+        let denied = store
+            .put_object(&bucket, "put", &mut reader, &ObjectOptions::default())
+            .await
+            .expect_err("a zero-growth overwrite must still fail when the actual write quorum is lost");
+        assert!(
+            matches!(
+                denied,
+                StorageError::ErasureWriteQuorum
+                    | StorageError::ErasureReadQuorum
+                    | StorageError::InsufficientWriteQuorum(_, _)
+                    | StorageError::InsufficientReadQuorum(_, _)
+            ),
+            "loss of actual disk quorum must return a storage quorum error, got {denied:?}"
+        );
+        shutdown.cancel();
+        drop(second_offline_disk);
+        drop(offline_disk);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn durable_quota_v1_writes_with_one_offline_disk_and_no_fleet_proof() {
+        run_large_stack_async_test("degraded-quota-v1", || durable_quota_writes_with_one_offline_disk(false));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn durable_quota_v2_writes_with_one_offline_disk_and_no_fleet_proof() {
+        run_large_stack_async_test("degraded-quota-v2", || durable_quota_writes_with_one_offline_disk(true));
     }
 
     fn active_rebalance_meta_for_pool(pool_count: usize, active_pool_idx: usize) -> RebalanceMeta {
@@ -17001,11 +17275,10 @@ mod tests {
             .delete_object_with_tier_delete_journal(bucket, object, ObjectOptions::default())
             .await
             .expect_err("one post-commit error plus one offline disk must miss delete quorum");
-        assert!(matches!(err, StorageError::Io(_)), "unexpected local delete failure: {err:?}");
-        assert!(
-            err.to_string()
-                .contains("Storage resources are insufficient for the write operation"),
-            "the caller must observe the wrapped quorum failure: {err}"
+        assert_eq!(
+            err,
+            StorageError::InsufficientWriteQuorum(bucket.to_owned(), object.to_owned()),
+            "the caller must observe the typed quorum failure with its object identity"
         );
         set.disks.write().await[1] = Some(saved_disk);
 

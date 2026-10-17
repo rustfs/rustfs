@@ -36,6 +36,7 @@ pub(crate) struct DeleteRecoverySummary {
     pub rolled_back: usize,
     pub blocked: usize,
     pub pending: usize,
+    pub failed: usize,
     pub reclaimed: usize,
     /// Observed removals for this exact key, not aggregated across prefixes.
     pub removed_versions: HashSet<Uuid>,
@@ -52,6 +53,7 @@ pub(crate) struct DeleteRecoveryContext<'a> {
     /// Only the locked heal path may repair a live marker-creation source.
     pub repair_marker_source: bool,
     pub namespace_owner: Option<Arc<dyn Send + Sync>>,
+    pub recovery_ticket: Option<crate::store::delete_recovery_runtime::DeleteRecoveryTicket>,
     pub can_commit: &'a (dyn Fn() -> bool + Sync),
 }
 
@@ -63,6 +65,7 @@ impl<'a> DeleteRecoveryContext<'a> {
             explicit_delete: false,
             repair_marker_source: false,
             namespace_owner: None,
+            recovery_ticket: None,
             can_commit,
         }
     }
@@ -75,6 +78,7 @@ impl DeleteRecoverySummary {
         self.rolled_back += other.rolled_back;
         self.blocked += other.blocked;
         self.pending += other.pending;
+        self.failed += other.failed;
         self.reclaimed += other.reclaimed;
     }
 }
@@ -307,6 +311,9 @@ impl SetDisks {
         {
             // An ordinary missing-key no-op requires no recovery decision.
             // Do not manufacture witness transactions while a drive is offline.
+            if let Some(ticket) = context.recovery_ticket.as_ref() {
+                self.ctx.delete_recovery_hints().ack(ticket);
+            }
             return Ok(());
         }
         let published = join_all(disks.iter().zip(&states).map(|(disk, state)| async {
@@ -336,7 +343,15 @@ impl SetDisks {
         }
         // Physical cleanup is retryable after the certified decision. An
         // unavailable participant retains the decision for its eventual return.
-        let _ = self.recover_delete_key(bucket, object, context).await;
+        let ticket = context.recovery_ticket.clone();
+        if let Ok(summary) = self.recover_delete_key(bucket, object, context).await
+            && summary.pending == 0
+            && summary.blocked == 0
+            && summary.failed == 0
+            && let Some(ticket) = ticket.as_ref()
+        {
+            self.ctx.delete_recovery_hints().ack(ticket);
+        }
         Ok(())
     }
 
@@ -363,6 +378,7 @@ impl SetDisks {
         }
         let pages = join_all(disks.iter().flatten().map(|disk| discover(disk, bucket, None))).await;
         let mut keys = BTreeSet::new();
+        let mut summary = DeleteRecoverySummary::default();
         for page in pages {
             match page {
                 Ok(ids) => {
@@ -373,18 +389,24 @@ impl SetDisks {
                     );
                 }
                 Err(error) if unavailable(&error) => {
-                    return Ok(DeleteRecoverySummary {
-                        pending: 1,
-                        ..Default::default()
-                    });
+                    summary.pending += 1;
                 }
+                Err(DiskError::FileCorrupt) => summary.failed += 1,
                 Err(error) => return Err(error),
             }
         }
-        let mut summary = DeleteRecoverySummary::default();
+        // Every key requires complete participation. Avoid taking each key's
+        // lock and repeating discovery while this sweep already lacks a peer.
+        if summary.pending > 0 {
+            return Ok(summary);
+        }
         // Lock order: caller's bucket lifecycle fence, then one exact key.
         for object in keys {
-            summary.add(self.recover_delete_object(bucket, &object, context.clone()).await?);
+            match self.recover_delete_object(bucket, &object, context.clone()).await {
+                Ok(result) => summary.add(result),
+                Err(DiskError::FileCorrupt) => summary.failed += 1,
+                Err(error) => return Err(error),
+            }
         }
         Ok(summary)
     }
@@ -428,6 +450,7 @@ impl SetDisks {
             repair_marker_source,
             namespace_owner,
             can_commit,
+            recovery_ticket: _,
         } = context;
         let disks = self.disk_inventory().await;
         let complete_inventory = disks.len() == self.set_drive_count && disks.iter().all(Option::is_some);
@@ -1052,6 +1075,131 @@ mod tests {
             report.detail
         );
         assert_eq!(body(&store, bucket, None).await, original);
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_corrupt_bucket_does_not_prevent_other_bucket_rollback() {
+        let bad_bucket = "recover-corrupt-bucket";
+        let good_bucket = "recover-good-bucket";
+        let (dirs, store, disks) = fixture(bad_bucket).await;
+        store
+            .make_bucket(good_bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create healthy bucket");
+        put(&store, bad_bucket, &[61; 4096], false).await;
+        let bad_transaction = applied(&store, &disks, bad_bucket, None, disks.len()).await;
+        let good_bytes = vec![62; 4096];
+        put(&store, good_bucket, &good_bytes, false).await;
+        applied(&store, &disks, good_bucket, None, disks.len()).await;
+        for dir in &dirs {
+            std::fs::write(
+                dir.path()
+                    .join(bad_bucket)
+                    .join("object")
+                    .join(bad_transaction.to_string())
+                    .join("delete-prepared"),
+                b"{broken",
+            )
+            .expect("inject malformed preparation journal");
+        }
+
+        let failed = store
+            .recover_delete_transactions(bad_bucket, &HealOpts::default())
+            .await
+            .expect("bucket corruption is an explicit partial recovery result");
+        assert_eq!(failed.delete_recovery.expect("recovery status").failed, 1);
+        let error = store
+            .recover_delete_transactions_at_incarnation(bad_bucket, Some("object"), None, &HealOpts::default())
+            .await
+            .expect_err("exact object recovery must retain typed corruption");
+        assert!(matches!(error, crate::error::StorageError::FileCorrupt));
+        let recovered = store
+            .recover_delete_transactions(good_bucket, &HealOpts::default())
+            .await
+            .expect("another bucket must remain recoverable");
+        assert!(recovered.detail.contains("rolled_back=1"));
+        assert!(!recovered.delete_recovery.expect("healthy recovery status").has_unresolved());
+        assert_eq!(body(&store, good_bucket, None).await, good_bytes);
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_corrupt_key_does_not_prevent_other_key_rollback() {
+        let bucket = "recover-corrupt-key";
+        let (dirs, store, disks) = fixture(bucket).await;
+        let healthy_bytes = vec![63; 4096];
+        put(&store, bucket, &healthy_bytes, false).await;
+        applied(&store, &disks, bucket, None, disks.len()).await;
+        let mut reader = PutObjReader::from_vec(vec![64; 4096]);
+        store
+            .put_object(
+                bucket,
+                "a-corrupt",
+                &mut reader,
+                &ObjectOptions {
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write corrupt-key fixture");
+        let transaction = Uuid::new_v4();
+        let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("bucket identity");
+        for disk in &disks {
+            disk.delete_version_recoverable(
+                bucket,
+                "a-corrupt",
+                FileInfo {
+                    name: "a-corrupt".to_owned(),
+                    ..Default::default()
+                },
+                false,
+                DeleteOptions {
+                    old_data_dir: Some(transaction),
+                    delete_recovery_bucket_incarnation: Some(incarnation),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("prepare corrupt-key fixture");
+        }
+        let damaged = dirs[0]
+            .path()
+            .join(bucket)
+            .join("a-corrupt")
+            .join(transaction.to_string())
+            .join(crate::disk::STORAGE_FORMAT_FILE_BACKUP);
+        std::fs::write(&damaged, b"corrupt metadata").expect("damage one backup while retaining discoverable journal");
+
+        let report = store
+            .recover_delete_transactions(bucket, &HealOpts::default())
+            .await
+            .expect("per-key corruption must not abort the remaining prefix");
+
+        assert_eq!(report.delete_recovery.expect("recovery status").failed, 1);
+        assert!(report.detail.contains("rolled_back=1"));
+        assert_eq!(std::fs::read(damaged).expect("corrupt proof is retained"), b"corrupt metadata");
+        assert_eq!(body(&store, bucket, None).await, healthy_bytes);
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_offline_bucket_reports_pending_without_hiding_exact_object_error() {
+        let bucket = "recover-offline-status";
+        let (_dirs, store, _disks) = fixture(bucket).await;
+        store.pools[0].disk_set[0].disks.write().await[3] = None;
+
+        let result = store
+            .recover_delete_transactions(bucket, &HealOpts::default())
+            .await
+            .expect("offline recovery must expose a pending summary even with no discovered transactions");
+        let status = result.delete_recovery.expect("offline status is retained");
+        assert_eq!(status.pending, 1);
+        assert_eq!(status.failed, 0);
+        assert!(status.has_unresolved());
+        let error = store
+            .recover_delete_transactions_at_incarnation(bucket, Some("object"), None, &HealOpts::default())
+            .await
+            .expect_err("exact-object workers require a typed retry error");
+        assert!(matches!(error, crate::error::StorageError::ErasureReadQuorum));
     }
 
     fn snapshot(root: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
@@ -2033,13 +2181,18 @@ mod tests {
             }
         }
         let error = store
-            .recover_delete_transactions(bucket, &HealOpts::default())
+            .recover_delete_transactions_at_incarnation(bucket, Some("object"), None, &HealOpts::default())
             .await
             .expect_err("cyclic history cannot settle");
         assert!(
             matches!(error, crate::error::StorageError::FileCorrupt),
             "typed corruption must reject cyclic evidence: {error:?}"
         );
+        let report = store
+            .recover_delete_transactions(bucket, &HealOpts::default())
+            .await
+            .expect("a bucket report must retain its corrupt-key status");
+        assert_eq!(report.delete_recovery.expect("corrupt-key status").failed, 1);
         for (path, bytes) in evidence {
             assert_eq!(std::fs::read(path).expect("all proof retained"), bytes);
         }

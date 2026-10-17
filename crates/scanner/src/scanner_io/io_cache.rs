@@ -470,7 +470,11 @@ impl ScannerIOCache for SetDisks {
                 "Scanner set assigned remote disks without namespace scanner support to coordinator-driven workers"
             );
         }
-        let dispatch_limit = scanner_max_concurrent_disk_scans(workers.len());
+        let online_disks = workers.len();
+        let walkers_per_disk = crate::runtime_config::scanner_walkers_per_disk_configured();
+        let walkers = namespace_scanner_walkers(workers, walkers_per_disk, |disk| disk.is_local());
+        let dispatch_limit = scanner_max_concurrent_disk_scans(walkers.len());
+        let configured_disk_scans = crate::runtime_config::scanner_max_concurrent_disk_scans_configured();
         let serial_progress_accounting = budget.requires_serial_progress_accounting();
         let disk_scan_limit = scanner_budgeted_concurrency_limit(dispatch_limit, serial_progress_accounting);
         record_disk_scan_concurrency_limit(&pool_label, &set_label, disk_scan_limit);
@@ -480,10 +484,18 @@ impl ScannerIOCache for SetDisks {
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_IO,
             state = "disk_concurrency_budget",
-            reason = if serial_progress_accounting { "count_budget" } else { "configured_or_available_work" },
+            reason = if serial_progress_accounting {
+                "count_budget"
+            } else if configured_disk_scans != 0 && configured_disk_scans < walkers.len() {
+                "configured_cap"
+            } else {
+                "available_walkers"
+            },
             pool = self.pool_index,
             set = self.set_index,
-            online_disks = workers.len(),
+            online_disks,
+            walkers_per_disk,
+            walkers = walkers.len(),
             dispatch_limit,
             concurrency_limit = disk_scan_limit,
             "Scanner disk concurrency budget resolved"
@@ -629,7 +641,7 @@ impl ScannerIOCache for SetDisks {
 
         let cache_mutex: Arc<Mutex<DataUsageCache>> = Arc::new(Mutex::new(cache));
 
-        let (bucket_result_tx, mut bucket_result_rx) = mpsc::channel::<DataUsageEntryInfo>(workers.len());
+        let (bucket_result_tx, mut bucket_result_rx) = mpsc::channel::<DataUsageEntryInfo>(walkers.len());
 
         let cache_mutex_clone = cache_mutex.clone();
         let ctx_clone = ctx.clone();
@@ -662,7 +674,12 @@ impl ScannerIOCache for SetDisks {
         let bucket_rx_mutex: Arc<Mutex<mpsc::Receiver<BucketInfo>>> = Arc::new(Mutex::new(bucket_rx));
         let remaining_bucket_work = Arc::new(AtomicUsize::new(buckets.len()));
         let bucket_work_complete = CancellationToken::new();
-        for (disk, worker_mode) in workers {
+        for NamespaceScannerWalker {
+            disk,
+            mode: worker_mode,
+            local_admission,
+        } in walkers
+        {
             let service_cohort_clone = service_cohort.clone();
             let bucket_rx_mutex_clone = bucket_rx_mutex.clone();
             let bucket_tx_clone = bucket_tx.clone();
@@ -907,8 +924,8 @@ impl ScannerIOCache for SetDisks {
                         continue;
                     }
 
-                    let _local_admission = if disk.is_local() {
-                        match crate::remote_scanner::try_admit_remote_scanner(&disk) {
+                    let _local_admission = if let Some(share) = &local_admission {
+                        match share.acquire(&disk) {
                             Ok(admission) => Some(admission),
                             Err(e) => {
                                 if requeue_bucket_work(&bucket_tx_clone, &bucket, &mut work_guard).await {
@@ -936,6 +953,8 @@ impl ScannerIOCache for SetDisks {
                     } else {
                         None
                     };
+                    #[cfg(test)]
+                    super::tests::observe_coordinator_bucket_scan_admitted(&bucket.name).await;
 
                     // Lock order: scanner leader fence -> set-scoped per-bucket cache lock ->
                     // cache object read/write.

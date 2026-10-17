@@ -26,7 +26,7 @@ use futures::future::join_all;
 use metrics::counter;
 use rand::seq::SliceRandom as _;
 #[cfg(test)]
-use rustfs_config::{ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS};
+use rustfs_config::{ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, ENV_SCANNER_WALKERS_PER_DISK};
 use rustfs_data_usage::{BucketTargetUsageInfo, BucketUsageInfo, observed_data_usage_is_newer};
 use rustfs_filemeta::FileMeta;
 use rustfs_heal_contracts::heal_channel::HealScanMode;
@@ -955,6 +955,20 @@ fn scanner_bucket_scan_status(has_failed: bool, has_partial: bool, has_namespace
     }
 }
 
+fn scanner_partial_progress_is_usable(
+    bucket_plan_complete: bool,
+    scan_scope_matches: bool,
+    bucket_status: ScannerBucketScanStatus,
+    has_set_failure: bool,
+    has_missing_namespace: bool,
+) -> bool {
+    bucket_plan_complete
+        && scan_scope_matches
+        && bucket_status == ScannerBucketScanStatus::Partial
+        && !has_set_failure
+        && !has_missing_namespace
+}
+
 fn scanner_cycle_cold_zero_walk_oracle(
     scan_scope: &ScannerBucketScanScope,
     all_buckets: &[BucketInfo],
@@ -1180,6 +1194,42 @@ fn namespace_scanner_workers<T>(
             .map(|(disk, server_epoch)| (disk, NamespaceScannerWorkerMode::RemoteV4(server_epoch))),
     );
     workers
+}
+
+struct NamespaceScannerWalker<T> {
+    disk: T,
+    mode: NamespaceScannerWorkerMode,
+    /// Shared by every walker of one local disk; `None` for disks the
+    /// coordinator reaches over the network, which keep today's one walker.
+    local_admission: Option<Arc<crate::remote_scanner::LocalDiskAdmissionShare>>,
+}
+
+/// Expands each worker into its bucket walkers. A local coordinator disk gets
+/// `walkers_per_disk` walkers sharing one disk admission; every other worker
+/// keeps a single walker, so the walker count never drops below the disk count.
+fn namespace_scanner_walkers<T: Clone>(
+    workers: Vec<(T, NamespaceScannerWorkerMode)>,
+    walkers_per_disk: usize,
+    is_local: impl Fn(&T) -> bool,
+) -> Vec<NamespaceScannerWalker<T>> {
+    let mut walkers = Vec::with_capacity(workers.len());
+    for (disk, mode) in workers {
+        if mode == NamespaceScannerWorkerMode::Coordinator && is_local(&disk) {
+            let local_admission = crate::remote_scanner::LocalDiskAdmissionShare::new();
+            walkers.extend((0..walkers_per_disk.max(1)).map(|_| NamespaceScannerWalker {
+                disk: disk.clone(),
+                mode,
+                local_admission: Some(local_admission.clone()),
+            }));
+        } else {
+            walkers.push(NamespaceScannerWalker {
+                disk,
+                mode,
+                local_admission: None,
+            });
+        }
+    }
+    walkers
 }
 
 fn group_remote_disks_by_peer<T>(disks: Vec<T>, peer_key: impl Fn(&T) -> String) -> Vec<Vec<T>> {
@@ -1427,6 +1477,7 @@ pub(crate) struct ScannerCycleResult {
     publication_epoch: Option<u64>,
     activity_digest: Option<[u8; 32]>,
     usage_update_emitted: bool,
+    partial_bucket_progress: bool,
     dirty_usage_clear: Option<DirtyUsageBuckets>,
     remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
     distributed_segment_invalidation_evidence: Option<DistributedSegmentInvalidationEvidence>,
@@ -1445,6 +1496,7 @@ impl ScannerCycleResult {
             publication_epoch: None,
             activity_digest: None,
             usage_update_emitted: false,
+            partial_bucket_progress: false,
             dirty_usage_clear,
             remote_dirty_usage_acknowledgements: Vec::new(),
             distributed_segment_invalidation_evidence: None,
@@ -1485,6 +1537,16 @@ impl ScannerCycleResult {
 
     pub(crate) fn has_usage_update(&self) -> bool {
         self.usage_update_emitted
+    }
+
+    pub(crate) fn with_partial_bucket_progress(mut self, partial_bucket_progress: bool) -> Self {
+        self.publication_expectation = None;
+        self.partial_bucket_progress = partial_bucket_progress;
+        self
+    }
+
+    pub(crate) fn has_partial_bucket_progress(&self) -> bool {
+        self.partial_bucket_progress
     }
 
     fn with_failed_dirty_usage(mut self, failed_dirty_usage: bool) -> Self {
