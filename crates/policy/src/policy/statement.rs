@@ -99,7 +99,7 @@ impl Statement {
             return false;
         }
 
-        !matches!(args.action, Action::AdminAction(action) if action.is_table_resource_scoped())
+        !matches!(args.action, Action::AdminAction(action) if action.is_table_resource_scoped() || action.is_artifact_resource_scoped())
     }
 
     fn is_kms(&self) -> bool {
@@ -254,6 +254,16 @@ impl Statement {
 
         if self.is_kms() {
             return self.kms_key_scope_matches(args, resolver).await;
+        }
+
+        // New artifact controls require an explicit Allow resource. Preserve
+        // unscoped Deny (including admin:*) so introducing scoping cannot weaken it.
+        if matches!(args.action, Action::AdminAction(action) if action.is_artifact_resource_scoped())
+            && !deny
+            && self.resources.is_empty()
+            && self.not_resources.is_empty()
+        {
+            return false;
         }
 
         let resource = build_resource(

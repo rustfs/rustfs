@@ -566,6 +566,10 @@ pub enum AdminAction {
     CreatePluginDelegationAction,
     #[strum(serialize = "admin:IssuePluginAttempt")]
     IssuePluginAttemptAction,
+    #[strum(serialize = "admin:SealPluginArtifactAttempt")]
+    SealPluginArtifactAttemptAction,
+    #[strum(serialize = "admin:RetirePluginArtifactVersion")]
+    RetirePluginArtifactVersionAction,
     #[strum(serialize = "admin:SubmitPluginJob")]
     SubmitPluginJobAction,
     #[strum(serialize = "admin:GetPluginRun")]
@@ -613,6 +617,10 @@ pub enum AdminAction {
 }
 
 impl AdminAction {
+    pub(crate) fn is_artifact_resource_scoped(&self) -> bool {
+        matches!(self, Self::SealPluginArtifactAttemptAction | Self::RetirePluginArtifactVersionAction)
+    }
+
     pub(crate) fn is_table_resource_scoped(&self) -> bool {
         matches!(
             self,
@@ -722,6 +730,8 @@ impl AdminAction {
                 | AdminAction::SetTableLifecycleAction
                 | AdminAction::GetTableCredentialsAction
                 | AdminAction::IssuePluginAttemptAction
+                | AdminAction::SealPluginArtifactAttemptAction
+                | AdminAction::RetirePluginArtifactVersionAction
                 | AdminAction::SubmitPluginJobAction
                 | AdminAction::GetPluginRunAction
                 | AdminAction::CancelPluginRunAction
