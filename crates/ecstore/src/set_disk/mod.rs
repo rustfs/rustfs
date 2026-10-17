@@ -7733,6 +7733,21 @@ pub fn e_tag_matches(etag: &str, condition: &str) -> bool {
     canonicalize_etag(etag) == canonicalize_etag(condition)
 }
 
+fn weak_etag_matches(etag: &str, condition: &str) -> bool {
+    let condition = condition.trim();
+    if condition == "*" {
+        return true;
+    }
+    fn strip_weak(value: &str) -> &str {
+        let trimmed = value.trim();
+        trimmed
+            .strip_prefix("W/")
+            .or_else(|| trimmed.strip_prefix("w/"))
+            .unwrap_or(trimmed)
+    }
+    canonicalize_etag(strip_weak(etag)) == canonicalize_etag(strip_weak(condition))
+}
+
 pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<String>, if_match: Option<String>) -> bool {
     let if_none_match = if_none_match
         .as_deref()
@@ -7743,7 +7758,7 @@ pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<String>, if_m
     match &oi.etag {
         Some(etag) => {
             if let Some(if_none_match) = if_none_match
-                && e_tag_matches(etag, if_none_match)
+                && weak_etag_matches(etag, if_none_match)
             {
                 return true;
             }
@@ -13688,6 +13703,14 @@ mod tests {
         let if_none_match = Some(String::new());
         let if_match = Some(" ".to_string());
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
+
+        let oi = ObjectInfo {
+            etag: Some("abc".to_string()),
+            ..Default::default()
+        };
+        assert!(should_prevent_write(&oi, Some("W/\"abc\"".to_string()), None));
+        assert!(!should_prevent_write(&oi, Some("W/\"def\"".to_string()), None));
+        assert!(should_prevent_write(&oi, None, Some("W/\"abc\"".to_string())));
     }
 
     #[test]
@@ -16234,6 +16257,34 @@ mod tests {
             set_disks.check_write_precondition(bucket, object, &create_only).await,
             Some(StorageError::PreconditionFailed),
             "data movement must not replace a target delete marker"
+        );
+        let ordinary_create_only = ObjectOptions {
+            versioned: true,
+            http_preconditions: Some(HTTPPreconditions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            set_disks
+                .check_write_precondition(bucket, object, &ordinary_create_only)
+                .await,
+            None,
+            "ordinary If-None-Match: * must proceed past a top-level delete marker"
+        );
+        let ordinary_if_match = ObjectOptions {
+            versioned: true,
+            http_preconditions: Some(HTTPPreconditions {
+                if_match: Some("*".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            set_disks.check_write_precondition(bucket, object, &ordinary_if_match).await,
+            Some(StorageError::ObjectNotFound(bucket.to_string(), object.to_string())),
+            "ordinary If-Match must treat a top-level delete marker as absent"
         );
         let err = match set_disks
             .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
