@@ -4912,6 +4912,14 @@ async fn expire_transitioned_object_with_lock_lost_signal(
     let (versioned, version_suspended) = snapshot.versioning_config().delete_state(&oi.name);
     let mut opts = transitioned_object_delete_opts(oi, lc_event.action, versioned, version_suspended, bucket_incarnation_id)
         .map_err(std::io::Error::other)?;
+    if lc_event.requires_expiry_policy() {
+        opts.lifecycle_expiry_policy = Some(
+            lc_event
+                .expiry_policy
+                .clone()
+                .ok_or_else(|| std::io::Error::other("lifecycle expiration is missing its policy snapshot"))?,
+        );
+    }
     opts.add_namespace_lock_guard(&publication_guard);
     if let Some(signal) = lock_lost_signal {
         opts.add_namespace_lock_lost_signal(signal);
@@ -5762,6 +5770,9 @@ async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
     bucket_incarnation_id: Uuid,
     lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
 ) -> bool {
+    let Some(expiry_policy) = lc_event.expiry_policy.clone() else {
+        return false;
+    };
     let Some(publication_guard) = lifecycle_expiry_publication_guard(&api, &oi.bucket, &oi.name, bucket_incarnation_id).await
     else {
         return false;
@@ -5792,6 +5803,7 @@ async fn apply_expiry_on_non_transitioned_objects_with_lock_lost_signal(
         versioned,
         version_suspended,
         expiration: ExpirationOptions { expire: true },
+        lifecycle_expiry_policy: Some(expiry_policy),
         delete_replication_config_snapshot: Some(Arc::new(snapshot)),
         expected_bucket_incarnation_id: Some(bucket_incarnation_id),
         ..Default::default()
@@ -6073,6 +6085,7 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 mod tests {
     use super::expiry_worker_count;
     use super::lifecycle_transition_publication_guard;
+    use super::metadata_boundary::get_expiry_configs;
     use super::{
         DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
         DEFAULT_TRANSITION_WORKERS_CAP, EVENT_LIFECYCLE_EVALUATION_FAILED, EVENT_LIFECYCLE_EXPIRED_DETECTED,
@@ -12895,6 +12908,7 @@ mod tests {
             .await
             .expect("bucket incarnation should be available");
 
+        let expiry_policy = install_test_expiry_policy(&ecstore, &bucket).await;
         test_recorder::install();
 
         // One version that exists and one that never did: `delete_objects`
@@ -12917,7 +12931,11 @@ mod tests {
             &ecstore,
             &bucket,
             &targets,
-            lifecycle::Event::default(),
+            lifecycle::Event {
+                action: IlmAction::DeleteVersionAction,
+                expiry_policy: Some(expiry_policy),
+                ..Default::default()
+            },
             incarnation,
         )
         .await;
@@ -13035,6 +13053,14 @@ mod tests {
         assert!(!object_infos[null_index].is_latest);
 
         let lifecycle = current_and_noncurrent_expiration_lifecycle();
+        metadata_sys::update_in(
+            &ecstore.ctx,
+            &bucket,
+            BUCKET_LIFECYCLE_CONFIG,
+            crate::bucket::utils::serialize(&lifecycle).unwrap(),
+        )
+        .await
+        .unwrap();
         let object_opts = object_infos
             .iter()
             .map(lifecycle::object_opts_from_object_info)
@@ -13389,6 +13415,7 @@ mod tests {
             .await
             .expect("table data object should be created");
 
+        let expiry_policy = install_test_expiry_policy(&ecstore, &bucket).await;
         let publication_lock = ecstore
             .new_ns_lock(&bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
             .await
@@ -13403,6 +13430,7 @@ mod tests {
         let mut expiry = tokio::spawn(async move {
             let event = crate::bucket::lifecycle::lifecycle::Event {
                 action: IlmAction::DeleteAction,
+                expiry_policy: Some(expiry_policy),
                 ..Default::default()
             };
             let bucket_incarnation_id = expiry_store
@@ -13517,6 +13545,7 @@ mod tests {
             queued.size = 1;
             let event = lifecycle::Event {
                 action: IlmAction::DeleteAction,
+                expiry_policy: Some(install_test_expiry_policy(&ecstore, &bucket).await),
                 ..Default::default()
             };
             let incarnation = ecstore
@@ -13628,6 +13657,7 @@ mod tests {
             .bucket_incarnation_id_from_disk(&bucket)
             .await
             .expect("bucket incarnation should be available");
+        let expiry_policy = install_test_expiry_policy(&ecstore, &bucket).await;
         let publication_lock = ecstore
             .new_ns_lock(&bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
             .await
@@ -13650,7 +13680,11 @@ mod tests {
                 &delete_store,
                 &delete_bucket,
                 std::slice::from_ref(&target),
-                lifecycle::Event::default(),
+                lifecycle::Event {
+                    action: IlmAction::DeleteVersionAction,
+                    expiry_policy: Some(expiry_policy),
+                    ..Default::default()
+                },
                 incarnation,
             )
             .await
@@ -13806,6 +13840,7 @@ mod tests {
         let queued_event = crate::bucket::lifecycle::lifecycle::Event {
             action: IlmAction::DelMarkerDeleteAllVersionsAction,
             rule_id: "delete-marker-history".to_string(),
+            expiry_policy: get_expiry_configs(&ecstore, &bucket).await.unwrap().lifecycle,
             ..Default::default()
         };
         metadata_sys::update(&bucket, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml(30).into_bytes())
@@ -13923,6 +13958,7 @@ mod tests {
             &crate::bucket::lifecycle::lifecycle::Event {
                 action: IlmAction::DeleteAllVersionsAction,
                 rule_id: "delete-all-versions".to_string(),
+                expiry_policy: get_expiry_configs(&ecstore, &bucket).await.unwrap().lifecycle,
                 ..Default::default()
             },
             &LcEventSrc::Scanner,
@@ -14107,6 +14143,221 @@ mod tests {
         let _ = STALE_MULTIPART_TEST_ENV.set((disk_paths.clone(), ecstore.clone()));
 
         (disk_paths, ecstore)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn queued_expiry_rejects_withdrawn_or_changed_policy() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        for case in [
+            "removed",
+            "disabled",
+            "longer-days",
+            "different-prefix",
+            "unreadable",
+            "missing-snapshot",
+            "unchanged",
+        ] {
+            let bucket = format!("expiry-policy-{case}");
+            create_test_bucket(&ecstore, &bucket).await;
+            metadata_sys::update_in(
+                &ecstore.ctx,
+                &bucket,
+                BUCKET_VERSIONING_CONFIG,
+                b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+            )
+            .await
+            .unwrap();
+            for object in ["single", "batch"] {
+                for age in [40, 2] {
+                    let mut reader = PutObjReader::from_vec(vec![1; 8]);
+                    ecstore
+                        .put_object(
+                            &bucket,
+                            object,
+                            &mut reader,
+                            &ObjectOptions {
+                                versioned: true,
+                                mod_time: Some(OffsetDateTime::now_utc() - time::Duration::days(age)),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            let policy = current_and_noncurrent_expiration_lifecycle();
+            metadata_sys::update_in(
+                &ecstore.ctx,
+                &bucket,
+                BUCKET_LIFECYCLE_CONFIG,
+                crate::bucket::utils::serialize(&policy).unwrap(),
+            )
+            .await
+            .unwrap();
+            let incarnation = ecstore.bucket_incarnation_id_from_disk(&bucket).await.unwrap();
+            let state = install_unconsumed_runtime_expiry_worker(&ecstore, 3).await;
+            for object in ["single", "batch"] {
+                let versions = ecstore
+                    .clone()
+                    .list_object_versions(&bucket, object, None, None, None, 10)
+                    .await
+                    .unwrap()
+                    .objects;
+                let opts = versions
+                    .iter()
+                    .map(lifecycle::object_opts_from_object_info)
+                    .collect::<Vec<_>>();
+                let events = Evaluator::new(Arc::new(policy.clone())).eval(&opts).await.unwrap();
+                let index = versions.iter().position(|version| !version.is_latest).unwrap();
+                let mut event = events[index].clone();
+                assert_eq!(event.action, IlmAction::DeleteVersionAction);
+                if case == "missing-snapshot" {
+                    event.expiry_policy = None;
+                }
+                let queued = if object == "single" {
+                    state
+                        .write()
+                        .await
+                        .enqueue_by_days(&versions[index], &event, &LcEventSrc::Scanner, incarnation)
+                } else {
+                    state.write().await.enqueue_by_newer_noncurrent(
+                        &bucket,
+                        vec![lifecycle_version_delete_target(&versions[index]).unwrap()],
+                        event,
+                        &LcEventSrc::Scanner,
+                        incarnation,
+                    )
+                };
+                assert!(queued);
+            }
+            let mut changed = policy.clone();
+            match case {
+                "removed" => {
+                    metadata_sys::delete(&bucket, BUCKET_LIFECYCLE_CONFIG).await.unwrap();
+                }
+                "disabled" => changed.rules[0].status = ExpirationStatus::from_static(ExpirationStatus::DISABLED),
+                "longer-days" => {
+                    changed.rules[0]
+                        .noncurrent_version_expiration
+                        .as_mut()
+                        .unwrap()
+                        .noncurrent_days = Some(60)
+                }
+                "different-prefix" => changed.rules[0].prefix = Some("keep/".to_string()),
+                "unreadable" => {
+                    let sys = metadata_sys::bucket_metadata_sys_of(&ecstore.ctx)
+                        .unwrap()
+                        .read()
+                        .await
+                        .clone();
+                    let mut metadata = (*sys.get(&bucket).await.unwrap()).clone();
+                    metadata.lifecycle_config_xml = b"<LifecycleConfiguration>".to_vec();
+                    metadata.lifecycle_config = None;
+                    sys.persist_and_set(metadata).await.unwrap();
+                }
+                _ => {}
+            }
+            if !matches!(case, "removed" | "unchanged" | "missing-snapshot" | "unreadable") {
+                metadata_sys::update_in(
+                    &ecstore.ctx,
+                    &bucket,
+                    BUCKET_LIFECYCLE_CONFIG,
+                    crate::bucket::utils::serialize(&changed).unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+            let (rx, stats, recovery_notify) = {
+                let state = state.read().await;
+                state.tasks_tx[0].try_send(None).unwrap();
+                (state.tasks_rx[0].clone(), state.stats.clone(), state.recovery_notify.clone())
+            };
+            tokio::time::timeout(StdDuration::from_secs(30), async {
+                let mut receiver = rx.lock().await;
+                ExpiryState::worker(&mut receiver, Arc::downgrade(&ecstore), stats, recovery_notify).await;
+            })
+            .await
+            .expect("queued expiry worker must drain");
+            let versions = ecstore
+                .clone()
+                .list_object_versions(&bucket, "", None, None, None, 10)
+                .await
+                .unwrap()
+                .objects;
+            assert_eq!(versions.len(), if case == "unchanged" { 2 } else { 4 }, "case: {case}");
+            assert_eq!(versions.iter().filter(|version| version.is_latest).count(), 2);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_policy_update_waits_for_admitted_delete_commit() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = "expiry-policy-commit-fence";
+        create_test_bucket(&ecstore, bucket).await;
+        let mut reader = PutObjReader::from_vec(b"expired".to_vec());
+        let object = ecstore
+            .put_object(
+                bucket,
+                "object",
+                &mut reader,
+                &ObjectOptions {
+                    mod_time: Some(OffsetDateTime::now_utc() - time::Duration::days(40)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let policy = install_test_expiry_policy(&ecstore, bucket).await;
+        let event = eval_action_from_lifecycle(&policy, None, &object).await;
+        assert_eq!(event.action, IlmAction::DeleteAction);
+        let incarnation = ecstore.bucket_incarnation_id_from_disk(bucket).await.unwrap();
+        let barrier = crate::store::DeleteAfterObjectLockSnapshotBarrier::install(bucket);
+        let deleting_store = ecstore.clone();
+        let deleting = tokio::spawn(async move {
+            super::apply_expiry_on_non_transitioned_objects(deleting_store, &object, &event, &LcEventSrc::Scanner, incarnation)
+                .await
+        });
+        tokio::time::timeout(StdDuration::from_secs(30), barrier.wait_until_paused())
+            .await
+            .unwrap();
+        let probe = metadata_sys::ConfigWriteLockProbe::install(bucket);
+        let mut removing = tokio::spawn(async move { metadata_sys::delete(bucket, BUCKET_LIFECYCLE_CONFIG).await });
+        probe.wait_until_attempted().await;
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(100), &mut removing)
+                .await
+                .is_err(),
+            "configuration removal must wait for the admitted delete"
+        );
+        barrier.release();
+        assert!(
+            tokio::time::timeout(StdDuration::from_secs(30), deleting)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        tokio::time::timeout(StdDuration::from_secs(30), removing)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(get_expiry_configs(&ecstore, bucket).await.unwrap().lifecycle.is_none());
+        assert!(
+            ecstore
+                .get_object_info(bucket, "object", &ObjectOptions::default())
+                .await
+                .is_err()
+        );
+    }
+
+    async fn install_test_expiry_policy(ecstore: &Arc<ECStore>, bucket: &str) -> Arc<BucketLifecycleConfiguration> {
+        let xml = br#"<LifecycleConfiguration><Rule><ID>expire</ID><Status>Enabled</Status><Filter><Prefix></Prefix></Filter><Expiration><Days>0</Days></Expiration><NoncurrentVersionExpiration><NoncurrentDays>0</NoncurrentDays></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>"#;
+        metadata_sys::update_in(&ecstore.ctx, bucket, BUCKET_LIFECYCLE_CONFIG, xml.to_vec())
+            .await
+            .expect("install expiration policy");
+        get_expiry_configs(ecstore, bucket).await.unwrap().lifecycle.unwrap()
     }
 
     async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket: &str) {

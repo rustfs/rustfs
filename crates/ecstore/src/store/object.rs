@@ -31,7 +31,7 @@ use crate::bucket::lifecycle::{
 };
 use crate::bucket::metadata_sys::{
     acquire_bucket_metadata_transaction_read_lock_in, get_bucket_incarnation_id_for_options_in,
-    get_cached_bucket_incarnation_id_in, get_object_lock_config_and_incarnation_from_disk_in,
+    get_cached_bucket_incarnation_id_in, get_delete_config_from_disk_in, get_object_lock_config_and_incarnation_from_disk_in,
 };
 use crate::bucket::object_lock::objectlock_sys::{
     check_object_lock_for_deletion_with_state, ensure_recursive_force_delete_allowed_for_state,
@@ -5297,7 +5297,7 @@ impl ECStore {
         }
         let current_bucket_incarnation_id = if let Some(metadata_guard) = _object_lock_metadata_guard.as_ref() {
             let (state, incarnation_id, config_revision) =
-                get_object_lock_config_and_incarnation_from_disk_in(&self.ctx, bucket).await?;
+                get_delete_config_from_disk_in(&self.ctx, bucket, None, opts.lifecycle_expiry_policy.as_deref()).await?;
             opts.object_lock_config_snapshot = Some(Arc::new(ObjectLockConfigSnapshot::for_store_bucket_under_lifecycle_fence(
                 self.id,
                 bucket,
@@ -5963,7 +5963,7 @@ impl ECStore {
         }
         let current_bucket_incarnation_id = if let Some(metadata_guard) = _object_lock_metadata_guard.as_ref() {
             let (state, incarnation_id, config_revision) =
-                match get_object_lock_config_and_incarnation_from_disk_in(&self.ctx, bucket).await {
+                match get_delete_config_from_disk_in(&self.ctx, bucket, None, opts.lifecycle_expiry_policy.as_deref()).await {
                     Ok(snapshot) => snapshot,
                     Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
                 };

@@ -18658,6 +18658,14 @@ mod tests {
             .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
             .await
             .expect("put expired object");
+        let lifecycle_xml = br#"<LifecycleConfiguration><Rule><ID>expire</ID><Status>Enabled</Status><Filter><Prefix></Prefix></Filter><Expiration><Days>0</Days></Expiration></Rule></LifecycleConfiguration>"#;
+        crate::bucket::metadata_sys::update_in(&store.ctx, &bucket, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.to_vec())
+            .await
+            .expect("install lifecycle policy");
+        let expiry_policy = crate::bucket::lifecycle::get_expiry_configs(&store, &bucket)
+            .await
+            .unwrap()
+            .lifecycle;
         let bucket_incarnation_id = store.bucket_incarnation_id(&bucket).await.expect("read bucket incarnation");
 
         let barrier = crate::store::object::DeleteAfterObjectLockSnapshotBarrier::install(&bucket);
@@ -18668,6 +18676,7 @@ mod tests {
                 &object_info,
                 &crate::bucket::lifecycle::lifecycle::Event {
                     action: crate::bucket::lifecycle::lifecycle::IlmAction::DeleteAction,
+                    expiry_policy,
                     ..Default::default()
                 },
                 &crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Scanner,
@@ -19348,11 +19357,20 @@ mod tests {
             .await
             .expect("put replacement object");
 
+        let lifecycle_xml = br#"<LifecycleConfiguration><Rule><ID>expire</ID><Status>Enabled</Status><Filter><Prefix></Prefix></Filter><Expiration><Days>0</Days></Expiration></Rule></LifecycleConfiguration>"#;
+        crate::bucket::metadata_sys::update_in(&store.ctx, &bucket, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.to_vec())
+            .await
+            .expect("install lifecycle policy");
+        let expiry_policy = crate::bucket::lifecycle::get_expiry_configs(&store, &bucket)
+            .await
+            .unwrap()
+            .lifecycle;
         let applied = crate::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_on_non_transitioned_objects(
             store.clone(),
             &old_object,
             &crate::bucket::lifecycle::lifecycle::Event {
                 action: crate::bucket::lifecycle::lifecycle::IlmAction::DeleteAction,
+                expiry_policy,
                 ..Default::default()
             },
             &crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Scanner,
@@ -20990,6 +21008,10 @@ mod tests {
                     let lifecycle_event = crate::bucket::lifecycle::lifecycle::Event {
                         action: rustfs_scanner_metrics::metrics::IlmAction::DeleteAllVersionsAction,
                         rule_id: "delete-all-versions".to_string(),
+                        expiry_policy: crate::bucket::lifecycle::get_expiry_configs(&store, bucket)
+                            .await
+                            .unwrap()
+                            .lifecycle,
                         ..Default::default()
                     };
                     let legacy_applied =
