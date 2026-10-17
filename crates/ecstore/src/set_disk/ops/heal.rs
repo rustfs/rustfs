@@ -3563,6 +3563,7 @@ mod heal_result_report_tests {
     use crate::object_api::{ObjectOptions, PutObjReader};
     use crate::set_disk::ops::object::hermetic_set_disks_support::{
         HermeticSetFixture, hermetic_set_disks_for_pool_with_default_parity_isolated, hermetic_set_disks_isolated,
+        lifecycle_owned_put_options,
     };
     use crate::storage_api_contracts::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
     use crate::storage_api_contracts::heal::HealOperations as _;
@@ -3824,10 +3825,15 @@ mod heal_result_report_tests {
                 &bucket,
                 object,
                 &mut reader,
-                &ObjectOptions {
-                    no_lock: true,
-                    ..Default::default()
-                },
+                &lifecycle_owned_put_options(
+                    &set,
+                    &bucket,
+                    ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await,
             )
             .await
             .expect("source object should be written");
@@ -4061,10 +4067,15 @@ mod heal_result_report_tests {
                 &bucket,
                 object,
                 &mut reader,
-                &ObjectOptions {
-                    no_lock: true,
-                    ..Default::default()
-                },
+                &lifecycle_owned_put_options(
+                    &set,
+                    &bucket,
+                    ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await,
             )
             .await
             .expect("source object should be written");
@@ -4210,10 +4221,15 @@ mod heal_result_report_tests {
             bucket,
             object,
             &mut reader,
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
+            &lifecycle_owned_put_options(
+                &set,
+                bucket,
+                ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await,
         )
         .await
         .expect("source object should be written");
@@ -4275,10 +4291,15 @@ mod heal_result_report_tests {
             bucket,
             object,
             &mut reader,
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
+            &lifecycle_owned_put_options(
+                &set,
+                bucket,
+                ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await,
         )
         .await
         .expect("source object should be written before shard loss");
@@ -4333,10 +4354,15 @@ mod heal_result_report_tests {
             bucket,
             object,
             &mut reader,
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
+            &lifecycle_owned_put_options(
+                &set,
+                bucket,
+                ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await,
         )
         .await
         .expect("source object should be written before volume loss");
@@ -4416,7 +4442,12 @@ mod heal_result_report_tests {
             ..Default::default()
         };
         let original = set
-            .put_object(bucket, object, &mut PutObjReader::from_vec(vec![0x41; 1024]), &versioned)
+            .put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(vec![0x41; 1024]),
+                &lifecycle_owned_put_options(&set, bucket, versioned.clone()).await,
+            )
             .await
             .expect("versioned source object should be written");
         let stale_metadata = disks[0]
@@ -4487,10 +4518,15 @@ mod heal_result_report_tests {
             bucket,
             object,
             &mut PutObjReader::from_vec(expected_payload.clone()),
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
+            &lifecycle_owned_put_options(
+                &set,
+                bucket,
+                ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await,
         )
         .await
         .expect("source object should be written before shard truncation");
@@ -4615,11 +4651,16 @@ mod heal_result_report_tests {
             bucket,
             object,
             &mut PutObjReader::from_vec(vec![0x6d; 1024 * 1024 + 123]),
-            &ObjectOptions {
-                shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
-                no_lock: true,
-                ..Default::default()
-            },
+            &lifecycle_owned_put_options(
+                &set,
+                bucket,
+                ObjectOptions {
+                    shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await,
         )
         .await
         .expect("write protected external fixture");
@@ -4744,11 +4785,16 @@ mod heal_result_report_tests {
             bucket,
             object,
             &mut PutObjReader::from_vec(vec![0x6d; 1024 * 1024 + 123]),
-            &ObjectOptions {
-                shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Legacy),
-                no_lock: true,
-                ..Default::default()
-            },
+            &lifecycle_owned_put_options(
+                &set,
+                bucket,
+                ObjectOptions {
+                    shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Legacy),
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await,
         )
         .await
         .expect("write external legacy fixture");
@@ -4837,11 +4883,16 @@ mod heal_result_report_tests {
             bucket,
             object,
             &mut PutObjReader::from_vec(expected_payload.clone()),
-            &ObjectOptions {
-                shard_integrity_write_mode: Some(mode),
-                no_lock: true,
-                ..Default::default()
-            },
+            &lifecycle_owned_put_options(
+                &set,
+                bucket,
+                ObjectOptions {
+                    shard_integrity_write_mode: Some(mode),
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await,
         )
         .await
         .expect("commit source object");
@@ -5068,9 +5119,14 @@ mod heal_result_report_tests {
         for parity in [false, true] {
             for corrupt_prefix in [false, true] {
                 let object = format!("parity-{parity}-prefix-{corrupt_prefix}.bin");
-                set.put_object(bucket, &object, &mut PutObjReader::from_vec(payload.clone()), &object_options)
-                    .await
-                    .expect("full-fanout PUT should persist every inline shard");
+                set.put_object(
+                    bucket,
+                    &object,
+                    &mut PutObjReader::from_vec(payload.clone()),
+                    &lifecycle_owned_put_options(&set, bucket, object_options.clone()).await,
+                )
+                .await
+                .expect("full-fanout PUT should persist every inline shard");
 
                 let mut target = None;
                 for (disk_index, disk) in disks.iter().enumerate() {
@@ -5207,10 +5263,15 @@ mod heal_result_report_tests {
                 bucket,
                 object,
                 &mut PutObjReader::from_vec(vec![0x71; 4113]),
-                &ObjectOptions {
-                    no_lock: true,
-                    ..Default::default()
-                },
+                &lifecycle_owned_put_options(
+                    &set,
+                    bucket,
+                    ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await,
             )
             .await
             .expect("all inline shards should be committed");
@@ -5304,10 +5365,15 @@ mod heal_result_report_tests {
             bucket,
             object,
             &mut PutObjReader::from_vec(vec![0x71; 4113]),
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
+            &lifecycle_owned_put_options(
+                &set,
+                bucket,
+                ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await,
         )
         .await
         .expect("inline fixture should be committed");
@@ -5377,10 +5443,15 @@ mod heal_result_report_tests {
             bucket,
             object,
             &mut PutObjReader::from_vec(Vec::new()),
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
+            &lifecycle_owned_put_options(
+                &set,
+                bucket,
+                ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await,
         )
         .await
         .expect("empty object should be committed");
@@ -5433,11 +5504,16 @@ mod heal_result_report_tests {
                 bucket,
                 object,
                 &mut old_reader,
-                &ObjectOptions {
-                    versioned: true,
-                    no_lock: true,
-                    ..Default::default()
-                },
+                &lifecycle_owned_put_options(
+                    &set,
+                    bucket,
+                    ObjectOptions {
+                        versioned: true,
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await,
             )
             .await
             .expect("old object version should be written");
@@ -5451,11 +5527,16 @@ mod heal_result_report_tests {
                 bucket,
                 object,
                 &mut latest_reader,
-                &ObjectOptions {
-                    versioned: true,
-                    no_lock: true,
-                    ..Default::default()
-                },
+                &lifecycle_owned_put_options(
+                    &set,
+                    bucket,
+                    ObjectOptions {
+                        versioned: true,
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await,
             )
             .await
             .expect("latest object version should be written");
@@ -5582,12 +5663,17 @@ mod heal_result_report_tests {
                     bucket,
                     object,
                     &mut reader,
-                    &ObjectOptions {
-                        no_lock: true,
-                        versioned: true,
-                        version_id: Some(stored_version_string.clone()),
-                        ..Default::default()
-                    },
+                    &lifecycle_owned_put_options(
+                        &set,
+                        bucket,
+                        ObjectOptions {
+                            no_lock: true,
+                            versioned: true,
+                            version_id: Some(stored_version_string.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .await,
                 )
                 .await
                 .expect("full-fanout PUT should seed the heal fixture");
@@ -5795,10 +5881,15 @@ mod heal_result_report_tests {
                 bucket,
                 object,
                 &mut reader,
-                &ObjectOptions {
-                    no_lock: true,
-                    ..Default::default()
-                },
+                &lifecycle_owned_put_options(
+                    &set,
+                    bucket,
+                    ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await,
             )
             .await
             .expect("full-fanout PUT should seed the renewal fixture");
@@ -6940,10 +7031,15 @@ mod heal_result_report_tests {
             bucket,
             object,
             &mut initial_reader,
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
+            &lifecycle_owned_put_options(
+                &set,
+                bucket,
+                ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await,
         )
         .await
         .expect("initial object should be written");
@@ -7311,12 +7407,22 @@ mod shard_identity_tests {
         {
             let target = format!("target-{case}");
             let donor = format!("donor-{case}");
-            set.put_object(bucket, &target, &mut PutObjReader::from_vec(expected.clone()), &options)
-                .await
-                .expect("commit every target shard");
-            set.put_object(bucket, &donor, &mut PutObjReader::from_vec(donor_body.clone()), &options)
-                .await
-                .expect("commit every donor shard");
+            set.put_object(
+                bucket,
+                &target,
+                &mut PutObjReader::from_vec(expected.clone()),
+                &lifecycle_owned_put_options(&set, bucket, options.clone()).await,
+            )
+            .await
+            .expect("commit every target shard");
+            set.put_object(
+                bucket,
+                &donor,
+                &mut PutObjReader::from_vec(donor_body.clone()),
+                &lifecycle_owned_put_options(&set, bucket, options.clone()).await,
+            )
+            .await
+            .expect("commit every donor shard");
             let mut target_meta = Vec::new();
             let mut donor_meta = Vec::new();
             for disk in &disks {
@@ -7502,12 +7608,22 @@ mod shard_identity_tests {
             let target = format!("target-{size}");
             let donor = format!("donor-{size}");
             let expected = vec![0x4d; size];
-            set.put_object(bucket, &target, &mut PutObjReader::from_vec(expected.clone()), &options)
-                .await
-                .expect("target PUT");
-            set.put_object(bucket, &donor, &mut PutObjReader::from_vec(vec![0x9a; size]), &options)
-                .await
-                .expect("donor PUT");
+            set.put_object(
+                bucket,
+                &target,
+                &mut PutObjReader::from_vec(expected.clone()),
+                &lifecycle_owned_put_options(&set, bucket, options.clone()).await,
+            )
+            .await
+            .expect("target PUT");
+            set.put_object(
+                bucket,
+                &donor,
+                &mut PutObjReader::from_vec(vec![0x9a; size]),
+                &lifecycle_owned_put_options(&set, bucket, options.clone()).await,
+            )
+            .await
+            .expect("donor PUT");
             let mut target_parts = Vec::new();
             let mut donor_parts = Vec::new();
             for disk in &disks {
@@ -7617,9 +7733,14 @@ mod shard_identity_tests {
         let mut parts = Vec::new();
         let mut paths = Vec::new();
         for (object, body) in [("target", expected.clone()), ("donor", vec![0x9a; expected.len()])] {
-            set.put_object(bucket, object, &mut PutObjReader::from_vec(body), &options)
-                .await
-                .expect("seed legacy fixture");
+            set.put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(body),
+                &lifecycle_owned_put_options(&set, bucket, options.clone()).await,
+            )
+            .await
+            .expect("seed legacy fixture");
             let mut object_parts = Vec::new();
             let mut object_paths = Vec::new();
             for (slot, disk) in disks.iter().enumerate() {
@@ -7891,9 +8012,14 @@ mod shard_identity_tests {
             no_lock: true,
             ..Default::default()
         };
-        set.put_object(bucket, object, &mut PutObjReader::from_vec(expected.clone()), &opts)
-            .await
-            .expect("PUT");
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(expected.clone()),
+            &lifecycle_owned_put_options(&set, bucket, opts.clone()).await,
+        )
+        .await
+        .expect("PUT");
         let mut snapshots = Vec::new();
         for (dir, disk) in dirs.iter().zip(&disks) {
             let info = disk
@@ -7990,9 +8116,14 @@ mod shard_identity_tests {
                     no_lock: true,
                     ..Default::default()
                 };
-                set.put_object(bucket, &object, &mut PutObjReader::from_vec(expected.clone()), &opts)
-                    .await
-                    .expect("PUT");
+                set.put_object(
+                    bucket,
+                    &object,
+                    &mut PutObjReader::from_vec(expected.clone()),
+                    &lifecycle_owned_put_options(&set, bucket, opts.clone()).await,
+                )
+                .await
+                .expect("PUT");
                 let mut reader = set
                     .get_object_reader(bucket, &object, None, Default::default(), &opts)
                     .await

@@ -10876,6 +10876,28 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
         }
     }
 
+    pub(in crate::set_disk::ops) async fn lifecycle_owned_put_options(
+        set: &SetDisks,
+        bucket: &str,
+        mut opts: ObjectOptions,
+    ) -> ObjectOptions {
+        let store = crate::bucket::metadata_sys::object_store_in(&set.ctx)
+            .await
+            .expect("fixture metadata authority must be live");
+        let incarnation = store
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("fixture bucket incarnation");
+        let owner = Arc::new(
+            store
+                .acquire_bucket_incarnation_fence(bucket, incarnation)
+                .await
+                .expect("fixture lifecycle owner"),
+        );
+        owner.attach_owner(&mut opts);
+        opts
+    }
+
     async fn make_formatted_local_disk_for_pool(
         disk_idx: usize,
         pool_index: usize,
@@ -11994,10 +12016,15 @@ mod inline_put_commit_path_tests {
                 bucket,
                 object,
                 &mut reader,
-                &ObjectOptions {
-                    no_lock: true,
-                    ..Default::default()
-                },
+                &hermetic_set_disks_support::lifecycle_owned_put_options(
+                    &set_disks,
+                    bucket,
+                    ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await,
             )
             .await
             .expect("inline PUT should commit");
@@ -12741,10 +12768,15 @@ mod inline_put_commit_path_tests {
                 bucket,
                 object,
                 &mut reader,
-                &ObjectOptions {
-                    no_lock: true,
-                    ..Default::default()
-                },
+                &hermetic_set_disks_support::lifecycle_owned_put_options(
+                    &set_disks,
+                    bucket,
+                    ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await,
             )
             .await
             .expect("zero-length PUT should commit through the existing pipeline");
@@ -12817,7 +12849,12 @@ mod get_object_downstream_close_accounting_tests {
                     .expect("bucket should be created");
                 let mut put_reader = PutObjReader::from_vec(payload.clone());
                 set_disks
-                    .put_object(bucket, object, &mut put_reader, &options)
+                    .put_object(
+                        bucket,
+                        object,
+                        &mut put_reader,
+                        &hermetic_set_disks_support::lifecycle_owned_put_options(&set_disks, bucket, options.clone()).await,
+                    )
                     .await
                     .expect("object should be written");
 
@@ -13088,10 +13125,15 @@ mod metadata_mutation_generation_tests {
                 bucket,
                 object,
                 &mut reader,
-                &ObjectOptions {
-                    no_lock: true,
-                    ..Default::default()
-                },
+                &hermetic_set_disks_support::lifecycle_owned_put_options(
+                    &set_disks,
+                    bucket,
+                    ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await,
             )
             .await
             .expect("test object should be written");
@@ -17184,11 +17226,16 @@ mod transition_upload_integrity_tests {
                 bucket,
                 object,
                 &mut reader,
-                &ObjectOptions {
-                    no_lock: true,
-                    user_defined,
-                    ..Default::default()
-                },
+                &hermetic_set_disks_support::lifecycle_owned_put_options(
+                    &set_disks,
+                    bucket,
+                    ObjectOptions {
+                        no_lock: true,
+                        user_defined,
+                        ..Default::default()
+                    },
+                )
+                .await,
             )
             .await
             .expect("compressed object should be written")
@@ -18619,10 +18666,15 @@ mod heterogeneous_pool_put_tests {
                 bucket,
                 "default.bin",
                 &mut default_reader,
-                &ObjectOptions {
-                    no_lock: true,
-                    ..Default::default()
-                },
+                &hermetic_set_disks_support::lifecycle_owned_put_options(
+                    &set_disks,
+                    bucket,
+                    ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await,
             )
             .await
             .expect("default PUT should commit");
@@ -18644,10 +18696,15 @@ mod heterogeneous_pool_put_tests {
                         bucket,
                         "fenced.bin",
                         &mut fenced_reader,
-                        &ObjectOptions {
-                            no_lock: true,
-                            ..Default::default()
-                        },
+                        &hermetic_set_disks_support::lifecycle_owned_put_options(
+                            &set_disks,
+                            bucket,
+                            ObjectOptions {
+                                no_lock: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await,
                     )
                     .await
                     .expect("fenced PUT should commit with a live proof");
@@ -18857,10 +18914,15 @@ mod heterogeneous_pool_put_tests {
                         bucket,
                         object,
                         &mut initial_reader,
-                        &ObjectOptions {
-                            no_lock: true,
-                            ..Default::default()
-                        },
+                        &hermetic_set_disks_support::lifecycle_owned_put_options(
+                            &set_disks,
+                            bucket,
+                            ObjectOptions {
+                                no_lock: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await,
                     )
                     .await
                     .expect("initial fenced PUT should commit");
@@ -18880,10 +18942,15 @@ mod heterogeneous_pool_put_tests {
                             bucket,
                             object,
                             &mut stale_reader,
-                            &ObjectOptions {
-                                no_lock: true,
-                                ..Default::default()
-                            },
+                            &hermetic_set_disks_support::lifecycle_owned_put_options(
+                                &stale_set,
+                                bucket,
+                                ObjectOptions {
+                                    no_lock: true,
+                                    ..Default::default()
+                                },
+                            )
+                            .await,
                         )
                         .await
                 });
@@ -18895,10 +18962,15 @@ mod heterogeneous_pool_put_tests {
                         bucket,
                         object,
                         &mut winner_reader,
-                        &ObjectOptions {
-                            no_lock: true,
-                            ..Default::default()
-                        },
+                        &hermetic_set_disks_support::lifecycle_owned_put_options(
+                            &set_disks,
+                            bucket,
+                            ObjectOptions {
+                                no_lock: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await,
                     )
                     .await
                     .expect("concurrent fenced PUT should advance the epoch");
@@ -20754,11 +20826,16 @@ mod put_object_tmp_cleanup_tests {
                 bucket,
                 object,
                 &mut reader,
-                &ObjectOptions {
-                    no_lock: true,
-                    namespace_lock_fence: Some(NamespaceLockFence::lost_for_test()),
-                    ..Default::default()
-                },
+                &hermetic_set_disks_support::lifecycle_owned_put_options(
+                    &set_disks,
+                    bucket,
+                    ObjectOptions {
+                        no_lock: true,
+                        namespace_lock_fence: Some(NamespaceLockFence::lost_for_test()),
+                        ..Default::default()
+                    },
+                )
+                .await,
             )
             .await
             .expect_err("a lost outer namespace lock must abort before rename");
@@ -22785,6 +22862,7 @@ mod body_cache_hook_e2e_tests {
     //! bucket/object and the hook returns `None` for anything else, so a stray
     //! concurrent GET in another test is unaffected.
 
+    use super::hermetic_set_disks_support;
     use crate::ecstore_validation_blackbox::make_local_set_disks;
     use crate::io_support::rio::{HashReader, compression_metadata_value, compression_reader};
     use crate::object_api::{
@@ -22878,7 +22956,12 @@ mod body_cache_hook_e2e_tests {
             .await
             .expect("bucket should be created");
         set_disks
-            .put_object(bucket, object, &mut reader, &opts)
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &hermetic_set_disks_support::lifecycle_owned_put_options(&set_disks, bucket, opts.clone()).await,
+            )
             .await
             .expect("compressed object should be written");
     }
@@ -22915,7 +22998,12 @@ mod body_cache_hook_e2e_tests {
             .await
             .expect("bucket should be created");
         set_disks
-            .put_object(bucket, object, &mut reader, &opts)
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &hermetic_set_disks_support::lifecycle_owned_put_options(&set_disks, bucket, opts.clone()).await,
+            )
             .await
             .expect("plain object should be written");
     }

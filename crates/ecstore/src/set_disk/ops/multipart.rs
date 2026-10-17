@@ -3773,14 +3773,12 @@ mod tests {
     use crate::services::notification_sys::install_remote_version_state_fleet_proof_for_test;
     use crate::set_disk::core::io_primitives::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, rename_fanout_barrier};
     use crate::set_disk::get_lock_acquire_timeout;
-    // No-locker helpers resolve to the isolated-context variants (see
-    // `hermetic_set_disks_isolated`); the guard-based tests build through
-    // `hermetic_set_disks_with_lockers`, which stays on the bootstrap context
-    // so their own ambient SetupTypeGuard flip remains visible to them.
+    // All fixtures own isolated metadata contexts; lock-failure tests switch
+    // the same context to distributed mode after seeding their objects.
     use crate::set_disk::ops::object::hermetic_set_disks_support::{
         hermetic_set_disks_for_pool_with_default_parity_isolated as hermetic_set_disks_for_pool_with_default_parity,
         hermetic_set_disks_isolated as hermetic_set_disks, hermetic_set_disks_with_lockers,
-        hermetic_set_disks_with_lockers_and_ctx,
+        hermetic_set_disks_with_lockers_and_ctx, lifecycle_owned_put_options,
     };
     use crate::set_disk::ops::object::{PutObjectCommitBarrier, PutObjectCommitPause};
     use crate::storage_api_contracts::namespace::NamespaceLocking as _;
@@ -4002,24 +4000,33 @@ mod tests {
     }
 
     struct SetupTypeGuard {
+        ctx: Arc<crate::runtime::instance::InstanceContext>,
         previous: SetupType,
     }
 
     impl SetupTypeGuard {
-        async fn switch_to(next: SetupType) -> Self {
-            let previous = crate::runtime::sources::current_setup_type().await;
-            crate::runtime::sources::set_setup_type(next).await;
-            Self { previous }
+        async fn switch_to(ctx: &Arc<crate::runtime::instance::InstanceContext>, next: SetupType) -> Self {
+            let previous = if ctx.is_dist_erasure().await {
+                SetupType::DistErasure
+            } else {
+                SetupType::Erasure
+            };
+            ctx.update_erasure_type(next).await;
+            Self {
+                ctx: Arc::clone(ctx),
+                previous,
+            }
         }
     }
 
     impl Drop for SetupTypeGuard {
         fn drop(&mut self) {
             let previous = self.previous.clone();
+            let ctx = Arc::clone(&self.ctx);
             let handle = tokio::runtime::Handle::current();
             std::thread::spawn(move || {
                 handle.block_on(async {
-                    crate::runtime::sources::set_setup_type(previous).await;
+                    ctx.update_erasure_type(previous).await;
                 });
             })
             .join()
@@ -4697,10 +4704,15 @@ mod tests {
                         bucket,
                         object,
                         &mut initial_reader,
-                        &ObjectOptions {
-                            no_lock: true,
-                            ..Default::default()
-                        },
+                        &lifecycle_owned_put_options(
+                            &set_disks,
+                            bucket,
+                            ObjectOptions {
+                                no_lock: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await,
                     )
                     .await
                     .expect("initial fenced PUT should commit");
@@ -4739,10 +4751,15 @@ mod tests {
                         bucket,
                         object,
                         &mut winner_reader,
-                        &ObjectOptions {
-                            no_lock: true,
-                            ..Default::default()
-                        },
+                        &lifecycle_owned_put_options(
+                            &set_disks,
+                            bucket,
+                            ObjectOptions {
+                                no_lock: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await,
                     )
                     .await
                     .expect("concurrent fenced PUT should advance the epoch");
@@ -5493,7 +5510,7 @@ mod tests {
         let (upload_id, parts) = stage_upload_with_create_opts(&set_disks, bucket, object, &[0x47; 4096], &create_opts).await;
         let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
         signaling.set_target(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path));
-        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
         let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::AfterRename);
 
         let complete_store = set_disks.clone();
@@ -5544,7 +5561,7 @@ mod tests {
         let (upload_id, parts) = stage_upload_with_create_opts(&set_disks, bucket, object, &[0x48; 4096], &create_opts).await;
         let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
         signaling.set_target(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path.clone()));
-        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
         let object_holder = set_disks
             .new_ns_lock(bucket, object)
             .await
@@ -5857,10 +5874,15 @@ mod tests {
                 bucket,
                 object,
                 &mut initial_reader,
-                &ObjectOptions {
-                    no_lock: true,
-                    ..Default::default()
-                },
+                &lifecycle_owned_put_options(
+                    &set_disks,
+                    bucket,
+                    ObjectOptions {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await,
             )
             .await
             .expect("initial object should be written");
@@ -6271,7 +6293,7 @@ mod tests {
         let upload_id = upload.upload_id;
         let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
         signaling.set_target(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path.clone()));
-        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
         let holder = set_disks
             .new_ns_lock(RUSTFS_META_MULTIPART_BUCKET, &upload_id_path)
             .await
@@ -6336,7 +6358,7 @@ mod tests {
         let upload_id = upload.upload_id;
         let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
         signaling.set_target(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path));
-        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
         let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::PutPartAfterRename);
 
         let put_store = set_disks.clone();
@@ -6389,7 +6411,7 @@ mod tests {
             .await
             .expect("multipart upload should be created");
         let upload_id = upload.upload_id;
-        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
         // issue#5961: the barrier releases only once BOTH commits are paused
         // inside their commit sections, so reaching wait_until_paused proves the
         // two part numbers held their commit locks concurrently. Under an
@@ -6485,7 +6507,7 @@ mod tests {
         let upload_id = upload.upload_id;
         let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
         let part_lock_path = format!("{upload_id_path}/part.1");
-        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
         let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::PutPartAfterRename);
 
         let first_store = set_disks.clone();
@@ -6594,7 +6616,7 @@ mod tests {
         let part_lock_path = format!("{upload_id_path}/part.1");
         *target.write().expect("lock-loss target should be writable") =
             Some(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, part_lock_path.clone()));
-        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
         let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::PutPartBeforeLockLost);
 
         let put_store = set_disks.clone();
@@ -6662,7 +6684,7 @@ mod tests {
         let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
         *target.write().expect("lock-loss target should be writable") =
             Some(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path.clone()));
-        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
         let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::PutPartBeforeLockLost);
 
         let put_store = set_disks.clone();
@@ -6978,7 +7000,7 @@ mod tests {
             let (upload_id, parts) = stage_upload_with_create_opts(&set_disks, bucket, object, &[0x42; 4096], &create_opts).await;
             let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
             signaling.set_target(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path.clone()));
-            let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+            let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
             let holder = set_disks
                 .new_ns_lock(RUSTFS_META_MULTIPART_BUCKET, &upload_id_path)
                 .await
@@ -7063,7 +7085,7 @@ mod tests {
                 let object_resource = rustfs_lock::ObjectKey::new(bucket, object);
                 signaling.set_target(upload_resource.clone());
                 signaling.clear_observed();
-                let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+                let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
                 let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::AfterRename);
 
                 let complete_store = set_disks.clone();
@@ -7203,7 +7225,7 @@ mod tests {
                 let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
                 signaling.set_target(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path));
                 signaling.clear_observed();
-                let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+                let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
                 let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::AfterRename);
 
                 let complete_store = set_disks.clone();
@@ -7649,7 +7671,7 @@ mod tests {
                 let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
                 signaling.set_target(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path));
                 signaling.clear_observed();
-                let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+                let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
                 let completion_barrier =
                     MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::AfterObjectPublication);
 
@@ -7760,7 +7782,7 @@ mod tests {
                 make_bucket_on_all(&disk_stores, bucket).await;
                 let (upload_id, parts) =
                     stage_upload_with_create_opts(&set_disks, bucket, object, &[0x65; 4096], &ObjectOptions::default()).await;
-                let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+                let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
                 let completion_barrier =
                     MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::BeforeObjectPublication);
 
@@ -7816,7 +7838,7 @@ mod tests {
             stage_upload_with_create_opts(&set_disks, bucket, object, &[0x49; 4096], &ObjectOptions::default()).await;
         let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
         signaling.set_target(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path));
-        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
         let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::PutPartBeforeLockLost);
 
         let put_store = set_disks.clone();
@@ -7883,7 +7905,7 @@ mod tests {
             let upload_id_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
             *target.write().expect("lock-loss target should be writable") =
                 Some(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, upload_id_path.clone()));
-            let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+            let _setup_type_guard = SetupTypeGuard::switch_to(&set_disks.ctx, SetupType::DistErasure).await;
             let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::BeforeLockLost);
 
             let complete_store = set_disks.clone();
