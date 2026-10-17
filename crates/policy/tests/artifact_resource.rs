@@ -1,6 +1,9 @@
 // Copyright 2026 RustFS Team
 // SPDX-License-Identifier: Apache-2.0
-use rustfs_policy::policy::{Args, Policy, action::Action};
+use rustfs_policy::policy::{
+    Args, Policy,
+    action::{Action, AdminAction},
+};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
@@ -22,7 +25,11 @@ fn allowed(statements: Value, action: &str, bucket: &str, object: &str) -> bool 
 
 #[test]
 fn artifact_resource_allow_is_scoped_to_bucket_and_attempt() {
-    for action in ["admin:SealPluginArtifactAttempt", "admin:RetirePluginArtifactVersion"] {
+    for action in [
+        "admin:SealPluginArtifactAttempt",
+        "admin:SealPluginArtifactRepairs",
+        "admin:RetirePluginArtifactVersion",
+    ] {
         let policy = json!([{"Effect":"Allow","Action":action,"Resource":["arn:aws:s3:::artifacts/out/attempt-a", "arn:aws:s3:::artifacts/out/attempt-a/*"]}]);
         assert!(allowed(policy.clone(), action, "artifacts", "out/attempt-a/"));
         assert!(allowed(policy.clone(), action, "artifacts", "out/attempt-a/image.png"));
@@ -36,7 +43,11 @@ fn artifact_resource_allow_is_scoped_to_bucket_and_attempt() {
 
 #[test]
 fn artifact_resource_deny_and_not_resource_are_enforced() {
-    for action in ["admin:SealPluginArtifactAttempt", "admin:RetirePluginArtifactVersion"] {
+    for action in [
+        "admin:SealPluginArtifactAttempt",
+        "admin:SealPluginArtifactRepairs",
+        "admin:RetirePluginArtifactVersion",
+    ] {
         let scoped_allow = json!({"Effect":"Allow","Action":action,"Resource":"arn:aws:s3:::artifacts/out/*"});
         let explicit_deny = json!({"Effect":"Deny","Action":action,"Resource":"arn:aws:s3:::artifacts/out/private/*"});
         assert!(!allowed(
@@ -82,7 +93,11 @@ fn artifact_resource_deny_and_not_resource_are_enforced() {
 
 #[test]
 fn artifact_resource_empty_allow_is_rejected_without_changing_old_admin() {
-    for action in ["admin:SealPluginArtifactAttempt", "admin:RetirePluginArtifactVersion"] {
+    for action in [
+        "admin:SealPluginArtifactAttempt",
+        "admin:SealPluginArtifactRepairs",
+        "admin:RetirePluginArtifactVersion",
+    ] {
         for granted in [action, "admin:*"] {
             assert!(
                 !allowed(json!([{"Effect":"Allow","Action":granted}]), action, "artifacts", "out/"),
@@ -165,4 +180,33 @@ fn artifact_bucket_inspect_resource_requires_independent_bucket_authority() {
         assert!(!allowed(json!([grant]), action, "artifacts", ""));
     }
     assert!(!allowed(json!([scoped, {"Effect":"Deny","Action":"admin:*"}]), action, "artifacts", ""));
+}
+
+#[test]
+fn artifact_repair_seal_action_is_independent_and_round_trips() {
+    assert!(AdminAction::SealPluginArtifactRepairsAction.is_valid());
+    let action = Action::AdminAction(AdminAction::SealPluginArtifactRepairsAction);
+    let wire = "admin:SealPluginArtifactRepairs";
+    assert_eq!(Action::try_from(wire).expect("repair seal action"), action);
+    assert_eq!(serde_json::to_value(action).expect("serialized repair seal action"), json!(wire));
+    for grant in ["admin:SealPluginArtifactAttempt", "admin:RetirePluginArtifactVersion"] {
+        assert!(!allowed(
+            json!([{"Effect":"Allow","Action":wire,"Resource":"arn:aws:s3:::artifacts/out/attempt-a"}]),
+            grant,
+            "artifacts",
+            "out/attempt-a/"
+        ));
+        assert!(!allowed(
+            json!([{"Effect":"Allow","Action":grant,"Resource":"arn:aws:s3:::artifacts/out/attempt-a"}]),
+            wire,
+            "artifacts",
+            "out/attempt-a/"
+        ));
+    }
+    assert!(!allowed(
+        json!([{"Effect":"Allow","Action":wire,"Resource":"arn:aws:s3:::artifacts/out/attempt-a/image.png"}]),
+        wire,
+        "artifacts",
+        "out/attempt-a/"
+    ));
 }

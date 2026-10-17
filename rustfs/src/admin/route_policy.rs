@@ -20,6 +20,7 @@ use rustfs_security_governance::{
 const GET_PLUGIN_ARTIFACT_BUCKET: AdminActionRef = AdminActionRef::new("GetPluginArtifactBucketAction");
 const CREATE_PLUGIN_ARTIFACT_BUCKET: AdminActionRef = AdminActionRef::new("CreatePluginArtifactBucketAction");
 const SEAL_PLUGIN_ARTIFACT: AdminActionRef = AdminActionRef::new("SealPluginArtifactAttemptAction");
+const SEAL_PLUGIN_ARTIFACT_REPAIRS: AdminActionRef = AdminActionRef::new("SealPluginArtifactRepairsAction");
 const RETIRE_PLUGIN_ARTIFACT: AdminActionRef = AdminActionRef::new("RetirePluginArtifactVersionAction");
 const ALL_ADMIN: AdminActionRef = AdminActionRef::new("AllAdminActions");
 const ADD_USER_TO_GROUP: AdminActionRef = AdminActionRef::new("AddUserToGroupAdminAction");
@@ -665,6 +666,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HttpMethod::Post,
         "/rustfs/admin/v3/plugin-artifacts/seal-attempt",
         SEAL_PLUGIN_ARTIFACT,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-artifacts/seal-repairs",
+        SEAL_PLUGIN_ARTIFACT_REPAIRS,
         RouteRiskLevel::High,
     ),
     admin(
@@ -2473,6 +2480,16 @@ mod tests {
         ] {
             assert_not_action(method, path, SERVER_INFO);
         }
+    }
+
+    #[test]
+    fn route_policy_requires_separate_artifact_repair_seal_action() {
+        assert_action(
+            HttpMethod::Post,
+            "/rustfs/admin/v3/plugin-artifacts/seal-repairs",
+            SEAL_PLUGIN_ARTIFACT_REPAIRS,
+        );
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/plugin-artifacts/seal-repairs", SEAL_PLUGIN_ARTIFACT);
     }
 
     #[test]

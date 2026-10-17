@@ -113,6 +113,13 @@ struct SealReceipt {
 }
 
 #[derive(Serialize)]
+struct RepairSealReceipt {
+    version: u32,
+    target: AttemptIdentity,
+    attempt_repairs_sealed: bool,
+}
+
+#[derive(Serialize)]
 struct RetirementReceipt {
     version: u32,
     target: AttemptIdentity,
@@ -166,6 +173,11 @@ pub fn register_plugin_artifact_routes(router: &mut S3Router<AdminOperation>) ->
         Method::POST,
         &format!("{ADMIN_PREFIX}/v3/plugin-artifacts/seal-attempt"),
         AdminOperation(&Seal),
+    )?;
+    router.insert(
+        Method::POST,
+        &format!("{ADMIN_PREFIX}/v3/plugin-artifacts/seal-repairs"),
+        AdminOperation(&SealRepairs),
     )?;
     router.insert(
         Method::POST,
@@ -266,6 +278,42 @@ impl Operation for Seal {
             version: 1,
             target: input.target,
             ordinary_put_sealed: true,
+        })
+    }
+}
+
+struct SealRepairs;
+#[async_trait::async_trait]
+impl Operation for SealRepairs {
+    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        require_builtin_authorization().await?;
+        let input: SealRequest = request_body(&mut req).await?;
+        input.target.validate()?;
+        if input.version != 1 {
+            return Err(s3_error!(InvalidRequest, "unsupported artifact protocol version"));
+        }
+        let store = request_store(&req)?;
+        owner_for_resource(
+            &req,
+            AdminAction::SealPluginArtifactRepairsAction,
+            AdminResourceScope::bucket_object(&input.target.bucket, &input.target.attempt_prefix),
+        )
+        .await?;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            store.seal_artifact_attempt_repairs(
+                &input.target.bucket,
+                input.target.bucket_incarnation,
+                &input.target.attempt_prefix,
+            ),
+        )
+        .await
+        .map_err(|_| unconfirmed())?
+        .map_err(|_| unconfirmed())?;
+        response(&RepairSealReceipt {
+            version: 1,
+            target: input.target,
+            attempt_repairs_sealed: true,
         })
     }
 }
@@ -371,8 +419,18 @@ mod tests {
         })
         .expect("receipt");
         assert_eq!(seal["ordinary_put_sealed"], true);
-        for absent in ["gc_safe", "deleted", "all_writes_sealed"] {
+        for absent in ["gc_safe", "deleted", "all_writes_sealed", "attempt_repairs_sealed"] {
             assert!(seal.get(absent).is_none());
+        }
+        let repairs = serde_json::to_value(RepairSealReceipt {
+            version: 1,
+            target: serde_json::from_value(seal["target"].clone()).expect("same target"),
+            attempt_repairs_sealed: true,
+        })
+        .expect("repair seal receipt");
+        assert_eq!(repairs["attempt_repairs_sealed"], true);
+        for absent in ["gc_safe", "deleted", "all_writes_sealed", "ordinary_put_sealed"] {
+            assert!(repairs.get(absent).is_none());
         }
     }
 
@@ -380,7 +438,7 @@ mod tests {
     async fn plugin_artifact_routes_and_body_limit() {
         let mut router = S3Router::new(false);
         register_plugin_artifact_routes(&mut router).expect("register controls");
-        for path in ["buckets", "buckets/inspect", "seal-attempt", "retire-version"] {
+        for path in ["buckets", "buckets/inspect", "seal-attempt", "seal-repairs", "retire-version"] {
             assert!(router.contains_route(Method::POST, &format!("{ADMIN_PREFIX}/v3/plugin-artifacts/{path}")));
         }
         let mut req = S3Request {

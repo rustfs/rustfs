@@ -131,8 +131,7 @@ impl Fixture {
             )
             .await
             .expect("create actual IAM user");
-        let mut statement =
-            json!({"Effect":"Allow", "Action":["admin:SealPluginArtifactAttempt", "admin:RetirePluginArtifactVersion"]});
+        let mut statement = json!({"Effect":"Allow", "Action":["admin:SealPluginArtifactAttempt", "admin:SealPluginArtifactRepairs", "admin:RetirePluginArtifactVersion"]});
         if let Some(resources) = resources {
             statement["Resource"] = json!(resources);
         }
@@ -203,6 +202,14 @@ impl Fixture {
     fn seal_path(&self) -> String {
         format!(
             "{BUCKET_META_PREFIX}/{BUCKET}/artifact-put-seals/{}/{}.json",
+            self.incarnation,
+            digest(&self.prefix)
+        )
+    }
+
+    fn repair_seal_path(&self) -> String {
+        format!(
+            "{BUCKET_META_PREFIX}/{BUCKET}/artifact-repair-seals/{}/{}.json",
             self.incarnation,
             digest(&self.prefix)
         )
@@ -314,12 +321,96 @@ async fn artifact_handlers_persist_seal_and_exact_retirement_with_idempotent_ret
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
+async fn artifact_repair_seal_handler_requires_put_seal_and_confirms_only_attempt_repairs() {
+    let fixture = Fixture::new(prefix()).await;
+    let body = fixture.seal();
+    for mutate in ["version", "unknown", "target"] {
+        let mut invalid = body.clone();
+        match mutate {
+            "version" => invalid["version"] = json!(2),
+            "unknown" => invalid["unknown"] = json!(true),
+            _ => invalid["target"]["unknown"] = json!(true),
+        }
+        assert_eq!(
+            SealRepairs
+                .call(fixture.request(&invalid, Some(USER)), Params::new())
+                .await
+                .expect_err("repair seal request is strict")
+                .code(),
+            &s3s::S3ErrorCode::InvalidRequest
+        );
+    }
+    for unready_slot in [false, true] {
+        let mut req = fixture.request(&body, Some(USER));
+        req.extensions.remove::<Arc<ServerContextSlot>>();
+        if unready_slot {
+            req.extensions.insert(Arc::new(ServerContextSlot::default()));
+        }
+        assert_eq!(
+            SealRepairs
+                .call(req, Params::new())
+                .await
+                .expect_err("repair seal requires a ready request instance")
+                .code(),
+            &s3s::S3ErrorCode::ServiceUnavailable
+        );
+    }
+    let error = SealRepairs
+        .call(fixture.request(&body, Some(USER)), Params::new())
+        .await
+        .expect_err("ordinary PUT seal is a prerequisite");
+    assert_eq!(error.code(), &s3s::S3ErrorCode::ServiceUnavailable);
+    assert_eq!(error.message(), Some("artifact operation unconfirmed; retry the same identity"));
+    fixture.absent(&fixture.repair_seal_path()).await;
+    fixture.absent(&fixture.seal_path()).await;
+    let ordinary = receipt(Seal.call(fixture.request(&body, Some(USER)), Params::new()).await).await;
+    assert_eq!(ordinary["ordinary_put_sealed"], true);
+    assert!(ordinary.get("attempt_repairs_sealed").is_none());
+    fixture.absent(&fixture.repair_seal_path()).await;
+    for _ in 0..2 {
+        let sealed = receipt(SealRepairs.call(fixture.request(&body, Some(USER)), Params::new()).await).await;
+        assert_eq!(sealed, json!({"version":1,"target":fixture.target(),"attempt_repairs_sealed":true}));
+    }
+    let persisted = fixture.record(&fixture.repair_seal_path()).await;
+    assert_eq!(persisted["incarnation_id"], json!(fixture.incarnation));
+    assert_eq!(persisted["attempt_prefix"], fixture.prefix);
+    assert_eq!(persisted["bucket"], BUCKET);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
 async fn artifact_handlers_reject_unauthorized_principals_and_wrong_scope_without_records() {
     let fixture = Fixture::new(prefix()).await;
     fixture
         .user("wrong-scope", Some(vec![format!("arn:aws:s3:::{BUCKET}/elsewhere/*")]))
         .await;
     fixture.user("empty-resource", None).await;
+    fixture
+        .user("wrong-bucket", Some(vec![format!("arn:aws:s3:::another/{}*", fixture.prefix)]))
+        .await;
+    fixture.user("old-controls-only", Some(vec![fixture.attempt_arn()])).await;
+    let old_controls = Policy::parse_config(
+        &serde_json::to_vec(&json!({"Version":"2012-10-17", "Statement":[{
+            "Effect":"Allow", "Action":["admin:SealPluginArtifactAttempt", "admin:RetirePluginArtifactVersion"],
+            "Resource":fixture.attempt_arn()
+        }]}))
+        .expect("old controls policy JSON"),
+    )
+    .expect("old controls policy");
+    fixture
+        .iam
+        .set_policy("old-controls-only", old_controls)
+        .await
+        .expect("old controls only policy");
+    assert_eq!(
+        SealRepairs
+            .call(fixture.request(&fixture.seal(), Some("old-controls-only")), Params::new())
+            .await
+            .expect_err("old controls do not authorize repair sealing")
+            .code(),
+        &s3s::S3ErrorCode::AccessDenied
+    );
+    fixture.absent(&fixture.repair_seal_path()).await;
     let (service, _) = fixture
         .iam
         .new_service_account(
@@ -364,25 +455,21 @@ async fn artifact_handlers_reject_unauthorized_principals_and_wrong_scope_withou
         Some(ROOT),
         Some("wrong-scope"),
         Some("empty-resource"),
+        Some("wrong-bucket"),
         Some(service.access_key.as_str()),
         Some(temporary.access_key.as_str()),
     ] {
-        for retire in [false, true] {
-            let body = if retire {
-                fixture.retire(&object, version)
-            } else {
-                fixture.seal()
-            };
+        for (operation, body) in [
+            (&Seal as &dyn Operation, fixture.seal()),
+            (&SealRepairs as &dyn Operation, fixture.seal()),
+            (&Retire as &dyn Operation, fixture.retire(&object, version)),
+        ] {
             let mut req = fixture.request(&body, user);
             if user == Some(temporary.access_key.as_str()) {
                 req.headers
                     .insert("x-amz-security-token", temporary.session_token.parse().unwrap());
             }
-            let result = if retire {
-                Retire.call(req, Params::new()).await
-            } else {
-                Seal.call(req, Params::new()).await
-            };
+            let result = operation.call(req, Params::new()).await;
             assert_eq!(
                 result
                     .expect_err("original user and exact resource policy are required")
@@ -390,6 +477,7 @@ async fn artifact_handlers_reject_unauthorized_principals_and_wrong_scope_withou
                 &s3s::S3ErrorCode::AccessDenied
             );
             fixture.absent(&fixture.seal_path()).await;
+            fixture.absent(&fixture.repair_seal_path()).await;
             fixture.absent(&fixture.retirement_path(&object, version)).await;
         }
     }
@@ -409,29 +497,35 @@ async fn artifact_handlers_bind_incarnation_and_request_instance() {
     let object = format!("{}image.png", first.prefix);
     let version = first.put(&object, 0xA5).await.expect("first store object");
     second.put(&object, 0xBB).await.expect("second store object");
-    for retire in [false, true] {
-        let mut body = if retire {
-            first.retire(&object, version)
-        } else {
-            first.seal()
-        };
+    for (operation, mut body) in [
+        (&Seal as &dyn Operation, first.seal()),
+        (&SealRepairs as &dyn Operation, first.seal()),
+        (&Retire as &dyn Operation, first.retire(&object, version)),
+    ] {
         body["target"]["bucket_incarnation"] = json!(second.incarnation);
         let req = first.request(&body, Some(USER));
-        let result = if retire {
-            Retire.call(req, Params::new()).await
-        } else {
-            Seal.call(req, Params::new()).await
-        };
+        let result = operation.call(req, Params::new()).await;
         assert_eq!(
             result.expect_err("other instance incarnation is rejected").code(),
             &s3s::S3ErrorCode::ServiceUnavailable
         );
         first.absent(&first.seal_path()).await;
         second.absent(&second.seal_path()).await;
+        first.absent(&first.repair_seal_path()).await;
+        second.absent(&second.repair_seal_path()).await;
         first.absent(&first.retirement_path(&object, version)).await;
         second.absent(&second.retirement_path(&object, version)).await;
     }
     receipt(Seal.call(first.request(&first.seal(), Some(USER)), Params::new()).await).await;
+    let mut wrong_incarnation = first.seal();
+    wrong_incarnation["target"]["bucket_incarnation"] = json!(second.incarnation);
+    let error = SealRepairs
+        .call(first.request(&wrong_incarnation, Some(USER)), Params::new())
+        .await
+        .expect_err("repair seal checks incarnation even after the PUT seal exists");
+    assert_eq!(error.code(), &s3s::S3ErrorCode::ServiceUnavailable);
+    first.absent(&first.repair_seal_path()).await;
+    second.absent(&second.repair_seal_path()).await;
     assert!(first.put(&object, 0xCC).await.is_err());
     second
         .put(&object, 0xDD)
@@ -439,6 +533,16 @@ async fn artifact_handlers_bind_incarnation_and_request_instance() {
         .expect("first instance seal cannot affect second store");
     second.absent(&second.seal_path()).await;
     first.record(&first.seal_path()).await;
+    let repaired = receipt(
+        SealRepairs
+            .call(first.request(&first.seal(), Some(USER)), Params::new())
+            .await,
+    )
+    .await;
+    assert_eq!(repaired["target"], first.target());
+    assert_eq!(repaired["attempt_repairs_sealed"], true);
+    first.record(&first.repair_seal_path()).await;
+    second.absent(&second.repair_seal_path()).await;
 }
 
 impl Fixture {

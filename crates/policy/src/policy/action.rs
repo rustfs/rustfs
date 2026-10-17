@@ -572,6 +572,8 @@ pub enum AdminAction {
     CreatePluginArtifactBucketAction,
     #[strum(serialize = "admin:SealPluginArtifactAttempt")]
     SealPluginArtifactAttemptAction,
+    #[strum(serialize = "admin:SealPluginArtifactRepairs")]
+    SealPluginArtifactRepairsAction,
     #[strum(serialize = "admin:RetirePluginArtifactVersion")]
     RetirePluginArtifactVersionAction,
     #[strum(serialize = "admin:SubmitPluginJob")]
@@ -627,6 +629,7 @@ impl AdminAction {
             Self::CreatePluginArtifactBucketAction
                 | Self::GetPluginArtifactBucketAction
                 | Self::SealPluginArtifactAttemptAction
+                | Self::SealPluginArtifactRepairsAction
                 | Self::RetirePluginArtifactVersionAction
         )
     }
@@ -743,6 +746,7 @@ impl AdminAction {
                 | AdminAction::CreatePluginArtifactBucketAction
                 | AdminAction::GetPluginArtifactBucketAction
                 | AdminAction::SealPluginArtifactAttemptAction
+                | AdminAction::SealPluginArtifactRepairsAction
                 | AdminAction::RetirePluginArtifactVersionAction
                 | AdminAction::SubmitPluginJobAction
                 | AdminAction::GetPluginRunAction
