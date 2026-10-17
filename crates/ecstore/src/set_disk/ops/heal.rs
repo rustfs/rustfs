@@ -1919,59 +1919,95 @@ impl SetDisks {
                                     .await
                                 };
 
-                                if let Err(err) = &rename_result {
-                                    warn!(
-                                        event = EVENT_HEAL_OBJECT_RENAME,
-                                        component = LOG_COMPONENT_ECSTORE,
-                                        subsystem = LOG_SUBSYSTEM_HEAL,
-                                        bucket,
-                                        object,
-                                        version_id,
-                                        disk_index = index,
-                                        endpoint = %disk.endpoint(),
-                                        tmp_id,
-                                        result = "failed",
-                                        error = %err,
-                                        "Heal object rename failed"
-                                    );
-                                } else {
-                                    rename_successes += 1;
-                                    healed_disks[index] = Some(disk.clone());
-                                    if parts_metadata[index].is_remote() {
-                                        let rm_data_dir =
-                                            parts_metadata[index].data_dir.expect("operation should succeed").to_string();
-
-                                        let d_path = Path::new(&encode_dir_object(object)).join(rm_data_dir);
-
-                                        if let Err(e) = disk
-                                            .delete(
-                                                bucket,
-                                                d_path.to_str().expect("operation should succeed"),
-                                                DeleteOptions {
-                                                    immediate: true,
-                                                    recursive: true,
-                                                    ..Default::default()
-                                                },
-                                            )
-                                            .await
-                                        {
-                                            // The healed shard has already been renamed into place; a
-                                            // failure cleaning up the old remote data dir must not abort
-                                            // the heal and leak the tmp shards (backlog#799 B20).
-                                            warn!(
-                                                component = LOG_COMPONENT_ECSTORE,
-                                                subsystem = LOG_SUBSYSTEM_HEAL,
-                                                bucket,
-                                                object,
-                                                error = %e,
-                                                "Heal remote data-dir cleanup failed"
-                                            );
-                                        }
+                                match rename_result {
+                                    Err(err) => {
+                                        warn!(
+                                            event = EVENT_HEAL_OBJECT_RENAME,
+                                            component = LOG_COMPONENT_ECSTORE,
+                                            subsystem = LOG_SUBSYSTEM_HEAL,
+                                            result = "failed",
+                                            bucket,
+                                            object,
+                                            version_id,
+                                            disk_index = index,
+                                            endpoint = %disk.endpoint(),
+                                            tmp_id,
+                                            error = %err,
+                                            "Heal object rename failed"
+                                        );
                                     }
+                                    Ok(rename_response) => {
+                                        rename_successes += 1;
+                                        healed_disks[index] = Some(disk.clone());
+                                        // Heal can reuse a live data directory, and a synthetic
+                                        // rollback directory can also contain a child key.
+                                        // Retire only this publication's backup while fenced.
+                                        if let Some(rollback_dir) =
+                                            rename_response.rollback_data_dir.or(rename_response.old_data_dir)
+                                            && bucket_heal_scope.as_ref().is_none_or(|scope| scope.check().is_ok())
+                                            && commit_fence.is_none_or(|check| check())
+                                            && !_write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                                            && !_read_repair_write_lock_guard
+                                                .as_ref()
+                                                .is_some_and(|guard| guard.is_lock_lost())
+                                        {
+                                            let backup_path = format!(
+                                                "{}/{rollback_dir}/{}",
+                                                rustfs_utils::path::encode_dir_object_ref(object),
+                                                disk::STORAGE_FORMAT_FILE_BACKUP,
+                                            );
+                                            match disk.delete(bucket, &backup_path, DeleteOptions::default()).await {
+                                                Ok(()) | Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => {}
+                                                Err(err) => warn!(
+                                                    event = EVENT_HEAL_OBJECT_RENAME,
+                                                    component = LOG_COMPONENT_ECSTORE,
+                                                    subsystem = LOG_SUBSYSTEM_HEAL,
+                                                    result = "cleanup_failed",
+                                                    bucket,
+                                                    object,
+                                                    version_id,
+                                                    disk_index = index,
+                                                    error = %err,
+                                                    "Heal rollback backup cleanup failed"
+                                                ),
+                                            }
+                                        }
+                                        if parts_metadata[index].is_remote() {
+                                            let rm_data_dir =
+                                                parts_metadata[index].data_dir.expect("operation should succeed").to_string();
 
-                                    for (i, v) in result.before.drives.iter().enumerate() {
-                                        if v.endpoint == disk.endpoint().to_string() {
-                                            result.after.drives[i].state = DriveState::Ok.to_string();
+                                            let d_path = Path::new(&encode_dir_object(object)).join(rm_data_dir);
+
+                                            if let Err(e) = disk
+                                                .delete(
+                                                    bucket,
+                                                    d_path.to_str().expect("operation should succeed"),
+                                                    DeleteOptions {
+                                                        immediate: true,
+                                                        recursive: true,
+                                                        ..Default::default()
+                                                    },
+                                                )
+                                                .await
+                                            {
+                                                // The healed shard has already been renamed into place; a
+                                                // failure cleaning up the old remote data dir must not abort
+                                                // the heal and leak the tmp shards (backlog#799 B20).
+                                                warn!(
+                                                    component = LOG_COMPONENT_ECSTORE,
+                                                    subsystem = LOG_SUBSYSTEM_HEAL,
+                                                    bucket,
+                                                    object,
+                                                    error = %e,
+                                                    "Heal remote data-dir cleanup failed"
+                                                );
+                                            }
+                                        }
+
+                                        for (i, v) in result.before.drives.iter().enumerate() {
+                                            if v.endpoint == disk.endpoint().to_string() {
+                                                result.after.drives[i].state = DriveState::Ok.to_string();
+                                            }
                                         }
                                     }
                                 }
@@ -3619,6 +3655,7 @@ impl SetDisks {
         // Pass no_lock=true since we already obtained write lock (or are already called with no_lock=true)
         let mut inner_opts = *opts;
         inner_opts.no_lock = true;
+        let commit_fence = || !_write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost());
         let (result, err) = self
             .heal_object_with_explicit_version_regen(
                 bucket,
@@ -3628,7 +3665,7 @@ impl SetDisks {
                     opts: &inner_opts,
                     allow_regeneration: true,
                     preserve_unrepairable: false,
-                    commit_fence: None,
+                    commit_fence: Some(&commit_fence),
                     retirement: proof.retirement,
                 },
                 absence,
@@ -3650,7 +3687,7 @@ impl SetDisks {
                                 opts: &inner_opts,
                                 allow_regeneration: true,
                                 preserve_unrepairable: false,
-                                commit_fence: None,
+                                commit_fence: Some(&commit_fence),
                                 retirement: proof.retirement,
                             },
                             absence,
@@ -3703,8 +3740,9 @@ impl SetDisks {
 #[cfg(test)]
 mod heal_result_report_tests {
     use super::{
-        AbsenceProofRequest, DanglingCheckPartsFailure, DanglingDeleteFailure, DanglingDeleteSafety, HealWriterFailures,
-        ReadRepairCommitFingerprint, ReadRepairPauseScope, SetDisks, heal_writer_error_summary, is_retryable_heal_writer_error,
+        AbsenceProofRequest, DanglingCheckPartsFailure, DanglingDeleteFailure, DanglingDeleteSafety, ExplicitVersionHeal,
+        HealWriterFailures, ReadRepairCommitFingerprint, ReadRepairPauseScope, SetDisks, heal_writer_error_summary,
+        is_retryable_heal_writer_error,
     };
     use super::{HEAL_RENAME_INCOMPLETE, HealRenameFailureScope, HealWriterFailureScope};
     use crate::disk::endpoint::Endpoint;
@@ -4516,6 +4554,11 @@ mod heal_result_report_tests {
                     first_result.after.drives[index].state,
                     expected.to_string(),
                     "{case}: after.drives must reflect the actual rename outcome at index {index}"
+                );
+                let data_path = temp_dirs[index].path().join(&bucket).join(object).join(data_dir.to_string());
+                assert!(
+                    !data_path.join(crate::disk::STORAGE_FORMAT_FILE_BACKUP).exists(),
+                    "{case}: heal must retire the backup even when it shares the live data directory"
                 );
                 assert_eq!(
                     temp_dirs[index]
@@ -5421,6 +5464,140 @@ mod heal_result_report_tests {
     }
 
     #[tokio::test]
+    async fn heal_reclaims_published_inline_backup_and_preserves_child_key() {
+        let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "heal-inline-rollback";
+        let object = "nested/object";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create bucket volume");
+        }
+        let options = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let rollback_dir = crate::disk::local::inline_metadata_rollback_dir(Uuid::nil(), &rustfs_filemeta::FileMeta::new());
+        let child = format!("{object}/{rollback_dir}");
+        let child_payload = b"a child key must survive parent repair".to_vec();
+        set.put_object(bucket, &child, &mut PutObjReader::from_vec(child_payload.clone()), &options)
+            .await
+            .expect("write child key in the synthetic rollback directory");
+        set.put_object(bucket, object, &mut PutObjReader::from_vec(vec![0x11; 592]), &options)
+            .await
+            .expect("write old inline generation on every disk");
+        let metadata_path = dirs[0].path().join(bucket).join(object).join(STORAGE_FORMAT_FILE);
+        let old_metadata = tokio::fs::read(&metadata_path).await.expect("save stale target metadata");
+        let payload = vec![0x22; 592];
+        set.put_object(bucket, object, &mut PutObjReader::from_vec(payload.clone()), &options)
+            .await
+            .expect("write current inline generation on every disk");
+        let read_options = ReadOptions {
+            read_data: true,
+            ..Default::default()
+        };
+        let expected = disks[0]
+            .read_version("", bucket, object, "", &read_options)
+            .await
+            .expect("read current target generation");
+        assert!(expected.data.is_some(), "fixture must exercise inline publication");
+        tokio::fs::write(&metadata_path, &old_metadata)
+            .await
+            .expect("restore one stale replica without a pre-existing delete transaction");
+        let backup_path = metadata_path
+            .parent()
+            .expect("object directory")
+            .join(rollback_dir.to_string())
+            .join(crate::disk::STORAGE_FORMAT_FILE_BACKUP);
+        let opts = HealOpts {
+            no_lock: true,
+            scan_mode: HealScanMode::Deep,
+            ..Default::default()
+        };
+        let (_, error) = set
+            .heal_object(bucket, object, "", &HealOpts { dry_run: true, ..opts })
+            .await
+            .expect("dry-run stale inline repair");
+        assert!(error.is_none(), "dry-run error: {error:?}");
+        assert_eq!(tokio::fs::read(&metadata_path).await.expect("dry-run target"), old_metadata);
+        assert!(!backup_path.exists(), "dry-run must not publish a backup");
+
+        let failure_scope = HealRenameFailureScope::install(bucket, object, &[expected.erasure.distribution[0] - 1]);
+        let (_, error) = set
+            .heal_object(bucket, object, "", &opts)
+            .await
+            .expect("report failed publication");
+        drop(failure_scope);
+        assert!(error.is_some(), "failed rename must remain retryable");
+        assert_eq!(tokio::fs::read(&metadata_path).await.expect("failed target"), old_metadata);
+        assert!(!backup_path.exists(), "failed publication must not reclaim or manufacture a backup");
+
+        let (result, error) = set
+            .heal_object(bucket, object, "", &opts)
+            .await
+            .expect("repair stale inline replica");
+        assert!(error.is_none(), "repair error: {error:?}");
+        assert_eq!(result.drives_healed(), Some(1));
+        let repaired = disks[0]
+            .read_version("", bucket, object, "", &read_options)
+            .await
+            .expect("read repaired physical target");
+        assert_eq!(repaired.mod_time, expected.mod_time);
+        assert_eq!(repaired.data_dir, expected.data_dir);
+        assert_eq!(repaired.data, expected.data);
+        assert!(!backup_path.exists(), "successful heal must retire its old-generation backup");
+        let evidence = disks[0]
+            .discover_delete_transactions(bucket, Some(object), None, 128)
+            .await
+            .expect("discover delete evidence without treating a child key as a transaction");
+        assert!(evidence.transactions.is_empty(), "successful repair must leave no delete blocker");
+        for (key, expected_body) in [(object, payload), (child.as_str(), child_payload)] {
+            let mut reader = set
+                .get_object_reader(bucket, key, None, Default::default(), &options)
+                .await
+                .expect("read repaired parent and preserved child");
+            let mut body = Vec::new();
+            tokio::io::copy(&mut reader, &mut body)
+                .await
+                .expect("read complete object body");
+            assert_eq!(body, expected_body, "object {key}");
+        }
+        let (healthy, error) = set.heal_object(bucket, object, "", &opts).await.expect("repeat repair");
+        assert!(error.is_none(), "repeat repair error: {error:?}");
+        assert_eq!(healthy.drives_healed(), Some(0));
+
+        tokio::fs::write(&metadata_path, &old_metadata)
+            .await
+            .expect("restore stale replica for fence probe");
+        // The fence is valid up to publication, then fails before backup removal.
+        let can_commit = || !backup_path.exists();
+        let (_, error) = set
+            .heal_object_with_explicit_version_regen(
+                bucket,
+                object,
+                "",
+                ExplicitVersionHeal {
+                    opts: &opts,
+                    allow_regeneration: true,
+                    preserve_unrepairable: false,
+                    commit_fence: Some(&can_commit),
+                    retirement: None,
+                },
+                &mut None,
+            )
+            .await
+            .expect("report committed repair after fence loss");
+        assert!(
+            error.is_none(),
+            "post-publication fence loss must not undo the committed target: {error:?}"
+        );
+        assert!(backup_path.exists(), "a lost fence must preserve the rollback evidence");
+        let repaired = disks[0]
+            .read_version("", bucket, object, "", &read_options)
+            .await
+            .expect("committed target survives skipped cleanup");
+        assert_eq!(repaired.data, expected.data);
+    }
+
+    #[tokio::test]
     async fn deep_heal_inline_bitrot_rebuilds_physical_data_and_parity_shards() {
         use crate::storage_api_contracts::range::HTTPRangeSpec;
         use tokio::io::AsyncReadExt;
@@ -5437,12 +5614,13 @@ mod heal_result_report_tests {
             read_data: true,
             ..Default::default()
         };
-        let object_options = ObjectOptions {
+        let mut object_options = ObjectOptions {
             no_lock: true,
             ..Default::default()
         };
 
         for parity in [false, true] {
+            object_options.versioned = parity;
             for corrupt_prefix in [false, true] {
                 let object = format!("parity-{parity}-prefix-{corrupt_prefix}.bin");
                 set.put_object(bucket, &object, &mut PutObjReader::from_vec(payload.clone()), &object_options)
@@ -5516,6 +5694,19 @@ mod heal_result_report_tests {
                         assert_eq!(repaired.data, original_meta.data, "heal must restore the exact encoded shard");
                         assert_eq!(repaired.version_id, original_meta.version_id);
                         assert_eq!(repaired.data_dir, original_meta.data_dir);
+                        let rollback_dir = crate::disk::local::inline_metadata_rollback_dir(
+                            repaired.version_id.unwrap_or_default(),
+                            &rustfs_filemeta::FileMeta::new(),
+                        );
+                        assert!(
+                            !metadata_path
+                                .parent()
+                                .expect("object directory")
+                                .join(rollback_dir.to_string())
+                                .join(crate::disk::STORAGE_FORMAT_FILE_BACKUP)
+                                .exists(),
+                            "inline bitrot repair must not retain a rollback backup"
+                        );
                     }
 
                     for (range, expected) in [
