@@ -14,12 +14,14 @@
 
 #![cfg(all(feature = "test-util", not(windows)))]
 
+mod storage_api;
+
 use bytes::Bytes;
-use rustfs_ecstore::api::disk::{
-    DiskAPI, DiskError, DiskOption, Endpoint, LocalPublicationPause, LocalPublicationStage, ReadOptions, new_disk,
-};
 use rustfs_filemeta::{FileInfo, ObjectPartInfo};
 use std::{process::Command, time::Duration};
+use storage_api::inline_heal_staging::{
+    DiskAPI, DiskError, DiskOption, Endpoint, LocalPublicationPause, LocalPublicationStage, ReadOptions, new_disk,
+};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
