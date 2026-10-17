@@ -160,7 +160,7 @@ use rustfs_utils::http::{
 use rustfs_utils::{
     HashAlgorithm,
     crypto::hex,
-    path::{SLASH_SEPARATOR, encode_dir_object, encode_dir_object_ref, has_suffix, path_join_buf},
+    path::{SLASH_SEPARATOR, encode_dir_object, encode_dir_object_ref, has_suffix, object_name_disk_identity, path_join_buf},
 };
 use sha2::Sha256;
 use std::borrow::Cow;
@@ -4696,31 +4696,11 @@ fn record_metadata_cache_invalidation(bucket: &str, object: &str) {
     }
 }
 
-/// Object name as the metadata cache identifies it.
-///
-/// Windows disks treat `\` as a path separator and `path_join_buf` drops the
-/// empty segments that leaves behind, so `a\b`, `a\\b`, `\a\b` and `a\b\`
-/// all address the xl.meta of `a/b`. Folding those spellings into one cache
-/// identity lets a mutation through any of them retire the others' cached
-/// metadata. Elsewhere `\` is an ordinary key byte and the name is verbatim.
-fn get_object_metadata_cache_object_name(object: &str) -> Cow<'_, str> {
-    fold_object_name_path_separators(object, cfg!(windows))
-}
-
-fn fold_object_name_path_separators(object: &str, backslash_is_separator: bool) -> Cow<'_, str> {
-    // Names without `\` already passed the `//` and leading-`/` checks.
-    if !backslash_is_separator || !object.contains('\\') {
-        return Cow::Borrowed(object);
-    }
-    let segments: Vec<&str> = object.split(['/', '\\']).filter(|segment| !segment.is_empty()).collect();
-    Cow::Owned(segments.join(SLASH_SEPARATOR))
-}
-
 impl GetObjectMetadataCacheKey {
     fn new(bucket: &str, object: &str, generation: GetObjectMetadataCacheGeneration) -> Self {
         Self {
             bucket: Arc::from(bucket),
-            object: Arc::from(get_object_metadata_cache_object_name(object).as_ref()),
+            object: Arc::from(object_name_disk_identity(object).as_ref()),
             generation: generation.value,
             hash: generation.hash,
         }
@@ -4731,7 +4711,7 @@ impl<'a> GetObjectMetadataCacheLookupKey<'a> {
     fn new(bucket: &'a str, object: &'a str, generation: GetObjectMetadataCacheGeneration) -> Self {
         Self {
             bucket,
-            object: get_object_metadata_cache_object_name(object),
+            object: object_name_disk_identity(object),
             generation: generation.value,
             hash: generation.hash,
         }
@@ -5006,7 +4986,9 @@ impl SetDisks {
     fn get_object_metadata_cache_hash(&self, bucket: &str, object: &str) -> u64 {
         let mut hasher = self.get_object_metadata_cache_hash_builder.build_hasher();
         bucket.hash(&mut hasher);
-        get_object_metadata_cache_object_name(object).hash(&mut hasher);
+        // Every spelling of one xl.meta (Windows `a\b` vs `a/b`) shares one
+        // cache identity, so a mutation through any of them retires the rest.
+        object_name_disk_identity(object).hash(&mut hasher);
         hasher.finish()
     }
 
