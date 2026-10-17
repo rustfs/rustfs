@@ -361,6 +361,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         pending_heals_changed: false,
         coverage_frontier: None,
         resume_frontier: None,
+        resume_failed_paths: Vec::new(),
         coverage_gap: false,
         raw_enumeration_progress: Vec::new(),
         pending_heal_sync_deferred: false,
@@ -2495,7 +2496,7 @@ async fn test_scan_folder_corrupt_xl_meta_stops_erasure_data_dir_descent() {
         .await
         .expect("cached metadata failure must still stop erasure data directory descent");
 
-    assert_eq!(retry_into.failed_objects, 0, "cached failure should not be counted twice");
+    assert_eq!(retry_into.failed_objects, 1, "a rebuilt entry must retain suppressed failure debt");
     assert!(!retry_budget.budget_elapsed());
     assert_eq!(retry_budget.reason(), None);
 
@@ -2620,7 +2621,7 @@ async fn test_scan_folder_missing_xl_meta_stops_erasure_data_dir_descent() {
         .await
         .expect("cached missing metadata must still stop erasure data directory descent");
 
-    assert_eq!(retry_into.failed_objects, 0, "cached failure should not be counted twice");
+    assert_eq!(retry_into.failed_objects, 1, "a rebuilt entry must retain suppressed failure debt");
     assert!(!retry_budget.budget_elapsed());
     assert_eq!(retry_budget.reason(), None);
 }

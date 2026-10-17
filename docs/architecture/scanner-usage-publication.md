@@ -121,6 +121,24 @@ reuse without this identity. Older readers can ignore the added map key, but
 older writers do not enforce its fence; readability is not a mixed-version
 publication-safety guarantee.
 
+Bucket checkpoints distinguish completed traversal from object health. A failed
+object does not stop later completed subtrees from advancing the traversal
+frontier. On resume, a sorted index of cached entries with `failed_objects > 0`
+excludes their containing subtrees from reuse; healthy covered siblings keep
+their exact cached accounting. Failure counters survive retry-cache TTL and
+capacity eviction, and any remaining entry failure keeps the bucket partial.
+Directory traversal errors and unresolved size reconciliation still stop the
+frontier because they do not have the same per-entry coverage proof.
+
+Coverage follows path-component traversal order, including punctuation in sibling
+names. Coverage receipts use digest domain 3 and bind every entry in each covered
+subtree using the same predicate as resume, while excluding the unvisited suffix.
+No unsigned nested failure can authorize subtree reuse. Current
+readers accept and migrate domain 2 and legacy epoch-bound receipts. Older
+binaries cannot validate a domain 3 receipt and safely reread the bucket rather
+than applying their unconditional covered-subtree skip. The serialized receipt
+shape, cache CAS, leader epoch and publication fences are unchanged.
+
 ## Persisted Objects
 
 The persisted objects are part of the compatibility contract. Removing one

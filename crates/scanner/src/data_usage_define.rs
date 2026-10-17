@@ -514,6 +514,14 @@ impl Serialize for DataUsageScanCoverageReceipt {
     }
 }
 
+/// Coverage follows depth-first directory traversal, rather than raw path order.
+/// A completed subtree includes its descendants but never an unfinished ancestor.
+pub(crate) fn scan_frontier_covers_path(path: &str, frontier: &str) -> bool {
+    let ancestor = frontier.strip_prefix(path).is_some_and(|suffix| suffix.starts_with('/'));
+    let descendant = path.strip_prefix(frontier).is_some_and(|suffix| suffix.starts_with('/'));
+    (path.split('/').cmp(frontier.split('/')).is_le() && !ancestor) || descendant
+}
+
 struct CheckpointDigestWriter(Sha256);
 
 impl std::io::Write for CheckpointDigestWriter {
@@ -1066,17 +1074,22 @@ impl DataUsageCache {
     }
 
     fn coverage_prefix_digest(&self, through: &str) -> Result<[u8; 32], serde_json::Error> {
-        self.coverage_prefix_digest_with_epoch(through, None)
+        self.coverage_prefix_digest_with_epoch(through, None, 3)
+    }
+
+    fn v2_coverage_prefix_digest(&self, through: &str) -> Result<[u8; 32], serde_json::Error> {
+        self.coverage_prefix_digest_with_epoch(through, None, 2)
     }
 
     fn legacy_coverage_prefix_digest(&self, through: &str) -> Result<[u8; 32], serde_json::Error> {
-        self.coverage_prefix_digest_with_epoch(through, Some(self.info.leader_epoch))
+        self.coverage_prefix_digest_with_epoch(through, Some(self.info.leader_epoch), 0)
     }
 
     fn coverage_prefix_digest_with_epoch(
         &self,
         through: &str,
         legacy_leader_epoch: Option<u64>,
+        domain_version: u8,
     ) -> Result<[u8; 32], serde_json::Error> {
         let mut writer = CheckpointDigestWriter(Sha256::new());
         if let Some(leader_epoch) = legacy_leader_epoch {
@@ -1100,10 +1113,12 @@ impl DataUsageCache {
             // process-local leader epoch is intentionally excluded because it
             // changes during a safe handoff.  The domain version also keeps
             // old epoch-bound receipts from colliding with this digest.
+            // Domain 3 permits object-health debt behind the frontier. Older
+            // readers must reject it because they skip covered failures.
             serde_json::to_writer(
                 &mut writer,
                 &(
-                    2u8,
+                    domain_version,
                     &self.info.name,
                     self.info.scan_identity,
                     self.info.source,
@@ -1117,6 +1132,11 @@ impl DataUsageCache {
             .cache
             .iter()
             .filter(|(key, _)| {
+                // Sign exactly the subtrees the reader can reuse, including
+                // descendants whose raw path order differs from traversal order.
+                if legacy_leader_epoch.is_none() && domain_version >= 3 {
+                    return scan_frontier_covers_path(key, through);
+                }
                 let ancestor = through
                     .strip_prefix(key.as_str())
                     .is_some_and(|suffix| suffix.starts_with('/'));
@@ -1152,6 +1172,7 @@ impl DataUsageCache {
                 .is_some_and(|suffix| suffix.starts_with('/'))
             && self.find(&receipt.through).is_some()
             && (self.coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest)
+                || self.v2_coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest)
                 || self.legacy_coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest)))
         .then_some(receipt.through.as_str())
     }
