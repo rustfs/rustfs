@@ -1094,6 +1094,9 @@ mod tests {
         revision: AtomicUsize,
         pool_meta_write_attempts: AtomicUsize,
         fail_pool_meta_write_at: AtomicUsize,
+        identity_repair_failures: AtomicUsize,
+        identity_write_attempts: AtomicUsize,
+        identity_unconverged: AtomicBool,
         pool_meta_written_versions: Mutex<Vec<u16>>,
         objects: Mutex<HashMap<String, (Vec<u8>, String)>>,
     }
@@ -1114,6 +1117,9 @@ mod tests {
                 revision: AtomicUsize::new(0),
                 pool_meta_write_attempts: AtomicUsize::new(0),
                 fail_pool_meta_write_at: AtomicUsize::new(0),
+                identity_repair_failures: AtomicUsize::new(0),
+                identity_write_attempts: AtomicUsize::new(0),
+                identity_unconverged: AtomicBool::new(false),
                 pool_meta_written_versions: Mutex::new(Vec::new()),
                 objects: Mutex::new(objects),
             }
@@ -1130,6 +1136,9 @@ mod tests {
                 revision: AtomicUsize::new(0),
                 pool_meta_write_attempts: AtomicUsize::new(0),
                 fail_pool_meta_write_at: AtomicUsize::new(0),
+                identity_repair_failures: AtomicUsize::new(0),
+                identity_write_attempts: AtomicUsize::new(0),
+                identity_unconverged: AtomicBool::new(false),
                 pool_meta_written_versions: Mutex::new(Vec::new()),
                 objects: Mutex::new(HashMap::new()),
             }
@@ -1244,6 +1253,17 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(object.to_string(), (payload, etag.clone()));
+            if object == POOL_META_IDENTITY_NAME {
+                self.identity_write_attempts.fetch_add(1, Ordering::SeqCst);
+                let partial = self
+                    .identity_repair_failures
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+                    .is_ok();
+                self.identity_unconverged.store(partial, Ordering::SeqCst);
+                if partial {
+                    return Err(Error::other(crate::set_disk::SystemMetadataRepairRequired));
+                }
+            }
             Ok(self.object_info(bucket, object, size, etag))
         }
     }
@@ -1748,6 +1768,220 @@ mod tests {
             .ensure_write_safe("unproven restart")
             .expect_err("the rejected restart latches the write gate");
         assert!(startup_object(&pool0, POOL_META_NAME).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_four_pool_expansion_repairs_missing_identity_disk_without_data_change() {
+        use crate::disk::{DiskAPI, RUSTFS_META_BUCKET, ReadOptions};
+        use crate::set_disk::hermetic_set_disks_isolated;
+
+        let mut dirs = Vec::new();
+        let mut disks = Vec::new();
+        let mut pools = Vec::new();
+        for _ in 0..4 {
+            let (pool_dirs, pool_disks, pool) = hermetic_set_disks_isolated(4).await;
+            dirs.extend(pool_dirs);
+            disks.push(pool_disks);
+            pools.push(pool);
+        }
+        let deployment_id = Uuid::new_v4();
+        let mut founder = PoolMetaWriteState::for_startup(deployment_id, true);
+        establish_pool_meta_bootstrap_identity_if_proven(pools[..3].to_vec(), &mut founder, true)
+            .await
+            .expect("seed three healthy pool identities");
+        let (_, replicas) = load_pool_meta_for_startup(pools[..3].to_vec(), &mut founder)
+            .await
+            .expect("load the original deployment");
+        persist_pool_meta_for_startup_if_safe(
+            &init_test_pool_meta_with_pools(3),
+            pools[..3].to_vec(),
+            replicas,
+            &mut founder,
+            true,
+            true,
+        )
+        .await
+        .expect("commit three healthy pools");
+        let identity = crate::config::com::read_config_no_lock(pools[0].clone(), POOL_META_IDENTITY_NAME)
+            .await
+            .expect("read the initialized deployment identity");
+        let bucket = "identity-repair-data";
+        for disk in &disks[0] {
+            disk.make_volume(bucket).await.expect("create the data bucket");
+        }
+        let original = vec![0x73; 256 * 1024];
+        pools[0]
+            .put_object(
+                bucket,
+                "retained",
+                &mut PutObjReader::from_vec(original.clone()),
+                &ObjectOptions {
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed user bytes before expansion");
+
+        // Model the startup snapshot containing a missing disk handle, while
+        // the other three disks can commit and serve the new pool identity.
+        let missing = pools[3].disks.write().await[0].take().expect("healthy fixture disk");
+        let startup = tokio::spawn({
+            let pools = pools.clone();
+            async move {
+                let mut owner = PoolMetaWriteState::for_startup_with_pool_bootstrap_authorities(
+                    deployment_id,
+                    vec![PoolMetaBootstrapAuthority::None; 4],
+                    true,
+                );
+                let (_, replicas) = load_pool_meta_for_startup(pools.clone(), &mut owner)
+                    .await
+                    .expect("load the three-pool predecessor");
+                let committed = persist_pool_meta_for_startup_if_safe(
+                    &init_test_pool_meta_with_pools(4),
+                    pools,
+                    replicas,
+                    &mut owner,
+                    true,
+                    true,
+                )
+                .await
+                .expect("startup must recover the partial identity and commit expansion");
+                owner
+                    .ensure_write_safe("expanded startup")
+                    .expect("repaired startup remains writable");
+                committed
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let mut committed = 0;
+                for disk in &disks[3][1..] {
+                    if disk
+                        .read_version("", RUSTFS_META_BUCKET, POOL_META_IDENTITY_NAME, "", &ReadOptions::default())
+                        .await
+                        .is_ok()
+                    {
+                        committed += 1;
+                    }
+                }
+                if committed == 3 {
+                    break;
+                }
+                assert!(!startup.is_finished(), "startup must reach the partial-commit barrier");
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("three disks must physically commit the identity");
+        assert!(
+            disks[3][0]
+                .read_version("", RUSTFS_META_BUCKET, POOL_META_IDENTITY_NAME, "", &ReadOptions::default())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            crate::config::com::read_config_no_lock(pools[3].clone(), POOL_META_IDENTITY_NAME)
+                .await
+                .expect("quorum can already read the unhealed identity"),
+            identity
+        );
+        assert!(!startup.is_finished(), "quorum readback must not acknowledge unrepaired identity");
+        pools[3].disks.write().await[0] = Some(missing);
+        let committed = tokio::time::timeout(std::time::Duration::from_secs(30), startup)
+            .await
+            .expect("startup must finish after reconnect")
+            .expect("startup task must join");
+        assert_eq!(committed.pools.len(), 4);
+        let metadata = crate::config::com::read_config_no_lock(pools[0].clone(), POOL_META_NAME)
+            .await
+            .expect("read committed expanded topology");
+        for (pool, pool_disks) in pools.iter().zip(&disks) {
+            for (object, payload) in [(POOL_META_IDENTITY_NAME, &identity), (POOL_META_NAME, &metadata)] {
+                assert_eq!(
+                    crate::config::com::read_config_no_lock(pool.clone(), object)
+                        .await
+                        .expect("read every pool"),
+                    *payload
+                );
+                let reference = pool_disks[0]
+                    .read_version("", RUSTFS_META_BUCKET, object, "", &ReadOptions::default())
+                    .await
+                    .expect("metadata exists on the first disk");
+                for disk in &pool_disks[1..] {
+                    let actual = disk
+                        .read_version("", RUSTFS_META_BUCKET, object, "", &ReadOptions::default())
+                        .await
+                        .expect("metadata must exist on every physical disk");
+                    assert_eq!(actual.metadata.get("etag"), reference.metadata.get("etag"));
+                    assert_eq!(actual.mod_time, reference.mod_time);
+                }
+            }
+        }
+        let mut reader = pools[0]
+            .get_object_reader(bucket, "retained", None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("user data remains readable after expansion");
+        let mut actual = Vec::new();
+        reader.stream.read_to_end(&mut actual).await.expect("read all retained bytes");
+        assert_eq!(actual, original);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_four_pool_expansion_repairs_identity_before_completing_startup() {
+        let deployment_id = Uuid::new_v4();
+        let mut pools = (0..3)
+            .map(|_| Arc::new(StartupPoolMetaStorage::new(Vec::new())))
+            .collect::<Vec<_>>();
+        let mut founder = PoolMetaWriteState::for_startup(deployment_id, true);
+        establish_pool_meta_bootstrap_identity_if_proven(pools.clone(), &mut founder, true)
+            .await
+            .expect("seed the three-pool deployment identity");
+        let (_, replicas) = load_pool_meta_for_startup(pools.clone(), &mut founder)
+            .await
+            .expect("load the fresh deployment");
+        persist_pool_meta_for_startup_if_safe(
+            &init_test_pool_meta_with_pools(3),
+            pools.clone(),
+            replicas,
+            &mut founder,
+            true,
+            true,
+        )
+        .await
+        .expect("commit the three-pool deployment");
+        let identity = startup_object(&pools[0], POOL_META_IDENTITY_NAME).expect("initialized identity");
+        let new_pool = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        new_pool.identity_repair_failures.store(1, Ordering::SeqCst);
+        pools.push(new_pool.clone());
+        let mut owner = PoolMetaWriteState::for_startup_with_pool_bootstrap_authorities(
+            deployment_id,
+            vec![PoolMetaBootstrapAuthority::None; 4],
+            true,
+        );
+        let (_, replicas) = load_pool_meta_for_startup(pools.clone(), &mut owner)
+            .await
+            .expect("read the committed predecessor during expansion");
+        let committed = persist_pool_meta_for_startup_if_safe(
+            &init_test_pool_meta_with_pools(4),
+            pools.clone(),
+            replicas,
+            &mut owner,
+            true,
+            true,
+        )
+        .await
+        .expect("the owning startup must repair its partial identity write before publishing expansion");
+        assert_eq!(committed.pools.len(), 4);
+        assert_eq!(new_pool.identity_write_attempts.load(Ordering::SeqCst), 2);
+        assert!(!new_pool.identity_unconverged.load(Ordering::SeqCst));
+        owner
+            .ensure_write_safe("expanded startup")
+            .expect("verified repair must not latch the write gate");
+        for pool in &pools {
+            assert_eq!(startup_object(pool, POOL_META_IDENTITY_NAME).as_ref(), Some(&identity));
+            assert_eq!(startup_object(pool, POOL_META_NAME), startup_object(&pools[0], POOL_META_NAME));
+        }
     }
 
     #[tokio::test]
