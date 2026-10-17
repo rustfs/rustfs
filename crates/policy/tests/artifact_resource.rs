@@ -120,3 +120,33 @@ fn artifact_resource_single_object_does_not_authorize_attempt_seal() {
         "out/attempt-a/"
     ));
 }
+
+#[test]
+fn artifact_bucket_create_resource_requires_exact_bucket_authority() {
+    let action = "admin:CreatePluginArtifactBucket";
+    let scoped = json!({"Effect":"Allow","Action":action,"Resource":"arn:aws:s3:::artifacts"});
+    assert!(allowed(json!([scoped.clone()]), action, "artifacts", ""));
+    assert!(!allowed(json!([scoped.clone()]), action, "another", ""), "ARTIFACT_CREATE_RESOURCE");
+    assert!(!allowed(
+        json!([{"Effect":"Allow","Action":action,"Resource":"arn:aws:s3:::artifacts/*"}]),
+        action,
+        "artifacts",
+        ""
+    ));
+    assert!(!allowed(json!([{"Effect":"Allow","Action":action}]), action, "artifacts", ""));
+    assert!(!allowed(
+        json!([scoped.clone(), {"Effect":"Deny","Action":"admin:*"}]),
+        action,
+        "artifacts",
+        ""
+    ));
+    assert!(!allowed(
+        json!([scoped, {"Effect":"Deny","Action":action,"Resource":"arn:aws:s3:::artifacts"}]),
+        action,
+        "artifacts",
+        ""
+    ));
+    let not_resource = json!([{"Effect":"Allow","Action":action,"NotResource":"arn:aws:s3:::artifacts"}]);
+    assert!(!allowed(not_resource.clone(), action, "artifacts", ""));
+    assert!(allowed(not_resource, action, "another", ""));
+}

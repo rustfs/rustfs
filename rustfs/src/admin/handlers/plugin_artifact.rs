@@ -18,6 +18,35 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateRequest {
+    version: u32,
+    bucket: String,
+    base_prefix: String,
+}
+
+impl CreateRequest {
+    fn validate(&self) -> S3Result<()> {
+        if self.version != 1
+            || crate::storage::ecstore_bucket::utils::check_valid_bucket_name_strict(&self.bucket).is_err()
+            || !crate::admin::storage_api::contract::bucket::valid_artifact_base_prefix(&self.base_prefix)
+        {
+            return Err(s3_error!(InvalidRequest, "invalid artifact bucket creation request"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct CreateReceipt {
+    version: u32,
+    bucket: String,
+    base_prefix: String,
+    bucket_incarnation: Uuid,
+    versioning_enabled: bool,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AttemptIdentity {
@@ -125,6 +154,11 @@ fn unconfirmed() -> s3s::S3Error {
 pub fn register_plugin_artifact_routes(router: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     router.insert(
         Method::POST,
+        &format!("{ADMIN_PREFIX}/v3/plugin-artifacts/buckets"),
+        AdminOperation(&Create),
+    )?;
+    router.insert(
+        Method::POST,
         &format!("{ADMIN_PREFIX}/v3/plugin-artifacts/seal-attempt"),
         AdminOperation(&Seal),
     )?;
@@ -134,6 +168,40 @@ pub fn register_plugin_artifact_routes(router: &mut S3Router<AdminOperation>) ->
         AdminOperation(&Retire),
     )?;
     Ok(())
+}
+
+struct Create;
+#[async_trait::async_trait]
+impl Operation for Create {
+    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        require_builtin_authorization().await?;
+        let input: CreateRequest = request_body(&mut req).await?;
+        input.validate()?;
+        let store = request_store(&req)?;
+        owner_for_resource(
+            &req,
+            AdminAction::CreatePluginArtifactBucketAction,
+            AdminResourceScope::bucket(&input.bucket),
+        )
+        .await?;
+        let incarnation =
+            tokio::time::timeout(Duration::from_secs(30), store.make_artifact_bucket(&input.bucket, &input.base_prefix))
+                .await
+                .map_err(|_| unconfirmed())?
+                .map_err(|error| match error {
+                    crate::admin::storage_api::Error::BucketExists(_) => {
+                        s3_error!(BucketAlreadyExists, "artifact bucket already exists")
+                    }
+                    _ => unconfirmed(),
+                })?;
+        response(&CreateReceipt {
+            version: 1,
+            bucket: input.bucket,
+            base_prefix: input.base_prefix,
+            bucket_incarnation: incarnation,
+            versioning_enabled: true,
+        })
+    }
 }
 
 struct Seal;

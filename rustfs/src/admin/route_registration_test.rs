@@ -158,6 +158,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             "/v3/plugin-delegations/{id}/issue-attempt",
             "/v3/plugin-delegations/test-delegation/issue-attempt",
         ),
+        admin_route(Method::POST, "/v3/plugin-artifacts/buckets"),
         admin_route(Method::POST, "/v3/plugin-artifacts/seal-attempt"),
         admin_route(Method::POST, "/v3/plugin-artifacts/retire-version"),
         route(Method::GET, HEALTH_PREFIX),

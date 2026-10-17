@@ -15,13 +15,17 @@
 //! Persistent artifact attempt fences and exact-version repair retirement.
 //! These records do not authorize object deletion or establish GC eligibility.
 
+use super::versioning::VersioningApi as _;
 use super::{metadata::BucketMetadata, metadata_sys};
 use crate::config::com::{read_config_observation_no_lock, save_config_no_lock, with_config_object_write_lock};
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::object_api::{NamespaceLockFence, ObjectLockConfigSnapshot, ObjectOptions, WriteCommitGuard};
 use crate::set_disk::get_lock_acquire_timeout;
-use crate::storage_api_contracts::namespace::NamespaceLocking;
+use crate::storage_api_contracts::{
+    bucket::{BucketOperations as _, MakeBucketOptions},
+    namespace::NamespaceLocking,
+};
 use crate::store::{BucketIncarnationFenceGuard, ECStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -333,6 +337,44 @@ async fn require_local_put_seal_topology(store: &ECStore) -> Result<()> {
 }
 
 impl ECStore {
+    /// Create a dedicated versioned bucket and observe its current incarnation.
+    /// A successful receipt does not assert that this request created that generation.
+    pub async fn make_artifact_bucket(self: Arc<Self>, bucket: &str, base_prefix: &str) -> Result<Uuid> {
+        require_local_put_seal_topology(&self).await?;
+        if self.ctx.lock_manager().is_disabled() {
+            return Err(Error::other("artifact bucket creation requires namespace locking"));
+        }
+        self.make_bucket(
+            bucket,
+            &MakeBucketOptions {
+                artifact_base_prefix: Some(base_prefix.to_owned()),
+                versioning_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        // Creation has released its locks. Observe one current generation under
+        // lifecycle -> metadata transaction -> bucket namespace read locks.
+        let lifecycle = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
+        let metadata = metadata_sys::get_bucket_incarnation_metadata_in(&self.ctx, bucket).await?;
+        if metadata.name != bucket
+            || metadata.bucket_incarnation_id.is_nil()
+            || metadata.artifact_base_prefix.as_deref() != Some(base_prefix)
+            || !metadata.versioning_config.as_ref().is_some_and(|config| {
+                config.enabled()
+                    && !config.exclude_folders.unwrap_or(false)
+                    && config.excluded_prefixes.as_ref().is_none_or(Vec::is_empty)
+            })
+        {
+            return Err(Error::other("artifact bucket identity could not be confirmed"));
+        }
+        if lifecycle.is_lock_lost() {
+            return Err(Error::other("artifact bucket creation observation fence was lost"));
+        }
+        Ok(metadata.bucket_incarnation_id)
+    }
+
     pub(crate) fn validate_write_lifecycle_owner(&self, bucket: &str, incarnation: Uuid, opts: &ObjectOptions) -> Result<()> {
         let invalid = || Error::other("write requires an owned bucket lifecycle fence");
         if let Some(owner) = &opts.bucket_incarnation_fence {

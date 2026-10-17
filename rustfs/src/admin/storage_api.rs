@@ -1013,6 +1013,7 @@ pub(crate) mod contract {
     }
 
     pub(crate) mod bucket {
+        pub(crate) use super::super::storage_contracts::bucket::valid_artifact_base_prefix;
         pub(crate) use super::super::storage_contracts::{
             BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp,
         };

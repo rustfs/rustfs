@@ -183,14 +183,16 @@ deletion.
 
 ## Controller API
 
-The admin router exposes two SigV4-authenticated POST operations:
+The admin router exposes three SigV4-authenticated POST operations:
 
+- `/rustfs/admin/v3/plugin-artifacts/buckets`, requiring
+  `admin:CreatePluginArtifactBucket` on the bucket ARN.
 - `/rustfs/admin/v3/plugin-artifacts/seal-attempt`, requiring
   `admin:SealPluginArtifactAttempt` on the attempt namespace.
 - `/rustfs/admin/v3/plugin-artifacts/retire-version`, requiring
   `admin:RetirePluginArtifactVersion` on the exact logical object key.
 
-Both require a permanent, non-root original IAM user and an installed request
+All require a permanent, non-root original IAM user and an installed request
 server context. Temporary credentials and service accounts are rejected. The
 initial profile requires built-in IAM; external authorization plugins cannot
 establish its explicit local Resource contract. No separate signer map is used.
@@ -236,7 +238,7 @@ controller policy can therefore use these two statements:
 }
 ```
 
-An Allow with neither Resource nor NotResource does not grant either new action.
+An Allow with neither Resource nor NotResource does not grant these artifact actions.
 Explicit unscoped Deny, including `admin:*`, remains effective. Existing admin
 and table/KMS action semantics are unchanged. A single-object grant cannot seal
 its containing attempt. IAM scopes the logical key, not individual versions;
@@ -258,7 +260,50 @@ was rolled back: the cancellation-safe storage transaction may still complete.
 Retry the identical target to obtain confirmation; operators must investigate
 persistent failures. Current distributed-topology rejection is retained.
 
-This interface does not create dedicated buckets or change STS vending. Existing
-vending still requires input and output to share the delegation's bucket;
+Bucket creation does not change STS vending. Existing v1
+vending requires input and output to share the delegation's bucket;
 cross-bucket output credentials need a separate change. GC remains disabled
 until the remaining storage and backup/PITR requirements are satisfied.
+
+### Dedicated bucket creation
+
+POST `/rustfs/admin/v3/plugin-artifacts/buckets` with:
+
+```json
+{"version":1,"bucket":"plugin-artifacts","base_prefix":"outputs/"}
+```
+
+The controller needs an explicit `admin:CreatePluginArtifactBucket` Allow on
+`arn:aws:s3:::plugin-artifacts`. An object-only ARN such as
+`arn:aws:s3:::plugin-artifacts/*` does not authorize bucket creation. The same
+original-user, built-in IAM, request-instance and body/deadline checks apply.
+Unknown fields and invalid bucket names or base prefixes are rejected.
+
+The storage helper first requires local-only configured endpoints and enabled
+namespace locking. It invokes the existing creation transaction with an
+immutable artifact namespace and versioning enabled. It does not change the
+type of an existing bucket or turn an existing-bucket failure into success.
+`BucketExists` maps to `BucketAlreadyExists`; other unconfirmed storage outcomes
+retain the sanitized ServiceUnavailable response described above.
+
+After creation returns, the helper acquires the lifecycle read lock and reads
+one authoritative metadata snapshot. The namespace, non-nil incarnation and
+full versioning configuration must match; excluded folders or prefixes are not
+allowed. Success returns HTTP 200 with `version`, `bucket`, `base_prefix`,
+`bucket_incarnation`, and `versioning_enabled: true`.
+
+This receipt identifies the current managed generation observed under the
+lifecycle lock. It does not assert that this request created that generation:
+a legitimate deletion/recreation between creation and observation may produce
+a newer matching generation. Every later seal or retirement operation must
+still supply and validate the receipt's incarnation. A cancelled or timed-out
+creation may have changed durable state; retrying it can return an existing-bucket
+error and is not a substitute for confirming identity. No GC authority follows.
+
+The `artifact_bucket_create_*` handler tests reuse the four-disk S4 fixture and
+real IAM. They cover creation and persisted identity, existing-bucket failures
+without changing type, bucket-resource authorization, request-instance isolation,
+distributed-topology rejection before creation, and actual delete/recreate with
+old-receipt rejection. The recreation test performs two completed creations;
+it does not inject the narrower creation-to-observation race. Policy coverage is
+`artifact_bucket_create_resource_requires_exact_bucket_authority`.

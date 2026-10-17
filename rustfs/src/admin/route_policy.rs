@@ -17,6 +17,7 @@ use rustfs_security_governance::{
     validate_admin_route_specs,
 };
 
+const CREATE_PLUGIN_ARTIFACT_BUCKET: AdminActionRef = AdminActionRef::new("CreatePluginArtifactBucketAction");
 const SEAL_PLUGIN_ARTIFACT: AdminActionRef = AdminActionRef::new("SealPluginArtifactAttemptAction");
 const RETIRE_PLUGIN_ARTIFACT: AdminActionRef = AdminActionRef::new("RetirePluginArtifactVersionAction");
 const ALL_ADMIN: AdminActionRef = AdminActionRef::new("AllAdminActions");
@@ -646,6 +647,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/rustfs/admin/v4/runtime/capabilities",
         SERVER_INFO,
         RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-artifacts/buckets",
+        CREATE_PLUGIN_ARTIFACT_BUCKET,
+        RouteRiskLevel::High,
     ),
     admin(
         HttpMethod::Post,

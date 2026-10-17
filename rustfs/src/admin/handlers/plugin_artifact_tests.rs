@@ -7,7 +7,7 @@ use crate::admin::{
     runtime_sources::{AppContext, IamInterface, KmsInterface},
     storage_api::{
         ECStore, Error,
-        contract::bucket::{BucketOperations as _, MakeBucketOptions},
+        contract::bucket::{BucketOperations as _, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
         contract::object::ObjectIO as _,
         read_admin_config,
     },
@@ -62,15 +62,17 @@ struct Fixture {
     context: Arc<AppContext>,
     incarnation: Uuid,
     prefix: String,
+    instance: Arc<crate::storage::storage_api::InstanceContext>,
 }
 
 impl Fixture {
     async fn new(prefix: String) -> Self {
         let root = tempfile::tempdir().expect("handler storage root");
+        let instance = new_instance_ctx();
         let env = rustfs_test_utils::TestECStoreEnv::builder()
             .base_dir(root.path())
             .disk_count(4)
-            .instance_ctx(new_instance_ctx())
+            .instance_ctx(instance.clone())
             .build()
             .await;
         assert_eq!(env.disk_paths.len(), 4);
@@ -106,6 +108,7 @@ impl Fixture {
             context,
             incarnation,
             prefix,
+            instance,
         };
         fixture
             .user(
@@ -436,4 +439,198 @@ async fn artifact_handlers_bind_incarnation_and_request_instance() {
         .expect("first instance seal cannot affect second store");
     second.absent(&second.seal_path()).await;
     first.record(&first.seal_path()).await;
+}
+
+impl Fixture {
+    async fn grant_creation(&self, bucket: &str) {
+        let policy = Policy::parse_config(
+            &serde_json::to_vec(&json!({
+                "Version":"2012-10-17", "Statement":[{
+                    "Effect":"Allow", "Action":"admin:CreatePluginArtifactBucket",
+                    "Resource":format!("arn:aws:s3:::{bucket}")
+                }]
+            }))
+            .expect("creation policy JSON"),
+        )
+        .expect("creation bucket policy");
+        self.iam.set_policy(USER, policy).await.expect("replace controller policy");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn artifact_bucket_create_persists_current_identity_and_recreation() {
+    use crate::admin::storage_api::AdminVersioningConfigExt as _;
+    use crate::storage::storage_api::ecstore_bucket::metadata::load_bucket_metadata_parse;
+    let fixture = Fixture::new(prefix()).await;
+    let bucket = "new-handler-artifacts";
+    fixture.grant_creation(bucket).await;
+    let mut body = json!({"version":1,"bucket":bucket,"base_prefix":"outputs/"});
+    let first = receipt(Create.call(fixture.request(&body, Some(USER)), Params::new()).await).await;
+    let first_id = Uuid::parse_str(first["bucket_incarnation"].as_str().expect("receipt UUID")).expect("UUID");
+    let metadata = load_bucket_metadata_parse(fixture.store.clone(), bucket, true)
+        .await
+        .expect("read persistent metadata");
+    assert_eq!(first_id, metadata.bucket_incarnation_id, "ARTIFACT_CREATE_CURRENT_GENERATION");
+    assert!(!first_id.is_nil());
+    assert_eq!(metadata.artifact_base_prefix.as_deref(), Some("outputs/"));
+    let config = metadata.versioning_config.expect("persistent versioning");
+    assert!(config.enabled());
+    assert!(!config.exclude_folders.unwrap_or(false));
+    assert!(config.excluded_prefixes.as_ref().is_none_or(Vec::is_empty));
+    assert_eq!(first["versioning_enabled"], true);
+    assert_eq!(first["bucket"], bucket);
+    assert_eq!(first["base_prefix"], "outputs/");
+    assert!(first.get("gc_safe").is_none());
+    fixture
+        .store
+        .delete_bucket(bucket, &DeleteBucketOptions::default())
+        .await
+        .expect("delete first empty generation");
+    body["base_prefix"] = json!("next/");
+    let second = receipt(Create.call(fixture.request(&body, Some(USER)), Params::new()).await).await;
+    let second_id = Uuid::parse_str(second["bucket_incarnation"].as_str().expect("new UUID")).expect("UUID");
+    assert_ne!(first_id, second_id, "ARTIFACT_CREATE_CURRENT_GENERATION");
+    let current = load_bucket_metadata_parse(fixture.store.clone(), bucket, true)
+        .await
+        .expect("read current metadata");
+    assert_eq!(second_id, current.bucket_incarnation_id, "ARTIFACT_CREATE_CURRENT_GENERATION");
+    assert_eq!(current.artifact_base_prefix.as_deref(), Some("next/"));
+    assert!(
+        fixture
+            .store
+            .clone()
+            .seal_artifact_attempt_puts(bucket, first_id, &fixture.prefix)
+            .await
+            .is_err(),
+        "old receipt cannot seal replacement"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn artifact_bucket_create_existing_bucket_preserves_type() {
+    use crate::storage::storage_api::ecstore_bucket::metadata::load_bucket_metadata_parse;
+    let fixture = Fixture::new(prefix()).await;
+    let ordinary = "ordinary-handler-bucket";
+    fixture
+        .store
+        .make_bucket(ordinary, &MakeBucketOptions::default())
+        .await
+        .expect("ordinary bucket");
+    for bucket in [ordinary, BUCKET] {
+        fixture.grant_creation(bucket).await;
+        let before = load_bucket_metadata_parse(fixture.store.clone(), bucket, true)
+            .await
+            .expect("initial metadata");
+        for base_prefix in ["outputs/", "different/"] {
+            let body = json!({"version":1,"bucket":bucket,"base_prefix":base_prefix});
+            assert!(
+                Create.call(fixture.request(&body, Some(USER)), Params::new()).await.is_err(),
+                "ARTIFACT_CREATE_NO_RETYPE"
+            );
+            let after = load_bucket_metadata_parse(fixture.store.clone(), bucket, true)
+                .await
+                .expect("unchanged metadata");
+            assert_eq!(before.bucket_incarnation_id, after.bucket_incarnation_id);
+            assert_eq!(before.artifact_base_prefix, after.artifact_base_prefix);
+            assert_eq!(before.versioning_config_xml, after.versioning_config_xml);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn artifact_bucket_create_resource_and_instance_isolation() {
+    let first = Fixture::new(prefix()).await;
+    let second = Fixture::new(prefix()).await;
+    let bucket = "isolated-handler-bucket";
+    first.grant_creation(bucket).await;
+    second.grant_creation(bucket).await;
+    let wrong = json!({"version":1,"bucket":"forbidden-handler-bucket","base_prefix":"outputs/"});
+    assert_eq!(
+        Create
+            .call(first.request(&wrong, Some(USER)), Params::new())
+            .await
+            .expect_err("ARTIFACT_CREATE_RESOURCE")
+            .code(),
+        &s3s::S3ErrorCode::AccessDenied
+    );
+    assert!(
+        first
+            .store
+            .get_bucket_info("forbidden-handler-bucket", &BucketOptions::default())
+            .await
+            .is_err()
+    );
+    let body = json!({"version":1,"bucket":bucket,"base_prefix":"outputs/"});
+    let mut request = first.request(&body, Some(USER));
+    let slot = ServerContextSlot::new();
+    assert!(slot.install(second.context.clone()));
+    request.extensions.insert(slot);
+    let created = receipt(Create.call(request, Params::new()).await).await;
+    assert_eq!(
+        created["bucket_incarnation"],
+        json!(
+            second
+                .store
+                .bucket_incarnation_id_from_disk(bucket)
+                .await
+                .expect("second instance created")
+        )
+    );
+    assert!(
+        first.store.get_bucket_info(bucket, &BucketOptions::default()).await.is_err(),
+        "request never creates in another instance"
+    );
+    let mut unready = first.request(&body, Some(USER));
+    unready.extensions.insert(ServerContextSlot::new());
+    assert!(Create.call(unready, Params::new()).await.is_err());
+    assert!(first.store.get_bucket_info(bucket, &BucketOptions::default()).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn artifact_bucket_create_topology_and_input_fail_closed() {
+    let fixture = Fixture::new(prefix()).await;
+    let bucket = "unsupported-handler-bucket";
+    fixture.grant_creation(bucket).await;
+    let body = json!({"version":1,"bucket":bucket,"base_prefix":"outputs/"});
+    for (key, value) in [
+        ("base_prefix", json!("../")),
+        ("base_prefix", json!("")),
+        ("unknown", json!(true)),
+        ("version", json!(2)),
+    ] {
+        let mut bad = body.clone();
+        bad[key] = value;
+        assert_eq!(
+            Create
+                .call(fixture.request(&bad, Some(USER)), Params::new())
+                .await
+                .expect_err("invalid request")
+                .code(),
+            &s3s::S3ErrorCode::InvalidRequest
+        );
+    }
+    fixture
+        .instance
+        .update_erasure_type(crate::storage::storage_api::ecstore_layout::SetupType::DistErasure)
+        .await;
+    assert_eq!(
+        Create
+            .call(fixture.request(&body, Some(USER)), Params::new())
+            .await
+            .expect_err("remote capability unsupported")
+            .code(),
+        &s3s::S3ErrorCode::ServiceUnavailable
+    );
+    assert!(
+        fixture
+            .store
+            .get_bucket_info(bucket, &BucketOptions::default())
+            .await
+            .is_err(),
+        "ARTIFACT_CREATE_LOCAL_ONLY"
+    );
 }
