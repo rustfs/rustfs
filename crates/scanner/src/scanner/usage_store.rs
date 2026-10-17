@@ -577,7 +577,10 @@ where
             outcome = DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
             break 'updates;
         }
-        let observational = data_usage_info.usage_snapshot_converged == Some(false);
+        // Routing keys on the explicit producer mark, not on convergence: a
+        // `Complete` cycle with pending buckets is authoritative but not
+        // converged, while a vetoed cycle is observational.
+        let observational = data_usage_info.usage_snapshot_observational;
         let target_path = if observational {
             DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()
         } else {
@@ -1143,7 +1146,6 @@ where
             }
         }
         if !observational
-            && data_usage_info.usage_snapshot_converged == Some(true)
             && matches!(outcome, DataUsagePersistOutcome::Saved | DataUsagePersistOutcome::AlreadyDurable)
             && (outcome == DataUsagePersistOutcome::AlreadyDurable || write_confirmed)
             && let (Some(expected), Some(epoch)) = (ack_expectation.as_ref(), ack_epoch)

@@ -39,7 +39,7 @@ use s3s::dto::{
     BucketLifecycleConfiguration, ObjectLockConfiguration, ObjectLockEnabled, ReplicationConfiguration, VersioningConfiguration,
 };
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -409,14 +409,26 @@ fn resolve_remote_dirty_usage_scope(
     }
 }
 
+/// `expected_converged` is `None` for the authoritative object: a `Complete`
+/// cycle with pending buckets publishes there unconverged and is still a
+/// structural baseline, because the buckets it could not certify stay in the
+/// dirty map and are rescanned rather than reused. The convergence marker
+/// must still be present; a snapshot without one was not written by a
+/// certifying scanner.
 fn complete_scanner_cache_snapshot_plan_digest(
     snapshot: &DataUsageInfo,
     proof: ScannerCacheBaselineProof<'_>,
-    expected_converged: bool,
+    expected_converged: Option<bool>,
 ) -> Option<DataUsageScanPlanDigest> {
+    // The observational mark disqualifies only the authoritative slot: an
+    // observed candidate carries it by construction.
+    let marks_accepted = match expected_converged {
+        Some(expected) => snapshot.usage_snapshot_converged == Some(expected),
+        None => snapshot.usage_snapshot_converged.is_some() && !snapshot.usage_snapshot_observational,
+    };
     if !snapshot.is_complete_bucket_usage_snapshot()
         || snapshot.usage_snapshot_partial
-        || snapshot.usage_snapshot_converged != Some(expected_converged)
+        || !marks_accepted
         || snapshot.scanner_epoch != Some(proof.leader_epoch)
         || snapshot.usage_snapshot_set_states.len() != proof.expected_sources.len()
     {
@@ -455,7 +467,7 @@ fn complete_scanner_cache_snapshot_plan_digest(
 
 fn complete_scanner_cache_baseline_plan_digest(proof: ScannerCacheBaselineProof<'_>) -> Option<DataUsageScanPlanDigest> {
     let authoritative = serde_json::from_slice::<DataUsageInfo>(proof.authoritative_data?).ok()?;
-    if let Some(validated_digest) = complete_scanner_cache_snapshot_plan_digest(&authoritative, proof, true) {
+    if let Some(validated_digest) = complete_scanner_cache_snapshot_plan_digest(&authoritative, proof, None) {
         return Some(validated_digest);
     }
 
@@ -464,7 +476,7 @@ fn complete_scanner_cache_baseline_plan_digest(proof: ScannerCacheBaselineProof<
     // remains observational: this proof grants bucket-scope reuse only and
     // never changes authoritative usage publication or dirty acknowledgement.
     let authoritative_has_identity = (crate::scanner::data_usage_info_has_persisted_baseline_identity(&authoritative)
-        && authoritative.usage_snapshot_converged != Some(false))
+        && !authoritative.usage_snapshot_observational)
         || crate::scanner::data_usage_info_is_bootstrap_pending(&authoritative);
     if !authoritative_has_identity {
         return None;
@@ -474,7 +486,7 @@ fn complete_scanner_cache_baseline_plan_digest(proof: ScannerCacheBaselineProof<
         return None;
     }
 
-    complete_scanner_cache_snapshot_plan_digest(&observed, proof, false)
+    complete_scanner_cache_snapshot_plan_digest(&observed, proof, Some(false))
 }
 
 fn scanner_segment_reuse_baseline_producer_evidence(
@@ -492,7 +504,9 @@ fn scanner_segment_reuse_baseline_producer_evidence(
     let Ok(authoritative) = serde_json::from_slice::<DataUsageInfo>(authoritative_data) else {
         return (evidence, false);
     };
-    if complete_scanner_cache_snapshot_plan_digest(&authoritative, baseline_proof, true).is_none() {
+    // Segment (prefix) reuse keeps requiring a converged baseline: its
+    // producer evidence is proven against a dirty snapshot that was current.
+    if complete_scanner_cache_snapshot_plan_digest(&authoritative, baseline_proof, Some(true)).is_none() {
         return (evidence, false);
     }
     let Some(cold_zero_walk_oracle) =
@@ -1014,9 +1028,13 @@ fn classify_nsscanner_cycle(
         return ScannerCycleStatus::Incomplete;
     }
 
-    match (activity_status, dirty_usage_status) {
-        (ScannerCycleActivityStatus::Unchanged, DirtyUsageSnapshotStatus::Current) => ScannerCycleStatus::Complete,
-        _ => ScannerCycleStatus::Superseded,
+    // Termination is snapshot-at-the-beginning: a structurally complete walk
+    // that the guardrail did not veto is `Complete`. Buckets whose dirty
+    // generation moved during the walk stay pending for the next cycle and
+    // are reported in the publication; they no longer supersede the cycle.
+    match activity_status {
+        ScannerCycleActivityStatus::Unchanged => ScannerCycleStatus::Complete,
+        ScannerCycleActivityStatus::Changed | ScannerCycleActivityStatus::Unverified => ScannerCycleStatus::Superseded,
     }
 }
 
@@ -1028,24 +1046,52 @@ fn should_publish_observational_snapshot(status: ScannerCycleStatus) -> bool {
     matches!(status, ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable))
 }
 
+/// Pending buckets of a cycle, sorted so the publication is deterministic.
+pub(crate) type ScannerCyclePendingBuckets = BTreeSet<String>;
+
+/// Stamp the certification outcome of a cycle on its usage snapshot. A
+/// `Complete` cycle publishes an authoritative snapshot that is converged
+/// only when no bucket is pending; any other publishable status is an
+/// observational snapshot routed to the observed object. The marks are part
+/// of the bytes the publication expectation digests, so every writer applies
+/// exactly this function.
+fn apply_scanner_cycle_publication_marks(
+    data_usage_info: &mut DataUsageInfo,
+    status: ScannerCycleStatus,
+    pending_buckets: &ScannerCyclePendingBuckets,
+) {
+    let complete = status == ScannerCycleStatus::Complete;
+    data_usage_info.usage_snapshot_observational = !complete;
+    data_usage_info.usage_snapshot_converged = Some(complete && pending_buckets.is_empty());
+    if complete {
+        data_usage_info.usage_snapshot_pending_buckets = pending_buckets.iter().cloned().collect();
+        data_usage_info.usage_snapshot_pending_bucket_count = u64::try_from(pending_buckets.len()).unwrap_or(u64::MAX);
+    } else {
+        data_usage_info.usage_snapshot_pending_buckets.clear();
+        data_usage_info.usage_snapshot_pending_bucket_count = 0;
+    }
+}
+
 fn prepare_usage_snapshot_for_publication(
     status: ScannerCycleStatus,
+    pending_buckets: &ScannerCyclePendingBuckets,
     mut data_usage_info: DataUsageInfo,
 ) -> Option<DataUsageInfo> {
     if !should_publish_usage_snapshot(status) {
         return None;
     }
 
-    data_usage_info.usage_snapshot_converged = Some(status == ScannerCycleStatus::Complete);
+    apply_scanner_cycle_publication_marks(&mut data_usage_info, status, pending_buckets);
     Some(data_usage_info)
 }
 
 async fn publish_usage_snapshot(
     updates: &mpsc::Sender<DataUsageInfo>,
     status: ScannerCycleStatus,
+    pending_buckets: &ScannerCyclePendingBuckets,
     data_usage_info: DataUsageInfo,
 ) -> Result<bool> {
-    let Some(data_usage_info) = prepare_usage_snapshot_for_publication(status, data_usage_info) else {
+    let Some(data_usage_info) = prepare_usage_snapshot_for_publication(status, pending_buckets, data_usage_info) else {
         return Ok(false);
     };
     send_data_usage_update(updates, data_usage_info).await?;
@@ -1059,10 +1105,17 @@ async fn publish_observational_snapshot(
     data_usage_info.usage_snapshot_complete = false;
     data_usage_info.usage_snapshot_partial = true;
     data_usage_info.usage_snapshot_converged = Some(false);
+    data_usage_info.usage_snapshot_observational = true;
+    data_usage_info.usage_snapshot_pending_buckets.clear();
+    data_usage_info.usage_snapshot_pending_bucket_count = 0;
     send_data_usage_update(updates, data_usage_info).await?;
     Ok(true)
 }
 
+/// Post-walk verdict of the cluster activity guardrail. `Changed` is an
+/// attributed veto (or, for peers, the phase-2 dirty-usage fallback); local
+/// namespace and dirty-usage generation movement is not a veto and is
+/// certified per bucket instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScannerCycleActivityStatus {
     Unchanged,
@@ -1083,10 +1136,47 @@ where
     let publication_blocked = store.scanner_data_usage_publication_blocked().await;
     match crate::scanner::probe_scanner_activity(store, distributed).await {
         Ok(after) => {
-            let status = if !publication_blocked && after == *before {
-                ScannerCycleActivityStatus::Unchanged
+            let veto = if publication_blocked {
+                Some(crate::scanner::ScannerActivityGuardrailVeto::new(
+                    crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE,
+                    "publication_blocked",
+                ))
             } else {
+                crate::scanner::scanner_activity_guardrail_veto(before, &after)
+            };
+            let status = if let Some(veto) = veto {
+                warn!(
+                    target: "rustfs::scanner::io",
+                    event = EVENT_SCANNER_SET_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_IO,
+                    state = "cycle_guardrail_veto",
+                    stage = "post_scan_probe",
+                    field = veto.field,
+                    host = %veto.host,
+                    "Scanner cycle publication vetoed by the cluster activity guardrail"
+                );
+                global_metrics().record_scanner_guardrail_veto(veto.reason());
                 ScannerCycleActivityStatus::Changed
+            } else if let Some(moved) = crate::scanner::scanner_peer_dirty_usage_moved(before, &after) {
+                // Per-bucket certification covers the local dirty map only;
+                // a peer whose dirty state moved keeps today's whole-cycle
+                // outcome until scoped acknowledgements can name its buckets.
+                tracing::info!(
+                    target: "rustfs::scanner::io",
+                    event = EVENT_SCANNER_SET_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_IO,
+                    state = "cycle_peer_dirty_usage_moved",
+                    stage = "post_scan_probe",
+                    field = moved.field,
+                    host = %moved.host,
+                    "Scanner cycle superseded because a peer's dirty usage moved during the walk"
+                );
+                global_metrics().record_scanner_guardrail_veto(moved.reason());
+                ScannerCycleActivityStatus::Changed
+            } else {
+                ScannerCycleActivityStatus::Unchanged
             };
             (status, crate::scanner::scanner_activity_publication_lease_targets(&after))
         }
@@ -1476,6 +1566,8 @@ pub(crate) struct ScannerCycleResult {
     pub(crate) status: ScannerCycleStatus,
     publication_epoch: Option<u64>,
     activity_digest: Option<[u8; 32]>,
+    activity_baseline: Option<Arc<crate::scanner::ScannerActivitySnapshot>>,
+    pending_dirty_usage_buckets: usize,
     usage_update_emitted: bool,
     partial_bucket_progress: bool,
     dirty_usage_clear: Option<DirtyUsageBuckets>,
@@ -1495,6 +1587,8 @@ impl ScannerCycleResult {
             status,
             publication_epoch: None,
             activity_digest: None,
+            activity_baseline: None,
+            pending_dirty_usage_buckets: 0,
             usage_update_emitted: false,
             partial_bucket_progress: false,
             dirty_usage_clear,
@@ -1525,8 +1619,32 @@ impl ScannerCycleResult {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn activity_digest(&self) -> Option<[u8; 32]> {
         self.activity_digest
+    }
+
+    fn with_activity_baseline(mut self, baseline: Arc<crate::scanner::ScannerActivitySnapshot>) -> Self {
+        self.publication_expectation = None;
+        self.activity_baseline = Some(baseline);
+        self
+    }
+
+    /// The pre-walk activity probe the post-lease guardrail recheck compares
+    /// against.
+    pub(crate) fn activity_baseline(&self) -> Option<&crate::scanner::ScannerActivitySnapshot> {
+        self.activity_baseline.as_deref()
+    }
+
+    fn with_pending_dirty_usage_buckets(mut self, pending: usize) -> Self {
+        self.publication_expectation = None;
+        self.pending_dirty_usage_buckets = pending;
+        self
+    }
+
+    /// Buckets a `Complete` cycle left pending for the next cycle.
+    pub(crate) fn pending_dirty_usage_buckets(&self) -> usize {
+        self.pending_dirty_usage_buckets
     }
 
     pub(crate) fn with_usage_update_emitted(mut self, emitted: bool) -> Self {

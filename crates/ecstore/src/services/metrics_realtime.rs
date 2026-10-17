@@ -231,6 +231,9 @@ fn to_madmin_scanner_metrics(metrics: rustfs_scanner_metrics::metrics::ScannerMe
             deferred_total: metrics.usage_freshness.deferred_total,
             last_deferred_unix_secs: metrics.usage_freshness.last_deferred_unix_secs,
             last_deferred_reason: metrics.usage_freshness.last_deferred_reason,
+            guardrail_veto_total: metrics.usage_freshness.guardrail_veto_total,
+            last_guardrail_veto_unix_secs: metrics.usage_freshness.last_guardrail_veto_unix_secs,
+            last_guardrail_veto_reason: metrics.usage_freshness.last_guardrail_veto_reason,
         },
         maintenance_control: MadminScannerMaintenanceControlSnapshot {
             primary_control: metrics.maintenance_control.primary_control,
@@ -886,10 +889,16 @@ mod test {
                 deferred_total: 15,
                 last_deferred_unix_secs: 16,
                 last_deferred_reason: "data_movement".to_string(),
+                guardrail_veto_total: 4,
+                last_guardrail_veto_unix_secs: 17,
+                last_guardrail_veto_reason: "publication_blocked@<local>".to_string(),
             },
             ..Default::default()
         });
 
+        assert_eq!(scanner.usage_freshness.guardrail_veto_total, 4);
+        assert_eq!(scanner.usage_freshness.last_guardrail_veto_unix_secs, 17);
+        assert_eq!(scanner.usage_freshness.last_guardrail_veto_reason, "publication_blocked@<local>");
         assert_eq!(scanner.usage_freshness.dirty_pending_buckets, 3);
         assert_eq!(scanner.usage_freshness.last_dirty_mark_unix_secs, 10);
         assert_eq!(scanner.usage_freshness.last_dirty_clear_unix_secs, 11);
