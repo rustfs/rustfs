@@ -6121,7 +6121,7 @@ mod tests {
         save_manual_transition_scope_admission_if_current, save_manual_transition_task_if_absent,
         save_manual_transition_worker_result_if_absent,
     };
-    use crate::bucket::lifecycle::replication_sink::{ReplicationStatusType, VersionPurgeStatusType};
+    use crate::bucket::lifecycle::replication_sink::{self, ReplicationStatusType, VersionPurgeStatusType};
     use crate::bucket::lifecycle::runtime_boundary as runtime_sources;
     use crate::bucket::lifecycle::tier_free_version_recovery::{
         FreeVersionRecoveryStats, RecoveryWalkTestAction, RecoveryWorkBudget, list_tier_free_versions,
@@ -12913,7 +12913,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let _ = crate::bucket::replication::ReplicationLifecycleBridge::take_scheduled_deletes_for_test();
+        let _ = replication_sink::take_scheduled_deletes_for_test();
         let failed = crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
             &ecstore,
             &bucket,
@@ -12924,7 +12924,7 @@ mod tests {
         .await;
         assert_eq!(failed, 0, "a missing version is not a batch failure");
         assert!(
-            crate::bucket::replication::ReplicationLifecycleBridge::take_scheduled_deletes_for_test().is_empty(),
+            replication_sink::take_scheduled_deletes_for_test().is_empty(),
             "a bucket without replication must not schedule deletes for removed or missing versions"
         );
 
@@ -12957,7 +12957,6 @@ mod tests {
     #[serial]
     async fn lifecycle_noncurrent_batch_expiry_schedules_only_matching_delete_rules() {
         use crate::bucket::metadata::BUCKET_REPLICATION_CONFIG;
-        use crate::bucket::replication::ReplicationLifecycleBridge;
 
         let (_disk_paths, ecstore) = setup_test_env().await;
         for (prefix, delete_status, should_replicate) in [
@@ -13007,7 +13006,7 @@ mod tests {
                 .bucket_incarnation_id_from_disk(&bucket)
                 .await
                 .expect("bucket incarnation should be available");
-            let _ = ReplicationLifecycleBridge::take_scheduled_deletes_for_test();
+            let _ = replication_sink::take_scheduled_deletes_for_test();
             let failed = crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
                 &ecstore,
                 &bucket,
@@ -13021,7 +13020,7 @@ mod tests {
             )
             .await;
             assert_eq!(failed, 0, "batch expiry should commit");
-            let scheduled = ReplicationLifecycleBridge::take_scheduled_deletes_for_test();
+            let scheduled = replication_sink::take_scheduled_deletes_for_test();
             assert_eq!(scheduled.len(), usize::from(should_replicate), "prefix={prefix}, delete={delete_status}");
             if should_replicate {
                 assert_eq!(scheduled[0].version_id, Some(versions[0]));
