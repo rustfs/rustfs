@@ -114,14 +114,24 @@ impl FileMeta {
 
     /// Count shared data directories
     pub fn shared_data_dir_count(&self, version_id: Option<Uuid>, data_dir: Option<Uuid>) -> usize {
+        self.shared_data_dir_count_with_inline_data(version_id, data_dir, None)
+    }
+
+    pub(super) fn shared_data_dir_count_with_inline_data(
+        &self,
+        version_id: Option<Uuid>,
+        data_dir: Option<Uuid>,
+        has_inline_data: Option<bool>,
+    ) -> usize {
         let vid = version_id.unwrap_or_default();
         let Some(data_dir) = data_dir else {
             return 0;
         };
 
-        if self.data.entries().unwrap_or_default() > 0
-            && self.find_inline_data_for_version(version_id).unwrap_or_default().is_some()
-        {
+        if has_inline_data.unwrap_or_else(|| {
+            self.data.entries().unwrap_or_default() > 0
+                && self.find_inline_data_for_version(version_id).unwrap_or_default().is_some()
+        }) {
             return 0;
         }
 
@@ -296,5 +306,192 @@ mod tests {
 
         let got = meta.find_unshared_data_dir_for_version(Some(target_version));
         assert_eq!(got, None);
+    }
+
+    fn sequential_delete(meta: &mut FileMeta, requests: &[FileInfo]) -> Result<Vec<Option<Uuid>>> {
+        let mut dirs = Vec::new();
+        for request in requests {
+            match meta.delete_version(request) {
+                Ok(dir) => {
+                    if let Some(dir) = dir {
+                        meta.data.remove(vec![request.version_id.unwrap_or_default(), dir])?;
+                    }
+                    dirs.push(dir);
+                }
+                Err(Error::FileNotFound | Error::FileVersionNotFound) if !request.deleted => dirs.push(None),
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(dirs)
+    }
+
+    fn assert_batch_matches_sequential(original: &FileMeta, requests: &[FileInfo]) {
+        let mut expected = original.clone();
+        let expected_dirs = sequential_delete(&mut expected, requests);
+        let mut actual = original.clone();
+        assert_eq!(actual.delete_versions(requests), expected_dirs);
+        let decode = |meta: &FileMeta| {
+            meta.versions
+                .iter()
+                .map(|version| version.parse_version_meta().expect("decode retained version"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(decode(&actual), decode(&expected));
+        assert_eq!(actual.data, expected.data, "retained inline bytes and ordering must be identical");
+    }
+
+    #[test]
+    fn delete_versions_matches_sequential_mixed_version_subsets() {
+        let mut original = FileMeta::new();
+        let mut requests = Vec::new();
+        for id in 0_u128..8 {
+            let version = Uuid::from_u128(id);
+            // Versions 2 and 3 share physical data. Version 4's data-dir key
+            // aliases version 5's inline key, so later decisions must see its removal.
+            let dir = Uuid::from_u128(match id {
+                2 | 3 | 5 => 100,
+                4 => 5,
+                _ => 200 + id,
+            });
+            let mut fi = make_plain_file_info(version, dir);
+            fi.mod_time =
+                Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_700_000_000 + i64::try_from(id).expect("small id")));
+            if !matches!(id, 2 | 3) {
+                fi.data = Some(Bytes::from(vec![u8::try_from(id).expect("small id"); 97]));
+                fi.set_inline_data();
+            }
+            original.add_version(fi).expect("seed mixed version chain");
+            requests.push(FileInfo {
+                version_id: Some(version),
+                ..Default::default()
+            });
+        }
+        for mask in 0_u32..256 {
+            let selected: Vec<_> = requests
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, fi)| fi.clone())
+                .collect();
+            assert_batch_matches_sequential(&original, &selected);
+            let reversed: Vec<_> = selected.into_iter().rev().collect();
+            assert_batch_matches_sequential(&original, &reversed);
+        }
+        let mut duplicate_and_missing = requests.clone();
+        duplicate_and_missing.extend(requests.iter().rev().cloned());
+        duplicate_and_missing.push(FileInfo {
+            version_id: Some(Uuid::from_u128(999)),
+            ..Default::default()
+        });
+        assert_batch_matches_sequential(&original, &duplicate_and_missing);
+    }
+
+    #[test]
+    fn delete_versions_preserves_pending_purge_and_stops_at_invalid_request() {
+        let mut original = FileMeta::new();
+        let mut fi = make_plain_file_info(Uuid::from_u128(1), Uuid::from_u128(101));
+        fi.data = Some(Bytes::from_static(b"retained until replication completes"));
+        fi.set_inline_data();
+        original.add_version(fi).expect("seed inline version");
+        let pending = FileInfo {
+            version_id: Some(Uuid::from_u128(1)),
+            mark_deleted: true,
+            replication_state_internal: Some(ReplicationState {
+                version_purge_status_internal: Some("target=PENDING;".into()),
+                purge_targets: version_purge_statuses_map("target=PENDING;"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_batch_matches_sequential(&original, std::slice::from_ref(&pending));
+        let completed = FileInfo {
+            version_id: pending.version_id,
+            replication_state_internal: Some(ReplicationState {
+                version_purge_status_internal: Some("target=COMPLETE;".into()),
+                purge_targets: version_purge_statuses_map("target=COMPLETE;"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_batch_matches_sequential(&original, &[pending, completed]);
+        let valid = FileInfo {
+            version_id: Some(Uuid::from_u128(1)),
+            ..Default::default()
+        };
+        let invalid = FileInfo {
+            parts: vec![
+                ObjectPartInfo {
+                    number: 1,
+                    ..Default::default()
+                };
+                2
+            ],
+            ..Default::default()
+        };
+        assert!(invalid.validate_for_delete_operation().is_err());
+        assert_batch_matches_sequential(&original, &[valid, invalid]);
+    }
+
+    #[test]
+    fn delete_versions_rejects_corrupt_inline_before_mutating_versions() {
+        let mut meta = FileMeta::new();
+        meta.add_version(make_plain_file_info(Uuid::from_u128(1), Uuid::from_u128(101)))
+            .expect("seed version");
+        for bytes in [
+            vec![1, 0x81, 0xa1, b'x', 0xc4, 255],
+            vec![2, 0x80],
+            vec![0, 0x80],
+            vec![1, 0x81, 0xa1, 0xff, 0xc4, 0],
+            vec![1, 0x81, 0xdb, 1, 0, 0, 1],
+            vec![1, 0x81, 0xa1, b'x', 0xc6, 0xff, 0xff, 0xff, 0xff],
+        ] {
+            meta.data.update(&bytes);
+            let before = meta.clone();
+            assert!(
+                meta.delete_versions(&[])
+                    .expect("empty batch does not inspect metadata")
+                    .is_empty()
+            );
+            assert!(
+                meta.delete_versions(&[FileInfo {
+                    version_id: Some(Uuid::from_u128(1)),
+                    ..Default::default()
+                }])
+                .is_err()
+            );
+            assert_eq!(meta, before);
+        }
+    }
+
+    #[test]
+    fn delete_versions_preserves_both_null_inline_key_encodings() {
+        for legacy in [false, true] {
+            let mut original = FileMeta::new();
+            let mut fi = make_plain_null_version_file_info(Uuid::from_u128(100));
+            fi.data = Some(Bytes::from_static(b"null version body"));
+            fi.set_inline_data();
+            original.add_version(fi).expect("seed null version");
+            if legacy {
+                let value = original
+                    .data
+                    .find(NULL_VERSION_ID)
+                    .expect("find null body")
+                    .expect("null body");
+                original.data.remove_key(NULL_VERSION_ID).expect("remove modern null key");
+                original
+                    .data
+                    .replace(&Uuid::nil().to_string(), value)
+                    .expect("write legacy null key");
+            }
+            for version_id in [None, Some(Uuid::nil())] {
+                assert_batch_matches_sequential(
+                    &original,
+                    &[FileInfo {
+                        version_id,
+                        ..Default::default()
+                    }],
+                );
+            }
+        }
     }
 }

@@ -17,6 +17,7 @@ use rustfs_config::{
     DEFAULT_RUSTFS_UNSUPPORTED_FS_POLICY, ENV_RUSTFS_UNSUPPORTED_FS_POLICY, RUSTFS_UNSUPPORTED_FS_POLICY_FAIL,
     RUSTFS_UNSUPPORTED_FS_POLICY_WARN,
 };
+use rustfs_utils::os::DiskInfo;
 use std::collections::BTreeSet;
 use std::io::{Error, Result};
 use tracing::warn;
@@ -60,6 +61,17 @@ fn is_unsupported_fs_type(fs_type: &str) -> bool {
     ) || normalized.starts_with("fuse.")
 }
 
+/// Describes why the filesystem behind `info` is outside the supported
+/// boundary, or returns `None` when it is supported.
+fn unsupported_fs_label(info: &DiskInfo) -> Option<String> {
+    if info.remote {
+        // Windows names the server's filesystem for SMB shares, which would
+        // otherwise pass as a local NTFS volume.
+        return Some(format!("{} on network share", info.fstype));
+    }
+    is_unsupported_fs_type(&info.fstype).then(|| info.fstype.clone())
+}
+
 fn collect_local_paths(endpoint_pools: &EndpointServerPools) -> Vec<String> {
     let mut local_paths = BTreeSet::new();
     for pool in endpoint_pools.as_ref() {
@@ -92,8 +104,8 @@ pub(crate) fn enforce_unsupported_fs_policy(endpoint_pools: &EndpointServerPools
             }
         };
 
-        if is_unsupported_fs_type(&info.fstype) {
-            unsupported.push((path, info.fstype));
+        if let Some(label) = unsupported_fs_label(&info) {
+            unsupported.push((path, label));
         }
     }
 
@@ -103,7 +115,7 @@ pub(crate) fn enforce_unsupported_fs_policy(endpoint_pools: &EndpointServerPools
 
     let detail = unsupported
         .iter()
-        .map(|(path, fs_type)| format!("{path} ({fs_type})"))
+        .map(|(path, label)| format!("{path} ({label})"))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -148,6 +160,29 @@ mod tests {
         assert!(!is_unsupported_fs_type("XFS"));
         assert!(!is_unsupported_fs_type("EXT4"));
         assert!(!is_unsupported_fs_type("BTRFS"));
+    }
+
+    #[test]
+    fn remote_volume_is_unsupported_whatever_its_fstype() {
+        // An SMB share on Windows reports the server's filesystem name.
+        let share = DiskInfo {
+            fstype: "NTFS".to_string(),
+            remote: true,
+            ..Default::default()
+        };
+        assert_eq!(unsupported_fs_label(&share).as_deref(), Some("NTFS on network share"));
+
+        let local = DiskInfo {
+            fstype: "NTFS".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(unsupported_fs_label(&local), None);
+
+        let cifs = DiskInfo {
+            fstype: "CIFS".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(unsupported_fs_label(&cifs).as_deref(), Some("CIFS"));
     }
 
     #[test]

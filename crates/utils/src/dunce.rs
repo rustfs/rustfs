@@ -162,6 +162,60 @@ fn extended_length_path_win(path: &Path) -> io::Result<PathBuf> {
     Ok(PathBuf::from(OsString::from_wide(&extended)))
 }
 
+/// Like [`simplified`], but without the `MAX_PATH` limit, and also turning
+/// `\\?\UNC\server\share\...` into `\\server\share\...`.
+///
+/// Use it for a root that callers extend by joining `/`-separated relative
+/// paths as strings: inside a verbatim path `/` is not a separator, so every
+/// such join fails with `ERROR_INVALID_NAME`. `std::fs` re-adds the
+/// extended-length prefix to long paths, and code handing paths to Win32
+/// directly goes through [`extended_length_path`]. A path with a component
+/// that Win32 would rewrite (reserved names, trailing dots or spaces, ...) or
+/// that is not valid UTF-8 is returned unchanged, as are volume GUID and
+/// device paths.
+///
+/// On non-Windows this is a no-op.
+#[must_use]
+pub fn non_verbatim(path: &Path) -> Cow<'_, Path> {
+    #[cfg(not(windows))]
+    {
+        Cow::Borrowed(path)
+    }
+    #[cfg(windows)]
+    {
+        try_non_verbatim(path).map_or(Cow::Borrowed(path), Cow::Owned)
+    }
+}
+
+#[cfg(windows)]
+fn try_non_verbatim(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    let unc = match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(..) => false,
+            Prefix::VerbatimUNC(..) => true,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    for component in components {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(file_name) if is_valid_filename(file_name) && !is_reserved(file_name) => {}
+            _ => return None,
+        }
+    }
+
+    let s = path.to_str()?;
+    Some(if unc {
+        // `\\?\UNC\server\share` (8-character prefix) becomes `\\server\share`.
+        PathBuf::from(format!(r"\\{}", s.get(8..)?))
+    } else {
+        // `\\?\C:\x` (4-character prefix) becomes `C:\x`.
+        PathBuf::from(s.get(4..)?)
+    })
+}
+
 /// Returns `true` if the path is relative or starts with a disk prefix (like "C:").
 ///
 /// This checks if the path is in a "simplified" format. On Windows, this means it
@@ -547,6 +601,42 @@ mod tests {
         let extended = extended_length_path(Path::new(&long)).unwrap();
         assert_eq!(&*extended, Path::new(&format!(r"\\?\{long}")));
         assert_eq!(simplified(&extended), &*extended, "a long path must stay verbatim");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn non_verbatim_strips_verbatim_prefixes_without_the_max_path_limit() {
+        let long = format!(r"C:\data\{}\root", "a".repeat(250));
+        assert_eq!(&*non_verbatim(Path::new(&format!(r"\\?\{long}"))), Path::new(&long));
+        assert_eq!(
+            &*non_verbatim(Path::new(r"\\?\UNC\localhost\C$\rfs\smb")),
+            Path::new(r"\\localhost\C$\rfs\smb")
+        );
+        let long_unc = format!(r"\\?\UNC\server\share\{}", "b".repeat(250));
+        assert_eq!(&*non_verbatim(Path::new(&long_unc)), Path::new(&format!(r"\\{}", &long_unc[8..])));
+
+        for unchanged in [
+            r"C:\data\root",
+            r"\\server\share\root",
+            r"\\?\C:\data\CON",
+            r"\\?\C:\data\trailing.",
+            r"\\?\C:\data\..\root",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\root",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\root",
+            r"\\.\C:\data",
+        ] {
+            assert!(
+                matches!(non_verbatim(Path::new(unchanged)), Cow::Borrowed(p) if p == Path::new(unchanged)),
+                "{unchanged} must be returned unchanged"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn non_verbatim_is_a_noop_off_windows() {
+        let path = Path::new("/data/root");
+        assert!(matches!(non_verbatim(path), Cow::Borrowed(p) if p == path));
     }
 
     #[test]

@@ -1310,26 +1310,14 @@ impl LocalDisk {
         for version in &plan.versions {
             original_versions.push(generation(version.into_fileinfo(volume, object, true)?)?);
         }
-        let mut data_dirs = Vec::with_capacity(requests.len());
-        for request in requests {
-            if original.is_none() {
+        let data_dirs = if original.is_none() {
+            for request in requests {
                 plan.add_version(request.clone())?;
-                continue;
             }
-            match plan.delete_version(request) {
-                Ok(Some(dir)) => {
-                    let _ = plan.data.remove(vec![request.version_id.unwrap_or_default(), dir]);
-                    data_dirs.push(dir);
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    let err: DiskError = err.into();
-                    if request.deleted || (err != DiskError::FileVersionNotFound && err != DiskError::FileNotFound) {
-                        return Err(err);
-                    }
-                }
-            }
-        }
+            Vec::new()
+        } else {
+            plan.delete_versions(requests)?.into_iter().flatten().collect::<Vec<_>>()
+        };
         if data_dirs.iter().any(|dir| *dir == transaction || dir.is_nil()) {
             return Err(DiskError::FileCorrupt);
         }
@@ -2682,6 +2670,120 @@ mod tests {
                 .unwrap()
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_batch_inline_matches_sequential_and_survives_settlement() {
+        for commit in [false, true] {
+            let (_temp, disk, _, _) = fixture().await;
+            let mut original = FileMeta::new();
+            let mut requests = Vec::new();
+            for id in 1_u128..=64 {
+                let mut info = test_file_info(
+                    "object",
+                    Uuid::from_u128(id),
+                    Some(Uuid::from_u128(1000 + id)),
+                    Some(Bytes::from(vec![u8::try_from(id).expect("small id"); 9 * 1024])),
+                );
+                info.set_inline_data();
+                original.add_version(info).expect("seed inline version");
+                if id <= 48 {
+                    requests.push(FileInfo {
+                        name: "object".into(),
+                        version_id: Some(Uuid::from_u128(id)),
+                        ..Default::default()
+                    });
+                }
+            }
+            let original_bytes = original.marshal_msg().expect("encode original");
+            let meta_path = disk.io_get_object_path("recovery", "object/xl.meta").expect("metadata path");
+            fs::write(&meta_path, &original_bytes).await.expect("persist version chain");
+            let mut expected = original;
+            for request in &requests {
+                if let Some(dir) = expected.delete_version(request).expect("sequential delete") {
+                    expected
+                        .data
+                        .remove(vec![request.version_id.expect("explicit version"), dir])
+                        .expect("sequential inline removal");
+                }
+            }
+            let transaction = Uuid::new_v4();
+            let errors = disk
+                .delete_versions_recoverable(
+                    "recovery",
+                    vec![FileInfoVersions {
+                        name: "object".into(),
+                        volume: "recovery".into(),
+                        versions: requests,
+                        ..Default::default()
+                    }],
+                    DeleteOptions {
+                        old_data_dir: Some(transaction),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert_eq!(errors, vec![None]);
+            let applied = disk.read_all("recovery", "object/xl.meta").await.expect("applied metadata");
+            assert_eq!(applied.as_ref(), expected.marshal_msg().expect("expected metadata"));
+            let target = disk
+                .read_all("recovery", &format!("object/{transaction}/{TARGET}"))
+                .await
+                .expect("prepared target");
+            assert_eq!(applied, target, "publication must use the exact prepared target");
+            let current = FileMeta::load(&applied).expect("load survivors");
+            assert_eq!(current.versions.len(), 16);
+            for id in 49_u128..=64 {
+                let fi = current
+                    .into_fileinfo("recovery", "object", &Uuid::from_u128(id).to_string(), true, false, true)
+                    .expect("surviving version");
+                assert_eq!(
+                    fi.data.expect("surviving inline body").as_ref(),
+                    vec![u8::try_from(id).expect("small id"); 9 * 1024]
+                );
+            }
+            let observed = disk
+                .inspect_delete_transaction("recovery", "object", transaction)
+                .await
+                .expect("inspect prepared batch");
+            if commit {
+                let committed = disk
+                    .settle_delete_transaction(
+                        "recovery",
+                        "object",
+                        transaction,
+                        observed.fingerprint,
+                        DeleteRecoveryAction::PublishCommit,
+                    )
+                    .await
+                    .expect("publish commit");
+                let finished = disk
+                    .settle_delete_transaction(
+                        "recovery",
+                        "object",
+                        transaction,
+                        committed.fingerprint,
+                        DeleteRecoveryAction::FinishCommit,
+                    )
+                    .await
+                    .expect("finish cleanup");
+                assert_eq!(finished.state, DeleteRecoveryState::CommitFinished);
+                assert_eq!(fs::read(&meta_path).await.expect("committed survivors"), applied.as_ref());
+            } else {
+                let restored = disk
+                    .settle_delete_transaction(
+                        "recovery",
+                        "object",
+                        transaction,
+                        observed.fingerprint,
+                        DeleteRecoveryAction::Rollback,
+                    )
+                    .await
+                    .expect("rollback batch");
+                assert_eq!(restored.state, DeleteRecoveryState::Absent);
+                assert_eq!(fs::read(&meta_path).await.expect("restored metadata"), original_bytes);
+            }
+        }
     }
 
     #[tokio::test]

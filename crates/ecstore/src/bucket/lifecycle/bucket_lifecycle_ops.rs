@@ -6134,7 +6134,7 @@ mod tests {
         save_manual_transition_scope_admission_if_current, save_manual_transition_task_if_absent,
         save_manual_transition_worker_result_if_absent,
     };
-    use crate::bucket::lifecycle::replication_sink::{ReplicationStatusType, VersionPurgeStatusType};
+    use crate::bucket::lifecycle::replication_sink::{self, ReplicationStatusType, VersionPurgeStatusType};
     use crate::bucket::lifecycle::runtime_boundary as runtime_sources;
     use crate::bucket::lifecycle::tier_free_version_recovery::{
         FreeVersionRecoveryStats, RecoveryWalkTestAction, RecoveryWorkBudget, list_tier_free_versions,
@@ -12927,6 +12927,7 @@ mod tests {
                 ..Default::default()
             },
         ];
+        let _ = replication_sink::take_scheduled_deletes_for_test();
         let failed = crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
             &ecstore,
             &bucket,
@@ -12940,6 +12941,10 @@ mod tests {
         )
         .await;
         assert_eq!(failed, 0, "a missing version is not a batch failure");
+        assert!(
+            replication_sink::take_scheduled_deletes_for_test().is_empty(),
+            "a bucket without replication must not schedule deletes for removed or missing versions"
+        );
 
         let events = test_recorder::recorded_for_bucket(&bucket);
         let announced = events.iter().map(|event| event.version_id).collect::<Vec<_>>();
@@ -12964,6 +12969,97 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].version_id, Some(current_version_id));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_noncurrent_batch_expiry_schedules_only_matching_delete_rules() {
+        use crate::bucket::metadata::BUCKET_REPLICATION_CONFIG;
+
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        for (prefix, delete_status, should_replicate) in [
+            ("other/", "Enabled", false),
+            ("logs/", "Disabled", false),
+            ("logs/", "Enabled", true),
+        ] {
+            let bucket = format!("lifecycle-repl-admission-{}", Uuid::new_v4().simple());
+            let object = "logs/object";
+            create_test_bucket(&ecstore, &bucket).await;
+            metadata_sys::update_in(
+                &ecstore.ctx,
+                &bucket,
+                BUCKET_VERSIONING_CONFIG,
+                b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+            )
+            .await
+            .expect("versioning should be enabled");
+
+            let mut versions = Vec::new();
+            for body in [b"noncurrent".as_slice(), b"current".as_slice()] {
+                let mut reader = PutObjReader::from_vec(body.to_vec());
+                let version = ecstore
+                    .put_object(
+                        &bucket,
+                        object,
+                        &mut reader,
+                        &ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("source version should be created");
+                versions.push(version.version_id.expect("versioned PUT must have an identity"));
+            }
+            let config = format!(
+                "<ReplicationConfiguration><Role></Role><Rule><ID>delete-rule</ID><Status>Enabled</Status>\
+                 <Prefix>{prefix}</Prefix><Destination><Bucket>arn:test</Bucket></Destination>\
+                 <DeleteReplication><Status>{delete_status}</Status></DeleteReplication>\
+                 </Rule></ReplicationConfiguration>"
+            );
+            metadata_sys::update_in(&ecstore.ctx, &bucket, BUCKET_REPLICATION_CONFIG, config.into_bytes())
+                .await
+                .expect("replication configuration should be persisted");
+            let expiry_policy = install_test_expiry_policy(&ecstore, &bucket).await;
+            let incarnation = ecstore
+                .bucket_incarnation_id_from_disk(&bucket)
+                .await
+                .expect("bucket incarnation should be available");
+            let _ = replication_sink::take_scheduled_deletes_for_test();
+            let failed = crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
+                &ecstore,
+                &bucket,
+                &[ObjectToDelete {
+                    object_name: object.to_string(),
+                    version_id: Some(versions[0]),
+                    ..Default::default()
+                }],
+                lifecycle::Event {
+                    action: IlmAction::DeleteVersionAction,
+                    expiry_policy: Some(expiry_policy.into()),
+                    ..Default::default()
+                },
+                incarnation,
+            )
+            .await;
+            assert_eq!(failed, 0, "batch expiry should commit");
+            let scheduled = replication_sink::take_scheduled_deletes_for_test();
+            assert_eq!(scheduled.len(), usize::from(should_replicate), "prefix={prefix}, delete={delete_status}");
+            if should_replicate {
+                assert_eq!(scheduled[0].version_id, Some(versions[0]));
+                let state = scheduled[0]
+                    .replication_state
+                    .as_ref()
+                    .expect("admitted purge state must survive");
+                assert_eq!(state.version_purge_status_internal.as_deref(), Some("arn:test=PENDING;"));
+                assert!(state.purge_targets.contains_key("arn:test"));
+            }
+            let current = ecstore
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect("batch expiry must retain the current version");
+            assert_eq!(current.version_id, Some(versions[1]));
+        }
     }
 
     #[tokio::test]
