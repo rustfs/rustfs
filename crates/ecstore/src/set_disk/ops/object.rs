@@ -10840,7 +10840,7 @@ pub(in crate::set_disk::ops) mod hermetic_set_disks_support {
     use tempfile::TempDir;
     use tokio::sync::RwLock;
 
-    pub(in crate::set_disk::ops) struct HermeticSetFixture {
+    pub(crate) struct HermeticSetFixture {
         dirs: Vec<TempDir>,
         _store: Arc<crate::store::ECStore>,
         shutdown: tokio_util::sync::CancellationToken,
