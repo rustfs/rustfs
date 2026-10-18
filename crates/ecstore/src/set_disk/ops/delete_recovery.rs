@@ -960,6 +960,9 @@ mod tests {
 
     async fn fixture(bucket: &str) -> (Vec<tempfile::TempDir>, Arc<ECStore>, Vec<DiskStore>) {
         let (dirs, store) = isolated_store_over_temp_disks().await;
+        // Manual recovery assertions need sole ownership of the seeded journals.
+        store.background_cancel_token().expect("fixture background token").cancel();
+        tokio::task::yield_now().await;
         init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         store
             .make_bucket(bucket, &MakeBucketOptions::default())
