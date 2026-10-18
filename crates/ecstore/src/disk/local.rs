@@ -368,11 +368,28 @@ async fn restore_delete_rollback_with_namespace_owner(
     publication_root: &os::PublicationRoot,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Result<()> {
-    remove_version_delete_markers(object_dir, rollback_dir, namespace_owner.clone()).await?;
+    restore_delete_rollback_with_prepared_publication(object_dir, xl_path, rollback_dir, publication_root, namespace_owner, None)
+        .await
+}
+
+async fn restore_delete_rollback_with_prepared_publication(
+    object_dir: &Path,
+    xl_path: &Path,
+    rollback_dir: Uuid,
+    publication_root: &os::PublicationRoot,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+    prepared: Option<Arc<os::NamespaceMutationLease>>,
+) -> Result<()> {
+    // Freeze every required mutation while holding metadata serialization. READ
+    // is already held, so all additional namespaces must be acquired by try.
+    let marker_paths = version_delete_marker_paths(object_dir, rollback_dir).await?;
+    if prepared.is_none() {
+        remove_version_delete_marker_paths(&marker_paths, namespace_owner.clone(), None).await?;
+    }
     let rollback_path = object_dir.join(rollback_dir.to_string());
     let mut staged_paths = Vec::new();
     let mut remove_new_metadata = false;
-    match fs::read_dir(&rollback_path).await {
+    let rollback_exists = match fs::read_dir(&rollback_path).await {
         Ok(mut entries) => {
             while let Some(entry) = entries.next_entry().await.map_err(to_file_error)? {
                 let name = entry.file_name();
@@ -382,45 +399,85 @@ async fn restore_delete_rollback_with_namespace_owner(
                     staged_paths.push((entry.path(), object_dir.join(name)));
                 }
             }
+            true
         }
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => false,
         Err(err) => return Err(to_file_error(err).into()),
+    };
+    let backup_path = rollback_path.join(STORAGE_FORMAT_FILE_BACKUP);
+    let prepared = if let Some(publication) = prepared {
+        let mut paths = marker_paths.clone();
+        if rollback_exists {
+            paths.push(backup_path.clone());
+            for (src, dst) in &staged_paths {
+                paths.extend([src.clone(), dst.clone()]);
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        let mut leases = Vec::with_capacity(paths.len());
+        for path in paths {
+            if path != xl_path {
+                leases.push(os::try_acquire_namespace_mutation_lease_with_owner(&path, publication.clone())?);
+            }
+        }
+        // Every worker owns the entire set, even after its async waiter ends.
+        // Attach siblings to one extra lease, never back to their publication
+        // owner, which would create an Arc cycle.
+        let lease = if let Some(lease) = leases.pop() {
+            lease.attach_external_guard(Arc::new(leases));
+            lease
+        } else {
+            publication
+        };
+        remove_version_delete_marker_paths(&marker_paths, namespace_owner.clone(), Some(lease.clone())).await?;
+        Some(lease)
+    } else {
+        None
+    };
+    if !rollback_exists {
+        return Ok(());
     }
 
     let had_staged_paths = !staged_paths.is_empty();
     for (src, dst) in staged_paths {
-        os::rename_all_with_owner(&src, &dst, object_dir, publication_root, namespace_owner.clone()).await?;
+        if let Some(publication) = &prepared {
+            os::rename_all_with_lease(&src, &dst, object_dir, publication_root, publication.clone()).await?;
+        } else {
+            os::rename_all_with_owner(&src, &dst, object_dir, publication_root, namespace_owner.clone()).await?;
+        }
     }
 
-    let backup_path = rollback_path.join(STORAGE_FORMAT_FILE_BACKUP);
-    match os::rename_all_with_owner(&backup_path, xl_path, object_dir, publication_root, namespace_owner.clone()).await {
+    let restore = if let Some(publication) = &prepared {
+        os::rename_all_with_lease(&backup_path, xl_path, object_dir, publication_root, publication.clone()).await
+    } else {
+        os::rename_all_with_owner(&backup_path, xl_path, object_dir, publication_root, namespace_owner.clone()).await
+    };
+    match restore {
         Ok(()) => {
-            let _ = os::remove_dir_with_owner(&rollback_path, namespace_owner.clone()).await;
+            cleanup_delete_rollback(&rollback_path, false, namespace_owner, prepared).await;
             Ok(())
         }
         // A missing backup only means "remove the newly-created delete marker"
         // when the marker proves there was no old metadata to restore.
         Err(DiskError::FileNotFound) if remove_new_metadata => {
-            match os::remove_file_with_owner(xl_path, namespace_owner.clone()).await {
-                Ok(()) => {
-                    let _ = os::remove_file_with_owner(rollback_path.join(DELETE_MARKER_ROLLBACK_FILE), namespace_owner.clone())
-                        .await;
-                    let _ = os::remove_dir_with_owner(&rollback_path, namespace_owner.clone()).await;
-                    Ok(())
-                }
-                Err(err) if err.kind() == ErrorKind::NotFound => {
-                    let _ = os::remove_file_with_owner(rollback_path.join(DELETE_MARKER_ROLLBACK_FILE), namespace_owner.clone())
-                        .await;
-                    let _ = os::remove_dir_with_owner(&rollback_path, namespace_owner.clone()).await;
-                    Ok(())
-                }
-                Err(err) => Err(to_file_error(err).into()),
+            let remove = if let Some(publication) = &prepared {
+                os::remove_file_with_lease(xl_path.to_path_buf(), publication.clone()).await
+            } else {
+                os::remove_file_with_owner(xl_path, namespace_owner.clone()).await
+            };
+            match remove {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(to_file_error(err).into()),
             }
+            cleanup_delete_rollback(&rollback_path, true, namespace_owner, prepared).await;
+            Ok(())
         }
         Err(DiskError::FileNotFound) if had_staged_paths => Err(DiskError::FileNotFound),
         Err(DiskError::FileNotFound) => match fs::metadata(xl_path).await {
             Ok(_) => {
-                let _ = os::remove_dir_with_owner(&rollback_path, namespace_owner.clone()).await;
+                cleanup_delete_rollback(&rollback_path, false, namespace_owner, prepared).await;
                 Ok(())
             }
             Err(err) if err.kind() == ErrorKind::NotFound => Err(DiskError::FileNotFound),
@@ -430,18 +487,42 @@ async fn restore_delete_rollback_with_namespace_owner(
     }
 }
 
-async fn remove_version_delete_markers(
-    object_dir: &Path,
-    rollback_dir: Uuid,
+async fn cleanup_delete_rollback(
+    rollback_path: &Path,
+    remove_marker: bool,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
-) -> Result<()> {
+    prepared: Option<Arc<os::NamespaceMutationLease>>,
+) {
+    if let Some(publication) = prepared {
+        // These removals have always been best effort. Contention leaves residue
+        // for a later retry rather than failing a completed restoration.
+        if remove_marker {
+            let marker = rollback_path.join(DELETE_MARKER_ROLLBACK_FILE);
+            if let Ok(lease) = os::try_acquire_namespace_mutation_lease_with_owner(&marker, publication.clone()) {
+                let _ = os::remove_file_with_lease(marker, lease).await;
+            }
+        }
+        if let Ok(lease) = os::try_acquire_namespace_mutation_lease_with_owner(rollback_path, publication) {
+            let path = rollback_path.to_path_buf();
+            let _ = os::run_blocking_namespace_operation(lease, move || std::fs::remove_dir(path)).await;
+        }
+    } else {
+        if remove_marker {
+            let _ = os::remove_file_with_owner(rollback_path.join(DELETE_MARKER_ROLLBACK_FILE), namespace_owner.clone()).await;
+        }
+        let _ = os::remove_dir_with_owner(rollback_path, namespace_owner).await;
+    }
+}
+
+async fn version_delete_marker_paths(object_dir: &Path, rollback_dir: Uuid) -> Result<Vec<PathBuf>> {
     let reserved_name = format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{rollback_dir}");
     let committed_name = format!("{DELETE_DATA_DIR_MARKER_PREFIX}{rollback_dir}");
     let mut entries = match fs::read_dir(object_dir).await {
         Ok(entries) => entries,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(to_file_error(err).into()),
     };
+    let mut paths = Vec::new();
     while let Some(entry) = entries.next_entry().await.map_err(to_file_error)? {
         if !entry.file_type().await.map_err(to_file_error)?.is_dir()
             || !entry.file_name().to_str().is_some_and(|name| Uuid::parse_str(name).is_ok())
@@ -449,11 +530,27 @@ async fn remove_version_delete_markers(
             continue;
         }
         for marker_name in [&reserved_name, &committed_name] {
-            match os::remove_file_with_owner(entry.path().join(marker_name), namespace_owner.clone()).await {
-                Ok(()) => {}
-                Err(err) if err.kind() == ErrorKind::NotFound => {}
-                Err(err) => return Err(to_file_error(err).into()),
-            }
+            paths.push(entry.path().join(marker_name));
+        }
+    }
+    Ok(paths)
+}
+
+async fn remove_version_delete_marker_paths(
+    paths: &[PathBuf],
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+    prepared: Option<Arc<os::NamespaceMutationLease>>,
+) -> Result<()> {
+    for path in paths {
+        let remove = if let Some(publication) = &prepared {
+            os::remove_file_with_lease(path.clone(), publication.clone()).await
+        } else {
+            os::remove_file_with_owner(path, namespace_owner.clone()).await
+        };
+        match remove {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(to_file_error(err).into()),
         }
     }
     Ok(())
@@ -6829,7 +6926,9 @@ impl LocalDisk {
         };
         // Reserve fresh trash destinations before changing metadata or data. A
         // held volume READ must never queue for another namespace behind delete.
-        let prepared_trash = if let Some(publication) = &prepared_publication {
+        let prepared_trash = if let Some(publication) = &prepared_publication
+            && !opts.undo_delete
+        {
             let data = self.prepare_undo_trash(publication.clone())?;
             let metadata = self.prepare_undo_trash(publication.clone())?;
             Some((data, metadata))
@@ -7256,12 +7355,13 @@ impl LocalDisk {
         let old_data_dir = opts.old_data_dir.ok_or(DiskError::FileCorrupt)?;
         let xl_path = path_join(&[file_path, Path::new(STORAGE_FORMAT_FILE)]);
         if opts.undo_delete {
-            restore_delete_rollback_with_namespace_owner(
+            restore_delete_rollback_with_prepared_publication(
                 file_path,
                 &xl_path,
                 old_data_dir,
                 &self.publication_root,
                 namespace_owner.clone(),
+                prepared_publication,
             )
             .await?;
         } else {
@@ -15921,9 +16021,371 @@ mod test {
         );
     }
 
+    async fn stage_legacy_delete_undo(disk: &LocalDisk, volume: &str, object: &str, case: &str) -> (FileInfo, Uuid, Vec<u8>) {
+        let object_dir = disk.io_get_object_path(volume, object).expect("object IO path");
+        let rollback = Uuid::new_v4();
+        let fi = if case == "marker" {
+            FileInfo {
+                name: object.to_owned(),
+                version_id: Some(Uuid::new_v4()),
+                deleted: true,
+                mark_deleted: true,
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            }
+        } else {
+            test_file_info(object, Uuid::new_v4(), Some(Uuid::new_v4()), None)
+        };
+        if case == "marker" {
+            assert!(fi.is_canonical_delete_marker(), "fixture must exercise marker-only rollback");
+        }
+        let original = if let Some(data_dir) = fi.data_dir {
+            let data = object_dir.join(data_dir.to_string());
+            fs::create_dir_all(&data).await.expect("old data directory");
+            fs::write(data.join("part.1"), b"old-complete-shard")
+                .await
+                .expect("old shard bytes");
+            let original = test_meta(fi.clone());
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), &original)
+                .await
+                .expect("old metadata");
+            original
+        } else {
+            Vec::new()
+        };
+        disk.delete_version(
+            volume,
+            object,
+            fi.clone(),
+            case == "marker",
+            DeleteOptions {
+                old_data_dir: Some(rollback),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("real staged single-object delete");
+        if case == "staged" {
+            let data = object_dir.join(fi.data_dir.expect("staged data UUID").to_string());
+            for prefix in [RESERVED_DELETE_DATA_DIR_MARKER_PREFIX, DELETE_DATA_DIR_MARKER_PREFIX] {
+                let marker = data.join(format!("{prefix}{rollback}"));
+                match fs::remove_file(marker).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => panic!("remove reservation before legacy data staging: {error}"),
+                }
+            }
+            // Older delete transactions moved the data rather than reserving it.
+            fs::rename(
+                &data,
+                object_dir
+                    .join(rollback.to_string())
+                    .join(data.file_name().expect("data name")),
+            )
+            .await
+            .expect("stage the real data for legacy rollback");
+        }
+        (fi, rollback, original)
+    }
+
+    #[tokio::test]
+    async fn legacy_undo_delete_preserves_variants_and_reuses_admission() {
+        use crate::disk::disk_store::LocalDiskWrapper;
+        for case in ["reserved", "staged", "marker", "no-backup", "staged-no-backup", "no-intent"] {
+            let dir = tempfile::tempdir().expect("delete rollback fixture root");
+            let endpoint = Endpoint::try_from(dir.path().to_string_lossy().as_ref()).expect("local endpoint");
+            let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+            let volume = "legacy-delete-undo";
+            let object = "prefix/object";
+            for volume in [volume, RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET] {
+                ensure_test_volume(&disk, volume).await;
+            }
+            let fixture = match case {
+                "no-backup" => "reserved",
+                "staged-no-backup" => "staged",
+                "no-intent" => "marker",
+                _ => case,
+            };
+            let (fi, rollback, original) = stage_legacy_delete_undo(&disk, volume, object, fixture).await;
+            let object_dir = disk.io_get_object_path(volume, object).expect("object path");
+            let metadata = object_dir.join(STORAGE_FORMAT_FILE);
+            let rollback_path = object_dir.join(rollback.to_string());
+            if matches!(case, "no-backup" | "staged-no-backup") {
+                fs::remove_file(rollback_path.join(STORAGE_FORMAT_FILE_BACKUP))
+                    .await
+                    .expect("missing backup fixture");
+            } else if case == "no-intent" {
+                fs::remove_file(rollback_path.join(DELETE_MARKER_ROLLBACK_FILE))
+                    .await
+                    .expect("missing marker intent");
+                fs::remove_file(&metadata).await.expect("missing old metadata");
+            }
+            let opts = DeleteOptions {
+                undo_write: true,
+                undo_delete: true,
+                old_data_dir: Some(rollback),
+                ..Default::default()
+            };
+            let wrapper = LocalDiskWrapper::new(disk.clone(), false);
+            let token = wrapper
+                .begin_legacy_metadata_write_with_namespace_owner(volume, object, None)
+                .await
+                .expect("prepare delete undo");
+            let mut deletion = Box::pin(disk.delete_volume(volume, true));
+            assert!(matches!(futures::poll!(deletion.as_mut()), Poll::Pending));
+            let result = timeout(Duration::from_secs(5), token.undo_delete(fi.clone(), opts.clone()))
+                .await
+                .expect("delete undo reuses admission behind a queued writer");
+            if matches!(case, "no-backup" | "staged-no-backup" | "no-intent") {
+                assert_eq!(result.expect_err("missing restore evidence retains its error"), DiskError::FileNotFound);
+                assert!(!metadata.exists());
+            } else {
+                result.expect("restore staged delete");
+                if case == "marker" {
+                    assert!(!metadata.exists(), "remove the newly-created delete marker");
+                } else {
+                    assert_eq!(fs::read(&metadata).await.expect("restored metadata"), original);
+                    let restored = disk
+                        .read_version("", volume, object, &fi.version_id.expect("version").to_string(), &ReadOptions::default())
+                        .await
+                        .expect("old complete version is readable");
+                    assert_eq!(restored.version_id, fi.version_id);
+                    assert_eq!(restored.data_dir, fi.data_dir);
+                }
+                assert!(!rollback_path.exists(), "uncontended residue is pruned");
+            }
+            if let Some(data) = fi.data_dir {
+                let data_path = object_dir.join(data.to_string());
+                assert_eq!(
+                    fs::read(data_path.join("part.1")).await.expect("old shard restored"),
+                    b"old-complete-shard"
+                );
+                for prefix in [RESERVED_DELETE_DATA_DIR_MARKER_PREFIX, DELETE_DATA_DIR_MARKER_PREFIX] {
+                    assert!(!data_path.join(format!("{prefix}{rollback}")).exists());
+                }
+            }
+            assert_eq!(wrapper.metrics_snapshot().api_calls.get("delete_version"), Some(&1));
+            drop(deletion);
+            if matches!(case, "reserved" | "staged" | "marker") {
+                wrapper
+                    .begin_legacy_metadata_write_with_namespace_owner(volume, object, None)
+                    .await
+                    .expect("repeat admission")
+                    .undo_delete(fi.clone(), opts.clone())
+                    .await
+                    .expect("consumed rollback is an idempotent no-op");
+                if case != "marker" {
+                    assert_eq!(fs::read(&metadata).await.expect("repeated undo metadata"), original);
+                    fs::create_dir_all(&rollback_path)
+                        .await
+                        .expect("empty consumed rollback directory");
+                    wrapper
+                        .begin_legacy_metadata_write_with_namespace_owner(volume, object, None)
+                        .await
+                        .expect("stale-dir admission")
+                        .undo_delete(fi.clone(), opts.clone())
+                        .await
+                        .expect("empty consumed rollback preserves live metadata");
+                }
+            }
+            for invalid in [
+                DeleteOptions {
+                    undo_write: false,
+                    ..opts.clone()
+                },
+                DeleteOptions {
+                    undo_delete: false,
+                    ..opts.clone()
+                },
+                DeleteOptions {
+                    old_data_dir: None,
+                    ..opts.clone()
+                },
+            ] {
+                let token = wrapper
+                    .begin_legacy_metadata_write_with_namespace_owner(volume, object, None)
+                    .await
+                    .expect("invalid admission");
+                assert_eq!(
+                    token
+                        .undo_delete(fi.clone(), invalid)
+                        .await
+                        .expect_err("reject other mutation shapes"),
+                    DiskError::MethodNotAllowed
+                );
+            }
+            disk.delete_volume(volume, true).await.expect("delete old volume");
+            assert_eq!(
+                wrapper
+                    .begin_legacy_metadata_write_with_namespace_owner(volume, object, None)
+                    .await
+                    .expect_err("missing volume"),
+                DiskError::VolumeNotFound
+            );
+            assert!(!dir.path().join(volume).exists());
+        }
+        assert_legacy_version_leading_slash_delete_semantics(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_undo_delete_namespace_contention_is_atomic() {
+        use crate::disk::disk_store::LocalDiskWrapper;
+        for case in [
+            "reserved-marker",
+            "committed-marker",
+            "restore-target",
+            "restore-source",
+            "backup",
+            "optional-directory",
+            "optional-marker",
+        ] {
+            let dir = tempfile::tempdir().expect("contention fixture root");
+            let endpoint = Endpoint::try_from(dir.path().to_string_lossy().as_ref()).expect("local endpoint");
+            let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+            let volume = "delete-undo-contention";
+            let object = "prefix/object";
+            for volume in [volume, RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET] {
+                ensure_test_volume(&disk, volume).await;
+            }
+            let fixture = match case {
+                "restore-target" | "restore-source" => "staged",
+                "optional-marker" => "marker",
+                _ => "reserved",
+            };
+            let (fi, rollback, original) = stage_legacy_delete_undo(&disk, volume, object, fixture).await;
+            let object_dir = disk.io_get_object_path(volume, object).expect("object path");
+            let metadata = object_dir.join(STORAGE_FORMAT_FILE);
+            let rollback_path = object_dir.join(rollback.to_string());
+            let backup = rollback_path.join(STORAGE_FORMAT_FILE_BACKUP);
+            let intent = rollback_path.join(DELETE_MARKER_ROLLBACK_FILE);
+            let data_path = object_dir.join(fi.data_dir.unwrap_or_default().to_string());
+            let staged_path = rollback_path.join(fi.data_dir.unwrap_or_default().to_string());
+            let reserved = data_path.join(format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{rollback}"));
+            let committed = data_path.join(format!("{DELETE_DATA_DIR_MARKER_PREFIX}{rollback}"));
+            if fixture == "reserved" {
+                fs::write(&reserved, b"reserved-intent")
+                    .await
+                    .expect("reservation marker bytes");
+                fs::write(&committed, b"committed-intent")
+                    .await
+                    .expect("committed marker bytes");
+            }
+            let held = match case {
+                "reserved-marker" => &reserved,
+                "committed-marker" => &committed,
+                "restore-target" => &data_path,
+                "restore-source" => &staged_path,
+                "backup" => &backup,
+                "optional-directory" => &rollback_path,
+                "optional-marker" => &intent,
+                _ => unreachable!(),
+            };
+            let paths = [
+                metadata.clone(),
+                backup.clone(),
+                intent.clone(),
+                reserved.clone(),
+                committed.clone(),
+                data_path.join("part.1"),
+                staged_path.join("part.1"),
+            ];
+            let before: Vec<_> = paths.iter().map(|path| std::fs::read(path).ok()).collect();
+            let wrapper = LocalDiskWrapper::new(disk.clone(), false);
+            let token = wrapper
+                .begin_legacy_metadata_write_with_namespace_owner(volume, object, None)
+                .await
+                .expect("P owns prepared READ");
+            let mut deletion = Box::pin(disk.delete_volume(volume, true));
+            assert!(
+                matches!(futures::poll!(deletion.as_mut()), Poll::Pending),
+                "W queues actual volume deletion"
+            );
+            let mut competing = Box::pin(os::acquire_rename_data_mutation_lease(&disk.root, volume, held));
+            assert!(
+                matches!(futures::poll!(competing.as_mut()), Poll::Pending),
+                "Q holds exact namespace behind W"
+            );
+            let opts = DeleteOptions {
+                undo_write: true,
+                undo_delete: true,
+                old_data_dir: Some(rollback),
+                ..Default::default()
+            };
+            let result = timeout(Duration::from_secs(5), token.undo_delete(fi.clone(), opts.clone())).await;
+            if case.starts_with("optional-") {
+                result
+                    .expect("optional cleanup cannot block restoration")
+                    .expect("optional contention still succeeds");
+                if fixture == "marker" {
+                    assert!(!metadata.exists());
+                    assert!(intent.exists(), "busy optional marker stays for retry");
+                } else {
+                    assert_eq!(fs::read(&metadata).await.expect("restored metadata"), original);
+                    assert_eq!(fs::read(data_path.join("part.1")).await.expect("restored shard"), b"old-complete-shard");
+                    assert!(rollback_path.exists(), "busy empty directory stays for retry");
+                }
+            } else {
+                // Check bytes before examining Result so a skipped required lock
+                // is caught as a write-before-admission violation.
+                for (path, expected) in paths.iter().zip(&before) {
+                    assert_eq!(
+                        &std::fs::read(path).ok(),
+                        expected,
+                        "{case}: changed {} before all required namespaces were admitted",
+                        path.display()
+                    );
+                }
+                assert!(
+                    matches!(result.expect("required namespace contention must not wait"), Err(DiskError::Io(error)) if error.kind() == ErrorKind::WouldBlock),
+                    "{case}: exact WouldBlock"
+                );
+            }
+            drop(deletion);
+            drop(
+                timeout(Duration::from_secs(5), competing)
+                    .await
+                    .expect("Q drains after W is cancelled"),
+            );
+            wrapper
+                .begin_legacy_metadata_write_with_namespace_owner(volume, object, None)
+                .await
+                .expect("retry admission")
+                .undo_delete(fi.clone(), opts)
+                .await
+                .expect("uncontended retry restores or consumes residue");
+            if fixture == "marker" {
+                assert!(!metadata.exists());
+            } else {
+                assert_eq!(fs::read(&metadata).await.expect("retry metadata"), original);
+                assert_eq!(fs::read(data_path.join("part.1")).await.expect("retry shard"), b"old-complete-shard");
+            }
+            assert!(!rollback_path.exists());
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_undo_delete_cancellation_retains_physical_owner() {
+        for case in ["undo-delete-backup", "undo-delete-data", "undo-delete-marker"] {
+            assert_undo_physical_namespace_owner(case, true, true).await;
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_undo_delete_timeout_retains_physical_owner() {
+        for case in ["undo-delete-backup", "undo-delete-data", "undo-delete-marker"] {
+            assert_undo_physical_namespace_owner(case, false, true).await;
+        }
+    }
+
     #[cfg(not(windows))]
     async fn assert_undo_physical_namespace_owner(case: &str, cancel_waiter: bool, prepared: bool) {
         use crate::disk::{disk_store::LocalDiskWrapper, os::prepared_publication_test_hooks as hooks};
+        let undo_delete = case.starts_with("undo-delete-");
+        let case = case.strip_prefix("undo-delete-").unwrap_or(case);
         let ordinary_delete = case.starts_with("delete-");
         let case = case.strip_prefix("delete-").unwrap_or(case);
         let tmp_stage = case.ends_with("-tmp");
@@ -15940,10 +16402,25 @@ mod test {
             ensure_test_volume(&disk, RUSTFS_META_TMP_DELETED_BUCKET).await;
             let object_dir = disk.io_get_object_path(bucket, &object).expect("object IO path");
             let xl_path = object_dir.join(STORAGE_FORMAT_FILE);
-            let old_version = Uuid::new_v4();
-            let mut old = test_file_info(&object, old_version, None, Some(Bytes::from_static(b"old-payload")));
-            old.set_inline_data();
-            let old_meta = test_meta(old.clone());
+            let (old, rollback_dir, old_meta) = if undo_delete {
+                stage_legacy_delete_undo(
+                    &disk,
+                    bucket,
+                    &object,
+                    match case {
+                        "data" => "staged",
+                        "backup" => "reserved",
+                        _ => case,
+                    },
+                )
+                .await
+            } else {
+                let mut old = test_file_info(&object, Uuid::new_v4(), None, Some(Bytes::from_static(b"old-payload")));
+                old.set_inline_data();
+                let old_meta = test_meta(old.clone());
+                (old, Uuid::new_v4(), old_meta)
+            };
+            let old_version = old.version_id.expect("old version UUID");
             let new_version = if matches!(case, "backup" | "data") {
                 old_version
             } else {
@@ -15954,92 +16431,117 @@ mod test {
             if case == "data" {
                 new.data_dir = Some(Uuid::new_v4());
             }
-            let rollback_dir = Uuid::new_v4();
             let mut opts = DeleteOptions {
                 undo_write: !ordinary_delete,
                 ..Default::default()
             };
             fs::create_dir_all(&object_dir).await.expect("object directory");
-            let stage = match case {
-                "backup" | "data" => {
-                    fs::write(&xl_path, test_meta(new.clone())).await.expect("current metadata");
-                    write_metadata_rollback_backup(&object_dir, rollback_dir, &old_meta)
-                        .await
-                        .expect("rollback backup");
-                    opts.old_data_dir = Some(rollback_dir);
-                    if let Some(data_dir) = new.data_dir {
-                        let dir = object_dir.join(data_dir.to_string());
-                        fs::create_dir_all(&dir).await.expect("new shard directory");
-                        fs::write(dir.join("part.1"), b"new-shard-complete")
-                            .await
-                            .expect("new shard bytes");
-                    }
-                    hooks::Stage::Rename
-                }
-                "marker" => {
-                    new = FileInfo {
-                        name: object.clone(),
-                        version_id: Some(new_version),
-                        deleted: true,
-                        mark_deleted: true,
-                        mod_time: Some(OffsetDateTime::now_utc()),
-                        ..Default::default()
-                    };
-                    disk.delete_version(
-                        bucket,
-                        &object,
-                        new.clone(),
-                        true,
-                        DeleteOptions {
-                            old_data_dir: Some(rollback_dir),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .expect("create the real no-backup delete-marker rollback intent");
-                    assert!(
-                        object_dir
-                            .join(rollback_dir.to_string())
-                            .join(DELETE_MARKER_ROLLBACK_FILE)
-                            .exists()
-                    );
-                    opts.old_data_dir = Some(rollback_dir);
-                    opts.undo_delete = true;
+            let stage = if undo_delete {
+                new = old.clone();
+                opts.undo_delete = true;
+                opts.old_data_dir = Some(rollback_dir);
+                if case == "marker" {
                     hooks::Stage::Remove
-                }
-                "force-marker" => {
-                    new = FileInfo {
-                        name: object.clone(),
-                        version_id: Some(new_version),
-                        deleted: true,
-                        mark_deleted: true,
-                        mod_time: Some(OffsetDateTime::now_utc()),
-                        ..Default::default()
-                    };
+                } else {
                     hooks::Stage::Rename
                 }
-                "fresh" => {
-                    fs::write(&xl_path, test_meta(new.clone()))
+            } else {
+                match case {
+                    "backup" | "data" => {
+                        fs::write(&xl_path, test_meta(new.clone())).await.expect("current metadata");
+                        write_metadata_rollback_backup(&object_dir, rollback_dir, &old_meta)
+                            .await
+                            .expect("rollback backup");
+                        opts.old_data_dir = Some(rollback_dir);
+                        if let Some(data_dir) = new.data_dir {
+                            let dir = object_dir.join(data_dir.to_string());
+                            fs::create_dir_all(&dir).await.expect("new shard directory");
+                            fs::write(dir.join("part.1"), b"new-shard-complete")
+                                .await
+                                .expect("new shard bytes");
+                        }
+                        hooks::Stage::Rename
+                    }
+                    "marker" => {
+                        new = FileInfo {
+                            name: object.clone(),
+                            version_id: Some(new_version),
+                            deleted: true,
+                            mark_deleted: true,
+                            mod_time: Some(OffsetDateTime::now_utc()),
+                            ..Default::default()
+                        };
+                        disk.delete_version(
+                            bucket,
+                            &object,
+                            new.clone(),
+                            true,
+                            DeleteOptions {
+                                old_data_dir: Some(rollback_dir),
+                                ..Default::default()
+                            },
+                        )
                         .await
-                        .expect("new version metadata");
-                    hooks::Stage::Rename
+                        .expect("create the real no-backup delete-marker rollback intent");
+                        assert!(
+                            object_dir
+                                .join(rollback_dir.to_string())
+                                .join(DELETE_MARKER_ROLLBACK_FILE)
+                                .exists()
+                        );
+                        opts.old_data_dir = Some(rollback_dir);
+                        opts.undo_delete = true;
+                        hooks::Stage::Remove
+                    }
+                    "force-marker" => {
+                        new = FileInfo {
+                            name: object.clone(),
+                            version_id: Some(new_version),
+                            deleted: true,
+                            mark_deleted: true,
+                            mod_time: Some(OffsetDateTime::now_utc()),
+                            ..Default::default()
+                        };
+                        hooks::Stage::Rename
+                    }
+                    "fresh" => {
+                        fs::write(&xl_path, test_meta(new.clone()))
+                            .await
+                            .expect("new version metadata");
+                        hooks::Stage::Rename
+                    }
+                    "remaining" => {
+                        let mut meta = FileMeta::load(&old_meta).expect("old metadata parses");
+                        meta.add_version(new.clone()).expect("add distinct new version");
+                        fs::write(&xl_path, meta.marshal_msg().expect("encode both versions"))
+                            .await
+                            .expect("versioned metadata");
+                        hooks::Stage::Rename
+                    }
+                    _ => panic!("unknown undo fixture"),
                 }
-                "remaining" => {
-                    let mut meta = FileMeta::load(&old_meta).expect("old metadata parses");
-                    meta.add_version(new.clone()).expect("add distinct new version");
-                    fs::write(&xl_path, meta.marshal_msg().expect("encode both versions"))
-                        .await
-                        .expect("versioned metadata");
-                    hooks::Stage::Rename
-                }
-                _ => panic!("unknown undo fixture"),
             };
-            let before = if case == "force-marker" {
+            let before = if case == "force-marker" || (undo_delete && case != "marker") {
                 assert!(!xl_path.exists(), "force marker starts without xl.meta");
                 Vec::new()
             } else {
                 fs::read(&xl_path).await.expect("metadata exists before mutation")
             };
+            let mut required_paths = if undo_delete {
+                version_delete_marker_paths(&object_dir, rollback_dir)
+                    .await
+                    .expect("frozen marker namespaces")
+            } else {
+                Vec::new()
+            };
+            if undo_delete {
+                let rollback = object_dir.join(rollback_dir.to_string());
+                required_paths.extend([xl_path.clone(), rollback.join(STORAGE_FORMAT_FILE_BACKUP)]);
+                if case == "data" {
+                    let data = old.data_dir.expect("staged data UUID").to_string();
+                    required_paths.extend([object_dir.join(&data), rollback.join(data)]);
+                }
+            }
             let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
             let physical_path = if case == "data" {
@@ -16079,6 +16581,8 @@ mod test {
                         .await?;
                     if ordinary_delete {
                         write.delete_version(new, case == "force-marker", opts).await
+                    } else if undo_delete {
+                        write.undo_delete(new, opts).await
                     } else {
                         write.undo_write(new, opts).await
                     }
@@ -16096,9 +16600,9 @@ mod test {
             })
             .await
             .expect("undo must enter its real filesystem executor");
-            let blocked_metadata = if case == "data" { &old_meta } else { &before };
+            let blocked_metadata = if case == "data" && !undo_delete { &old_meta } else { &before };
             let assert_blocked_metadata = || {
-                if case == "force-marker" {
+                if case == "force-marker" || (undo_delete && case != "marker") {
                     assert!(!xl_path.exists(), "force marker must not publish before the held worker");
                 } else {
                     assert_eq!(&std::fs::read(&xl_path).expect("blocked metadata"), blocked_metadata);
@@ -16126,6 +16630,14 @@ mod test {
             if prepared {
                 assert!(read_retained, "{case}: actual worker retains volume READ after waiter ends");
             }
+            for path in &required_paths {
+                assert!(
+                    matches!(os::try_acquire_namespace_mutation_lease_with_owner(path, Arc::new(())),
+                    Err(DiskError::Io(error)) if error.kind() == ErrorKind::WouldBlock),
+                    "{} must remain owned by the physical worker",
+                    path.display()
+                );
+            }
             let mut deletion = prepared.then(|| Box::pin(disk.delete_volume(bucket, true)));
             let delete_blocked = match deletion.as_mut() {
                 Some(deletion) => matches!(futures::poll!(deletion.as_mut()), Poll::Pending),
@@ -16142,6 +16654,9 @@ mod test {
                         }
                     } else {
                         match case {
+                            "data" if undo_delete => {
+                                std::fs::read(physical_path.join("part.1")).is_ok_and(|data| data == b"old-complete-shard")
+                            }
                             "backup" | "data" => std::fs::read(&xl_path).is_ok_and(|data| data == old_meta),
                             "marker" | "fresh" => !xl_path.exists(),
                             "force-marker" => std::fs::read(&xl_path)
@@ -16169,7 +16684,14 @@ mod test {
             })
             .await
             .expect("released physical undo must publish and release ownership");
-            if matches!(case, "backup" | "remaining" | "data") {
+            for path in &required_paths {
+                assert!(
+                    os::try_acquire_namespace_mutation_lease_with_owner(path, Arc::new(())).is_ok(),
+                    "{} is released after physical drain without an owner cycle",
+                    path.display()
+                );
+            }
+            if matches!(case, "backup" | "remaining" | "data") && !(undo_delete && case == "data") {
                 let restored = disk
                     .read_version(
                         "",
@@ -16183,7 +16705,21 @@ mod test {
                     )
                     .await
                     .expect("the old version remains readable after physical undo");
-                assert_eq!(restored.data.as_deref(), Some(b"old-payload".as_slice()));
+                if undo_delete {
+                    assert_eq!(restored.version_id, old.version_id);
+                    assert_eq!(
+                        fs::read(
+                            object_dir
+                                .join(old.data_dir.expect("old data UUID").to_string())
+                                .join("part.1")
+                        )
+                        .await
+                        .expect("restored old shard"),
+                        b"old-complete-shard"
+                    );
+                } else {
+                    assert_eq!(restored.data.as_deref(), Some(b"old-payload".as_slice()));
+                }
             }
             assert!(
                 pending_while_blocked && owner_alive_while_blocked,
@@ -16199,7 +16735,12 @@ mod test {
                     assert_eq!(metrics.total_errors_timeout, 1);
                 }
                 if case == "data" {
-                    assert!(!physical_path.exists(), "released worker finishes the admitted data trash rename");
+                    if undo_delete {
+                        assert!(physical_path.exists(), "released worker finishes the admitted data restoration");
+                        assert!(!xl_path.exists(), "cancelled waiter cannot start a later metadata restore");
+                    } else {
+                        assert!(!physical_path.exists(), "released worker finishes the admitted data trash rename");
+                    }
                 }
                 tokio::time::timeout(Duration::from_secs(10), deletion.expect("prepared delete waiter"))
                     .await
@@ -16547,7 +17088,7 @@ mod test {
     #[tokio::test]
     async fn legacy_delete_version_preserves_variants_and_reuses_admission() {
         assert_legacy_version_mutation_variants(false).await;
-        assert_legacy_version_leading_slash_delete_semantics(false).await;
+        assert_legacy_version_leading_slash_delete_semantics(false, false).await;
     }
 
     #[tokio::test]
@@ -16648,7 +17189,7 @@ mod test {
         }
     }
 
-    async fn assert_legacy_version_leading_slash_delete_semantics(undo_write: bool) {
+    async fn assert_legacy_version_leading_slash_delete_semantics(undo_write: bool, undo_delete: bool) {
         use crate::disk::disk_store::LocalDiskWrapper;
         for case in ["empty", "populated", "file"] {
             let dir = tempfile::tempdir().expect("slash fixture root");
@@ -16680,10 +17221,14 @@ mod test {
             assert!(matches!(futures::poll!(deletion.as_mut()), Poll::Pending));
             let opts = DeleteOptions {
                 undo_write,
+                undo_delete,
+                old_data_dir: undo_delete.then(Uuid::new_v4),
                 ..Default::default()
             };
             let mutation = async {
-                if undo_write {
+                if undo_delete {
+                    token.undo_delete(FileInfo::default(), opts).await
+                } else if undo_write {
                     token.undo_write(FileInfo::default(), opts).await
                 } else {
                     token.delete_version(FileInfo::default(), false, opts).await
@@ -16727,7 +17272,7 @@ mod test {
 
     #[tokio::test]
     async fn legacy_undo_write_preserves_leading_slash_delete_semantics() {
-        assert_legacy_version_leading_slash_delete_semantics(true).await;
+        assert_legacy_version_leading_slash_delete_semantics(true, false).await;
     }
 
     #[cfg(not(windows))]

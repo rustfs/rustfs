@@ -2117,6 +2117,10 @@ pub(crate) async fn remove_file_with_owner(
     }
     let path = path.as_ref().to_path_buf();
     let lease = acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await;
+    remove_file_with_lease(path, lease).await
+}
+
+pub(in crate::disk) async fn remove_file_with_lease(path: PathBuf, lease: Arc<NamespaceMutationLease>) -> io::Result<()> {
     run_blocking_namespace_operation(lease, move || {
         #[cfg(all(any(test, feature = "test-util"), not(windows)))]
         prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Remove, &path);
