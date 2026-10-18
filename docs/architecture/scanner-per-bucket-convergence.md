@@ -1,7 +1,7 @@
 # Scanner Per-Bucket Convergence Design
 
 **Use this when:** changing what makes a scanner cycle `Complete`, `Superseded`, or converged; adding or re-classifying a dirty-usage producer; deciding whether a background writeback may invalidate a scanner cycle; changing scanner worker concurrency or throttling; or activating scoped dirty acknowledgements.
-**Source of truth:** `classify_nsscanner_cycle`, `scanner_cycle_activity_status`, and `scoped_scan_scope_from_dirty_buckets` in `crates/scanner/src/scanner_io.rs`; `dirty_usage_snapshot_status` and `acknowledge_scoped_dirty_usage` in `crates/scanner/src/scanner_io/dirty_usage.rs`; `scanner_concurrency_limit` in `crates/scanner/src/scanner_io/guards.rs`; the per-disk worker loop in `crates/scanner/src/scanner_io/io_cache.rs`; `DynamicSleeper` in `crates/scanner/src/sleeper.rs`; `ScannerNodeActivity` in `crates/scanner/src/scanner/activity.rs`; `persist_replication_state_if_current` in `crates/ecstore/src/bucket/replication/replication_resyncer.rs`; the publication fences in [scanner-usage-publication.md](scanner-usage-publication.md).
+**Source of truth:** `classify_nsscanner_cycle`, `scanner_cycle_activity_status`, and `scoped_scan_scope_from_dirty_buckets` in `crates/scanner/src/scanner_io.rs`; `dirty_usage_snapshot_status` and `acknowledge_scoped_dirty_usage` in `crates/scanner/src/scanner_io/dirty_usage.rs`; `scanner_concurrency_limit` in `crates/scanner/src/scanner_io/guards.rs`; the per-disk worker loop in `crates/scanner/src/scanner_io/io_cache.rs`; `DynamicSleeper` in `crates/scanner/src/sleeper.rs`; `ScannerNodeActivity` in `crates/scanner/src/scanner/activity.rs`; `persist_replication_state_if_current` in `crates/ecstore/src/bucket/replication/replication_resyncer.rs`; `NamespaceCommitCardTable` in `crates/ecstore/src/runtime/namespace_commit_cards.rs` and `observe_post_walk_namespace_commits` in `crates/scanner/src/scanner_io.rs`; the publication fences in [scanner-usage-publication.md](scanner-usage-publication.md).
 
 ## Decision
 
@@ -19,9 +19,11 @@ collection, because the problems and the known-good answers are the same.
    turn the cycle into `Superseded`.
 2. **The cluster activity probe stays, as a guardrail only.** It vetoes a
    publication when the heap it describes is not the heap that was walked:
-   topology, peer identity, protocol version, data movement, or a pending PUT
-   tail changed. Namespace and dirty-usage generation movement alone never
-   vetoes; it only shades buckets.
+   topology, peer identity, protocol version, or data movement changed, or a
+   namespace commit is in flight that cannot be attributed to a bucket.
+   Namespace and dirty-usage generation movement alone never vetoes, and
+   neither does an in-flight commit that names its bucket; both only shade
+   buckets.
 3. **Replication status writebacks are status-class barrier hits.** They
    shade a bucket for a scoped rescan but are not namespace activity. They
    never uncertify a walk and never block cycle completion. The scanner's own
@@ -206,7 +208,7 @@ walk. Field roles:
 | Field | Role |
 |---|---|
 | `instance_id`, `protocol_version`, `topology_digest` | veto: a peer restarted, changed version, or the topology changed |
-| `data_movement_active`, `movement_generation`, `publication_blocked` | veto: rebalance, decommission, or a pending PUT tail can make the walk describe a different generation |
+| `data_movement_active`, `movement_generation`, `publication_blocked` | veto: rebalance or decommission can make the walk describe a different generation. On the wire `publication_blocked` carries only the movement barrier; in-flight namespace commits are not part of any field and are handled below |
 | `maintenance_generation` | veto: no cycle today records whether it published maintenance results, and the field is already part of the structural digest; it becomes a shade signal only once that distinction exists |
 | `namespace_generation`, `dirty_usage_generation`, `dirty_usage_pending` | shade signal: consumed per bucket; never a veto on their own |
 
@@ -238,6 +240,75 @@ The guardrail is bounded in three ways:
   superseded backoff schedule with a cap, and `usage_freshness` reports the
   field and peer that caused the last deferral so the operator can tell a
   rebalance from a broken probe.
+
+### In-flight namespace commits
+
+A namespace commit (PUT and multipart rename fanouts including the post-ACK
+tail, delete commits, delete recovery, heal rewrites, and the peer-RPC disk
+writes of a remote coordinator) holds a
+`NamespaceCommitGuard` from before its first disk effect until its last disk
+task ends. The S3 layer marks the bucket dirty when the request returns,
+which for an early-ACK PUT is before the tail ends, and heal rewrites mark
+nothing. A walk that overlaps such a commit therefore may read partial state
+for a bucket whose dirty generation never moves afterwards, so an in-flight
+commit cannot simply be ignored.
+
+Before this rule the local barrier was the instance-wide pending-commit count:
+any commit in flight at the post-walk check vetoed the cycle as
+`publication_blocked`, and any commit in flight at publication deferred it. A
+single node under continuous writes always has a commit in flight, so it
+never published (the #8305 class of guardrail false positive), while a tail
+that ended between the walk and the check was not caught at all.
+
+The guard is now a card on the bucket it commits to, kept by the instance
+context next to the count (`NamespaceCommitCardTable` in
+`crates/ecstore/src/runtime/namespace_commit_cards.rs`):
+
+- **Begin.** Every production commit is opened with its bucket and, where it
+  has one, its object (`begin_bucket_namespace_commit`). It is registered as
+  in flight before any disk effect. Meta-bucket commits are counted but not
+  carded; the scanner does not walk meta buckets for usage.
+- **End.** When the last owner of the guard drops, after the last disk task,
+  the bucket is stamped with a monotonic end sequence. Objects are kept per
+  bucket up to the dirty map's top-level-entry bound, and across the table up
+  to a fixed total, and then collapse to the whole bucket.
+- **Collector.** Before listing buckets, the cycle records the end sequence
+  as its floor. After the walk, before the guardrail verdict and the pending
+  read, it asks for every bucket with a commit in flight or ended above the
+  floor (`observe_post_walk_namespace_commits`). Each such listed bucket is
+  held grey: it is added to the pending set and left out of this cycle's
+  certification. A held bucket that is not in the dirty map is also shaded
+  into it without a producer identity, since it has no S3 mark yet or never
+  gets one (a heal rewrite), so the next cycle walks it. A held bucket that
+  is already dirty keeps the generation and producer identities its S3 marks
+  recorded, so segment-reuse evidence is not weakened for buckets under
+  ordinary writes; only its scope widens to the commit's top-level entries,
+  because an unmarked commit may touch an entry the marked scope does not
+  cover.
+
+Correctness, against the floor `F` (read before the walk), the start snapshot
+`S`, and the post-walk read `P`:
+
+- a commit that ended at or below `F` ended before the walk read anything,
+  so the walk saw all of its effects;
+- a commit that ended above `F` and before `P`, or is in flight at `P`, is
+  held: the bucket is pending and certification does not clear it. If it was
+  dirty it stays dirty at its marked generation; if it was not, it is
+  shaded. Either way the next cycle walks it, and that cycle certifies it
+  only if no commit overlaps its own walk;
+- a commit that begins after `P` is the next cycle's work, like a write after
+  publication: its end is above the next floor only if it overlaps the next
+  walk, and its S3 mark, if any, moves the generation certification
+  compares.
+
+Certification is compare-and-remove against `S`, so no commit that overlaps a
+walk can leave its bucket black. The local barrier keeps only what cannot be
+attributed: a guard opened without a bucket name, counter exhaustion, or an
+end that did not fit the card table. Every production commit, including the
+peer-RPC admission of a remote coordinator's disk write, names its bucket. Those still veto the post-walk check as `publication_blocked`
+(an unscoped guard or exhaustion also defers publication), which is the
+previous behaviour. Distributed publication leases on peers still reject
+pending commits; attributing them is phase 5 work.
 
 ### Generations of buckets
 
@@ -318,6 +389,7 @@ not tuning advice.
 | `Status` hits are not namespace activity | A `Status` hit costs one atomic OR on the writeback path and no scanner work. It never triggers a dirty-usage wake. A replication resync therefore adds nothing to scanner load beyond the full walk the cycle already performs. |
 | A `Complete` cycle with pending buckets is a baseline | When the pending set is the whole namespace (a mass write, a disk loss), the next cycle is declared a full sweep explicitly and uses the existing superseded retry backoff schedule. A full sweep is never run under the scoped cycle's wake cadence. |
 | Bounded remark | At most one remark pass per cycle, inside the remaining budget. |
+| An attributed in-flight commit holds its bucket grey instead of vetoing | A cycle holds at most its listed buckets, once each, and shades only those not already dirty, each scoped to at most the dirty map's top-level-entry bound. The card table holds at most a fixed number of ended buckets and object names, whether or not the scanner runs, and prunes everything at or below the latest floor on every post-walk read; an end that does not fit, an unscoped guard, or counter exhaustion falls back to the whole-cycle veto with the capped superseded backoff. A permanently written bucket stays grey and is rescanned under the ordinary dirty-usage wake; holding adds no wake of its own, and a shade adds at most one per unmarked bucket per cycle. |
 | Old-generation sweep every `M` cycles | The sweep is checkpointed and resumes; it does not restart on a `Namespace` hit. A hit only demotes the bucket to young for the following cycle. |
 | Pacer raises walkers and lowers sleep | CPU and I/O ceilings are absolute. Foreground admission backoff cannot be undercut. Walker count never exceeds the ceiling-derived maximum even when the target is missed. |
 | Faster convergence discovers heal and replication work sooner | Heal admission keeps its queue bounds and `queue_full` and `dropped` accounting in `crates/scanner/src/scanner_folder/ledger.rs`; replication MRF keeps its pending cap. Convergence speed does not change retry intervals. Discovered work is swept lazily under those bounds, in the sense of a lazy sweeper: discovery and execution are decoupled. |

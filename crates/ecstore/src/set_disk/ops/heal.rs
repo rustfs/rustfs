@@ -1975,7 +1975,7 @@ impl SetDisks {
                                                     _write_lock_guard.clone(),
                                                     _read_repair_write_lock_guard.clone(),
                                                     bucket_heal_scope.clone(),
-                                                    self.ctx.begin_namespace_commit(),
+                                                    self.ctx.begin_bucket_namespace_commit(bucket, Some(object)),
                                                 ))
                                             });
                                             match disk
@@ -3576,8 +3576,11 @@ impl SetDisks {
                         explicit_delete,
                         repair_marker_source: true,
                         namespace_owner: (!opts.dry_run).then(|| {
-                            Arc::new((scope.clone(), self.ctx.begin_namespace_commit(), _write_lock_guard.clone()))
-                                as Arc<dyn Send + Sync>
+                            Arc::new((
+                                scope.clone(),
+                                self.ctx.begin_bucket_namespace_commit(bucket, Some(object)),
+                                _write_lock_guard.clone(),
+                            )) as Arc<dyn Send + Sync>
                         }),
                         ..crate::set_disk::DeleteRecoveryContext::new(Some(scope.incarnation), &|| {
                             scope.check().is_ok() && !_write_lock_guard.as_deref().is_some_and(|guard| guard.is_lock_lost())

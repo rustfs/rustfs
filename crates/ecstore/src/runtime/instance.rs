@@ -40,6 +40,7 @@
 //! single-instance behavior is byte-for-byte unchanged.
 
 use super::global::TypeLocalDiskSetDrives;
+use super::namespace_commit_cards::{NamespaceCommitCardTable, NamespaceCommitKey, ScannerNamespaceCommitCards};
 use crate::bucket::bandwidth::monitor::Monitor;
 use crate::bucket::lifecycle::bucket_lifecycle_ops::{ExpiryState, TransitionState};
 use crate::bucket::metadata_sys::BucketMetadataSys;
@@ -94,10 +95,36 @@ pub(crate) struct ScannerPublicationLeaseEntry {
 pub(crate) struct NamespaceCommitGuard {
     ctx: Arc<InstanceContext>,
     counted: bool,
+    card: NamespaceCommitCard,
+}
+
+/// How a namespace commit is attributed for the scanner.
+enum NamespaceCommitCard {
+    /// The owner cannot name its bucket.
+    Unscoped,
+    Bucket(NamespaceCommitKey),
+    /// Meta-bucket commits are counted but never carded: the scanner does not
+    /// walk meta buckets for usage.
+    Untracked,
+}
+
+impl NamespaceCommitCard {
+    fn key(&self) -> Option<Option<&NamespaceCommitKey>> {
+        match self {
+            Self::Unscoped => Some(None),
+            Self::Bucket(key) => Some(Some(key)),
+            Self::Untracked => None,
+        }
+    }
 }
 
 impl Drop for NamespaceCommitGuard {
     fn drop(&mut self) {
+        // The last owner drops after the last disk task, so the ended card is
+        // recorded strictly after every disk effect of this commit.
+        if let Some(key) = self.card.key() {
+            self.ctx.namespace_commit_cards().end(key);
+        }
         if self.counted {
             // Publish the new generation before a zero-pending publication probe.
             self.ctx.advance_namespace_commit_generation();
@@ -239,6 +266,10 @@ pub struct InstanceContext {
     scanner_publication_state: AtomicU8,
     namespace_commits: AtomicU64,
     namespace_commit_generation: AtomicU64,
+    /// Per-bucket attribution of the commits counted by `namespace_commits`.
+    /// Leaf lock: held only for in-memory map updates, never across another
+    /// lock or an await.
+    namespace_commit_cards: std::sync::Mutex<NamespaceCommitCardTable>,
     /// Resolves object-encryption material at the application boundary.
     object_encryption_resolver: OnceLock<Arc<dyn ObjectEncryptionResolver>>,
     delete_recovery_hints: DeleteRecoveryHints,
@@ -295,6 +326,7 @@ impl InstanceContext {
             scanner_publication_state: AtomicU8::new(SCANNER_PUBLICATION_STATE_UNKNOWN),
             namespace_commits: AtomicU64::new(0),
             namespace_commit_generation: AtomicU64::new(0),
+            namespace_commit_cards: std::sync::Mutex::new(NamespaceCommitCardTable::default()),
             object_encryption_resolver: OnceLock::new(),
             delete_recovery_hints: DeleteRecoveryHints::default(),
             tier_delete_journal_recovery_stores: std::sync::Mutex::new(HashSet::new()),
@@ -442,7 +474,37 @@ impl InstanceContext {
             && self.scanner_publication_state.load(Ordering::Acquire) == SCANNER_PUBLICATION_STATE_ALLOWED
     }
 
+    /// Begin a namespace commit that cannot name its bucket. While it is in
+    /// flight the scanner treats every walk as unattributable and keeps the
+    /// whole-cycle publication barrier. Production commits name their bucket
+    /// through `begin_bucket_namespace_commit`.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn begin_namespace_commit(self: &Arc<Self>) -> Arc<NamespaceCommitGuard> {
+        self.begin_namespace_commit_with_card(NamespaceCommitCard::Unscoped)
+    }
+
+    /// Begin a namespace commit on `bucket` (and `object`, when the commit
+    /// changes one object). The scanner shades that bucket while the commit is
+    /// in flight and after it ends, instead of vetoing the whole cycle.
+    pub(crate) fn begin_bucket_namespace_commit(
+        self: &Arc<Self>,
+        bucket: &str,
+        object: Option<&str>,
+    ) -> Arc<NamespaceCommitGuard> {
+        let card = if bucket.is_empty() {
+            NamespaceCommitCard::Unscoped
+        } else if crate::bucket::utils::is_meta_bucketname(bucket) {
+            NamespaceCommitCard::Untracked
+        } else {
+            NamespaceCommitCard::Bucket(NamespaceCommitKey::new(bucket, object))
+        };
+        self.begin_namespace_commit_with_card(card)
+    }
+
+    fn begin_namespace_commit_with_card(self: &Arc<Self>, card: NamespaceCommitCard) -> Arc<NamespaceCommitGuard> {
+        if let Some(key) = card.key() {
+            self.namespace_commit_cards().begin(key);
+        }
         let counted = self
             .namespace_commits
             .try_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_add(1))
@@ -455,7 +517,33 @@ impl InstanceContext {
         Arc::new(NamespaceCommitGuard {
             ctx: Arc::clone(self),
             counted,
+            card,
         })
+    }
+
+    fn namespace_commit_cards(&self) -> std::sync::MutexGuard<'_, NamespaceCommitCardTable> {
+        self.namespace_commit_cards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Whether an in-flight namespace commit cannot be attributed to a bucket:
+    /// an unscoped owner, or an exhausted commit counter.
+    pub(crate) fn namespace_commits_unattributed(&self) -> bool {
+        self.namespace_commit_cards().unscoped_in_flight() || self.namespace_commit_generation() == u64::MAX
+    }
+
+    /// End sequence a scanner walk records before it starts reading.
+    pub(crate) fn namespace_commit_card_floor(&self) -> u64 {
+        self.namespace_commit_cards().floor()
+    }
+
+    /// Buckets whose namespace commits are in flight or ended after `floor`,
+    /// and whether any such commit cannot be attributed to a bucket.
+    pub(crate) fn namespace_commit_cards_overlapping(&self, floor: u64) -> ScannerNamespaceCommitCards {
+        let mut cards = self.namespace_commit_cards().overlapping(floor);
+        cards.unattributed |= self.namespace_commit_generation() == u64::MAX;
+        cards
     }
 
     fn advance_namespace_commit_generation(&self) {
@@ -903,6 +991,56 @@ mod tests {
             assert_eq!(ctx.namespace_commit_generation(), u64::MAX);
             assert_eq!(ctx.namespace_commits.load(Ordering::Acquire), count);
         }
+    }
+
+    #[test]
+    fn bucket_namespace_commits_are_carded_and_only_unscoped_or_exhausted_ones_are_unattributed() {
+        use crate::runtime::namespace_commit_cards::ScannerNamespaceCommitCardScope;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let ctx = Arc::new(InstanceContext::new());
+        let floor = ctx.namespace_commit_card_floor();
+        let tail = ctx.begin_bucket_namespace_commit("photos", Some("2026/a.jpg"));
+        let shared_tail = Arc::clone(&tail);
+        let meta = ctx.begin_bucket_namespace_commit(crate::disk::RUSTFS_META_BUCKET, Some("config.json"));
+        assert!(ctx.namespace_commits_pending(), "attributed commits still count as pending");
+        assert!(!ctx.namespace_commits_unattributed());
+        let photos = BTreeMap::from([(
+            "photos".to_string(),
+            ScannerNamespaceCommitCardScope::Objects(BTreeSet::from(["2026/a.jpg".to_string()])),
+        )]);
+        let in_flight = ctx.namespace_commit_cards_overlapping(floor);
+        assert!(!in_flight.unattributed);
+        assert_eq!(in_flight.buckets, photos, "meta-bucket commits are counted but never carded");
+
+        drop(tail);
+        assert_eq!(ctx.namespace_commit_card_floor(), floor, "an end is recorded by the last owner only");
+        drop(shared_tail);
+        drop(meta);
+        assert!(!ctx.namespace_commits_pending());
+        assert_eq!(ctx.namespace_commit_cards_overlapping(floor).buckets, photos);
+        assert!(
+            ctx.namespace_commit_cards_overlapping(ctx.namespace_commit_card_floor())
+                .buckets
+                .is_empty()
+        );
+
+        let unscoped = ctx.begin_namespace_commit();
+        assert!(ctx.namespace_commits_unattributed());
+        assert!(
+            ctx.namespace_commit_cards_overlapping(ctx.namespace_commit_card_floor())
+                .unattributed
+        );
+        drop(unscoped);
+        assert!(!ctx.namespace_commits_unattributed());
+
+        ctx.namespace_commit_generation.store(u64::MAX - 1, Ordering::Release);
+        drop(ctx.begin_bucket_namespace_commit("photos", None));
+        assert!(ctx.namespace_commits_unattributed(), "an exhausted counter cannot be attributed");
+        assert!(
+            ctx.namespace_commit_cards_overlapping(ctx.namespace_commit_card_floor())
+                .unattributed
+        );
     }
 
     #[tokio::test(start_paused = true)]

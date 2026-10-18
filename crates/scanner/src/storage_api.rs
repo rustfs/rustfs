@@ -134,6 +134,8 @@ pub(crate) use rustfs_ecstore::api::storage::SCANNER_PUBLICATION_LEASE_TTL_MS as
 pub(crate) use rustfs_ecstore::api::storage::init_local_disks_with_instance_ctx as ecstore_init_local_disks_with_instance_ctx;
 pub(crate) use rustfs_ecstore::api::storage::{
     ECStore as EcstoreStore, ScannerDataMovementPauseStatus as EcstoreScannerDataMovementPauseStatus,
+    ScannerNamespaceCommitCardScope as EcstoreScannerNamespaceCommitCardScope,
+    ScannerNamespaceCommitCards as EcstoreScannerNamespaceCommitCards,
 };
 pub(crate) use rustfs_lifecycle::{
     Evaluator as EcstoreEvaluator, Event as EcstoreEvent, Lifecycle as EcstoreLifecycle, ObjectOpts as EcstoreObjectOpts,
@@ -169,7 +171,8 @@ pub(crate) mod owner {
     pub(crate) use rustfs_ecstore::api::set_disk::get_lock_acquire_timeout as ecstore_get_lock_acquire_timeout;
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::set_disk::test_util::{
-        PutObjectCommitBarrier, PutObjectCommitPause, hold_namespace_commit as ecstore_hold_namespace_commit,
+        PutObjectCommitBarrier, PutObjectCommitPause, hold_bucket_namespace_commit as ecstore_hold_bucket_namespace_commit,
+        hold_namespace_commit as ecstore_hold_namespace_commit,
     };
 
     pub(crate) use super::storage_contracts::{
@@ -390,7 +393,9 @@ pub(crate) trait ScannerStorage:
     fn scanner_topology_digest(&self) -> [u8; 32];
     fn scanner_namespace_mutation_generation(&self) -> u64;
     async fn scanner_data_movement_activity(&self) -> (bool, bool, u64);
-    async fn scanner_data_usage_publication_blocked(&self) -> bool;
+    async fn scanner_attributed_usage_publication_blocked(&self) -> bool;
+    fn scanner_namespace_commit_card_floor(&self) -> u64;
+    fn scanner_namespace_commit_cards(&self, floor: u64) -> EcstoreScannerNamespaceCommitCards;
     async fn scanner_data_movement_publication_blocked(&self) -> bool;
     async fn scanner_data_movement_pause_status(&self) -> ScannerDataMovementPauseStatus;
     fn scanner_data_movement_generation(&self) -> u64;
@@ -427,8 +432,16 @@ impl ScannerStorage for EcstoreStore {
         EcstoreStore::scanner_data_movement_activity(self).await
     }
 
-    async fn scanner_data_usage_publication_blocked(&self) -> bool {
-        EcstoreStore::scanner_data_usage_publication_blocked(self).await
+    async fn scanner_attributed_usage_publication_blocked(&self) -> bool {
+        EcstoreStore::scanner_attributed_usage_publication_blocked(self).await
+    }
+
+    fn scanner_namespace_commit_card_floor(&self) -> u64 {
+        EcstoreStore::scanner_namespace_commit_card_floor(self)
+    }
+
+    fn scanner_namespace_commit_cards(&self, floor: u64) -> EcstoreScannerNamespaceCommitCards {
+        EcstoreStore::scanner_namespace_commit_cards(self, floor)
     }
 
     async fn scanner_data_movement_publication_blocked(&self) -> bool {
@@ -600,8 +613,16 @@ mod tests {
             (false, false, 0)
         }
 
-        async fn scanner_data_usage_publication_blocked(&self) -> bool {
+        async fn scanner_attributed_usage_publication_blocked(&self) -> bool {
             false
+        }
+
+        fn scanner_namespace_commit_card_floor(&self) -> u64 {
+            0
+        }
+
+        fn scanner_namespace_commit_cards(&self, _floor: u64) -> EcstoreScannerNamespaceCommitCards {
+            EcstoreScannerNamespaceCommitCards::default()
         }
 
         async fn scanner_data_movement_publication_blocked(&self) -> bool {

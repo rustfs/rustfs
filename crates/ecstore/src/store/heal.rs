@@ -382,7 +382,7 @@ impl ECStore {
                 dry_run: opts.dry_run,
                 explicit_delete,
                 namespace_owner: (!opts.dry_run)
-                    .then(|| Arc::new((scope.clone(), store.ctx.begin_namespace_commit())) as Arc<dyn Send + Sync>),
+                    .then(|| Arc::new((scope.clone(), store.ctx.begin_bucket_namespace_commit(&bucket, None))) as Arc<dyn Send + Sync>),
                 ..crate::set_disk::DeleteRecoveryContext::new(Some(scope.incarnation), &can_commit)
             };
             let mut summary = crate::set_disk::DeleteRecoverySummary::default();

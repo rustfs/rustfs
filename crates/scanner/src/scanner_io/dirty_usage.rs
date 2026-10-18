@@ -537,6 +537,54 @@ mod status_class_mutation_tests {
         );
         clear_dirty_usage_buckets_for_tests();
     }
+
+    #[test]
+    #[serial]
+    fn namespace_commit_hold_keeps_marked_buckets_untouched_and_shades_unmarked_ones() {
+        use crate::storage_api::{EcstoreScannerNamespaceCommitCardScope as Scope, EcstoreScannerNamespaceCommitCards};
+
+        clear_dirty_usage_buckets_for_tests();
+        record_dirty_usage_object_from_producer("marked", "2026/a.jpg", SegmentInvalidationProducerIdentity::PutObject);
+        let marked_generation = dirty_usage_buckets_for_tests()["marked"];
+        let cards = EcstoreScannerNamespaceCommitCards {
+            buckets: BTreeMap::from([
+                (
+                    "marked".to_string(),
+                    Scope::Objects(BTreeSet::from(["2026/a.jpg".to_string(), "heal/c.jpg".to_string()])),
+                ),
+                ("healed".to_string(), Scope::Objects(BTreeSet::from(["2026/b.jpg".to_string()]))),
+                ("unlisted".to_string(), Scope::WholeBucket),
+            ]),
+            unattributed: false,
+        };
+
+        let held = hold_namespace_commit_buckets(&cards, &HashSet::from(["marked", "healed"]));
+
+        assert_eq!(held, BTreeSet::from(["healed".to_string(), "marked".to_string()]));
+        let dirty = dirty_usage_buckets_for_tests();
+        assert_eq!(
+            dirty["marked"], marked_generation,
+            "a marked bucket keeps the generation its S3 mark recorded"
+        );
+        assert!(
+            dirty_usage_producer_identities()["marked"].fully_identified,
+            "holding a marked bucket must not erase its producer identity"
+        );
+        assert_eq!(
+            dirty_usage_bucket_scopes()["marked"],
+            DirtyUsageBucketScope::TopLevelEntries(HashSet::from(["2026".to_string(), "heal".to_string()])),
+            "a marked bucket's scope widens to the unmarked commit's entry"
+        );
+        assert!(dirty["healed"] > marked_generation, "an unmarked bucket is shaded");
+        assert!(!dirty_usage_producer_identities()["healed"].fully_identified);
+        assert_eq!(
+            dirty_usage_bucket_scopes()["healed"],
+            DirtyUsageBucketScope::TopLevelEntries(HashSet::from(["2026".to_string()])),
+            "the shade keeps the commit's top-level entry"
+        );
+        assert!(!dirty.contains_key("unlisted"), "an unwalked bucket is left to its own marks");
+        clear_dirty_usage_buckets_for_tests();
+    }
 }
 
 #[cfg(test)]
@@ -1275,6 +1323,78 @@ pub(super) fn snapshot_dirty_usage_buckets(buckets: &[BucketInfo], absent_genera
         generation,
         covers_all_pending,
     }
+}
+
+/// Hold the listed buckets whose namespace commits overlap the walk grey.
+///
+/// A commit's S3-layer dirty mark can precede its last disk effect (an
+/// early-ACK rename tail), so a bucket already in the dirty map may have been
+/// walked mid-commit without its generation moving. Such a bucket keeps the
+/// generation and producer identities its S3 marks recorded; only its scope is
+/// widened to the commit's top-level entries, because a commit without a mark
+/// (a heal rewrite) may touch an entry the marked scope does not cover. The
+/// caller reports it pending and keeps it out of this cycle's certification.
+/// A bucket not in the dirty map has no mark yet, or never gets one; it is
+/// shaded here without a producer identity so the next cycle walks it.
+/// Buckets outside `listed` were not walked and are left to their own marks.
+pub(super) fn hold_namespace_commit_buckets(
+    cards: &crate::storage_api::EcstoreScannerNamespaceCommitCards,
+    listed: &HashSet<&str>,
+) -> BTreeSet<String> {
+    use crate::segment_invalidation::SegmentInvalidationProducerIdentity::Unknown;
+    use crate::storage_api::EcstoreScannerNamespaceCommitCardScope as Scope;
+
+    let mut held = BTreeSet::new();
+    for (bucket, scope) in &cards.buckets {
+        if !listed.contains(bucket.as_str()) {
+            continue;
+        }
+        if !widen_dirty_usage_bucket_scope(bucket, scope) {
+            match scope {
+                Scope::Objects(objects) if !objects.is_empty() => {
+                    for object in objects {
+                        record_dirty_usage_object_from_producer(bucket, object, Unknown);
+                    }
+                }
+                _ => record_dirty_usage_bucket_from_producer(bucket, Unknown),
+            }
+        }
+        held.insert(bucket.clone());
+    }
+    held
+}
+
+/// Widen a dirty bucket's scope to cover a namespace-commit card without moving
+/// its generation or producer identities. Returns `false` when the bucket is
+/// not dirty. The widening is process-local, like the commit card itself.
+fn widen_dirty_usage_bucket_scope(bucket: &str, card: &crate::storage_api::EcstoreScannerNamespaceCommitCardScope) -> bool {
+    use crate::storage_api::EcstoreScannerNamespaceCommitCardScope as Scope;
+
+    // Same lock order as `record_dirty_usage_object_inner`.
+    let dirty_buckets = dirty_usage_buckets();
+    if !dirty_buckets.contains_key(bucket) {
+        return false;
+    }
+    let mut dirty_scopes = dirty_usage_bucket_scopes();
+    let scope = dirty_scopes
+        .entry(bucket.to_string())
+        .or_insert(DirtyUsageBucketScope::WholeBucket);
+    let DirtyUsageBucketScope::TopLevelEntries(entries) = scope else {
+        return true;
+    };
+    let widened = match card {
+        Scope::Objects(objects) if !objects.is_empty() => objects.iter().all(|object| {
+            dirty_usage_top_level_entry(object).is_some_and(|entry| {
+                entries.insert(entry);
+                entries.len() <= MAX_DIRTY_USAGE_TOP_LEVEL_ENTRIES_PER_BUCKET
+            })
+        }),
+        _ => false,
+    };
+    if !widened {
+        *scope = DirtyUsageBucketScope::WholeBucket;
+    }
+    true
 }
 
 pub(crate) fn dirty_usage_buckets_pending() -> bool {

@@ -3575,16 +3575,21 @@ async fn scanner_local_publication_defer_reason<S>(storeapi: &S, observational_o
 where
     S: ScannerStorage,
 {
+    // An authoritative publication is blocked by movement or by a namespace
+    // commit that cannot be attributed to a bucket. An attributed commit that
+    // began after the walk's pending set was read is the next cycle's work,
+    // like a write after publication: the next walk holds its bucket grey if
+    // the commit overlaps that walk, so it does not defer this publication.
     let blocked = if observational_only {
         storeapi.scanner_data_movement_publication_blocked().await
     } else {
-        storeapi.scanner_data_usage_publication_blocked().await
+        storeapi.scanner_attributed_usage_publication_blocked().await
     };
     if !blocked {
         return None;
     }
-    // Pending namespace commits invalidate this publication attempt, but only
-    // storage movement creates durable, rate-limited catch-up debt.
+    // Unattributed namespace commits invalidate this publication attempt, but
+    // only storage movement creates durable, rate-limited catch-up debt.
     if storeapi.scanner_data_movement_publication_blocked().await {
         debug!(
             target: "rustfs::scanner",
@@ -3603,7 +3608,7 @@ where
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_RUNTIME,
             stage = "local_barrier",
-            blocker = "pending_namespace_commit",
+            blocker = "unattributed_namespace_commit",
             "Scanner usage publication deferred"
         );
         Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)

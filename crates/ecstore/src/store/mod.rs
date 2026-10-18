@@ -936,6 +936,33 @@ impl ECStore {
         self.scanner_data_usage_publication_snapshot_blocked().await || self.ctx.namespace_commits_pending()
     }
 
+    /// Local publication barrier for an authoritative scanner snapshot. Data
+    /// movement blocks it as in `scanner_data_usage_publication_blocked`, but
+    /// an in-flight namespace commit blocks it only when it cannot be
+    /// attributed to a bucket: attributed commits are reported by
+    /// `scanner_namespace_commit_cards` and keep their bucket grey instead.
+    pub async fn scanner_attributed_usage_publication_blocked(&self) -> bool {
+        let operation_gate = self.ctx.data_movement_operation_gate();
+        let _operation_guard = operation_gate.read_owned().await;
+        self.scanner_data_usage_publication_snapshot_blocked().await || self.ctx.namespace_commits_unattributed()
+    }
+
+    /// End sequence of namespace commits, recorded by a scanner walk before it
+    /// starts reading. See "In-flight namespace commits" in
+    /// docs/architecture/scanner-per-bucket-convergence.md.
+    pub fn scanner_namespace_commit_card_floor(&self) -> u64 {
+        self.ctx.namespace_commit_card_floor()
+    }
+
+    /// Buckets whose namespace commits were in flight or ended after `floor`,
+    /// that is, commits that may overlap the walk that recorded `floor`.
+    pub fn scanner_namespace_commit_cards(
+        &self,
+        floor: u64,
+    ) -> crate::runtime::namespace_commit_cards::ScannerNamespaceCommitCards {
+        self.ctx.namespace_commit_cards_overlapping(floor)
+    }
+
     pub async fn scanner_data_movement_pause_status(&self) -> ScannerDataMovementPauseStatus {
         let operation_gate = self.ctx.data_movement_operation_gate();
         let _operation_guard = operation_gate.read_owned().await;

@@ -27,8 +27,12 @@ Ordinary PUT rename fanouts also track instance-scoped in-flight work. A quorum
 ACK does not release it: the actual disk tasks retain ownership until their
 rename work ends, including when the request caller is cancelled. Scan admission
 remains movement-only so sustained PUTs do not stop namespace walks and
-scanner-driven lifecycle discovery. The post-walk local publication check and
-remote publication leases reject pending fanouts. Begin/end namespace generations
+scanner-driven lifecycle discovery. Locally, a fanout names its bucket: the
+post-walk check holds that bucket grey (pending, not certified) instead of
+rejecting the cycle, and only a commit that cannot be attributed to a bucket still blocks
+local publication (see "In-flight namespace commits" in
+[scanner-per-bucket-convergence.md](scanner-per-bucket-convergence.md)).
+Remote publication leases still reject pending fanouts. Begin/end namespace generations
 invalidate cached plans across the fanout; after acquiring remote leases, the
 coordinator rechecks the guardrail fields of the activity snapshot (the
 structural digest and the movement fields, plus the peers' dirty-usage state
@@ -40,8 +44,9 @@ are the next cycle's work, as described in
 [scanner-per-bucket-convergence.md](scanner-per-bucket-convergence.md).
 
 This adds no namespace or movement lock. An already-verified older snapshot may
-still precede a newly started write. Sustained or stalled PUT tails can delay
-authoritative usage publication, which resumes through the existing retry
+still precede a newly started write. On a distributed deployment sustained or
+stalled PUT tails on a peer can delay authoritative usage publication, which
+resumes through the existing retry
 schedule rather than a new immediate-wakeup protocol. Intermediate per-set and
 prefix cache readers retain their existing approximate-cache semantics. A
 prolonged pending tail with no generation changes can also delay cycle advancement

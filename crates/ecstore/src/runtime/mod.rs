@@ -16,4 +16,5 @@
 
 pub(crate) mod global;
 pub(crate) mod instance;
+pub(crate) mod namespace_commit_cards;
 pub(crate) mod sources;

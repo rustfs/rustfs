@@ -609,10 +609,22 @@ pub mod set_disk {
         pub use crate::set_disk::ConditionalReadBenchmarkMetadataGuard;
         pub use crate::set_disk::{MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause};
 
-        /// Keep a namespace commit pending until the returned owner is dropped.
+        /// Keep a namespace commit that names no bucket pending until the
+        /// returned owner is dropped.
         #[must_use]
         pub fn hold_namespace_commit(store: &crate::store::ECStore) -> impl Send + Sync {
             store.ctx.begin_namespace_commit()
+        }
+
+        /// Keep a namespace commit attributed to `bucket`/`object` pending
+        /// until the returned owner is dropped, as a held PUT rename tail does.
+        #[must_use]
+        pub fn hold_bucket_namespace_commit(
+            store: &crate::store::ECStore,
+            bucket: &str,
+            object: &str,
+        ) -> impl Send + Sync + use<> {
+            store.ctx.begin_bucket_namespace_commit(bucket, Some(object))
         }
     }
 }
@@ -623,6 +635,7 @@ pub mod store_list {
 
 pub mod storage {
     pub use crate::core::pools::{HealLifecycleExpiryContext, POOL_META_NAME};
+    pub use crate::runtime::namespace_commit_cards::{ScannerNamespaceCommitCardScope, ScannerNamespaceCommitCards};
     pub use crate::store::HealWalkVersion;
     pub use crate::store::{
         BootstrapLocalTarget, ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk,

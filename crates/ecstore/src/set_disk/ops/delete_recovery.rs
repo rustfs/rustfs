@@ -299,7 +299,7 @@ impl SetDisks {
         mut context: DeleteRecoveryContext<'_>,
     ) -> Result<()> {
         if context.namespace_owner.is_none() {
-            context.namespace_owner = Some(self.ctx.begin_namespace_commit());
+            context.namespace_owner = Some(self.ctx.begin_bucket_namespace_commit(bucket, Some(object)));
         }
         let can_commit = context.can_commit;
         let states = inspect(disks, bucket, object, transaction).await;
@@ -427,7 +427,7 @@ impl SetDisks {
             let namespace_owner = context
                 .namespace_owner
                 .clone()
-                .unwrap_or_else(|| self.ctx.begin_namespace_commit());
+                .unwrap_or_else(|| self.ctx.begin_bucket_namespace_commit(bucket, Some(object)));
             context.namespace_owner = Some(Arc::new((namespace_owner, guard.clone())));
         }
         let can_commit = context.can_commit;
@@ -583,7 +583,7 @@ impl SetDisks {
         let namespace_owner = if dry_run {
             None
         } else {
-            Some(namespace_owner.unwrap_or_else(|| self.ctx.begin_namespace_commit()))
+            Some(namespace_owner.unwrap_or_else(|| self.ctx.begin_bucket_namespace_commit(bucket, Some(object))))
         };
         if !dry_run && metadata_may_change {
             self.invalidate_get_object_metadata_cache(bucket, object).await;

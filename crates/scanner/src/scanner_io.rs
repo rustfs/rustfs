@@ -1127,13 +1127,15 @@ async fn scanner_cycle_activity_status<S>(
     store: &S,
     distributed: bool,
     before: &crate::scanner::ScannerActivitySnapshot,
+    namespace_commits: &ScannerCycleNamespaceCommits,
 ) -> (ScannerCycleActivityStatus, Vec<(String, String, u64)>)
 where
     S: ScannerStorage,
 {
-    // Read the pending-commit barrier before sampling its completion generation.
-    // A tail that drains during this await must invalidate the earlier baseline.
-    let publication_blocked = store.scanner_data_usage_publication_blocked().await;
+    // Namespace commits that overlap the walk and name their bucket keep that
+    // bucket grey (`ScannerCycleNamespaceCommits::held`). Only movement or a
+    // commit that cannot be attributed to a bucket remains a local barrier.
+    let publication_blocked = namespace_commits.unattributed || store.scanner_attributed_usage_publication_blocked().await;
     match crate::scanner::probe_scanner_activity(store, distributed).await {
         Ok(after) => {
             let veto = if publication_blocked {
@@ -1193,6 +1195,64 @@ where
             );
             (ScannerCycleActivityStatus::Unverified, Vec::new())
         }
+    }
+}
+
+/// Namespace commits that overlap one walk: in flight at the post-walk check
+/// or ended after the floor the cycle recorded before walking.
+#[derive(Debug, Default)]
+pub(super) struct ScannerCycleNamespaceCommits {
+    /// Listed buckets kept grey: reported pending and left out of this
+    /// cycle's certification.
+    held: BTreeSet<String>,
+    /// Some overlapping commit could not be attributed to a bucket.
+    unattributed: bool,
+}
+
+impl ScannerCycleNamespaceCommits {
+    /// Add the held buckets to a `Complete` cycle's pending set.
+    fn extend_pending(&self, pending: &mut ScannerCyclePendingBuckets) {
+        pending.extend(self.held.iter().cloned());
+    }
+
+    /// Keep the held buckets out of the certification snapshot.
+    fn exclude_from_clear(&self, clear: Option<DirtyUsageBuckets>) -> Option<DirtyUsageBuckets> {
+        clear.map(|mut clear| {
+            clear.retain(|bucket, _| !self.held.contains(bucket));
+            clear
+        })
+    }
+}
+
+/// Read, after the walk, every namespace commit that overlaps it and hold its
+/// bucket grey. See "In-flight namespace commits" in
+/// docs/architecture/scanner-per-bucket-convergence.md.
+fn observe_post_walk_namespace_commits<S>(store: &S, floor: u64, listed_buckets: &[BucketInfo]) -> ScannerCycleNamespaceCommits
+where
+    S: ScannerStorage,
+{
+    let cards = store.scanner_namespace_commit_cards(floor);
+    let listed = listed_buckets
+        .iter()
+        .map(|bucket| bucket.name.as_str())
+        .collect::<HashSet<_>>();
+    let held = hold_namespace_commit_buckets(&cards, &listed);
+    if !held.is_empty() || cards.unattributed {
+        debug!(
+            target: "rustfs::scanner::io",
+            event = EVENT_SCANNER_SET_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_IO,
+            state = "cycle_namespace_commits_held",
+            stage = "post_scan_probe",
+            held_buckets = held.len(),
+            unattributed = cards.unattributed,
+            "Scanner kept buckets with namespace commits overlapping the walk grey"
+        );
+    }
+    ScannerCycleNamespaceCommits {
+        held,
+        unattributed: cards.unattributed,
     }
 }
 

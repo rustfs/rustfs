@@ -23,7 +23,7 @@ use crate::scanner_folder::ScannerItem;
 use crate::storage_api::EcstoreScannerPeerDirtyUsageSnapshot;
 use crate::storage_api::owner::{
     EcstorePoolDecommissionInfo, EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats,
-    WriteCommitGuard, WriteCompletion, ecstore_hold_namespace_commit,
+    WriteCommitGuard, WriteCompletion, ecstore_hold_bucket_namespace_commit, ecstore_hold_namespace_commit,
 };
 use crate::storage_api::scan::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions, ObjectIO as _};
 use crate::{

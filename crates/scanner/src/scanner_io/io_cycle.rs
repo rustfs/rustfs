@@ -366,6 +366,8 @@ where
             ));
         }
     };
+    // Commits that end at or below this floor end before the walk reads.
+    let namespace_commit_floor = store.scanner_namespace_commit_card_floor();
     let dirty_generation_before_bucket_list = dirty_usage_generation();
     let bucket_listing = store.list_bucket_for_scanner(&BucketOptions::default()).await?;
     let mut bucket_plan_complete = bucket_listing.topology_complete;
@@ -440,8 +442,9 @@ where
         if !bucket_plan_complete {
             return Ok(ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None).with_publication_epoch(publication_epoch));
         }
+        let namespace_commits = observe_post_walk_namespace_commits(store, namespace_commit_floor, &all_buckets);
         let (activity_status, remote_publication_lease_targets) =
-            scanner_cycle_activity_status(store, distributed, &activity_before).await;
+            scanner_cycle_activity_status(store, distributed, &activity_before, &namespace_commits).await;
         let dirty_usage_status = dirty_usage_snapshot_status(&dirty_usage_snapshot);
         let status = classify_nsscanner_cycle(
             true,
@@ -452,7 +455,9 @@ where
             activity_status,
         );
         let pending_buckets = if status == ScannerCycleStatus::Complete {
-            pending_dirty_usage_buckets(&dirty_usage_snapshot.buckets)
+            let mut pending = pending_dirty_usage_buckets(&dirty_usage_snapshot.buckets);
+            namespace_commits.extend_pending(&mut pending);
+            pending
         } else {
             ScannerCyclePendingBuckets::new()
         };
@@ -482,7 +487,8 @@ where
         if status == ScannerCycleStatus::Complete {
             complete_tier_registry_cycle(want_cycle, leader_epoch);
         }
-        let dirty_usage_clear = (status == ScannerCycleStatus::Complete).then(|| dirty_usage_snapshot.buckets.as_ref().clone());
+        let dirty_usage_clear = namespace_commits
+            .exclude_from_clear((status == ScannerCycleStatus::Complete).then(|| dirty_usage_snapshot.buckets.as_ref().clone()));
         let remote_dirty_usage_acknowledgements = if status == ScannerCycleStatus::Complete {
             crate::scanner::scanner_dirty_usage_acknowledgements(&activity_before)
         } else {
@@ -765,8 +771,9 @@ where
             !namespace_not_found_buckets.is_empty(),
         );
     let dirty_usage_status = dirty_usage_snapshot_status(&dirty_usage_snapshot);
+    let namespace_commits = observe_post_walk_namespace_commits(store, namespace_commit_floor, &all_buckets);
     let (activity_status, remote_publication_lease_targets) =
-        scanner_cycle_activity_status(store, distributed, &activity_before).await;
+        scanner_cycle_activity_status(store, distributed, &activity_before, &namespace_commits).await;
     let all_bucket_names = all_buckets.iter().map(|bucket| bucket.name.clone()).collect::<Vec<_>>();
     let completed_usage = completed_usage_candidate(
         &results,
@@ -813,7 +820,9 @@ where
     // guardrail verdict so a bucket written during the walk is reported in
     // the same publication that certifies the others.
     let pending_buckets = if cycle_status == ScannerCycleStatus::Complete {
-        pending_dirty_usage_buckets(&dirty_usage_snapshot.buckets)
+        let mut pending = pending_dirty_usage_buckets(&dirty_usage_snapshot.buckets);
+        namespace_commits.extend_pending(&mut pending);
+        pending
     } else {
         ScannerCyclePendingBuckets::new()
     };
@@ -833,14 +842,14 @@ where
     } else {
         false
     };
-    let dirty_usage_clear = should_clear_dirty_usage_snapshot(
+    let dirty_usage_clear = namespace_commits.exclude_from_clear(should_clear_dirty_usage_snapshot(
         result.is_ok(),
         structurally_complete_snapshot,
         budget_elapsed,
         activity_status == ScannerCycleActivityStatus::Unchanged,
         &dirty_usage_snapshot.buckets,
         &failed_buckets,
-    );
+    ));
     result?;
     if cycle_status == ScannerCycleStatus::Complete {
         complete_tier_registry_cycle(want_cycle, leader_epoch);

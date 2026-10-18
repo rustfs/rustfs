@@ -3733,10 +3733,11 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 (&commit_bucket, &commit_object),
                 commit_allows_early_ack,
                 crate::set_disk::core::io_primitives::RenameDataFenceOptions::new(write_quorum, None)
-                    .with_namespace_commit_guard(
-                        (!crate::bucket::utils::is_meta_bucketname(&commit_bucket))
-                            .then(|| commit_set.ctx.begin_namespace_commit()),
-                    ),
+                    .with_namespace_commit_guard((!crate::bucket::utils::is_meta_bucketname(&commit_bucket)).then(|| {
+                        commit_set
+                            .ctx
+                            .begin_bucket_namespace_commit(&commit_bucket, Some(&commit_object))
+                    })),
             )
             .await;
             if let Ok(rename_commit) = rename_result.as_mut() {
