@@ -69,7 +69,9 @@ pub(crate) mod cleanup_isolation {
 #[cfg(all(feature = "test-util", not(windows)))]
 pub(crate) mod inline_heal_staging {
     pub(crate) use super::{DiskAPI, DiskOption, Endpoint, new_disk};
-    pub(crate) use rustfs_ecstore::api::disk::{DiskError, LocalPublicationPause, LocalPublicationStage, ReadOptions};
+    pub(crate) use rustfs_ecstore::api::disk::{
+        DeleteOptions, DiskError, LocalPublicationPause, LocalPublicationStage, ReadOptions,
+    };
 }
 
 #[cfg(all(feature = "test-util", target_os = "linux"))]

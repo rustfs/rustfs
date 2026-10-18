@@ -1596,6 +1596,7 @@ pub(crate) async fn acquire_metadata_mutation_lease(
 /// cancelled while a blocking filesystem call is still running.
 pub(crate) struct NamespaceMutationLease {
     _namespace_guard: OwnedMutexGuard<()>,
+    _staging_guard: Option<OwnedMutexGuard<()>>,
     _volume_guard: Option<OwnedRwLockReadGuard<()>>,
     external_guard: Mutex<Option<Arc<dyn Send + Sync>>>,
     // Independent of the quota claim; both survive cancellation of the waiter.
@@ -1618,6 +1619,7 @@ pub(in crate::disk) async fn acquire_namespace_mutation_lease_with_owner(
 ) -> Arc<NamespaceMutationLease> {
     Arc::new(NamespaceMutationLease {
         _namespace_guard: disk_namespace_mutation_lock(path).lock_owned().await,
+        _staging_guard: None,
         _volume_guard: None,
         external_guard: Mutex::new(None),
         _namespace_owner: namespace_owner,
@@ -1631,19 +1633,34 @@ pub(crate) async fn acquire_rename_data_mutation_lease(
     volume: &str,
     destination_object: &Path,
 ) -> Arc<NamespaceMutationLease> {
-    acquire_rename_data_mutation_lease_with_owner(root, volume, destination_object, None).await
+    acquire_rename_data_mutation_lease_with_owner(root, volume, destination_object, None, None).await
 }
 
 pub(crate) async fn acquire_rename_data_mutation_lease_with_owner(
     root: &Path,
     volume: &str,
     destination_object: &Path,
+    staging_prefix: Option<&Path>,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Arc<NamespaceMutationLease> {
-    let namespace_guard = disk_namespace_mutation_lock(destination_object).lock_owned().await;
+    // Metadata ownership precedes namespace paths in lexical order, then volume
+    // ownership. Deduplicate identical keys so TMP-to-TMP publication cannot self-lock.
+    let destination_lock = disk_namespace_mutation_lock(destination_object);
+    let (namespace_guard, staging_guard) = match staging_prefix {
+        Some(source) if source < destination_object => {
+            let staging = disk_namespace_mutation_lock(source).lock_owned().await;
+            (destination_lock.lock_owned().await, Some(staging))
+        }
+        Some(source) if source > destination_object => {
+            let destination = destination_lock.lock_owned().await;
+            (destination, Some(disk_namespace_mutation_lock(source).lock_owned().await))
+        }
+        _ => (destination_lock.lock_owned().await, None),
+    };
     let volume_guard = disk_volume_mutation_lock(root, volume).read_owned().await;
     Arc::new(NamespaceMutationLease {
         _namespace_guard: namespace_guard,
+        _staging_guard: staging_guard,
         _volume_guard: Some(volume_guard),
         external_guard: Mutex::new(None),
         _namespace_owner: namespace_owner,
@@ -2182,9 +2199,19 @@ pub(crate) async fn remove_dir_with_owner(
     if namespace_owner.is_none() {
         return tokio::fs::remove_dir(path).await;
     }
+    let lease = acquire_namespace_mutation_lease_with_owner(path.as_ref(), namespace_owner).await;
+    remove_dir_with_lease(path, lease).await
+}
+
+/// Remove a directory whose namespace is already leased by the caller.
+pub(crate) async fn remove_dir_with_lease(path: impl AsRef<Path>, lease: Arc<NamespaceMutationLease>) -> io::Result<()> {
     let path = path.as_ref().to_path_buf();
-    let lease = acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await;
-    run_blocking_namespace_operation(lease, move || std::fs::remove_dir(path)).await
+    run_blocking_namespace_operation(lease, move || {
+        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Remove, &path);
+        std::fs::remove_dir(path)
+    })
+    .await
 }
 
 /// Preserve raw rename semantics while retaining a counted owner in the syscall.
@@ -5022,6 +5049,53 @@ mod tests {
     use std::time::Duration;
     use tempfile::tempdir;
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[tokio::test]
+    async fn rename_staging_leases_are_ordered_and_deduplicated() {
+        let root = tempdir().expect("namespace fixture");
+        let early = root.path().join("a");
+        let late = root.path().join("b");
+        let blocker = acquire_namespace_mutation_lease_with_owner(&late, None).await;
+        let first_root = root.path().to_path_buf();
+        let first_early = early.clone();
+        let first_late = late.clone();
+        let first = tokio::spawn(async move {
+            drop(
+                acquire_rename_data_mutation_lease_with_owner(&first_root, "bucket", &first_late, Some(&first_early), None).await,
+            );
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while disk_namespace_mutation_lock(&early).try_lock_owned().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("source must acquire the earlier key before waiting for destination");
+        let second_root = root.path().to_path_buf();
+        let second_early = early.clone();
+        let second_late = late.clone();
+        let second = tokio::spawn(async move {
+            drop(
+                acquire_rename_data_mutation_lease_with_owner(&second_root, "bucket", &second_early, Some(&second_late), None)
+                    .await,
+            );
+        });
+        drop(blocker);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            first.await.expect("first publication");
+            second.await.expect("reverse publication");
+        })
+        .await
+        .expect("reverse source/destination order must not deadlock");
+        drop(
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                acquire_rename_data_mutation_lease_with_owner(root.path(), "bucket", &early, Some(&early), None),
+            )
+            .await
+            .expect("identical source and destination key must be acquired once"),
+        );
+    }
 
     #[test]
     fn fsync_groups_do_not_mix_cleanup_and_foreground_workers() {

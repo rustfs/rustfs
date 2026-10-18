@@ -20,7 +20,7 @@ use bytes::Bytes;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo};
 use std::{process::Command, time::Duration};
 use storage_api::inline_heal_staging::{
-    DiskAPI, DiskError, DiskOption, Endpoint, LocalPublicationPause, LocalPublicationStage, ReadOptions, new_disk,
+    DeleteOptions, DiskAPI, DiskError, DiskOption, Endpoint, LocalPublicationPause, LocalPublicationStage, ReadOptions, new_disk,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -162,4 +162,65 @@ fn inline_heal_stages_backup_in_production_durability_modes() {
                 }
             }
         });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recursive_tmp_cleanup_prunes_nested_stage_without_relocking() {
+    for key in ["stage", "stage/child", "stage/deep/child"] {
+        for layout in ["absent", "empty-parent", "present"] {
+            for has_sibling in [false, true] {
+                let root = tempfile::tempdir().expect("nested cleanup fixture");
+                let endpoint = Endpoint::try_from(root.path().to_str().expect("UTF-8 fixture path")).expect("endpoint");
+                let disk = new_disk(&endpoint, &DiskOption::default()).await.expect("local disk");
+                let temporary = root.path().join(TMP_BUCKET);
+                let target = temporary.join(key);
+                tokio::fs::create_dir_all(&temporary).await.expect("TMP bucket");
+                if layout != "absent" {
+                    tokio::fs::create_dir_all(target.parent().expect("target parent"))
+                        .await
+                        .expect("prepare cleanup ancestors");
+                }
+                if layout == "present" {
+                    disk.write_all(TMP_BUCKET, &format!("{key}/payload"), Bytes::from_static(b"removed child"))
+                        .await
+                        .expect("seed cleanup target");
+                }
+                let sibling = if key == "stage" { "other/payload" } else { "stage/sibling" };
+                if has_sibling {
+                    disk.write_all(TMP_BUCKET, sibling, Bytes::from_static(b"preserved sibling"))
+                        .await
+                        .expect("seed sibling");
+                }
+                for _ in 0..2 {
+                    tokio::time::timeout(
+                        Duration::from_secs(10),
+                        disk.delete(
+                            TMP_BUCKET,
+                            key,
+                            DeleteOptions {
+                                recursive: true,
+                                ..Default::default()
+                            },
+                        ),
+                    )
+                    .await
+                    .expect("nested TMP cleanup must not reacquire its staging lease")
+                    .expect("recursive TMP cleanup");
+                }
+                assert!(!target.exists(), "cleanup target must be gone: {key}");
+                assert!(temporary.is_dir(), "TMP bucket must remain");
+                if has_sibling {
+                    assert_eq!(
+                        tokio::fs::read(temporary.join(sibling)).await.expect("sibling survives"),
+                        b"preserved sibling"
+                    );
+                }
+                assert_eq!(
+                    temporary.join("stage").exists(),
+                    has_sibling && key != "stage",
+                    "empty staging ancestors must be pruned: {key}"
+                );
+            }
+        }
+    }
 }
