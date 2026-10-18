@@ -240,6 +240,17 @@ impl Disk {
         }
     }
 
+    pub(crate) async fn begin_legacy_file_write_with_namespace_owner(
+        &self,
+        volume: &str,
+        owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<LegacyFileWrite> {
+        match self {
+            Self::Local(disk) => disk.begin_legacy_file_write_with_namespace_owner(volume, owner).await,
+            Self::Remote(_) => Err(DiskError::DiskNotFound),
+        }
+    }
+
     /// Capture metadata publication admission before authoritative classification.
     pub async fn begin_legacy_metadata_write(&self, volume: &str, path: &str) -> Result<LegacyMetadataWrite> {
         match self {

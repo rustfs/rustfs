@@ -1482,6 +1482,15 @@ impl std::fmt::Debug for LegacyFileWrite {
 }
 
 impl LegacyFileWrite {
+    pub async fn delete_versions(self, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<DiskError>> {
+        with_disk_io_permit(
+            Some(self.permit.clone()),
+            self.disk
+                .execute_delete_versions(&self.volume, versions, opts, Some(self.owner)),
+        )
+        .await
+    }
+
     pub async fn write_all(&self, path: &str, data: Bytes) -> Result<()> {
         crate::disk::io_admission::with_disk_io_permit(
             Some(self.permit.clone()),
@@ -1753,6 +1762,18 @@ impl LocalDiskWrapper {
             publication,
             permit,
         })
+    }
+
+    pub(in crate::disk) async fn begin_legacy_file_write_with_namespace_owner(
+        &self,
+        volume: &str,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<LegacyFileWrite> {
+        let mut write = tokio::time::timeout(get_max_timeout_duration(), self.begin_legacy_file_write(volume))
+            .await
+            .map_err(|_| DiskError::Timeout)??;
+        write.owner = Arc::new((write.owner, namespace_owner));
+        Ok(write)
     }
 
     pub(in crate::disk) async fn begin_legacy_file_write(&self, volume: &str) -> Result<LegacyFileWrite> {
@@ -2294,6 +2315,72 @@ impl LocalDiskWrapper {
         }
     }
 
+    async fn execute_delete_versions(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        opts: DeleteOptions,
+        owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Vec<Option<Error>> {
+        let deadline = owner
+            .as_ref()
+            .map(|_| tokio::time::Instant::now() + get_max_timeout_duration());
+        let version_count = versions.len();
+        self.metrics.record_operation_call("delete_versions");
+        // Check if disk is faulty before proceeding
+        if self.health.is_faulty() {
+            self.metrics.record_availability_error();
+            return vec![Some(DiskError::FaultyDisk); versions.len()];
+        }
+
+        // Stale-drive lookup is part of the same prepared batch deadline.
+        let stale = if let Some(deadline) = deadline {
+            match tokio::time::timeout_at(deadline, self.check_disk_stale()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    self.metrics.record_timeout_error();
+                    return vec![Some(DiskError::Timeout); version_count];
+                }
+            }
+        } else {
+            self.check_disk_stale().await
+        };
+        if let Err(e) = stale {
+            self.metrics.record_availability_error();
+            return vec![Some(e); versions.len()];
+        }
+
+        let _io_permit = match self.acquire_disk_io_permit().await {
+            Ok(permit) => permit,
+            Err(error) => return vec![Some(error); version_count],
+        };
+
+        // Record operation start
+        self.health.last_started.store(current_unix_nanos(), Ordering::Relaxed);
+        let waiting_guard = self.health.waiting_guard();
+        let metric_waiting_guard = self.metrics.waiting_guard();
+        let started = Instant::now();
+
+        // Execute the operation
+        let result = self
+            .disk
+            .delete_versions_with_owner(volume, versions, opts, owner, deadline)
+            .await;
+        self.metrics.record_operation_latency("delete_versions", started.elapsed());
+        self.record_batch_delete_error_metrics(&result);
+
+        drop(waiting_guard);
+        drop(metric_waiting_guard);
+        let has_err = result.iter().any(|e| e.is_some());
+        if !has_err {
+            // Log success and decrement waiting counter
+            self.health.record_operation_success(&self.endpoint(), "operation_success");
+            self.metrics.record_mutation_success(DiskMetricMutation::Delete);
+        }
+
+        result
+    }
+
     fn record_batch_delete_error_metrics(&self, result: &[Option<Error>]) {
         let mut saw_timeout = false;
         let mut saw_availability = false;
@@ -2720,46 +2807,7 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>> {
-        let version_count = versions.len();
-        self.metrics.record_operation_call("delete_versions");
-        // Check if disk is faulty before proceeding
-        if self.health.is_faulty() {
-            self.metrics.record_availability_error();
-            return vec![Some(DiskError::FaultyDisk); versions.len()];
-        }
-
-        // Check if disk is stale
-        if let Err(e) = self.check_disk_stale().await {
-            self.metrics.record_availability_error();
-            return vec![Some(e); versions.len()];
-        }
-
-        let _io_permit = match self.acquire_disk_io_permit().await {
-            Ok(permit) => permit,
-            Err(error) => return vec![Some(error); version_count],
-        };
-
-        // Record operation start
-        self.health.last_started.store(current_unix_nanos(), Ordering::Relaxed);
-        let waiting_guard = self.health.waiting_guard();
-        let metric_waiting_guard = self.metrics.waiting_guard();
-        let started = Instant::now();
-
-        // Execute the operation
-        let result = self.disk.delete_versions(volume, versions, opts).await;
-        self.metrics.record_operation_latency("delete_versions", started.elapsed());
-        self.record_batch_delete_error_metrics(&result);
-
-        drop(waiting_guard);
-        drop(metric_waiting_guard);
-        let has_err = result.iter().any(|e| e.is_some());
-        if !has_err {
-            // Log success and decrement waiting counter
-            self.health.record_operation_success(&self.endpoint(), "operation_success");
-            self.metrics.record_mutation_success(DiskMetricMutation::Delete);
-        }
-
-        result
+        self.execute_delete_versions(volume, versions, opts, None).await
     }
 
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {

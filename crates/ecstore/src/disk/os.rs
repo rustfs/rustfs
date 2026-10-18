@@ -1460,21 +1460,36 @@ pub(crate) struct MetadataMutationLease {
     _owner: Option<Arc<dyn Send + Sync>>,
 }
 
+fn disk_metadata_mutation_lock(object: &Path) -> Arc<AsyncMutex<()>> {
+    let mut locks = DISK_METADATA_MUTATION_LOCKS.lock();
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(object).and_then(Weak::upgrade) {
+        lock
+    } else {
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(object.to_path_buf(), Arc::downgrade(&lock));
+        lock
+    }
+}
+
+pub(in crate::disk) fn try_acquire_metadata_mutation_lease_with_owner(
+    object: &Path,
+    owner: Arc<dyn Send + Sync>,
+) -> Result<Arc<MetadataMutationLease>> {
+    let guard = disk_metadata_mutation_lock(object)
+        .try_lock_owned()
+        .map_err(|_| DiskError::Io(io::Error::from(io::ErrorKind::WouldBlock)))?;
+    Ok(Arc::new(MetadataMutationLease {
+        _guard: guard,
+        _owner: Some(owner),
+    }))
+}
+
 pub(crate) async fn acquire_metadata_mutation_lease(
     object: &Path,
     owner: Option<Arc<dyn Send + Sync>>,
 ) -> Arc<MetadataMutationLease> {
-    let lock = {
-        let mut locks = DISK_METADATA_MUTATION_LOCKS.lock();
-        locks.retain(|_, lock| lock.strong_count() > 0);
-        if let Some(lock) = locks.get(object).and_then(Weak::upgrade) {
-            lock
-        } else {
-            let lock = Arc::new(AsyncMutex::new(()));
-            locks.insert(object.to_path_buf(), Arc::downgrade(&lock));
-            lock
-        }
-    };
+    let lock = disk_metadata_mutation_lock(object);
     Arc::new(MetadataMutationLease {
         _guard: lock.lock_owned().await,
         _owner: owner,

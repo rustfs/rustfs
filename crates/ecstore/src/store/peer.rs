@@ -15,7 +15,9 @@
 use super::*;
 use crate::bucket::utils::has_bad_path_component;
 use crate::disk::error::{DiskError, Result as DiskResult};
-use crate::disk::{DeleteOptions, Disk, LegacyMetadataWrite, LegacyRenameData, RenameDataGuards, RenameDataResp};
+use crate::disk::{
+    DeleteOptions, Disk, LegacyFileWrite, LegacyMetadataWrite, LegacyRenameData, RenameDataGuards, RenameDataResp,
+};
 use crate::runtime::instance::{InstanceContext, NamespaceCommitGuard};
 use crate::runtime::sources as runtime_sources;
 use tracing::{debug, error};
@@ -33,6 +35,11 @@ pub struct BootstrapLocalTarget {
 }
 
 impl BootstrapLocalTarget {
+    pub async fn begin_legacy_local_delete_versions(&self, disk_ref: &str, volume: &str) -> DiskResult<LegacyFileWrite> {
+        validate_bootstrap_volume(volume)?;
+        begin_legacy_local_delete_versions_with_ctx(&self.ctx, disk_ref, volume).await
+    }
+
     /// Resolve only this listener's active local registry; never an ambient store.
     pub async fn local_mutation_disk(&self, disk_ref: &str) -> DiskResult<DiskStore> {
         local_mutation_disk(&self.ctx, disk_ref).await
@@ -107,6 +114,10 @@ fn validate_bootstrap_volume(volume: &str) -> DiskResult<()> {
 }
 
 impl ECStore {
+    pub async fn begin_legacy_local_delete_versions(&self, disk_ref: &str, volume: &str) -> DiskResult<LegacyFileWrite> {
+        begin_legacy_local_delete_versions_with_ctx(&self.ctx, disk_ref, volume).await
+    }
+
     pub async fn local_mutation_disk(&self, disk_ref: &str) -> DiskResult<DiskStore> {
         local_mutation_disk(&self.ctx, disk_ref).await
     }
@@ -492,6 +503,17 @@ async fn rename_local_data_with_ctx(
         .result;
     drop(owner);
     result
+}
+
+async fn begin_legacy_local_delete_versions_with_ctx(
+    ctx: &Arc<InstanceContext>,
+    disk_ref: &str,
+    volume: &str,
+) -> DiskResult<LegacyFileWrite> {
+    let (disk, disk_id) = local_disk_candidate(ctx, disk_ref).await?;
+    let owner = admit_local_disk(ctx, &disk, disk_id, !is_meta_bucketname(volume)).await?;
+    disk.begin_legacy_file_write_with_namespace_owner(volume, owner.map(|owner| owner as Arc<dyn Send + Sync>))
+        .await
 }
 
 async fn begin_legacy_local_metadata_mutation_with_ctx(

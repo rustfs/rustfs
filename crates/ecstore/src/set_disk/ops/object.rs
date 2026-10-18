@@ -23348,6 +23348,100 @@ mod single_delete_namespace_owner_tests {
         .expect("seed a complete real object version");
     }
 
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn legacy_bulk_delete_flow_set_disk_forward_and_quorum_undo() {
+        for rollback in [false, true] {
+            let (_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+            let bucket = "bulk-delete-flow";
+            for disk in &disks {
+                disk.make_volume(bucket).await.expect("real bucket volume");
+            }
+            let versions = [Uuid::new_v4(), Uuid::new_v4()];
+            let body = vec![17u8; 2 * 1024 * 1024];
+            let mut originals = Vec::new();
+            let mut requests = Vec::new();
+            for object in ["first", "second"] {
+                for version in versions {
+                    seed_version(&set, bucket, object, version, &body).await;
+                    requests.push(ObjectToDelete {
+                        object_name: object.to_owned(),
+                        version_id: Some(version),
+                        ..Default::default()
+                    });
+                }
+                for disk in &disks {
+                    let crate::disk::Disk::Local(local) = disk.as_ref() else {
+                        panic!("real local disks required");
+                    };
+                    let path = local
+                        .get_disk()
+                        .get_object_path_for_io(bucket, object)
+                        .expect("object IO path");
+                    let metadata = path.join(STORAGE_FORMAT_FILE);
+                    originals.push((metadata.clone(), std::fs::read(&metadata).expect("complete raw version history")));
+                    for version in versions {
+                        let fi = disk
+                            .read_version("", bucket, object, &version.to_string(), &ReadOptions::default())
+                            .await
+                            .expect("seeded version");
+                        assert!(!fi.inline_data(), "flow must retain actual shard bytes");
+                        let part = path.join(fi.data_dir.expect("shard UUID").to_string()).join("part.1");
+                        originals.push((part.clone(), std::fs::read(part).expect("complete raw shard")));
+                    }
+                }
+                if rollback {
+                    for disk in disks.iter().take(2) {
+                        crate::disk::local::set_delete_version_fail_after_commit(disk.path().as_path(), object);
+                    }
+                }
+            }
+            let (deleted, errors) = set
+                .delete_objects(
+                    bucket,
+                    requests,
+                    ObjectOptions {
+                        versioned: true,
+                        object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                            ObjectLockConfigState::ConfirmedAbsent,
+                        ))),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert_eq!(deleted.len(), 4);
+            assert_eq!(errors.len(), 4);
+            if rollback {
+                assert!(
+                    errors.iter().all(Option::is_some),
+                    "both real object groups must fail write quorum: {errors:?}"
+                );
+                for (path, expected) in &originals {
+                    assert_eq!(
+                        &std::fs::read(path).expect("automatic quorum undo restores every online disk"),
+                        expected,
+                        "{}",
+                        path.display()
+                    );
+                }
+            } else {
+                assert!(errors.iter().all(Option::is_none), "real batch forward succeeds: {errors:?}");
+                for disk in &disks {
+                    for object in ["first", "second"] {
+                        for version in versions {
+                            assert!(
+                                disk.read_version("", bucket, object, &version.to_string(), &ReadOptions::default())
+                                    .await
+                                    .is_err(),
+                                "selected version removed on every disk"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn internal_metadata_mutations_do_not_reenter_pool_metadata() {
