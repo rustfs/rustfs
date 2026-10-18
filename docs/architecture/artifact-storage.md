@@ -62,6 +62,13 @@ Ordinary `UndoWrite` prepares metadata admission on that same captured instance
 before classification. Backup restoration, remaining-version rewrites and fresh
 version rollback retain the admission through physical completion. This does not
 cover `undo_delete` or incarnation-bound deletion.
+Ordinary `DeleteVersion` without rollback staging uses the same admission. It
+covers remaining-version rewrites, final-version removal, and forced delete
+markers when metadata is missing. These operations reuse the prepared publication
+instead of reacquiring namespace or volume locks. Missing metadata without a
+forced marker preserves the original error and leaves optional residue cleanup
+to the existing unprepared cleanup path. Staged deletion and bulk `DeleteVersions`
+remain outside this boundary.
 The incarnation-bound heal path retains its separate admission. Other legacy
 mutation routes and internal metadata publication still need their own admission
 boundary before distributed artifact sealing can be enabled.

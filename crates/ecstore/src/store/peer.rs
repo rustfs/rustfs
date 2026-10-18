@@ -74,14 +74,14 @@ impl BootstrapLocalTarget {
         rename_local_data_with_ctx(&self.ctx, disk_ref, source, fi, destination, RenameDataGuards::default()).await
     }
 
-    pub async fn begin_legacy_local_undo_write(
+    pub async fn begin_legacy_local_metadata_mutation(
         &self,
         disk_ref: &str,
         volume: &str,
         path: &str,
     ) -> DiskResult<LegacyMetadataWrite> {
         validate_bootstrap_volume(volume)?;
-        begin_legacy_local_undo_write_with_ctx(&self.ctx, disk_ref, volume, path).await
+        begin_legacy_local_metadata_mutation_with_ctx(&self.ctx, disk_ref, volume, path).await
     }
 
     pub async fn undo_local_write(
@@ -376,13 +376,13 @@ impl ECStore {
         .await
     }
 
-    pub async fn begin_legacy_local_undo_write(
+    pub async fn begin_legacy_local_metadata_mutation(
         &self,
         disk_ref: &str,
         volume: &str,
         path: &str,
     ) -> DiskResult<LegacyMetadataWrite> {
-        begin_legacy_local_undo_write_with_ctx(&self.ctx, disk_ref, volume, path).await
+        begin_legacy_local_metadata_mutation_with_ctx(&self.ctx, disk_ref, volume, path).await
     }
 
     pub async fn undo_local_write(
@@ -494,7 +494,7 @@ async fn rename_local_data_with_ctx(
     result
 }
 
-async fn begin_legacy_local_undo_write_with_ctx(
+async fn begin_legacy_local_metadata_mutation_with_ctx(
     ctx: &Arc<InstanceContext>,
     disk_ref: &str,
     volume: &str,
@@ -885,7 +885,7 @@ mod tests {
             let store = super::super::tests::build_store_with_ctx(ctx_a.clone());
             let generation = ctx_a.namespace_commit_generation();
             let token = store
-                .begin_legacy_local_undo_write(&id.to_string(), "undo-target", "object")
+                .begin_legacy_local_metadata_mutation(&id.to_string(), "undo-target", "object")
                 .await
                 .expect("capture A through real UUID lookup");
             assert!(ctx_a.namespace_commits_pending());
@@ -963,7 +963,7 @@ mod tests {
         ] {
             assert_eq!(
                 target
-                    .begin_legacy_local_undo_write(&disk.endpoint().to_string(), volume, "object")
+                    .begin_legacy_local_metadata_mutation(&disk.endpoint().to_string(), volume, "object")
                     .await
                     .expect_err("bootstrap raw volume must reject before admission"),
                 DiskError::FileAccessDenied,
@@ -986,7 +986,7 @@ mod tests {
                 .await
                 .expect("real internal overwrite");
             target
-                .begin_legacy_local_undo_write(&disk.endpoint().to_string(), volume, "object")
+                .begin_legacy_local_metadata_mutation(&disk.endpoint().to_string(), volume, "object")
                 .await
                 .expect("legitimate internal prepare")
                 .undo_write(
@@ -1045,7 +1045,7 @@ mod tests {
         let store = super::super::tests::build_store_with_ctx(ctx.clone());
         let generation = ctx.namespace_commit_generation();
         let token = store
-            .begin_legacy_local_undo_write(&disk.endpoint().to_string(), "undo-owner", "object")
+            .begin_legacy_local_metadata_mutation(&disk.endpoint().to_string(), "undo-owner", "object")
             .await
             .expect("prepare with captured instance owner");
         let destination = disk

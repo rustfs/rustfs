@@ -1553,17 +1553,31 @@ impl LegacyMetadataWrite {
         if !opts.undo_write || opts.undo_delete {
             return Err(DiskError::MethodNotAllowed);
         }
+        self.execute_delete_version(fi, false, opts).await
+    }
+
+    pub async fn delete_version(self, fi: FileInfo, force_del_marker: bool, opts: DeleteOptions) -> Result<()> {
+        if opts.undo_write || opts.undo_delete || opts.old_data_dir.is_some() {
+            return Err(DiskError::MethodNotAllowed);
+        }
+        self.execute_delete_version(fi, force_del_marker, opts).await
+    }
+
+    async fn execute_delete_version(self, fi: FileInfo, force_del_marker: bool, opts: DeleteOptions) -> Result<()> {
         crate::disk::io_admission::with_disk_io_permit(
             Some(self.permit.clone()),
             self.disk.track_disk_health_mutation(
                 "delete_version",
                 DiskMetricMutation::Delete,
                 || async {
-                    Box::pin(
-                        self.disk
-                            .disk
-                            .undo_write_prepared(&self.volume, &self.path, fi, opts, self.publication.clone()),
-                    )
+                    Box::pin(self.disk.disk.delete_version_prepared(
+                        &self.volume,
+                        &self.path,
+                        fi,
+                        force_del_marker,
+                        opts,
+                        self.publication.clone(),
+                    ))
                     .await
                 },
                 get_max_timeout_duration(),
@@ -1708,13 +1722,13 @@ impl LocalDiskWrapper {
         volume: &str,
         path: &str,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
-        undo_write: bool,
+        delete_version: bool,
     ) -> Result<LegacyMetadataWrite> {
         let permit = self.io_admission.foreground();
         let publication = tokio::time::timeout(
             get_max_timeout_duration(),
             self.disk
-                .begin_legacy_metadata_write(volume, path, permit.clone(), namespace_owner, undo_write),
+                .begin_legacy_metadata_write(volume, path, permit.clone(), namespace_owner, delete_version),
         )
         .await
         .map_err(|_| DiskError::Timeout)??;
