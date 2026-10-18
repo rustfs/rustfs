@@ -917,6 +917,17 @@ impl NodeService {
                 }
                 Err(err) => Err(err),
             }
+        } else if !opts.undo_delete && opts.old_data_dir.is_some() {
+            match target
+                .begin_legacy_local_metadata_mutation(&request.disk, &request.volume, &request.path)
+                .await
+            {
+                Ok(write) => {
+                    target.reject_legacy_artifact_mutation(&request.volume).await?;
+                    write.stage_delete_version(file_info, request.force_del_marker, opts).await
+                }
+                Err(err) => Err(err),
+            }
         } else if let Some(disk) = target.find_mutation_disk(&request.disk).await {
             target.reject_legacy_artifact_mutation(&request.volume).await?;
             disk.delete_version(&request.volume, &request.path, file_info, request.force_del_marker, opts)
@@ -3647,14 +3658,13 @@ mod legacy_artifact_tests {
         }
     }
 
-    async fn stage_legacy_undo_delete(
+    async fn prepare_legacy_delete_rollback(
         disk: &ecstore_disk::DiskStore,
         volume: &str,
         path: &str,
         case: &str,
-    ) -> (FileInfo, DeleteOptions, Option<Vec<u8>>) {
+    ) -> (FileInfo, Option<Vec<u8>>) {
         let object_dir = ecstore_disk::DiskAPI::path(disk.as_ref()).join(volume).join(path);
-        let rollback = Uuid::new_v4();
         let mut fi = inline_rename_file_info(path);
         fi.data = None;
         fi.metadata.clear();
@@ -3683,6 +3693,18 @@ mod legacy_artifact_tests {
                     .expect("original metadata bytes"),
             )
         };
+        (fi, original)
+    }
+
+    async fn stage_legacy_undo_delete(
+        disk: &ecstore_disk::DiskStore,
+        volume: &str,
+        path: &str,
+        case: &str,
+    ) -> (FileInfo, DeleteOptions, Option<Vec<u8>>) {
+        let object_dir = ecstore_disk::DiskAPI::path(disk.as_ref()).join(volume).join(path);
+        let rollback = Uuid::new_v4();
+        let (fi, original) = prepare_legacy_delete_rollback(disk, volume, path, case).await;
         disk.delete_version(
             volume,
             path,
@@ -3881,6 +3903,268 @@ mod legacy_artifact_tests {
                 assert!(
                     !env.disk_paths[0].join(&volume).exists(),
                     "retained authority must not recreate volume or object"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_staged_delete_receiver_preserves_variants_and_instance_binding() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-staged-delete-receiver-test-secret".to_owned());
+        let root = tempfile::tempdir().expect("staged delete receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("staged-delete-ordinary", true).await;
+        env.ecstore
+            .clone()
+            .make_artifact_bucket("staged-delete-managed", "outputs/")
+            .await
+            .expect("managed bucket");
+        let ready = service_for(&env).await;
+        let instance = crate::storage::storage_api::bootstrap_instance_ctx();
+        assert!(super::super::BootstrapLocalTarget::new(instance.clone()).is_for_store(&env.ecstore));
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = ready
+            .local_mutation_target()
+            .find_mutation_disk(&disk_ref)
+            .await
+            .expect("listener disk");
+        let mut wrong_instance = super::super::make_server_for_context(ready.context.clone());
+        wrong_instance.server_ctx = Some(super::super::ServerContextSlot::with_instance_context(
+            crate::storage::storage_api::new_instance_ctx(),
+        ));
+        for bootstrap in [false, true] {
+            let slot = super::super::ServerContextSlot::with_instance_context(instance.clone());
+            if !bootstrap {
+                slot.try_install(ready.context.clone().expect("ready context"))
+                    .expect("install this instance");
+            }
+            let service = super::super::make_server_for_slot(slot);
+            assert_eq!(matches!(service.local_mutation_target(), LocalMutationTarget::Bootstrap(_)), bootstrap);
+            for msgpack in [false, true] {
+                for volume in ["staged-delete-ordinary", ".rustfs.sys", "staged-delete-managed"] {
+                    for case in ["remaining", "last", "marker"] {
+                        let path = if volume == "staged-delete-managed" {
+                            format!("outputs/74656e616e74/{}/{}/{case}-{msgpack}-{bootstrap}", Uuid::new_v4(), Uuid::new_v4())
+                        } else {
+                            format!("staged-delete/{case}-{msgpack}-{bootstrap}")
+                        };
+                        let (fi, previous) = if case == "remaining" {
+                            stage_legacy_delete(&disk, volume, &path, case).await
+                        } else {
+                            let (fi, _) = prepare_legacy_delete_rollback(&disk, volume, &path, case).await;
+                            (fi, None)
+                        };
+                        let object_dir = env.disk_paths[0].join(volume).join(&path);
+                        let metadata = object_dir.join("xl.meta");
+                        let before = tokio::fs::read(&metadata).await.ok();
+                        assert_eq!(before.is_none(), case == "marker");
+                        let rollback = Uuid::new_v4();
+                        let rollback_path = object_dir.join(rollback.to_string());
+                        let opts = DeleteOptions {
+                            old_data_dir: Some(rollback),
+                            ..Default::default()
+                        };
+                        if volume == ".rustfs.sys" && case == "last" {
+                            let rejected = authenticated_legacy_delete(
+                                &wrong_instance,
+                                signed_legacy_delete_request(&disk_ref, volume, &path, &fi, &opts, msgpack, false),
+                            )
+                            .await
+                            .expect("wrong-instance response")
+                            .into_inner();
+                            assert!(!rejected.success, "a listener must not fall back to its ready context or ambient disks");
+                            assert!(rejected.error.is_some());
+                            assert_eq!(tokio::fs::read(&metadata).await.ok(), before);
+                            assert!(!rollback_path.exists());
+                        }
+                        let result = authenticated_legacy_delete(
+                            &service,
+                            signed_legacy_delete_request(&disk_ref, volume, &path, &fi, &opts, msgpack, case == "marker"),
+                        )
+                        .await;
+                        if bootstrap && volume != ".rustfs.sys" {
+                            let response = result.expect("bootstrap admission response").into_inner();
+                            assert!(!response.success);
+                            assert_eq!(DiskError::from(response.error.expect("bootstrap error")), DiskError::FileAccessDenied);
+                        } else if volume == "staged-delete-managed" {
+                            assert_eq!(result.expect_err("managed staging rejects").code(), tonic::Code::PermissionDenied);
+                        } else {
+                            let response = result.expect("signed staged delete response").into_inner();
+                            assert!(
+                                response.success,
+                                "volume={volume}, case={case}, bootstrap={bootstrap}, msgpack={msgpack}: {:?}",
+                                response.error
+                            );
+                            assert!(response.error.is_none());
+                            assert_eq!(response.raw_file_info, "null");
+                            if case == "marker" {
+                                assert!(rollback_path.join("xl.meta.delete-marker.rollback").exists());
+                                assert!(!rollback_path.join("xl.meta.bkp").exists());
+                                let marker = disk
+                                    .read_version(
+                                        volume,
+                                        volume,
+                                        &path,
+                                        &fi.version_id.expect("marker version").to_string(),
+                                        &ReadOptions::default(),
+                                    )
+                                    .await
+                                    .expect("persisted forced marker");
+                                assert!(marker.is_canonical_delete_marker());
+                                assert_eq!(marker.version_id, fi.version_id);
+                            } else {
+                                assert_eq!(
+                                    tokio::fs::read(rollback_path.join("xl.meta.bkp"))
+                                        .await
+                                        .expect("staged exact backup"),
+                                    *before.as_ref().expect("old metadata")
+                                );
+                                assert_eq!(
+                                    disk.read_version(
+                                        volume,
+                                        volume,
+                                        &path,
+                                        &fi.version_id.expect("deleted version").to_string(),
+                                        &ReadOptions::default(),
+                                    )
+                                    .await
+                                    .expect_err("forward staging removes the requested version"),
+                                    DiskError::FileVersionNotFound
+                                );
+                                if let Some((previous, _)) = previous {
+                                    let retained = disk
+                                        .read_version(
+                                            volume,
+                                            volume,
+                                            &path,
+                                            &previous.version_id.expect("previous version").to_string(),
+                                            &ReadOptions {
+                                                read_data: true,
+                                                ..Default::default()
+                                            },
+                                        )
+                                        .await
+                                        .expect("remaining version");
+                                    assert_eq!(retained.data, previous.data);
+                                    assert_eq!(retained.version_id, previous.version_id);
+                                } else {
+                                    assert!(!metadata.exists(), "last version removed");
+                                }
+                            }
+                            let undo = DeleteOptions {
+                                undo_write: true,
+                                undo_delete: true,
+                                ..opts
+                            };
+                            let response = authenticated_legacy_delete(
+                                &service,
+                                signed_legacy_delete_request(&disk_ref, volume, &path, &fi, &undo, msgpack, false),
+                            )
+                            .await
+                            .expect("signed undo response")
+                            .into_inner();
+                            assert!(response.success, "staged delete undo: {:?}", response.error);
+                            assert!(!rollback_path.exists(), "undo consumes rollback state");
+                            if case != "marker" {
+                                let restored = disk
+                                    .read_version(
+                                        volume,
+                                        volume,
+                                        &path,
+                                        &fi.version_id.expect("original version").to_string(),
+                                        &ReadOptions {
+                                            read_data: true,
+                                            ..Default::default()
+                                        },
+                                    )
+                                    .await
+                                    .expect("restored exact version");
+                                assert_eq!(restored.version_id, fi.version_id);
+                                assert_eq!(restored.size, fi.size);
+                                assert_eq!(restored.data_dir, fi.data_dir);
+                                if fi.data.is_some() {
+                                    assert_eq!(restored.data, fi.data);
+                                }
+                            }
+                        }
+                        assert_eq!(
+                            tokio::fs::read(&metadata).await.ok(),
+                            before,
+                            "rejected or undone staging preserves metadata bytes"
+                        );
+                        assert!(!rollback_path.exists());
+                        if let Some(data_dir) = fi.data_dir {
+                            let data_path = object_dir.join(data_dir.to_string());
+                            assert_eq!(
+                                tokio::fs::read(data_path.join("part.1"))
+                                    .await
+                                    .expect("original part retained"),
+                                LEGACY_RENAME_BODY
+                            );
+                            for prefix in ["reserve-delete-data.", "delete-data."] {
+                                assert!(!data_path.join(format!("{prefix}{rollback}")).exists());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_staged_delete_receiver_rejects_missing_volume_with_retained_authority() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-staged-delete-receiver-test-secret".to_owned());
+        let root = tempfile::tempdir().expect("missing staged delete receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        let service = service_for(&env).await;
+        let target = service.local_mutation_target();
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = target.find_mutation_disk(&disk_ref).await.expect("listener local disk");
+        for msgpack in [false, true] {
+            for case in ["remaining", "last", "marker"] {
+                let volume = format!("staged-delete-missing-{case}-{msgpack}");
+                env.make_bucket(&volume, true).await;
+                let path = "nested/object";
+                let fi = if case == "remaining" {
+                    stage_legacy_delete(&disk, &volume, path, case).await.0
+                } else {
+                    prepare_legacy_delete_rollback(&disk, &volume, path, case).await.0
+                };
+                let incarnation = env
+                    .ecstore
+                    .bucket_incarnation_id(&volume)
+                    .await
+                    .expect("authoritative incarnation");
+                disk.delete_volume(&volume, true).await.expect("remove only receiving volume");
+                assert_eq!(env.ecstore.bucket_incarnation_id(&volume).await.expect("retained authority"), incarnation);
+                target
+                    .reject_legacy_artifact_mutation(&volume)
+                    .await
+                    .expect("ordinary authority still classifies");
+                let opts = DeleteOptions {
+                    old_data_dir: Some(Uuid::new_v4()),
+                    ..Default::default()
+                };
+                let response = authenticated_legacy_delete(
+                    &service,
+                    signed_legacy_delete_request(&disk_ref, &volume, path, &fi, &opts, msgpack, case == "marker"),
+                )
+                .await
+                .expect("missing-volume response")
+                .into_inner();
+                assert!(!response.success);
+                assert_eq!(DiskError::from(response.error.expect("missing-volume error")), DiskError::VolumeNotFound);
+                assert!(
+                    !env.disk_paths[0].join(&volume).exists(),
+                    "retained authority must not recreate physical parents"
                 );
             }
         }
