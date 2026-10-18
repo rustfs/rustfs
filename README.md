@@ -364,7 +364,6 @@ for backward compatibility with older policies):
 
 <a href="https://repocloud.io/details/RustFS/"><img src="https://d16t0pc4846x52.cloudfront.net/deploylobe.svg" alt="Deploy on RepoCloud" height="34"></a>
 <a href="https://railway.com/deploy/rustfs"><img src="https://railway.com/button.svg" alt="Deploy on Railway" height="34"></a>
-<a href="https://zeabur.com/templates/7FG0WI"><img src="https://zeabur.com/button.svg" alt="Deploy on Zeabur" height="34"></a>
 <a href="https://template.sealos.io/deploy?templateName=rustfs"><img src="https://raw.githubusercontent.com/labring-actions/templates/main/Deploy-on-Sealos.svg" alt="Deploy on Sealos" height="34"></a>
 <a href="https://elest.io/open-source/rustfs"><img src="https://elest.io/images/logos/deploy-to-elestio-btn.png" alt="Deploy on Elestio" height="34"></a>
 
