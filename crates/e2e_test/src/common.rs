@@ -1037,6 +1037,22 @@ pub async fn awscurl_post_sts_form_urlencoded(
     Ok(response)
 }
 
+fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml[start..end].to_string())
+}
+
+/// Returns `(access_key, secret_key, session_token)` from an STS `AssumeRole` XML response.
+pub fn parse_assume_role_credentials(xml: &str) -> Result<(String, String, String), Box<dyn std::error::Error + Send + Sync>> {
+    let access_key = extract_xml_tag(xml, "AccessKeyId").ok_or("missing AccessKeyId in AssumeRole response")?;
+    let secret_key = extract_xml_tag(xml, "SecretAccessKey").ok_or("missing SecretAccessKey in AssumeRole response")?;
+    let session_token = extract_xml_tag(xml, "SessionToken").ok_or("missing SessionToken in AssumeRole response")?;
+    Ok((access_key, secret_key, session_token))
+}
+
 /// Helper function for POST requests
 pub async fn awscurl_post(
     url: &str,

@@ -14,8 +14,8 @@
 
 use crate::common::{
     AdminTransport, RustFSTestEnvironment, admin_add_canned_policy_via, admin_attach_user_policy_via, admin_create_user,
-    awscurl_post_sts_form_urlencoded, init_logging, local_http_client, replication_fast_env, rustfs_binary_path, signed_request,
-    signed_request_with_client, signed_request_with_session_token,
+    awscurl_post_sts_form_urlencoded, init_logging, local_http_client, parse_assume_role_credentials, replication_fast_env,
+    rustfs_binary_path, signed_request, signed_request_with_client, signed_request_with_session_token,
 };
 use crate::fake_s3_target::{
     FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, FaultAction as FakeTargetFault, Operation as FakeTargetOperation,
@@ -385,21 +385,6 @@ pub(crate) struct ReplicationResetStatusTarget {
     pub(crate) replicated_count: i64,
     #[serde(rename = "object", default)]
     pub(crate) object: String,
-}
-
-fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&close)? + start;
-    Some(xml[start..end].to_string())
-}
-
-fn parse_assume_role_credentials(xml: &str) -> Result<(String, String, String), Box<dyn Error + Send + Sync>> {
-    let access_key = extract_xml_tag(xml, "AccessKeyId").ok_or("missing AccessKeyId in AssumeRole response")?;
-    let secret_key = extract_xml_tag(xml, "SecretAccessKey").ok_or("missing SecretAccessKey in AssumeRole response")?;
-    let session_token = extract_xml_tag(xml, "SessionToken").ok_or("missing SessionToken in AssumeRole response")?;
-    Ok((access_key, secret_key, session_token))
 }
 
 pub(crate) struct ReplicationTargetOptions<'a> {

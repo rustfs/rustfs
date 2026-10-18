@@ -1261,6 +1261,7 @@ impl DefaultObjectUsecase {
         {
             return Err(s3_error!(InvalidStorageClass));
         }
+        reject_non_wildcard_write_if_none_match(req.input.if_none_match.as_ref(), &req.headers)?;
         // An authorized inbound replication PUT must store the replica verbatim.
         // Legacy snowball-extracted members may still carry the auto-extract
         // metadata, which replication replays as a header. Do not interpret that
@@ -3570,6 +3571,25 @@ mod tests {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
 
         assert!(should_use_zero_copy(2 * 1024 * 1024, &headers));
+    }
+
+    #[tokio::test]
+    async fn execute_put_object_rejects_post_object_etag_if_none_match_header() {
+        let input = PutObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .build()
+            .expect("POST-to-PUT input should build without conditional DTO fields");
+        let mut req = build_request(input, Method::POST);
+        req.extensions.insert(PostObjectRequestMarker);
+        req.headers
+            .insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("\"different-etag\""));
+
+        let usecase = DefaultObjectUsecase::without_context();
+        let err = Box::pin(usecase.execute_put_object(&FS::new(), req))
+            .await
+            .expect_err("POST header-only ETag precondition must fail before storage access");
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
     }
 
     #[tokio::test]
