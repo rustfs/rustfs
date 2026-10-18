@@ -130,8 +130,8 @@ async fn test_conditional_put_failed() -> TestResult {
     assert_s3_error_code(response1, "PreconditionFailed");
     assert_eq!(object_body(&client, test_key).await?.as_ref(), initial_data);
 
-    // Test 2: writes accept If-None-Match only as `*`; an ETag value is answered
-    // with 501 NotImplemented, as on AWS, whether or not it matches.
+    // Test 2: writes accept If-None-Match only as `*`; RustFS rejects an ETag
+    // value with 501 NotImplemented whether or not it matches.
     for if_none_match in [initial_etag.as_str(), "\"fake-etag-12345\""] {
         let response = client
             .put_object()
@@ -265,7 +265,7 @@ async fn test_conditional_multi_part_upload() -> TestResult {
 
     assert_s3_error_code(complete_response, "PreconditionFailed");
 
-    // Test 2: Multipart upload with an ETag If-None-Match, rejected as on AWS
+    // Test 2: Multipart upload with an unsupported ETag If-None-Match
     let complete_response = client
         .complete_multipart_upload()
         .bucket(TEST_BUCKET)

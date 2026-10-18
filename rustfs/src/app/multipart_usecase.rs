@@ -580,7 +580,7 @@ impl DefaultMultipartUsecase {
             ..
         } = input;
 
-        reject_non_wildcard_write_if_none_match(if_none_match.as_ref())?;
+        reject_non_wildcard_write_if_none_match(if_none_match.as_ref(), &req.headers)?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         if if_match.is_some() || if_none_match.is_some() {
@@ -3016,7 +3016,7 @@ mod tests {
             .expect_err("DTO-only If-None-Match: * on existing key must fail");
         assert_eq!(dto_complete_err.code(), &S3ErrorCode::PreconditionFailed);
 
-        // Weak If-None-Match ETag must also prevent overwriting the existing object.
+        // Write requests reject ETag-valued If-None-Match before checking object state.
         let weak_if_none_match_input = CompleteMultipartUploadInput::builder()
             .bucket(bucket.clone())
             .key(object.to_string())
@@ -3028,8 +3028,8 @@ mod tests {
         let weak_complete_err = usecase
             .execute_complete_multipart_upload(build_request(weak_if_none_match_input, Method::POST))
             .await
-            .expect_err("weak If-None-Match matching existing ETag must fail");
-        assert_eq!(weak_complete_err.code(), &S3ErrorCode::PreconditionFailed);
+            .expect_err("weak If-None-Match ETag must be rejected as unsupported");
+        assert_eq!(weak_complete_err.code(), &S3ErrorCode::NotImplemented);
 
         let second_complete_input = CompleteMultipartUploadInput::builder()
             .bucket(bucket.clone())

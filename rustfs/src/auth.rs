@@ -772,21 +772,6 @@ pub fn get_condition_values_with_query_and_client_info(
         clone_header.remove(*grant_header);
     }
 
-    // `s3:if-none-match` / `s3:if-match` must describe the precondition the write
-    // enforces, which ignores a blank header. A raw copy would let `If-None-Match:`
-    // with no value satisfy `Null: false` while the object is overwritten.
-    for conditional_header in [IF_NONE_MATCH, IF_MATCH] {
-        if let Some(value) = clone_header
-            .get(&conditional_header)
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        {
-            args.insert(conditional_header.as_str().to_string(), vec![value.to_string()]);
-        }
-        clone_header.remove(&conditional_header);
-    }
-
     // Claims and group membership are part of the verified identity, so they are
     // resolved before request headers are merged in below.
     if let Some(claims) = &cred.claims {
@@ -811,6 +796,21 @@ pub fn get_condition_values_with_query_and_client_info(
         && !args.contains_key("groups")
     {
         args.insert("groups".to_string(), groups.clone());
+    }
+
+    // Only request headers may supply these keys, including when they are absent.
+    // A blank header must not satisfy `Null: false` while the write ignores it.
+    for conditional_header in [IF_NONE_MATCH, IF_MATCH] {
+        args.remove(conditional_header.as_str());
+        if let Some(value) = clone_header
+            .get(&conditional_header)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            args.insert(conditional_header.as_str().to_string(), vec![value.to_string()]);
+        }
+        clone_header.remove(&conditional_header);
     }
 
     // Every remaining header is attacker-controlled. A header must never contribute
@@ -2092,6 +2092,36 @@ mod tests {
             assert!(!conditions.contains_key("if-none-match"), "headers {headers:?}");
             assert!(!conditions.contains_key("if-match"), "headers {headers:?}");
         }
+    }
+
+    #[test]
+    fn test_get_condition_values_conditional_write_headers_cannot_be_overridden_by_claims() {
+        let mut cred = create_service_account_credentials();
+        cred.claims = Some(HashMap::from([
+            ("if-none-match".to_string(), json!("*")),
+            ("if-match".to_string(), json!("\"claim-etag\"")),
+        ]));
+
+        for value in [None, Some(""), Some(" ")] {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = value {
+                headers.insert(IF_NONE_MATCH, HeaderValue::from_str(value).expect("valid header"));
+                headers.insert(IF_MATCH, HeaderValue::from_str(value).expect("valid header"));
+            }
+            let conditions = get_condition_values(&headers, &cred, None, None, None);
+            assert!(
+                !conditions.contains_key("if-none-match"),
+                "claim must not fabricate an absent precondition"
+            );
+            assert!(!conditions.contains_key("if-match"), "claim must not fabricate an absent precondition");
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, HeaderValue::from_static("*"));
+        headers.insert(IF_MATCH, HeaderValue::from_static("\"request-etag\""));
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+        assert_eq!(conditions.get("if-none-match"), Some(&vec!["*".to_string()]));
+        assert_eq!(conditions.get("if-match"), Some(&vec!["\"request-etag\"".to_string()]));
     }
 
     #[test]

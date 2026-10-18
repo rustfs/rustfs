@@ -1107,15 +1107,25 @@ pub(crate) fn odm_check_source_preconditions(headers: &HeaderMap, head: &SourceH
     check_preconditions(headers, &info)
 }
 
-/// S3 accepts `If-None-Match` on PutObject, CopyObject and CompleteMultipartUpload
-/// only as `*` (create-only) and answers any other value with 501 NotImplemented.
+/// S3 documents write-side `If-None-Match` only as `*` (create-only).
+/// Reject unsupported ETag comparisons with 501 NotImplemented.
 /// Treating it as an ETag comparison would let a write overwrite an existing key
 /// while still satisfying a policy that requires `s3:if-none-match`.
-pub(crate) fn reject_non_wildcard_write_if_none_match(if_none_match: Option<&s3s::dto::ETagCondition>) -> S3Result<()> {
-    match if_none_match {
-        Some(s3s::dto::ETagCondition::ETag(_)) => Err(S3Error::new(S3ErrorCode::NotImplemented)),
-        Some(s3s::dto::ETagCondition::Any) | None => Ok(()),
+pub(crate) fn reject_non_wildcard_write_if_none_match(
+    if_none_match: Option<&s3s::dto::ETagCondition>,
+    headers: &HeaderMap,
+) -> S3Result<()> {
+    // POST parses conditional DTO fields from the form, so HTTP headers also need validation.
+    let unsupported_header = headers.get_all(http::header::IF_NONE_MATCH).iter().any(|value| {
+        value.to_str().map_or(true, |value| {
+            let value = value.trim();
+            !value.is_empty() && value != "*"
+        })
+    });
+    if matches!(if_none_match, Some(s3s::dto::ETagCondition::ETag(_))) || unsupported_header {
+        return Err(S3Error::new(S3ErrorCode::NotImplemented));
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1130,17 +1140,35 @@ mod tests {
 
     #[test]
     fn reject_non_wildcard_write_if_none_match_allows_only_wildcard() {
-        assert!(reject_non_wildcard_write_if_none_match(None).is_ok());
-        assert!(reject_non_wildcard_write_if_none_match(Some(&s3s::dto::ETagCondition::Any)).is_ok());
+        let headers = HeaderMap::new();
+        assert!(reject_non_wildcard_write_if_none_match(None, &headers).is_ok());
+        assert!(reject_non_wildcard_write_if_none_match(Some(&s3s::dto::ETagCondition::Any), &headers).is_ok());
 
         let etag = s3s::dto::ETagCondition::ETag(ETag::Strong("9b2cf535f27731c974343645a3985328".to_owned()));
-        let err = reject_non_wildcard_write_if_none_match(Some(&etag)).expect_err("an ETag If-None-Match must be rejected");
+        let err =
+            reject_non_wildcard_write_if_none_match(Some(&etag), &headers).expect_err("an ETag If-None-Match must be rejected");
         assert_eq!(*err.code(), S3ErrorCode::NotImplemented);
         assert_eq!(err.status_code(), Some(http::StatusCode::NOT_IMPLEMENTED));
         assert_eq!(
             err.message(),
             Some("A header you provided implies functionality that is not implemented.")
         );
+    }
+
+    #[test]
+    fn reject_non_wildcard_write_if_none_match_checks_header_without_dto() {
+        for value in ["*", " * ", "", " "] {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::IF_NONE_MATCH, http::HeaderValue::from_str(value).expect("valid header"));
+            assert!(reject_non_wildcard_write_if_none_match(None, &headers).is_ok(), "{value:?}");
+        }
+        for value in ["\"different-etag\"", "W/\"weak-etag\"", "unquoted-etag"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::IF_NONE_MATCH, http::HeaderValue::from_str(value).expect("valid header"));
+            let err = reject_non_wildcard_write_if_none_match(None, &headers)
+                .expect_err("header-only ETag precondition must be rejected");
+            assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        }
     }
 
     #[test]
