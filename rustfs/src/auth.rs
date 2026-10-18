@@ -775,7 +775,10 @@ pub fn get_condition_values_with_query_and_client_info(
             if let Some(v_str) = v.as_str() {
                 let key = k.trim_start_matches("ldap");
                 // Request conditions cannot originate from identity claims, even without a header.
-                if key.eq_ignore_ascii_case(IF_MATCH.as_str()) || key.eq_ignore_ascii_case(IF_NONE_MATCH.as_str()) {
+                if key.eq_ignore_ascii_case(OBJECT_CREATION_OPERATION_CONDITION)
+                    || key.eq_ignore_ascii_case(IF_MATCH.as_str())
+                    || key.eq_ignore_ascii_case(IF_NONE_MATCH.as_str())
+                {
                     continue;
                 }
                 args.insert(key.to_lowercase(), vec![v_str.to_string()]);
@@ -843,6 +846,9 @@ pub fn get_condition_values_with_query_and_client_info(
 
     args
 }
+
+/// The S3 operation, rather than identity claims or request input, determines this value.
+pub(crate) const OBJECT_CREATION_OPERATION_CONDITION: &str = "ObjectCreationOperation";
 
 /// Condition name for `s3:object-lock-remaining-retention-days`. Storage access
 /// derives it from the requested retain-until date, so no header may set it.

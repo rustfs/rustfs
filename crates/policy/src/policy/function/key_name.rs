@@ -57,6 +57,7 @@ impl KeyName {
         KeyName::S3(S3KeyName::S3XAmzContentSha256),
         KeyName::S3(S3KeyName::S3LocationConstraint),
         KeyName::S3(S3KeyName::S3VersionId),
+        KeyName::S3(S3KeyName::S3ObjectCreationOperation),
         //aws
         KeyName::Aws(AwsKeyName::AWSReferer),
         KeyName::Aws(AwsKeyName::AWSSourceIP),
@@ -166,6 +167,9 @@ impl From<&KeyName> for &'static str {
 #[derive(Clone, EnumString, Debug, IntoStaticStr, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "&str", into = "&str")]
 pub enum S3KeyName {
+    #[strum(serialize = "s3:ObjectCreationOperation")]
+    S3ObjectCreationOperation,
+
     #[strum(serialize = "s3:x-amz-copy-source")]
     S3XAmzCopySource,
 
@@ -397,6 +401,18 @@ mod tests {
     use super::*;
     use serde::Deserialize;
     use test_case::test_case;
+
+    #[test]
+    fn object_creation_operation_is_registered_as_server_derived() {
+        let key = KeyName::try_from("s3:ObjectCreationOperation").expect("AWS object creation condition key should parse");
+        assert_eq!(key.name(), "ObjectCreationOperation");
+        assert!(key.is_server_derived());
+        assert!(KeyName::server_derived_key_names().any(|name| name == "ObjectCreationOperation"));
+        assert_eq!(
+            serde_json::to_string(&key).expect("condition key should serialize"),
+            "\"s3:ObjectCreationOperation\""
+        );
+    }
 
     #[test_case("s3:x-amz-copy-source", KeyName::S3(S3KeyName::S3XAmzCopySource))]
     #[test_case("s3:VersionId", KeyName::S3(S3KeyName::S3VersionId) ; "aws_version_id")]

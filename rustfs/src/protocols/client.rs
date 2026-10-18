@@ -18,7 +18,7 @@ use crate::runtime_sources::current_object_store_handle;
 use crate::shared_types::RemoteAddr;
 #[cfg(feature = "webdav")]
 use crate::storage_api::protocols::client::capacity;
-use crate::storage_api::protocols::client::{FS, ReqInfo, RequestContext, authorize_request};
+use crate::storage_api::protocols::client::{FS, MultipartStagingOperation, ReqInfo, RequestContext, authorize_request};
 use http::{HeaderMap, Method};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustfs_credentials;
@@ -286,6 +286,10 @@ impl ProtocolStorageClient {
         client_info.forwarded_proto = Some(if session.secure_transport { "https" } else { "http" }.to_owned());
         request.extensions.insert(client_info);
         request.headers = session.request_headers.clone();
+        // Preserve staging semantics before distinct operations collapse to PutObject.
+        if matches!(action, S3Action::CreateMultipartUpload | S3Action::UploadPart) {
+            request.extensions.insert(MultipartStagingOperation);
+        }
         let policy_action = if matches!(action, S3Action::HeadBucket) {
             S3Action::ListBucket.into()
         } else {
