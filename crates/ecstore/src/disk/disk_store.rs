@@ -1563,6 +1563,13 @@ impl LegacyMetadataWrite {
         self.execute_delete_version(fi, false, opts).await
     }
 
+    pub async fn stage_delete_version(self, fi: FileInfo, force_del_marker: bool, opts: DeleteOptions) -> Result<()> {
+        if opts.undo_write || opts.undo_delete || opts.old_data_dir.is_none() {
+            return Err(DiskError::MethodNotAllowed);
+        }
+        self.execute_delete_version(fi, force_del_marker, opts).await
+    }
+
     pub async fn delete_version(self, fi: FileInfo, force_del_marker: bool, opts: DeleteOptions) -> Result<()> {
         if opts.undo_write || opts.undo_delete || opts.old_data_dir.is_some() {
             return Err(DiskError::MethodNotAllowed);

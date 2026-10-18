@@ -2155,6 +2155,10 @@ pub(in crate::disk) async fn rename_with_namespace_owner(
     let src = src.to_path_buf();
     let dst = dst.to_path_buf();
     let lease = acquire_namespace_mutation_lease_with_owner(&dst, namespace_owner).await;
+    rename_with_lease(src, dst, lease).await
+}
+
+pub(in crate::disk) async fn rename_with_lease(src: PathBuf, dst: PathBuf, lease: Arc<NamespaceMutationLease>) -> io::Result<()> {
     run_blocking_namespace_operation(lease, move || {
         #[cfg(all(test, not(windows)))]
         {
@@ -2175,6 +2179,10 @@ pub(in crate::disk) async fn create_dir_all_with_namespace_owner(
     }
     let path = path.to_path_buf();
     let lease = acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await;
+    create_dir_all_with_lease(path, lease).await
+}
+
+pub(in crate::disk) async fn create_dir_all_with_lease(path: PathBuf, lease: Arc<NamespaceMutationLease>) -> io::Result<()> {
     run_blocking_namespace_operation(lease, move || std::fs::create_dir_all(path)).await
 }
 
@@ -4050,7 +4058,9 @@ pub(crate) fn compare_and_update_control_file(
     validate_windows_owned_file(&lock)?;
     match lock.as_file().try_lock() {
         Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => return Err(io::Error::from(io::ErrorKind::WouldBlock)),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
         Err(std::fs::TryLockError::Error(err)) => return Err(err),
     }
 
