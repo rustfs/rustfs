@@ -53,7 +53,10 @@ async fn nested_periodic_snapshot(
     if corrupt_first {
         write_test_object_metadata_bytes(&root, "bucket", "prefix/a/0000", b"not-valid-filemeta").await;
     }
-    let (_, identity) = bound_checkpoint();
+    let identity = crate::DataUsageScanIdentity {
+        tier_registry_generation: crate::runtime_tier_registry_for_cycle(11, 7).await.generation,
+        ..bound_checkpoint().1
+    };
     let mut cache = DataUsageCache::default();
     cache.prepare_bucket_checkpoint("bucket", 11, 7, SOURCE, PLAN, identity);
     prepare_scanner(&mut scanner, cache);
@@ -200,6 +203,96 @@ async fn finish_resumed_walk(cache: DataUsageCache, original: &FolderScanner) ->
         .expect("finish resumed nested periodic walk");
     let visits = scanner.budget.progress().0;
     (scanner.new_cache, visits, guard)
+}
+
+#[tokio::test]
+#[serial]
+async fn periodic_mixed_tail_requires_terminal_persistence_before_fresh_certification() {
+    let (periodic, identity, scanner, _guard) = nested_periodic_snapshot(false, (0, 0)).await;
+    assert!(periodic.has_scan_position(), "real periodic snapshot retains traversal position");
+    let store = FixtureStore::new();
+    let revisions = DataUsageCache::default()
+        .load_with_revisions(store.clone(), CACHE_NAME)
+        .await
+        .expect("initial periodic fixture revisions");
+    periodic
+        .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+        .await
+        .expect("seed durable periodic snapshot");
+
+    for round in 0..3 {
+        let cycle = 12 + round;
+        let leader_epoch = 9 + round;
+        let plan = crate::scanner_io::checkpoint_fixture_bucket_digest(PLAN, Some(cycle));
+        write_checkpoint_object(std::path::Path::new(&scanner.root), "prefix/b/0003", &[(None, 1)]).await;
+        let mut cache = DataUsageCache::default();
+        let revisions = cache
+            .load_with_revisions(store.clone(), CACHE_NAME)
+            .await
+            .expect("reload last successful save");
+        cache.prepare_bucket_checkpoint("bucket", cycle, leader_epoch, SOURCE, plan, identity);
+        assert_eq!(
+            cache.has_scan_position(),
+            round < 2,
+            "only a saved terminal clears the inherited position"
+        );
+        assert_eq!(
+            cache
+                .info
+                .scan_progress
+                .is_some_and(|progress| progress.started_plan != progress.requested_plan),
+            round < 2,
+            "a surviving periodic prefix must remain mixed under a changed plan"
+        );
+        cache.info.skip_healing = true;
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, Default::default());
+        let outcome = scanner
+            .local_disk
+            .clone()
+            .nsscanner_disk(
+                budget.token(),
+                budget.clone(),
+                vec![scanner.local_disk.clone()],
+                cache,
+                None,
+                scan_options(HealScanMode::Normal),
+            )
+            .await
+            .expect("finish the periodic tail or fresh verification sweep");
+        let (terminal, complete) = match outcome {
+            ScannerDiskScanOutcome::Partial(cache) => (cache, false),
+            ScannerDiskScanOutcome::Complete(cache) => (cache, true),
+            ScannerDiskScanOutcome::NamespaceNotFound(_) => panic!("fixture namespace exists"),
+        };
+        assert!(!budget.budget_elapsed());
+        assert_eq!(complete, round == 2);
+        assert!(!terminal.has_scan_position(), "completed traversal clears every position before saving");
+        let totals = terminal.checked_flatten("bucket").expect("connected terminal root");
+        assert_eq!(totals.objects, usize::try_from(OBJECTS).expect("fixture count"));
+        assert_eq!(totals.size, usize::try_from(OBJECTS).expect("fixture bytes"));
+
+        store.reject_save.store(round == 0, Ordering::SeqCst);
+        let saved = terminal
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .await;
+        if round == 0 {
+            assert!(saved.is_err(), "injected terminal persistence failure must be observable");
+            let retained = store.strict_load().await;
+            assert_eq!(retained.info.scan_coverage_receipt, periodic.info.scan_coverage_receipt);
+            assert_eq!(retained.info.scan_checkpoint, periodic.info.scan_checkpoint);
+            assert!(
+                retained.has_scan_position(),
+                "failed terminal save must leave periodic recovery state intact"
+            );
+        } else {
+            saved.expect("persist terminal sweep");
+            let retained = store.strict_load().await;
+            assert!(!retained.has_scan_position());
+            assert_eq!(retained.info.snapshot_complete, round == 2);
+        }
+        store.reject_save.store(false, Ordering::SeqCst);
+    }
 }
 
 #[tokio::test]

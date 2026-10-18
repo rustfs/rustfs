@@ -230,7 +230,9 @@ worker finishing does not certify its namespace coverage.
 
 | Signal | Meaning and next evidence |
 | --- | --- |
-| `bucket_sweep_incomplete` | A bucket reached the end of a sweep but needs another verification pass. Inspect `coverage_gap`, `root_failed_objects`, `failed_objects`, `size_reconciliation_entries`, and `mixed_coverage` with its bucket, pool, set, and cycle. Multiple blockers can coexist. |
+| `bucket_checkpoint_prepared` | Checkpoint admission identifies the bucket, pool/set, cycle/leader epoch, and previous cycle/epoch. `resume_position` distinguishes retained traversal position from a fresh sweep; `mixed_coverage` reports whether that retained prefix began under another plan. |
+| `bucket_sweep_incomplete` | A bucket reached the end of a sweep but needs another verification pass. Inspect `coverage_gap`, `root_failed_objects`, `failed_objects`, `size_reconciliation_entries`, and `mixed_coverage` with its bucket, pool/set, and cycle/leader epoch. `resume_position_on_entry` identifies a sweep entered with traversal position; `resume_position` reports the returned cache position after terminal cleanup. Multiple blockers can coexist. |
+| `partial_saved_not_published` | The local or remote worker successfully saved a terminal Partial cache. Correlate its bucket, pool/set, cycle/leader epoch and `resume_position` with admission and sweep events. This confirms persistence, not complete coverage or authoritative publication. |
 | `remote_scan_partial` | The coordinator received a Partial terminal response for the named bucket and disk. Correlate the worker's bucket-sweep or checkpoint events; Partial is not a complete bucket root. |
 | `bucket_result_rejected` | A bucket result did not match the cycle's frozen tier-registry generation and was not applied. |
 | `set_cache_publish_skipped` | `completed_buckets` counts distinct bucket roots successfully applied to this set cache. Use `first_incomplete_bucket` with pool/set/cycle to locate one actual gap in this set. Inspect `unprocessed_buckets` and budget/cancellation state, then correlate that bucket's worker events. |
@@ -244,6 +246,22 @@ Only then inspect its worker evidence. Mixed coverage is a resumable sweep
 under a newer plan; failed objects and size reconciliation require different
 follow-up. A global dirty-generation change alone does not establish which
 bucket failed to produce a complete root.
+
+A mixed tail clears traversal positions before returning Partial. If that
+terminal cache is saved, the next fresh sweep binds both coverage plans to its
+new request, even if ordinary writes continue between cycles. A periodic
+checkpoint saved before terminal cleanup still contains traversal position;
+resuming it under a changed plan can legitimately be mixed again. Correlate
+admission, sweep completion, and terminal persistence for the same bucket and
+pool/set across consecutive cycles. Samples from different sets cannot establish
+a repeated mixed loop. Check save failures, remote interruption, and leadership
+changes if only periodic progress survives.
+
+An unknown bucket cannot be quarantined as zero in an authoritative total.
+Existing pending-bucket semantics still require complete structural coverage.
+A separately labelled subtotal would need proof for each included bucket across
+every source, with missing buckets explicitly unavailable or stale; it must not
+advance full-census authority or acknowledge their dirty work.
 
 Use a bounded DEBUG window on the capacity-scanner leader and the workers
 serving the affected bucket:

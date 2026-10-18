@@ -18,7 +18,8 @@ use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig};
 use crate::scanner_io::{
     DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerCheckpointPersistContext, ScannerCheckpointPersistResult,
     ScannerDiskScanOptions, ScannerDiskScanOutcome, ScannerIODisk, acquire_scanner_cache_locks, cache_root_entry_info,
-    current_cache_root_or_prepare_with_generation, persist_scanner_checkpoint, scanner_set_disk_inventory,
+    current_cache_root_or_prepare_with_generation, log_saved_partial_bucket_cache, persist_scanner_checkpoint,
+    scanner_set_disk_inventory,
 };
 use crate::storage_api::owner::NS_SCANNER_PROTOCOL_VERSION;
 use crate::{
@@ -957,6 +958,9 @@ async fn scan_and_persist_local_bucket(
     }
 
     if let Some(partial_result) = partial_result {
+        if matches!(partial_result, RemoteScannerFrameResult::Partial) {
+            log_saved_partial_bucket_cache(&cache, &cache_name);
+        }
         return Ok(partial_result);
     }
     if cache.info.source != Some(source) || !cache.info.snapshot_complete {

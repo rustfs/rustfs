@@ -1809,7 +1809,8 @@ use guards::*;
 
 pub(crate) use cache::{
     DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerCheckpointPersistContext, ScannerCheckpointPersistResult,
-    acquire_scanner_cache_locks, current_cache_root_or_prepare_with_generation, persist_scanner_checkpoint,
+    acquire_scanner_cache_locks, current_cache_root_or_prepare_with_generation, log_saved_partial_bucket_cache,
+    persist_scanner_checkpoint,
 };
 pub use dirty_usage::{
     ScannerDirtyUsageAckError, ScannerDirtyUsageBucket, ScannerDirtyUsageClearObserver, ScannerDirtyUsageMutationObserver,
