@@ -1002,6 +1002,192 @@ async fn test_anonymous_post_object_rejects_sse_kms_params_outside_policy_condit
 }
 
 #[tokio::test]
+async fn test_object_creation_operation_separates_staging_from_publication() -> Result<(), Box<dyn Error + Send + Sync>> {
+    use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let client = env.create_s3_client();
+    let bucket = "object-creation-operation";
+    client.create_bucket().bucket(bucket).send().await?;
+    client
+        .put_object()
+        .bucket(bucket)
+        .key("source")
+        .body(ByteStream::from_static(b"copied-part"))
+        .send()
+        .await?;
+    let policy = |deny_creation: bool| {
+        serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            { "Effect": "Allow", "Principal": "*", "Action": "s3:PutObject", "Resource": format!("arn:aws:s3:::{bucket}/*") },
+            { "Effect": "Deny", "Principal": "*", "Action": "s3:PutObject", "Resource": format!("arn:aws:s3:::{bucket}/target*"),
+              "Condition": { "Bool": { "s3:ObjectCreationOperation": deny_creation.to_string() } } },
+            { "Effect": "Deny", "Principal": "*", "Action": "s3:GetObject", "Resource": format!("arn:aws:s3:::{bucket}/*"),
+              "Condition": { "Null": { "s3:ObjectCreationOperation": "false" } } }
+        ]
+    }).to_string()
+    };
+    client.put_bucket_policy().bucket(bucket).policy(policy(true)).send().await?;
+    let upload = client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key("target-multipart")
+        .send()
+        .await?;
+    let upload_id = upload.upload_id().expect("multipart initiation should return upload ID");
+    let first_body = vec![b'a'; 5 * 1024 * 1024];
+    let part = client
+        .upload_part()
+        .bucket(bucket)
+        .key("target-multipart")
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(ByteStream::from(first_body.clone()))
+        .send()
+        .await?;
+    let copy = client
+        .upload_part_copy()
+        .bucket(bucket)
+        .key("target-multipart")
+        .upload_id(upload_id)
+        .part_number(2)
+        .copy_source(format!("{bucket}/source"))
+        .send()
+        .await?;
+    let completed = CompletedMultipartUpload::builder()
+        .parts(
+            CompletedPart::builder()
+                .part_number(1)
+                .e_tag(part.e_tag().expect("part ETag"))
+                .build(),
+        )
+        .parts(
+            CompletedPart::builder()
+                .part_number(2)
+                .e_tag(copy.copy_part_result().and_then(|part| part.e_tag()).expect("copy part ETag"))
+                .build(),
+        )
+        .build();
+    let error = client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key("target-multipart")
+        .upload_id(upload_id)
+        .multipart_upload(completed.clone())
+        .send()
+        .await
+        .expect_err("publication must be denied");
+    assert_eq!(error.as_service_error().and_then(|error| error.code()), Some("AccessDenied"));
+    let error = client
+        .put_object()
+        .bucket(bucket)
+        .key("target-put")
+        .body(ByteStream::from_static(b"blocked"))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("objectcreationoperation", "false");
+        })
+        .send()
+        .await
+        .expect_err("a spoofed header must not exempt PutObject");
+    assert_eq!(error.as_service_error().and_then(|error| error.code()), Some("AccessDenied"));
+    let error = client
+        .copy_object()
+        .bucket(bucket)
+        .key("target-copy")
+        .copy_source(format!("{bucket}/source"))
+        .send()
+        .await
+        .expect_err("CopyObject publishes an object");
+    assert_eq!(error.as_service_error().and_then(|error| error.code()), Some("AccessDenied"));
+    let archive = make_tar(&[("target-member", b"blocked member")], &[]).await;
+    let error = client
+        .put_object()
+        .bucket(bucket)
+        .key("archive.tar")
+        .body(ByteStream::from(archive))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await
+        .expect_err("each extracted member must authorize object creation");
+    assert_eq!(error.as_service_error().and_then(|error| error.code()), Some("AccessDenied"));
+    let missing = client
+        .head_object()
+        .bucket(bucket)
+        .key("target-member")
+        .send()
+        .await
+        .expect_err("denied archive member must not exist");
+    assert!(missing.as_service_error().is_some_and(|error| error.is_not_found()));
+    for deny_creation in [true, false] {
+        client
+            .put_bucket_policy()
+            .bucket(bucket)
+            .policy(policy(deny_creation))
+            .send()
+            .await?;
+        let form = reqwest::multipart::Form::new()
+            .text("key", "target-post")
+            .text("success_action_status", "201")
+            .part(
+                "file",
+                reqwest::multipart::Part::bytes(b"post body".to_vec())
+                    .file_name("upload.txt")
+                    .mime_str("text/plain")?,
+            );
+        let response = local_http_client()
+            .post(format!("{}/{bucket}", env.url))
+            .multipart(form)
+            .send()
+            .await?;
+        assert_eq!(
+            response.status(),
+            if deny_creation {
+                reqwest::StatusCode::FORBIDDEN
+            } else {
+                reqwest::StatusCode::CREATED
+            },
+            "POST object creation={deny_creation}"
+        );
+    }
+    let error = client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key("target-denied")
+        .send()
+        .await
+        .expect_err("Bool=false must deny multipart staging under the inverted policy");
+    assert_eq!(error.as_service_error().and_then(|error| error.code()), Some("AccessDenied"));
+    client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key("target-multipart")
+        .upload_id(upload_id)
+        .multipart_upload(completed)
+        .send()
+        .await?;
+    let object = client
+        .get_object()
+        .bucket(bucket)
+        .key("target-multipart")
+        .send()
+        .await?
+        .body
+        .collect()
+        .await?
+        .into_bytes();
+    let mut expected = first_body;
+    expected.extend_from_slice(b"copied-part");
+    assert_eq!(object.as_ref(), expected, "completion must publish both regular and copied parts");
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_anonymous_multipart_control_apis_require_auth() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 

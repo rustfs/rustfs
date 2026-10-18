@@ -776,7 +776,11 @@ pub fn get_condition_values_with_query_and_client_info(
     if let Some(claims) = &cred.claims {
         for (k, v) in claims {
             if let Some(v_str) = v.as_str() {
-                args.insert(k.trim_start_matches("ldap").to_lowercase(), vec![v_str.to_string()]);
+                let key = k.trim_start_matches("ldap");
+                if key.eq_ignore_ascii_case(OBJECT_CREATION_OPERATION_CONDITION) {
+                    continue;
+                }
+                args.insert(key.to_lowercase(), vec![v_str.to_string()]);
             }
         }
 
@@ -823,6 +827,9 @@ pub fn get_condition_values_with_query_and_client_info(
 
     args
 }
+
+/// The S3 operation, rather than identity claims or request input, determines this value.
+pub(crate) const OBJECT_CREATION_OPERATION_CONDITION: &str = "ObjectCreationOperation";
 
 /// Condition name for `s3:object-lock-remaining-retention-days`. Storage access
 /// derives it from the requested retain-until date, so no header may set it.
