@@ -1116,13 +1116,14 @@ pub(crate) fn reject_non_wildcard_write_if_none_match(
     headers: &HeaderMap,
 ) -> S3Result<()> {
     // POST parses conditional DTO fields from the form, so HTTP headers also need validation.
-    let unsupported_header = headers.get_all(http::header::IF_NONE_MATCH).iter().any(|value| {
-        value.to_str().map_or(true, |value| {
-            let value = value.trim();
-            !value.is_empty() && value != "*"
+    if matches!(if_none_match, Some(s3s::dto::ETagCondition::ETag(_)))
+        || headers.get_all(http::header::IF_NONE_MATCH).iter().any(|value| {
+            value.to_str().map_or(true, |value| {
+                let value = value.trim();
+                !value.is_empty() && value != "*"
+            })
         })
-    });
-    if matches!(if_none_match, Some(s3s::dto::ETagCondition::ETag(_))) || unsupported_header {
+    {
         return Err(S3Error::new(S3ErrorCode::NotImplemented));
     }
     Ok(())
@@ -1167,6 +1168,21 @@ mod tests {
             headers.insert(http::header::IF_NONE_MATCH, http::HeaderValue::from_str(value).expect("valid header"));
             let err = reject_non_wildcard_write_if_none_match(None, &headers)
                 .expect_err("header-only ETag precondition must be rejected");
+            assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        }
+    }
+
+    #[test]
+    fn reject_non_wildcard_write_if_none_match_rejects_conflicting_sources() {
+        for value in [
+            http::HeaderValue::from_static("\"different-etag\""),
+            http::HeaderValue::from_bytes(b"\xff").expect("obs-text is a valid HTTP header"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.append(http::header::IF_NONE_MATCH, http::HeaderValue::from_static("*"));
+            headers.append(http::header::IF_NONE_MATCH, value);
+            let err = reject_non_wildcard_write_if_none_match(Some(&s3s::dto::ETagCondition::Any), &headers)
+                .expect_err("a form wildcard must not hide an unsupported raw HTTP precondition");
             assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
         }
     }

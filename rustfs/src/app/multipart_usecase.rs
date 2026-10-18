@@ -548,7 +548,7 @@ impl DefaultMultipartUsecase {
     #[hotpath::measure(impl_type = "MultipartUsecase")]
     pub async fn execute_complete_multipart_upload(
         &self,
-        req: S3Request<CompleteMultipartUploadInput>,
+        mut req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         reject_presigned_multipart_max_total_object_size_for_other_operation(
             &req.headers,
@@ -566,7 +566,7 @@ impl DefaultMultipartUsecase {
             S3Operation::CompleteMultipartUpload,
         );
         let replication_authorized = replication_request_authorized(&req);
-        let input = req.input.clone();
+        let input = std::mem::take(&mut req.input);
         let CompleteMultipartUploadInput {
             multipart_upload,
             bucket,
@@ -595,23 +595,17 @@ impl DefaultMultipartUsecase {
                             return Err(ApiError::from(StorageError::ObjectNotFound(bucket.clone(), key.clone())).into());
                         }
                     } else {
-                        if let Some(ifmatch) = if_match
+                        if let Some(ifmatch) = &if_match
                             && !ifmatch.is_any()
-                            && info
-                                .etag
-                                .as_ref()
-                                .is_none_or(|etag| Some(ETag::Strong(etag.clone())) != ifmatch.into_etag())
+                            && ifmatch
+                                .as_etag()
+                                .and_then(ETag::as_strong)
+                                .is_none_or(|expected| info.etag.as_deref() != Some(expected))
                         {
                             return Err(s3_error!(PreconditionFailed));
                         }
-                        if let Some(ifnonematch) = if_none_match
-                            && (ifnonematch.is_any()
-                                || ifnonematch.into_etag().is_some_and(|cond_etag| {
-                                    info.etag
-                                        .as_deref()
-                                        .is_some_and(|etag| etag.trim_matches('"') == cond_etag.value())
-                                }))
-                        {
+                        // The request guard permits only the wildcard here.
+                        if if_none_match.is_some() {
                             return Err(s3_error!(PreconditionFailed));
                         }
                     }
@@ -3015,6 +3009,22 @@ mod tests {
             .await
             .expect_err("DTO-only If-None-Match: * on existing key must fail");
         assert_eq!(dto_complete_err.code(), &S3ErrorCode::PreconditionFailed);
+
+        for condition in [ETag::Weak(committed_etag.clone()), ETag::Strong("different-etag".to_string())] {
+            let input = CompleteMultipartUploadInput::builder()
+                .bucket(bucket.clone())
+                .key(object.to_string())
+                .upload_id(second_upload_id.clone())
+                .if_match(Some(s3s::dto::ETagCondition::ETag(condition)))
+                .multipart_upload(Some(completed_parts.clone()))
+                .build()
+                .expect("If-Match complete input should build");
+            let err = usecase
+                .execute_complete_multipart_upload(build_request(input, Method::POST))
+                .await
+                .expect_err("weak or nonmatching If-Match must reject the overwrite");
+            assert_eq!(err.code(), &S3ErrorCode::PreconditionFailed);
+        }
 
         // Write requests reject ETag-valued If-None-Match before checking object state.
         let weak_if_none_match_input = CompleteMultipartUploadInput::builder()

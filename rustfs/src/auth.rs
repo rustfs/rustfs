@@ -731,10 +731,8 @@ pub fn get_condition_values_with_query_and_client_info(
         args.insert("LocationConstraint".to_owned(), vec![lc.to_string()]);
     }
 
-    let mut clone_header = header.clone();
-    if let Some(v) = clone_header.get("x-amz-signature-age") {
+    if let Some(v) = header.get("x-amz-signature-age") {
         args.insert("signatureAge".to_string(), vec![v.to_str().unwrap_or("").to_string()]);
-        clone_header.remove("x-amz-signature-age");
     }
 
     for obj_lock in &[
@@ -742,7 +740,7 @@ pub fn get_condition_values_with_query_and_client_info(
         AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
         AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
     ] {
-        let values = clone_header
+        let values = header
             .get_all(*obj_lock)
             .iter()
             .map(|v| v.to_str().unwrap_or("").to_string())
@@ -750,7 +748,6 @@ pub fn get_condition_values_with_query_and_client_info(
         if !values.is_empty() {
             args.insert(obj_lock.trim_start_matches("x-amz-").to_string(), values);
         }
-        clone_header.remove(*obj_lock);
     }
 
     // S3 policy condition keys use "x-amz-grant-*" (policy key s3:x-amz-grant-* -> name() returns x-amz-grant-*)
@@ -761,7 +758,7 @@ pub fn get_condition_values_with_query_and_client_info(
         "x-amz-grant-read-acp",
         "x-amz-grant-write-acp",
     ] {
-        let values = clone_header
+        let values = header
             .get_all(*grant_header)
             .iter()
             .map(|v| v.to_str().unwrap_or("").to_string())
@@ -769,7 +766,6 @@ pub fn get_condition_values_with_query_and_client_info(
         if !values.is_empty() {
             args.insert((*grant_header).to_string(), values);
         }
-        clone_header.remove(*grant_header);
     }
 
     // Claims and group membership are part of the verified identity, so they are
@@ -777,7 +773,12 @@ pub fn get_condition_values_with_query_and_client_info(
     if let Some(claims) = &cred.claims {
         for (k, v) in claims {
             if let Some(v_str) = v.as_str() {
-                args.insert(k.trim_start_matches("ldap").to_lowercase(), vec![v_str.to_string()]);
+                let key = k.trim_start_matches("ldap");
+                // Request conditions cannot originate from identity claims, even without a header.
+                if key.eq_ignore_ascii_case(IF_MATCH.as_str()) || key.eq_ignore_ascii_case(IF_NONE_MATCH.as_str()) {
+                    continue;
+                }
+                args.insert(key.to_lowercase(), vec![v_str.to_string()]);
             }
         }
 
@@ -798,21 +799,6 @@ pub fn get_condition_values_with_query_and_client_info(
         args.insert("groups".to_string(), groups.clone());
     }
 
-    // Only request headers may supply these keys, including when they are absent.
-    // A blank header must not satisfy `Null: false` while the write ignores it.
-    for conditional_header in [IF_NONE_MATCH, IF_MATCH] {
-        args.remove(conditional_header.as_str());
-        if let Some(value) = clone_header
-            .get(&conditional_header)
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        {
-            args.insert(conditional_header.as_str().to_string(), vec![value.to_string()]);
-        }
-        clone_header.remove(&conditional_header);
-    }
-
     // Every remaining header is attacker-controlled. A header must never contribute
     // to a condition key that describes the caller's own identity or the connection,
     // otherwise sending `userid: admin` (or any `jwt:`/`ldap:` claim name) would let a
@@ -820,9 +806,27 @@ pub fn get_condition_values_with_query_and_client_info(
     // both the ones already populated above and the well-known identity keys that are
     // absent for this credential, since an absent key is exactly what a spoofed header
     // would fill in.
-    for key in clone_header.keys() {
-        if key.as_str().eq_ignore_ascii_case("x-amz-tagging") {
-            continue;
+    for key in header.keys() {
+        match key.as_str() {
+            // These headers were consumed under their policy names above, or by tagging authorization.
+            "x-amz-signature-age"
+            | AMZ_OBJECT_LOCK_MODE_LOWER
+            | AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER
+            | AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER
+            | "x-amz-tagging" => continue,
+            "if-match" | "if-none-match" => {
+                // A blank header must not satisfy `Null: false` while storage ignores it.
+                if let Some(value) = header
+                    .get(key)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    args.insert(key.as_str().to_string(), vec![value.to_string()]);
+                }
+                continue;
+            }
+            _ => {}
         }
         if is_reserved_condition_key(key.as_str(), &args) {
             continue;
@@ -2100,6 +2104,8 @@ mod tests {
         cred.claims = Some(HashMap::from([
             ("if-none-match".to_string(), json!("*")),
             ("if-match".to_string(), json!("\"claim-etag\"")),
+            ("IF-NONE-MATCH".to_string(), json!("*")),
+            ("ldapIF-MATCH".to_string(), json!("\"claim-etag\"")),
         ]));
 
         for value in [None, Some(""), Some(" ")] {
@@ -2122,6 +2128,60 @@ mod tests {
         let conditions = get_condition_values(&headers, &cred, None, None, None);
         assert_eq!(conditions.get("if-none-match"), Some(&vec!["*".to_string()]));
         assert_eq!(conditions.get("if-match"), Some(&vec!["\"request-etag\"".to_string()]));
+    }
+
+    #[test]
+    fn test_get_condition_values_preserves_consumed_headers_and_multivalues() {
+        let cred = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-signature-age", HeaderValue::from_static("300"));
+        headers.insert("x-amz-object-lock-mode", HeaderValue::from_static("GOVERNANCE"));
+        headers.insert("x-amz-object-lock-legal-hold", HeaderValue::from_static("ON"));
+        headers.insert("x-amz-object-lock-retain-until-date", HeaderValue::from_static("2030-01-01T00:00:00Z"));
+        headers.insert("x-amz-tagging", HeaderValue::from_static("project=blue"));
+        for name in [
+            "x-amz-grant-full-control",
+            "x-amz-grant-read",
+            "x-amz-grant-write",
+            "x-amz-grant-read-acp",
+            "x-amz-grant-write-acp",
+            "x-custom-header",
+        ] {
+            headers.append(name, HeaderValue::from_static("first"));
+            headers.append(name, HeaderValue::from_static("second"));
+        }
+        headers.append(IF_MATCH, HeaderValue::from_static(" \"first-etag\" "));
+        headers.append(IF_MATCH, HeaderValue::from_static("\"second-etag\""));
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+        for (name, expected) in [
+            ("signatureAge", "300"),
+            ("object-lock-mode", "GOVERNANCE"),
+            ("object-lock-legal-hold", "ON"),
+            ("object-lock-retain-until-date", "2030-01-01T00:00:00Z"),
+            ("if-match", "\"first-etag\""),
+        ] {
+            assert_eq!(conditions.get(name), Some(&vec![expected.to_string()]), "{name}");
+        }
+        for name in [
+            "x-amz-signature-age",
+            "x-amz-object-lock-mode",
+            "x-amz-object-lock-legal-hold",
+            "x-amz-object-lock-retain-until-date",
+            "x-amz-tagging",
+        ] {
+            assert!(!conditions.contains_key(name), "consumed header {name} must not be merged again");
+        }
+        for name in [
+            "x-amz-grant-full-control",
+            "x-amz-grant-read",
+            "x-amz-grant-write",
+            "x-amz-grant-read-acp",
+            "x-amz-grant-write-acp",
+            "x-custom-header",
+        ] {
+            assert_eq!(conditions.get(name), Some(&vec!["first".to_string(), "second".to_string()]), "{name}");
+        }
     }
 
     #[test]
