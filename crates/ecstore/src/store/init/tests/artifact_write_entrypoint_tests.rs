@@ -689,3 +689,260 @@ async fn lifecycle_owner_case() {
     shutdown.cancel();
     assert!(ctx.wait_for_detached_mutations(Duration::from_secs(30)).await);
 }
+
+// Include directories as well as bytes: a rejected delete must not even stage
+// a rollback directory before another layer can refuse the request.
+async fn delete_physical_snapshot(
+    store: &ECStore,
+    bucket: &str,
+    object: &str,
+) -> Vec<std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>> {
+    let mut snapshots = Vec::new();
+    for disk in store.pools[0].disk_set[0].disk_inventory().await {
+        let disk = disk.expect("online delete fixture disk");
+        let root = disk.path().join(bucket).join(object);
+        let mut entries = std::collections::BTreeMap::new();
+        let mut pending = vec![root.clone()];
+        while let Some(directory) = pending.pop() {
+            let mut children = tokio::fs::read_dir(&directory)
+                .await
+                .expect("read physical artifact directory");
+            while let Some(child) = children.next_entry().await.expect("read physical artifact entry") {
+                let path = child.path();
+                let relative = path.strip_prefix(&root).expect("fixture descendant").to_owned();
+                if child.file_type().await.expect("physical entry type").is_dir() {
+                    entries.insert(relative, None);
+                    pending.push(path);
+                } else {
+                    entries.insert(relative, Some(tokio::fs::read(path).await.expect("physical artifact bytes")));
+                }
+            }
+        }
+        snapshots.push(entries);
+    }
+    snapshots
+}
+
+async fn seed_delete_versions(store: &ECStore, bucket: &str, object: &str, incarnation: Uuid) -> (Uuid, Uuid) {
+    let first = store
+        .put_object(bucket, object, &mut PutObjReader::from_vec(vec![0xA5; 2 * 1024 * 1024]), &options())
+        .await
+        .expect("publish actual external artifact shards")
+        .version_id
+        .expect("versioned artifact identity");
+    store
+        .put_object(bucket, object, &mut body(), &options())
+        .await
+        .expect("publish another readable artifact version");
+    let marker = Uuid::new_v4();
+    let mut fi = rustfs_filemeta::FileInfo {
+        name: object.to_owned(),
+        version_id: Some(marker),
+        deleted: true,
+        mod_time: Some(time::OffsetDateTime::now_utc()),
+        ..Default::default()
+    };
+    fi.set_delete_marker_incarnation(incarnation);
+    // Seed a pre-existing marker through the physical fixture API. Ordinary
+    // managed deletion must never be needed to construct its own refusal case.
+    for disk in store.pools[0].disk_set[0].disk_inventory().await {
+        disk.expect("online marker fixture disk")
+            .write_metadata("", bucket, object, fi.clone())
+            .await
+            .expect("persist pre-existing delete marker");
+    }
+    (first, marker)
+}
+
+fn delete_variants(version: Uuid, marker: Uuid) -> Vec<ObjectOptions> {
+    vec![
+        options(),
+        ObjectOptions {
+            version_id: Some(version.to_string()),
+            ..options()
+        },
+        ObjectOptions {
+            version_id: Some(marker.to_string()),
+            ..options()
+        },
+        ObjectOptions {
+            version_id: Some(Uuid::new_v4().to_string()),
+            delete_marker: true,
+            replication_request: true,
+            delete_replication: Some(crate::bucket::replication::ReplicationState::default()),
+            ..options()
+        },
+    ]
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_delete_entrypoints_store_rejects_single_and_batch_before_mutation() {
+    run_large_stack_async_test("artifact-delete-store", || delete_entrypoints_case(false));
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_delete_entrypoints_set_disks_rejects_direct_mutations() {
+    run_large_stack_async_test("artifact-delete-set-disks", || delete_entrypoints_case(true));
+}
+
+async fn delete_entrypoints_case(direct: bool) {
+    use crate::storage_api_contracts::object::ObjectToDelete;
+    let root = tempfile::tempdir().expect("delete entrypoint fixture root");
+    let (ctx, store, shutdown) =
+        without_storage_class_env(build_isolated_test_store(root.path(), "artifact-delete-entrypoints", &[4])).await;
+    metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+    let managed = "artifact-delete-managed";
+    let ordinary = "artifact-delete-control";
+    let incarnation = bucket(&store, managed, true).await;
+    let ordinary_incarnation = bucket(&store, ordinary, false).await;
+    let object = object_key();
+    let (version, marker) = seed_delete_versions(&store, managed, &object, incarnation).await;
+    let (control_version, control_marker) = seed_delete_versions(&store, ordinary, &object, ordinary_incarnation).await;
+    let set = &store.pools[0].disk_set[0];
+    let before = delete_physical_snapshot(&store, managed, &object).await;
+    assert!(
+        before.iter().all(|disk| disk.keys().any(|path| path.ends_with("part.1"))),
+        "fixture must include external shards"
+    );
+
+    for sealed in [false, true] {
+        if sealed {
+            let attempt = object.rsplit_once('/').expect("attempt/object fixture").0.to_owned() + "/";
+            store
+                .clone()
+                .seal_artifact_attempt_puts(managed, incarnation, &attempt)
+                .await
+                .expect("seal ordinary PUT domain");
+            store
+                .clone()
+                .seal_artifact_attempt_repairs(managed, incarnation, &attempt)
+                .await
+                .expect("seal repair domain");
+        }
+        for opts in delete_variants(version, marker) {
+            let result = if direct {
+                set.delete_object(managed, &object, opts).await
+            } else {
+                // Hold the object lock to distinguish the ECStore guard from a
+                // later SetDisks refusal, without removing that second defense.
+                let lock = store.new_ns_lock(managed, &object).await.expect("delete namespace");
+                let _held = lock
+                    .get_write_lock(Duration::from_secs(5))
+                    .await
+                    .expect("hold delete namespace");
+                tokio::time::timeout(Duration::from_secs(1), store.delete_object(managed, &object, opts))
+                    .await
+                    .expect("managed rejection precedes object locking")
+            };
+            unsupported(result);
+            assert_eq!(delete_physical_snapshot(&store, managed, &object).await, before);
+        }
+        let targets = vec![
+            ObjectToDelete {
+                object_name: object.clone(),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: object.clone(),
+                version_id: Some(version),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: object.clone(),
+                version_id: Some(marker),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: object.clone(),
+                version_id: Some(version),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: object.clone(),
+                version_id: Some(Uuid::new_v4()),
+                delete_marker_replication_status: Some("REPLICA".to_owned()),
+                ..Default::default()
+            },
+        ];
+        let (deleted, errors) = if direct {
+            set.delete_objects(managed, targets.clone(), options()).await
+        } else {
+            let lock = store.new_ns_lock(managed, &object).await.expect("batch namespace");
+            let _held = lock
+                .get_write_lock(Duration::from_secs(5))
+                .await
+                .expect("hold batch namespace");
+            tokio::time::timeout(Duration::from_secs(1), store.delete_objects(managed, targets.clone(), options()))
+                .await
+                .expect("managed batch rejection precedes object locking")
+        };
+        assert_eq!(deleted.len(), targets.len());
+        assert_eq!(errors.len(), targets.len());
+        for error in errors {
+            unsupported::<()>(Err(error.expect("each managed delete retains its own refusal")));
+        }
+        assert_eq!(delete_physical_snapshot(&store, managed, &object).await, before);
+        let request = rustfs_filemeta::FileInfo {
+            version_id: Some(version),
+            name: object.clone(),
+            ..Default::default()
+        };
+        unsupported(if direct {
+            set.delete_object_version(managed, &object, &request, false).await
+        } else {
+            store.delete_object_version(managed, &object, &request, false).await
+        });
+        assert_eq!(delete_physical_snapshot(&store, managed, &object).await, before);
+    }
+
+    let control_before = delete_physical_snapshot(&store, ordinary, &object).await;
+    let mut control_opts = options();
+    if direct {
+        // An unbound policy snapshot remains supported, but is not lifecycle
+        // authority. The direct entry point must acquire its own real owner.
+        control_opts.object_lock_config_snapshot = Some(std::sync::Arc::new(crate::object_api::ObjectLockConfigSnapshot::new(
+            metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+        )));
+    }
+    let created = if direct {
+        set.delete_object(ordinary, &object, control_opts.clone()).await
+    } else {
+        store.delete_object(ordinary, &object, control_opts.clone()).await
+    }
+    .expect("ordinary bucket actually creates a delete marker");
+    assert!(created.delete_marker);
+    assert_ne!(delete_physical_snapshot(&store, ordinary, &object).await, control_before);
+    let control_targets = vec![
+        ObjectToDelete {
+            object_name: object.clone(),
+            version_id: Some(control_version),
+            ..Default::default()
+        },
+        ObjectToDelete {
+            object_name: object.clone(),
+            version_id: Some(control_marker),
+            ..Default::default()
+        },
+    ];
+    let (_, errors) = if direct {
+        set.delete_objects(ordinary, control_targets, control_opts).await
+    } else {
+        store.delete_objects(ordinary, control_targets, control_opts).await
+    };
+    assert!(errors.iter().all(Option::is_none), "ordinary batch deletion must commit: {errors:?}");
+    for disk in set.disk_inventory().await {
+        let disk = disk.expect("online control disk");
+        for removed in [control_version, control_marker] {
+            assert!(
+                disk.read_version(ordinary, ordinary, &object, &removed.to_string(), &crate::disk::ReadOptions::default())
+                    .await
+                    .is_err(),
+                "ordinary deletion removed the exact physical version"
+            );
+        }
+    }
+    shutdown.cancel();
+    assert!(ctx.wait_for_detached_mutations(Duration::from_secs(30)).await);
+}

@@ -254,6 +254,15 @@ impl ObjectLockConfigSnapshot {
         &self.state
     }
 
+    pub(crate) fn is_unbound(&self) -> bool {
+        self.store_id.is_none()
+            && self.bucket.is_none()
+            && self.bucket_incarnation_id.is_none()
+            && self.config_revision.is_none()
+            && self._lifecycle_guard.is_none()
+            && self.metadata_transaction_guard.is_none()
+    }
+
     pub(crate) fn is_valid_for_destructive_put(&self, store_id: Uuid, bucket: &str, bucket_incarnation_id: Uuid) -> bool {
         self.store_id == Some(store_id)
             && self.bucket.as_deref() == Some(bucket)

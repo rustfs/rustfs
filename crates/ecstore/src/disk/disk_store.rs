@@ -556,6 +556,31 @@ impl LocalDiskWrapper {
             namespace_owner,
             ..
         } = guards;
+        // Observe the RPC-facing waiter separately from the owned mutation.
+        // This test-only guard owns no physical lease and stays outside the
+        // spawned task, whose admitted metadata/rollback work may continue.
+        #[cfg(feature = "e2e-test-hooks")]
+        let mut rpc_waiter_observer = if external_guard.is_some() {
+            match fi.data_dir {
+                Some(data_dir) => {
+                    let selected = self.disk.get_object_path(dst_volume, dst_path).and_then(|object| {
+                        super::os::PhysicalRenameTestBarrier::selected(
+                            &self.disk.path(),
+                            &object.join(data_dir.to_string()),
+                            "rpc-waiter-dropped",
+                        )
+                        .map_err(DiskError::from)
+                    });
+                    match selected {
+                        Ok(observer) => observer,
+                        Err(error) => return super::RenameDataObservation::unknown(Err(error)),
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let operation = self.clone();
         let src_volume = src_volume.to_owned();
         let src_path = src_path.to_owned();
@@ -602,6 +627,10 @@ impl LocalDiskWrapper {
             })
         })
         .await;
+        #[cfg(feature = "e2e-test-hooks")]
+        if let Some(observer) = rpc_waiter_observer.as_mut() {
+            observer.complete();
+        }
         observed.unwrap_or_else(|error| super::RenameDataObservation::unknown(Err(error)))
     }
 }

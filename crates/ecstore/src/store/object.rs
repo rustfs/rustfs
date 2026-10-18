@@ -4857,14 +4857,22 @@ impl ECStore {
         opts: ObjectOptions,
         guards: impl IntoIterator<Item = rustfs_lock::NamespaceLockGuard>,
     ) -> Result<ObjectInfo> {
-        let guards: Vec<_> = guards.into_iter().collect();
+        let mut guards: Vec<_> = guards.into_iter().collect();
+        let lifecycle_owner = if opts.delete_prefix && opts.bucket_lifecycle_lock_fence.is_some() {
+            if guards.len() != 1 {
+                return Err(Error::other("recursive delete requires its owned bucket lifecycle guard"));
+            }
+            guards.pop()
+        } else {
+            None
+        };
         let store = Arc::clone(self);
         let bucket = bucket.to_owned();
         let object = object.to_owned();
         self.ctx
             .run_detached_mutation(async move {
                 let result = store
-                    .handle_delete_object_with_journal(&bucket, &object, opts, Some(Arc::clone(&store)))
+                    .handle_delete_object_with_journal_owned(&bucket, &object, opts, Some(Arc::clone(&store)), lifecycle_owner)
                     .await;
                 if result.is_ok() {
                     list_objects::observe_list_objects_mutation(&store, &bucket).await;
@@ -4934,11 +4942,23 @@ impl ECStore {
         opts: ObjectOptions,
         tier_journal_api: Option<Arc<ECStore>>,
     ) -> Result<ObjectInfo> {
+        self.handle_delete_object_with_journal_owned(bucket, object, opts, tier_journal_api, None)
+            .await
+    }
+
+    async fn handle_delete_object_with_journal_owned(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: ObjectOptions,
+        tier_journal_api: Option<Arc<ECStore>>,
+        lifecycle_owner: Option<rustfs_lock::NamespaceLockGuard>,
+    ) -> Result<ObjectInfo> {
         Box::pin(async move {
             let mut opts = opts;
             let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
             let result = self
-                .handle_delete_object_with_journal_inner(bucket, object, opts, tier_journal_api)
+                .handle_delete_object_with_journal_inner(bucket, object, opts, tier_journal_api, lifecycle_owner)
                 .await;
             enqueue_recorded_tier_free_versions(self, receipt_sink).await;
             result
@@ -4952,6 +4972,7 @@ impl ECStore {
         object: &str,
         opts: ObjectOptions,
         tier_journal_api: Option<Arc<ECStore>>,
+        lifecycle_owner: Option<rustfs_lock::NamespaceLockGuard>,
     ) -> Result<ObjectInfo> {
         check_del_obj_args(bucket, object)?;
 
@@ -4959,14 +4980,29 @@ impl ECStore {
             return Err(Error::other("lifecycle delete-all requires namespace locking"));
         }
 
-        let _bucket_lifecycle_guard =
-            if is_meta_bucketname(bucket) || (opts.delete_prefix && opts.bucket_lifecycle_lock_fence.is_some()) {
-                None
-            } else if opts.delete_prefix {
-                Some(self.acquire_bucket_lifecycle_write_lock(bucket).await?)
-            } else {
-                Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
-            };
+        // Lifecycle -> classification -> metadata transaction -> object locks.
+        // Borrowed recursive deletion must carry the actual caller-owned guard.
+        let mut bucket_lifecycle_guard = if is_meta_bucketname(bucket) {
+            None
+        } else if let Some(owner) = lifecycle_owner {
+            Some(owner)
+        } else if opts.delete_prefix && opts.bucket_lifecycle_lock_fence.is_some() {
+            return Err(Error::other("recursive delete requires its owned bucket lifecycle guard"));
+        } else if opts.delete_prefix {
+            Some(self.acquire_bucket_lifecycle_write_lock(bucket).await?)
+        } else {
+            Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
+        };
+        if !is_meta_bucketname(bucket) {
+            let metadata = metadata_sys::get_bucket_incarnation_metadata_in(&self.ctx, bucket).await?;
+            if opts
+                .expected_bucket_incarnation_id
+                .is_some_and(|expected| expected != metadata.bucket_incarnation_id)
+            {
+                return Err(StorageError::BucketNotFound(bucket.to_owned()));
+            }
+            crate::bucket::artifact::reject_unsupported_artifact_write(&metadata)?;
+        }
         let object = if opts.delete_prefix && !opts.delete_prefix_object {
             object.to_owned()
         } else {
@@ -4981,7 +5017,7 @@ impl ECStore {
             None
         };
         opts.tier_delete_journal_api = tier_journal_api.clone();
-        if let Some(guard) = _bucket_lifecycle_guard.as_ref() {
+        if let Some(guard) = bucket_lifecycle_guard.as_ref() {
             opts.add_bucket_lifecycle_lock_guard(guard);
         }
 
@@ -4989,26 +5025,26 @@ impl ECStore {
             get_cached_bucket_incarnation_id_in(&self.ctx, bucket).await?;
         }
         let _object_lock_metadata_guard = if !is_meta_bucketname(bucket) {
-            Some(Arc::new(acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await?))
+            Some(acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await?)
         } else {
             None
         };
         if let Some(guard) = _object_lock_metadata_guard.as_ref() {
             opts.add_namespace_lock_guard(guard);
         }
-        let current_bucket_incarnation_id = if let Some(metadata_guard) = _object_lock_metadata_guard.as_ref() {
+        let current_bucket_incarnation_id = if let Some(metadata_guard) = _object_lock_metadata_guard {
             let (state, incarnation_id, config_revision) =
                 get_object_lock_config_and_incarnation_from_disk_in(&self.ctx, bucket).await?;
-            opts.object_lock_config_snapshot = Some(Arc::new(ObjectLockConfigSnapshot::for_store_bucket_under_lifecycle_fence(
+            opts.object_lock_config_snapshot = Some(Arc::new(ObjectLockConfigSnapshot::for_guarded_store_bucket(
                 self.id,
                 bucket,
                 incarnation_id,
                 config_revision,
                 state,
-                opts.bucket_lifecycle_lock_fence
-                    .clone()
-                    .unwrap_or_else(NamespaceLockFence::new),
-                Arc::clone(metadata_guard),
+                bucket_lifecycle_guard
+                    .take()
+                    .ok_or_else(|| Error::other("delete requires its owned bucket lifecycle guard"))?,
+                metadata_guard,
             )));
             Some(incarnation_id)
         } else {
@@ -5426,7 +5462,7 @@ impl ECStore {
 
         let mut opts = opts;
         opts.tier_delete_journal_api = tier_journal_api;
-        let _bucket_lifecycle_guard = if is_meta_bucketname(bucket) {
+        let mut bucket_lifecycle_guard = if is_meta_bucketname(bucket) {
             None
         } else {
             match self.acquire_bucket_lifecycle_read_lock(bucket).await {
@@ -5434,8 +5470,19 @@ impl ECStore {
                 Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
             }
         };
-        if let Some(guard) = _bucket_lifecycle_guard.as_ref() {
+        if let Some(guard) = bucket_lifecycle_guard.as_ref() {
             opts.add_bucket_lifecycle_lock_guard(guard);
+        }
+        // Classify under the lifecycle owner before any per-object delete
+        // can stage metadata or enter its rollback path.
+        if !is_meta_bucketname(bucket) {
+            let metadata = match metadata_sys::get_bucket_incarnation_metadata_in(&self.ctx, bucket).await {
+                Ok(metadata) => metadata,
+                Err(error) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), error),
+            };
+            if let Err(error) = crate::bucket::artifact::reject_unsupported_artifact_write(&metadata) {
+                return return_batch_delete_lock_error_with_accounting(objects.as_slice(), error);
+            }
         }
         if opts.delete_replication_config_snapshot.is_none() {
             match ReplicationObjectBridge::delete_request_config_in(&self.ctx, bucket).await {
@@ -5455,32 +5502,36 @@ impl ECStore {
         let _object_lock_metadata_guard = if is_meta_bucketname(bucket) {
             None
         } else {
-            Some(Arc::new(
-                match acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await {
-                    Ok(guard) => guard,
-                    Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
-                },
-            ))
+            Some(match acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await {
+                Ok(guard) => guard,
+                Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
+            })
         };
         if let Some(guard) = _object_lock_metadata_guard.as_ref() {
             opts.add_namespace_lock_guard(guard);
         }
-        let current_bucket_incarnation_id = if let Some(metadata_guard) = _object_lock_metadata_guard.as_ref() {
+        let current_bucket_incarnation_id = if let Some(metadata_guard) = _object_lock_metadata_guard {
             let (state, incarnation_id, config_revision) =
                 match get_object_lock_config_and_incarnation_from_disk_in(&self.ctx, bucket).await {
                     Ok(snapshot) => snapshot,
                     Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
                 };
-            opts.object_lock_config_snapshot = Some(Arc::new(ObjectLockConfigSnapshot::for_store_bucket_under_lifecycle_fence(
+            opts.object_lock_config_snapshot = Some(Arc::new(ObjectLockConfigSnapshot::for_guarded_store_bucket(
                 self.id,
                 bucket,
                 incarnation_id,
                 config_revision,
                 state,
-                opts.bucket_lifecycle_lock_fence
-                    .clone()
-                    .unwrap_or_else(NamespaceLockFence::new),
-                Arc::clone(metadata_guard),
+                match bucket_lifecycle_guard.take() {
+                    Some(guard) => guard,
+                    None => {
+                        return return_batch_delete_lock_error_with_accounting(
+                            objects.as_slice(),
+                            Error::other("delete requires its owned bucket lifecycle guard"),
+                        );
+                    }
+                },
+                metadata_guard,
             )));
             Some(incarnation_id)
         } else {

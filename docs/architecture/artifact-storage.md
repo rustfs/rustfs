@@ -217,10 +217,21 @@ and ordinary buckets remain writable. After a receiver restarts, HTTP readiness
 does not imply that peers have re-established its disk connection; retry the
 same seal identity until a successful receipt confirms every receiver.
 
-These scenarios do not inject a disconnected request with an unfinished physical
-write, power loss, disk replacement, or backup restoration. Those fault boundaries
-need separate evidence; successful ordinary PUT sealing is not a repair seal, version retirement, or
-GC authorization.
+`crates/e2e_test/src/distributed/artifact_put_tail_test.rs` sends a direct signed
+ordinary PUT receiver request without a coordinator attempt lock. It pauses the
+actual filesystem worker, disconnects the RPC, observes server-side waiter
+cancellation, and requires seal refusal until physical completion. Re-signed
+requests remain rejected both while draining and after confirmation, without
+changing staged or published bytes. Exact-version shard census and GET verify
+the completed publication on all four nodes. This test requires the
+`e2e-test-hooks` server feature. RPC cancellation does not cancel the admitted
+PUT transaction: it may finish metadata publication while retaining its owner.
+The first successful seal confirmation is the boundary after which the test
+requires published files to remain unchanged.
+
+These scenarios do not inject power loss, disk replacement, or backup
+restoration. Successful ordinary PUT sealing is not a repair seal, version
+retirement, or GC authorization.
 
 A failed or cancelled seal request may still leave a record for its original
 incarnation. Retry idempotently to confirm success; an error is not proof that
@@ -229,8 +240,12 @@ the attempt remains writable or that all metadata writes have been cleaned up.
 The managed ECStore entry points reject unsupported writes into an artifact
 bucket: borrowed-lock and special-purpose PUTs, copy destinations, multipart
 creation/parts/completion, data movement, restore, transition, metadata rewrites,
-and tag changes. Copying from an artifact bucket to an ordinary bucket remains
-allowed. Listing and aborting existing multipart uploads remain available for
+and tag changes. Ordinary single, batch, and exact-version deletion are also
+rejected, including delete-marker creation and removal, before any local disk
+can stage metadata or rollback state. This applies both at ECStore and public
+SetDisks entry points; it does not authorize retirement or GC. Copying from an
+artifact bucket to an ordinary bucket remains allowed. Listing and aborting
+existing multipart uploads remain available for
 cleanup. Classification is bound to the authoritative bucket incarnation, so an
 old ordinary-bucket request cannot publish into a recreated artifact bucket.
 The guarded entry points only borrow lifecycle authority from a matching snapshot
@@ -242,6 +257,20 @@ Lower-level SetDisks PUTs also resolve authoritative bucket metadata and require
 a matching managed target for an artifact object. Missing metadata authority is
 an error, not evidence that a bucket is ordinary. Internal callers borrowing a
 lifecycle fence must retain its actual owner through physical publication.
+
+Deletion preserves that owner in the existing Object Lock snapshot. Detached
+prefix deletion transfers its owned lifecycle lock, rather than borrowing only
+a lock-loss signal. The internal free-version cleaner passes its existing lock
+owner explicitly, avoiding a second read acquisition behind a queued bucket
+writer. It still rejects managed buckets. Transaction-private rollback cleanup
+keeps its existing admission contract.
+
+`crates/e2e_test/src/distributed/artifact_delete_test.rs` exercises single and
+mixed batch deletion through all four nodes before sealing, after sealing, and
+after restart. It includes persisted delete-marker state and ordinary-bucket
+success controls. Rejected requests must preserve file bytes and filesystem
+identity/change times, so a local mutation followed by rollback is not treated
+as a successful rejection.
 
 Object repair takes the same attempt lock before capacity and object locks.
 Local rename and metadata-replacement workers retain the lifecycle and attempt

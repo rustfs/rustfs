@@ -886,6 +886,7 @@ async fn cleanup_free_version_exact(api: Arc<ECStore>, oi: &ObjectInfo, cancel: 
     let bucket_guard = api
         .acquire_bucket_lifecycle_read_lock(&oi.bucket)
         .await
+        .map(Arc::new)
         .map_err(std::io::Error::other)?;
     let (lease, delete_plan) = acquire_free_version_tier_lease(oi, &api.tier_config_mgr()).await?;
     let local_object = encode_dir_object(&oi.name);
@@ -954,7 +955,7 @@ async fn cleanup_free_version_exact(api: Arc<ECStore>, oi: &ObjectInfo, cancel: 
         };
         delete_request.set_tier_free_version();
         if let Err(err) = set
-            .delete_object_version(&oi.bucket, &local_object, &delete_request, false)
+            .delete_object_version_with_lifecycle_owner(&oi.bucket, &local_object, &delete_request, Arc::clone(&bucket_guard))
             .await
             && first_error.is_none()
         {
@@ -8382,6 +8383,104 @@ mod tests {
                     .expect("free-version path existence check should succeed")
             );
         }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial]
+    async fn artifact_delete_entrypoints_free_version_cleaner_completes_with_queued_lifecycle_writer() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("free-version-queued-writer-{}", Uuid::new_v4());
+        let object = "free-version";
+        create_test_bucket(&ecstore, &bucket).await;
+        let (backend, identity) = register_recovery_mock_tier(&ecstore).await;
+        seed_recoverable_free_version(&disk_paths, &bucket, object, None, Some(identity)).await;
+        let oi = list_tier_free_versions(Arc::clone(&ecstore), 100, None, None, CancellationToken::new())
+            .await
+            .expect("list real persisted free version")
+            .items
+            .into_iter()
+            .find(|oi| oi.bucket == bucket)
+            .expect("free-version task must address this fixture");
+        assert!(oi.transitioned_object.free_version);
+        backend
+            .set_put_remote_version(Some(oi.transitioned_object.version_id.clone()))
+            .await;
+        let remote = TierConfigMgr::acquire_operation_lease(&ecstore.tier_config_mgr(), "WARM")
+            .await
+            .expect("remote fixture lease");
+        remote
+            .put(&oi.transitioned_object.name, ReaderImpl::Body(Bytes::from_static(b"body")), 4)
+            .await
+            .expect("seed exact remote object");
+        drop(remote);
+
+        let barrier = Arc::new(super::FreeVersionPostRemoteDeleteTestBarrier::default());
+        let cleanup_barrier = Arc::clone(&barrier);
+        let cleanup_store = Arc::clone(&ecstore);
+        let cleanup_oi = oi.clone();
+        let mut cleanup = tokio::spawn(async move {
+            super::FREE_VERSION_POST_REMOTE_DELETE_TEST_BARRIER
+                .scope(cleanup_barrier, async move {
+                    super::cleanup_free_version_exact(cleanup_store, &cleanup_oi, &CancellationToken::new()).await
+                })
+                .await
+        });
+        tokio::time::timeout(StdDuration::from_secs(10), barrier.arrived.notified())
+            .await
+            .expect("cleaner owns lifecycle READ and has completed remote DELETE");
+        assert!(!backend.contains(&oi.transitioned_object.name).await);
+        for disk in &disk_paths {
+            assert!(
+                disk.join(&bucket).join(object).join(STORAGE_FORMAT_FILE).is_file(),
+                "local exact cleanup must still be pending at the boundary"
+            );
+        }
+
+        // Resolve first so the pending poll is the actual local lock wait.
+        // A later READ would normally be admitted alongside the cleaner's READ;
+        // its pending state independently proves this WRITE is now queued.
+        let lifecycle = ecstore
+            .new_ns_lock(&bucket, crate::storage_api_contracts::bucket::BUCKET_LIFECYCLE_LOCK_OBJECT)
+            .await
+            .expect("lifecycle namespace");
+        let mut writer = Box::pin(lifecycle.get_write_lock(StdDuration::from_secs(30)));
+        let writer_queued = futures::poll!(&mut writer).is_pending();
+        let mut later_reader = Box::pin(lifecycle.get_read_lock(StdDuration::from_secs(30)));
+        let later_reader_blocked = futures::poll!(&mut later_reader).is_pending();
+        drop(later_reader);
+        barrier.release.notify_one();
+        assert!(writer_queued, "cleaner must retain the real lifecycle READ owner");
+        assert!(later_reader_blocked, "queued lifecycle WRITE must block a later READ");
+
+        // Keep the same WRITE future queued, without cancelling/retrying it.
+        // Re-entering READ here would deadlock behind this waiting writer.
+        let finished = tokio::time::timeout(StdDuration::from_secs(10), &mut cleanup).await;
+        if finished.is_err() {
+            cleanup.abort();
+            drop(writer);
+            let _ = tokio::time::timeout(StdDuration::from_secs(5), &mut cleanup).await;
+            panic!("exact local free-version cleanup re-entered lifecycle READ behind the queued writer");
+        }
+        assert!(
+            finished
+                .expect("bounded cleaner completion")
+                .expect("cleaner task")
+                .expect("exact local cleanup")
+        );
+        let writer = tokio::time::timeout(StdDuration::from_secs(10), writer)
+            .await
+            .expect("queued lifecycle WRITE proceeds after real cleanup drains")
+            .expect("lifecycle WRITE acquired");
+        for disk in &disk_paths {
+            assert!(!disk.join(&bucket).join(object).exists(), "free version remains on a real local disk");
+        }
+        assert_eq!(backend.remove_count().await, 1, "cleaner must delete the exact remote tuple once");
+        drop(writer);
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("remove empty fixture bucket");
     }
 
     #[cfg(feature = "test-util")]

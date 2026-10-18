@@ -20,20 +20,20 @@ use uuid::Uuid;
 
 const REPAIR_SEAL_ROUTE: &str = "/rustfs/admin/v3/plugin-artifacts/seal-repairs";
 
-struct PhysicalBarrier(PathBuf);
+pub(super) struct PhysicalBarrier(PathBuf);
 
 impl PhysicalBarrier {
-    fn arm(disk: &Path, destination: &Path) -> TestResult<Self> {
+    pub(super) fn arm(disk: &Path, destination: &Path) -> TestResult<Self> {
         let path = disk.join(".rustfs.sys/e2e-physical-rename-barrier");
         std::fs::write(&path, destination.to_str().ok_or("non-UTF8 fixture destination")?)?;
         Ok(Self(path))
     }
 
-    async fn observed(&self, stage: &str) -> TestResult {
+    pub(super) async fn observed(&self, stage: &str) -> TestResult {
         wait_until(Duration::from_secs(15), || async { Ok(self.0.with_extension(stage).is_file()) }, stage).await
     }
 
-    fn release(&self) -> TestResult {
+    pub(super) fn release(&self) -> TestResult {
         std::fs::write(self.0.with_extension("release"), b"release physical worker")?;
         Ok(())
     }

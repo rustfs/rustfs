@@ -2670,14 +2670,19 @@ async fn reliable_rename_inner(
 // and separately records cancellation so E2E tests cannot mistake an open RPC
 // waiter for ownership retained by a detached filesystem operation.
 #[cfg(feature = "e2e-test-hooks")]
-struct PhysicalRenameTestBarrier {
+pub(in crate::disk) struct PhysicalRenameTestBarrier {
     path: PathBuf,
     completed: bool,
+    cancellation_stage: &'static str,
 }
 
 #[cfg(feature = "e2e-test-hooks")]
 impl PhysicalRenameTestBarrier {
-    fn selected(root: &Path, destination: &Path) -> io::Result<Option<Self>> {
+    pub(in crate::disk) fn selected(
+        root: &Path,
+        destination: &Path,
+        cancellation_stage: &'static str,
+    ) -> io::Result<Option<Self>> {
         let path = root.join(".rustfs.sys/e2e-physical-rename-barrier");
         let expected = match std::fs::read_to_string(&path) {
             Ok(expected) => expected,
@@ -2688,7 +2693,17 @@ impl PhysicalRenameTestBarrier {
         let Some(name) = destination.file_name() else { return Ok(None) };
         let Ok(parent) = parent.canonicalize() else { return Ok(None) };
         let destination = parent.join(name);
-        Ok((destination == Path::new(&expected)).then_some(Self { path, completed: false }))
+        // Construct lazily: dropping an unselected observer must never report
+        // cancellation of another operation using this disk's barrier file.
+        Ok((destination == Path::new(&expected)).then(|| Self {
+            path,
+            completed: false,
+            cancellation_stage,
+        }))
+    }
+
+    pub(in crate::disk) fn complete(&mut self) {
+        self.completed = true;
     }
 
     fn wait(path: &Path) -> io::Result<()> {
@@ -2708,9 +2723,36 @@ impl PhysicalRenameTestBarrier {
 impl Drop for PhysicalRenameTestBarrier {
     fn drop(&mut self) {
         if !self.completed {
-            let _ = std::fs::write(self.path.with_extension("waiter-dropped"), b"async waiter dropped");
+            let _ = std::fs::write(self.path.with_extension(self.cancellation_stage), b"async waiter dropped");
         }
     }
+}
+
+#[cfg(all(test, feature = "e2e-test-hooks"))]
+#[test]
+fn physical_rename_barrier_reports_only_selected_cancelled_waiters() {
+    let root = tempfile::tempdir().expect("physical barrier fixture");
+    let root_path = root.path().canonicalize().expect("canonical fixture root");
+    let barrier = root_path.join(".rustfs.sys/e2e-physical-rename-barrier");
+    std::fs::create_dir_all(barrier.parent().expect("barrier parent")).expect("barrier directory");
+    let destination = root_path.join("selected");
+    std::fs::write(&barrier, destination.to_str().expect("fixture path")).expect("select physical destination");
+    let marker = barrier.with_extension("waiter-dropped");
+    assert!(
+        PhysicalRenameTestBarrier::selected(&root_path, &root_path.join("other"), "waiter-dropped")
+            .expect("unselected observer")
+            .is_none()
+    );
+    assert!(!marker.exists(), "unselected rename falsely reported cancellation");
+    drop(PhysicalRenameTestBarrier::selected(&root_path, &destination, "waiter-dropped").expect("cancelled observer"));
+    assert!(marker.exists(), "selected cancelled waiter was not observed");
+    std::fs::remove_file(&marker).expect("reset observation");
+    let mut observer = PhysicalRenameTestBarrier::selected(&root_path, &destination, "waiter-dropped")
+        .expect("completed observer")
+        .expect("selected destination");
+    observer.complete();
+    drop(observer);
+    assert!(!marker.exists(), "completed waiter falsely reported cancellation");
 }
 
 async fn reliable_rename_inner_with_lease(
@@ -2722,7 +2764,7 @@ async fn reliable_rename_inner_with_lease(
     lease: Arc<NamespaceMutationLease>,
 ) -> io::Result<()> {
     #[cfg(feature = "e2e-test-hooks")]
-    let mut physical_barrier = PhysicalRenameTestBarrier::selected(publication_root.path(), &dst_file_path)?;
+    let mut physical_barrier = PhysicalRenameTestBarrier::selected(publication_root.path(), &dst_file_path, "waiter-dropped")?;
     #[cfg(feature = "e2e-test-hooks")]
     let physical_barrier_path = physical_barrier.as_ref().map(|barrier| barrier.path.clone());
     let operation = {
@@ -2748,7 +2790,7 @@ async fn reliable_rename_inner_with_lease(
     let result = run_blocking_namespace_operation(lease, operation).await;
     #[cfg(feature = "e2e-test-hooks")]
     if let Some(barrier) = physical_barrier.as_mut() {
-        barrier.completed = true;
+        barrier.complete();
     }
 
     if let Err(err) = &result

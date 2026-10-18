@@ -7592,6 +7592,56 @@ mod transition_version_id_tests {
 }
 
 impl SetDisks {
+    pub(crate) async fn delete_object_version_with_lifecycle_owner(
+        &self,
+        bucket: &str,
+        object: &str,
+        fi: &FileInfo,
+        lifecycle: Arc<rustfs_lock::NamespaceLockGuard>,
+    ) -> Result<()> {
+        let metadata = metadata_sys::get_bucket_incarnation_metadata_in(&self.ctx, bucket).await?;
+        crate::bucket::artifact::reject_unsupported_artifact_write(&metadata)?;
+        if lifecycle.is_lock_lost() {
+            return Err(Error::other("delete requires its owned bucket lifecycle guard"));
+        }
+        self.delete_object_version_with_purge_owned(
+            bucket,
+            object,
+            fi,
+            false,
+            None,
+            (Some(metadata.bucket_incarnation_id), Some(lifecycle)),
+        )
+        .await
+    }
+
+    async fn prepare_public_delete(
+        &self,
+        bucket: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(ObjectOptions, Option<Arc<crate::store::BucketIncarnationFenceGuard>>)> {
+        if is_meta_bucketname(bucket) {
+            return Ok((opts.clone(), None));
+        }
+        let store = metadata_sys::object_store_in(&self.ctx).await?;
+        let mut admission = opts.clone();
+        // Direct callers may supply an unscoped Object Lock policy snapshot.
+        // Keep its policy, but acquire a real lifecycle owner independently.
+        let policy = admission
+            .object_lock_config_snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.is_unbound())
+            .cloned();
+        if policy.is_some() {
+            admission.object_lock_config_snapshot = None;
+        }
+        let (mut admitted, lifecycle) = store.prepare_unsupported_artifact_write(bucket, &admission).await?;
+        if let Some(policy) = policy {
+            admitted.object_lock_config_snapshot = Some(policy);
+        }
+        Ok((admitted, lifecycle))
+    }
+
     pub(crate) async fn replay_authorized_tier_delete_sources(
         &self,
         bucket: &str,
@@ -7737,10 +7787,32 @@ impl SetDisks {
         delete_marker_purge: Option<MrfDeleteMarkerPurge>,
         source_bucket_incarnation_id: Option<Uuid>,
     ) -> Result<()> {
+        self.delete_object_version_with_purge_owned(
+            bucket,
+            object,
+            fi,
+            force_del_marker,
+            delete_marker_purge,
+            (source_bucket_incarnation_id, None),
+        )
+        .await
+    }
+
+    async fn delete_object_version_with_purge_owned(
+        &self,
+        bucket: &str,
+        object: &str,
+        fi: &FileInfo,
+        force_del_marker: bool,
+        delete_marker_purge: Option<MrfDeleteMarkerPurge>,
+        publication: (Option<Uuid>, Option<Arc<dyn Send + Sync>>),
+    ) -> Result<()> {
+        let (source_bucket_incarnation_id, lifecycle_owner) = publication;
         let transported = delete_file_info_with_replication_transport_metadata(fi);
         let fi = &transported;
         let disks = self.disk_inventory().await;
-        let namespace_owner = (!is_meta_bucketname(bucket)).then(|| self.ctx.begin_namespace_commit());
+        let namespace_owner = (!is_meta_bucketname(bucket))
+            .then(|| Arc::new((self.ctx.begin_namespace_commit(), lifecycle_owner)) as Arc<dyn Send + Sync>);
         // Quorum is a property of the configured set, not of the current
         // online snapshot. A decommission/offline refresh may temporarily
         // shorten the snapshot; deriving quorum from it would turn a
@@ -8228,13 +8300,22 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
     }
     #[tracing::instrument(skip(self))]
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
+        let (opts, _lifecycle) = self.prepare_public_delete(bucket, &ObjectOptions::default()).await?;
         let source_bucket_incarnation_id = if is_meta_bucketname(bucket) {
             None
         } else {
-            self.bucket_incarnation_id_from_disk(bucket).await.ok()
+            opts.expected_bucket_incarnation_id
         };
-        self.delete_object_version_with_purge(bucket, object, fi, force_del_marker, None, source_bucket_incarnation_id)
-            .await
+        let owner: Arc<dyn Send + Sync> = Arc::new((opts.bucket_incarnation_fence, opts.object_lock_config_snapshot));
+        self.delete_object_version_with_purge_owned(
+            bucket,
+            object,
+            fi,
+            force_del_marker,
+            None,
+            (source_bucket_incarnation_id, Some(owner)),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self, objects, opts))]
@@ -8254,6 +8335,18 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+        // Admit before object locks and before a disk can stage a rollback.
+        let (opts, _lifecycle) = match self.prepare_public_delete(bucket, &opts).await {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                let message = error.to_string();
+                return (
+                    vec![DeletedObject::default(); objects.len()],
+                    objects.iter().map(|_| Some(Error::other(message.clone()))).collect(),
+                    vec![None; objects.len()],
+                );
+            }
+        };
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
         let mut accounting = vec![None; objects.len()];
         let delete_config_snapshot = opts
@@ -8936,6 +9029,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self, opts))]
     async fn delete_object(&self, bucket: &str, object: &str, mut opts: ObjectOptions) -> Result<ObjectInfo> {
+        let (admitted, _lifecycle) = self.prepare_public_delete(bucket, &opts).await?;
+        opts = admitted;
         let _scope_outcome_guard = opts
             .scanner_publication_commit_scope
             .clone()
