@@ -1399,6 +1399,42 @@ mod tier_free_version_receipt_eligibility_tests {
     }
 }
 
+// Own only completed staging, before the commit owner can rename or roll back
+// shards. Borrow the request state; clone it only if cancellation needs cleanup.
+struct PutObjectStagingCleanup<'a> {
+    set: &'a SetDisks,
+    tmp_dir: &'a str,
+    reservation: &'a Option<cleanup_runtime::Reservation>,
+    runtime: Option<tokio::runtime::Handle>,
+}
+
+impl Drop for PutObjectStagingCleanup<'_> {
+    fn drop(&mut self) {
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        let set = self.set.clone();
+        let tmp_dir = self.tmp_dir.to_owned();
+        let reservation = self.reservation.clone();
+        // A request future may be dropped outside its polling runtime. Cleanup
+        // remains best-effort on runtime shutdown, like the existing PUT tail.
+        let _enter = runtime.enter();
+        cleanup_runtime::spawn(reservation, async move {
+            if let Err(err) = set.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await {
+                warn!(
+                    event = EVENT_SET_DISK_WRITE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    state = "cancelled_staging_cleanup_failed",
+                    tmp_dir = %tmp_dir,
+                    error = ?err,
+                    "Cancelled PUT staging cleanup failed"
+                );
+            }
+        });
+    }
+}
+
 struct PutObjectCommitCancellation {
     token: CancellationToken,
     armed: bool,
@@ -4281,6 +4317,12 @@ impl SetDisks {
                 (None, None, None)
             };
         let mut tmp_cleanup_owned = false;
+        let mut staging_cleanup = PutObjectStagingCleanup {
+            set: self,
+            tmp_dir: &tmp_dir,
+            reservation: &cleanup_reservation,
+            runtime: None,
+        };
         let rollback_receipt = RenameRollbackReceipt::default();
         let operation_first_poll_delay_started = rustfs_io_metrics::put_stage_timer();
         let operation = async {
@@ -4644,6 +4686,12 @@ impl SetDisks {
             let is_compressed = parts_metadatas[response_metadata_slot].is_compressed();
 
             drop(writers); // drop writers to close all files, this is to prevent FileAccessDenied errors when renaming data
+
+            // File creation, writes and integrity sidecars must finish before
+            // cancellation can remove staging without racing pending writers.
+            if !direct_inline_commit {
+                staging_cleanup.runtime = Some(tokio::runtime::Handle::current());
+            }
 
             if parity_blocks == 0 {
                 let written_size = i64::try_from(w_size).map_err(|_| Error::other("put_object written size overflows i64"))?;
@@ -5128,6 +5176,9 @@ impl SetDisks {
             let request_cancellation = operation_cancellation.clone();
             let commit_cleanup_reservation = cleanup_reservation.clone();
             tmp_cleanup_owned = true;
+            // No await separates this handoff from starting the commit owner.
+            // Its rollback rules, not request Drop, now decide what to retain.
+            staging_cleanup.runtime = None;
             rustfs_io_metrics::record_put_object_stage_duration_from(
                 rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_CONTEXT_PREPARE,
                 commit_context_prepare_started,
@@ -6052,6 +6103,9 @@ impl SetDisks {
         } else {
             operation.await
         };
+        // Normal completion keeps the existing cleanup/error semantics below.
+        staging_cleanup.runtime = None;
+        drop(staging_cleanup);
         rustfs_io_metrics::record_put_object_stage_duration_from(
             rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_OPERATION_SELECT_WAIT,
             operation_select_wait_started,
