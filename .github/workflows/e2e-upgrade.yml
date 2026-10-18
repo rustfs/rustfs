@@ -50,7 +50,7 @@ env:
 jobs:
   build:
     name: Build upgrade candidate
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -63,7 +63,7 @@ jobs:
       - name: Setup Rust environment
         uses: ./.github/actions/setup
         with:
-          cache-shared-key: e2e-upgrade-server
+          cache-shared-key: e2e-upgrade-server-hosted
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           install-build-packaging-tools: "false"
           install-test-tools: "false"
@@ -86,7 +86,7 @@ jobs:
   upgrade:
     name: Upgrade compatibility (${{ matrix.source.version }})
     needs: build
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -112,7 +112,7 @@ jobs:
       - name: Setup Rust environment
         uses: ./.github/actions/setup
         with:
-          cache-shared-key: e2e-upgrade-tests
+          cache-shared-key: e2e-upgrade-tests-hosted
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           install-build-packaging-tools: "false"
           install-test-tools: "false"
