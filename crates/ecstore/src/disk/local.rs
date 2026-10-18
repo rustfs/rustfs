@@ -1022,15 +1022,15 @@ async fn remove_empty_directory_tree_under_mount_lease(
     mount_lease: &std::fs::File,
     volume: &str,
     root: PathBuf,
-    owner: Arc<dyn Send + Sync>,
+    owner: Arc<VolumeMutationOwner>,
 ) -> std::io::Result<()> {
     let root_parent = mount_lease.try_clone()?;
     let root_name = std::ffi::CString::new(volume.as_bytes()).map_err(|_| std::io::Error::from(ErrorKind::DirectoryNotEmpty))?;
     tokio::task::spawn_blocking(move || {
-        let _owner = owner;
         #[cfg(test)]
         volume_mutation_test_hooks::run(volume_mutation_test_hooks::Stage::Delete, &root);
         let result = remove_empty_directory_tree_unix_at(&root_parent, root_name.as_c_str(), &root, |_| Ok(()), |_| Ok(()));
+        owner.retire_deleted_snapshots(&result);
         #[cfg(test)]
         volume_mutation_test_hooks::run(volume_mutation_test_hooks::Stage::DeleteComplete, &root);
         result
@@ -1049,13 +1049,13 @@ async fn remove_empty_directory_tree_with(
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-async fn remove_empty_directory_tree(root: &Path, owner: Arc<dyn Send + Sync>) -> std::io::Result<()> {
+async fn remove_empty_directory_tree(root: &Path, owner: Arc<VolumeMutationOwner>) -> std::io::Result<()> {
     let root = root.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let _owner = owner;
         #[cfg(test)]
         volume_mutation_test_hooks::run(volume_mutation_test_hooks::Stage::Delete, &root);
         let result = remove_empty_directory_tree_unix_with(&root, |_| Ok(()), |_| Ok(()));
+        owner.retire_deleted_snapshots(&result);
         #[cfg(test)]
         volume_mutation_test_hooks::run(volume_mutation_test_hooks::Stage::DeleteComplete, &root);
         result
@@ -1124,7 +1124,7 @@ async fn lock_windows_empty_directory(path: &Path, canonical_root: Option<&Path>
 // FILE_DISPOSITION_INFO to the synchronous Windows deletion API.
 #[allow(unsafe_code)]
 async fn remove_windows_empty_directory(directory: LockedEmptyDirectory) -> std::io::Result<()> {
-    remove_windows_empty_directory_with_owner(directory, None).await
+    remove_windows_empty_directory_with_owner(directory, None, None).await
 }
 
 #[cfg(windows)]
@@ -1133,6 +1133,7 @@ async fn remove_windows_empty_directory(directory: LockedEmptyDirectory) -> std:
 async fn remove_windows_empty_directory_with_owner(
     directory: LockedEmptyDirectory,
     owner: Option<Arc<dyn Send + Sync>>,
+    retirement: Option<Arc<VolumeMutationOwner>>,
 ) -> std::io::Result<()> {
     tokio::task::spawn_blocking(move || {
         let _owner = owner;
@@ -1152,11 +1153,16 @@ async fn remove_windows_empty_directory_with_owner(
         let deleted = unsafe {
             SetFileInformationByHandle(handle, FileDispositionInfo, std::ptr::from_ref(&disposition).cast(), disposition_size)
         };
-        if deleted == 0 {
+        let result = if deleted == 0 {
             Err(std::io::Error::last_os_error())
         } else {
             Ok(())
+        };
+        drop(directory);
+        if let Some(retirement) = retirement {
+            retirement.retire_deleted_snapshots(&result);
         }
+        result
     })
     .await?
 }
@@ -1174,7 +1180,7 @@ async fn remove_empty_directory_tree_with(
     before_descend: impl FnMut(&Path) -> std::io::Result<()>,
     before_remove: impl FnMut(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    remove_empty_directory_tree_with_owner(root, before_descend, before_remove, None).await
+    remove_empty_directory_tree_with_owner(root, before_descend, before_remove, None, None).await
 }
 
 #[cfg(windows)]
@@ -1183,6 +1189,7 @@ async fn remove_empty_directory_tree_with_owner(
     mut before_descend: impl FnMut(&Path) -> std::io::Result<()>,
     mut before_remove: impl FnMut(&Path) -> std::io::Result<()>,
     owner: Option<Arc<dyn Send + Sync>>,
+    retirement: Option<Arc<VolumeMutationOwner>>,
 ) -> std::io::Result<()> {
     let root_directory = lock_windows_empty_directory(root, None).await?;
     let canonical_root = fs::canonicalize(root).await?;
@@ -1230,7 +1237,13 @@ async fn remove_empty_directory_tree_with_owner(
             Ok(None) => {
                 before_remove(&frame.path)?;
                 drop(frame.entries);
-                match remove_windows_empty_directory_with_owner(frame.directory, owner.clone()).await {
+                match remove_windows_empty_directory_with_owner(
+                    frame.directory,
+                    owner.clone(),
+                    (frame.path == root).then(|| retirement.clone()).flatten(),
+                )
+                .await
+                {
                     Ok(()) => {}
                     Err(err) if err.kind() == ErrorKind::NotFound => {}
                     Err(err) if err.kind() == ErrorKind::NotADirectory => {
@@ -1248,16 +1261,17 @@ async fn remove_empty_directory_tree_with_owner(
 }
 
 #[cfg(windows)]
-async fn remove_empty_directory_tree(root: &Path, owner: Arc<dyn Send + Sync>) -> std::io::Result<()> {
-    remove_empty_directory_tree_with_owner(root, |_| Ok(()), |_| Ok(()), Some(owner)).await
+async fn remove_empty_directory_tree(root: &Path, owner: Arc<VolumeMutationOwner>) -> std::io::Result<()> {
+    remove_empty_directory_tree_with_owner(root, |_| Ok(()), |_| Ok(()), Some(owner.clone()), Some(owner)).await
 }
 
 #[cfg(all(not(unix), not(windows)))]
-async fn remove_empty_directory_tree(root: &Path, owner: Arc<dyn Send + Sync>) -> std::io::Result<()> {
+async fn remove_empty_directory_tree(root: &Path, owner: Arc<VolumeMutationOwner>) -> std::io::Result<()> {
     let root = root.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let _owner = owner;
-        std::fs::remove_dir(root)
+        let result = std::fs::remove_dir(root);
+        owner.retire_deleted_snapshots(&result);
+        result
     })
     .await?
 }
@@ -5610,9 +5624,18 @@ async fn build_local_io_backend(root: PathBuf) -> Arc<dyn LocalIoBackend> {
     Arc::new(StdBackend::new(root))
 }
 
+#[cfg(test)]
+static PATH_DELETE_FULL_TARGET: ParkingLotMutex<Option<PathBuf>> = ParkingLotMutex::new(None);
+
+struct PreparedPathDelete {
+    lease: Arc<os::NamespaceMutationLease>,
+    trash: Option<PathBuf>,
+    encoded_trash: Option<(PathBuf, PathBuf)>,
+}
+
 struct LegacyFileWriteOwner {
     _volume: tokio::sync::OwnedRwLockReadGuard<()>,
-    _permit: crate::disk::io_admission::DiskIoPermit,
+    _permit: Option<crate::disk::io_admission::DiskIoPermit>,
     #[cfg(target_os = "linux")]
     _mount: Arc<std::fs::File>,
 }
@@ -5622,8 +5645,22 @@ struct VolumeMutationOwner {
     cache_path: PathBuf,
     volume: String,
     io_backend: Arc<dyn LocalIoBackend>,
+    snapshot_leases: Arc<ParkingLotMutex<SnapshotLeaseRegistry>>,
     #[cfg(target_os = "linux")]
     _mount: Arc<std::fs::File>,
+}
+
+impl VolumeMutationOwner {
+    fn retire_deleted_snapshots(&self, result: &std::io::Result<()>) {
+        // Called only by the physical blocking executor. A missing child can
+        // also return NotFound; only an absent root retires the volume.
+        let root_removed = result.is_ok()
+            || (matches!(result, Err(error) if error.kind() == ErrorKind::NotFound)
+                && matches!(std::fs::symlink_metadata(&self.cache_path), Err(error) if error.kind() == ErrorKind::NotFound));
+        if root_removed {
+            self.snapshot_leases.lock().entries.retain(|key, _| key.volume != self.volume);
+        }
+    }
 }
 
 impl Drop for VolumeMutationOwner {
@@ -6860,6 +6897,14 @@ impl LocalDisk {
         volume: &str,
         permit: crate::disk::io_admission::DiskIoPermit,
     ) -> Result<Arc<dyn Send + Sync>> {
+        self.begin_legacy_volume_read(volume, Some(permit)).await
+    }
+
+    async fn begin_legacy_volume_read(
+        &self,
+        volume: &str,
+        permit: Option<crate::disk::io_admission::DiskIoPermit>,
+    ) -> Result<Arc<dyn Send + Sync>> {
         let path = self.io_get_bucket_path(volume)?;
         // This receiver-local lock never reacquires the coordinator lifecycle
         // lock. The caller carries this exact owner through classification.
@@ -6923,12 +6968,13 @@ impl LocalDisk {
         guard: tokio::sync::OwnedRwLockWriteGuard<()>,
         volume: &str,
         cache_path: PathBuf,
-    ) -> Arc<dyn Send + Sync> {
+    ) -> Arc<VolumeMutationOwner> {
         Arc::new(VolumeMutationOwner {
             _guard: guard,
             cache_path,
             volume: volume.to_owned(),
             io_backend: self.io_backend.clone(),
+            snapshot_leases: self.snapshot_leases.clone(),
             #[cfg(target_os = "linux")]
             _mount: self.mount_lease.clone(),
         })
@@ -7803,6 +7849,18 @@ impl LocalDisk {
         opts: DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<DataDirDeleteStatus> {
+        self.delete_data_dir_with_prepared_entry(volume, path, opts, namespace_owner, None)
+            .await
+    }
+
+    async fn delete_data_dir_with_prepared_entry(
+        &self,
+        volume: &str,
+        path: &str,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        prepared: Option<PreparedPathDelete>,
+    ) -> Result<DataDirDeleteStatus> {
         let key = SnapshotLeaseKey {
             volume: volume.to_string(),
             path: path.to_string(),
@@ -7831,11 +7889,15 @@ impl LocalDisk {
                 );
             }
         }
+        let _claim_owner = (namespace_owner.clone(), prepared.as_ref().map(|plan| plan.lease.clone()));
         let claim = SnapshotLeaseDeleteClaim::new(&self.snapshot_leases, key);
 
-        let result = self
-            .delete_unleased_with_namespace_owner(volume, path, &opts, namespace_owner)
-            .await;
+        let result = if let Some(prepared) = prepared {
+            self.delete_unleased_prepared(volume, path, &opts, prepared).await
+        } else {
+            self.delete_unleased_with_namespace_owner(volume, path, &opts, namespace_owner)
+                .await
+        };
         claim.finish(result.is_ok());
         result.map(|()| DataDirDeleteStatus::Deleted)
     }
@@ -7918,7 +7980,6 @@ impl LocalDisk {
         // Reserve fresh trash destinations before changing metadata or data. A
         // held volume READ must never queue for another namespace behind delete.
         let prepared_trash = if let Some(publication) = &prepared_publication
-            && !opts.undo_delete
             && (opts.old_data_dir.is_none() || opts.undo_write)
         {
             let data = self.prepare_undo_trash(publication.clone())?;
@@ -8499,6 +8560,19 @@ impl LocalDisk {
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         prepared_target: Option<(PathBuf, Arc<os::NamespaceMutationLease>)>,
     ) -> Result<()> {
+        self.move_to_trash_with_prepared_targets(delete_path, recursive, immediate_purge, namespace_owner, prepared_target, None)
+            .await
+    }
+
+    async fn move_to_trash_with_prepared_targets(
+        &self,
+        delete_path: &PathBuf,
+        recursive: bool,
+        immediate_purge: bool,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        prepared_target: Option<(PathBuf, Arc<os::NamespaceMutationLease>)>,
+        encoded_target: Option<(PathBuf, PathBuf, Arc<os::NamespaceMutationLease>)>,
+    ) -> Result<()> {
         // if recursive {
         //     remove_all_std(delete_path).map_err(to_volume_error)?;
         // } else {
@@ -8522,7 +8596,42 @@ impl LocalDisk {
         //     }
         // }
 
-        let err = if let Some(lease) = &prepared_lease {
+        #[cfg(test)]
+        let injected_full = {
+            let mut target = PATH_DELETE_FULL_TARGET.lock();
+            if target.as_deref() == Some(delete_path.as_path()) {
+                target.take();
+                true
+            } else {
+                false
+            }
+        };
+        #[cfg(not(test))]
+        let injected_full = false;
+        let err = if injected_full {
+            Some(DiskError::DiskFull)
+        } else if let Some(lease) = &prepared_lease
+            && !recursive
+        {
+            let source = delete_path.clone();
+            let target = trash_path.clone();
+            match os::run_blocking_namespace_operation(lease.clone(), move || {
+                #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Rename, &source);
+                std::fs::rename(source, target)
+            })
+            .await
+            {
+                Ok(()) => None,
+                Err(error)
+                    if error.kind() == ErrorKind::NotFound
+                        && os::rename_source_is_missing(delete_path, &self.publication_root) =>
+                {
+                    None
+                }
+                Err(error) => Some(to_file_error(error).into()),
+            }
+        } else if let Some(lease) = &prepared_lease {
             os::rename_all_ignore_missing_source_with_lease(
                 delete_path,
                 &trash_path,
@@ -8554,7 +8663,16 @@ impl LocalDisk {
             }
         };
 
-        if immediate_purge || delete_path.to_string_lossy().ends_with(SLASH_SEPARATOR) {
+        if let Some((source, target, lease)) = encoded_target {
+            let _ = os::rename_all_ignore_missing_source_with_lease(
+                source,
+                target,
+                self.io_get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?,
+                &self.publication_root,
+                lease,
+            )
+            .await;
+        } else if immediate_purge || delete_path.to_string_lossy().ends_with(SLASH_SEPARATOR) {
             let trash_path2 = self.io_get_object_path(RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
             let _ = os::rename_all_ignore_missing_source_with_owner(
                 encode_dir_object(delete_path.to_string_lossy().as_ref()),
@@ -8573,7 +8691,15 @@ impl LocalDisk {
                 if let Some(lease) = prepared_lease {
                     let path = delete_path.clone();
                     let result = os::run_blocking_namespace_operation(lease, move || {
-                        if recursive { remove_all_std(&path) } else { remove_std(&path) }
+                        #[cfg(all(test, not(windows)))]
+                        os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &path);
+                        let result = if recursive { remove_all_std(&path) } else { remove_std(&path) };
+                        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                        os::prepared_publication_test_hooks::run(
+                            os::prepared_publication_test_hooks::Stage::RemoveComplete,
+                            &path,
+                        );
+                        result
                     })
                     .await;
                     if recursive {
@@ -8596,6 +8722,205 @@ impl LocalDisk {
         }
 
         Ok(())
+    }
+
+    fn prepare_path_delete_object(
+        &self,
+        volume: &str,
+        path: &str,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Result<Arc<os::NamespaceMutationLease>> {
+        let object_path = self.get_object_path(volume, path)?;
+        // This is a lock key, not a child to traverse: Delete also accepts files.
+        let metadata_key = self.io_get_object_path(volume, path)?.join(STORAGE_FORMAT_FILE);
+        let repair_scope = crate::bucket::artifact::artifact_repair_scope(volume, path);
+        if let Some(scope) = &repair_scope {
+            scope.check().map_err(Error::other)?;
+        }
+        let metadata = os::try_acquire_metadata_mutation_lease_with_owner(&object_path, Arc::new((owner, repair_scope)))?;
+        os::try_acquire_namespace_mutation_lease_with_owner(&metadata_key, metadata)
+    }
+
+    fn prepare_path_delete_entries(
+        &self,
+        volume: &str,
+        entries: &[(&str, &DeleteOptions)],
+        mut lease: Arc<os::NamespaceMutationLease>,
+    ) -> Result<Vec<PreparedPathDelete>> {
+        let mut plans = Vec::with_capacity(entries.len());
+        let mut namespaces = Vec::new();
+        for (path, opts) in entries {
+            let source = self.io_get_object_path(volume, path)?;
+            check_path_length(source.to_string_lossy().as_ref())?;
+            namespaces.push(source.clone());
+            let trash = if opts.recursive {
+                let target = self.io_get_object_path(RUSTFS_META_TMP_DELETED_BUCKET, &Uuid::new_v4().to_string())?;
+                namespaces.push(target.clone());
+                Some(target)
+            } else {
+                None
+            };
+            let encoded_trash = if opts.recursive && (opts.immediate || source.to_string_lossy().ends_with(SLASH_SEPARATOR)) {
+                let encoded = PathBuf::from(encode_dir_object(source.to_string_lossy().as_ref()));
+                let target = self.io_get_object_path(RUSTFS_META_TMP_DELETED_BUCKET, &Uuid::new_v4().to_string())?;
+                namespaces.extend([encoded.clone(), target.clone()]);
+                Some((encoded, target))
+            } else {
+                None
+            };
+            plans.push((trash, encoded_trash));
+        }
+        namespaces.sort();
+        namespaces.dedup();
+        // The volume READ and metadata key are already owned. No lock here may
+        // wait behind a writer which is itself waiting for this batch to drain.
+        for path in namespaces {
+            lease = os::try_acquire_namespace_mutation_lease_with_owner(&path, lease)?;
+        }
+        Ok(plans
+            .into_iter()
+            .map(|(trash, encoded_trash)| PreparedPathDelete {
+                lease: lease.clone(),
+                trash,
+                encoded_trash,
+            })
+            .collect())
+    }
+
+    async fn delete_unleased_prepared(
+        &self,
+        volume: &str,
+        path: &str,
+        opts: &DeleteOptions,
+        plan: PreparedPathDelete,
+    ) -> Result<()> {
+        let volume_dir = self.io_get_bucket_path(volume)?;
+        let file_path = self.io_get_object_path(volume, path)?;
+        let lease = plan.lease.clone();
+        self.delete_file_with_prepared_entry(
+            &volume_dir,
+            &file_path,
+            opts.recursive,
+            opts.immediate,
+            Some(lease.clone()),
+            Some(lease),
+            None,
+            Some(plan),
+        )
+        .await?;
+        self.io_backend.invalidate_cached_fds_under(volume, path);
+        Ok(())
+    }
+
+    pub(in crate::disk) async fn delete_path_prepared(
+        &self,
+        volume: &str,
+        path: &str,
+        opts: DeleteOptions,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Result<()> {
+        let transaction = (opts.recursive && opts.immediate)
+            .then(|| path.rsplit_once('/'))
+            .flatten()
+            .and_then(|(object, id)| Uuid::parse_str(id).ok().map(|id| (object, id)));
+        let object = transaction.map_or(path, |(object, _)| object);
+        let publication = self.prepare_path_delete_object(volume, object, owner)?;
+        let (data_paths, scan_error) = if let Some((object, transaction)) = transaction {
+            self.version_delete_paths(volume, object, transaction).await
+        } else {
+            (Vec::new(), None)
+        };
+        let data_opts = DeleteOptions {
+            recursive: true,
+            ..Default::default()
+        };
+        let entries = data_paths
+            .iter()
+            .map(|path| (path.as_str(), &data_opts))
+            .chain(std::iter::once((path, &opts)))
+            .collect::<Vec<_>>();
+        let mut plans = self.prepare_path_delete_entries(volume, &entries, publication)?.into_iter();
+        let mut first_error = None;
+        for data_path in &data_paths {
+            let plan = plans.next().ok_or(DiskError::Unexpected)?;
+            if let Err(error) = self
+                .delete_data_dir_with_prepared_entry(volume, data_path, data_opts.clone(), None, Some(plan))
+                .await
+                && error != DiskError::FileNotFound
+                && error != DiskError::VolumeNotFound
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        // The old scanner returns a metadata/read_dir error immediately, even
+        // if an earlier physical deletion failed; preserve that precedence.
+        if let Some(error) = scan_error.or(first_error) {
+            return Err(error);
+        }
+        let result = self
+            .delete_unleased_prepared(volume, path, &opts, plans.next().ok_or(DiskError::Unexpected)?)
+            .await;
+        match result {
+            Err(DiskError::FileNotFound) if !data_paths.is_empty() => Ok(()),
+            result => result,
+        }
+    }
+
+    pub(in crate::disk) async fn delete_paths_prepared(
+        &self,
+        volume: &str,
+        paths: &[String],
+        owner: Arc<dyn Send + Sync>,
+    ) -> Result<()> {
+        for path in paths {
+            let publication = self.prepare_path_delete_object(volume, path, owner.clone())?;
+            // DeletePaths always stages a raw rename, even for an ordinary file.
+            let opts = DeleteOptions {
+                recursive: true,
+                ..Default::default()
+            };
+            let mut plans = self.prepare_path_delete_entries(volume, &[(path, &opts)], publication)?;
+            let plan = plans.pop().ok_or(DiskError::Unexpected)?;
+            let file_path = self.io_get_object_path(volume, path)?;
+            self.move_to_trash_with_prepared_targets(
+                &file_path,
+                false,
+                false,
+                Some(plan.lease.clone()),
+                plan.trash.map(|target| (target, plan.lease.clone())),
+                plan.encoded_trash.map(|(source, target)| (source, target, plan.lease)),
+            )
+            .await?;
+            self.io_backend.invalidate_cached_fds_under(volume, path);
+        }
+        Ok(())
+    }
+
+    async fn version_delete_paths(&self, volume: &str, object: &str, transaction: Uuid) -> (Vec<String>, Option<DiskError>) {
+        let mut paths = Vec::new();
+        let scan = async {
+            let mut entries = match fs::read_dir(self.io_get_object_path(volume, object)?).await {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(to_file_error(error).into()),
+            };
+            let marker = format!("{DELETE_DATA_DIR_MARKER_PREFIX}{transaction}");
+            while let Some(entry) = entries.next_entry().await.map_err(to_file_error)? {
+                let Some(data_dir) = entry.file_name().to_str().and_then(|name| Uuid::parse_str(name).ok()) else {
+                    continue;
+                };
+                match fs::metadata(entry.path().join(&marker)).await {
+                    Ok(metadata) if metadata.is_file() => paths.push(format!("{object}/{data_dir}")),
+                    Ok(_) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(to_file_error(error).into()),
+                }
+            }
+            Ok(())
+        }
+        .await;
+        (paths, scan.err())
     }
 
     #[tracing::instrument(name = "delete", level = "trace", skip_all)]
@@ -8624,10 +8949,6 @@ impl LocalDisk {
             Err(DiskError::FileNotFound) if handled_version_delete => Ok(()),
             result => result,
         }
-    }
-
-    async fn delete_unleased(&self, volume: &str, path: &str, opt: &DeleteOptions) -> Result<()> {
-        self.delete_unleased_with_namespace_owner(volume, path, opt, None).await
     }
 
     async fn delete_unleased_with_namespace_owner(
@@ -8694,6 +9015,29 @@ impl LocalDisk {
         prepared_publication: Option<Arc<os::NamespaceMutationLease>>,
         prepared_trash: Option<(PathBuf, Arc<os::NamespaceMutationLease>)>,
     ) -> BoxFuture<'a, Result<()>> {
+        self.delete_file_with_prepared_entry(
+            base_path,
+            delete_path,
+            recursive,
+            immediate_purge,
+            namespace_owner,
+            prepared_publication,
+            prepared_trash,
+            None,
+        )
+    }
+
+    fn delete_file_with_prepared_entry<'a>(
+        &'a self,
+        base_path: &'a PathBuf,
+        delete_path: &'a PathBuf,
+        recursive: bool,
+        immediate_purge: bool,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        prepared_publication: Option<Arc<os::NamespaceMutationLease>>,
+        prepared_trash: Option<(PathBuf, Arc<os::NamespaceMutationLease>)>,
+        prepared_entry: Option<PreparedPathDelete>,
+    ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             // debug!("delete_file {:?}\n base_path:{:?}", &delete_path, &base_path);
 
@@ -8708,18 +9052,37 @@ impl LocalDisk {
             }
 
             if recursive {
-                self.move_to_trash_with_prepared_target(
-                    delete_path,
-                    recursive,
-                    immediate_purge,
-                    namespace_owner.clone(),
-                    prepared_trash,
-                )
-                .await?;
+                if let Some(entry) = &prepared_entry {
+                    self.move_to_trash_with_prepared_targets(
+                        delete_path,
+                        recursive,
+                        immediate_purge,
+                        namespace_owner.clone(),
+                        entry.trash.as_ref().map(|path| (path.clone(), entry.lease.clone())),
+                        entry
+                            .encoded_trash
+                            .as_ref()
+                            .map(|(source, target)| (source.clone(), target.clone(), entry.lease.clone())),
+                    )
+                    .await?;
+                } else {
+                    self.move_to_trash_with_prepared_target(
+                        delete_path,
+                        recursive,
+                        immediate_purge,
+                        namespace_owner.clone(),
+                        prepared_trash,
+                    )
+                    .await?;
+                }
             } else if delete_path.is_dir() {
                 // debug!("delete_file remove_dir {:?}", &delete_path);
                 let result = if let Some(publication) = &prepared_publication {
-                    let lease = os::try_acquire_namespace_mutation_lease_with_owner(delete_path, publication.clone())?;
+                    let lease = if let Some(entry) = &prepared_entry {
+                        entry.lease.clone()
+                    } else {
+                        os::try_acquire_namespace_mutation_lease_with_owner(delete_path, publication.clone())?
+                    };
                     let path = delete_path.clone();
                     os::run_blocking_namespace_operation(lease, move || std::fs::remove_dir(path)).await
                 } else {
@@ -8753,12 +9116,22 @@ impl LocalDisk {
                 // debug!("delete_file remove_dir done {:?}", &delete_path);
             } else {
                 let result = if let Some(publication) = &prepared_publication {
-                    let lease = os::try_acquire_namespace_mutation_lease_with_owner(delete_path, publication.clone())?;
+                    let lease = if let Some(entry) = &prepared_entry {
+                        entry.lease.clone()
+                    } else {
+                        os::try_acquire_namespace_mutation_lease_with_owner(delete_path, publication.clone())?
+                    };
                     let path = delete_path.clone();
                     os::run_blocking_namespace_operation(lease, move || {
                         #[cfg(all(any(test, feature = "test-util"), not(windows)))]
                         os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &path);
-                        std::fs::remove_file(path)
+                        let result = std::fs::remove_file(&path);
+                        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                        os::prepared_publication_test_hooks::run(
+                            os::prepared_publication_test_hooks::Stage::RemoveComplete,
+                            &path,
+                        );
+                        result
                     })
                     .await
                 } else {
@@ -11699,9 +12072,13 @@ impl LocalDisk {
             .collect();
 
         for (claim, opts) in pending {
-            let result = self
-                .delete_unleased_with_namespace_owner(&claim.key.volume, &claim.key.path, &opts, owner.clone())
-                .await;
+            let result = if let Some(owner) = &owner {
+                self.delete_path_prepared(&claim.key.volume, &claim.key.path, opts, owner.clone())
+                    .await
+            } else {
+                self.delete_unleased_with_namespace_owner(&claim.key.volume, &claim.key.path, &opts, None)
+                    .await
+            };
             if let Err(err) = &result {
                 warn!(
                     volume = %claim.key.volume,
@@ -12548,10 +12925,12 @@ impl DiskAPI for LocalDisk {
         match fs::metadata(file_path).await {
             Ok(metadata) if metadata.is_dir() => Ok(token),
             Ok(_) => {
+                drop(_mutation_lease);
                 self.release_snapshot_lease(volume, path, token).await?;
                 Err(DiskError::FileNotFound)
             }
             Err(err) => {
+                drop(_mutation_lease);
                 self.release_snapshot_lease(volume, path, token).await?;
                 Err(to_file_error(err).into())
             }
@@ -12605,16 +12984,26 @@ impl DiskAPI for LocalDisk {
             self.snapshot_leases.lock().entries.remove(&key);
             return Ok(());
         }
+        let permit = crate::disk::io_admission::current_disk_io_context().and_then(|context| context.permit);
+        let owner = match self.begin_legacy_volume_read(volume, permit).await {
+            Ok(owner) => owner,
+            Err(DiskError::VolumeNotFound) => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let opts = {
             let mut registry = self.snapshot_leases.lock();
             let Some(entry) = registry.entries.get_mut(&key) else {
                 return Ok(());
             };
-            entry.tokens.remove(&token);
-            if !entry.tokens.is_empty() || entry.deleting {
+            // The token must still belong to this generation after READ was
+            // acquired. A cancelled/failed cleanup retains it for a retry.
+            if !entry.tokens.contains(&token) || entry.deleting {
                 return Ok(());
             }
-
+            if entry.tokens.len() > 1 {
+                entry.tokens.remove(&token);
+                return Ok(());
+            }
             let Some(opts) = entry.pending_delete.clone() else {
                 registry.entries.remove(&key);
                 return Ok(());
@@ -12623,7 +13012,7 @@ impl DiskAPI for LocalDisk {
             opts
         };
         let claim = SnapshotLeaseDeleteClaim::new(&self.snapshot_leases, key);
-        let result = self.delete_unleased(volume, path, &opts).await;
+        let result = self.delete_path_prepared(volume, path, opts, owner.clone()).await;
         claim.finish(result.is_ok());
         result
     }
@@ -12942,10 +13331,10 @@ impl DiskAPI for LocalDisk {
             let path = p.clone();
             let owner = owner.clone();
             tokio::task::spawn_blocking(move || {
-                let _owner = owner;
                 #[cfg(test)]
                 volume_mutation_test_hooks::run(volume_mutation_test_hooks::Stage::Delete, &path);
                 let result = std::fs::remove_dir_all(&path);
+                owner.retire_deleted_snapshots(&result);
                 #[cfg(test)]
                 volume_mutation_test_hooks::run(volume_mutation_test_hooks::Stage::DeleteComplete, &path);
                 result
@@ -17646,6 +18035,568 @@ mod test {
         assert_eq!(part_tree_bytes(zero._root.path()), before);
         assert_eq!(zero.wrapper.metrics_snapshot().api_calls.get("prepare_part_transaction"), Some(&1));
         assert_eq!(zero.wrapper.metrics_snapshot().total_errors_timeout, 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_path_delete_core_preserves_path_and_batch_semantics() {
+        use crate::disk::LegacyPathDeleteOperation as Op;
+        for kind in ["file", "directory", "recursive", "encoded", "full"] {
+            let (_root, disk, wrapper) = rename_file_fixture().await;
+            let path = if kind == "encoded" { "entry/" } else { "entry" };
+            let target = disk.io_get_object_path("source", path).expect("target");
+            if kind == "file" {
+                fs::write(&target, b"file").await.expect("regular file");
+            } else {
+                fs::create_dir_all(&target).await.expect("directory");
+                if kind != "directory" {
+                    fs::write(target.join("child"), b"payload").await.expect("child");
+                }
+            }
+            let encoded = PathBuf::from(encode_dir_object(target.to_string_lossy().as_ref()));
+            if kind == "encoded" {
+                fs::create_dir_all(&encoded).await.expect("encoded directory");
+                fs::write(encoded.join("xl.meta"), b"encoded").await.expect("encoded payload");
+            }
+            if kind == "full" {
+                *PATH_DELETE_FULL_TARGET.lock() = Some(target.clone());
+            }
+            let token = wrapper
+                .begin_legacy_path_delete("source", Op::Delete, None, tokio::time::Instant::now() + Duration::from_secs(30))
+                .await
+                .expect("admission");
+            let mut writer = Box::pin(disk.delete_volume("source", true));
+            assert!(matches!(futures::poll!(writer.as_mut()), Poll::Pending));
+            let result = timeout(
+                Duration::from_secs(5),
+                token.delete(
+                    path,
+                    DeleteOptions {
+                        recursive: matches!(kind, "recursive" | "encoded" | "full"),
+                        immediate: kind == "encoded",
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .expect("no namespace/READ reentry behind WRITE");
+            drop(writer);
+            result.expect("delete succeeds");
+            assert!(!target.exists(), "{kind}: target removed");
+            if kind == "encoded" {
+                assert!(!encoded.exists(), "encoded directory removed");
+            }
+            assert_eq!(wrapper.metrics_snapshot().api_calls.get("delete"), Some(&1));
+            assert_eq!(wrapper.metrics_snapshot().total_deletes, 1);
+        }
+        let (root, disk, wrapper) = rename_file_fixture().await;
+        for path in ["first", "busy", "last"] {
+            fs::write(disk.io_get_object_path("source", path).expect("path"), path)
+                .await
+                .expect("file");
+        }
+        let busy_path = disk.io_get_object_path("source", "busy").expect("busy");
+        let busy = os::acquire_namespace_mutation_lease_with_owner(&busy_path, None).await;
+        let result = wrapper
+            .delete_paths("source", &["first".into(), "busy".into(), "last".into()])
+            .await;
+        assert!(matches!(result, Err(DiskError::Io(error)) if error.kind() == ErrorKind::WouldBlock));
+        assert!(!root.path().join("source/first").exists());
+        assert!(
+            root.path().join("source/busy").exists() && root.path().join("source/last").exists(),
+            "batch stops at first error"
+        );
+        drop(busy);
+        wrapper
+            .delete_paths("source", &["busy".into(), "busy".into(), "last".into()])
+            .await
+            .expect("duplicate raw file cleanup");
+        wrapper.delete_paths("source", &[]).await.expect("empty live batch");
+        assert_eq!(wrapper.metrics_snapshot().api_calls.get("delete_paths"), Some(&3));
+        assert_eq!(wrapper.metrics_snapshot().total_deletes, 2);
+        let before = part_tree_bytes(root.path());
+        let token = wrapper
+            .begin_legacy_path_delete("source", Op::DeletePaths, None, tokio::time::Instant::now() + Duration::from_secs(30))
+            .await
+            .expect("token");
+        assert_eq!(token.delete("unused", DeleteOptions::default()).await, Err(DiskError::Unexpected));
+        assert_eq!(part_tree_bytes(root.path()), before);
+        assert_eq!(wrapper.metrics_snapshot().total_deletes, 2);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_path_delete_core_residual_flags_preserve_version_history() {
+        for (undo_write, staged) in [(false, false), (false, true), (true, false)] {
+            let (_root, disk, wrapper) = rename_file_fixture().await;
+            let (fi, rollback, original) = prepare_legacy_delete_fixture(&disk, "source", "object", "data").await;
+            let destination = disk.io_get_object_path("destination", "object").expect("object");
+            fs::create_dir_all(destination.join(fi.data_dir.expect("data").to_string()))
+                .await
+                .expect("data dir");
+            fs::write(
+                destination.join(fi.data_dir.expect("data").to_string()).join("part.1"),
+                b"old-complete-shard",
+            )
+            .await
+            .expect("data");
+            fs::write(destination.join(STORAGE_FORMAT_FILE), original)
+                .await
+                .expect("metadata");
+            let opts = DeleteOptions {
+                undo_delete: true,
+                undo_write,
+                old_data_dir: staged.then_some(rollback),
+                ..Default::default()
+            };
+            let expected = disk.delete_version("source", "object", fi.clone(), false, opts.clone()).await;
+            let token = wrapper
+                .begin_legacy_metadata_write_with_namespace_owner("destination", "object", None)
+                .await
+                .expect("token");
+            let result = token.delete_version_residual(fi, false, opts).await;
+            assert_eq!(result, expected, "residual preserves original result");
+            let files = |root: &Path| {
+                part_tree_bytes(root)
+                    .into_iter()
+                    .filter(|(_, bytes)| bytes.is_some())
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            assert_eq!(
+                files(&disk.io_get_bucket_path("source").expect("volume")),
+                files(&disk.io_get_bucket_path("destination").expect("volume")),
+                "residual preserves metadata/data/rollback files"
+            );
+            assert_eq!(wrapper.metrics_snapshot().api_calls.get("delete_version"), Some(&1));
+        }
+        for undo_write in [false, true] {
+            let (_root, disk, wrapper) = rename_file_fixture().await;
+            fs::write(disk.io_get_object_path("source", "leaf").expect("file"), b"leaf")
+                .await
+                .expect("file");
+            wrapper
+                .begin_legacy_metadata_write_with_namespace_owner("source", "/leaf", None)
+                .await
+                .expect("slash token")
+                .delete_version_residual(
+                    FileInfo::default(),
+                    false,
+                    DeleteOptions {
+                        undo_delete: true,
+                        undo_write,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("legacy slash delete");
+            assert!(!disk.io_get_object_path("source", "leaf").expect("file").exists());
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_path_delete_core_required_namespace_contention_is_atomic() {
+        use crate::disk::LegacyPathDeleteOperation as Op;
+        for kind in ["source", "metadata", "encoded", "transaction-data"] {
+            let (root, disk, wrapper) = rename_file_fixture().await;
+            let (path, opts, locked) = if kind == "transaction-data" {
+                let residue = write_committed_delete_residue(&disk, "source", "object").await;
+                (
+                    format!("object/{}", residue.transaction),
+                    DeleteOptions {
+                        recursive: true,
+                        immediate: true,
+                        ..Default::default()
+                    },
+                    residue.part().parent().expect("data").to_path_buf(),
+                )
+            } else {
+                let path = if kind == "encoded" { "entry/" } else { "entry" };
+                let source = disk.io_get_object_path("source", path).expect("source");
+                if kind == "encoded" {
+                    fs::create_dir_all(&source).await.expect("directory");
+                } else {
+                    fs::write(&source, b"payload").await.expect("file");
+                }
+                let lock = match kind {
+                    "metadata" => source.join(STORAGE_FORMAT_FILE),
+                    "encoded" => PathBuf::from(encode_dir_object(source.to_string_lossy().as_ref())),
+                    _ => source,
+                };
+                (
+                    path.to_owned(),
+                    DeleteOptions {
+                        recursive: kind == "encoded",
+                        immediate: kind == "encoded",
+                        ..Default::default()
+                    },
+                    lock,
+                )
+            };
+            let busy = os::acquire_namespace_mutation_lease_with_owner(&locked, None).await;
+            let before = part_tree_bytes(root.path());
+            let token = wrapper
+                .begin_legacy_path_delete("source", Op::Delete, None, tokio::time::Instant::now() + Duration::from_secs(30))
+                .await
+                .expect("token");
+            let result = token.delete(&path, opts).await;
+            assert_eq!(
+                part_tree_bytes(root.path()),
+                before,
+                "{kind}: required namespace contention must cause zero writes"
+            );
+            assert!(matches!(result, Err(DiskError::Io(error)) if error.kind() == ErrorKind::WouldBlock));
+            drop(busy);
+        }
+    }
+
+    #[cfg(not(windows))]
+    async fn assert_path_delete_physical_owner(kind: &str, cancel: bool) {
+        use crate::disk::{LegacyPathDeleteOperation as Op, os::prepared_publication_test_hooks as hooks};
+        let (_root, disk, wrapper) = rename_file_fixture().await;
+        let (path, opts, physical) = if kind == "finish" {
+            let residue = write_committed_delete_residue(&disk, "source", "object").await;
+            (
+                format!("object/{}", residue.transaction),
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+                residue.part().parent().expect("data").to_path_buf(),
+            )
+        } else {
+            let path = if kind == "encoded" { "entry/" } else { "entry" };
+            let physical = disk.io_get_object_path("source", path).expect("target");
+            if matches!(kind, "trash" | "encoded" | "full") {
+                fs::create_dir_all(&physical).await.expect("directory");
+                fs::write(physical.join("child"), b"payload").await.expect("child");
+            } else {
+                fs::write(&physical, b"payload").await.expect("file");
+            }
+            let watched = if kind == "encoded" {
+                let encoded = PathBuf::from(encode_dir_object(physical.to_string_lossy().as_ref()));
+                fs::create_dir_all(&encoded).await.expect("encoded");
+                encoded
+            } else {
+                physical.clone()
+            };
+            if kind == "full" {
+                *PATH_DELETE_FULL_TARGET.lock() = Some(physical);
+            }
+            (
+                path.to_owned(),
+                DeleteOptions {
+                    recursive: matches!(kind, "trash" | "encoded" | "full"),
+                    immediate: kind == "encoded",
+                    ..Default::default()
+                },
+                watched,
+            )
+        };
+        if kind == "batch" {
+            for entry in ["first", "last"] {
+                fs::write(disk.io_get_object_path("source", entry).expect("batch path"), b"batch")
+                    .await
+                    .expect("batch entry");
+            }
+        }
+        let stage = if matches!(kind, "remove" | "full") {
+            hooks::Stage::Remove
+        } else {
+            hooks::Stage::Rename
+        };
+        let (completed, _complete_hook) = if matches!(kind, "remove" | "full") {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let hook = hooks::install_at(hooks::Stage::RemoveComplete, &physical, move || {
+                let _ = tx.send(());
+            });
+            (Some(rx), Some(hook))
+        } else {
+            (None, None)
+        };
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hook = hooks::install_at(stage, &physical, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        let op = if kind == "batch" { Op::DeletePaths } else { Op::Delete };
+        let token = wrapper
+            .begin_legacy_path_delete("source", op, Some(owner), tokio::time::Instant::now() + get_max_timeout_duration())
+            .await
+            .expect("token");
+        let mutation = tokio::spawn(async move {
+            if op == Op::DeletePaths {
+                token.delete_paths(&["first".into(), path, "last".into()]).await
+            } else {
+                token.delete(&path, opts).await
+            }
+        });
+        entered_rx.await.expect("real worker entered");
+        let outcome = if cancel {
+            mutation.abort();
+            mutation.await.map_err(|error| error.is_cancelled())
+        } else {
+            tokio::time::pause();
+            tokio::time::advance(get_max_timeout_duration() + Duration::from_secs(1)).await;
+            tokio::time::resume();
+            mutation.await.map_err(|error| error.is_cancelled())
+        };
+        let retained = weak.upgrade().is_some();
+        let read_held = os::disk_volume_mutation_lock(&disk.root, "source").try_write_owned().is_err();
+        let mut writer = Box::pin(disk.delete_volume("source", true));
+        let writer_waits = matches!(futures::poll!(writer.as_mut()), Poll::Pending);
+        drop(release_tx);
+        if let Some(completed) = completed {
+            completed
+                .await
+                .expect("actual remove syscall completed even if the owner is broken");
+        }
+        drop(
+            timeout(Duration::from_secs(10), os::acquire_namespace_mutation_lease_with_owner(&physical, None))
+                .await
+                .expect("actual worker drains"),
+        );
+        let batch_progress = (kind == "batch").then(|| {
+            (
+                !disk.io_get_object_path("source", "first").expect("first").exists(),
+                disk.io_get_object_path("source", "last").expect("last").exists(),
+            )
+        });
+        let deleted = writer.await;
+        assert!(
+            retained && read_held && writer_waits,
+            "{kind}: physical worker must retain owner and volume READ"
+        );
+        if cancel {
+            assert_eq!(outcome, Err(true));
+        } else {
+            assert_eq!(outcome, Ok(Err(DiskError::Timeout)));
+        }
+        if let Some((first_gone, last_present)) = batch_progress {
+            assert!(first_gone, "completed batch prefix is preserved");
+            assert!(last_present, "cancelled/timed-out batch leaves suffix untouched");
+        }
+        deleted.expect("delete after drain");
+        disk.make_volume("source").await.expect("recreate volume");
+        disk.write_all("source", "sentinel", Bytes::from_static(b"new"))
+            .await
+            .expect("sentinel");
+        assert_eq!(
+            disk.read_all("source", "sentinel").await.expect("sentinel remains"),
+            Bytes::from_static(b"new")
+        );
+        assert_eq!(wrapper.metrics_snapshot().api_calls.get(op.name()), Some(&1));
+        assert_eq!(wrapper.metrics_snapshot().total_errors_timeout, u64::from(!cancel));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_path_delete_core_cancellation_retains_physical_owner() {
+        for kind in ["remove", "trash", "encoded", "batch", "full", "finish"] {
+            assert_path_delete_physical_owner(kind, true).await;
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_path_delete_core_deadline_retains_physical_owner_and_batch_progress() {
+        use crate::disk::LegacyPathDeleteOperation as Op;
+        for kind in ["remove", "batch", "finish"] {
+            assert_path_delete_physical_owner(kind, false).await;
+        }
+        let (root, disk, wrapper) = rename_file_fixture().await;
+        fs::write(disk.io_get_object_path("source", "leaf").expect("leaf"), b"payload")
+            .await
+            .expect("file");
+        let token = wrapper
+            .begin_legacy_path_delete("source", Op::Delete, None, tokio::time::Instant::now() + get_max_timeout_duration())
+            .await
+            .expect("token");
+        wrapper.set_disk_id_state(Some(Uuid::new_v4())).await;
+        let format_guard = disk.format_info.write().await;
+        let before = part_tree_bytes(root.path());
+        let mut deletion = Box::pin(token.delete("leaf", DeleteOptions::default()));
+        assert!(matches!(futures::poll!(deletion.as_mut()), Poll::Pending));
+        tokio::time::pause();
+        tokio::time::advance(get_max_timeout_duration() + Duration::from_secs(1)).await;
+        let result = deletion.await;
+        tokio::time::resume();
+        drop(format_guard);
+        assert_eq!(result, Err(DiskError::Timeout));
+        assert_eq!(part_tree_bytes(root.path()), before, "format wait must not permit writes");
+        wrapper.set_disk_id_state(None).await;
+        let result = temp_env::async_with_vars(
+            [(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("0"))],
+            wrapper.delete("source", "leaf", DeleteOptions::default()),
+        )
+        .await;
+        assert_eq!(result, Err(DiskError::Timeout));
+        assert_eq!(part_tree_bytes(root.path()), before, "expired deadline never polls a mutation");
+        assert_eq!(wrapper.metrics_snapshot().total_errors_timeout, 2);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_path_delete_core_transaction_finish_preserves_snapshot_deferred_cleanup() {
+        let (_root, disk, wrapper) = rename_file_fixture().await;
+        let residue = write_committed_delete_residue(&disk, "source", "object").await;
+        let data_path = format!("object/{}", residue.data_dir);
+        let snapshot = disk.acquire_snapshot_lease("source", &data_path).await.expect("snapshot");
+        wrapper
+            .delete(
+                "source",
+                &format!("object/{}", residue.transaction),
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("finish defers leased data");
+        assert!(residue.part().exists());
+        assert!(!residue.backup().exists());
+        disk.release_snapshot_lease("source", &data_path, snapshot)
+            .await
+            .expect("release executes prepared cleanup");
+        assert!(!residue.part().exists());
+
+        // NotFound from a vanished child is not proof that the volume was removed.
+        let (_retained_root, retained_disk, _wrapper) = rename_file_fixture().await;
+        retained_disk
+            .write_all("source", "live/part.1", Bytes::from_static(b"live"))
+            .await
+            .expect("live shard");
+        let retained_token = retained_disk
+            .acquire_snapshot_lease("source", "live")
+            .await
+            .expect("live snapshot");
+        retained_disk
+            .delete_data_dir(
+                "source",
+                "live",
+                DeleteOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("pending cleanup");
+        let root = retained_disk.io_get_bucket_path("source").expect("volume");
+        let guard = os::disk_volume_mutation_lock(&retained_disk.root, "source")
+            .write_owned()
+            .await;
+        let owner = retained_disk.volume_mutation_owner(guard, "source", root.clone());
+        let missing_child = tokio::task::spawn_blocking(move || {
+            let result = std::fs::symlink_metadata(root.join("vanished-child")).map(|_| ());
+            owner.retire_deleted_snapshots(&result);
+            result
+        })
+        .await
+        .expect("real blocking worker");
+        assert!(matches!(missing_child, Err(error) if error.kind() == ErrorKind::NotFound));
+        assert!(
+            retained_disk
+                .snapshot_leases
+                .lock()
+                .entries
+                .get(&SnapshotLeaseKey {
+                    volume: "source".into(),
+                    path: "live".into()
+                })
+                .expect("a missing child must not retire the live volume")
+                .tokens
+                .contains(&retained_token)
+        );
+        retained_disk
+            .release_snapshot_lease("source", "live", retained_token)
+            .await
+            .expect("original cleanup remains recoverable");
+
+        // A queued WRITE must not be bypassed by claiming pending work before READ.
+        for force in [false, true] {
+            let (_root, disk, _wrapper) = rename_file_fixture().await;
+            let path = "object/data";
+            disk.write_all("source", "object/data/part.1", Bytes::from_static(b"old"))
+                .await
+                .expect("old shard");
+            let snapshot = disk.acquire_snapshot_lease("source", path).await.expect("snapshot");
+            assert_eq!(
+                disk.delete_data_dir(
+                    "source",
+                    path,
+                    DeleteOptions {
+                        recursive: true,
+                        ..Default::default()
+                    }
+                )
+                .await
+                .expect("defer"),
+                DataDirDeleteStatus::Deferred
+            );
+            // Force deletion must retire even when settlement could not acquire D.
+            let busy = if force {
+                Some(
+                    os::acquire_namespace_mutation_lease_with_owner(
+                        &disk.io_get_object_path("source", path).expect("data"),
+                        None,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            };
+            let volume_path = disk.io_get_bucket_path("source").expect("volume");
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let _hook = volume_mutation_test_hooks::install(volume_mutation_test_hooks::Stage::Delete, &volume_path, move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            });
+            let worker_disk = disk.clone();
+            let mutation = tokio::spawn(async move { worker_disk.delete_volume("source", force).await });
+            entered_rx.await.expect("real volume delete worker");
+            mutation.abort();
+            let cancelled = mutation.await;
+            drop(release_tx);
+            drop(busy);
+            let drained = os::disk_volume_mutation_lock(&disk.root, "source").write_owned().await;
+            let retired = !disk.snapshot_leases.lock().entries.keys().any(|key| key.volume == "source");
+            drop(drained);
+            assert!(cancelled.expect_err("cancelled caller").is_cancelled());
+            assert!(retired, "physical completion retires old pending entries before WRITE releases");
+            disk.make_volume("source").await.expect("new volume");
+            disk.write_all("source", "object/data/part.1", Bytes::from_static(b"new"))
+                .await
+                .expect("new generation");
+            let current = disk.acquire_snapshot_lease("source", path).await.expect("new snapshot");
+            disk.release_snapshot_lease("source", path, snapshot)
+                .await
+                .expect("late release is harmless");
+            assert_eq!(
+                disk.read_all("source", "object/data/part.1").await.expect("new shard"),
+                Bytes::from_static(b"new")
+            );
+            assert!(
+                disk.snapshot_leases
+                    .lock()
+                    .entries
+                    .get(&SnapshotLeaseKey {
+                        volume: "source".into(),
+                        path: path.into()
+                    })
+                    .expect("new entry")
+                    .tokens
+                    .contains(&current)
+            );
+        }
     }
 
     async fn rename_file_fixture() -> (tempfile::TempDir, Arc<LocalDisk>, crate::disk::disk_store::LocalDiskWrapper) {
@@ -28380,7 +29331,7 @@ mod test {
             let _ = entered_tx.send(());
             let _ = release_rx.recv();
         });
-        let waiter = tokio::spawn(remove_windows_empty_directory_with_owner(directory, Some(owner)));
+        let waiter = tokio::spawn(remove_windows_empty_directory_with_owner(directory, Some(owner), None));
         timeout(Duration::from_secs(5), entered_rx)
             .await
             .expect("physical Windows deletion starts")

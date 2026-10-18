@@ -7284,6 +7284,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_path_delete_flow_multipart_cleanup_preserves_order_and_quorum() {
+        use rustfs_storage_api::BucketOperations;
+
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        for disk in &disks {
+            for path in ["cleanup/first", "cleanup/blocker", "cleanup/last"] {
+                disk.write_all(RUSTFS_META_MULTIPART_BUCKET, path, Bytes::from_static(b"staged"))
+                    .await
+                    .expect("seed raw multipart file");
+            }
+        }
+        set.cleanup_multipart_path(&[
+            "cleanup/first".to_owned(),
+            "cleanup/blocker/child".to_owned(),
+            "cleanup/last".to_owned(),
+        ])
+        .await;
+        for disk in &disks {
+            assert!(
+                matches!(
+                    disk.read_all(RUSTFS_META_MULTIPART_BUCKET, "cleanup/first").await,
+                    Err(DiskError::FileNotFound)
+                ),
+                "batch keeps the successful item before its first error"
+            );
+            for path in ["cleanup/blocker", "cleanup/last"] {
+                assert_eq!(
+                    disk.read_all(RUSTFS_META_MULTIPART_BUCKET, path)
+                        .await
+                        .expect("later file remains"),
+                    b"staged".as_slice(),
+                    "batch must stop at the first non-directory error"
+                );
+            }
+        }
+        set.cleanup_multipart_path(&["cleanup/blocker".to_owned(), "cleanup/last".to_owned()])
+            .await;
+        for disk in &disks {
+            for path in ["cleanup/blocker", "cleanup/last"] {
+                assert!(
+                    matches!(disk.read_all(RUSTFS_META_MULTIPART_BUCKET, path).await, Err(DiskError::FileNotFound)),
+                    "retry cleans remaining raw files on every disk"
+                );
+            }
+        }
+
+        let bucket = "path-delete-multipart";
+        crate::bucket::metadata_sys::object_store_in(&set.ctx)
+            .await
+            .expect("fixture object store")
+            .make_bucket(bucket, &Default::default())
+            .await
+            .expect("authoritative multipart bucket");
+        for available in [3, 2] {
+            let object = format!("object-{available}");
+            let upload = set
+                .new_multipart_upload(bucket, &object, &ObjectOptions::default())
+                .await
+                .expect("create upload before reducing availability");
+            let saved = {
+                let mut current = set.disks.write().await;
+                let saved = current.clone();
+                for disk in current.iter_mut().skip(available) {
+                    *disk = None;
+                }
+                saved
+            };
+            let result = set
+                .abort_multipart_upload(bucket, &object, &upload.upload_id, &ObjectOptions::default())
+                .await;
+            *set.disks.write().await = saved;
+            let remaining = set.check_upload_id_exists(bucket, &object, &upload.upload_id, false).await;
+            if available == 3 {
+                result.expect("three of four disks satisfy delete write quorum");
+                assert!(matches!(remaining, Err(StorageError::InvalidUploadID(..))));
+            } else {
+                assert!(
+                    matches!(result, Err(StorageError::ErasureWriteQuorum)),
+                    "two disks must not acknowledge an abort"
+                );
+                remaining.expect("failed abort leaves quorum-visible staging after disks return");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn abort_enforces_delete_write_quorum_boundary() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "multipart-abort-delete-quorum";

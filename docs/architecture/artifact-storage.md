@@ -102,6 +102,22 @@ The existing transaction files and recovery decisions remain authoritative;
 a timed-out settlement leaves recoverable state instead of claiming completion.
 Admission failures and consumed operations retain their original operation
 metrics without counting a successful write twice.
+`Delete` and `DeletePaths` bind one volume admission to the captured instance
+before classification. Each item tries all required namespaces before its first
+mutation, including the encoded-directory cleanup target. Batches retain input
+order and stop at the first error without undoing completed items. Scanner
+ownership comes from the same instance and remains with the physical workers.
+The two residual `DeleteVersion` undo combinations reuse prepared metadata
+deletion rather than bypassing admission.
+
+Snapshot-deferred cleanup releases its initial admission while readers remain.
+The final snapshot release reacquires volume admission and checks the pending
+claim under that ownership before deleting. Claim completion retains the same
+owner, so an old cleanup cannot remove a recreated volume's registry entry.
+Bucket deletion settles pending cleanup under its existing write owner and tries
+required namespaces without waiting for a competing volume reader. Successful
+physical volume deletion retires old snapshot state before releasing that owner,
+including when the caller has already been cancelled.
 The incarnation-bound heal path retains its separate admission. Other legacy
 mutation routes and internal metadata publication still need their own admission
 boundary before distributed artifact sealing can be enabled.

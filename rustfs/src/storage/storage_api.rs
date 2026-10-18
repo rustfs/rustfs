@@ -480,10 +480,10 @@ pub(crate) mod ecstore_disk {
     pub(crate) use rustfs_ecstore::api::disk::{
         BUCKET_META_PREFIX, BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, ConditionalFileUpdate, DeleteOptions,
         DiskAPI, DiskInfo, DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, LegacyFileWrite,
-        LegacyMetadataWrite, LegacyPartMutation, LegacyPartOperation, LegacyRenameData, LegacyRenameFile, OldCurrentSize,
-        PartTransactionAction, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-        SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout,
-        validate_batch_read_version_item_count,
+        LegacyMetadataWrite, LegacyPartMutation, LegacyPartOperation, LegacyPathDelete, LegacyPathDeleteOperation,
+        LegacyRenameData, LegacyRenameFile, OldCurrentSize, PartTransactionAction, RUSTFS_META_BUCKET, ReadMultipleReq,
+        ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+        get_object_disk_read_timeout, validate_batch_read_version_item_count,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::disk::{DiskOption, new_disk};
@@ -740,6 +740,8 @@ pub(crate) type RenameDataResp = ecstore_disk::RenameDataResp;
 pub(crate) type LegacyRenameData = ecstore_disk::LegacyRenameData;
 pub(crate) type LegacyPartOperation = ecstore_disk::LegacyPartOperation;
 pub(crate) type LegacyPartMutation = ecstore_disk::LegacyPartMutation;
+pub(crate) type LegacyPathDeleteOperation = ecstore_disk::LegacyPathDeleteOperation;
+pub(crate) type LegacyPathDelete = ecstore_disk::LegacyPathDelete;
 pub(crate) type LegacyRenameFile = ecstore_disk::LegacyRenameFile;
 pub(crate) type LegacyFileWrite = ecstore_disk::LegacyFileWrite;
 pub(crate) type LegacyMetadataWrite = ecstore_disk::LegacyMetadataWrite;
@@ -1407,7 +1409,6 @@ pub(crate) trait StorageDiskRpcExt {
         opts: &UpdateMetadataOpts,
     ) -> DiskResult<()>;
     async fn read_metadata(&self, volume: &str, path: &str) -> DiskResult<bytes::Bytes>;
-    async fn delete_paths(&self, volume: &str, paths: &[String]) -> DiskResult<()>;
     async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> DiskResult<SnapshotLeaseToken>;
     async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<()>;
     async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> DiskResult<SnapshotLeaseToken>;
@@ -1496,10 +1497,6 @@ where
 
     async fn read_metadata(&self, volume: &str, path: &str) -> DiskResult<bytes::Bytes> {
         ecstore_disk::DiskAPI::read_metadata(self, volume, path).await
-    }
-
-    async fn delete_paths(&self, volume: &str, paths: &[String]) -> DiskResult<()> {
-        ecstore_disk::DiskAPI::delete_paths(self, volume, paths).await
     }
 
     async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> DiskResult<SnapshotLeaseToken> {

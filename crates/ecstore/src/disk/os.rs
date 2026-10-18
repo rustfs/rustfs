@@ -272,6 +272,7 @@ pub(crate) mod prepared_publication_test_hooks {
         PreparedRename,
         Rename,
         Remove,
+        RemoveComplete,
         #[cfg(test)]
         Rollback,
         #[cfg(test)]

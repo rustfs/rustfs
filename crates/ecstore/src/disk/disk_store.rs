@@ -1539,6 +1539,86 @@ impl LegacyFileWrite {
     }
 }
 
+/// Existing path deletion operations; callers cannot supply metric labels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyPathDeleteOperation {
+    Delete,
+    DeletePaths,
+}
+
+impl LegacyPathDeleteOperation {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Delete => "delete",
+            Self::DeletePaths => "delete_paths",
+        }
+    }
+}
+
+/// One deletion request bound to its captured disk and live volume.
+#[derive(Debug)]
+pub struct LegacyPathDelete {
+    write: LegacyFileWrite,
+    operation: LegacyPathDeleteOperation,
+    deadline: tokio::time::Instant,
+}
+
+enum PathDelete<'a> {
+    One(&'a str, DeleteOptions),
+    Many(&'a [String]),
+}
+
+impl PathDelete<'_> {
+    fn operation(&self) -> LegacyPathDeleteOperation {
+        match self {
+            Self::One(..) => LegacyPathDeleteOperation::Delete,
+            Self::Many(_) => LegacyPathDeleteOperation::DeletePaths,
+        }
+    }
+
+    async fn apply(self, disk: &LocalDisk, volume: &str, owner: Arc<dyn Send + Sync>) -> Result<()> {
+        match self {
+            Self::One(path, options) => disk.delete_path_prepared(volume, path, options, owner).await,
+            Self::Many(paths) => disk.delete_paths_prepared(volume, paths, owner).await,
+        }
+    }
+}
+
+impl LegacyPathDelete {
+    pub async fn delete(self, path: &str, opts: DeleteOptions) -> Result<()> {
+        self.execute(PathDelete::One(path, opts)).await
+    }
+
+    pub async fn delete_paths(self, paths: &[String]) -> Result<()> {
+        self.execute(PathDelete::Many(paths)).await
+    }
+
+    async fn execute(self, action: PathDelete<'_>) -> Result<()> {
+        let Self {
+            write,
+            operation,
+            deadline,
+        } = self;
+        with_disk_io_permit(
+            Some(write.permit),
+            write.disk.track_disk_health_with_deadline(
+                operation.name(),
+                |_permit| async {
+                    if action.operation() != operation {
+                        return Err(DiskError::Unexpected);
+                    }
+                    action.apply(&write.disk.disk, &write.volume, write.owner).await
+                },
+                get_max_timeout_duration(),
+                TimeoutHealthAction::MarkFailure,
+                DiskMetricMutation::Delete,
+                Some(deadline),
+            ),
+        )
+        .await
+    }
+}
+
 /// A single metadata publication bound to its disk, object and physical lease.
 pub struct LegacyMetadataWrite {
     disk: LocalDiskWrapper,
@@ -1546,6 +1626,7 @@ pub struct LegacyMetadataWrite {
     path: String,
     publication: Arc<super::os::NamespaceMutationLease>,
     permit: crate::disk::io_admission::DiskIoPermit,
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl std::fmt::Debug for LegacyMetadataWrite {
@@ -1558,6 +1639,11 @@ impl std::fmt::Debug for LegacyMetadataWrite {
 }
 
 impl LegacyMetadataWrite {
+    pub(crate) fn with_deadline(mut self, deadline: tokio::time::Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
     pub async fn undo_write(self, fi: FileInfo, opts: DeleteOptions) -> Result<()> {
         if !opts.undo_write || opts.undo_delete {
             return Err(DiskError::MethodNotAllowed);
@@ -1579,6 +1665,13 @@ impl LegacyMetadataWrite {
         self.execute_delete_version(fi, force_del_marker, opts).await
     }
 
+    pub async fn delete_version_residual(self, fi: FileInfo, force_del_marker: bool, opts: DeleteOptions) -> Result<()> {
+        if !opts.undo_delete || (opts.undo_write && opts.old_data_dir.is_some()) || (force_del_marker && opts.undo_write) {
+            return Err(DiskError::MethodNotAllowed);
+        }
+        self.execute_delete_version(fi, force_del_marker, opts).await
+    }
+
     pub async fn delete_version(self, fi: FileInfo, force_del_marker: bool, opts: DeleteOptions) -> Result<()> {
         if opts.undo_write || opts.undo_delete || opts.old_data_dir.is_some() {
             return Err(DiskError::MethodNotAllowed);
@@ -1589,10 +1682,9 @@ impl LegacyMetadataWrite {
     async fn execute_delete_version(self, fi: FileInfo, force_del_marker: bool, opts: DeleteOptions) -> Result<()> {
         crate::disk::io_admission::with_disk_io_permit(
             Some(self.permit.clone()),
-            self.disk.track_disk_health_mutation(
+            self.disk.track_disk_health_with_deadline(
                 "delete_version",
-                DiskMetricMutation::Delete,
-                || async {
+                |_permit| async {
                     Box::pin(self.disk.disk.delete_version_prepared(
                         &self.volume,
                         &self.path,
@@ -1604,6 +1696,9 @@ impl LegacyMetadataWrite {
                     .await
                 },
                 get_max_timeout_duration(),
+                TimeoutHealthAction::MarkFailure,
+                DiskMetricMutation::Delete,
+                self.deadline,
             ),
         )
         .await
@@ -1876,7 +1971,7 @@ impl LegacyRenameFile {
 }
 
 impl LocalDiskWrapper {
-    pub(crate) fn record_legacy_part_admission_failure(&self, operation: &'static str, error: &DiskError, started: Instant) {
+    pub(crate) fn record_legacy_admission_failure(&self, operation: &'static str, error: &DiskError, started: Instant) {
         self.metrics.record_operation_call(operation);
         if *error == DiskError::Timeout {
             self.record_operation_timeout(operation, started, get_max_timeout_duration(), TimeoutHealthAction::MarkFailure);
@@ -1884,6 +1979,50 @@ impl LocalDiskWrapper {
             self.metrics.record_operation_latency(operation, started.elapsed());
             self.record_result_error_metrics::<()>(&Err(error.clone()));
         }
+    }
+
+    pub(in crate::disk) async fn begin_legacy_path_delete(
+        &self,
+        volume: &str,
+        operation: LegacyPathDeleteOperation,
+        owner: Option<Arc<dyn Send + Sync>>,
+        deadline: tokio::time::Instant,
+    ) -> Result<LegacyPathDelete> {
+        let mut write = tokio::time::timeout_at(deadline, self.begin_legacy_file_write(volume))
+            .await
+            .map_err(|_| DiskError::Timeout)??;
+        write.owner = Arc::new((write.owner, owner));
+        Ok(LegacyPathDelete {
+            write,
+            operation,
+            deadline,
+        })
+    }
+
+    async fn execute_path_delete(
+        &self,
+        volume: &str,
+        action: PathDelete<'_>,
+        external_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        let duration = get_max_timeout_duration();
+        let deadline = tokio::time::Instant::now() + duration;
+        let permit = self.io_admission.foreground();
+        with_disk_io_permit(
+            Some(permit.clone()),
+            self.track_disk_health_with_deadline(
+                action.operation().name(),
+                |_permit| async {
+                    let owner = self.disk.begin_legacy_file_write(volume, permit).await?;
+                    action.apply(&self.disk, volume, Arc::new((owner, external_guard))).await
+                },
+                duration,
+                TimeoutHealthAction::MarkFailure,
+                DiskMetricMutation::Delete,
+                Some(deadline),
+            ),
+        )
+        .await
     }
 
     pub(in crate::disk) async fn begin_legacy_part_mutation(
@@ -2058,6 +2197,7 @@ impl LocalDiskWrapper {
             path: path.to_owned(),
             publication,
             permit,
+            deadline: None,
         })
     }
 
@@ -2119,19 +2259,10 @@ impl LocalDiskWrapper {
         let operation = self.clone();
         let volume = volume.to_owned();
         let path = path.to_owned();
-        let timeout_duration = if external_guard.is_some() {
-            Duration::ZERO
-        } else {
-            get_max_timeout_duration()
-        };
+        let physical_guard = external_guard.clone();
         run_owned_mutation(external_guard, move || async move {
             operation
-                .track_disk_health_mutation(
-                    "delete",
-                    DiskMetricMutation::Delete,
-                    || async { operation.disk.delete(&volume, &path, options).await },
-                    timeout_duration,
-                )
+                .execute_path_delete(&volume, PathDelete::One(&path, options), physical_guard)
                 .await
         })
         .await
@@ -3153,13 +3284,7 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
-        self.track_disk_health_mutation(
-            "delete_paths",
-            DiskMetricMutation::Delete,
-            || async { self.disk.delete_paths(volume, paths).await },
-            get_max_timeout_duration(),
-        )
-        .await
+        self.execute_path_delete(volume, PathDelete::Many(paths), None).await
     }
 
     async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> Result<SnapshotLeaseToken> {
@@ -3430,13 +3555,7 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
-        self.track_disk_health_mutation(
-            "delete",
-            DiskMetricMutation::Delete,
-            || async { self.disk.delete(volume, path, opt).await },
-            get_max_timeout_duration(),
-        )
-        .await
+        self.execute_path_delete(volume, PathDelete::One(path, opt), None).await
     }
 
     async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {

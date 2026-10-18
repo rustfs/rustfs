@@ -20,8 +20,9 @@ use crate::storage::storage_api::rpc_consumer::node_service::{
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use crate::storage::storage_api::{
-    LegacyFileWrite, LegacyMetadataWrite, LegacyPartMutation, LegacyPartOperation, LegacyRenameData, LegacyRenameFile,
-    PartTransactionAction, RenameDataResp, SnapshotLeaseToken, verify_tonic_mutation_body_digest,
+    LegacyFileWrite, LegacyMetadataWrite, LegacyPartMutation, LegacyPartOperation, LegacyPathDelete, LegacyPathDeleteOperation,
+    LegacyRenameData, LegacyRenameFile, PartTransactionAction, RenameDataResp, SnapshotLeaseToken,
+    verify_tonic_mutation_body_digest,
 };
 use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
@@ -200,18 +201,50 @@ impl LocalMutationTarget {
         }
     }
 
-    async fn undo_local_write(
+    async fn begin_legacy_local_path_delete(
+        &self,
+        disk_ref: &str,
+        volume: &str,
+        operation: LegacyPathDeleteOperation,
+        external_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<LegacyPathDelete, DiskError> {
+        match self {
+            Self::Ready(store) => {
+                store
+                    .begin_legacy_local_path_delete(disk_ref, volume, operation, external_guard)
+                    .await
+            }
+            Self::Bootstrap(target) => {
+                target
+                    .begin_legacy_local_path_delete(disk_ref, volume, operation, external_guard)
+                    .await
+            }
+            Self::Unbound => Err(DiskError::other("cannot find disk")),
+        }
+    }
+    async fn begin_legacy_local_residual_version_delete(
         &self,
         disk_ref: &str,
         volume: &str,
         path: &str,
-        fi: FileInfo,
-        opts: DeleteOptions,
-    ) -> Result<(), DiskError> {
+        undo_write: bool,
+    ) -> Result<LegacyMetadataWrite, DiskError> {
         match self {
-            Self::Ready(store) => store.undo_local_write(disk_ref, volume, path, fi, opts).await,
-            Self::Bootstrap(target) => target.undo_local_write(disk_ref, volume, path, fi, opts).await,
-            Self::Unbound => Err(DiskError::other("target disk instance is unavailable")),
+            Self::Ready(store) => {
+                store
+                    .begin_legacy_local_residual_version_delete(disk_ref, volume, path, undo_write)
+                    .await
+            }
+            Self::Bootstrap(target) => {
+                target
+                    .begin_legacy_local_residual_version_delete(disk_ref, volume, path, undo_write)
+                    .await
+            }
+            Self::Unbound => Err(DiskError::other(if undo_write {
+                "target disk instance is unavailable"
+            } else {
+                "cannot find disk"
+            })),
         }
     }
 }
@@ -963,10 +996,16 @@ impl NodeService {
                     Err(err) => Err(err),
                 }
             } else if opts.undo_delete {
-                target.reject_legacy_artifact_mutation(&request.volume).await?;
-                target
-                    .undo_local_write(&request.disk, &request.volume, &request.path, file_info, opts)
+                match target
+                    .begin_legacy_local_residual_version_delete(&request.disk, &request.volume, &request.path, true)
                     .await
+                {
+                    Ok(write) => {
+                        target.reject_legacy_artifact_mutation(&request.volume).await?;
+                        write.delete_version_residual(file_info, request.force_del_marker, opts).await
+                    }
+                    Err(err) => Err(err),
+                }
             } else {
                 match target
                     .begin_legacy_local_metadata_mutation(&request.disk, &request.volume, &request.path)
@@ -1001,12 +1040,17 @@ impl NodeService {
                 }
                 Err(err) => Err(err),
             }
-        } else if let Some(disk) = target.find_mutation_disk(&request.disk).await {
-            target.reject_legacy_artifact_mutation(&request.volume).await?;
-            disk.delete_version(&request.volume, &request.path, file_info, request.force_del_marker, opts)
-                .await
         } else {
-            Err(DiskError::other("cannot find disk"))
+            match target
+                .begin_legacy_local_residual_version_delete(&request.disk, &request.volume, &request.path, false)
+                .await
+            {
+                Ok(write) => {
+                    target.reject_legacy_artifact_mutation(&request.volume).await?;
+                    write.delete_version_residual(file_info, request.force_del_marker, opts).await
+                }
+                Err(err) => Err(err),
+            }
         };
         match result {
             Ok(raw_file_info) => match serde_json::to_string(&raw_file_info) {
@@ -1390,24 +1434,20 @@ impl NodeService {
         )?;
         let request = request.into_inner();
         let target = self.local_mutation_target();
-        if let Some(disk) = target.find_mutation_disk(&request.disk).await {
-            target.reject_legacy_artifact_mutation(&request.volume).await?;
-            match disk.delete_paths(&request.volume, &request.paths).await {
-                Ok(_) => Ok(Response::new(DeletePathsResponse {
-                    success: true,
-                    error: None,
-                })),
-                Err(err) => Ok(Response::new(DeletePathsResponse {
-                    success: false,
-                    error: Some(err.into()),
-                })),
+        let result = match target
+            .begin_legacy_local_path_delete(&request.disk, &request.volume, LegacyPathDeleteOperation::DeletePaths, None)
+            .await
+        {
+            Ok(delete) => {
+                target.reject_legacy_artifact_mutation(&request.volume).await?;
+                delete.delete_paths(&request.paths).await
             }
-        } else {
-            Ok(Response::new(DeletePathsResponse {
-                success: false,
-                error: Some(DiskError::other("cannot find disk".to_string()).into()),
-            }))
-        }
+            Err(err) => Err(err),
+        };
+        Ok(Response::new(DeletePathsResponse {
+            success: result.is_ok(),
+            error: result.err().map(Into::into),
+        }))
     }
 
     pub(super) async fn handle_stat_volume(
@@ -2072,75 +2112,65 @@ impl NodeService {
                 error: result.err().map(Into::into),
             }));
         }
-        if let Some(disk) = target.find_mutation_disk(&request.disk).await {
-            target.reject_legacy_artifact_mutation(&request.volume).await?;
-            let options = match serde_json::from_str::<DeleteOptions>(&request.options) {
-                Ok(options) => options,
+        let options = match serde_json::from_str::<DeleteOptions>(&request.options) {
+            Ok(options) => options,
+            Err(err) => {
+                return Ok(Response::new(DeleteResponse {
+                    success: false,
+                    error: Some(DiskError::other(format!("decode DeleteOptions failed: {err}")).into()),
+                }));
+            }
+        };
+        let scanner_publication_lease_token = if request.scanner_publication_lease_token.is_empty() {
+            None
+        } else {
+            let token = Uuid::from_slice(&request.scanner_publication_lease_token)
+                .map_err(|_| Status::invalid_argument("scanner publication lease token must be a UUID"))?;
+            if token.is_nil() {
+                return Err(Status::invalid_argument("scanner publication lease token must not be nil"));
+            }
+            Some(token)
+        };
+        // Resolve the guard from the captured receiver and retain it in the
+        // physical delete owner, including after caller cancellation.
+        let scanner_publication_lease_guard: Option<Arc<dyn Send + Sync>> = if let Some(token) = scanner_publication_lease_token {
+            let LocalMutationTarget::Ready(store) = &target else {
+                return Ok(Response::new(DeleteResponse {
+                    success: false,
+                    error: Some(DiskError::other("scanner publication lease owner is unavailable").into()),
+                }));
+            };
+            match store.acquire_scanner_publication_lease_guard(token).await {
+                Ok(guard) => Some(Arc::new(guard)),
                 Err(err) => {
                     return Ok(Response::new(DeleteResponse {
                         success: false,
-                        error: Some(DiskError::other(format!("decode DeleteOptions failed: {err}")).into()),
+                        error: Some(DiskError::other(err.to_string()).into()),
                     }));
                 }
-            };
-            let scanner_publication_lease_token = if request.scanner_publication_lease_token.is_empty() {
-                None
-            } else {
-                let token = Uuid::from_slice(&request.scanner_publication_lease_token)
-                    .map_err(|_| Status::invalid_argument("scanner publication lease token must be a UUID"))?;
-                if token.is_nil() {
-                    return Err(Status::invalid_argument("scanner publication lease token must not be nil"));
-                }
-                Some(token)
-            };
-            // The target-side guard spans the complete delete operation. A
-            // lease expiry or movement transition cannot occur between this
-            // validation and the disk delete linearization point.
-            let scanner_publication_lease_guard: Option<Arc<dyn Send + Sync>> =
-                if let Some(token) = scanner_publication_lease_token {
-                    let Some(store) = self.resolve_object_store() else {
-                        return Ok(Response::new(DeleteResponse {
-                            success: false,
-                            error: Some(DiskError::other("scanner publication lease owner is unavailable").into()),
-                        }));
-                    };
-                    match store.acquire_scanner_publication_lease_guard(token).await {
-                        Ok(guard) => Some(Arc::new(guard)),
-                        Err(err) => {
-                            return Ok(Response::new(DeleteResponse {
-                                success: false,
-                                error: Some(DiskError::other(err.to_string()).into()),
-                            }));
-                        }
-                    }
-                } else {
-                    None
-                };
-            match disk
-                .delete_with_scanner_publication_lease_and_guard(
-                    &request.volume,
-                    &request.path,
-                    options,
-                    scanner_publication_lease_token,
-                    scanner_publication_lease_guard,
-                )
-                .await
-            {
-                Ok(_) => Ok(Response::new(DeleteResponse {
-                    success: true,
-                    error: None,
-                })),
-                Err(err) => Ok(Response::new(DeleteResponse {
-                    success: false,
-                    error: Some(err.into()),
-                })),
             }
         } else {
-            Ok(Response::new(DeleteResponse {
-                success: false,
-                error: Some(DiskError::other("cannot find disk".to_string()).into()),
-            }))
-        }
+            None
+        };
+        let result = match target
+            .begin_legacy_local_path_delete(
+                &request.disk,
+                &request.volume,
+                LegacyPathDeleteOperation::Delete,
+                scanner_publication_lease_guard,
+            )
+            .await
+        {
+            Ok(delete) => {
+                target.reject_legacy_artifact_mutation(&request.volume).await?;
+                delete.delete(&request.path, options).await
+            }
+            Err(err) => Err(err),
+        };
+        Ok(Response::new(DeleteResponse {
+            success: result.is_ok(),
+            error: result.err().map(Into::into),
+        }))
     }
 
     pub(super) async fn handle_write_all(&self, request: Request<WriteAllRequest>) -> Result<Response<WriteAllResponse>, Status> {
@@ -3540,6 +3570,962 @@ mod legacy_artifact_tests {
     ) -> Result<Response<DeleteVersionResponse>, Status> {
         verify_legacy_rpc_request(&request, "DeleteVersion")?;
         service.handle_delete_version(request, false).await
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum LegacyPathCase {
+        Delete,
+        DeletePaths,
+        Residual(bool),
+    }
+
+    impl LegacyPathCase {
+        const ALL: [Self; 4] = [Self::Delete, Self::DeletePaths, Self::Residual(false), Self::Residual(true)];
+    }
+
+    struct LegacyPathFixture {
+        case: LegacyPathCase,
+        volume: String,
+        path: String,
+        physical: std::path::PathBuf,
+        fi: FileInfo,
+        previous: Option<FileInfo>,
+        options: DeleteOptions,
+        scanner: Option<Uuid>,
+    }
+
+    async fn legacy_path_fixture(disk: &ecstore_disk::DiskStore, volume: &str, case: LegacyPathCase) -> LegacyPathFixture {
+        let path = format!("outputs/74656e616e74/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+        let physical = ecstore_disk::DiskAPI::path(disk.as_ref()).join(volume).join(&path);
+        let fi = inline_rename_file_info(&path);
+        let (previous, options) = match case {
+            LegacyPathCase::Residual(undo_write) => {
+                let mut previous = fi.clone();
+                previous.version_id = Some(Uuid::new_v4());
+                previous.mod_time = fi.mod_time.map(|value| value - time::Duration::seconds(1));
+                ecstore_disk::DiskAPI::write_metadata(disk.as_ref(), "", volume, &path, previous.clone())
+                    .await
+                    .expect("retained inline history");
+                ecstore_disk::DiskAPI::write_metadata(disk.as_ref(), "", volume, &path, fi.clone())
+                    .await
+                    .expect("version selected for residual deletion");
+                (
+                    Some(previous),
+                    DeleteOptions {
+                        undo_write,
+                        undo_delete: true,
+                        ..Default::default()
+                    },
+                )
+            }
+            _ => {
+                tokio::fs::create_dir_all(&physical).await.expect("delete fixture directory");
+                tokio::fs::write(physical.join("payload"), LEGACY_RENAME_BODY)
+                    .await
+                    .expect("delete fixture bytes");
+                (
+                    None,
+                    DeleteOptions {
+                        recursive: true,
+                        immediate: true,
+                        ..Default::default()
+                    },
+                )
+            }
+        };
+        LegacyPathFixture {
+            case,
+            volume: volume.to_owned(),
+            path,
+            physical,
+            fi,
+            previous,
+            options,
+            scanner: None,
+        }
+    }
+
+    async fn legacy_residual_file_fixture(disk: &ecstore_disk::DiskStore, volume: &str, undo_write: bool) -> LegacyPathFixture {
+        let path = format!("outputs/74656e616e74/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+        let physical = ecstore_disk::DiskAPI::path(disk.as_ref()).join(volume).join(&path);
+        tokio::fs::create_dir_all(physical.parent().expect("file parent"))
+            .await
+            .expect("raw file parent");
+        tokio::fs::write(&physical, LEGACY_RENAME_BODY).await.expect("raw file bytes");
+        LegacyPathFixture {
+            case: LegacyPathCase::Residual(undo_write),
+            volume: volume.to_owned(),
+            fi: inline_rename_file_info(&path),
+            path: format!("/{path}"),
+            physical,
+            previous: None,
+            options: DeleteOptions {
+                undo_write,
+                undo_delete: true,
+                ..Default::default()
+            },
+            scanner: None,
+        }
+    }
+
+    fn path_delete_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
+        let mut paths = vec![root.to_path_buf()];
+        let mut entries = Vec::new();
+        while let Some(path) = paths.pop() {
+            if !path.exists() {
+                continue;
+            }
+            if path.is_dir() {
+                entries.push((path.clone(), None));
+                paths.extend(
+                    std::fs::read_dir(path)
+                        .expect("snapshot directory")
+                        .map(|entry| entry.expect("snapshot entry").path()),
+                );
+            } else {
+                entries.push((path.clone(), Some(std::fs::read(path).expect("snapshot bytes"))));
+            }
+        }
+        entries.sort();
+        entries
+    }
+
+    fn signed_path_delete_request(disk: &str, fixture: &LegacyPathFixture) -> Request<DeleteRequest> {
+        let mut request = Request::new(DeleteRequest {
+            disk: disk.to_owned(),
+            volume: fixture.volume.clone(),
+            path: fixture.path.clone(),
+            options: serde_json::to_string(&fixture.options).expect("delete options"),
+            scanner_publication_lease_token: fixture
+                .scanner
+                .map(|token| Bytes::copy_from_slice(token.as_bytes()))
+                .unwrap_or_default(),
+            ..Default::default()
+        });
+        let body = rustfs_protos::canonical_delete_request_body(request.get_ref()).expect("canonical delete");
+        sign_legacy_rpc_request(&mut request, &body, "Delete");
+        request
+    }
+
+    async fn authenticated_path_mutation(
+        service: &NodeService,
+        disk: &str,
+        fixture: &LegacyPathFixture,
+        msgpack: bool,
+        tamper: bool,
+    ) -> Result<Result<(), DiskError>, Status> {
+        let (success, error) = match fixture.case {
+            LegacyPathCase::Delete => {
+                let mut request = signed_path_delete_request(disk, fixture);
+                if tamper {
+                    request.get_mut().path.push_str("-tampered");
+                }
+                verify_legacy_rpc_request(&request, "Delete")?;
+                let response = service.handle_delete(request).await?.into_inner();
+                (response.success, response.error)
+            }
+            LegacyPathCase::DeletePaths => {
+                let mut request = Request::new(DeletePathsRequest {
+                    disk: disk.to_owned(),
+                    volume: fixture.volume.clone(),
+                    paths: vec![fixture.path.clone(), fixture.path.clone()],
+                });
+                let body = rustfs_protos::canonical_delete_paths_request_body(request.get_ref()).expect("canonical paths");
+                sign_legacy_rpc_request(&mut request, &body, "DeletePaths");
+                if tamper {
+                    request.get_mut().paths.push("tampered".to_owned());
+                }
+                verify_legacy_rpc_request(&request, "DeletePaths")?;
+                let response = service.handle_delete_paths(request).await?.into_inner();
+                (response.success, response.error)
+            }
+            LegacyPathCase::Residual(_) => {
+                let mut request = signed_legacy_delete_request(
+                    disk,
+                    &fixture.volume,
+                    &fixture.path,
+                    &fixture.fi,
+                    &fixture.options,
+                    msgpack,
+                    false,
+                );
+                if tamper {
+                    request.get_mut().path.push_str("-tampered");
+                }
+                let response = authenticated_legacy_delete(service, request).await?.into_inner();
+                if response.success {
+                    assert_eq!(response.raw_file_info, "null");
+                }
+                (response.success, response.error)
+            }
+        };
+        assert_eq!(success, error.is_none(), "typed error and success agree");
+        Ok(error.map(DiskError::from).map_or(Ok(()), Err))
+    }
+
+    async fn assert_path_mutation_result(disk: &ecstore_disk::DiskStore, fixture: &LegacyPathFixture) {
+        if let Some(previous) = &fixture.previous {
+            let retained = ecstore_disk::DiskAPI::read_version(
+                disk.as_ref(),
+                &fixture.volume,
+                &fixture.volume,
+                &fixture.path,
+                &previous.version_id.expect("history version").to_string(),
+                &ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("history survives residual deletion");
+            assert_eq!(retained.version_id, previous.version_id);
+            assert_eq!(retained.data, previous.data);
+            assert_eq!(
+                ecstore_disk::DiskAPI::read_version(
+                    disk.as_ref(),
+                    &fixture.volume,
+                    &fixture.volume,
+                    &fixture.path,
+                    &fixture.fi.version_id.expect("deleted version").to_string(),
+                    &ReadOptions::default()
+                )
+                .await
+                .expect_err("selected version removed"),
+                DiskError::FileVersionNotFound
+            );
+        } else {
+            assert!(!fixture.physical.exists(), "path bytes removed");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_path_delete_receiver_preserves_signed_shapes_and_managed_rejection() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-path-delete-secret".to_owned());
+        let root = tempfile::tempdir().expect("path receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("path-ordinary", true).await;
+        env.ecstore
+            .clone()
+            .make_artifact_bucket("path-managed", "outputs/")
+            .await
+            .expect("managed bucket");
+        let service = service_for(&env).await;
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = service
+            .local_mutation_target()
+            .find_mutation_disk(&disk_ref)
+            .await
+            .expect("receiver disk");
+        for case in LegacyPathCase::ALL {
+            for msgpack in [false, true] {
+                for volume in ["path-ordinary", ".rustfs.sys", "path-managed"] {
+                    let mut fixture = legacy_path_fixture(&disk, volume, case).await;
+                    if msgpack && !matches!(case, LegacyPathCase::Residual(_)) {
+                        fixture.path.insert(0, '/');
+                    }
+                    if matches!(case, LegacyPathCase::Delete) {
+                        fixture.options.immediate = msgpack;
+                    }
+                    if matches!(case, LegacyPathCase::Residual(false)) && msgpack {
+                        fixture.options.old_data_dir = Some(Uuid::new_v4());
+                    }
+                    let before = path_delete_snapshot(&fixture.physical);
+                    assert_eq!(
+                        authenticated_path_mutation(&service, &disk_ref, &fixture, msgpack, true)
+                            .await
+                            .expect_err("body change rejects before mutation")
+                            .code(),
+                        tonic::Code::PermissionDenied
+                    );
+                    assert_eq!(path_delete_snapshot(&fixture.physical), before);
+                    let result = authenticated_path_mutation(&service, &disk_ref, &fixture, msgpack, false).await;
+                    if volume == "path-managed" {
+                        assert_eq!(result.expect_err("managed path rejects").code(), tonic::Code::PermissionDenied);
+                        assert_eq!(path_delete_snapshot(&fixture.physical), before);
+                    } else {
+                        result.expect("authenticated envelope").expect("legacy deletion succeeds");
+                        assert_path_mutation_result(&disk, &fixture).await;
+                    }
+                }
+            }
+        }
+        for undo_write in [false, true] {
+            for msgpack in [false, true] {
+                for volume in ["path-ordinary", ".rustfs.sys", "path-managed"] {
+                    let fixture = legacy_residual_file_fixture(&disk, volume, undo_write).await;
+                    let before = path_delete_snapshot(&fixture.physical);
+                    let result = authenticated_path_mutation(&service, &disk_ref, &fixture, msgpack, false).await;
+                    if volume == "path-managed" {
+                        assert_eq!(result.expect_err("managed slash deletion rejects").code(), tonic::Code::PermissionDenied);
+                        assert_eq!(path_delete_snapshot(&fixture.physical), before);
+                    } else {
+                        result
+                            .expect("slash residual envelope")
+                            .expect("legacy slash deletes a regular file");
+                        assert_path_mutation_result(&disk, &fixture).await;
+                    }
+                }
+            }
+        }
+        for volume in ["path-ordinary", "path-managed"] {
+            let mut request = Request::new(DeletePathsRequest {
+                disk: disk_ref.clone(),
+                volume: volume.to_owned(),
+                paths: Vec::new(),
+            });
+            let body = rustfs_protos::canonical_delete_paths_request_body(request.get_ref()).expect("empty batch body");
+            sign_legacy_rpc_request(&mut request, &body, "DeletePaths");
+            verify_legacy_rpc_request(&request, "DeletePaths").expect("signed empty batch");
+            let result = service.handle_delete_paths(request).await;
+            if volume == "path-managed" {
+                assert_eq!(
+                    result.expect_err("empty batch cannot bypass managed classification").code(),
+                    tonic::Code::PermissionDenied
+                );
+            } else {
+                let response = result.expect("empty ordinary batch").into_inner();
+                assert!(response.success && response.error.is_none());
+            }
+        }
+        let fixture = legacy_path_fixture(&disk, "path-ordinary", LegacyPathCase::Residual(true)).await;
+        let before = path_delete_snapshot(&fixture.physical);
+        let response = authenticated_legacy_delete(
+            &service,
+            signed_legacy_delete_request(&disk_ref, &fixture.volume, &fixture.path, &fixture.fi, &fixture.options, false, true),
+        )
+        .await
+        .expect("force/undo envelope")
+        .into_inner();
+        assert!(!response.success);
+        let error = response.error.expect("force/undo error");
+        assert_eq!(error.code, DiskError::other("undo_write cannot force a delete marker").to_u32());
+        assert_eq!(error.error_info, "io error undo_write cannot force a delete marker");
+        assert_eq!(path_delete_snapshot(&fixture.physical), before);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_path_delete_receiver_rejects_missing_live_volume() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-path-delete-secret".to_owned());
+        let root = tempfile::tempdir().expect("missing path receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        let service = service_for(&env).await;
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let target = service.local_mutation_target();
+        let disk = target.find_mutation_disk(&disk_ref).await.expect("receiver disk");
+        for (index, case) in LegacyPathCase::ALL.into_iter().enumerate() {
+            for msgpack in [false, true] {
+                let volume = format!("path-missing-{index}-{msgpack}");
+                if msgpack {
+                    env.ecstore
+                        .clone()
+                        .make_artifact_bucket(&volume, "outputs/")
+                        .await
+                        .expect("managed authority retained after volume deletion");
+                } else {
+                    env.make_bucket(&volume, true).await;
+                }
+                let mut fixture = legacy_path_fixture(&disk, &volume, case).await;
+                if msgpack {
+                    fixture.path.insert(0, '/');
+                }
+                let incarnation = env.ecstore.bucket_incarnation_id(&volume).await.expect("authority");
+                ecstore_disk::DiskAPI::delete_volume(disk.as_ref(), &volume, true)
+                    .await
+                    .expect("remove physical volume");
+                assert_eq!(env.ecstore.bucket_incarnation_id(&volume).await.expect("retained authority"), incarnation);
+                assert_eq!(
+                    target.reject_legacy_artifact_mutation(&volume).await.is_err(),
+                    msgpack,
+                    "authority classification survives physical deletion"
+                );
+                assert_eq!(
+                    authenticated_path_mutation(&service, &disk_ref, &fixture, msgpack, false)
+                        .await
+                        .expect("typed missing-volume envelope")
+                        .expect_err("live volume admission fails"),
+                    DiskError::VolumeNotFound
+                );
+                assert!(!env.disk_paths[0].join(&volume).exists(), "no missing volume recreation");
+            }
+        }
+        env.make_bucket("path-contract", true).await;
+        let mut fixtures = Vec::new();
+        for case in LegacyPathCase::ALL {
+            let fixture = legacy_path_fixture(&disk, "path-contract", case).await;
+            let before = path_delete_snapshot(&fixture.physical);
+            for unknown in ["not-a-disk-reference".to_owned(), Uuid::new_v4().to_string()] {
+                let error = authenticated_path_mutation(&service, &unknown, &fixture, false, false)
+                    .await
+                    .expect("candidate failure envelope")
+                    .expect_err("unknown disk rejects");
+                // The legacy wire stores Display text; decoding an Io error wraps that text again.
+                let expected = if matches!(case, LegacyPathCase::Residual(true)) {
+                    DiskError::DiskNotFound
+                } else {
+                    DiskError::other("io error cannot find disk")
+                };
+                assert_eq!(error.to_string(), expected.to_string(), "exact lookup-stage error text");
+                assert_eq!(error, expected, "old lookup-stage error contract");
+                assert_eq!(path_delete_snapshot(&fixture.physical), before);
+            }
+            fixtures.push(fixture);
+        }
+        let id = ecstore_disk::DiskAPI::get_disk_id(disk.as_ref())
+            .await
+            .expect("disk identity")
+            .expect("formatted disk")
+            .to_string();
+        target
+            .find_mutation_disk(&id)
+            .await
+            .expect("prime instance UUID-to-path cache");
+        let format = env.disk_paths[0].join(".rustfs.sys/format.json");
+        let saved_format = tokio::fs::read(&format).await.expect("original format bytes");
+        tokio::fs::remove_file(&format).await.expect("remove cached disk format");
+        // The format cache deliberately trusts wall-clock checks for one second.
+        // This wait expires that cache; it is not evidence of a physical worker drain.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        for (corrupt, typed) in [(false, DiskError::UnformattedDisk), (true, DiskError::CorruptedBackend)] {
+            if corrupt {
+                tokio::fs::write(&format, b"invalid format").await.expect("corrupt format");
+            }
+            for fixture in &fixtures {
+                let before = path_delete_snapshot(&fixture.physical);
+                let error = authenticated_path_mutation(&service, &id, fixture, false, false)
+                    .await
+                    .expect("cached identity error envelope")
+                    .expect_err("format error rejects admission");
+                let expected = if matches!(fixture.case, LegacyPathCase::Residual(true)) {
+                    typed.clone()
+                } else {
+                    DiskError::other("io error cannot find disk")
+                };
+                assert_eq!(error.to_string(), expected.to_string(), "exact cached-ID error text");
+                assert_eq!(error, expected, "cached-ID failures keep their original envelope");
+                assert_eq!(path_delete_snapshot(&fixture.physical), before);
+            }
+        }
+        tokio::fs::write(&format, saved_format).await.expect("restore real format");
+        ecstore_disk::DiskAPI::get_disk_id(disk.as_ref())
+            .await
+            .expect("restored disk identity");
+        for mut fixture in fixtures {
+            let expected = if matches!(fixture.case, LegacyPathCase::Residual(_)) {
+                let metadata = fixture.physical.join("xl.meta");
+                let mut bytes = tokio::fs::read(&metadata).await.expect("valid metadata before bitrot");
+                // Match the filemeta CRC regression: mutate the blob after its header and bin32 prefix.
+                bytes[8 + 5] ^= 0xff;
+                tokio::fs::write(metadata, bytes).await.expect("corrupt consume input");
+                DiskError::FileCorrupt
+            } else {
+                fixture.path = "../outside".to_owned();
+                DiskError::InvalidPath
+            };
+            let before = path_delete_snapshot(&fixture.physical);
+            let error = authenticated_path_mutation(&service, &disk_ref, &fixture, false, false)
+                .await
+                .expect("consume error envelope")
+                .expect_err("actual consume failure remains typed");
+            assert_eq!(error, expected);
+            assert_eq!(path_delete_snapshot(&fixture.physical), before, "failed consume is zero-write");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_path_delete_receiver_binds_instance_bootstrap_and_scanner_guard() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-path-delete-secret".to_owned());
+        let root = tempfile::tempdir().expect("instance receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("path-instance", true).await;
+        let ready = service_for(&env).await;
+        let instance = crate::storage::storage_api::bootstrap_instance_ctx();
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = ready
+            .local_mutation_target()
+            .find_mutation_disk(&disk_ref)
+            .await
+            .expect("receiver disk");
+        let slot = super::super::ServerContextSlot::with_instance_context(instance.clone());
+        let bootstrap = super::super::make_server_for_slot(slot.clone());
+        let unbound = super::super::make_server_for_slot(super::super::ServerContextSlot::new());
+        let mut wrong = super::super::make_server_for_context(ready.context.clone());
+        wrong.server_ctx = Some(super::super::ServerContextSlot::with_instance_context(
+            crate::storage::storage_api::new_instance_ctx(),
+        ));
+        for case in LegacyPathCase::ALL {
+            for volume in ["path-instance", ".rustfs.sys"] {
+                let fixture = legacy_path_fixture(&disk, volume, case).await;
+                let before = path_delete_snapshot(&fixture.physical);
+                for (service, is_bootstrap) in [(&unbound, false), (&wrong, true)] {
+                    let error = authenticated_path_mutation(service, &disk_ref, &fixture, false, false)
+                        .await
+                        .expect("unbound or bootstrap envelope")
+                        .expect_err("wrong instance cannot delete");
+                    let expected = if is_bootstrap && volume == "path-instance" {
+                        DiskError::FileAccessDenied
+                    } else if matches!(case, LegacyPathCase::Residual(true)) {
+                        if is_bootstrap {
+                            DiskError::DiskNotFound
+                        } else {
+                            DiskError::other("io error target disk instance is unavailable")
+                        }
+                    } else {
+                        DiskError::other("io error cannot find disk")
+                    };
+                    assert_eq!(error.to_string(), expected.to_string(), "exact instance admission error text");
+                    assert_eq!(error, expected, "instance admission keeps its original envelope");
+                    assert_eq!(path_delete_snapshot(&fixture.physical), before);
+                }
+                let result = authenticated_path_mutation(&bootstrap, &disk_ref, &fixture, false, false)
+                    .await
+                    .expect("bootstrap envelope");
+                if volume == ".rustfs.sys" {
+                    result.expect("bootstrap internal deletion");
+                    assert_path_mutation_result(&disk, &fixture).await;
+                } else {
+                    assert_eq!(result.expect_err("bootstrap ordinary admission rejects"), DiskError::FileAccessDenied);
+                    assert_eq!(path_delete_snapshot(&fixture.physical), before);
+                }
+            }
+        }
+        let captured = bootstrap.local_mutation_target();
+        slot.try_install(ready.context.clone().expect("ready context"))
+            .expect("publish ready slot");
+        assert_eq!(
+            captured
+                .begin_legacy_local_path_delete(&disk_ref, "path-instance", LegacyPathDeleteOperation::Delete, None)
+                .await
+                .err()
+                .expect("captured bootstrap cannot upgrade"),
+            DiskError::FileAccessDenied
+        );
+
+        let mut fixture = legacy_path_fixture(&disk, "path-instance", LegacyPathCase::Delete).await;
+        let ttl = std::time::Duration::from_millis(crate::storage::storage_api::SCANNER_PUBLICATION_LEASE_TTL_MS);
+        let (scanner, _) = env
+            .ecstore
+            .acquire_scanner_publication_lease(env.ecstore.scanner_data_movement_generation(), ttl)
+            .await
+            .expect("real scanner token");
+        fixture.scanner = Some(scanner);
+        let before = path_delete_snapshot(&fixture.physical);
+        let mut unsigned = signed_path_delete_request(&disk_ref, &fixture);
+        unsigned.metadata_mut().remove("x-rustfs-content-sha256");
+        assert_eq!(
+            ready
+                .handle_delete(unsigned)
+                .await
+                .expect_err("scanner requires body digest")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut combined = signed_path_delete_request(&disk_ref, &fixture).into_inner();
+        combined.bucket_incarnation_id = Bytes::copy_from_slice(Uuid::new_v4().as_bytes());
+        let mut combined = Request::new(combined);
+        let body = rustfs_protos::canonical_delete_request_body(combined.get_ref()).expect("combined body");
+        sign_legacy_rpc_request(&mut combined, &body, "Delete");
+        verify_legacy_rpc_request(&combined, "Delete").expect("signed combined request");
+        assert_eq!(
+            ready
+                .handle_delete(combined)
+                .await
+                .expect_err("incarnation and scanner are exclusive")
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(path_delete_snapshot(&fixture.physical), before);
+        for bytes in [Bytes::from_static(b"bad"), Bytes::copy_from_slice(Uuid::nil().as_bytes())] {
+            let mut request = signed_path_delete_request(&disk_ref, &fixture).into_inner();
+            request.scanner_publication_lease_token = bytes;
+            let mut request = Request::new(request);
+            let body = rustfs_protos::canonical_delete_request_body(request.get_ref()).expect("invalid token body");
+            sign_legacy_rpc_request(&mut request, &body, "Delete");
+            verify_legacy_rpc_request(&request, "Delete").expect("signed invalid token");
+            assert_eq!(
+                ready.handle_delete(request).await.expect_err("invalid scanner UUID").code(),
+                tonic::Code::InvalidArgument
+            );
+            assert_eq!(path_delete_snapshot(&fixture.physical), before);
+        }
+        let bootstrap_only =
+            super::super::make_server_for_slot(super::super::ServerContextSlot::with_instance_context(instance.clone()));
+        authenticated_path_mutation(&bootstrap_only, &disk_ref, &fixture, false, false)
+            .await
+            .expect("bootstrap scanner envelope")
+            .expect_err("bootstrap has no Ready scanner authority");
+        assert_eq!(path_delete_snapshot(&fixture.physical), before);
+        authenticated_path_mutation(&ready, &disk_ref, &fixture, false, true)
+            .await
+            .expect_err("scanner body is bound");
+        assert_eq!(path_delete_snapshot(&fixture.physical), before);
+        authenticated_path_mutation(&ready, &disk_ref, &fixture, false, false)
+            .await
+            .expect("scanner envelope")
+            .expect("captured Ready scanner delete");
+        assert_path_mutation_result(&disk, &fixture).await;
+        assert!(env.ecstore.release_scanner_publication_lease(scanner).await);
+
+        let other_root = tempfile::tempdir().expect("foreign scanner instance");
+        let other = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(other_root.path())
+            .instance_ctx(crate::storage::storage_api::new_instance_ctx())
+            .init_bucket_metadata(false)
+            .build()
+            .await;
+        let (foreign, _) = other
+            .ecstore
+            .acquire_scanner_publication_lease(other.ecstore.scanner_data_movement_generation(), ttl)
+            .await
+            .expect("foreign token");
+        let mut fixture = legacy_path_fixture(&disk, "path-instance", LegacyPathCase::Delete).await;
+        fixture.scanner = Some(foreign);
+        let before = path_delete_snapshot(&fixture.physical);
+        authenticated_path_mutation(&ready, &disk_ref, &fixture, false, false)
+            .await
+            .expect("foreign scanner envelope")
+            .expect_err("cross-instance token rejects");
+        assert_eq!(path_delete_snapshot(&fixture.physical), before);
+        assert!(other.ecstore.release_scanner_publication_lease(foreign).await);
+
+        let (scanner, _) = env
+            .ecstore
+            .acquire_scanner_publication_lease(env.ecstore.scanner_data_movement_generation(), ttl)
+            .await
+            .expect("new scanner token");
+        let guard = Arc::new(
+            env.ecstore
+                .acquire_scanner_publication_lease_guard(scanner)
+                .await
+                .expect("captured Ready guard"),
+        );
+        let weak_guard = Arc::downgrade(&guard);
+        let admitted = ready
+            .local_mutation_target()
+            .begin_legacy_local_path_delete(&disk_ref, &fixture.volume, LegacyPathDeleteOperation::Delete, Some(guard))
+            .await
+            .expect("admitted original disk with scanner guard");
+        assert!(env.ecstore.release_scanner_publication_lease(scanner).await);
+        assert!(weak_guard.upgrade().is_some(), "removing token does not release admitted guard");
+        crate::storage::storage_api::init_local_disks_with_instance_ctx(&instance, env.endpoint_pools.clone())
+            .await
+            .expect("replace registry handles");
+        let replacement = ready
+            .local_mutation_target()
+            .find_mutation_disk(&disk_ref)
+            .await
+            .expect("replacement disk");
+        assert!(!Arc::ptr_eq(&disk, &replacement));
+        let info_options = DiskInfoOptions {
+            metrics: true,
+            noop: true,
+            ..Default::default()
+        };
+        let original_before = ecstore_disk::DiskAPI::disk_info(disk.as_ref(), &info_options)
+            .await
+            .expect("original metrics")
+            .metrics;
+        let replacement_before = ecstore_disk::DiskAPI::disk_info(replacement.as_ref(), &info_options)
+            .await
+            .expect("replacement metrics")
+            .metrics;
+        admitted
+            .delete(&fixture.path, fixture.options.clone())
+            .await
+            .expect("captured original token consumes");
+        assert_path_mutation_result(&disk, &fixture).await;
+        assert!(weak_guard.upgrade().is_none(), "consuming the admitted token releases its scanner guard");
+        let original_after = ecstore_disk::DiskAPI::disk_info(disk.as_ref(), &info_options)
+            .await
+            .expect("original metrics after")
+            .metrics;
+        let replacement_after = ecstore_disk::DiskAPI::disk_info(replacement.as_ref(), &info_options)
+            .await
+            .expect("replacement metrics after")
+            .metrics;
+        assert_eq!(original_after.total_deletes, original_before.total_deletes + 1);
+        assert_eq!(replacement_after.total_deletes, replacement_before.total_deletes);
+        for case in [
+            LegacyPathCase::DeletePaths,
+            LegacyPathCase::Residual(false),
+            LegacyPathCase::Residual(true),
+        ] {
+            let target = ready.local_mutation_target();
+            let original = target.find_mutation_disk(&disk_ref).await.expect("current disk");
+            let fixture = legacy_path_fixture(&original, "path-instance", case).await;
+            let (path_delete, version_delete) = match case {
+                LegacyPathCase::DeletePaths => (
+                    Some(
+                        target
+                            .begin_legacy_local_path_delete(
+                                &disk_ref,
+                                &fixture.volume,
+                                LegacyPathDeleteOperation::DeletePaths,
+                                None,
+                            )
+                            .await
+                            .expect("captured batch"),
+                    ),
+                    None,
+                ),
+                LegacyPathCase::Residual(undo_write) => (
+                    None,
+                    Some(
+                        target
+                            .begin_legacy_local_residual_version_delete(&disk_ref, &fixture.volume, &fixture.path, undo_write)
+                            .await
+                            .expect("captured residual"),
+                    ),
+                ),
+                _ => unreachable!(),
+            };
+            crate::storage::storage_api::init_local_disks_with_instance_ctx(&instance, env.endpoint_pools.clone())
+                .await
+                .expect("replace admitted registry");
+            let replacement = ready
+                .local_mutation_target()
+                .find_mutation_disk(&disk_ref)
+                .await
+                .expect("new registry disk");
+            assert!(!Arc::ptr_eq(&original, &replacement));
+            let before = ecstore_disk::DiskAPI::disk_info(original.as_ref(), &info_options)
+                .await
+                .expect("captured metrics")
+                .metrics;
+            let other_before = ecstore_disk::DiskAPI::disk_info(replacement.as_ref(), &info_options)
+                .await
+                .expect("new metrics")
+                .metrics;
+            if let Some(delete) = path_delete {
+                delete
+                    .delete_paths(&[fixture.path.clone(), fixture.path.clone()])
+                    .await
+                    .expect("captured batch consumes");
+            }
+            if let Some(delete) = version_delete {
+                delete
+                    .delete_version_residual(fixture.fi.clone(), false, fixture.options.clone())
+                    .await
+                    .expect("captured residual consumes");
+            }
+            assert_path_mutation_result(&original, &fixture).await;
+            let after = ecstore_disk::DiskAPI::disk_info(original.as_ref(), &info_options)
+                .await
+                .expect("captured metrics after")
+                .metrics;
+            let other_after = ecstore_disk::DiskAPI::disk_info(replacement.as_ref(), &info_options)
+                .await
+                .expect("new metrics after")
+                .metrics;
+            assert_eq!(after.total_deletes, before.total_deletes + 1);
+            assert_eq!(other_after.total_deletes, other_before.total_deletes);
+        }
+    }
+
+    async fn remote_path_mutation(remote: &ecstore_disk::DiskStore, fixture: &LegacyPathFixture) -> Result<(), DiskError> {
+        match fixture.case {
+            LegacyPathCase::Delete => {
+                ecstore_disk::DiskAPI::delete(remote.as_ref(), &fixture.volume, &fixture.path, fixture.options.clone()).await
+            }
+            LegacyPathCase::DeletePaths => {
+                ecstore_disk::DiskAPI::delete_paths(
+                    remote.as_ref(),
+                    &fixture.volume,
+                    &[fixture.path.clone(), fixture.path.clone()],
+                )
+                .await
+            }
+            LegacyPathCase::Residual(_) => {
+                ecstore_disk::DiskAPI::delete_version(
+                    remote.as_ref(),
+                    &fixture.volume,
+                    &fixture.path,
+                    fixture.fi.clone(),
+                    false,
+                    fixture.options.clone(),
+                )
+                .await
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_path_delete_remote_delete_batch_and_residual() {
+        use crate::storage::storage_api::{
+            Endpoint, EndpointServerPools, Endpoints,
+            ecstore_disk::{DiskOption, new_disk},
+            init_local_disks_with_instance_ctx,
+        };
+        use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
+        use tokio_stream::wrappers::TcpListenerStream;
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-path-delete-secret".to_owned());
+        let root = tempfile::tempdir().expect("remote path deletion root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("path-remote", true).await;
+        let ready = service_for(&env).await;
+        let instance = crate::storage::storage_api::bootstrap_instance_ctx();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback listener");
+        let addr = listener.local_addr().expect("loopback address");
+        let mut endpoints = env.endpoint_pools.as_ref()[0].endpoints.as_ref().clone();
+        let mut endpoint =
+            Endpoint::try_from(format!("http://{addr}{}", env.disk_paths[0].display()).as_str()).expect("remote endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        endpoint.is_local = true;
+        endpoints[0] = endpoint.clone();
+        let mut pool = env.endpoint_pools.as_ref()[0].clone();
+        pool.endpoints = Endpoints::from(endpoints);
+        init_local_disks_with_instance_ctx(&instance, EndpointServerPools::from(vec![pool]))
+            .await
+            .expect("register receiving disk");
+        let service = super::super::make_server_for_context(ready.context.clone());
+        let local = service
+            .local_mutation_target()
+            .find_mutation_disk(&endpoint.to_string())
+            .await
+            .expect("local receiving disk");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let audience = addr.to_string();
+        let auth = tower::ServiceBuilder::new().map_request(move |request: http::Request<_>| {
+            let path = request.uri().path();
+            crate::storage::storage_api::ecstore_rpc::verify_tonic_rpc_signature_with_bootstrap(
+                &audience,
+                path,
+                request.headers(),
+                path == "/node_service.NodeService/Ping",
+            )
+            .expect("real remote HMAC signature");
+            if matches!(
+                path,
+                "/node_service.NodeService/Delete"
+                    | "/node_service.NodeService/DeletePaths"
+                    | "/node_service.NodeService/DeleteVersion"
+            ) {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            request
+        });
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .layer(auth)
+                .add_service(NodeServiceServer::new(service))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = stopped.await;
+                })
+                .await
+                .expect("path delete server");
+        });
+        endpoint.is_local = false;
+        let remote = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("real remote client");
+        assert!(!ecstore_disk::DiskAPI::is_local(remote.as_ref()));
+        for case in LegacyPathCase::ALL {
+            let mut fixture = legacy_path_fixture(&local, "path-remote", case).await;
+            if !matches!(case, LegacyPathCase::Residual(_)) {
+                fixture.path.insert(0, '/');
+            }
+            remote_path_mutation(&remote, &fixture).await.expect("real network deletion");
+            assert_path_mutation_result(&local, &fixture).await;
+        }
+        for undo_write in [false, true] {
+            let fixture = legacy_residual_file_fixture(&local, "path-remote", undo_write).await;
+            remote_path_mutation(&remote, &fixture)
+                .await
+                .expect("network slash residual deletes regular file");
+            assert_path_mutation_result(&local, &fixture).await;
+        }
+        env.make_bucket("path-retry", true).await;
+        let mut fixtures = Vec::new();
+        for case in LegacyPathCase::ALL {
+            fixtures.push(legacy_path_fixture(&local, "path-retry", case).await);
+        }
+        let incarnation = env
+            .ecstore
+            .bucket_incarnation_id("path-retry")
+            .await
+            .expect("retry authority");
+        ecstore_disk::DiskAPI::delete_volume(local.as_ref(), "path-retry", true)
+            .await
+            .expect("remove receiving physical volume");
+        assert_eq!(
+            env.ecstore
+                .bucket_incarnation_id("path-retry")
+                .await
+                .expect("authority retained"),
+            incarnation
+        );
+        for fixture in &fixtures {
+            assert_eq!(
+                remote_path_mutation(&remote, fixture)
+                    .await
+                    .expect_err("network preserves missing live volume"),
+                DiskError::VolumeNotFound
+            );
+            assert!(!env.disk_paths[0].join("path-retry").exists());
+        }
+        ecstore_disk::DiskAPI::make_volume(local.as_ref(), "path-retry")
+            .await
+            .expect("restore physical volume");
+        for fixture in &fixtures {
+            if let Some(previous) = &fixture.previous {
+                ecstore_disk::DiskAPI::write_metadata(local.as_ref(), "", &fixture.volume, &fixture.path, previous.clone())
+                    .await
+                    .expect("restore history");
+                ecstore_disk::DiskAPI::write_metadata(local.as_ref(), "", &fixture.volume, &fixture.path, fixture.fi.clone())
+                    .await
+                    .expect("restore selected version");
+            } else {
+                tokio::fs::create_dir_all(&fixture.physical)
+                    .await
+                    .expect("restore retry path");
+                tokio::fs::write(fixture.physical.join("payload"), LEGACY_RENAME_BODY)
+                    .await
+                    .expect("restore retry bytes");
+            }
+            remote_path_mutation(&remote, fixture)
+                .await
+                .expect("same network request succeeds after volume recovery");
+            assert_path_mutation_result(&local, fixture).await;
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            14,
+            "three RPC methods carry ten successes and four typed failures"
+        );
+        ecstore_disk::DiskAPI::close(remote.as_ref())
+            .await
+            .expect("close remote client");
+        drop(remote);
+        shutdown.send(()).expect("stop server");
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("server drains")
+            .expect("server task");
     }
 
     #[derive(Clone, Copy, Debug)]

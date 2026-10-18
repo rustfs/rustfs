@@ -65,7 +65,8 @@ use crate::cluster::rpc::build_internode_data_transport_from_env;
 use crate::disk::disk_store::DiskStoreRenameDataExt;
 use crate::disk::disk_store::LocalDiskWrapper;
 pub use crate::disk::disk_store::{
-    LegacyFileWrite, LegacyMetadataWrite, LegacyPartMutation, LegacyPartOperation, LegacyRenameData, LegacyRenameFile,
+    LegacyFileWrite, LegacyMetadataWrite, LegacyPartMutation, LegacyPartOperation, LegacyPathDelete, LegacyPathDeleteOperation,
+    LegacyRenameData, LegacyRenameFile,
 };
 use crate::disk::health_state::RuntimeDriveHealthState;
 use crate::disk::local::ScanGuard;
@@ -276,14 +277,27 @@ impl Disk {
         }
     }
 
-    pub(crate) fn record_legacy_part_admission_failure(
+    pub(crate) fn record_legacy_admission_failure(
         &self,
         operation: &'static str,
         error: &DiskError,
         started: std::time::Instant,
     ) {
         if let Self::Local(disk) = self {
-            disk.record_legacy_part_admission_failure(operation, error, started);
+            disk.record_legacy_admission_failure(operation, error, started);
+        }
+    }
+
+    pub(crate) async fn begin_legacy_path_delete(
+        &self,
+        volume: &str,
+        operation: LegacyPathDeleteOperation,
+        owner: Option<Arc<dyn Send + Sync>>,
+        deadline: tokio::time::Instant,
+    ) -> Result<LegacyPathDelete> {
+        match self {
+            Self::Local(disk) => disk.begin_legacy_path_delete(volume, operation, owner, deadline).await,
+            Self::Remote(_) => Err(DiskError::DiskNotFound),
         }
     }
 

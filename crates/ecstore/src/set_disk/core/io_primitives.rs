@@ -11760,6 +11760,118 @@ mod tests {
         assert!(missing.below_quorum, "missing disk slots should remain visible in the quorum lens");
     }
 
+    #[cfg(not(windows))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn legacy_path_delete_flow_prefix_delete_keeps_scanner_owner_until_drain() {
+        use crate::disk::os::{drain_namespace_for_test, prepared_publication_test_hooks as hooks};
+        use crate::object_api::{
+            ScannerPublicationCommitScope, ScannerPublicationCommitScopeGuard, ScannerPublicationCommitState,
+        };
+        use crate::set_disk::ops::object::hermetic_set_disks_support::hermetic_set_disks_isolated;
+        use rustfs_storage_api::BucketOperations;
+
+        let (_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "path-delete-scanner";
+        crate::bucket::metadata_sys::object_store_in(&set.ctx)
+            .await
+            .expect("fixture object store")
+            .make_bucket(bucket, &Default::default())
+            .await
+            .expect("authoritative bucket creation");
+        let mut paths = Vec::new();
+        for disk in &disks {
+            disk.write_all(bucket, "prefix/part.1", Bytes::from_static(b"old shard"))
+                .await
+                .expect("seed prefix on every disk");
+            paths.push(
+                disk.get_object_path_for_io_if_local(bucket, "prefix")
+                    .expect("local disk")
+                    .expect("prefix path"),
+            );
+        }
+        let movement = Arc::new(tokio::sync::RwLock::new(()));
+        let scope = ScannerPublicationCommitScope::new_storage_owned(
+            7,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            Vec::new(),
+            movement.clone().read_owned().await,
+        );
+        scope.try_begin().expect("begin scanner publication");
+        let caller_guard = ScannerPublicationCommitScopeGuard::new(scope.clone());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hook = hooks::install_at(hooks::Stage::Rename, &paths[0], move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let owner_set = set.clone();
+        let owner_scope = scope.clone();
+        let caller = tokio::spawn(async move {
+            owner_set
+                .delete_prefix_with_scanner_publication_lease(bucket, "prefix", None, Some(owner_scope))
+                .await
+        });
+        let entered = tokio::time::timeout(Duration::from_secs(5), entered_rx).await;
+        caller.abort();
+        let _ = caller.await;
+        drop(caller_guard);
+        let state_while_blocked = scope.state();
+        let movement_while_blocked = movement.clone().try_write_owned().is_ok();
+        let disk::Disk::Local(local) = disks[0].as_ref() else {
+            unreachable!("fixture contains local disks");
+        };
+        let local = local.get_disk();
+        let volume_read_held = crate::disk::os::disk_volume_mutation_lock(&local.root, bucket)
+            .try_write_owned()
+            .is_err();
+        let mut deletion = Box::pin(local.delete_volume(bucket, true));
+        let early_deletion = futures::poll!(deletion.as_mut());
+        let deletion_was_blocked = early_deletion.is_pending();
+        // Always release and drain physical work before reporting an ownership failure.
+        let _ = release_tx.send(());
+        let mut drained = Vec::new();
+        for path in &paths {
+            drained.push(tokio::time::timeout(Duration::from_secs(5), drain_namespace_for_test(path)).await);
+        }
+        let deletion_result = match early_deletion {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => tokio::time::timeout(Duration::from_secs(5), deletion)
+                .await
+                .expect("volume deletion drains"),
+        };
+        let terminal = tokio::time::timeout(Duration::from_secs(5), scope.wait_for_completion()).await;
+        assert!(
+            entered.is_ok_and(|result| result.is_ok()),
+            "real prefix deletion must reach its filesystem worker"
+        );
+        assert!(drained.into_iter().all(|result| result.is_ok()), "every physical namespace must drain");
+        deletion_result.expect("volume deletion after physical drain");
+        assert!(
+            volume_read_held && deletion_was_blocked,
+            "volume deletion must wait for the physical prefix worker"
+        );
+        assert_eq!(state_while_blocked, ScannerPublicationCommitState::InFlight);
+        assert!(!movement_while_blocked, "scanner movement remains fenced after caller cancellation");
+        assert_eq!(terminal.expect("scanner owner completion"), ScannerPublicationCommitState::Committed);
+        assert!(scope.release_movement_permit().await, "terminal scanner owner releases movement");
+        assert!(movement.try_write_owned().is_ok());
+        for path in paths.iter().skip(1) {
+            assert!(!path.exists(), "successful prefix fanout removes every surviving volume's prefix");
+        }
+        disks[0].make_volume(bucket).await.expect("recreate deleted volume");
+        disks[0]
+            .write_all(bucket, "prefix/sentinel", Bytes::from_static(b"new generation"))
+            .await
+            .expect("new generation sentinel");
+        assert_eq!(
+            disks[0]
+                .read_all(bucket, "prefix/sentinel")
+                .await
+                .expect("sentinel survives old deletion"),
+            b"new generation".as_slice()
+        );
+    }
+
     #[tokio::test]
     async fn delete_prefix_succeeds_when_present_disks_reach_quorum() {
         let bucket = "delete-prefix-bucket";
