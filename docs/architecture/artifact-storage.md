@@ -49,6 +49,13 @@ Ordinary `UpdateMetadata` reuses that prepared publication for its read-modify-w
 operation, preserving metadata merge/replacement and durability options. Transition
 reconciliation retains its separate authorization path and is not covered by this
 admission.
+The HTTP file-stream receivers serialize requests for the same target before
+admitting the captured disk and live volume. Classification follows admission;
+the stream then fixes its target and optional staging paths under namespace
+ownership. Authenticated writes verify the staged body before publication, while
+legacy writes retain their direct append/truncate behavior. Physical stream
+workers, publication and failure cleanup retain the same ownership, including
+the HTTP target guard, after the request waiter is cancelled.
 Ordinary `RenameData` similarly prepares a single-use disk-bound transaction
 before classifying either volume. It acquires the destination metadata and
 namespace mutexes, then distinct source and destination volume read locks in

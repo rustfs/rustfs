@@ -65,8 +65,8 @@ use crate::cluster::rpc::build_internode_data_transport_from_env;
 use crate::disk::disk_store::DiskStoreRenameDataExt;
 use crate::disk::disk_store::LocalDiskWrapper;
 pub use crate::disk::disk_store::{
-    LegacyFileWrite, LegacyMetadataWrite, LegacyPartMutation, LegacyPartOperation, LegacyPathDelete, LegacyPathDeleteOperation,
-    LegacyRenameData, LegacyRenameFile,
+    LegacyFileStream, LegacyFileWrite, LegacyMetadataWrite, LegacyPartMutation, LegacyPartOperation, LegacyPathDelete,
+    LegacyPathDeleteOperation, LegacyRenameData, LegacyRenameFile,
 };
 use crate::disk::health_state::RuntimeDriveHealthState;
 use crate::disk::local::ScanGuard;

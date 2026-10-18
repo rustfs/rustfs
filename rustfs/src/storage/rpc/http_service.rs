@@ -17,8 +17,8 @@ use crate::server::RPC_PREFIX;
 use crate::storage::request_context::spawn_traced;
 use crate::storage::storage_api::ServerContextSlot;
 use crate::storage::storage_api::rpc_consumer::http_service::{
-    DEFAULT_READ_BUFFER_SIZE, DeleteOptions, DiskStore, NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse,
-    PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1, PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, StorageDiskRpcExt as _,
+    DEFAULT_READ_BUFFER_SIZE, DiskStore, NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse, PUT_FILE_AUTH_TRAILER_LEN,
+    PUT_FILE_AUTH_V1, PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, StorageDiskRpcExt as _,
     WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions, check_and_record_signed_rpc_nonce, find_local_disk_by_ref,
     sign_ns_scanner_capability_with_tier_registry_generation, sign_put_file_capability, verify_put_file_auth_trailer,
     verify_rpc_signature,
@@ -32,7 +32,7 @@ use crate::storage::storage_api::rpc_consumer::http_service::{
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use crate::storage::storage_api::tonic_rpc_auth_failure_reason;
-use crate::storage::storage_api::{DiskError, FileReader};
+use crate::storage::storage_api::{DiskError, FileReader, LegacyFileStream};
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt, TryStreamExt, stream};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri};
@@ -1378,21 +1378,16 @@ fn put_file_target_lock(disk: &DiskStore, query: &PutFileQuery) -> Arc<Mutex<()>
     lock
 }
 
-async fn remove_put_file_staging(disk: &DiskStore, volume: &str, path: &str) -> Result<(), BoxError> {
-    disk.delete(
-        volume,
-        path,
-        DeleteOptions {
-            immediate: true,
-            ..Default::default()
-        },
-    )
-    .await
-    .map_err(Into::into)
+fn put_file_staging_path(path: &str) -> String {
+    let name = format!(".rustfs-put-{}", uuid::Uuid::new_v4());
+    match path.rsplit_once('/') {
+        Some((parent, _)) => format!("{parent}/{name}"),
+        None => name,
+    }
 }
 
 async fn write_authenticated_put_file<S, E>(
-    disk: &DiskStore,
+    prepared: &LegacyFileStream,
     body: S,
     query: &PutFileQuery,
     nonce: uuid::Uuid,
@@ -1402,22 +1397,14 @@ where
     S: futures::TryStream<Ok = Bytes, Error = E> + Unpin,
     E: Into<BoxError>,
 {
-    let target_lock = put_file_target_lock(disk, query);
-    let _target_guard = target_lock.lock_owned().await;
-    let staging_name = format!(".rustfs-put-{}", uuid::Uuid::new_v4());
-    let staging_path = match query.path.rsplit_once('/') {
-        Some((parent, _)) => format!("{parent}/{staging_name}"),
-        None => staging_name,
-    };
-
     let result = async {
-        let mut file = disk
-            .create_file("", &query.volume, &staging_path, query.size)
+        let mut file = prepared
+            .create_file(query.size)
             .await
             .map_err(|err| ("create_staging", Box::new(err) as BoxError))?;
 
         if query.append {
-            match disk.read_file(&query.volume, &query.path).await {
+            match prepared.read_file().await {
                 Ok(mut source) => {
                     tokio::io::copy(&mut source, &mut file)
                         .await
@@ -1443,7 +1430,8 @@ where
         file.shutdown().await.map_err(|err| ("shutdown", Box::new(err) as BoxError))?;
         drop(file);
 
-        disk.rename_file(&query.volume, &staging_path, &query.volume, &query.path)
+        prepared
+            .publish()
             .await
             .map_err(|err| ("publish", Box::new(err) as BoxError))?;
         Ok(copied)
@@ -1453,7 +1441,7 @@ where
     match result {
         Ok(copied) => Ok(copied),
         Err((stage, primary)) => {
-            if let Err(cleanup) = remove_put_file_staging(disk, &query.volume, &staging_path).await {
+            if let Err(cleanup) = prepared.cleanup().await {
                 return Err((
                     stage,
                     Box::new(io::Error::other(format!("{primary}; staging cleanup failed: {cleanup}"))) as BoxError,
@@ -1516,10 +1504,6 @@ async fn handle_put_file(req: Request<Incoming>, require_auth: bool, target: Loc
         return response_with_status(StatusCode::FORBIDDEN, format!("invalid put_file auth: {e}"));
     }
 
-    if target.reject_legacy_artifact_mutation(&query.volume).await.is_err() {
-        return response_with_status(StatusCode::FORBIDDEN, "legacy artifact mutation is not permitted");
-    }
-
     let Some(disk) = target.find_mutation_disk(&query.disk).await else {
         log_internode_rpc_response_failure!(
             StatusCode::BAD_REQUEST,
@@ -1534,8 +1518,45 @@ async fn handle_put_file(req: Request<Incoming>, require_auth: bool, target: Loc
         return response_with_status(StatusCode::BAD_REQUEST, "disk not found");
     };
 
+    let target_lock = put_file_target_lock(&disk, &query);
+    let target_guard = Arc::new(target_lock.lock_owned().await);
+    let write = match target
+        .begin_legacy_local_file_write(&disk, &query.volume, Some(target_guard))
+        .await
+    {
+        Ok(write) => write,
+        Err(error) => {
+            let message = put_file_stage_error_message("admit", &query, &error);
+            log_internode_put_file_stage_failure!("admit", query, error);
+            return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, message);
+        }
+    };
+    if target.reject_legacy_artifact_mutation(&query.volume).await.is_err() {
+        return response_with_status(StatusCode::FORBIDDEN, "legacy artifact mutation is not permitted");
+    }
+    let staging = auth_nonce.map(|_| put_file_staging_path(&query.path));
+    let prepared = match write
+        .prepare_stream(&query.path, staging.as_deref(), auth_nonce.is_none() && query.append)
+        .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let stage = if staging.is_some() {
+                "create_staging"
+            } else if query.append {
+                "append"
+            } else {
+                "create"
+            };
+            let message = put_file_stage_error_message(stage, &query, &error);
+            log_internode_put_file_stage_failure!(stage, query, error);
+            return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, message);
+        }
+    };
+
     if let Some(nonce) = auth_nonce {
-        let copied = match write_authenticated_put_file(&disk, req.into_body().into_data_stream(), &query, nonce, &url).await {
+        let copied = match write_authenticated_put_file(&prepared, req.into_body().into_data_stream(), &query, nonce, &url).await
+        {
             Ok(copied) => copied,
             Err((stage, e)) => {
                 let message = put_file_stage_error_message(stage, &query, e.as_ref());
@@ -1547,11 +1568,8 @@ async fn handle_put_file(req: Request<Incoming>, require_auth: bool, target: Loc
         return empty_ok();
     }
 
-    let target_lock = put_file_target_lock(&disk, &query);
-    let _target_guard = target_lock.lock_owned().await;
-
     let mut file = if query.append {
-        match disk.append_file(&query.volume, &query.path).await {
+        match prepared.append_file().await {
             Ok(file) => file,
             Err(e) => {
                 let message = put_file_stage_error_message("append", &query, &e);
@@ -1560,7 +1578,7 @@ async fn handle_put_file(req: Request<Incoming>, require_auth: bool, target: Loc
             }
         }
     } else {
-        match disk.create_file("", &query.volume, &query.path, query.size).await {
+        match prepared.create_file(query.size).await {
             Ok(file) => file,
             Err(e) => {
                 let message = put_file_stage_error_message("create", &query, &e);
@@ -1596,6 +1614,12 @@ async fn handle_put_file(req: Request<Incoming>, require_auth: bool, target: Loc
     if let Err(e) = file.flush().await {
         let message = put_file_stage_error_message("flush", &query, &e);
         log_internode_put_file_stage_failure!("flush", query, e);
+        return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, message);
+    }
+
+    if let Err(e) = file.shutdown().await {
+        let message = put_file_stage_error_message("shutdown", &query, &e);
+        log_internode_put_file_stage_failure!("shutdown", query, e);
         return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, message);
     }
 
@@ -1863,8 +1887,7 @@ mod tests {
         put_file_stage_error_message, put_file_target_lock, read_file_body_stream, read_file_stream_buffer_size,
         remote_scanner_claim_rejection, response_with_disk_error, supports_walk_dir_stream_completion,
         validate_walk_dir_completion_request, verify_internode_rpc_signature, verify_ns_scanner_body_digest,
-        verify_walk_dir_body_digest, walk_dir_response_body, write_authenticated_put_file, write_body_chunks_to_writer,
-        write_put_file_body_chunks_to_writer,
+        verify_walk_dir_body_digest, walk_dir_response_body, write_body_chunks_to_writer, write_put_file_body_chunks_to_writer,
     };
     use crate::storage::storage_api::ecstore_rpc::{build_put_file_auth_trailer, gen_signature_headers};
     use crate::storage::storage_api::rpc_consumer::http_service::{DiskAPI as _, DiskOption, DiskStore, Endpoint, new_disk};
@@ -1919,6 +1942,523 @@ mod tests {
             .expect("local disk should be created");
         disk.make_volume("bucket").await.expect("test volume should be created");
         (disk, dir)
+    }
+
+    async fn test_authenticated_put_file<S, E>(
+        disk: &DiskStore,
+        body: S,
+        query: &PutFileQuery,
+        nonce: uuid::Uuid,
+        url: &str,
+    ) -> Result<u64, (&'static str, super::BoxError)>
+    where
+        S: futures::TryStream<Ok = Bytes, Error = E> + Unpin,
+        E: Into<super::BoxError>,
+    {
+        let lock = put_file_target_lock(disk, query);
+        let _guard = lock.lock_owned().await;
+        let write = disk
+            .begin_legacy_file_write(&query.volume)
+            .await
+            .map_err(|error| ("admit", Box::new(error) as super::BoxError))?;
+        let staging = super::put_file_staging_path(&query.path);
+        let prepared = write
+            .prepare_stream(&query.path, Some(&staging), false)
+            .await
+            .map_err(|error| ("create_staging", Box::new(error) as super::BoxError))?;
+        super::write_authenticated_put_file(&prepared, body, query, nonce, url).await
+    }
+
+    struct StreamReceiverFixture {
+        _root: tempfile::TempDir,
+        env: rustfs_test_utils::TestECStoreEnv,
+        slot: std::sync::Arc<super::ServerContextSlot>,
+        context: std::sync::Arc<crate::runtime_sources::AppContext>,
+        instance: std::sync::Arc<crate::storage::storage_api::InstanceContext>,
+        disk: DiskStore,
+        disk_ref: String,
+    }
+
+    impl StreamReceiverFixture {
+        async fn new() -> Self {
+            use rustfs_iam::store::{
+                Store as _,
+                object::{IAM_CONFIG_PREFIX, ObjectStore},
+            };
+            let _ = rustfs_credentials::set_global_rpc_secret("put-file-auth-body-test-secret".to_owned());
+            let root = tempfile::tempdir().expect("stream receiver root");
+            let instance = crate::storage::storage_api::new_instance_ctx();
+            let env = rustfs_test_utils::TestECStoreEnv::builder()
+                .base_dir(root.path())
+                .instance_ctx(instance.clone())
+                .build()
+                .await;
+            env.make_bucket("stream-ordinary", true).await;
+            env.ecstore
+                .clone()
+                .make_artifact_bucket("stream-managed", "outputs/")
+                .await
+                .expect("managed bucket");
+            ObjectStore::new(env.ecstore.clone())
+                .save_iam_config(serde_json::json!({"version":1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+                .await
+                .expect("IAM format");
+            let iam = rustfs_iam::build_iam_sys(env.ecstore.clone()).await.expect("fixture IAM");
+            let context = std::sync::Arc::new(crate::runtime_sources::AppContext::with_default_interfaces(
+                env.ecstore.clone(),
+                iam,
+                std::sync::Arc::new(rustfs_kms::KmsServiceManager::new()),
+            ));
+            let slot = super::ServerContextSlot::with_instance_context(instance.clone());
+            slot.try_install(context.clone()).expect("ready receiver");
+            let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+            let target = InternodeRpcService::with_server_context((), slot.clone()).mutation_target();
+            let disk = target.find_mutation_disk(&disk_ref).await.expect("captured fixture disk");
+            Self {
+                _root: root,
+                env,
+                slot,
+                context,
+                instance,
+                disk,
+                disk_ref,
+            }
+        }
+
+        fn path(&self, volume: &str, path: &str) -> std::path::PathBuf {
+            self.env.disk_paths[0].join(volume).join(path)
+        }
+    }
+
+    struct StreamConnection {
+        sender: client_http1::SendRequest<s3s::Body>,
+        client: tokio::task::JoinHandle<Result<(), hyper::Error>>,
+        server: tokio::task::JoinHandle<Result<(), hyper::Error>>,
+    }
+
+    impl StreamConnection {
+        async fn connect(slot: std::sync::Arc<super::ServerContextSlot>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("real stream listener");
+            let address = listener.local_addr().expect("listener address");
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.expect("stream connection");
+                let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(s3s::Body::empty())) });
+                server_http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(socket),
+                        TowerToHyperService::new(InternodeRpcService::with_server_context(fallback, slot)),
+                    )
+                    .await
+            });
+            let socket = TcpStream::connect(address).await.expect("stream client");
+            let (sender, connection) = client_http1::handshake(TokioIo::new(socket)).await.expect("HTTP handshake");
+            let client = tokio::spawn(connection);
+            Self { sender, client, server }
+        }
+
+        async fn send(&mut self, request: Request<s3s::Body>) -> (StatusCode, Bytes) {
+            let response = self.sender.send_request(request).await.expect("real HTTP response");
+            let status = response.status();
+            let body = response.into_body().collect().await.expect("drain HTTP response").to_bytes();
+            (status, body)
+        }
+
+        async fn finish(self) {
+            drop(self.sender);
+            self.client.await.expect("client joined").expect("client completed");
+            self.server.await.expect("server joined").expect("server completed");
+        }
+
+        #[cfg(not(windows))]
+        async fn cancel(self) {
+            self.server.abort();
+            assert!(self.server.await.expect_err("receiver canceled").is_cancelled());
+            drop(self.sender);
+            self.client.abort();
+            let _ = self.client.await;
+        }
+    }
+
+    fn stream_request(
+        disk: &str,
+        volume: &str,
+        path: &str,
+        append: bool,
+        authenticated: bool,
+        data: &[u8],
+        tamper: bool,
+    ) -> Request<s3s::Body> {
+        let nonce = uuid::Uuid::new_v4();
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query
+            .append_pair("disk", disk)
+            .append_pair("volume", volume)
+            .append_pair("path", path)
+            .append_pair("append", if append { "true" } else { "false" })
+            .append_pair("size", &if append { 0 } else { data.len() }.to_string());
+        if authenticated {
+            query
+                .append_pair("put_file_auth", "digest-trailer-v1")
+                .append_pair("put_file_nonce", &nonce.to_string())
+                .append_pair("put_file_server_epoch", &super::PUT_FILE_CAPABILITY_SERVER_EPOCH.to_string());
+        }
+        let route = if authenticated {
+            PUT_FILE_AUTH_STREAM_PATH
+        } else {
+            PUT_FILE_STREAM_PATH
+        };
+        let uri = format!("{route}?{}", query.finish());
+        let mut payload = data.to_vec();
+        if authenticated {
+            let digest = hex_simd::encode_to_string(sha2::Sha256::digest(data), hex_simd::AsciiCase::Lower);
+            payload.extend_from_slice(&build_put_file_auth_trailer(&uri, &Method::PUT, nonce, &digest).expect("signed trailer"));
+            if tamper {
+                payload[0] ^= 1;
+            }
+        }
+        let mut request = Request::builder()
+            .method(Method::PUT)
+            .uri(&uri)
+            .header(http::header::HOST, "127.0.0.1")
+            .body(s3s::Body::from(Bytes::from(payload)))
+            .expect("stream request");
+        request
+            .headers_mut()
+            .extend(gen_signature_headers(&uri, &Method::PUT).expect("request signature"));
+        request
+    }
+
+    fn stream_snapshot(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut snapshot = std::collections::BTreeMap::new();
+        let mut pending = vec![root.to_owned()];
+        while let Some(path) = pending.pop() {
+            if !path.exists() {
+                continue;
+            }
+            if path.is_dir() {
+                snapshot.insert(path.clone(), Vec::new());
+                pending.extend(
+                    std::fs::read_dir(path)
+                        .expect("snapshot directory")
+                        .map(|entry| entry.expect("entry").path()),
+                );
+            } else {
+                snapshot.insert(path.clone(), std::fs::read(path).expect("snapshot bytes"));
+            }
+        }
+        snapshot
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_file_stream_receiver_preserves_modes_and_managed_rejection() {
+        let fixture = StreamReceiverFixture::new().await;
+        let mut connection = StreamConnection::connect(fixture.slot.clone()).await;
+        for authenticated in [false, true] {
+            for volume in ["stream-ordinary", ".rustfs.sys"] {
+                let path = format!("stream/{}/part", uuid::Uuid::new_v4());
+                for (append, data, expected) in [
+                    (false, b"old-data".as_slice(), b"old-data".as_slice()),
+                    (true, b"-append".as_slice(), b"old-data-append".as_slice()),
+                    (false, b"new".as_slice(), b"new".as_slice()),
+                ] {
+                    let (status, body) = connection
+                        .send(stream_request(&fixture.disk_ref, volume, &path, append, authenticated, data, false))
+                        .await;
+                    assert_eq!(status, StatusCode::OK, "{body:?}");
+                    assert!(body.is_empty());
+                    assert_eq!(tokio::fs::read(fixture.path(volume, &path)).await.expect("published bytes"), expected);
+                }
+                if authenticated {
+                    let before = stream_snapshot(fixture.path(volume, &path).parent().expect("parent"));
+                    let (status, body) = connection
+                        .send(stream_request(&fixture.disk_ref, volume, &path, false, true, b"bad", true))
+                        .await;
+                    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+                    assert!(
+                        std::str::from_utf8(&body)
+                            .expect("error text")
+                            .starts_with("write_body file err put_file body digest mismatch")
+                    );
+                    assert_eq!(
+                        stream_snapshot(fixture.path(volume, &path).parent().expect("parent")),
+                        before,
+                        "failed authentication cleans staging and preserves target"
+                    );
+                }
+            }
+            for append in [false, true] {
+                let before = stream_snapshot(&fixture.path("stream-managed", ""));
+                let (status, body) = connection
+                    .send(stream_request(
+                        &fixture.disk_ref,
+                        "stream-managed",
+                        "outputs/blocked/part",
+                        append,
+                        authenticated,
+                        b"blocked",
+                        false,
+                    ))
+                    .await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert_eq!(body, Bytes::from_static(b"legacy artifact mutation is not permitted"));
+                assert_eq!(stream_snapshot(&fixture.path("stream-managed", "")), before);
+            }
+        }
+        connection.finish().await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_file_stream_receiver_rejects_missing_live_volume() {
+        let fixture = StreamReceiverFixture::new().await;
+        let mut connection = StreamConnection::connect(fixture.slot.clone()).await;
+        for volume in ["stream-ordinary", "stream-managed"] {
+            tokio::fs::remove_dir_all(fixture.path(volume, ""))
+                .await
+                .expect("remove only physical volume");
+            for authenticated in [false, true] {
+                for append in [false, true] {
+                    let (status, body) = connection
+                        .send(stream_request(
+                            &fixture.disk_ref,
+                            volume,
+                            "outputs/missing/part",
+                            append,
+                            authenticated,
+                            b"blocked",
+                            false,
+                        ))
+                        .await;
+                    assert!(!fixture.path(volume, "").exists(), "missing volume must never be recreated");
+                    assert_eq!(
+                        status,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "missing volume admission precedes managed classification"
+                    );
+                    let expected = format!(
+                        "admit file err {} [disk={}, volume={volume}, path=outputs/missing/part, append={append}, size={}]",
+                        DiskError::VolumeNotFound,
+                        fixture.disk_ref,
+                        if append { 0 } else { 7 }
+                    );
+                    assert_eq!(body.as_ref(), expected.as_bytes());
+                }
+            }
+        }
+        let (status, body) = connection
+            .send(stream_request(
+                "missing-disk",
+                "stream-managed",
+                "outputs/missing/part",
+                false,
+                true,
+                b"blocked",
+                false,
+            ))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, Bytes::from_static(b"disk not found"));
+        let mut request =
+            stream_request("missing-disk", "stream-managed", "outputs/missing/part", false, true, b"blocked", false);
+        let invalid = request
+            .uri()
+            .to_string()
+            .replace(&super::PUT_FILE_CAPABILITY_SERVER_EPOCH.to_string(), &uuid::Uuid::nil().to_string());
+        *request.uri_mut() = invalid.parse().expect("invalid epoch URI");
+        request
+            .headers_mut()
+            .extend(gen_signature_headers(&invalid, &Method::PUT).expect("invalid epoch signature"));
+        let (status, body) = connection.send(request).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, Bytes::from_static(b"put_file capability server epoch changed"));
+        assert!(!fixture.path("stream-ordinary", "").exists());
+        assert!(!fixture.path("stream-managed", "").exists());
+        connection.finish().await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_file_stream_receiver_binds_instance_and_bootstrap() {
+        let fixture = StreamReceiverFixture::new().await;
+        let wrong = super::ServerContextSlot::with_instance_context(crate::storage::storage_api::new_instance_ctx());
+        for slot in [super::ServerContextSlot::new(), wrong] {
+            let mut connection = StreamConnection::connect(slot).await;
+            let before = stream_snapshot(&fixture.path(".rustfs.sys", "stream-instance"));
+            let (status, body) = connection
+                .send(stream_request(
+                    &fixture.disk_ref,
+                    ".rustfs.sys",
+                    "stream-instance/blocked",
+                    false,
+                    true,
+                    b"blocked",
+                    false,
+                ))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body, Bytes::from_static(b"disk not found"));
+            assert_eq!(stream_snapshot(&fixture.path(".rustfs.sys", "stream-instance")), before);
+            connection.finish().await;
+        }
+        let slot = super::ServerContextSlot::with_instance_context(fixture.instance.clone());
+        let captured = InternodeRpcService::with_server_context((), slot.clone()).mutation_target();
+        let mut connection = StreamConnection::connect(slot.clone()).await;
+        let (status, body) = connection
+            .send(stream_request(
+                &fixture.disk_ref,
+                ".rustfs.sys",
+                "stream-instance/internal",
+                false,
+                true,
+                b"internal",
+                false,
+            ))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(
+            tokio::fs::read(fixture.path(".rustfs.sys", "stream-instance/internal"))
+                .await
+                .expect("internal bytes"),
+            b"internal"
+        );
+        let (status, body) = connection
+            .send(stream_request(
+                &fixture.disk_ref,
+                "stream-ordinary",
+                "blocked/part",
+                false,
+                true,
+                b"blocked",
+                false,
+            ))
+            .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            std::str::from_utf8(&body)
+                .expect("error text")
+                .starts_with(&format!("admit file err {}", DiskError::FileAccessDenied))
+        );
+        assert!(!fixture.path("stream-ordinary", "blocked").exists());
+        slot.try_install(fixture.context.clone())
+            .expect("install Ready after capture");
+        let error = captured
+            .begin_legacy_local_file_write(&fixture.disk, "stream-ordinary", None)
+            .await
+            .expect_err("captured Bootstrap cannot upgrade");
+        assert_eq!(error, DiskError::FileAccessDenied);
+        let (status, body) = connection
+            .send(stream_request(
+                &fixture.disk_ref,
+                "stream-ordinary",
+                "ready/part",
+                false,
+                true,
+                b"ready",
+                false,
+            ))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(
+            tokio::fs::read(fixture.path("stream-ordinary", "ready/part"))
+                .await
+                .expect("ready bytes"),
+            b"ready"
+        );
+        connection.finish().await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_file_stream_network_retains_cancelled_worker_owner() {
+        let fixture = StreamReceiverFixture::new().await;
+        #[cfg(not(windows))]
+        {
+            use crate::storage::storage_api::{LocalPublicationPause, LocalPublicationStage};
+            let path = "stream-cancel/part";
+            let query = PutFileQuery {
+                volume: "stream-ordinary".to_owned(),
+                path: path.to_owned(),
+                ..Default::default()
+            };
+            let target_lock = put_file_target_lock(&fixture.disk, &query);
+            let mut pause = LocalPublicationPause::install(
+                fixture.disk.as_ref(),
+                "stream-ordinary",
+                path,
+                LocalPublicationStage::StreamWrite,
+            )
+            .expect("real stream write pause");
+            let mut connection = StreamConnection::connect(fixture.slot.clone()).await;
+            let request = stream_request(
+                &fixture.disk_ref,
+                "stream-ordinary",
+                path,
+                false,
+                false,
+                &vec![b'x'; DEFAULT_READ_BUFFER_SIZE],
+                false,
+            );
+            let mut response = Box::pin(connection.sender.send_request(request));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    entered = pause.entered() => entered.expect("physical write entered"),
+                    response = &mut response => panic!("response before physical pause: {response:?}"),
+                }
+            })
+            .await
+            .expect("bounded physical entry");
+            drop(response);
+            connection.cancel().await;
+            let physically_retained = target_lock.try_lock().is_err();
+            pause.release_and_wait().await.expect("physical syscall completed");
+            let drained = tokio::time::timeout(Duration::from_secs(10), target_lock.lock_owned())
+                .await
+                .expect("physical target owner drained");
+            drop(drained);
+            assert!(physically_retained, "cancelled stream worker retains the target queue owner");
+            let previous = tokio::fs::read(fixture.path("stream-ordinary", path))
+                .await
+                .expect("physical write result");
+            assert!(!previous.is_empty());
+            let mut connection = StreamConnection::connect(fixture.slot.clone()).await;
+            let (status, body) = connection
+                .send(stream_request(&fixture.disk_ref, "stream-ordinary", path, true, true, b"-next", false))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body:?}");
+            let mut expected = previous;
+            expected.extend_from_slice(b"-next");
+            assert_eq!(
+                tokio::fs::read(fixture.path("stream-ordinary", path))
+                    .await
+                    .expect("next append bytes"),
+                expected
+            );
+            connection.finish().await;
+        }
+        #[cfg(windows)]
+        {
+            let mut connection = StreamConnection::connect(fixture.slot.clone()).await;
+            let (status, body) = connection
+                .send(stream_request(
+                    &fixture.disk_ref,
+                    "stream-ordinary",
+                    "stream-network/part",
+                    false,
+                    true,
+                    b"network",
+                    false,
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body:?}");
+            assert_eq!(
+                tokio::fs::read(fixture.path("stream-ordinary", "stream-network/part"))
+                    .await
+                    .expect("network bytes"),
+                b"network"
+            );
+            connection.finish().await;
+        }
     }
 
     #[tokio::test]
@@ -2677,7 +3217,7 @@ mod tests {
         payload.extend_from_slice(&trailer);
 
         let err =
-            write_authenticated_put_file(&disk, iter(vec![Ok::<Bytes, io::Error>(Bytes::from(payload))]), &query, nonce, url)
+            test_authenticated_put_file(&disk, iter(vec![Ok::<Bytes, io::Error>(Bytes::from(payload))]), &query, nonce, url)
                 .await
                 .expect_err("tampered body must not publish");
 
@@ -2713,7 +3253,7 @@ mod tests {
             put_file_server_epoch: None,
         };
 
-        let err = write_authenticated_put_file(
+        let err = test_authenticated_put_file(
             &disk,
             iter(vec![Ok::<Bytes, io::Error>(Bytes::from_static(b"short"))]),
             &query,
@@ -2754,7 +3294,7 @@ mod tests {
             put_file_server_epoch: None,
         };
 
-        let err = write_authenticated_put_file(
+        let err = test_authenticated_put_file(
             &disk,
             iter(vec![Ok::<Bytes, io::Error>(Bytes::from_static(b"append-data"))]),
             &query,
@@ -2801,7 +3341,7 @@ mod tests {
         payload.extend_from_slice(&trailer);
 
         let copied =
-            write_authenticated_put_file(&disk, iter(vec![Ok::<Bytes, io::Error>(Bytes::from(payload))]), &query, nonce, url)
+            test_authenticated_put_file(&disk, iter(vec![Ok::<Bytes, io::Error>(Bytes::from(payload))]), &query, nonce, url)
                 .await
                 .expect("authenticated append should publish");
 
@@ -2859,7 +3399,7 @@ mod tests {
         let first_disk = disk.clone();
         let first_query = query.clone();
         let first = tokio::spawn(async move {
-            write_authenticated_put_file(
+            test_authenticated_put_file(
                 &first_disk,
                 GatedPutBody {
                     started: Some(started_tx),
@@ -2878,7 +3418,7 @@ mod tests {
         let mut second_query = query;
         second_query.put_file_nonce = Some(second_nonce);
         let second = tokio::spawn(async move {
-            write_authenticated_put_file(
+            test_authenticated_put_file(
                 &second_disk,
                 iter(vec![Ok::<Bytes, io::Error>(Bytes::from(second_payload))]),
                 &second_query,
@@ -2971,7 +3511,7 @@ mod tests {
         let authenticated_disk = disk.clone();
         let authenticated_query = query.clone();
         let authenticated = tokio::spawn(async move {
-            write_authenticated_put_file(
+            test_authenticated_put_file(
                 &authenticated_disk,
                 iter(vec![Ok::<Bytes, io::Error>(Bytes::from(payload))]),
                 &authenticated_query,

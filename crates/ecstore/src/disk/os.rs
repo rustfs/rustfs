@@ -273,6 +273,18 @@ pub(crate) mod prepared_publication_test_hooks {
         Rename,
         Remove,
         RemoveComplete,
+        StreamOpen,
+        StreamOpenComplete,
+        StreamWrite,
+        StreamWriteComplete,
+        StreamFlush,
+        StreamFlushComplete,
+        StreamShutdown,
+        StreamShutdownComplete,
+        #[cfg(test)]
+        StreamDrainWaiting,
+        #[cfg(all(test, target_os = "linux"))]
+        DirectOpened,
         #[cfg(test)]
         Rollback,
         #[cfg(test)]
@@ -374,6 +386,8 @@ pub struct LocalPublicationPause {
     _hook: prepared_publication_test_hooks::Guard,
     entered: oneshot::Receiver<()>,
     _release: std::sync::mpsc::Sender<()>,
+    _completion_hook: Option<prepared_publication_test_hooks::Guard>,
+    completed: Option<oneshot::Receiver<()>>,
 }
 
 #[cfg(all(feature = "test-util", not(windows)))]
@@ -382,6 +396,8 @@ pub enum LocalPublicationStage {
     PreparedRename,
     Rename,
     Remove,
+    StreamWrite,
+    StreamShutdown,
 }
 
 #[cfg(all(feature = "test-util", not(windows)))]
@@ -394,7 +410,26 @@ impl LocalPublicationPause {
             LocalPublicationStage::PreparedRename => prepared_publication_test_hooks::Stage::PreparedRename,
             LocalPublicationStage::Rename => prepared_publication_test_hooks::Stage::Rename,
             LocalPublicationStage::Remove => prepared_publication_test_hooks::Stage::Remove,
+            LocalPublicationStage::StreamWrite => prepared_publication_test_hooks::Stage::StreamWrite,
+            LocalPublicationStage::StreamShutdown => prepared_publication_test_hooks::Stage::StreamShutdown,
         };
+        let complete_stage = match stage {
+            prepared_publication_test_hooks::Stage::StreamWrite => {
+                Some(prepared_publication_test_hooks::Stage::StreamWriteComplete)
+            }
+            prepared_publication_test_hooks::Stage::StreamShutdown => {
+                Some(prepared_publication_test_hooks::Stage::StreamShutdownComplete)
+            }
+            _ => None,
+        };
+        let completion = complete_stage.map(|stage| {
+            let (tx, rx) = oneshot::channel();
+            let hook = prepared_publication_test_hooks::install_at(stage, &path, move || {
+                let _ = tx.send(());
+            });
+            (hook, rx)
+        });
+        let (completion_hook, completed) = completion.map_or((None, None), |(hook, rx)| (Some(hook), Some(rx)));
         let (entered_tx, entered) = oneshot::channel();
         let (release, release_rx) = std::sync::mpsc::channel::<()>();
         let hook = prepared_publication_test_hooks::install_at(stage, &path, move || {
@@ -405,7 +440,25 @@ impl LocalPublicationPause {
             _hook: hook,
             entered,
             _release: release,
+            _completion_hook: completion_hook,
+            completed,
         })
+    }
+
+    /// Release a stream barrier and observe its actual physical operation finish.
+    pub async fn release_and_wait(self) -> std::result::Result<(), oneshot::error::RecvError> {
+        let Self {
+            _hook,
+            entered: _,
+            _release,
+            _completion_hook,
+            completed,
+        } = self;
+        drop(_release);
+        if let Some(completed) = completed {
+            completed.await?;
+        }
+        Ok(())
     }
 
     pub async fn entered(&mut self) -> std::result::Result<(), oneshot::error::RecvError> {

@@ -2328,11 +2328,198 @@ fn sanitize_direct_write_error(err: std::io::Error) -> std::io::Error {
     }
 }
 
+/// Buffered writes keep their physical owner in the state moved to the blocking
+/// pool. Dropping the async writer cannot release a running write's lease.
+struct OwnedStreamInner {
+    file: std::fs::File,
+    _owner: Arc<dyn Send + Sync>,
+    buffer: Vec<u8>,
+    #[cfg(target_os = "linux")]
+    reclaim_len: usize,
+    reclaim_on_shutdown: bool,
+    #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+    path: PathBuf,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum StreamWriteOperation {
+    Write,
+    Flush,
+    Shutdown,
+}
+
+struct OwnedStreamWriter {
+    inner: Option<OwnedStreamInner>,
+    pending: Option<tokio::task::JoinHandle<(OwnedStreamInner, std::io::Result<()>)>>,
+    operation: StreamWriteOperation,
+    shutdown: bool,
+}
+
+impl OwnedStreamWriter {
+    async fn open(path: PathBuf, append: bool, size: i64, owner: Arc<dyn Send + Sync>) -> Result<FileWriter> {
+        let worker_owner = owner.clone();
+        let inner = tokio::task::spawn_blocking(move || {
+            let _owner = owner;
+            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+            os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::StreamOpen, &path);
+            let opened = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(append)
+                .truncate(!append)
+                .open(&path);
+            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+            os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::StreamOpenComplete, &path);
+            let file = opened?;
+            let reclaim_on_shutdown = !append && should_reclaim_file_cache_after_write(size);
+            #[cfg(target_os = "macos")]
+            if reclaim_on_shutdown {
+                let _ = set_std_fd_nocache(&file);
+            }
+            Ok(OwnedStreamInner {
+                file,
+                _owner: worker_owner,
+                buffer: Vec::new(),
+                #[cfg(target_os = "linux")]
+                reclaim_len: usize::try_from(size.max(0)).unwrap_or(usize::MAX),
+                reclaim_on_shutdown,
+                #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                path,
+            })
+        })
+        .await
+        .map_err(|error| DiskError::other(format!("stream open worker failed: {error}")))?
+        .map_err(to_file_error)?;
+        Ok(Box::new(Self {
+            inner: Some(inner),
+            pending: None,
+            operation: StreamWriteOperation::Write,
+            shutdown: false,
+        }))
+    }
+
+    fn start(&mut self, operation: StreamWriteOperation) -> std::io::Result<()> {
+        let mut inner = self
+            .inner
+            .take()
+            .ok_or_else(|| std::io::Error::new(ErrorKind::BrokenPipe, "stream writer is closed"))?;
+        self.operation = operation;
+        self.pending = Some(tokio::task::spawn_blocking(move || {
+            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+            let stages = {
+                use os::prepared_publication_test_hooks::Stage;
+                match operation {
+                    StreamWriteOperation::Write => (Stage::StreamWrite, Stage::StreamWriteComplete),
+                    StreamWriteOperation::Flush => (Stage::StreamFlush, Stage::StreamFlushComplete),
+                    StreamWriteOperation::Shutdown => (Stage::StreamShutdown, Stage::StreamShutdownComplete),
+                }
+            };
+            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+            os::prepared_publication_test_hooks::run(stages.0, &inner.path);
+            let result = match operation {
+                StreamWriteOperation::Write => std::io::Write::write_all(&mut inner.file, &inner.buffer),
+                StreamWriteOperation::Flush | StreamWriteOperation::Shutdown => std::io::Write::flush(&mut inner.file),
+            };
+            if operation == StreamWriteOperation::Shutdown && result.is_ok() && inner.reclaim_on_shutdown {
+                #[cfg(target_os = "linux")]
+                if let Err(_error) = reclaim_written_file_cache(&inner.file, inner.reclaim_len) {
+                    record_file_cache_reclaim_error("write");
+                }
+            }
+            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+            os::prepared_publication_test_hooks::run(stages.1, &inner.path);
+            (inner, result)
+        }));
+        Ok(())
+    }
+
+    fn poll_pending(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<Option<StreamWriteOperation>>> {
+        let Some(pending) = &mut self.pending else {
+            return std::task::Poll::Ready(Ok(None));
+        };
+        let joined = std::task::ready!(std::pin::Pin::new(pending).poll(cx));
+        self.pending = None;
+        let (inner, result) = joined.map_err(|error| std::io::Error::other(format!("stream write worker failed: {error}")))?;
+        self.inner = Some(inner);
+        result?;
+        if self.operation == StreamWriteOperation::Shutdown {
+            self.shutdown = true;
+        }
+        std::task::Poll::Ready(Ok(Some(self.operation)))
+    }
+
+    fn poll_finish(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        operation: StreamWriteOperation,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let completed = std::task::ready!(self.poll_pending(cx))?;
+        if self.shutdown || completed == Some(operation) {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        self.start(operation)?;
+        self.poll_pending(cx).map_ok(|_| ())
+    }
+}
+
+impl AsyncWrite for OwnedStreamWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        std::task::ready!(this.poll_pending(cx))?;
+        if this.shutdown {
+            return std::task::Poll::Ready(Err(std::io::Error::new(ErrorKind::BrokenPipe, "stream writer is shut down")));
+        }
+        if bytes.is_empty() {
+            return std::task::Poll::Ready(Ok(0));
+        }
+        let inner = this
+            .inner
+            .as_mut()
+            .ok_or_else(|| std::io::Error::new(ErrorKind::BrokenPipe, "stream writer is closed"))?;
+        let size = bytes.len().min(2 * 1024 * 1024);
+        inner.buffer.clear();
+        inner.buffer.extend_from_slice(&bytes[..size]);
+        this.start(StreamWriteOperation::Write)?;
+        std::task::Poll::Ready(Ok(size))
+    }
+
+    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        self.get_mut().poll_finish(cx, StreamWriteOperation::Flush)
+    }
+
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        self.get_mut().poll_finish(cx, StreamWriteOperation::Shutdown)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reclaim_written_file_cache(file: &impl std::os::fd::AsFd, reclaim_len: usize) -> std::io::Result<()> {
+    use core::num::NonZeroU64;
+    use rustix::fs::{Advice, fadvise};
+    let Some(length) = NonZeroU64::new(reclaim_len as u64) else {
+        return Ok(());
+    };
+    let started = std::time::Instant::now();
+    fadvise(file, 0, Some(length), Advice::DontNeed).map_err(std::io::Error::from)?;
+    record_file_cache_reclaim_success("write", reclaim_len, started);
+    Ok(())
+}
+
 /// Owned O_DIRECT write state moved in and out of the `spawn_blocking` flush
 /// closures so the reactor is never blocked on synchronous device I/O.
 #[cfg(target_os = "linux")]
 struct DirectWriteInner {
     file: std::fs::File,
+    _owner: Option<Arc<dyn Send + Sync>>,
+    #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+    path: PathBuf,
     /// Aligned bounce buffer; its capacity (`buf.len`) is a whole multiple of
     /// `align`.
     buf: AlignedBuf,
@@ -2448,6 +2635,9 @@ impl DirectWriter {
             write_offset: 0,
             align,
             direct_cleared: false,
+            _owner: None,
+            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+            path: PathBuf::new(),
         })
     }
 
@@ -2500,7 +2690,17 @@ impl AsyncWrite for DirectWriter {
                     if inner.filled == capacity {
                         let mut inner = inner_opt.take().expect("idle direct writer must hold inner state");
                         let handle = tokio::task::spawn_blocking(move || {
+                            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                            os::prepared_publication_test_hooks::run(
+                                os::prepared_publication_test_hooks::Stage::StreamWrite,
+                                &inner.path,
+                            );
                             let res = inner.flush_batch();
+                            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                            os::prepared_publication_test_hooks::run(
+                                os::prepared_publication_test_hooks::Stage::StreamWriteComplete,
+                                &inner.path,
+                            );
                             (inner, res)
                         });
                         this.state = DirectWriteState::Busy(handle);
@@ -2551,7 +2751,17 @@ impl AsyncWrite for DirectWriter {
                     if inner.filled == capacity {
                         let mut inner = inner_opt.take().expect("idle direct writer must hold inner state");
                         let handle = tokio::task::spawn_blocking(move || {
+                            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                            os::prepared_publication_test_hooks::run(
+                                os::prepared_publication_test_hooks::Stage::StreamWrite,
+                                &inner.path,
+                            );
                             let res = inner.flush_batch();
+                            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                            os::prepared_publication_test_hooks::run(
+                                os::prepared_publication_test_hooks::Stage::StreamWriteComplete,
+                                &inner.path,
+                            );
                             (inner, res)
                         });
                         this.state = DirectWriteState::Busy(handle);
@@ -2587,7 +2797,17 @@ impl AsyncWrite for DirectWriter {
                     let mut inner = inner_opt.take().expect("idle direct writer must hold inner state");
                     this.shutdown_started = true;
                     let handle = tokio::task::spawn_blocking(move || {
+                        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                        os::prepared_publication_test_hooks::run(
+                            os::prepared_publication_test_hooks::Stage::StreamShutdown,
+                            &inner.path,
+                        );
                         let res = inner.finish();
+                        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                        os::prepared_publication_test_hooks::run(
+                            os::prepared_publication_test_hooks::Stage::StreamShutdownComplete,
+                            &inner.path,
+                        );
                         (inner, res)
                     });
                     this.state = DirectWriteState::Busy(handle);
@@ -2649,6 +2869,9 @@ fn open_direct_writer(file_path: &Path, state: &DirectIoWriteState) -> Result<Op
         write_offset: 0,
         align,
         direct_cleared: false,
+        _owner: None,
+        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+        path: file_path.to_path_buf(),
     })))
 }
 
@@ -3477,20 +3700,11 @@ impl FileCacheReclaimWriter {
 
     #[cfg(target_os = "linux")]
     fn reclaim_file_cache(&mut self) -> std::io::Result<()> {
-        use core::num::NonZeroU64;
-        use rustix::fs::{Advice, fadvise};
-
         if !self.reclaim_on_shutdown || self.reclaimed || self.reclaim_len == 0 {
             return Ok(());
         }
-
-        let started = std::time::Instant::now();
-        let reclaim_len =
-            NonZeroU64::new(self.reclaim_len as u64).expect("reclaim_len is guaranteed non-zero by the early return");
-        fadvise(&self.inner, 0, Some(reclaim_len), Advice::DontNeed).map_err(std::io::Error::from)?;
-
+        reclaim_written_file_cache(&self.inner, self.reclaim_len)?;
         self.reclaimed = true;
-        record_file_cache_reclaim_success("write", self.reclaim_len, started);
         Ok(())
     }
 
@@ -3629,7 +3843,13 @@ pub(crate) trait LocalIoBackend: Send + Sync + Debug + 'static {
     async fn open_full_read(&self, volume: &str, path: &str) -> Result<FileReader>;
 
     /// Open a writer (mirrors `create_file`/`append_file` per [`WriteMode`]).
-    async fn open_write(&self, volume: &str, path: &str, mode: WriteMode) -> Result<FileWriter>;
+    async fn open_write(
+        &self,
+        volume: &str,
+        path: &str,
+        mode: WriteMode,
+        owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<FileWriter>;
 
     /// Drop any descriptor this backend caches for exactly `volume`'s `path`
     /// (backlog#1145). Preferred wherever the caller knows the affected paths.
@@ -4361,7 +4581,13 @@ impl LocalIoBackend for StdBackend {
         Ok(Box::new(f))
     }
 
-    async fn open_write(&self, volume: &str, path: &str, mode: WriteMode) -> Result<FileWriter> {
+    async fn open_write(
+        &self,
+        volume: &str,
+        path: &str,
+        mode: WriteMode,
+        owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<FileWriter> {
         match mode {
             WriteMode::Truncate { size_hint } => {
                 let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
@@ -4369,7 +4595,11 @@ impl LocalIoBackend for StdBackend {
                 check_path_length(file_path.to_string_lossy().as_ref())?;
 
                 if let Some(parent) = file_path.parent() {
-                    os::make_dir_all(parent, &volume_dir).await?;
+                    if let Some(owner) = &owner {
+                        os::make_dir_all_with_owner(parent, &volume_dir, owner.clone()).await?;
+                    } else {
+                        os::make_dir_all(parent, &volume_dir).await?;
+                    }
                 }
 
                 // O_DIRECT streaming write (Linux, opt-in): shard bytes stream
@@ -4382,12 +4612,46 @@ impl LocalIoBackend for StdBackend {
                 if is_direct_io_write_enabled() && self.direct_io_write.supported.load(Ordering::Relaxed) {
                     let write_state = self.direct_io_write.clone();
                     let direct_path = file_path.clone();
-                    let direct = tokio::task::spawn_blocking(move || open_direct_writer(&direct_path, &write_state))
-                        .await
-                        .map_err(|err| DiskError::other(format!("O_DIRECT open task failed: {err}")))??;
+                    let direct_owner = owner.clone();
+                    let direct = tokio::task::spawn_blocking(move || {
+                        let _owner = direct_owner.clone();
+                        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                        os::prepared_publication_test_hooks::run(
+                            os::prepared_publication_test_hooks::Stage::StreamOpen,
+                            &direct_path,
+                        );
+                        let result = open_direct_writer(&direct_path, &write_state);
+                        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                        os::prepared_publication_test_hooks::run(
+                            os::prepared_publication_test_hooks::Stage::StreamOpenComplete,
+                            &direct_path,
+                        );
+                        let mut writer = result?;
+                        if let Some(writer) = &mut writer
+                            && let DirectWriteState::Idle(Some(inner)) = &mut writer.state
+                        {
+                            inner._owner = direct_owner;
+                            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                            {
+                                inner.path = direct_path;
+                            }
+                        }
+                        Ok::<_, DiskError>(writer)
+                    })
+                    .await
+                    .map_err(|err| DiskError::other(format!("O_DIRECT open task failed: {err}")))??;
                     if let Some(writer) = direct {
+                        #[cfg(test)]
+                        os::prepared_publication_test_hooks::run(
+                            os::prepared_publication_test_hooks::Stage::DirectOpened,
+                            &file_path,
+                        );
                         return Ok(Box::new(writer));
                     }
+                }
+
+                if let Some(owner) = owner {
+                    return OwnedStreamWriter::open(file_path, false, size_hint, owner).await;
                 }
 
                 // O_TRUNC: if a file already exists at this path, stale trailing bytes past
@@ -4410,6 +4674,14 @@ impl LocalIoBackend for StdBackend {
                 let file_path = local_disk_object_path(self.io_root(), volume, path)?;
                 check_path_length(file_path.to_string_lossy().as_ref())?;
 
+                if let Some(owner) = owner {
+                    if let Some(parent) = file_path.parent()
+                        && parent != volume_dir
+                    {
+                        os::make_dir_all_with_owner(parent, &volume_dir, owner.clone()).await?;
+                    }
+                    return OwnedStreamWriter::open(file_path, true, 0, owner).await;
+                }
                 let f = self.open_file(file_path, O_CREATE | O_APPEND | O_WRONLY, volume_dir).await?;
 
                 Ok(Box::new(f))
@@ -5581,8 +5853,14 @@ impl LocalIoBackend for UringBackend {
         self.inner.open_full_read(volume, path).await
     }
 
-    async fn open_write(&self, volume: &str, path: &str, mode: WriteMode) -> Result<FileWriter> {
-        self.inner.open_write(volume, path, mode).await
+    async fn open_write(
+        &self,
+        volume: &str,
+        path: &str,
+        mode: WriteMode,
+        owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<FileWriter> {
+        self.inner.open_write(volume, path, mode, owner).await
     }
 
     async fn invalidate_cached_fd(&self, volume: &str, path: &str) {
@@ -6890,6 +7168,82 @@ impl LocalDisk {
             .map_err(to_file_error)?;
         }
         Ok(())
+    }
+
+    pub(in crate::disk) fn prepare_legacy_stream(
+        &self,
+        volume: &str,
+        target: &str,
+        staging: Option<&str>,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Result<Arc<os::NamespaceMutationLease>> {
+        let target_path = self.io_get_object_path(volume, target)?;
+        let mut paths = vec![target_path.clone()];
+        let mut scopes = Vec::new();
+        for path in std::iter::once(target).chain(staging) {
+            if let Some(scope) = crate::bucket::artifact::artifact_repair_scope(volume, path) {
+                scope.check().map_err(Error::other)?;
+                scopes.push(scope);
+            }
+        }
+        if let Some(staging) = staging {
+            let staging_path = self.io_get_object_path(volume, staging)?;
+            if staging_path == target_path || staging_path.parent() != target_path.parent() {
+                return Err(DiskError::InvalidPath);
+            }
+            paths.push(staging_path);
+        }
+        paths.sort();
+        for path in &paths {
+            check_path_length(path.to_string_lossy().as_ref())?;
+        }
+        // The live volume READ is already owned; every namespace is a try.
+        let mut owner: Arc<dyn Send + Sync> = Arc::new((owner, scopes));
+        let mut last = None;
+        for path in paths {
+            let lease = os::try_acquire_namespace_mutation_lease_with_owner(&path, owner)?;
+            owner = lease.clone();
+            last = Some(lease);
+        }
+        last.ok_or(DiskError::Unexpected)
+    }
+
+    pub(in crate::disk) async fn open_legacy_stream(
+        &self,
+        volume: &str,
+        path: &str,
+        append: bool,
+        size: i64,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Result<FileWriter> {
+        let mode = if append {
+            WriteMode::Append
+        } else {
+            WriteMode::Truncate { size_hint: size }
+        };
+        self.io_backend.open_write(volume, path, mode, Some(owner)).await
+    }
+
+    pub(in crate::disk) async fn remove_legacy_stream_staging(
+        &self,
+        volume: &str,
+        path: &str,
+        lease: Arc<os::NamespaceMutationLease>,
+    ) -> Result<()> {
+        self.delete_unleased_prepared(
+            volume,
+            path,
+            &DeleteOptions {
+                immediate: true,
+                ..Default::default()
+            },
+            PreparedPathDelete {
+                lease,
+                trash: None,
+                encoded_trash: None,
+            },
+        )
+        .await
     }
 
     pub(in crate::disk) async fn begin_legacy_file_write(
@@ -12551,7 +12905,7 @@ impl DiskAPI for LocalDisk {
         }
 
         self.io_backend
-            .open_write(volume, path, WriteMode::Truncate { size_hint: _file_size })
+            .open_write(volume, path, WriteMode::Truncate { size_hint: _file_size }, None)
             .await
     }
 
@@ -12563,7 +12917,7 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     // async fn append_file(&self, volume: &str, path: &str, mut r: DuplexStream) -> Result<File> {
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
-        self.io_backend.open_write(volume, path, WriteMode::Append).await
+        self.io_backend.open_write(volume, path, WriteMode::Append, None).await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -18597,6 +18951,419 @@ mod test {
                     .contains(&current)
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_stream_preserves_write_publish_cleanup() {
+        let (_root, disk, wrapper) = rename_file_fixture().await;
+        let stream = wrapper
+            .begin_legacy_file_write("source")
+            .await
+            .expect("admission")
+            .prepare_stream("entry", None, false)
+            .await
+            .expect("scope");
+        let mut file = stream.create_file(8).await.expect("create");
+        file.write_all(b"old-long").await.expect("bytes");
+        file.shutdown().await.expect("shutdown");
+        drop(file);
+        let mut file = stream.create_file(3).await.expect("truncate");
+        file.write_all(b"old").await.expect("bytes");
+        file.shutdown().await.expect("shutdown");
+        drop(file);
+        let mut file = stream.append_file().await.expect("append");
+        file.write_all(b"+").await.expect("bytes");
+        file.flush().await.expect("flush");
+        drop(file);
+        assert_eq!(disk.read_all("source", "entry").await.expect("read"), Bytes::from_static(b"old+"));
+        assert_eq!(stream.publish().await, Err(DiskError::Unexpected));
+        assert_eq!(stream.cleanup().await, Err(DiskError::Unexpected));
+        drop(stream);
+        let stream = wrapper
+            .begin_legacy_file_write("source")
+            .await
+            .expect("admission")
+            .prepare_stream("entry", Some(".staging"), false)
+            .await
+            .expect("scope");
+        assert!(matches!(stream.append_file().await, Err(DiskError::Unexpected)));
+        let mut file = stream.create_file(7).await.expect("staging");
+        let mut old = stream.read_file().await.expect("old target");
+        tokio::io::copy(&mut old, &mut file).await.expect("copy old");
+        file.write_all(b"new").await.expect("append staging");
+        file.shutdown().await.expect("shutdown");
+        drop(file);
+        drop(old);
+        assert_eq!(disk.read_all("source", "entry").await.expect("unpublished"), Bytes::from_static(b"old+"));
+        stream.publish().await.expect("publish");
+        assert_eq!(disk.read_all("source", "entry").await.expect("published"), Bytes::from_static(b"old+new"));
+        let mut file = stream.create_file(3).await.expect("failed staging");
+        file.write_all(b"bad").await.expect("bytes");
+        file.shutdown().await.expect("shutdown");
+        drop(file);
+        stream.cleanup().await.expect("cleanup");
+        assert!(!disk.io_get_object_path("source", ".staging").expect("path").exists());
+        assert_eq!(disk.read_all("source", "entry").await.expect("preserved"), Bytes::from_static(b"old+new"));
+        assert_eq!(wrapper.metrics_snapshot().api_calls.get("create_file"), Some(&4));
+        assert_eq!(wrapper.metrics_snapshot().api_calls.get("append_file"), Some(&1));
+        assert_eq!(wrapper.metrics_snapshot().api_calls.get("rename_file"), Some(&1));
+        assert_eq!(wrapper.metrics_snapshot().api_calls.get("delete"), Some(&1));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_stream_live_volume_and_namespace_admission() {
+        let (root, disk, wrapper) = rename_file_fixture().await;
+        disk.delete_volume("source", true).await.expect("remove volume");
+        let before = part_tree_bytes(root.path());
+        assert!(matches!(wrapper.begin_legacy_file_write("source").await, Err(DiskError::VolumeNotFound)));
+        assert_eq!(
+            part_tree_bytes(root.path()),
+            before,
+            "missing ordinary volume cannot be recreated by a stream"
+        );
+        disk.make_volume("source").await.expect("restore volume");
+        for append in [false, true] {
+            let operation = if append { "append_file" } else { "create_file" };
+            let before = wrapper.metrics_snapshot();
+            let tree = part_tree_bytes(root.path());
+            let result = wrapper
+                .begin_legacy_file_write("source")
+                .await
+                .expect("live admission")
+                .prepare_stream("../outside", None, append)
+                .await;
+            assert!(matches!(result, Err(DiskError::InvalidPath)));
+            let after = wrapper.metrics_snapshot();
+            assert_eq!(
+                after.api_calls.get(operation).copied().unwrap_or(0),
+                before.api_calls.get(operation).copied().unwrap_or(0) + 1
+            );
+            assert_eq!(
+                after.last_minute.get(operation).map(|action| action.count).unwrap_or(0),
+                before.last_minute.get(operation).map(|action| action.count).unwrap_or(0) + 1
+            );
+            assert_eq!(after.total_writes, before.total_writes);
+            assert_eq!(part_tree_bytes(root.path()), tree, "preparation failure performs no write");
+        }
+        for locked in ["entry", ".staging"] {
+            let lease =
+                os::acquire_namespace_mutation_lease_with_owner(&disk.io_get_object_path("source", locked).expect("path"), None)
+                    .await;
+            let before = part_tree_bytes(root.path());
+            let result = wrapper
+                .begin_legacy_file_write("source")
+                .await
+                .expect("admission")
+                .prepare_stream("entry", Some(".staging"), false)
+                .await;
+            assert!(matches!(result, Err(DiskError::Io(error)) if error.kind() == ErrorKind::WouldBlock));
+            assert_eq!(part_tree_bytes(root.path()), before, "every stream namespace precedes the first write");
+            drop(lease);
+        }
+        let stream = wrapper
+            .begin_legacy_file_write(".rustfs.sys/tmp")
+            .await
+            .expect("internal admission")
+            .prepare_stream("nested/entry", None, false)
+            .await
+            .expect("internal scope");
+        let mut file = stream.create_file(3).await.expect("internal create on demand");
+        file.write_all(b"sys").await.expect("bytes");
+        file.shutdown().await.expect("shutdown");
+        drop(file);
+        assert_eq!(
+            disk.read_all(".rustfs.sys/tmp", "nested/entry").await.expect("read"),
+            Bytes::from_static(b"sys")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_stream_cancellation_retains_physical_owner() {
+        use os::prepared_publication_test_hooks::{self as hooks, Stage};
+        temp_env::async_with_vars([("RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE", Some("false"))], async {
+            for (stage, completed_stage) in [
+                (Stage::StreamOpen, Stage::StreamOpenComplete),
+                (Stage::StreamWrite, Stage::StreamWriteComplete),
+                (Stage::StreamFlush, Stage::StreamFlushComplete),
+                (Stage::StreamShutdown, Stage::StreamShutdownComplete),
+            ] {
+                let (_root, disk, wrapper) = rename_file_fixture().await;
+                let path = disk.io_get_object_path("source", "entry").expect("path");
+                let queue = Arc::new(tokio::sync::Mutex::new(()));
+                let guard = Arc::new(queue.clone().lock_owned().await);
+                let weak = Arc::downgrade(&guard);
+                let stream = wrapper
+                    .begin_legacy_file_write_with_namespace_owner("source", Some(guard))
+                    .await
+                    .expect("admission")
+                    .prepare_stream("entry", None, false)
+                    .await
+                    .expect("scope");
+                let (entered_tx, entered) = tokio::sync::oneshot::channel();
+                let (release, release_rx) = std::sync::mpsc::channel::<()>();
+                let _hook = hooks::install_at(stage, &path, move || {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv();
+                });
+                let (done_tx, done) = tokio::sync::oneshot::channel();
+                let _done_hook = hooks::install_at(completed_stage, &path, move || {
+                    let _ = done_tx.send(());
+                });
+                let operation = tokio::spawn(async move {
+                    let mut file = stream.create_file(7).await.expect("open");
+                    file.write_all(b"payload").await.expect("bytes");
+                    file.flush().await.expect("flush");
+                    file.shutdown().await.expect("shutdown");
+                });
+                entered.await.expect("actual worker entered");
+                operation.abort();
+                let cancelled = operation.await.expect_err("cancelled").is_cancelled();
+                let retained = weak.upgrade().is_some();
+                let volume_waits = os::disk_volume_mutation_lock(&disk.root, "source").try_write_owned().is_err();
+                let append_waits = queue.clone().try_lock_owned().is_err();
+                drop(release);
+                done.await.expect("actual syscall complete");
+                drop(
+                    timeout(Duration::from_secs(10), os::acquire_namespace_mutation_lease_with_owner(&path, None))
+                        .await
+                        .expect("physical namespace drains"),
+                );
+                drop(
+                    timeout(Duration::from_secs(10), queue.lock())
+                        .await
+                        .expect("HTTP queue drains"),
+                );
+                disk.delete_volume("source", true).await.expect("delete drained volume");
+                disk.make_volume("source").await.expect("recreate");
+                disk.write_all("source", "entry", Bytes::from_static(b"new-generation"))
+                    .await
+                    .expect("sentinel");
+                assert!(cancelled);
+                assert!(retained && volume_waits, "{stage:?}: actual stream worker retains volume READ");
+                assert!(append_waits, "{stage:?}: actual stream worker retains HTTP append queue");
+                assert_eq!(
+                    disk.read_all("source", "entry").await.expect("sentinel"),
+                    Bytes::from_static(b"new-generation")
+                );
+            }
+        })
+        .await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_stream_cleanup_waits_for_failed_writer_tail() {
+        use os::prepared_publication_test_hooks::{self as hooks, Stage};
+        temp_env::async_with_vars([("RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE", Some("false"))], async {
+            let (_root, disk, wrapper) = rename_file_fixture().await;
+            disk.write_all("source", "entry", Bytes::from_static(b"old"))
+                .await
+                .expect("old target");
+            let stream = wrapper
+                .begin_legacy_file_write("source")
+                .await
+                .expect("admission")
+                .prepare_stream("entry", Some(".staging"), false)
+                .await
+                .expect("scope");
+            let path = disk.io_get_object_path("source", ".staging").expect("path");
+            let mut file = stream.create_file(3).await.expect("open");
+            let (entered_tx, entered) = tokio::sync::oneshot::channel();
+            let (release, release_rx) = std::sync::mpsc::channel::<()>();
+            let _hook = hooks::install_at(Stage::StreamWrite, &path, move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            });
+            let (done_tx, done) = tokio::sync::oneshot::channel();
+            let _done_hook = hooks::install_at(Stage::StreamWriteComplete, &path, move || {
+                let _ = done_tx.send(());
+            });
+            file.write_all(b"bad")
+                .await
+                .expect("accepted body before authentication failure");
+            entered.await.expect("real write entered");
+            drop(file);
+            let (waiting_tx, waiting) = tokio::sync::oneshot::channel();
+            let _waiting = hooks::install_at(
+                Stage::StreamDrainWaiting,
+                &disk.get_object_path("source", ".staging").expect("key"),
+                move || {
+                    let _ = waiting_tx.send(());
+                },
+            );
+            let stream = Arc::new(stream);
+            let mut cleanup = tokio::spawn({
+                let stream = stream.clone();
+                async move { stream.cleanup().await }
+            });
+            let early_result;
+            let waits = tokio::select! {
+                observed = waiting => { early_result = None; observed.is_ok() },
+                result = &mut cleanup => { early_result = Some(result); false },
+            };
+            let staging_exists = path.exists();
+            drop(release);
+            done.await.expect("actual write complete");
+            let result = match early_result {
+                Some(result) => result,
+                None => cleanup.await,
+            }
+            .expect("cleanup task");
+            drop(stream);
+            drop(os::acquire_namespace_mutation_lease_with_owner(&path, None).await);
+            assert!(waits && staging_exists, "failed body cleanup must wait for the real writer tail");
+            result.expect("cleanup after tail");
+            assert!(!path.exists());
+            assert_eq!(disk.read_all("source", "entry").await.expect("old target"), Bytes::from_static(b"old"));
+        })
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_stream_direct_writer_tail_retains_owner() {
+        use os::prepared_publication_test_hooks::{self as hooks, Stage};
+        for (stage, complete, size) in [
+            (Stage::StreamWrite, Stage::StreamWriteComplete, 4096),
+            (Stage::StreamShutdown, Stage::StreamShutdownComplete, 7),
+        ] {
+            let (_root, disk, _wrapper) = rename_file_fixture().await;
+            let path = disk.io_get_object_path("source", "entry").expect("path");
+            let queue = Arc::new(tokio::sync::Mutex::new(()));
+            let external = Arc::new(queue.clone().lock_owned().await);
+            let weak = Arc::downgrade(&external);
+            let owner = disk.begin_legacy_volume_read("source", None).await.expect("admission");
+            let lease = disk
+                .prepare_legacy_stream("source", "entry", None, Arc::new((owner, external)))
+                .expect("scope");
+            let mut file = DirectWriter::from_std_file_for_test(std::fs::File::create(&path).expect("file"), 512, 4096);
+            if let DirectWriteState::Idle(Some(inner)) = &mut file.state {
+                inner._owner = Some(lease);
+                inner.path = path.clone();
+            }
+            let (entered_tx, entered) = tokio::sync::oneshot::channel();
+            let (release, release_rx) = std::sync::mpsc::channel::<()>();
+            let _hook = hooks::install_at(stage, &path, move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            });
+            let (done_tx, done) = tokio::sync::oneshot::channel();
+            let _done = hooks::install_at(complete, &path, move || {
+                let _ = done_tx.send(());
+            });
+            let operation = tokio::spawn(async move {
+                file.write_all(&vec![5; size]).await.expect("bytes");
+                file.shutdown().await.expect("tail");
+            });
+            entered.await.expect("actual direct state-machine worker");
+            operation.abort();
+            let cancelled = operation.await.expect_err("cancelled").is_cancelled();
+            let retained = weak.upgrade().is_some();
+            let volume_waits = os::disk_volume_mutation_lock(&disk.root, "source").try_write_owned().is_err();
+            let queue_waits = queue.clone().try_lock_owned().is_err();
+            drop(release);
+            done.await.expect("actual direct write finished");
+            drop(
+                timeout(Duration::from_secs(10), os::acquire_namespace_mutation_lease_with_owner(&path, None))
+                    .await
+                    .expect("direct worker drains"),
+            );
+            drop(timeout(Duration::from_secs(10), queue.lock()).await.expect("queue drains"));
+            let bytes = fs::read(&path).await.expect("physical bytes");
+            assert!(cancelled);
+            assert!(retained && volume_waits, "direct {stage:?}: physical worker retains volume READ");
+            assert!(queue_waits, "direct {stage:?}: physical worker retains HTTP append queue");
+            assert_eq!(bytes, vec![5; size]);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_stream_backend_direct_open_retains_physical_owner() {
+        use os::prepared_publication_test_hooks::{self as hooks, Stage};
+        temp_env::async_with_vars([("RUSTFS_OBJECT_DIRECT_IO_WRITE_ENABLE", Some("true"))], async {
+            let (_root, disk, wrapper) = rename_file_fixture().await;
+            let path = disk.io_get_object_path("source", "entry").expect("path");
+            let queue = Arc::new(tokio::sync::Mutex::new(()));
+            let guard = Arc::new(queue.clone().lock_owned().await);
+            let weak = Arc::downgrade(&guard);
+            let stream = wrapper
+                .begin_legacy_file_write_with_namespace_owner("source", Some(guard))
+                .await
+                .expect("admission")
+                .prepare_stream("entry", None, false)
+                .await
+                .expect("scope");
+            let direct_opened = Arc::new(AtomicBool::new(false));
+            let _opened = hooks::install_at(Stage::DirectOpened, &path, {
+                let direct_opened = direct_opened.clone();
+                move || {
+                    direct_opened.store(true, Ordering::Release);
+                }
+            });
+            let mut file = stream.create_file(7).await.expect("real backend create");
+            // This test requires a DIO-capable filesystem. A buffered fallback
+            // must never count as coverage of the direct-open owner transfer.
+            assert!(
+                direct_opened.load(Ordering::Acquire),
+                "Direct backend unavailable: buffered fallback does not validate direct-open owner transfer"
+            );
+            let (entered_tx, entered) = tokio::sync::oneshot::channel();
+            let (release, release_rx) = std::sync::mpsc::channel::<()>();
+            let _hook = hooks::install_at(Stage::StreamShutdown, &path, move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            });
+            let (done_tx, done) = tokio::sync::oneshot::channel();
+            let _done = hooks::install_at(Stage::StreamShutdownComplete, &path, move || {
+                let _ = done_tx.send(());
+            });
+            let operation = tokio::spawn(async move {
+                let _stream = stream;
+                file.write_all(b"payload").await.expect("direct buffered tail");
+                file.shutdown().await.expect("physical tail");
+            });
+            entered.await.expect("actual backend direct tail worker");
+            operation.abort();
+            let cancelled = operation.await.expect_err("cancelled").is_cancelled();
+            let retained = weak.upgrade().is_some();
+            let volume_waits = os::disk_volume_mutation_lock(&disk.root, "source").try_write_owned().is_err();
+            let append_waits = queue.clone().try_lock_owned().is_err();
+            drop(release);
+            done.await.expect("actual direct tail syscall completed");
+            drop(
+                timeout(Duration::from_secs(10), os::acquire_namespace_mutation_lease_with_owner(&path, None))
+                    .await
+                    .expect("direct worker drains"),
+            );
+            drop(
+                timeout(Duration::from_secs(10), queue.lock())
+                    .await
+                    .expect("HTTP queue drains"),
+            );
+            let actual = fs::read(&path).await.expect("tail bytes");
+            disk.delete_volume("source", true).await.expect("delete drained volume");
+            disk.make_volume("source").await.expect("recreate");
+            disk.write_all("source", "entry", Bytes::from_static(b"new-generation"))
+                .await
+                .expect("sentinel");
+            assert!(cancelled);
+            assert!(retained && volume_waits, "backend DirectWriter tail retains admitted volume READ");
+            assert!(append_waits, "backend DirectWriter tail retains HTTP append queue");
+            assert_eq!(actual, b"payload");
+            assert_eq!(
+                disk.read_all("source", "entry").await.expect("sentinel"),
+                Bytes::from_static(b"new-generation")
+            );
+        })
+        .await;
     }
 
     async fn rename_file_fixture() -> (tempfile::TempDir, Arc<LocalDisk>, crate::disk::disk_store::LocalDiskWrapper) {
@@ -30173,7 +30940,7 @@ mod test {
         let backend = StdBackend::new(dir.path().to_path_buf());
 
         let mut writer = backend
-            .open_write(volume, "nested/blob.bin", WriteMode::Truncate { size_hint: 6 })
+            .open_write(volume, "nested/blob.bin", WriteMode::Truncate { size_hint: 6 }, None)
             .await
             .expect("truncate writer should open");
         writer.write_all(b"abcdef").await.expect("initial bytes should write");
@@ -30186,14 +30953,14 @@ mod test {
         assert_eq!(window, Bytes::from_static(b"bcd"));
 
         let mut writer = backend
-            .open_write(volume, "nested/blob.bin", WriteMode::Truncate { size_hint: 2 })
+            .open_write(volume, "nested/blob.bin", WriteMode::Truncate { size_hint: 2 }, None)
             .await
             .expect("second truncate writer should open");
         writer.write_all(b"xy").await.expect("truncated bytes should write");
         writer.shutdown().await.expect("second truncate writer should shutdown");
 
         let mut writer = backend
-            .open_write(volume, "nested/blob.bin", WriteMode::Append)
+            .open_write(volume, "nested/blob.bin", WriteMode::Append, None)
             .await
             .expect("append writer should open");
         writer.write_all(b"z").await.expect("append byte should write");

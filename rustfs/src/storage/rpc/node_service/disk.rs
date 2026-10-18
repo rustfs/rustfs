@@ -193,6 +193,19 @@ impl LocalMutationTarget {
         }
     }
 
+    pub(crate) async fn begin_legacy_local_file_write(
+        &self,
+        disk: &super::DiskStore,
+        volume: &str,
+        external_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<LegacyFileWrite, DiskError> {
+        match self {
+            Self::Ready(store) => store.begin_legacy_local_file_write(disk, volume, external_guard).await,
+            Self::Bootstrap(target) => target.begin_legacy_local_file_write(disk, volume, external_guard).await,
+            Self::Unbound => Err(DiskError::other("cannot find disk")),
+        }
+    }
+
     async fn begin_legacy_local_delete_versions(&self, disk_ref: &str, volume: &str) -> Result<LegacyFileWrite, DiskError> {
         match self {
             Self::Ready(store) => store.begin_legacy_local_delete_versions(disk_ref, volume).await,

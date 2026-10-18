@@ -1482,6 +1482,25 @@ impl std::fmt::Debug for LegacyFileWrite {
 }
 
 impl LegacyFileWrite {
+    pub async fn prepare_stream(self, target: &str, staging: Option<&str>, append: bool) -> Result<LegacyFileStream> {
+        let started = Instant::now();
+        let lease = self
+            .disk
+            .disk
+            .prepare_legacy_stream(&self.volume, target, staging, self.owner.clone())
+            .inspect_err(|error| {
+                self.disk
+                    .record_legacy_admission_failure(if append { "append_file" } else { "create_file" }, error, started);
+            })?;
+        Ok(LegacyFileStream {
+            write: self,
+            target: target.to_owned(),
+            staging: staging.map(str::to_owned),
+            writers: Arc::new(RwLock::new(())),
+            lease,
+        })
+    }
+
     pub async fn delete_versions(self, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<DiskError>> {
         with_disk_io_permit(
             Some(self.permit.clone()),
@@ -1533,6 +1552,149 @@ impl LegacyFileWrite {
                         .await
                 },
                 get_max_timeout_duration(),
+            ),
+        )
+        .await
+    }
+}
+
+/// One HTTP stream's fixed target and optional sibling staging namespace.
+pub struct LegacyFileStream {
+    write: LegacyFileWrite,
+    target: String,
+    staging: Option<String>,
+    writers: Arc<RwLock<()>>,
+    lease: Arc<super::os::NamespaceMutationLease>,
+}
+
+impl LegacyFileStream {
+    async fn exclude_writers(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        #[cfg(all(test, not(windows)))]
+        {
+            let mut waiting = std::pin::pin!(tokio::task::unconstrained(self.writers.clone().write_owned()));
+            return std::future::poll_fn(|cx| {
+                let state = std::future::Future::poll(waiting.as_mut(), cx);
+                if state.is_pending()
+                    && let Ok(path) = self
+                        .write
+                        .disk
+                        .disk
+                        .get_object_path(&self.write.volume, self.staging.as_deref().unwrap_or(&self.target))
+                {
+                    super::os::prepared_publication_test_hooks::run(
+                        super::os::prepared_publication_test_hooks::Stage::StreamDrainWaiting,
+                        &path,
+                    );
+                }
+                state
+            })
+            .await;
+        }
+        #[cfg(not(all(test, not(windows))))]
+        self.writers.clone().write_owned().await
+    }
+
+    pub async fn create_file(&self, size: i64) -> Result<crate::disk::FileWriter> {
+        self.open(false, size).await
+    }
+
+    pub async fn append_file(&self) -> Result<crate::disk::FileWriter> {
+        if self.staging.is_some() {
+            return Err(DiskError::Unexpected);
+        }
+        self.open(true, 0).await
+    }
+
+    async fn open(&self, append: bool, size: i64) -> Result<crate::disk::FileWriter> {
+        let writer = with_disk_io_permit(
+            Some(self.write.permit.clone()),
+            self.write.disk.track_disk_health_with_deadline(
+                if append { "append_file" } else { "create_file" },
+                |_permit| async {
+                    let writer = self.writers.clone().read_owned().await;
+                    self.write
+                        .disk
+                        .disk
+                        .open_legacy_stream(
+                            &self.write.volume,
+                            self.staging.as_deref().unwrap_or(&self.target),
+                            append,
+                            size,
+                            Arc::new((self.lease.clone(), writer)),
+                        )
+                        .await
+                },
+                get_max_timeout_duration(),
+                TimeoutHealthAction::MarkFailure,
+                if append {
+                    DiskMetricMutation::None
+                } else {
+                    DiskMetricMutation::Write
+                },
+                Some(tokio::time::Instant::now() + get_max_timeout_duration()),
+            ),
+        )
+        .await?;
+        Ok(Box::new(SlowDiskWriter::new(writer, self.write.disk.endpoint())))
+    }
+
+    pub async fn read_file(&self) -> Result<crate::disk::FileReader> {
+        with_disk_io_permit(
+            Some(self.write.permit.clone()),
+            self.write.disk.read_file(&self.write.volume, &self.target),
+        )
+        .await
+    }
+
+    pub async fn publish(&self) -> Result<()> {
+        let staging = self.staging.as_deref().ok_or(DiskError::Unexpected)?;
+        with_disk_io_permit(
+            Some(self.write.permit.clone()),
+            self.write.disk.track_disk_health_with_deadline(
+                "rename_file",
+                |_permit| async {
+                    let writers = self.exclude_writers().await;
+                    let disk = self.write.disk.disk.clone();
+                    let volume = self.write.volume.clone();
+                    let staging = staging.to_owned();
+                    let target = self.target.clone();
+                    let lease = self.lease.clone();
+                    run_owned_mutation(Some(Arc::new(writers)), move || async move {
+                        disk.rename_file_prepared((&volume, &staging), (&volume, &target), false, lease)
+                            .await
+                    })
+                    .await
+                },
+                get_max_timeout_duration(),
+                TimeoutHealthAction::MarkFailure,
+                DiskMetricMutation::Write,
+                Some(tokio::time::Instant::now() + get_max_timeout_duration()),
+            ),
+        )
+        .await
+    }
+
+    pub async fn cleanup(&self) -> Result<()> {
+        let staging = self.staging.as_deref().ok_or(DiskError::Unexpected)?;
+        with_disk_io_permit(
+            Some(self.write.permit.clone()),
+            self.write.disk.track_disk_health_with_deadline(
+                "delete",
+                |_permit| async {
+                    let writers = self.exclude_writers().await;
+                    let disk = self.write.disk.disk.clone();
+                    let volume = self.write.volume.clone();
+                    let staging = staging.to_owned();
+                    let lease = self.lease.clone();
+                    run_owned_mutation(Some(Arc::new(writers)), move || async move {
+                        disk.remove_legacy_stream_staging(&volume, &staging, lease).await
+                    })
+                    .await
+                },
+                get_max_timeout_duration(),
+                TimeoutHealthAction::MarkFailure,
+                DiskMetricMutation::Delete,
+                Some(tokio::time::Instant::now() + get_max_timeout_duration()),
             ),
         )
         .await

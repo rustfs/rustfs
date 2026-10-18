@@ -255,9 +255,9 @@ pub(crate) mod rpc_consumer {
             PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, WALK_DIR_STREAM_COMPLETION_V1,
         };
         pub(crate) use super::super::{
-            DeleteOptions, DiskStore, StorageDiskRpcExt, WalkDirOptions, check_and_record_signed_rpc_nonce,
-            find_local_disk_by_ref, sign_ns_scanner_capability_with_tier_registry_generation, sign_put_file_capability,
-            verify_put_file_auth_trailer, verify_rpc_signature,
+            DiskStore, StorageDiskRpcExt, WalkDirOptions, check_and_record_signed_rpc_nonce, find_local_disk_by_ref,
+            sign_ns_scanner_capability_with_tier_registry_generation, sign_put_file_capability, verify_put_file_auth_trailer,
+            verify_rpc_signature,
         };
     }
 
@@ -479,7 +479,7 @@ pub(crate) mod ecstore_data_usage {
 pub(crate) mod ecstore_disk {
     pub(crate) use rustfs_ecstore::api::disk::{
         BUCKET_META_PREFIX, BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, ConditionalFileUpdate, DeleteOptions,
-        DiskAPI, DiskInfo, DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, LegacyFileWrite,
+        DiskAPI, DiskInfo, DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, LegacyFileStream, LegacyFileWrite,
         LegacyMetadataWrite, LegacyPartMutation, LegacyPartOperation, LegacyPathDelete, LegacyPathDeleteOperation,
         LegacyRenameData, LegacyRenameFile, OldCurrentSize, PartTransactionAction, RUSTFS_META_BUCKET, ReadMultipleReq,
         ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
@@ -707,7 +707,6 @@ pub(crate) type EventArgs = ecstore_event::EventArgs;
 pub(crate) type ExpiryState = ecstore_bucket::lifecycle::bucket_lifecycle_ops::ExpiryState;
 pub(crate) type FileInfoVersions = ecstore_disk::FileInfoVersions;
 pub(crate) type FileReader = ecstore_disk::FileReader;
-pub(crate) type FileWriter = ecstore_disk::FileWriter;
 pub(crate) type SnapshotLeaseToken = ecstore_disk::SnapshotLeaseToken;
 pub(crate) type FS = super::ecfs::FS;
 pub(crate) type HashReader = ecstore_rio::HashReader;
@@ -744,6 +743,7 @@ pub(crate) type LegacyPathDeleteOperation = ecstore_disk::LegacyPathDeleteOperat
 pub(crate) type LegacyPathDelete = ecstore_disk::LegacyPathDelete;
 pub(crate) type LegacyRenameFile = ecstore_disk::LegacyRenameFile;
 pub(crate) type LegacyFileWrite = ecstore_disk::LegacyFileWrite;
+pub(crate) type LegacyFileStream = ecstore_disk::LegacyFileStream;
 pub(crate) type LegacyMetadataWrite = ecstore_disk::LegacyMetadataWrite;
 pub(crate) type ReplicationStatusType = ecstore_bucket::replication::ReplicationStatusType;
 pub(crate) type ReplicationStats = StorageReplicationStatsHandle;
@@ -1417,17 +1417,12 @@ pub(crate) trait StorageDiskRpcExt {
     async fn make_volume(&self, volume: &str) -> DiskResult<()>;
     async fn make_volumes(&self, volume: Vec<&str>) -> DiskResult<()>;
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>>;
-    async fn read_file(&self, volume: &str, path: &str) -> DiskResult<FileReader>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> DiskResult<FileReader>;
-    async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> DiskResult<()>;
-    async fn delete(&self, volume: &str, path: &str, options: DeleteOptions) -> DiskResult<()>;
     async fn verify_file(&self, volume: &str, path: &str, file_info: &rustfs_filemeta::FileInfo) -> DiskResult<CheckPartsResp>;
     async fn check_parts(&self, volume: &str, path: &str, file_info: &rustfs_filemeta::FileInfo) -> DiskResult<CheckPartsResp>;
     async fn read_parts(&self, bucket: &str, paths: &[String]) -> DiskResult<Vec<ObjectPartInfo>>;
     async fn walk_dir<W: tokio::io::AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> DiskResult<()>;
     async fn read_all(&self, volume: &str, path: &str) -> DiskResult<bytes::Bytes>;
-    async fn append_file(&self, volume: &str, path: &str) -> DiskResult<FileWriter>;
-    async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: i64) -> DiskResult<FileWriter>;
 }
 
 impl<T> StorageDiskRpcExt for T
@@ -1531,20 +1526,8 @@ where
         ecstore_disk::DiskAPI::list_dir(self, origvolume, volume, dir_path, count).await
     }
 
-    async fn read_file(&self, volume: &str, path: &str) -> DiskResult<FileReader> {
-        ecstore_disk::DiskAPI::read_file(self, volume, path).await
-    }
-
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> DiskResult<FileReader> {
         ecstore_disk::DiskAPI::read_file_stream(self, volume, path, offset, length).await
-    }
-
-    async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> DiskResult<()> {
-        ecstore_disk::DiskAPI::rename_file(self, src_volume, src_path, dst_volume, dst_path).await
-    }
-
-    async fn delete(&self, volume: &str, path: &str, options: DeleteOptions) -> DiskResult<()> {
-        ecstore_disk::DiskAPI::delete(self, volume, path, options).await
     }
 
     async fn verify_file(&self, volume: &str, path: &str, file_info: &rustfs_filemeta::FileInfo) -> DiskResult<CheckPartsResp> {
@@ -1565,14 +1548,6 @@ where
 
     async fn read_all(&self, volume: &str, path: &str) -> DiskResult<bytes::Bytes> {
         ecstore_disk::DiskAPI::read_all(self, volume, path).await
-    }
-
-    async fn append_file(&self, volume: &str, path: &str) -> DiskResult<FileWriter> {
-        ecstore_disk::DiskAPI::append_file(self, volume, path).await
-    }
-
-    async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: i64) -> DiskResult<FileWriter> {
-        ecstore_disk::DiskAPI::create_file(self, origvolume, volume, path, file_size).await
     }
 }
 

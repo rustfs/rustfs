@@ -36,6 +36,16 @@ pub struct BootstrapLocalTarget {
 }
 
 impl BootstrapLocalTarget {
+    pub async fn begin_legacy_local_file_write(
+        &self,
+        disk: &DiskStore,
+        volume: &str,
+        external_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> DiskResult<LegacyFileWrite> {
+        validate_bootstrap_volume(volume)?;
+        begin_legacy_local_file_write_with_ctx(&self.ctx, disk, volume, external_guard).await
+    }
+
     pub async fn begin_legacy_local_residual_version_delete(
         &self,
         disk_ref: &str,
@@ -163,6 +173,15 @@ fn validate_bootstrap_volume(volume: &str) -> DiskResult<()> {
 }
 
 impl ECStore {
+    pub async fn begin_legacy_local_file_write(
+        &self,
+        disk: &DiskStore,
+        volume: &str,
+        external_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> DiskResult<LegacyFileWrite> {
+        begin_legacy_local_file_write_with_ctx(&self.ctx, disk, volume, external_guard).await
+    }
+
     pub async fn begin_legacy_local_residual_version_delete(
         &self,
         disk_ref: &str,
@@ -594,6 +613,24 @@ async fn rename_local_data_with_ctx(
         .result;
     drop(owner);
     result
+}
+
+async fn begin_legacy_local_file_write_with_ctx(
+    ctx: &Arc<InstanceContext>,
+    disk: &DiskStore,
+    volume: &str,
+    external_guard: Option<Arc<dyn Send + Sync>>,
+) -> DiskResult<LegacyFileWrite> {
+    let deadline = tokio::time::Instant::now() + crate::disk::disk_store::get_max_timeout_duration();
+    tokio::time::timeout_at(deadline, async {
+        // The HTTP target mutex belongs to this exact captured disk, never a
+        // replacement resolved after the caller has joined its queue.
+        let owner = admit_local_disk(ctx, disk, None, !is_meta_bucketname(volume)).await?;
+        disk.begin_legacy_file_write_with_namespace_owner(volume, Some(Arc::new((owner, external_guard))))
+            .await
+    })
+    .await
+    .map_err(|_| DiskError::Timeout)?
 }
 
 async fn begin_legacy_local_delete_versions_with_ctx(
