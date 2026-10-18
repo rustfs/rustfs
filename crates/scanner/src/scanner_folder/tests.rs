@@ -349,6 +349,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         checkpoint_objects: 0,
         last_checkpoint_objects: 0,
         last_checkpoint_at: Instant::now(),
+        last_checkpoint_build_time: Duration::ZERO,
         update_current_path,
         budget: ScannerCycleBudget::new(&CancellationToken::new(), Default::default()),
         skip_heal: Arc::new(AtomicBool::new(false)),
@@ -376,15 +377,8 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
     (scanner, temp_dir)
 }
 
-#[tokio::test]
-async fn periodic_checkpoint_emits_at_object_threshold_without_wall_clock_wait() {
+async fn build_checkpoint_scanner() -> (FolderScanner, std::path::PathBuf) {
     let (mut scanner, temp_dir) = build_test_scanner().await;
-    let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel(1);
-    scanner.checkpoint_tx = Some(checkpoint_tx);
-    scanner.checkpoint_objects = SCANNER_CHECKPOINT_OBJECT_INTERVAL;
-    scanner.last_checkpoint_at = Instant::now()
-        .checked_sub(SCANNER_CHECKPOINT_MIN_INTERVAL)
-        .expect("test instant subtraction");
     scanner.new_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.scan_progress = Some(crate::DataUsageScanProgress {
         started_plan: crate::DataUsageScanPlanDigest([1; 32]),
@@ -412,6 +406,18 @@ async fn periodic_checkpoint_emits_at_object_threshold_without_wall_clock_wait()
         .seal_scan_frontier(Some("bucket/a"))
         .expect("fixture frontier");
     assert_eq!(scanner.new_cache.validated_scan_frontier(), Some("bucket/a"));
+    (scanner, temp_dir)
+}
+
+#[tokio::test]
+async fn periodic_checkpoint_emits_at_object_threshold_without_wall_clock_wait() {
+    let (mut scanner, temp_dir) = build_checkpoint_scanner().await;
+    let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel(1);
+    scanner.checkpoint_tx = Some(checkpoint_tx);
+    scanner.checkpoint_objects = SCANNER_CHECKPOINT_OBJECT_INTERVAL;
+    scanner.last_checkpoint_at = Instant::now()
+        .checked_sub(SCANNER_CHECKPOINT_MIN_INTERVAL)
+        .expect("test instant subtraction");
     let checkpoint_folder = CachedFolder {
         name: "bucket".to_string(),
         parent: None,
@@ -422,6 +428,7 @@ async fn periodic_checkpoint_emits_at_object_threshold_without_wall_clock_wait()
 
     scanner.maybe_send_checkpoint(&checkpoint_folder, &checkpoint_hash, &checkpoint_entry);
 
+    let build_time = scanner.last_checkpoint_build_time;
     scanner.checkpoint_objects = SCANNER_CHECKPOINT_OBJECT_INTERVAL * 2;
     scanner.last_checkpoint_at = Instant::now()
         .checked_sub(SCANNER_CHECKPOINT_MIN_INTERVAL)
@@ -430,6 +437,10 @@ async fn periodic_checkpoint_emits_at_object_threshold_without_wall_clock_wait()
     assert_eq!(
         scanner.last_checkpoint_objects, SCANNER_CHECKPOINT_OBJECT_INTERVAL,
         "a full checkpoint queue must reject before cloning or advancing progress"
+    );
+    assert_eq!(
+        scanner.last_checkpoint_build_time, build_time,
+        "a full queue must not reset the cost estimate"
     );
 
     let checkpoint = checkpoint_rx.try_recv().expect("object threshold emits a bounded checkpoint");
@@ -459,6 +470,87 @@ async fn periodic_checkpoint_emits_at_object_threshold_without_wall_clock_wait()
     tokio::fs::remove_dir_all(temp_dir)
         .await
         .expect("remove test scanner directory");
+}
+
+#[test]
+fn checkpoint_build_cost_interval_is_bounded() {
+    for (build_time, interval) in [
+        (Duration::ZERO, Duration::from_secs(5)),
+        (Duration::from_millis(500), Duration::from_secs(5)),
+        (Duration::from_millis(501), Duration::from_millis(5010)),
+        (Duration::from_secs(3), Duration::from_secs(30)),
+        (Duration::from_secs(6), Duration::from_secs(60)),
+        (Duration::MAX, Duration::from_secs(60)),
+    ] {
+        assert_eq!(checkpoint_interval_for_build_time(build_time), interval, "build time: {build_time:?}");
+    }
+}
+
+#[tokio::test]
+async fn periodic_checkpoint_build_cost_backoff_preserves_deadline_and_validation() {
+    let (mut scanner, temp_dir) = build_checkpoint_scanner().await;
+    let _guard = TestGuard {
+        temp_dir: Some(temp_dir),
+    };
+    let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel(1);
+    scanner.checkpoint_tx = Some(checkpoint_tx);
+    let folder = CachedFolder {
+        name: "bucket".to_string(),
+        parent: None,
+        object_heal_prob_div: 1,
+    };
+    let hash = hash_path("bucket");
+    let mut entry = scanner.new_cache.root().expect("checkpoint fixture root");
+    scanner.checkpoint_objects = SCANNER_CHECKPOINT_OBJECT_INTERVAL;
+    scanner.last_checkpoint_build_time = Duration::from_secs(3);
+    scanner.last_checkpoint_at = Instant::now()
+        .checked_sub(Duration::from_secs(10))
+        .expect("backdate checkpoint attempt");
+    scanner.maybe_send_checkpoint(&folder, &hash, &entry);
+    assert!(
+        checkpoint_rx.try_recv().is_err(),
+        "expensive checkpoints must not rebuild at the old five-second floor"
+    );
+    assert_eq!(scanner.last_checkpoint_objects, 0, "a deferred checkpoint must not consume progress");
+    assert_eq!(scanner.last_checkpoint_build_time, Duration::from_secs(3));
+
+    scanner.last_checkpoint_at = Instant::now()
+        .checked_sub(Duration::from_secs(30))
+        .expect("reach cost-adjusted interval");
+    scanner.maybe_send_checkpoint(&folder, &hash, &entry);
+    let snapshot = checkpoint_rx
+        .try_recv()
+        .expect("checkpoint is admitted at its adjusted interval");
+    assert_eq!(snapshot.validated_scan_frontier(), Some("bucket/a"));
+    assert!(snapshot.checked_flatten_complete_scope("bucket").is_some());
+    assert!(!snapshot.info.snapshot_complete);
+    assert!(
+        scanner.last_checkpoint_build_time <= scanner.last_checkpoint_at.elapsed(),
+        "record actual construction time"
+    );
+
+    scanner.last_checkpoint_build_time = Duration::MAX;
+    scanner.last_checkpoint_at = Instant::now()
+        .checked_sub(SCANNER_CHECKPOINT_INTERVAL)
+        .expect("reach periodic deadline without another object batch");
+    scanner.maybe_send_checkpoint(&folder, &hash, &entry);
+    assert!(
+        checkpoint_rx.try_recv().is_ok(),
+        "even a costly snapshot retains the sixty-second periodic attempt"
+    );
+
+    scanner.new_cache.cache.get_mut("bucket/a").expect("fixture child").size = usize::MAX;
+    entry.size = 1;
+    scanner.last_checkpoint_build_time = Duration::from_secs(3);
+    scanner.last_checkpoint_at = Instant::now()
+        .checked_sub(SCANNER_CHECKPOINT_INTERVAL)
+        .expect("reach periodic overflow check");
+    scanner.maybe_send_checkpoint(&folder, &hash, &entry);
+    assert!(checkpoint_rx.try_recv().is_err(), "backoff must not bypass overflow validation");
+    assert!(
+        scanner.last_checkpoint_build_time <= scanner.last_checkpoint_at.elapsed(),
+        "failed construction must also update the cost estimate"
+    );
 }
 
 #[tokio::test]

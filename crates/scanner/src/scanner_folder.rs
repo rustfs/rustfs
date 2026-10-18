@@ -122,6 +122,14 @@ const MAX_SIZE_RECONCILIATION_ENTRIES_PER_BUCKET: usize = 10_000;
 const MAX_SIZE_RECONCILIATION_BYTES_PER_BUCKET: usize = 8 * 1024 * 1024;
 const MAX_SIZE_RECONCILIATION_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 
+fn checkpoint_interval_for_build_time(build_time: Duration) -> Duration {
+    // Aim to spend at most a tenth of the interval building snapshots, while
+    // preserving the existing upper bound on periodic checkpoint attempts.
+    build_time
+        .saturating_mul(10)
+        .clamp(SCANNER_CHECKPOINT_MIN_INTERVAL, SCANNER_CHECKPOINT_INTERVAL)
+}
+
 // --- scanner excess alerts as S3 notification events (rustfs/backlog#1868) --
 //
 // The excess-versions / excess-version-size / excess-folders alerts were
@@ -754,6 +762,7 @@ pub struct FolderScanner {
     checkpoint_objects: u64,
     last_checkpoint_objects: u64,
     last_checkpoint_at: Instant,
+    last_checkpoint_build_time: Duration,
 
     update_current_path: UpdateCurrentPathFn,
 
@@ -1292,7 +1301,7 @@ impl FolderScanner {
         let elapsed = self.last_checkpoint_at.elapsed();
         if into.compacted
             || self.new_cache.info.scan_progress.is_none()
-            || elapsed < SCANNER_CHECKPOINT_MIN_INTERVAL
+            || elapsed < checkpoint_interval_for_build_time(self.last_checkpoint_build_time)
             || (self.checkpoint_objects.saturating_sub(self.last_checkpoint_objects) < SCANNER_CHECKPOINT_OBJECT_INTERVAL
                 && elapsed < SCANNER_CHECKPOINT_INTERVAL)
         {
@@ -1314,6 +1323,14 @@ impl FolderScanner {
         // Invalid partial graphs must not trigger a fresh O(N) clone on every object.
         self.last_checkpoint_objects = self.checkpoint_objects;
         self.last_checkpoint_at = Instant::now();
+        let snapshot = self.checkpoint_snapshot(folder, hash, into);
+        self.last_checkpoint_build_time = self.last_checkpoint_at.elapsed();
+        if let Some(snapshot) = snapshot {
+            permit.send(snapshot);
+        }
+    }
+
+    fn checkpoint_snapshot(&self, folder: &CachedFolder, hash: &DataUsageHash, into: &DataUsageEntry) -> Option<DataUsageCache> {
         // Heal revisits are not sorted with the forward sweep. An unfinished
         // earlier subtree, including a suspended ancestor, must not be signed
         // as completed prefix coverage.
@@ -1323,7 +1340,7 @@ impl FolderScanner {
                     .iter()
                     .any(|ancestor| scan_frontier_covers_path(&ancestor.hash.0, frontier))
         }) {
-            return;
+            return None;
         }
         let mut snapshot = self.new_cache.clone();
         let mut parent = None;
@@ -1332,30 +1349,26 @@ impl FolderScanner {
             parent = Some(ancestor.hash.clone());
         }
         snapshot.replace_hashed(hash, &folder.parent, into);
-        if snapshot.checked_flatten_complete_scope(&snapshot.info.name).is_none() {
-            return;
-        }
+        snapshot.checked_flatten_complete_scope(&snapshot.info.name)?;
         snapshot.info.last_update = Some(SystemTime::now());
         snapshot.info.snapshot_complete = false;
         let (cursor, page_index) = self.peek_raw_enumeration_resume_state();
         snapshot.info.scan_raw_enumeration_cursor = cursor;
         snapshot.info.scan_raw_enumeration_page_index = page_index;
-        if snapshot.seal_scan_frontier(self.coverage_frontier.as_deref()).is_err() {
-            return;
-        }
+        snapshot.seal_scan_frontier(self.coverage_frontier.as_deref()).ok()?;
         // A resumed readdir can run before covered subtrees are copied. Keep
         // its durable receipt until this snapshot can represent that coverage.
         if self.coverage_frontier.is_some() && snapshot.info.scan_coverage_receipt.is_none() {
-            return;
+            return None;
         }
         // The receipt was just sealed from this snapshot; do not hash it twice.
         if snapshot.info.scan_raw_enumeration_cursor.is_none()
             && snapshot.info.scan_raw_enumeration_page_index.is_none()
             && snapshot.info.scan_coverage_receipt.is_none()
         {
-            return;
+            return None;
         }
-        permit.send(snapshot);
+        Some(snapshot)
     }
 
     fn carry_forward_old_children(&mut self, parent_hash: &DataUsageHash, entry: &mut DataUsageEntry) {
@@ -2982,6 +2995,7 @@ pub(crate) async fn scan_data_folder_scoped(
         checkpoint_objects: 0,
         last_checkpoint_objects: 0,
         last_checkpoint_at: Instant::now(),
+        last_checkpoint_build_time: Duration::ZERO,
         update_current_path,
         budget: budget.clone(),
         skip_heal,
