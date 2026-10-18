@@ -1761,14 +1761,29 @@ impl LocalDiskWrapper {
         durable: bool,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<LegacyRenameFile> {
+        let started = Instant::now();
+        let duration = get_max_timeout_duration();
         let permit = self.io_admission.foreground();
-        let lease = tokio::time::timeout(
-            get_max_timeout_duration(),
+        let lease = match tokio::time::timeout(
+            duration,
             self.disk
                 .begin_legacy_rename_file(source, destination, permit.clone(), namespace_owner),
         )
         .await
-        .map_err(|_| DiskError::Timeout)??;
+        {
+            Ok(Ok(lease)) => lease,
+            Ok(Err(error)) => {
+                let result = Err(error);
+                self.metrics.record_operation_call("rename_file");
+                self.metrics.record_operation_latency("rename_file", started.elapsed());
+                self.record_result_error_metrics(&result);
+                return result;
+            }
+            Err(_) => {
+                self.metrics.record_operation_call("rename_file");
+                return Err(self.record_operation_timeout("rename_file", started, duration, TimeoutHealthAction::MarkFailure));
+            }
+        };
         Ok(LegacyRenameFile {
             disk: self.clone(),
             source: (source.0.to_owned(), source.1.to_owned()),
@@ -3307,6 +3322,133 @@ mod tests {
     };
     use tokio::io::AsyncWriteExt;
     use tracing_subscriber::fmt::MakeWriter;
+
+    async fn rename_file_admission_fixture() -> (tempfile::TempDir, Arc<LocalDisk>, LocalDiskWrapper) {
+        let root = tempfile::tempdir().expect("admission fixture");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        for volume in ["source", "destination"] {
+            disk.make_volume(volume).await.expect("live volume");
+        }
+        tokio::fs::write(root.path().join("source/entry"), b"source bytes")
+            .await
+            .expect("source bytes");
+        tokio::fs::write(root.path().join("destination/target"), b"old destination")
+            .await
+            .expect("destination bytes");
+        let wrapper = LocalDiskWrapper::new(disk.clone(), false);
+        (root, disk, wrapper)
+    }
+
+    #[tokio::test]
+    async fn legacy_rename_file_admission_missing_volume_records_failure_once() {
+        for missing in ["source", "destination"] {
+            for durable in [false, true] {
+                let (_root, disk, wrapper) = rename_file_admission_fixture().await;
+                disk.delete_volume(missing, true).await.expect("remove physical volume");
+                assert_eq!(
+                    wrapper
+                        .begin_legacy_rename_file(("source", "entry"), ("destination", "target"), durable, None)
+                        .await
+                        .expect_err("missing live volume"),
+                    DiskError::VolumeNotFound
+                );
+                let metrics = wrapper.metrics_snapshot();
+                assert_eq!(metrics.api_calls.get("rename_file"), Some(&1));
+                assert_eq!(metrics.last_minute.get("rename_file").map(|action| action.count), Some(1));
+                assert_eq!(metrics.total_writes, 0);
+                assert_eq!(metrics.total_waiting, 0);
+                assert_eq!(metrics.total_errors_timeout, 0);
+                assert_eq!(
+                    metrics.total_errors_availability, 0,
+                    "VolumeNotFound retains the existing error classification"
+                );
+                assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_rename_file_admission_namespace_timeout_records_health_once() {
+        for cancel in [true, false] {
+            let (root, _disk, wrapper) = rename_file_admission_fixture().await;
+            let target = root.path().join("destination/target");
+            let guard = crate::disk::os::acquire_namespace_mutation_lease_with_owner(&target, None).await;
+            let mut begin =
+                Box::pin(wrapper.begin_legacy_rename_file(("source", "entry"), ("destination", "target"), false, None));
+            time::pause();
+            assert!(matches!(futures::poll!(begin.as_mut()), Poll::Pending));
+            if cancel {
+                drop(begin);
+                time::resume();
+            } else {
+                time::advance(get_max_timeout_duration() + Duration::from_secs(1)).await;
+                time::resume();
+                assert_eq!(
+                    time::timeout(Duration::from_secs(5), begin)
+                        .await
+                        .expect("admission timeout returns")
+                        .expect_err("bounded namespace admission"),
+                    DiskError::Timeout
+                );
+            }
+            let count = u64::from(!cancel);
+            let metrics = wrapper.metrics_snapshot();
+            assert_eq!(metrics.api_calls.get("rename_file").copied().unwrap_or(0), count);
+            assert_eq!(metrics.last_minute.get("rename_file").map(|action| action.count).unwrap_or(0), count);
+            assert_eq!(metrics.total_errors_timeout, count);
+            assert_eq!(metrics.total_errors_availability, 0);
+            assert_eq!(metrics.total_writes, 0);
+            assert_eq!(metrics.total_waiting, 0);
+            assert_eq!(wrapper.health.consecutive_failures.load(Ordering::Acquire), u32::from(!cancel));
+            assert_eq!(
+                wrapper.runtime_state(),
+                if cancel {
+                    RuntimeDriveHealthState::Online
+                } else {
+                    RuntimeDriveHealthState::Suspect
+                }
+            );
+            assert_eq!(
+                tokio::fs::read(root.path().join("source/entry"))
+                    .await
+                    .expect("source unchanged"),
+                b"source bytes"
+            );
+            assert_eq!(tokio::fs::read(&target).await.expect("destination unchanged"), b"old destination");
+            drop(guard);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_rename_file_admission_success_counts_only_commit() {
+        for durable in [false, true] {
+            let (root, _disk, wrapper) = rename_file_admission_fixture().await;
+            let token = wrapper
+                .begin_legacy_rename_file(("source", "entry"), ("destination", "target"), durable, None)
+                .await
+                .expect("admitted rename");
+            let before = wrapper.metrics_snapshot();
+            assert_eq!(before.api_calls.get("rename_file").copied().unwrap_or(0), 0);
+            assert_eq!(before.last_minute.get("rename_file").map(|action| action.count).unwrap_or(0), 0);
+            assert_eq!(before.total_writes, 0);
+            token.commit().await.expect("rename commits");
+            let metrics = wrapper.metrics_snapshot();
+            assert_eq!(metrics.api_calls.get("rename_file"), Some(&1));
+            assert_eq!(metrics.last_minute.get("rename_file").map(|action| action.count), Some(1));
+            assert_eq!(metrics.total_writes, 1);
+            assert_eq!(metrics.total_waiting, 0);
+            assert_eq!(metrics.total_errors_timeout, 0);
+            assert_eq!(metrics.total_errors_availability, 0);
+            assert!(!root.path().join("source/entry").exists());
+            assert_eq!(
+                tokio::fs::read(root.path().join("destination/target"))
+                    .await
+                    .expect("published bytes"),
+                b"source bytes"
+            );
+        }
+    }
 
     #[derive(Clone, Default)]
     struct SlowOperationLogs(Arc<std::sync::Mutex<Vec<u8>>>);
