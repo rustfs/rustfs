@@ -427,11 +427,51 @@ impl TableMaintenanceSchedulerRunRequest {
 struct TableMaintenanceWorkerRunRequest {
     #[serde(default, rename = "worker-id")]
     worker_id: Option<String>,
+    #[serde(
+        default,
+        rename = "expected-job-id",
+        deserialize_with = "deserialize_present_worker_condition_field"
+    )]
+    expected_job_id: Option<String>,
+    #[serde(
+        default,
+        rename = "expected-attempt",
+        deserialize_with = "deserialize_present_worker_condition_field"
+    )]
+    expected_attempt: Option<u16>,
+}
+
+// Explicit null must not turn a conditional request into an unconditional run.
+fn deserialize_present_worker_condition_field<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 impl TableMaintenanceWorkerRunRequest {
     fn worker_id(&self) -> &str {
         self.worker_id.as_deref().unwrap_or(DEFAULT_TABLE_MAINTENANCE_WORKER_ID)
+    }
+
+    fn condition(&self) -> S3Result<Option<crate::table_catalog::TableMaintenanceWorkerCondition>> {
+        match (&self.expected_job_id, self.expected_attempt) {
+            (None, None) => Ok(None),
+            (Some(job_id), Some(attempt)) => {
+                if job_id.trim().is_empty() || self.worker_id().trim().is_empty() {
+                    return Err(s3_error!(InvalidRequest, "conditional maintenance requires non-empty job and worker ids"));
+                }
+                Ok(Some(crate::table_catalog::TableMaintenanceWorkerCondition {
+                    expected_job_id: job_id.clone(),
+                    expected_attempt: attempt,
+                }))
+            }
+            _ => Err(s3_error!(
+                InvalidRequest,
+                "expected-job-id and expected-attempt must be supplied together"
+            )),
+        }
     }
 }
 
