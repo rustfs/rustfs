@@ -1904,6 +1904,8 @@ where
             service_cohort: scheduling.service_cohort,
             #[cfg(test)]
             resolved_scope_observer: None,
+            #[cfg(test)]
+            post_walk_gate: None,
         },
     )
     .await;
@@ -2033,7 +2035,10 @@ where
         && let Ok(result) = &scan_result
         && result.status == ScannerCycleStatus::Complete
     {
-        scanner_post_lease_activity_defer_reason(result.activity_digest(), probe_scanner_activity(storeapi.as_ref(), true).await)
+        scanner_post_lease_activity_defer_reason(
+            result.activity_baseline(),
+            probe_scanner_activity(storeapi.as_ref(), true).await,
+        )
     } else {
         None
     };
@@ -2364,15 +2369,19 @@ where
     }
 
     usage_publication_result.restrict_outcome(usage_persist_outcome);
-    let partial_cause = if scan_cycle_result.has_usage_update()
+    let partial_cause = if scan_cycle_result.has_partial_bucket_progress() && !scan_cycle_result.has_usage_update() {
+        "saved_bucket_progress"
+    } else if scan_cycle_result.has_usage_update()
         && matches!(
             scan_cycle_result.status,
             ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
-        ) {
+        )
+    {
         "activity_unverified_observation"
     } else {
         "incomplete_coverage"
     };
+    let pending_dirty_usage_buckets = scan_cycle_result.pending_dirty_usage_buckets();
     let (completion_outcome, scanner_pending_maintenance_work, remote_dirty_usage_acknowledgements) =
         finalize_scanner_cycle_result(scan_cycle_result, usage_publication_result);
     let remote_dirty_usage_pending = if remote_dirty_usage_acknowledgements.is_empty() {
@@ -2584,6 +2593,7 @@ where
         state = "completed",
         duration = ?now.elapsed(),
         cycles_total = cycle_info.cycle_completed.len(),
+        pending_dirty_buckets = pending_dirty_usage_buckets,
         "Scanner cycle completed"
     );
 
@@ -3653,6 +3663,21 @@ impl ScannerCyclePublicationPlan {
         } else {
             budget.token()
         };
+        debug!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_CYCLE_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "publication_proof_started",
+            cycle,
+            stage = "lease_acquire",
+            publication_kind = match self {
+                Self::ProgressOnly => "progress_only",
+                Self::Observational => "observational",
+                Self::Authoritative => "authoritative",
+            },
+            "Scanner is acquiring peer publication proof"
+        );
         let proof = await_scanner_publication_proof(
             &proof_ctx,
             cycle,
@@ -3672,14 +3697,22 @@ impl ScannerCyclePublicationPlan {
     }
 }
 
+/// Re-prove the guardrail after every peer granted a publication lease. The
+/// comparison uses the guardrail fields (`scanner_activity_guardrail_veto`),
+/// not the full digest: local generation movement in this window is the next
+/// cycle's work and its buckets stay in the dirty map. A peer whose dirty
+/// usage moved keeps deferring in this phase, as it does during the walk.
 fn scanner_post_lease_activity_defer_reason(
-    expected_digest: Option<[u8; 32]>,
+    baseline: Option<&ScannerActivitySnapshot>,
     activity: Result<ScannerActivitySnapshot, String>,
 ) -> Option<ScannerCycleDeferReason> {
     match activity {
         Ok(snapshot)
             if scanner_activity_allows_usage_publication(&snapshot)
-                && expected_digest == Some(scanner_activity_snapshot_digest(&snapshot)) =>
+                && baseline.is_some_and(|baseline| {
+                    scanner_activity_guardrail_veto(baseline, &snapshot).is_none()
+                        && scanner_peer_dirty_usage_moved(baseline, &snapshot).is_none()
+                }) =>
         {
             None
         }
@@ -3687,8 +3720,13 @@ fn scanner_post_lease_activity_defer_reason(
             let blocker = match &observed {
                 Err(_) => "probe_failed",
                 Ok(snapshot) if !scanner_activity_allows_usage_publication(snapshot) => "publication_blocked",
-                Ok(_) if expected_digest.is_none() => "baseline_missing",
-                Ok(_) => "activity_changed",
+                Ok(_) if baseline.is_none() => "baseline_missing",
+                Ok(snapshot) => baseline
+                    .and_then(|baseline| {
+                        scanner_activity_guardrail_veto(baseline, snapshot)
+                            .or_else(|| scanner_peer_dirty_usage_moved(baseline, snapshot))
+                    })
+                    .map_or("activity_changed", |veto| veto.field),
             };
             debug!(
                 target: "rustfs::scanner",
@@ -3868,6 +3906,16 @@ fn scanner_cycle_completion_outcome_for_result(
 ) -> ScannerCycleOutcome {
     let has_dirty_usage = scan_cycle_result.has_dirty_usage_to_acknowledge();
     let has_failed_dirty_usage = scan_cycle_result.has_failed_dirty_usage();
+    if scan_cycle_result.status == ScannerCycleStatus::Incomplete
+        && scan_cycle_result.has_partial_bucket_progress()
+        && !scan_cycle_result.has_usage_update()
+        && !has_failed_dirty_usage
+        && usage_persist_outcome == DataUsagePersistOutcome::NoUpdate
+    {
+        // No root was submitted: retain dirty usage and advance only the
+        // fenced partial-cycle state. A fresh sweep still has to certify usage.
+        return ScannerCycleOutcome::Partial;
+    }
     if scan_cycle_result.has_usage_update()
         && matches!(
             scan_cycle_result.status,
@@ -3967,10 +4015,11 @@ use usage_store::*;
 pub(crate) use activity::scanner_node_activity_for_tests;
 pub use activity::scanner_topology_digest;
 pub(crate) use activity::{
-    ScannerActivitySnapshot, ScannerDirtyUsageAcknowledgement, ScannerDirtyUsageAcknowledgementKind, probe_scanner_activity,
-    scanner_activity_allows_usage_publication, scanner_activity_dirty_usage_state_for_host,
-    scanner_activity_publication_lease_targets, scanner_activity_snapshot_digest, scanner_activity_structural_digest,
-    scanner_dirty_usage_acknowledgements,
+    LOCAL_SCANNER_ACTIVITY_NODE, ScannerActivityGuardrailVeto, ScannerActivitySnapshot, ScannerDirtyUsageAcknowledgement,
+    ScannerDirtyUsageAcknowledgementKind, probe_scanner_activity, scanner_activity_allows_usage_publication,
+    scanner_activity_dirty_usage_state_for_host, scanner_activity_guardrail_veto, scanner_activity_publication_lease_targets,
+    scanner_activity_snapshot_digest, scanner_activity_structural_digest, scanner_dirty_usage_acknowledgements,
+    scanner_peer_dirty_usage_moved,
 };
 pub(crate) use activity::{ScannerCycleOutcome, scanner_cycle_outcome_with_pending_maintenance};
 pub use backlog::{

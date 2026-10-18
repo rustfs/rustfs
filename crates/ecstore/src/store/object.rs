@@ -31,7 +31,7 @@ use crate::bucket::lifecycle::{
 };
 use crate::bucket::metadata_sys::{
     acquire_bucket_metadata_transaction_read_lock_in, get_bucket_incarnation_id_for_options_in,
-    get_cached_bucket_incarnation_id_in, get_object_lock_config_and_incarnation_from_disk_in,
+    get_cached_bucket_incarnation_id_in, get_delete_config_from_disk_in, get_object_lock_config_and_incarnation_from_disk_in,
 };
 use crate::bucket::object_lock::objectlock_sys::{
     check_object_lock_for_deletion_with_state, ensure_recursive_force_delete_allowed_for_state,
@@ -3457,7 +3457,7 @@ impl ECStore {
         Ok(guards)
     }
 
-    async fn acquire_object_read_lock_if_needed(
+    pub(super) async fn acquire_object_read_lock_if_needed(
         &self,
         op: &'static str,
         bucket: &str,
@@ -4562,7 +4562,7 @@ impl ECStore {
     }
 
     async fn prepare_put_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<(String, ObjectOptions)> {
-        check_put_object_args(bucket, object)?;
+        check_new_object_args(bucket, object, opts.data_movement)?;
 
         let object = encode_dir_object(object);
         let mut opts = opts.clone();
@@ -4782,7 +4782,17 @@ impl ECStore {
         dst_opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
         check_copy_obj_args(src_bucket, src_object)?;
-        check_copy_obj_args(dst_bucket, dst_object)?;
+        if src_bucket == dst_bucket && src_object == dst_object {
+            // In-place copies (metadata replace, restore) rewrite a key that
+            // already exists, so they must keep working for keys that new
+            // writes would no longer accept.
+            check_copy_obj_args(dst_bucket, dst_object)?;
+        } else {
+            // A copy onto another key creates that key: it must be admitted
+            // exactly like PutObject, since the copy reaches the pools' own
+            // put_object without passing through prepare_put_object.
+            check_new_object_args(dst_bucket, dst_object, dst_opts.data_movement)?;
+        }
 
         let src_object = encode_dir_object(src_object);
         let dst_object = encode_dir_object(dst_object);
@@ -5287,7 +5297,7 @@ impl ECStore {
         }
         let current_bucket_incarnation_id = if let Some(metadata_guard) = _object_lock_metadata_guard.as_ref() {
             let (state, incarnation_id, config_revision) =
-                get_object_lock_config_and_incarnation_from_disk_in(&self.ctx, bucket).await?;
+                get_delete_config_from_disk_in(&self.ctx, bucket, None, opts.lifecycle_expiry_policy.as_ref()).await?;
             opts.object_lock_config_snapshot = Some(Arc::new(ObjectLockConfigSnapshot::for_store_bucket_under_lifecycle_fence(
                 self.id,
                 bucket,
@@ -5953,7 +5963,7 @@ impl ECStore {
         }
         let current_bucket_incarnation_id = if let Some(metadata_guard) = _object_lock_metadata_guard.as_ref() {
             let (state, incarnation_id, config_revision) =
-                match get_object_lock_config_and_incarnation_from_disk_in(&self.ctx, bucket).await {
+                match get_delete_config_from_disk_in(&self.ctx, bucket, None, opts.lifecycle_expiry_policy.as_ref()).await {
                     Ok(snapshot) => snapshot,
                     Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
                 };

@@ -1073,6 +1073,7 @@ impl SetDisks {
             let version_id = version_id.clone();
             let slowtail_fault = slowtail_fault.clone();
             #[cfg(feature = "diagnostic-read-version-caller")]
+            #[allow(clippy::redundant_locals)]
             let diagnostic_context = diagnostic_context;
             AbortOnDropJoinHandle(tokio::spawn(async move {
                 let read = async move {
@@ -1210,6 +1211,7 @@ impl SetDisks {
             let version_id = version_id.clone();
             let slowtail_fault = slowtail_fault.clone();
             #[cfg(feature = "diagnostic-read-version-caller")]
+            #[allow(clippy::redundant_locals)]
             let diagnostic_context = diagnostic_context;
             let task = join_set.spawn(async move {
                 let read = async move {

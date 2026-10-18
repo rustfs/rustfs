@@ -113,6 +113,13 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
     }
 
+    async fn acquire_quota_mutation_fence(
+        &self,
+        _request: Request<SnapshotLeaseRequest>,
+    ) -> Result<Response<SnapshotLeaseResponse>, Status> {
+        Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
+    }
+
     async fn renew_snapshot_lease(
         &self,
         _request: Request<SnapshotLeaseRenewRequest>,
@@ -121,6 +128,13 @@ impl NodeService for MinimalLockNodeService {
     }
 
     async fn release_snapshot_lease(
+        &self,
+        _request: Request<SnapshotLeaseReleaseRequest>,
+    ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
+        Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
+    }
+
+    async fn release_quota_mutation_fence(
         &self,
         _request: Request<SnapshotLeaseReleaseRequest>,
     ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
@@ -535,6 +549,13 @@ impl NodeService for MinimalLockNodeService {
     }
 
     async fn rename_data_at_incarnation(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::RenameDataRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::RenameDataResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn rename_data_with_quota_fence(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::RenameDataRequest>,
     ) -> Result<Response<rustfs_protos::proto_gen::node_service::RenameDataResponse>, Status> {

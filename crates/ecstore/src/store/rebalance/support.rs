@@ -52,11 +52,6 @@ pub(in crate::store) struct LatestObjectInfoCandidate {
     pub(in crate::store) err: Option<Error>,
 }
 
-pub(super) struct RebalanceDeletePoolResult {
-    pub(super) pool_idx: usize,
-    pub(super) result: Result<ObjectInfo>,
-}
-
 pub(super) fn pool_lookup_not_found_error(bucket: &str, object: &str, opts: &ObjectOptions) -> Error {
     let object = decode_dir_object(object);
 
@@ -71,53 +66,30 @@ pub(super) fn resolve_store_rebalance_pool_meta_reload_result<T>(result: Result<
     result.map_err(|err| Error::other(format!("store rebalance pool meta reload failed during {stage}: {err}")))
 }
 
-pub(super) fn resolve_rebalance_delete_from_all_pools_result(
-    result: Result<ObjectInfo>,
-    bucket: &str,
-    object: &str,
-) -> Result<ObjectInfo> {
-    result.map_err(|err| {
-        if matches!(&err, Error::PreconditionFailed | Error::PrefixAccessDenied(_, _)) {
-            err
-        } else {
-            Error::other(format!("failed to delete rebalance source object {bucket}/{object}: {err}"))
-        }
-    })
-}
-
 fn is_ignorable_rebalance_delete_error(err: &Error) -> bool {
     is_err_object_not_found(err) || is_err_version_not_found(err)
 }
 
-fn rebalance_delete_pool_error(pool_idx: usize, bucket: &str, object: &str, err: Error) -> Error {
-    if matches!(&err, Error::PreconditionFailed | Error::PrefixAccessDenied(_, _)) {
-        err
-    } else {
-        Error::other(format!("pool {pool_idx} delete failed for {bucket}/{object}: {err}"))
-    }
-}
-
 pub(super) fn resolve_rebalance_delete_from_all_pools_results(
-    results: Vec<RebalanceDeletePoolResult>,
+    results: Vec<Result<ObjectInfo>>,
     bucket: &str,
     object: &str,
 ) -> Result<ObjectInfo> {
     let mut deleted = None;
     let mut ignored_error = None;
 
-    for pool_result in results {
-        let pool_idx = pool_result.pool_idx;
-        match pool_result.result {
+    for result in results {
+        match result {
             Ok(info) => {
                 if deleted.is_none() {
                     deleted = Some(info);
                 }
             }
             Err(err) if is_ignorable_rebalance_delete_error(&err) => {
-                ignored_error = Some((pool_idx, err));
+                ignored_error = Some(err);
             }
             Err(err) => {
-                return Err(rebalance_delete_pool_error(pool_idx, bucket, object, err));
+                return Err(err);
             }
         }
     }
@@ -126,8 +98,8 @@ pub(super) fn resolve_rebalance_delete_from_all_pools_results(
         return Ok(info);
     }
 
-    if let Some((pool_idx, err)) = ignored_error {
-        return Err(rebalance_delete_pool_error(pool_idx, bucket, object, err));
+    if let Some(err) = ignored_error {
+        return Err(err);
     }
 
     Err(Error::other(format!(
@@ -377,52 +349,56 @@ mod tests {
     }
 
     #[test]
-    fn rebalance_delete_result_preserves_precondition_failed() {
-        let err = resolve_rebalance_delete_from_all_pools_result(Err(Error::PreconditionFailed), "bucket", "object")
-            .expect_err("precondition failure should remain structured");
-
-        assert_eq!(err, Error::PreconditionFailed);
+    fn rebalance_delete_aggregation_preserves_typed_failures() {
+        for expected in [
+            Error::UnsupportedDisk,
+            Error::GuardedDeleteUnsupported,
+            Error::ErasureReadQuorum,
+            Error::ErasureWriteQuorum,
+            Error::SlowDown,
+            Error::PreconditionFailed,
+            Error::PrefixAccessDenied("bucket".to_owned(), "object".to_owned()),
+            Error::FileCorrupt,
+        ] {
+            for results in [
+                vec![Err(expected.clone())],
+                vec![Ok(ObjectInfo::default()), Err(expected.clone())],
+                vec![Err(expected.clone()), Ok(ObjectInfo::default())],
+                vec![
+                    Err(Error::ObjectNotFound("bucket".to_owned(), "object".to_owned())),
+                    Err(expected.clone()),
+                ],
+            ] {
+                let actual = resolve_rebalance_delete_from_all_pools_results(results, "bucket", "object")
+                    .expect_err("a pool failure must retain its S3 error classification");
+                assert_eq!(actual, expected);
+            }
+        }
     }
 
     #[test]
-    fn rebalance_delete_result_preserves_prefix_access_denied() {
-        let err = resolve_rebalance_delete_from_all_pools_result(
-            Err(Error::PrefixAccessDenied("bucket".to_owned(), "object".to_owned())),
-            "bucket",
-            "object",
-        )
-        .expect_err("prefix access denial should remain structured");
-
-        assert_eq!(err, Error::PrefixAccessDenied("bucket".to_owned(), "object".to_owned()));
+    fn rebalance_delete_aggregation_preserves_missing_identity() {
+        for expected in [
+            Error::ObjectNotFound("bucket".to_owned(), "object".to_owned()),
+            Error::VersionNotFound("bucket".to_owned(), "object".to_owned(), "version".to_owned()),
+        ] {
+            let actual = resolve_rebalance_delete_from_all_pools_results(vec![Err(expected.clone())], "bucket", "object")
+                .expect_err("all-missing deletes must preserve their typed object or version identity");
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
-    fn rebalance_delete_pool_result_preserves_precondition_failed() {
-        let err = resolve_rebalance_delete_from_all_pools_results(
-            vec![RebalanceDeletePoolResult {
-                pool_idx: 0,
-                result: Err(Error::PreconditionFailed),
-            }],
-            "bucket",
-            "object",
-        )
-        .expect_err("precondition failure should remain structured");
-
-        assert_eq!(err, Error::PreconditionFailed);
-    }
-
-    #[test]
-    fn rebalance_delete_pool_result_preserves_prefix_access_denied() {
-        let err = resolve_rebalance_delete_from_all_pools_results(
-            vec![RebalanceDeletePoolResult {
-                pool_idx: 0,
-                result: Err(Error::PrefixAccessDenied("bucket".to_owned(), "object".to_owned())),
-            }],
-            "bucket",
-            "object",
-        )
-        .expect_err("prefix access denial should remain structured");
-
-        assert_eq!(err, Error::PrefixAccessDenied("bucket".to_owned(), "object".to_owned()));
+    fn rebalance_delete_aggregation_rejects_no_attempted_pools() {
+        let error = resolve_rebalance_delete_from_all_pools_results(Vec::new(), "bucket", "object")
+            .expect_err("an empty attempt set cannot report a successful delete");
+        let Error::Io(error) = error else {
+            panic!("an empty attempt set must remain an internal error");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            error.to_string(),
+            "failed to delete rebalance source object bucket/object: no pools were attempted"
+        );
     }
 }

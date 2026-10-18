@@ -64,6 +64,13 @@ pub struct DiskInfo {
     pub files: u64,
     pub ffree: u64,
     pub fstype: String,
+    /// The volume is reached through a network redirector.
+    ///
+    /// Windows names the server's filesystem (usually `NTFS`) in `fstype` for
+    /// SMB shares, so remote volumes are reported here instead. On Unix the
+    /// client filesystem type (`nfs`, `cifs`, `smb2`, ...) already identifies
+    /// network mounts and this stays `false`.
+    pub remote: bool,
     pub major: u64,
     pub minor: u64,
     pub name: String,

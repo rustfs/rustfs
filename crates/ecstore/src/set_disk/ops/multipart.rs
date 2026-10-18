@@ -3626,7 +3626,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 #[cfg(any(test, feature = "test-util"))]
                 pause_multipart_commit(&commit_bucket, &commit_object, MultipartCommitPause::BeforeQuotaRename).await;
                 if quota_reservation.is_lock_lost()
-                    || !quota_reservation.capability_proof_matches()
                     || write_context.is_lock_lost()
                     || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                     || _decommission_object_lock_guard
@@ -3681,7 +3680,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     verify_object_transaction_epoch_fence(&commit_set, &commit_bucket, &commit_object, expected).await?;
                 }
                 if quota_reservation.is_lock_lost()
-                    || !quota_reservation.capability_proof_matches()
                     || write_context.is_lock_lost()
                     || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                     || _decommission_object_lock_guard

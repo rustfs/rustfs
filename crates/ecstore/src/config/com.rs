@@ -2853,7 +2853,7 @@ mod tests {
     use rustfs_config::{
         DEFAULT_DELIMITER, ENABLE_KEY, EnableState, HEAL_BITROT_CYCLE, HEAL_SUB_SYS, MYSQL_DSN_STRING,
         MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_TABLE, SCANNER_CYCLE, SCANNER_IDLE_MODE, SCANNER_KEYS, SCANNER_SPEED,
-        SCANNER_SUB_SYS,
+        SCANNER_SUB_SYS, SCANNER_WALKERS_PER_DISK,
     };
 
     #[tokio::test]
@@ -2939,7 +2939,10 @@ mod tests {
     async fn save_config_preserves_retryable_system_volume_errors() {
         let store = Arc::new(MetadataWriteStore {
             error: Some(Error::BucketNotFound(RUSTFS_META_BUCKET.to_string())),
-            ..Default::default()
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            observations: Default::default(),
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            pending: false,
         });
         let error =
             save_config_with_opts_inner(store, "buckets/example/.metadata.bin", Vec::new(), &ObjectOptions::default(), false)
@@ -4198,6 +4201,8 @@ mod tests {
             let value = match *key {
                 SCANNER_SPEED => "fast",
                 SCANNER_IDLE_MODE => "false",
+                // "1" is this key's default, which the diff encoding omits.
+                SCANNER_WALKERS_PER_DISK => "2",
                 _ => "1",
             };
             scanner_kvs.insert((*key).to_string(), value.to_string());
@@ -4219,6 +4224,8 @@ mod tests {
             let expected = match *key {
                 SCANNER_SPEED => "fast",
                 SCANNER_IDLE_MODE => "false",
+                // "1" is this key's default, which the diff encoding omits.
+                SCANNER_WALKERS_PER_DISK => "2",
                 _ => "1",
             };
             assert_eq!(decoded_scanner.get(key), expected, "scanner key {key} should survive roundtrip");

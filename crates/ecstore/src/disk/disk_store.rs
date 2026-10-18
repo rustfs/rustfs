@@ -1829,21 +1829,7 @@ impl LocalDiskWrapper {
             }
 
             // Clean up
-            disk.delete(
-                test_bucket,
-                test_filename,
-                DeleteOptions {
-                    recursive: false,
-                    immediate: false,
-                    undo_write: false,
-                    undo_delete: false,
-                    old_data_dir: None,
-                    expected_delete_marker: None,
-                    recoverable_delete: false,
-                    delete_recovery_bucket_incarnation: None,
-                },
-            )
-            .await?;
+            disk.delete(test_bucket, test_filename, DeleteOptions::default()).await?;
 
             Ok(())
         })
@@ -2417,6 +2403,14 @@ impl DiskAPI for LocalDiskWrapper {
         }
         opts.recoverable_delete = true;
         self.delete_versions(volume, versions, opts).await
+    }
+    async fn has_delete_transaction_evidence(&self, volume: &str, object: &str) -> Result<bool> {
+        self.track_disk_health_with_op(
+            "has_delete_transaction_evidence",
+            || async { self.disk.has_delete_transaction_evidence(volume, object).await },
+            get_max_timeout_duration(),
+        )
+        .await
     }
     async fn discover_delete_transactions(
         &self,

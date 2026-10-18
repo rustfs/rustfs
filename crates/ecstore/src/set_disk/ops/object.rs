@@ -764,6 +764,8 @@ use rustfs_filemeta::ObjectPartInfo;
 use rustfs_utils::path::decode_dir_object;
 #[cfg(test)]
 use rustfs_utils::path::encode_dir_object;
+use rustfs_utils::path::object_name_disk_identity;
+use std::borrow::Cow;
 use std::future::Future;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -1394,6 +1396,42 @@ mod tier_free_version_receipt_eligibility_tests {
             vec![0, 2],
             "independent fully committed groups should retain their sparse receipts"
         );
+    }
+}
+
+// Own only completed staging, before the commit owner can rename or roll back
+// shards. Borrow the request state; clone it only if cancellation needs cleanup.
+struct PutObjectStagingCleanup<'a> {
+    set: &'a SetDisks,
+    tmp_dir: &'a str,
+    reservation: &'a Option<cleanup_runtime::Reservation>,
+    runtime: Option<tokio::runtime::Handle>,
+}
+
+impl Drop for PutObjectStagingCleanup<'_> {
+    fn drop(&mut self) {
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        let set = self.set.clone();
+        let tmp_dir = self.tmp_dir.to_owned();
+        let reservation = self.reservation.clone();
+        // A request future may be dropped outside its polling runtime. Cleanup
+        // remains best-effort on runtime shutdown, like the existing PUT tail.
+        let _enter = runtime.enter();
+        cleanup_runtime::spawn(reservation, async move {
+            if let Err(err) = set.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await {
+                warn!(
+                    event = EVENT_SET_DISK_WRITE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    state = "cancelled_staging_cleanup_failed",
+                    tmp_dir = %tmp_dir,
+                    error = ?err,
+                    "Cancelled PUT staging cleanup failed"
+                );
+            }
+        });
     }
 }
 
@@ -4279,6 +4317,12 @@ impl SetDisks {
                 (None, None, None)
             };
         let mut tmp_cleanup_owned = false;
+        let mut staging_cleanup = PutObjectStagingCleanup {
+            set: self,
+            tmp_dir: &tmp_dir,
+            reservation: &cleanup_reservation,
+            runtime: None,
+        };
         let rollback_receipt = RenameRollbackReceipt::default();
         let operation_first_poll_delay_started = rustfs_io_metrics::put_stage_timer();
         let operation = async {
@@ -4642,6 +4686,12 @@ impl SetDisks {
             let is_compressed = parts_metadatas[response_metadata_slot].is_compressed();
 
             drop(writers); // drop writers to close all files, this is to prevent FileAccessDenied errors when renaming data
+
+            // File creation, writes and integrity sidecars must finish before
+            // cancellation can remove staging without racing pending writers.
+            if !direct_inline_commit {
+                staging_cleanup.runtime = Some(tokio::runtime::Handle::current());
+            }
 
             if parity_blocks == 0 {
                 let written_size = i64::try_from(w_size).map_err(|_| Error::other("put_object written size overflows i64"))?;
@@ -5126,6 +5176,9 @@ impl SetDisks {
             let request_cancellation = operation_cancellation.clone();
             let commit_cleanup_reservation = cleanup_reservation.clone();
             tmp_cleanup_owned = true;
+            // No await separates this handoff from starting the commit owner.
+            // Its rollback rules, not request Drop, now decide what to retain.
+            staging_cleanup.runtime = None;
             rustfs_io_metrics::record_put_object_stage_duration_from(
                 rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_CONTEXT_PREPARE,
                 commit_context_prepare_started,
@@ -5166,7 +5219,6 @@ impl SetDisks {
                     pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::BeforeQuotaRename).await;
                     let first_fence_check_started = rustfs_io_metrics::put_stage_timer();
                     if quota_reservation.is_lock_lost()
-                        || !quota_reservation.capability_proof_matches()
                         || write_context.is_lock_lost()
                         || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                         || _decommission_object_lock_guard
@@ -5241,7 +5293,6 @@ impl SetDisks {
                     }
                     let second_fence_check_started = rustfs_io_metrics::put_stage_timer();
                     if quota_reservation.is_lock_lost()
-                        || !quota_reservation.capability_proof_matches()
                         || write_context.is_lock_lost()
                         || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                         || _decommission_object_lock_guard
@@ -6052,6 +6103,9 @@ impl SetDisks {
         } else {
             operation.await
         };
+        // Normal completion keeps the existing cleanup/error semantics below.
+        staging_cleanup.runtime = None;
+        drop(staging_cleanup);
         rustfs_io_metrics::record_put_object_stage_duration_from(
             rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_OPERATION_SELECT_WAIT,
             operation_select_wait_started,
@@ -8753,6 +8807,21 @@ impl SetDisks {
         // quorum-minus-one delete into an apparent success.
         let write_quorum = self.set_drive_count / 2 + 1;
         let rollback_dir = Uuid::new_v4();
+        // Register before preparation: cancellation and response loss can
+        // leave a durable journal even when publication never returns.
+        let recovery_ticket = (!is_meta_bucketname(bucket))
+            .then(|| {
+                self.ctx
+                    .delete_recovery_hints()
+                    .register(crate::store::delete_recovery_runtime::DeleteRecoveryKey {
+                        pool: self.pool_index,
+                        set: self.set_index,
+                        bucket: bucket.to_owned(),
+                        object: object.to_owned(),
+                        incarnation: source_bucket_incarnation_id,
+                    })
+            })
+            .flatten();
 
         let mut futures = Vec::with_capacity(disks.len());
         let mut errs = Vec::with_capacity(disks.len());
@@ -8823,6 +8892,7 @@ impl SetDisks {
                 &disks,
                 write_quorum,
                 DeleteRecoveryContext {
+                    recovery_ticket,
                     namespace_owner: namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>),
                     ..DeleteRecoveryContext::new(source_bucket_incarnation_id, &|| commit_context.can_commit(bucket, object))
                 },
@@ -9372,10 +9442,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         // Acquire locks in batch mode (best effort, matching previous behavior)
         let mut batch = rustfs_lock::BatchLockRequest::new(self.locker_owner.as_str()).with_all_or_nothing(false);
+        // Keyed by the same disk identity `new_ns_lock` uses, so aliases such
+        // as `a\b` and `a/b` on Windows share one lock (and one entry here).
+        let lock_names: Vec<Cow<'_, str>> = objects
+            .iter()
+            .map(|dobj| object_name_disk_identity(&dobj.object_name))
+            .collect();
         let mut unique_objects: HashSet<String> = HashSet::new();
-        for dobj in &objects {
-            if unique_objects.insert(dobj.object_name.clone()) {
-                batch = batch.add_write_lock(ObjectKey::new(bucket, dobj.object_name.clone()));
+        for lock_name in &lock_names {
+            if unique_objects.insert(lock_name.to_string()) {
+                batch = batch.add_write_lock(ObjectKey::new(bucket, lock_name.to_string()));
             }
         }
         let unique_lock_count = batch.requests.len();
@@ -9428,8 +9504,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         // Mark failures for objects that could not be locked
-        for (i, dobj) in objects.iter().enumerate() {
-            if let Some(err) = failed_map.get(&(bucket.to_string(), dobj.object_name.clone())) {
+        for (i, lock_name) in lock_names.iter().enumerate() {
+            if let Some(err) = failed_map.get(&(bucket.to_string(), lock_name.to_string())) {
                 del_errs[i] = Some(Error::other(err.to_string()));
             }
         }
@@ -9444,7 +9520,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     Err(err) => {
                         let message = err.to_string();
                         for (index, item) in del_errs.iter_mut().enumerate() {
-                            if locked_objects.contains(&objects[index].object_name) {
+                            if locked_objects.contains(lock_names[index].as_ref()) {
                                 *item = Some(Error::other(message.clone()));
                             }
                         }
@@ -9734,20 +9810,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 vr.set_delete_marker_incarnation(incarnation);
             }
 
-            let v = {
-                if vers_map.contains_key(&dobj.object_name) {
-                    let val = vers_map.get_mut(&dobj.object_name).unwrap();
-                    val.versions.push(vr.clone());
-                    val.clone()
-                } else {
-                    FileInfoVersions {
-                        name: vr.name.clone(),
-                        versions: vec![vr.clone()],
-                        ..Default::default()
-                    }
-                }
-            };
-
             if vr.deleted || removed_delete_marker {
                 del_objects[i] = DeletedObject {
                     delete_marker: true,
@@ -9801,8 +9863,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
 
             // Only add to vers_map if we hold the lock
-            if locked_objects.contains(&dobj.object_name) {
-                vers_map.insert(&dobj.object_name, v);
+            if locked_objects.contains(lock_names[i].as_ref()) {
+                vers_map
+                    .entry(&dobj.object_name)
+                    .or_insert_with(|| FileInfoVersions {
+                        name: vr.name.clone(),
+                        ..Default::default()
+                    })
+                    .versions
+                    .push(vr);
             }
         }
 
@@ -9892,6 +9961,24 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             fi_vers.versions.retain(|fi| del_errs[fi.idx].is_none());
         }
         vers.retain(|fi_vers| !fi_vers.versions.is_empty());
+        let recovery_tickets: Vec<_> = vers
+            .iter()
+            .map(|group| {
+                (!is_meta_bucketname(bucket))
+                    .then(|| {
+                        self.ctx
+                            .delete_recovery_hints()
+                            .register(crate::store::delete_recovery_runtime::DeleteRecoveryKey {
+                                pool: self.pool_index,
+                                set: self.set_index,
+                                bucket: bucket.to_owned(),
+                                object: group.name.clone(),
+                                incarnation: opts.expected_bucket_incarnation_id,
+                            })
+                    })
+                    .flatten()
+            })
+            .collect();
         let mut futures = Vec::with_capacity(disks.len());
         let lock_lost_during_commit = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -10072,6 +10159,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             published_groups.extend(groups.iter().map(|index| vers[*index].name.clone()));
             let publications = futures::stream::iter(groups.into_iter().map(|index: usize| {
                 let group = &vers[index];
+                let recovery_ticket = recovery_tickets[index].clone();
                 let namespace_owner = namespace_owner.clone();
                 let disks = &disks;
                 let opts = &opts;
@@ -10091,6 +10179,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                             disks,
                             self.set_drive_count / 2 + 1,
                             DeleteRecoveryContext {
+                                recovery_ticket,
                                 namespace_owner,
                                 ..DeleteRecoveryContext::new(opts.expected_bucket_incarnation_id, &can_commit)
                             },
@@ -22612,6 +22701,42 @@ mod put_object_tmp_cleanup_tests {
         ));
     }
 
+    async fn borrowed_write_context_accepts(set: &SetDisks, bucket: &str, held: &str, target: &str) -> bool {
+        let guard = crate::object_api::WriteCommitGuard::acquire(
+            &set.new_ns_lock(bucket, held).await.expect("namespace wrapper"),
+            get_lock_acquire_timeout(),
+        )
+        .await
+        .expect("outer write lock");
+        let mut opts = ObjectOptions::default();
+        opts.add_write_commit_guard(&guard);
+        matches!(
+            WriteCommitContext::from_options(&opts, bucket, target, false),
+            Ok(WriteCommitContext::Borrowed(_))
+        )
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn borrowed_write_context_keeps_backslash_spelling_distinct_off_windows() {
+        let (_dirs, _disks, set) = hermetic_set_disks(4).await;
+        assert!(borrowed_write_context_accepts(&set, "bucket", "a/b", "a/b").await);
+        assert!(!borrowed_write_context_accepts(&set, "bucket", "a/b", "a\\b").await);
+        assert!(!borrowed_write_context_accepts(&set, "bucket", "a\\b", "a/b").await);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_borrowed_write_context_accepts_backslash_spelling_of_held_object() {
+        // The guard records the folded lock key; a self-copy through `a\b`
+        // must still prove the namespace it commits into.
+        let (_dirs, _disks, set) = hermetic_set_disks(4).await;
+        assert!(borrowed_write_context_accepts(&set, "bucket", "a/b", "a\\b").await);
+        assert!(borrowed_write_context_accepts(&set, "bucket", "a\\b", "a\\b").await);
+        assert!(borrowed_write_context_accepts(&set, "bucket", "a\\b\\", "a/b").await);
+        assert!(!borrowed_write_context_accepts(&set, "bucket", "a/b", "a/b/c").await);
+    }
+
     #[tokio::test]
     #[serial_test::serial(capacity_dirty_scope)]
     async fn borrowed_tail_drained_put_keeps_owner_after_caller_cancel() {
@@ -25046,6 +25171,73 @@ mod delete_objects_lock_gating_tests {
             );
         }
         drop(outer_guard);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_delete_objects_batch_waits_on_backslash_alias_lock() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "batch-alias-lock-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        put_plain_object(&set_disks, bucket, "a/b").await;
+
+        let outer_guard = set_disks
+            .new_ns_lock(bucket, "a/b")
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("outer write lock should be acquired");
+        let lock_manager = set_disks
+            .local_lock_manager
+            .as_fast_lock_manager()
+            .expect("isolated fixture should use the local lock manager");
+        assert_eq!(lock_manager.current_lock_counts(), (1, 0));
+
+        let objects = vec![ObjectToDelete {
+            object_name: "a\\b".to_string(),
+            ..Default::default()
+        }];
+        let mut delete = Box::pin(set_disks.delete_objects(
+            bucket,
+            objects,
+            ObjectOptions {
+                object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                    ObjectLockConfigState::ConfirmedAbsent,
+                ))),
+                ..Default::default()
+            },
+        ));
+        // `a\b` is the xl.meta of `a/b`: the batch must queue behind the outer
+        // holder instead of taking a second exclusive lock beside it.
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(300),
+            futures::future::poll_fn(|cx| {
+                let result = std::future::Future::poll(delete.as_mut(), cx);
+                // Holders only: the queued batch shows up as a waiter.
+                assert_eq!(
+                    lock_manager.current_lock_counts().0,
+                    1,
+                    "batch delete through `a\\b` must not lock beside the `a/b` holder"
+                );
+                result
+            }),
+        )
+        .await;
+        assert!(blocked.is_err(), "batch delete through `a\\b` must wait for the `a/b` holder");
+
+        drop(outer_guard);
+        let (deleted, errs) = tokio::time::timeout(Duration::from_secs(30), delete)
+            .await
+            .expect("batch delete should finish once the holder releases");
+        assert!(errs[0].is_none(), "batch delete should succeed after the holder releases: {:?}", errs[0]);
+        assert!(deleted[0].found, "`a\\b` must delete the object stored as `a/b`");
+        set_disks
+            .get_object_info(bucket, "a/b", &ObjectOptions::default())
+            .await
+            .expect_err("`a/b` must be gone after deleting `a\\b`");
     }
 }
 

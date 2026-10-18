@@ -926,6 +926,10 @@ pub struct ObjectOptions {
     /// Lifecycle-only staged purge request checked under the object write lock.
     #[doc(hidden)]
     pub lifecycle_delete_all: Option<LifecycleDeleteAllRequest>,
+    /// Policy observed by lifecycle evaluation, checked under the metadata
+    /// transaction lock before logical deletion. Not persisted or sent over RPC.
+    #[doc(hidden)]
+    pub lifecycle_expiry_policy: Option<rustfs_lifecycle::ExpiryPolicySnapshot>,
     #[doc(hidden)]
     pub lifecycle_delete_all_journal: Option<Arc<parking_lot::Mutex<LifecycleDeleteAllJournalState>>>,
     /// Whole-operation authorization created only by consuming a validated

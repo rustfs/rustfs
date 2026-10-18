@@ -87,6 +87,26 @@ async fn call_load_table_handler(request: S3Request<Body>) -> S3Result<S3Respons
     RestLoadTableHandler {}.call(request, matched.params).await
 }
 
+async fn call_maintenance_worker_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    let mut router = matchit::Router::new();
+    router
+        .insert("/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/worker/run", ())
+        .expect("worker test route should insert");
+    let path = request.uri.path().to_string();
+    let matched = router.at(&path).expect("worker test route should match");
+    RunTableMaintenanceWorkerHandler {}.call(request, matched.params).await
+}
+
+async fn call_metadata_maintenance_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    let mut router = matchit::Router::new();
+    router
+        .insert("/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata", ())
+        .expect("maintenance test route should insert");
+    let path = request.uri.path().to_string();
+    let matched = router.at(&path).expect("maintenance test route should match");
+    RestTableMetadataMaintenanceHandler {}.call(request, matched.params).await
+}
+
 #[tokio::test]
 async fn commit_backend_borrowed_put_preserves_owner_authorization_and_precondition() {
     use crate::admin::storage_api::object::WriteCommitGuard;
@@ -246,6 +266,539 @@ async fn table_catalog_authentication_and_credentials_use_the_request_context() 
     let resolved_store =
         runtime_sources::object_store_from_extensions(&request.extensions).expect("request object store should resolve");
     assert!(Arc::ptr_eq(&resolved_store, &store));
+
+    let mut request = request;
+    request.method = Method::POST;
+    request.uri = "/iceberg/v1/request-warehouse/namespaces/analytics/tables/events/maintenance/worker/run"
+        .parse()
+        .expect("worker URI");
+    request.input = Body::from(br#"{"expected-job-id":"job-a","expected-attempt":0}"#.to_vec());
+    let err = call_maintenance_worker_handler(request)
+        .await
+        .expect_err("table read permission must not authorize a conditional maintenance worker");
+    assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn table_maintenance_worker_handler_enforces_conditions_after_authorization() {
+    use crate::admin::storage_api::RUSTFS_META_BUCKET;
+    use crate::table_catalog::{
+        TableCatalogObject, TableMaintenanceConfig, TableMetadataMaintenanceJobStatus, TableMetadataMaintenanceReport,
+    };
+
+    async fn inventory<B: TableCatalogObjectBackend>(backend: &B) -> BTreeMap<(String, String), TableCatalogObject> {
+        let mut objects = BTreeMap::new();
+        for bucket in ["warehouse", RUSTFS_META_BUCKET] {
+            for object in backend.list_objects(bucket, "").await.expect("list isolated fixture objects") {
+                let stored = backend
+                    .read_object(bucket, &object)
+                    .await
+                    .expect("read fixture object")
+                    .expect("listed object exists");
+                objects.insert((bucket.to_string(), object), stored);
+            }
+        }
+        objects
+    }
+
+    temp_env::async_with_vars(
+        [(
+            crate::table_catalog::ENV_TABLE_CATALOG_BACKING,
+            Some(crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT),
+        )],
+        async {
+            let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            object_store
+                .make_bucket("warehouse", &MakeBucketOptions::default())
+                .await
+                .expect("create table bucket");
+            rustfs_iam::store::object::ObjectStore::new(object_store.clone())
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("seed request IAM format");
+            let iam = rustfs_iam::build_iam_sys(object_store.clone())
+                .await
+                .expect("initialize request IAM");
+            let context = Arc::new(AppContext::new(
+                object_store.clone(),
+                Arc::new(RequestIam { handle: iam }),
+                Arc::new(RequestKms),
+            ));
+            let access_key = "maintenance-handler-root";
+            let secret_key = "maintenance-handler-root-secret";
+            assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+                access_key: access_key.to_string(),
+                secret_key: secret_key.to_string(),
+                status: "on".to_string(),
+                ..Default::default()
+            }));
+            let request = |body: serde_json::Value| {
+                let mut request = table_catalog_handler_request(context.clone(), access_key, secret_key);
+                request.method = Method::POST;
+                request.uri = "/iceberg/v1/warehouse/namespaces/analytics/tables/events/maintenance/worker/run"
+                    .parse()
+                    .expect("worker URI");
+                request.input = Body::from(serde_json::to_vec(&body).expect("worker request JSON"));
+                request
+            };
+            let setup = request(serde_json::json!({}));
+            let backend = table_catalog_backend_from_extensions(&setup.extensions).expect("request catalog backend");
+            let catalog = table_catalog_store_from_backend(backend.clone()).expect("object-backed catalog");
+            enable_table_bucket_marker(object_store.as_ref(), "warehouse")
+                .await
+                .expect("enable table bucket");
+            ensure_table_bucket_entry(&catalog, "warehouse", true)
+                .await
+                .expect("create table bucket entry");
+            let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace");
+            create_namespace_response(
+                &catalog,
+                "warehouse",
+                CreateNamespaceRequest {
+                    namespace: vec!["analytics".to_string()],
+                    properties: BTreeMap::new(),
+                },
+                true,
+            )
+            .await
+            .expect("create namespace");
+            let create_request = serde_json::from_value::<CreateTableRequest>(serde_json::json!({
+                "name": "events",
+                "schema": {
+                    "type": "struct",
+                    "schema-id": 0,
+                    "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+                }
+            }))
+            .expect("create table request");
+            create_table_response(
+                &catalog,
+                &TableCommitObjectBackend::trusted(backend.clone()),
+                "warehouse",
+                &namespace,
+                create_request,
+                true,
+            )
+            .await
+            .expect("create table and real metadata");
+            catalog
+                .put_table_maintenance_config(
+                    "warehouse",
+                    "analytics",
+                    "events",
+                    TableMaintenanceConfig {
+                        background_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("enable background maintenance");
+            let queued = catalog
+                .run_table_maintenance_scheduler_once("warehouse", "analytics", "events", "handler-scheduler".to_string())
+                .await
+                .expect("queue maintenance")
+                .report;
+            assert_eq!(queued.job.status, TableMetadataMaintenanceJobStatus::Queued);
+            assert_eq!(queued.job.attempt, 0);
+            let entry = catalog
+                .load_table("warehouse", "analytics", "events")
+                .await
+                .expect("load table")
+                .expect("table exists");
+            let before = inventory(&backend).await;
+
+            for body in [
+                serde_json::json!({"worker-id":"worker-a", "expected-job-id":"missing-job", "expected-attempt":0}),
+                serde_json::json!({"worker-id":"worker-a", "expected-job-id":queued.job.job_id, "expected-attempt":1}),
+            ] {
+                let error = call_maintenance_worker_handler(request(body))
+                    .await
+                    .expect_err("stale condition must not dispatch an unconditional worker");
+                assert_eq!(error.status_code(), Some(StatusCode::CONFLICT));
+                for id in [queued.job.job_id.as_str(), "latest", "current"] {
+                    assert_eq!(
+                        catalog
+                            .get_table_metadata_maintenance_report("warehouse", "analytics", "events", id)
+                            .await
+                            .unwrap(),
+                        Some(queued.clone()),
+                    );
+                }
+                assert_eq!(catalog.load_table("warehouse", "analytics", "events").await.unwrap(), Some(entry.clone()));
+                assert_eq!(inventory(&backend).await, before);
+            }
+
+            let claim = serde_json::json!({
+                "worker-id":"worker-a", "expected-job-id":queued.job.job_id, "expected-attempt":0
+            });
+            let response = call_maintenance_worker_handler(request(claim.clone()))
+                .await
+                .expect("authorized conditional claim");
+            assert_eq!(response.output.0, StatusCode::OK);
+            let completed: TableMetadataMaintenanceReport =
+                serde_json::from_slice(&response.output.1.bytes().expect("buffered worker response")).expect("worker report");
+            assert_eq!(completed.job.job_id, queued.job.job_id);
+            assert_eq!(completed.job.attempt, 1);
+            assert_eq!(completed.job.status, TableMetadataMaintenanceJobStatus::Successful);
+            assert_eq!(completed.job.worker_id.as_deref(), Some("worker-a"));
+            for id in [queued.job.job_id.as_str(), "latest", "current"] {
+                assert_eq!(
+                    catalog
+                        .get_table_metadata_maintenance_report("warehouse", "analytics", "events", id)
+                        .await
+                        .unwrap(),
+                    Some(completed.clone()),
+                );
+            }
+            assert_eq!(catalog.load_table("warehouse", "analytics", "events").await.unwrap(), Some(entry.clone()));
+            let committed = inventory(&backend).await;
+            let response = call_maintenance_worker_handler(request(claim))
+                .await
+                .expect("same-worker replay");
+            assert_eq!(response.output.0, StatusCode::OK);
+            let replay: TableMetadataMaintenanceReport =
+                serde_json::from_slice(&response.output.1.bytes().expect("buffered replay response")).expect("replayed report");
+            assert_eq!(replay, completed);
+            assert_eq!(inventory(&backend).await, committed);
+
+            let error = call_maintenance_worker_handler(request(serde_json::json!({
+                "worker-id":"worker-b", "expected-job-id":queued.job.job_id, "expected-attempt":0
+            })))
+            .await
+            .expect_err("another worker cannot replay an old condition");
+            assert_eq!(error.status_code(), Some(StatusCode::CONFLICT));
+            for id in [queued.job.job_id.as_str(), "latest", "current"] {
+                assert_eq!(
+                    catalog
+                        .get_table_metadata_maintenance_report("warehouse", "analytics", "events", id)
+                        .await
+                        .unwrap(),
+                    Some(completed.clone()),
+                );
+            }
+            assert_eq!(catalog.load_table("warehouse", "analytics", "events").await.unwrap(), Some(entry.clone()));
+            assert_eq!(inventory(&backend).await, committed);
+
+            let response = call_maintenance_worker_handler(request(serde_json::json!({})))
+                .await
+                .expect("legacy unconditional request remains supported");
+            assert_eq!(response.output.0, StatusCode::OK);
+            let legacy: TableMetadataMaintenanceReport =
+                serde_json::from_slice(&response.output.1.bytes().expect("buffered legacy response"))
+                    .expect("legacy worker report");
+            assert_ne!(legacy.job.job_id, completed.job.job_id);
+            assert_eq!(legacy.job.worker_id.as_deref(), Some(DEFAULT_TABLE_MAINTENANCE_WORKER_ID));
+            assert_eq!(legacy.job.status, TableMetadataMaintenanceJobStatus::Successful);
+            assert_eq!(catalog.load_table("warehouse", "analytics", "events").await.unwrap(), Some(entry));
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn strong_metadata_maintenance_handler_plans_without_changing_table_objects() {
+    use crate::admin::storage_api::RUSTFS_META_BUCKET;
+    use crate::table_catalog::{
+        TableCatalogObject, TableCatalogObjectPaths, TableMaintenanceAuditAction, TableMetadataMaintenanceJobStatus,
+        TableMetadataMaintenanceOperation, TableMetadataMaintenanceReport,
+    };
+
+    async fn inventory<B: TableCatalogObjectBackend>(backend: &B) -> BTreeMap<(String, String), TableCatalogObject> {
+        let mut objects = BTreeMap::new();
+        for bucket in ["warehouse", RUSTFS_META_BUCKET] {
+            for object in backend.list_objects(bucket, "").await.expect("list isolated fixture objects") {
+                let stored = backend
+                    .read_object(bucket, &object)
+                    .await
+                    .expect("read fixture object")
+                    .expect("listed object exists");
+                objects.insert((bucket.to_string(), object), stored);
+            }
+        }
+        objects
+    }
+
+    temp_env::async_with_vars(
+        [(
+            crate::table_catalog::ENV_TABLE_CATALOG_BACKING,
+            Some(crate::table_catalog::TABLE_CATALOG_BACKING_DURABLE_STRONG),
+        )],
+        async {
+            let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            object_store
+                .make_bucket("warehouse", &MakeBucketOptions::default())
+                .await
+                .expect("create table bucket");
+            rustfs_iam::store::object::ObjectStore::new(object_store.clone())
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("seed request IAM format");
+            let iam = rustfs_iam::build_iam_sys(object_store.clone())
+                .await
+                .expect("initialize request IAM");
+            let reader_access_key = "planning-handler-reader";
+            let reader_secret_key = "planning-handler-reader-secret";
+            iam.create_user(
+                reader_access_key,
+                &AddOrUpdateUserReq {
+                    secret_key: reader_secret_key.to_string(),
+                    policy: None,
+                    status: AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect("create read-only user");
+            iam.set_policy(
+                "planning-handler-read",
+                Policy::parse_config(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["admin:GetTable"]}]}"#)
+                    .expect("read-only policy"),
+            )
+            .await
+            .expect("save read-only policy");
+            iam.policy_db_set(reader_access_key, UserType::Reg, false, "planning-handler-read")
+                .await
+                .expect("attach read-only policy");
+            let context = Arc::new(AppContext::new(
+                object_store.clone(),
+                Arc::new(RequestIam { handle: iam }),
+                Arc::new(RequestKms),
+            ));
+            let access_key = "planning-handler-root";
+            let secret_key = "planning-handler-root-secret";
+            assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+                access_key: access_key.to_string(),
+                secret_key: secret_key.to_string(),
+                status: "on".to_string(),
+                ..Default::default()
+            }));
+            let request = |body: &str| {
+                let mut request = table_catalog_handler_request(context.clone(), access_key, secret_key);
+                request.method = Method::POST;
+                request.uri = "/iceberg/v1/warehouse/namespaces/analytics/tables/events/maintenance/metadata"
+                    .parse()
+                    .expect("maintenance URI");
+                request.input = Body::from(body.as_bytes().to_vec());
+                request
+            };
+            let setup = request("{}");
+            let backend = table_catalog_backend_from_extensions(&setup.extensions).expect("request catalog backend");
+            enable_table_bucket_marker(object_store.as_ref(), "warehouse")
+                .await
+                .expect("enable table bucket");
+            // The isolated ECStore does not run catalog startup. Seed its snapshot
+            // before using the production request path, which requires it to exist.
+            let bootstrap = crate::table_catalog::StrongTableCatalogStore::new(backend.clone());
+            ensure_table_bucket_entry(&bootstrap, "warehouse", true)
+                .await
+                .expect("seed durable snapshot and bucket entry");
+            let catalog = table_catalog_store_from_backend(backend.clone()).expect("strong catalog");
+            assert!(matches!(&catalog, crate::table_catalog::ConfiguredTableCatalogStore::DurableStrong(_)));
+            ensure_table_bucket_entry(&catalog, "warehouse", true)
+                .await
+                .expect("read bootstrapped bucket through configured catalog");
+            let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace");
+            let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table");
+            create_namespace_response(
+                &catalog,
+                "warehouse",
+                CreateNamespaceRequest {
+                    namespace: vec!["analytics".to_string()],
+                    properties: BTreeMap::new(),
+                },
+                true,
+            )
+            .await
+            .expect("create namespace");
+            let create_request = serde_json::from_value::<CreateTableRequest>(serde_json::json!({
+                "name": "events",
+                "schema": {"type": "struct", "schema-id": 0,
+                    "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]}
+            }))
+            .expect("create request");
+            create_table_response(
+                &catalog,
+                &TableCommitObjectBackend::trusted(backend.clone()),
+                "warehouse",
+                &namespace,
+                create_request,
+                true,
+            )
+            .await
+            .expect("create table and metadata");
+            let entry = catalog.load_table("warehouse", "analytics", "events").await.unwrap().unwrap();
+            let before = inventory(&backend).await;
+
+            for body in [
+                r#"{"delete":true}"#,
+                r#"{"commit-snapshot-expiration":true}"#,
+                r#"{"commit-compaction":true}"#,
+            ] {
+                let error = call_metadata_maintenance_handler(request(body))
+                    .await
+                    .expect_err("strong mutation must be rejected");
+                assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+                assert!(
+                    error
+                        .message()
+                        .unwrap_or_default()
+                        .contains("not supported with durable-strong")
+                );
+                assert_eq!(inventory(&backend).await, before, "{body}");
+            }
+            for body in [
+                r#"{"delete":null}"#,
+                r#"{"retain-recent-metadata-files":-1}"#,
+                r#"{"snapshot-expiration":{"min-snapshots-to-keep":"1","max-snapshot-age-ms":1000}}"#,
+                r#"{"compaction":true}"#,
+                r#"{"force":true}"#,
+                r#"{"delete":false,"delete":true}"#,
+            ] {
+                let error = call_metadata_maintenance_handler(request(body))
+                    .await
+                    .expect_err("malformed request must be rejected");
+                assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+                assert_eq!(inventory(&backend).await, before, "{body}");
+            }
+            let mut anonymous = request("{}");
+            anonymous.credentials = None;
+            let error = call_metadata_maintenance_handler(anonymous)
+                .await
+                .expect_err("planning requires authentication");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            assert!(error.message().unwrap_or_default().contains("authentication required"));
+            let mut reader = request("not-json");
+            reader.credentials = Some(s3s::auth::Credentials {
+                access_key: reader_access_key.to_string(),
+                secret_key: s3s::auth::SecretKey::from(reader_secret_key.to_string()),
+            });
+            let error = call_metadata_maintenance_handler(reader)
+                .await
+                .expect_err("read-only permission must not authorize planning");
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+            assert_eq!(inventory(&backend).await, before);
+
+            for body in [
+                serde_json::json!({}),
+                serde_json::json!({
+                    "retain-recent-metadata-files": 2,
+                    "snapshot-expiration": {"min-snapshots-to-keep": 1, "max-snapshot-age-ms": 1000},
+                    "compaction": {"target-file-size-bytes": 1024, "small-file-threshold-bytes": 512,
+                        "min-input-files": 2, "max-rewrite-bytes-per-job": 4096}
+                }),
+            ] {
+                let before = inventory(&backend).await;
+                let response = call_metadata_maintenance_handler(request(&body.to_string()))
+                    .await
+                    .expect("authorized strong planning");
+                assert_eq!(response.output.0, StatusCode::OK);
+                let report: TableMetadataMaintenanceReport =
+                    serde_json::from_slice(&response.output.1.bytes().expect("buffered planning response"))
+                        .expect("planning report");
+                assert_eq!(report.job.status, TableMetadataMaintenanceJobStatus::Successful);
+                assert_eq!(report.job.operation, TableMetadataMaintenanceOperation::DryRun);
+                assert_eq!(report.job.table_id, entry.table_id);
+                assert_eq!(report.current_metadata_location, entry.metadata_location);
+                assert_eq!(report.job.current_generation, entry.generation);
+                assert_eq!(report.job.deleted_metadata_file_count, 0);
+                assert_eq!(report.job.deleted_object_count, 0);
+                assert_eq!(
+                    report.job.retain_recent_metadata_files,
+                    if body.get("compaction").is_some() { 2 } else { 0 }
+                );
+                assert_eq!(report.snapshot_expiration.is_some(), body.get("snapshot-expiration").is_some());
+                assert_eq!(report.compaction.is_some(), body.get("compaction").is_some());
+                if let Some(plan) = &report.snapshot_expiration {
+                    assert_eq!(plan.config.min_snapshots_to_keep, 1);
+                    assert_eq!(plan.config.max_snapshot_age_ms, 1000);
+                    assert!(plan.committed_metadata_location.is_none());
+                }
+                if let Some(plan) = &report.compaction {
+                    assert_eq!(plan.config.target_file_size_bytes, 1024);
+                    assert_eq!(plan.config.max_rewrite_bytes_per_job, 4096);
+                    assert!(plan.committed_metadata_location.is_none());
+                }
+                assert!(
+                    report
+                        .audit_events
+                        .iter()
+                        .any(|event| event.action == TableMaintenanceAuditAction::WorkerStarted)
+                );
+                assert!(
+                    report
+                        .audit_events
+                        .iter()
+                        .any(|event| event.action == TableMaintenanceAuditAction::WorkerSucceeded)
+                );
+                let reloaded = table_catalog_store_from_backend(backend.clone()).expect("reload strong catalog");
+                for id in [report.job.job_id.as_str(), "latest", "current"] {
+                    assert_eq!(
+                        reloaded
+                            .get_table_metadata_maintenance_report("warehouse", "analytics", "events", id)
+                            .await
+                            .unwrap(),
+                        Some(report.clone())
+                    );
+                }
+                assert_eq!(
+                    reloaded.load_table("warehouse", "analytics", "events").await.unwrap(),
+                    Some(entry.clone())
+                );
+                let paths = TableCatalogObjectPaths::default();
+                let report_paths = [
+                    paths.table_maintenance_job_path("warehouse", &namespace, &table, &entry.table_id, &report.job.job_id),
+                    paths.table_maintenance_latest_job_path("warehouse", &namespace, &table, &entry.table_id),
+                    paths.table_maintenance_current_job_path("warehouse", &namespace, &table, &entry.table_id),
+                ];
+                let outside_report = |((bucket, key), _): &((String, String), TableCatalogObject)| {
+                    bucket != RUSTFS_META_BUCKET || !report_paths.contains(key)
+                };
+                assert_eq!(
+                    inventory(&backend)
+                        .await
+                        .into_iter()
+                        .filter(outside_report)
+                        .collect::<BTreeMap<_, _>>(),
+                    before.into_iter().filter(outside_report).collect::<BTreeMap<_, _>>(),
+                    "planning may only publish its named, latest, and current audit reports",
+                );
+            }
+
+            catalog
+                .put_table_maintenance_config(
+                    "warehouse",
+                    "analytics",
+                    "events",
+                    crate::table_catalog::TableMaintenanceConfig {
+                        background_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("enable queue admission");
+            let queued = catalog
+                .run_table_maintenance_scheduler_once("warehouse", "analytics", "events", "planning-test-scheduler".to_string())
+                .await
+                .expect("queue a maintenance job")
+                .report;
+            assert_eq!(queued.job.status, TableMetadataMaintenanceJobStatus::Queued);
+            let before = inventory(&backend).await;
+            let error = call_metadata_maintenance_handler(request("{}"))
+                .await
+                .expect_err("planning must not replace a queued job");
+            assert_eq!(error.status_code(), Some(StatusCode::CONFLICT));
+            assert_eq!(inventory(&backend).await, before);
+            assert_eq!(catalog.load_table("warehouse", "analytics", "events").await.unwrap(), Some(entry));
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -732,6 +1285,7 @@ fn table_catalog_handlers_require_table_admin_actions() {
         ("GetTableMaintenanceJobHandler", "AdminAction::GetTableLifecycleAction"),
         ("GetTableMaintenanceSchedulerHandler", "AdminAction::GetTableLifecycleAction"),
         ("RunTableMaintenanceSchedulerHandler", "AdminAction::RunTableMaintenanceAction"),
+        ("RunTableMaintenanceWorkerHandler", "AdminAction::RunTableMaintenanceAction"),
         ("TableMaintenanceQuarantineHandler", "AdminAction::RunTableMaintenanceAction"),
         ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
         ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
@@ -818,6 +1372,7 @@ fn table_catalog_handlers_require_table_admin_actions() {
         ("GetTableMaintenanceJobHandler", "AdminAction::GetTableLifecycleAction"),
         ("GetTableMaintenanceSchedulerHandler", "AdminAction::GetTableLifecycleAction"),
         ("RunTableMaintenanceSchedulerHandler", "AdminAction::RunTableMaintenanceAction"),
+        ("RunTableMaintenanceWorkerHandler", "AdminAction::RunTableMaintenanceAction"),
         ("TableMaintenanceQuarantineHandler", "AdminAction::RunTableMaintenanceAction"),
         ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
         ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
@@ -1372,6 +1927,7 @@ fn table_maintenance_worker_run_request_uses_stable_default_worker_id() {
         serde_json::from_value(serde_json::json!({})).expect("worker run request should parse");
 
     assert_eq!(request.worker_id(), "rustfs-maintenance-worker");
+    assert!(request.condition().expect("legacy request").is_none());
 }
 
 #[test]
@@ -1382,6 +1938,84 @@ fn table_maintenance_worker_run_request_accepts_worker_id() {
     .expect("worker run request should parse worker id");
 
     assert_eq!(request.worker_id(), "worker-a");
+    assert!(request.condition().expect("legacy request").is_none());
+}
+
+#[test]
+fn table_maintenance_worker_condition_accepts_paired_fields() {
+    for attempt in [0, 1, u16::MAX] {
+        let request: TableMaintenanceWorkerRunRequest = serde_json::from_value(serde_json::json!({
+            "expected-job-id": "job-a", "expected-attempt": attempt
+        }))
+        .expect("paired condition parses");
+        let condition = request
+            .condition()
+            .expect("valid condition")
+            .expect("condition remains present");
+        assert_eq!(condition.expected_job_id, "job-a");
+        assert_eq!(condition.expected_attempt, attempt);
+    }
+}
+
+#[test]
+fn table_maintenance_worker_condition_rejects_incomplete_or_empty_fields() {
+    for value in [
+        serde_json::json!({"expected-job-id":"job-a"}),
+        serde_json::json!({"expected-attempt":0}),
+        serde_json::json!({"expected-job-id":"", "expected-attempt":0}),
+        serde_json::json!({"expected-job-id":"  ", "expected-attempt":0}),
+        serde_json::json!({"worker-id":"  ", "expected-job-id":"job-a", "expected-attempt":0}),
+    ] {
+        let request: TableMaintenanceWorkerRunRequest = serde_json::from_value(value).expect("well-typed request");
+        let err = request
+            .condition()
+            .expect_err("partial or empty condition must not run unconditionally");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+}
+
+#[test]
+fn table_maintenance_worker_condition_rejects_null_malformed_duplicate_and_unknown_fields() {
+    for body in [
+        r#"{"expected-job-id":null,"expected-attempt":null}"#,
+        r#"{"expected-job-id":null}"#,
+        r#"{"expected-attempt":null}"#,
+        r#"{"expected-job-id":"job-a","expected-attempt":-1}"#,
+        r#"{"expected-job-id":"job-a","expected-attempt":65536}"#,
+        r#"{"expected-job-id":"job-a","expected-attempt":0.5}"#,
+        r#"{"expected-job-id":"job-a","expected-attempt":"0"}"#,
+        r#"{"expected-job-id":"job-a","expected-attempt":false}"#,
+        r#"{"expected-job-id":1,"expected-attempt":0}"#,
+        r#"{"expected-job-id":"job-a","expected-job-id":"job-b","expected-attempt":0}"#,
+        r#"{"expected-job-id":"job-a","expected-attempt":0,"expected-attempt":1}"#,
+        r#"{"expected-job-id":"job-a","expected-attempt":0,"force":true}"#,
+    ] {
+        assert!(serde_json::from_str::<TableMaintenanceWorkerRunRequest>(body).is_err(), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn table_maintenance_worker_handler_requires_authentication_for_both_request_forms() {
+    for body in [r#"{}"#, r#"{"expected-job-id":"job-a","expected-attempt":0}"#] {
+        let request = S3Request {
+            input: Body::from(body.as_bytes().to_vec()),
+            method: Method::POST,
+            uri: "/iceberg/v1/warehouse/namespaces/analytics/tables/events/maintenance/worker/run"
+                .parse()
+                .expect("worker URI"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let err = call_maintenance_worker_handler(request)
+            .await
+            .expect_err("worker requires authentication");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert!(err.message().unwrap_or_default().contains("authentication required"));
+    }
 }
 
 #[test]

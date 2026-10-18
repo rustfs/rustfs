@@ -514,6 +514,14 @@ impl Serialize for DataUsageScanCoverageReceipt {
     }
 }
 
+/// Coverage follows depth-first directory traversal, rather than raw path order.
+/// A completed subtree includes its descendants but never an unfinished ancestor.
+pub(crate) fn scan_frontier_covers_path(path: &str, frontier: &str) -> bool {
+    let ancestor = frontier.strip_prefix(path).is_some_and(|suffix| suffix.starts_with('/'));
+    let descendant = path.strip_prefix(frontier).is_some_and(|suffix| suffix.starts_with('/'));
+    (path.split('/').cmp(frontier.split('/')).is_le() && !ancestor) || descendant
+}
+
 struct CheckpointDigestWriter(Sha256);
 
 impl std::io::Write for CheckpointDigestWriter {
@@ -891,6 +899,14 @@ impl DataUsageCache {
         }
     }
 
+    pub(crate) fn has_scan_position(&self) -> bool {
+        self.info.scan_resume_after.is_some()
+            || self.info.scan_checkpoint.is_some()
+            || self.info.scan_raw_enumeration_cursor.is_some()
+            || self.info.scan_raw_enumeration_page_index.is_some()
+            || self.info.scan_coverage_receipt.is_some()
+    }
+
     pub(crate) fn prepare_bucket_checkpoint(
         &mut self,
         name: &str,
@@ -906,6 +922,8 @@ impl DataUsageCache {
         if self.info.leader_epoch > leader_epoch {
             return DataUsageCachePrepareOutcome::RejectedNewerLeader;
         }
+        let previous_cycle = self.info.next_cycle;
+        let previous_leader_epoch = self.info.leader_epoch;
         // A checkpoint is a durable traversal frontier, not a publication
         // result.  A newer leader may adopt it only when the frontier is
         // independently fenced by the bucket identity and has a validated
@@ -934,22 +952,13 @@ impl DataUsageCache {
         if reusable
             && self.info.snapshot_complete
             && self.info.scan_progress.is_none()
-            && self.info.scan_checkpoint.is_none()
-            && self.info.scan_raw_enumeration_cursor.is_none()
-            && self.info.scan_raw_enumeration_page_index.is_none()
-            && self.info.scan_resume_after.is_none()
-            && self.info.scan_coverage_receipt.is_none()
+            && !self.has_scan_position()
             && self.info.scan_plan_digest == Some(scan_plan_digest)
         {
             return self.prepare_for_scan(name, next_cycle, leader_epoch, source, scan_plan_digest, true);
         }
         if !reusable {
-            let had_resume_state = self.info.scan_checkpoint.is_some()
-                || self.info.scan_resume_after.is_some()
-                || self.info.scan_coverage_receipt.is_some()
-                || self.info.scan_raw_enumeration_cursor.is_some()
-                || self.info.scan_raw_enumeration_page_index.is_some();
-            if had_resume_state {
+            if self.has_scan_position() {
                 let reason = if name == DATA_USAGE_ROOT {
                     "invalid_bucket_scope"
                 } else if !identity.is_valid() {
@@ -1003,11 +1012,7 @@ impl DataUsageCache {
         if self.validated_raw_enumeration_page_index().is_none() {
             self.info.scan_raw_enumeration_page_index = None;
         }
-        let cursor_is_valid = (self.info.scan_checkpoint.is_none()
-            && self.info.scan_raw_enumeration_cursor.is_none()
-            && self.info.scan_raw_enumeration_page_index.is_none()
-            && self.info.scan_resume_after.is_none()
-            && self.info.scan_coverage_receipt.is_none())
+        let cursor_is_valid = !self.has_scan_position()
             || self.validated_scan_frontier().is_some()
             || self.info.scan_raw_enumeration_cursor.is_some()
             || self.info.scan_raw_enumeration_page_index.is_some();
@@ -1035,11 +1040,7 @@ impl DataUsageCache {
         // so it observes nothing under the plan that finished the previous
         // sweep. Keeping that plan would mark every sweep of a bucket written
         // between cycles as mixed, and the bucket could never certify.
-        let has_position = self.info.scan_resume_after.is_some()
-            || self.info.scan_checkpoint.is_some()
-            || self.info.scan_raw_enumeration_cursor.is_some()
-            || self.info.scan_raw_enumeration_page_index.is_some()
-            || self.info.scan_coverage_receipt.is_some();
+        let has_position = self.has_scan_position();
         if let Some(progress) = &mut self.info.scan_progress
             && has_position
         {
@@ -1058,6 +1059,23 @@ impl DataUsageCache {
         // Old readers do not understand coverage sweeps. An absent plan makes
         // their existing prepare path rebuild instead of promoting mixed data.
         self.info.scan_plan_digest = None;
+        debug!(
+            target: "rustfs::scanner::data_usage",
+            event = EVENT_SCANNER_CACHE_LOAD_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_CACHE,
+            state = "bucket_checkpoint_prepared",
+            bucket = %name,
+            pool = source.pool_index,
+            set = source.set_index,
+            cycle = next_cycle,
+            leader_epoch,
+            previous_cycle,
+            previous_leader_epoch,
+            resume_position = self.has_scan_position(),
+            mixed_coverage = self.info.scan_progress.is_some_and(|progress| progress.started_plan != progress.requested_plan),
+            "Scanner bucket checkpoint prepared for a coverage sweep"
+        );
         if reusable {
             DataUsageCachePrepareOutcome::Reused
         } else {
@@ -1066,17 +1084,22 @@ impl DataUsageCache {
     }
 
     fn coverage_prefix_digest(&self, through: &str) -> Result<[u8; 32], serde_json::Error> {
-        self.coverage_prefix_digest_with_epoch(through, None)
+        self.coverage_prefix_digest_with_epoch(through, None, 3)
+    }
+
+    fn v2_coverage_prefix_digest(&self, through: &str) -> Result<[u8; 32], serde_json::Error> {
+        self.coverage_prefix_digest_with_epoch(through, None, 2)
     }
 
     fn legacy_coverage_prefix_digest(&self, through: &str) -> Result<[u8; 32], serde_json::Error> {
-        self.coverage_prefix_digest_with_epoch(through, Some(self.info.leader_epoch))
+        self.coverage_prefix_digest_with_epoch(through, Some(self.info.leader_epoch), 0)
     }
 
     fn coverage_prefix_digest_with_epoch(
         &self,
         through: &str,
         legacy_leader_epoch: Option<u64>,
+        domain_version: u8,
     ) -> Result<[u8; 32], serde_json::Error> {
         let mut writer = CheckpointDigestWriter(Sha256::new());
         if let Some(leader_epoch) = legacy_leader_epoch {
@@ -1100,10 +1123,12 @@ impl DataUsageCache {
             // process-local leader epoch is intentionally excluded because it
             // changes during a safe handoff.  The domain version also keeps
             // old epoch-bound receipts from colliding with this digest.
+            // Domain 3 permits object-health debt behind the frontier. Older
+            // readers must reject it because they skip covered failures.
             serde_json::to_writer(
                 &mut writer,
                 &(
-                    2u8,
+                    domain_version,
                     &self.info.name,
                     self.info.scan_identity,
                     self.info.source,
@@ -1117,6 +1142,11 @@ impl DataUsageCache {
             .cache
             .iter()
             .filter(|(key, _)| {
+                // Sign exactly the subtrees the reader can reuse, including
+                // descendants whose raw path order differs from traversal order.
+                if legacy_leader_epoch.is_none() && domain_version >= 3 {
+                    return scan_frontier_covers_path(key, through);
+                }
                 let ancestor = through
                     .strip_prefix(key.as_str())
                     .is_some_and(|suffix| suffix.starts_with('/'));
@@ -1152,6 +1182,7 @@ impl DataUsageCache {
                 .is_some_and(|suffix| suffix.starts_with('/'))
             && self.find(&receipt.through).is_some()
             && (self.coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest)
+                || self.v2_coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest)
                 || self.legacy_coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest)))
         .then_some(receipt.through.as_str())
     }

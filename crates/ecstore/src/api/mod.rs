@@ -437,9 +437,9 @@ pub mod disk {
         DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DeleteRecoveryState,
         Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, DiskStore, FileInfoVersions, FileReader, FileWriter,
         GuardedDeleteVersionsPayload, GuardedFileInfoVersions, HEALING_MARKER_PATH, NsScannerOpenRequest, OldCurrentSize,
-        PartTransactionAction, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-        STORAGE_FORMAT_FILE, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, new_disk,
-        validate_batch_read_version_item_count,
+        PartTransactionAction, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp,
+        ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+        is_quota_mutation_fence_path, new_disk, validate_batch_read_version_item_count,
     };
     pub use bytes::Bytes;
     pub use endpoint::Endpoint;
@@ -508,17 +508,19 @@ pub mod metrics {
 }
 
 pub mod notification {
-    #[cfg(any(test, feature = "test-util"))]
-    pub use crate::services::notification_sys::rotate_cross_pool_fence_fleet_proof_for_test;
     pub use crate::services::notification_sys::{
         ClusterTierDailyStats, CrossPoolFenceFleetProofToken, IlmRecoveryExportFleetProofToken,
         LegacyTransitionStateReconcileFleetProofToken, NotificationPeerErr, NotificationSys, ScannerPublicationLeaseGrant,
         acquire_cross_pool_fence_fleet_proof, acquire_ilm_recovery_export_fleet_proof,
-        acquire_legacy_transition_state_reconcile_fleet_proof, cross_pool_fence_fleet_proof_matches, get_global_notification_sys,
-        ilm_recovery_export_fleet_proof_matches, ilm_recovery_export_local_process_epoch,
-        ilm_recovery_export_member_epochs_sha256, ilm_recovery_export_topology_generation,
-        legacy_transition_state_reconcile_fleet_proof_matches, new_global_notification_sys,
-        scanner_peer_transport_error_message_is_retryable, start_remote_version_state_fleet_probe,
+        acquire_legacy_transition_state_reconcile_fleet_proof, configured_fleet_topology_fingerprint,
+        cross_pool_fence_fleet_proof_matches, get_global_notification_sys, ilm_recovery_export_fleet_proof_matches,
+        ilm_recovery_export_local_process_epoch, ilm_recovery_export_member_epochs_sha256,
+        ilm_recovery_export_topology_generation, legacy_transition_state_reconcile_fleet_proof_matches,
+        new_global_notification_sys, scanner_peer_transport_error_message_is_retryable, start_remote_version_state_fleet_probe,
+    };
+    #[cfg(any(test, feature = "test-util"))]
+    pub use crate::services::notification_sys::{
+        rotate_cross_pool_fence_fleet_proof_for_test, without_cross_pool_fence_fleet_proof_for_test,
     };
 }
 

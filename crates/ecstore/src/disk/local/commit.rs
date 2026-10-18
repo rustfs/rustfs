@@ -24,7 +24,7 @@ use super::{
     LOG_SUBSYSTEM_DISK_LOCAL, LocalDisk, SyncMode, effective_durability, inline_metadata_rollback_dir, observe_old_current_size,
     remove_dir_all_if_exists, remove_dst_base_before_commit, remove_file_if_exists, rename_data_versions_signature,
     run_inline_preparation_before_backup, should_fail_after_metadata_commit, should_fail_before_old_metadata_backup,
-    should_fail_commit_rename, should_remove_staged_meta_before_commit, skip_access_checks,
+    should_fail_commit_rename, should_remove_staged_meta_before_commit, skip_access_checks, tmp_staging_mutation_path,
 };
 #[cfg(test)]
 use super::{run_inline_before_file_sync_admission, run_owned_file_write_before_open, run_rename_data_after_first_publication};
@@ -354,12 +354,20 @@ impl LocalDisk {
             None => None,
         };
         // Quota admission -> metadata RMW -> namespace/volume publication.
+        let no_inline = fi.data.is_none() && fi.size > 0;
+        let fi_healing = fi.is_healing();
+        let staging_prefix = if fi_healing && !no_inline && src_volume == super::super::RUSTFS_META_TMP_BUCKET {
+            Some(tmp_staging_mutation_path(&self.root, src_path)?)
+        } else {
+            None
+        };
         let metadata_lease =
             os::acquire_metadata_mutation_lease(&self.get_object_path(dst_volume, dst_path)?, state.namespace_owner.take()).await;
         let mutation_lease = os::acquire_rename_data_mutation_lease_with_owner(
             &self.root,
             dst_volume,
             &destination_object_path,
+            staging_prefix.as_deref(),
             Some(metadata_lease),
         )
         .await;
@@ -456,11 +464,6 @@ impl LocalDisk {
 
         check_path_length(src_file_path.to_string_lossy().to_string().as_str())?;
         check_path_length(dst_file_path.to_string_lossy().to_string().as_str())?;
-
-        let no_inline = fi.data.is_none() && fi.size > 0;
-        // Captured before `fi` is consumed by add_version; gates the stale
-        // destination purge below.
-        let fi_healing = fi.is_healing();
 
         // Resolved once for the whole commit so a concurrent configuration
         // change can never leave a single rename_data half-synced. The tier is
@@ -1006,14 +1009,21 @@ impl LocalDisk {
                     version_id,
                 );
                 let old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
-                let old_version_exists = xlmeta.find_version(Some(version_id)).is_ok();
-                let rollback_data_dir = old_data_dir.or_else(|| {
-                    if old_version_exists && has_dst_buf.is_some() {
-                        Some(inline_metadata_rollback_dir(version_id, &xlmeta))
-                    } else {
-                        None
-                    }
-                });
+                // Healing commits never run set-level post-return rollback; keep
+                // their intra-commit rollback backup in the staging directory so
+                // `<object>/<rollback_data_dir>/xl.meta.bkp` is never stranded.
+                let rollback_data_dir = if fi_healing {
+                    None
+                } else {
+                    let old_version_exists = xlmeta.find_version(Some(version_id)).is_ok();
+                    old_data_dir.or_else(|| {
+                        if old_version_exists && has_dst_buf.is_some() {
+                            Some(inline_metadata_rollback_dir(version_id, &xlmeta))
+                        } else {
+                            None
+                        }
+                    })
+                };
                 let mut staged_rollback_path = None;
                 if let Some(d) = old_data_dir.as_ref() {
                     let _ = xlmeta.data.remove_two(version_id, *d);
@@ -1029,7 +1039,7 @@ impl LocalDisk {
                 prepared_metadata_source.write_all(&new_buf, sync)?;
                 run_inline_preparation_before_backup(&dst_path_for_failpoint);
                 if let Some(ref old_metadata) = has_dst_buf
-                    && (rollback_data_dir.is_some() || sync || cfg!(test))
+                    && (rollback_data_dir.is_some() || fi_healing || sync || cfg!(test))
                 {
                     #[cfg(windows)]
                     let backup_path = {

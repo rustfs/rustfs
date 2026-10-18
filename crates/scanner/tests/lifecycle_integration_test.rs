@@ -663,14 +663,42 @@ mod serial_tests {
         );
 
         ExpiryState::resize_workers(1, ecstore.clone()).await;
+        set_bucket_lifecycle(bucket_name.as_str())
+            .await
+            .expect("install the expiration policy");
         let lc_event = LcEvent {
             action: IlmAction::DeleteAction,
+            expiry_policy: get_bucket_metadata(bucket_name.as_str())
+                .await
+                .expect("load expiration policy")
+                .lifecycle_config
+                .clone()
+                .map(|configuration| Arc::new(configuration).into()),
             ..Default::default()
         };
         let bucket_incarnation_id = ecstore
             .bucket_incarnation_id(bucket_name.as_str())
             .await
             .expect("read bucket incarnation");
+
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, Vec::new())
+            .await
+            .expect("withdraw the queued expiration policy");
+        assert!(
+            expire_transitioned_object(ecstore.clone(), &oi, &lc_event, &LcEventSrc::Scanner, bucket_incarnation_id)
+                .await
+                .is_err(),
+            "a withdrawn policy must retain both local metadata and remote data"
+        );
+        assert_eq!(backend.remove_count().await, 0);
+        assert!(backend.contains(&remote_object).await);
+        ecstore
+            .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
+            .await
+            .expect("withdrawn expiration must retain transition metadata");
+        set_bucket_lifecycle(bucket_name.as_str())
+            .await
+            .expect("restore the expiration policy");
 
         // Pause one real tier GET after it has resolved local transition
         // metadata. The reader still owns the object read lock, so local expiry
@@ -2451,6 +2479,9 @@ mod serial_tests {
 
         // The scanner's restore-expiry action removes only the local restored
         // copy (same direct-drive pattern as the ilm-2 expiry test).
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, Vec::new())
+            .await
+            .expect("restore-copy cleanup must not require a lifecycle policy");
         let lc_event = LcEvent {
             action: IlmAction::DeleteRestoredAction,
             ..Default::default()

@@ -213,9 +213,7 @@ where
                     Some(manifest_list) => {
                         let planning = match compaction_data_file_candidates(
                             backend,
-                            table_bucket,
-                            namespace,
-                            table,
+                            entry,
                             warehouse_object_prefix.as_deref(),
                             manifest_list,
                             &config,
@@ -326,9 +324,7 @@ where
 
 async fn compaction_data_file_candidates<B>(
     backend: &B,
-    table_bucket: &str,
-    namespace: &Namespace,
-    table: &IdentifierSegment,
+    entry: &TableEntry,
     warehouse_object_prefix: Option<&str>,
     manifest_list: &str,
     config: &TableCompactionPlanningConfig,
@@ -336,12 +332,13 @@ async fn compaction_data_file_candidates<B>(
 where
     B: TableCatalogObjectBackend,
 {
+    let table_bucket = &entry.table_bucket;
     let Some(manifest_list_key) = table_catalog_object_key_from_location(table_bucket, manifest_list) else {
         return Err(TableCatalogStoreError::Invalid(
             "compaction manifest list must be inside the table bucket".to_string(),
         ));
     };
-    if table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &manifest_list_key)
+    if table_maintenance_object_kind_for_entry(entry, warehouse_object_prefix, &manifest_list_key)
         != Some(TableMetadataMaintenanceObjectKind::ManifestList)
     {
         return Err(TableCatalogStoreError::Invalid(
@@ -367,7 +364,7 @@ where
                 "compaction manifest must be inside the table bucket".to_string(),
             ));
         };
-        if table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &manifest_key)
+        if table_maintenance_object_kind_for_entry(entry, warehouse_object_prefix, &manifest_key)
             != Some(TableMetadataMaintenanceObjectKind::ManifestFile)
         {
             return Err(TableCatalogStoreError::Invalid(
@@ -384,9 +381,7 @@ where
             if reference.object_kind != TableMetadataMaintenanceObjectKind::DataFile {
                 record_compaction_row_level_delete_file(
                     backend,
-                    table_bucket,
-                    namespace,
-                    table,
+                    entry,
                     warehouse_object_prefix,
                     &mut planning.row_level_planning,
                     &reference,
@@ -400,7 +395,7 @@ where
                     "compaction data file must be inside the table bucket".to_string(),
                 ));
             };
-            if table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &data_key)
+            if table_maintenance_object_kind_for_entry(entry, warehouse_object_prefix, &data_key)
                 != Some(TableMetadataMaintenanceObjectKind::DataFile)
             {
                 return Err(TableCatalogStoreError::Invalid(
@@ -413,7 +408,7 @@ where
             let size_bytes = u64::try_from(data_object.data.len()).unwrap_or(u64::MAX);
             if size_bytes <= config.small_file_threshold_bytes {
                 planning.candidates.push(TableCompactionDataFileCandidate {
-                    rewrite_prefix: compaction_data_file_rewrite_prefix(namespace, table, warehouse_object_prefix, &data_key)
+                    rewrite_prefix: compaction_data_file_rewrite_prefix_for_entry(entry, warehouse_object_prefix, &data_key)
                         .unwrap_or_else(|| data_key.clone()),
                     location: data_key,
                     size_bytes,
@@ -427,9 +422,7 @@ where
 
 async fn record_compaction_row_level_delete_file<B>(
     backend: &B,
-    table_bucket: &str,
-    namespace: &Namespace,
-    table: &IdentifierSegment,
+    entry: &TableEntry,
     warehouse_object_prefix: Option<&str>,
     planning: &mut TableRowLevelMaintenancePlanningReport,
     reference: &ManifestDataFileReference,
@@ -437,6 +430,7 @@ async fn record_compaction_row_level_delete_file<B>(
 where
     B: TableCatalogObjectBackend,
 {
+    let table_bucket = &entry.table_bucket;
     let Some(content) = row_level_delete_file_content(reference.content) else {
         return Ok(());
     };
@@ -445,7 +439,7 @@ where
             "compaction delete file must be inside the table bucket".to_string(),
         ));
     };
-    if table_maintenance_object_kind(namespace, table, warehouse_object_prefix, &delete_key)
+    if table_maintenance_object_kind_for_entry(entry, warehouse_object_prefix, &delete_key)
         != Some(TableMetadataMaintenanceObjectKind::DeleteFile)
     {
         return Err(TableCatalogStoreError::Invalid(
@@ -703,6 +697,29 @@ pub(crate) fn compaction_data_file_rewrite_prefix(
         .unwrap_or_else(|| default_table_data_dir_path(namespace, table));
     let default_data_prefix = format!("{}/", default_table_data_dir_path(namespace, table));
     if let Some(relative_path) = location.strip_prefix(&default_data_prefix) {
+        return Some(compaction_data_file_output_prefix(&warehouse_data_prefix, relative_path));
+    }
+    if let Some(warehouse_object_prefix) = warehouse_object_prefix {
+        let warehouse_input_prefix = format!("{warehouse_object_prefix}{DATA_DIR}/");
+        if let Some(relative_path) = location.strip_prefix(&warehouse_input_prefix) {
+            return Some(compaction_data_file_output_prefix(&warehouse_data_prefix, relative_path));
+        }
+    }
+    None
+}
+
+fn compaction_data_file_rewrite_prefix_for_entry(
+    entry: &TableEntry,
+    warehouse_object_prefix: Option<&str>,
+    location: &str,
+) -> Option<String> {
+    let metadata_dir = table_metadata_dir_path_for_entry(entry).ok()?;
+    let table_root = metadata_dir.strip_suffix(&format!("/{METADATA_DIR}"))?;
+    let entry_data_prefix = format!("{table_root}/{DATA_DIR}/");
+    let warehouse_data_prefix = warehouse_object_prefix
+        .map(|prefix| format!("{prefix}{DATA_DIR}"))
+        .unwrap_or_else(|| format!("{table_root}/{DATA_DIR}"));
+    if let Some(relative_path) = location.strip_prefix(&entry_data_prefix) {
         return Some(compaction_data_file_output_prefix(&warehouse_data_prefix, relative_path));
     }
     if let Some(warehouse_object_prefix) = warehouse_object_prefix {
