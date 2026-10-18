@@ -998,6 +998,15 @@ async fn periodic_resume_uses_traversal_order_for_punctuation_siblings() {
 #[tokio::test]
 #[serial]
 async fn periodic_failed_nested_entries_cannot_certify_a_bucket_with_diagnostics_disabled() {
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
     let (loaded, _, original, _guard) = nested_periodic_snapshot(true, (0, 0)).await;
     let result = temp_env::async_with_vars([(ENV_FAILED_OBJECT_TTL_SECS, Some("0"))], async {
         let mut cache = loaded;
@@ -1029,6 +1038,23 @@ async fn periodic_failed_nested_entries_cannot_certify_a_bucket_with_diagnostics
             .expect("partial accounting")
             .failed_objects,
         1
+    );
+    let events = logs
+        .contents()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("scanner JSON event"))
+        .filter(|event| event["fields"]["state"] == "bucket_sweep_incomplete")
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1, "the completed sweep must identify its uncapped failure debt");
+    let fields = &events[0]["fields"];
+    assert_eq!(fields["coverage_gap"], false);
+    assert_eq!(fields["root_failed_objects"], 0);
+    assert_eq!(fields["failed_objects"], 0);
+    assert_eq!(fields["size_reconciliation_entries"], 0);
+    assert_eq!(fields["mixed_coverage"], false);
+    assert_eq!(
+        fields["unresolved_objects"], true,
+        "child-entry failure debt remains a certification blocker"
     );
 }
 

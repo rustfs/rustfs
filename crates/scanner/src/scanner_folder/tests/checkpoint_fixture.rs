@@ -1046,6 +1046,7 @@ async fn hot_bucket_certifies_first_full_sweep_after_mixed_end(advance_epoch: bo
     assert_eq!(fields["resume_position_on_entry"], true);
     assert_eq!(fields["resume_position"], false);
     assert_eq!(fields["mixed_coverage"], true);
+    assert_eq!(fields["unresolved_objects"], false);
     assert_eq!(fields["coverage_gap"], false);
     assert_eq!(fields["failed_objects"], 0);
     assert_eq!(fields["size_reconciliation_entries"], 0);

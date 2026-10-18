@@ -3094,6 +3094,7 @@ pub(crate) async fn scan_data_folder_scoped(
                     resume_position_on_entry,
                     resume_position = new_cache.has_scan_position(),
                     coverage_gap,
+                    unresolved_objects,
                     root_failed_objects = root.failed_objects,
                     failed_objects = new_cache.info.failed_objects.len(),
                     size_reconciliation_entries = new_cache.info.size_reconciliation.len(),
