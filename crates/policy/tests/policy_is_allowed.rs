@@ -933,3 +933,90 @@ fn wildcard_resource_preserves_conditions(prefix: Option<&str>) -> bool {
     }
     policy_is_allowed(policy, args)
 }
+
+// Conditional write enforcement (`s3:if-none-match` / `s3:if-match`). Condition values
+// carry request headers under their lowercase header name; a missing header leaves
+// the key absent, which `Null: true` matches and `StringEquals` never satisfies.
+
+fn header_conditions(headers: &[(&str, &str)]) -> HashMap<String, Vec<String>> {
+    headers
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), vec![(*value).to_string()]))
+        .collect()
+}
+
+fn is_allowed_put_object(policy: &Policy, conditions: &HashMap<String, Vec<String>>) -> bool {
+    let claims: HashMap<String, Value> = HashMap::new();
+    let groups: Option<Vec<String>> = None;
+    pollster::block_on(policy.is_allowed(&Args {
+        account: "Q3AM3UQ867SPQQA43P2F",
+        groups: &groups,
+        action: rustfs_policy::policy::action::Action::S3Action(PutObjectAction),
+        bucket: "mybucket",
+        conditions,
+        is_owner: false,
+        object: "uploads/report.csv",
+        claims: &claims,
+        deny_only: false,
+    }))
+}
+
+fn put_object_policy_with_condition(condition: &str) -> Policy {
+    let json = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["s3:PutObject"],"Resource":["arn:aws:s3:::mybucket/*"],"Condition":{condition}}}]}}"#
+    );
+    Policy::parse_config(json.as_bytes()).expect("policy with conditional write key should parse")
+}
+
+#[test_case(r#"{"StringEquals":{"s3:if-none-match":"*"}}"#, &[("if-none-match", "*")] => true ; "if_none_match_string_equals_header_present")]
+#[test_case(r#"{"StringEquals":{"s3:if-none-match":"*"}}"#, &[] => false ; "if_none_match_string_equals_header_absent")]
+#[test_case(r#"{"StringEquals":{"s3:if-none-match":"*"}}"#, &[("if-match", "\"etag\"")] => false ; "if_none_match_string_equals_other_header")]
+#[test_case(r#"{"Null":{"s3:if-none-match":"false"}}"#, &[("if-none-match", "*")] => true ; "if_none_match_not_null_header_present")]
+#[test_case(r#"{"Null":{"s3:if-none-match":"false"}}"#, &[] => false ; "if_none_match_not_null_header_absent")]
+#[test_case(r#"{"Null":{"s3:if-match":"false"}}"#, &[("if-match", "\"etag\"")] => true ; "if_match_not_null_header_present")]
+#[test_case(r#"{"Null":{"s3:if-match":"false"}}"#, &[] => false ; "if_match_not_null_header_absent")]
+#[test_case(r#"{"StringEquals":{"s3:if-match":"\"etag\""}}"#, &[("if-match", "\"etag\"")] => true ; "if_match_string_equals_matching_value")]
+#[test_case(r#"{"StringEquals":{"s3:if-match":"\"etag\""}}"#, &[("if-match", "\"other\"")] => false ; "if_match_string_equals_different_value")]
+fn conditional_write_condition_keys(condition: &str, headers: &[(&str, &str)]) -> bool {
+    let policy = put_object_policy_with_condition(condition);
+    is_allowed_put_object(&policy, &header_conditions(headers))
+}
+
+/// Mirrors the AWS deny-based enforcement example: allow PutObject, but deny it
+/// when the `If-Match` header is missing.
+#[test_case(&[("if-match", "\"etag\"")] => true ; "header_present")]
+#[test_case(&[] => false ; "header_absent")]
+fn bucket_policy_denies_put_object_without_if_match(headers: &[(&str, &str)]) -> bool {
+    let policy: BucketPolicy = serde_json::from_str(
+        r#"{
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": ["*"]},
+                    "Action": ["s3:PutObject"],
+                    "Resource": ["arn:aws:s3:::mybucket/*"]
+                },
+                {
+                    "Effect": "Deny",
+                    "Principal": {"AWS": ["*"]},
+                    "Action": ["s3:PutObject"],
+                    "Resource": ["arn:aws:s3:::mybucket/*"],
+                    "Condition": {"Null": {"s3:if-match": "true"}}
+                }
+            ]
+        }"#,
+    )
+    .expect("bucket policy with conditional write key should parse");
+    let conditions = header_conditions(headers);
+    let groups: Option<Vec<String>> = None;
+    pollster::block_on(policy.is_allowed(&BucketPolicyArgs {
+        account: "Q3AM3UQ867SPQQA43P2F",
+        groups: &groups,
+        action: rustfs_policy::policy::action::Action::S3Action(PutObjectAction),
+        bucket: "mybucket",
+        conditions: &conditions,
+        is_owner: false,
+        object: "uploads/report.csv",
+    }))
+}

@@ -10550,8 +10550,9 @@ mod tests {
                 disk.read_all(bucket, &format!("{object}/xl.meta")).await.unwrap(),
             ));
         }
-        for slot in 12..16 {
-            set.disks.write().await[slot] = None;
+        for disk in before.iter().skip(12).flatten() {
+            disk.close().await.expect("stop stale member health monitoring");
+            disk.force_offline_for_test();
         }
         for version in historical {
             store
@@ -10592,7 +10593,9 @@ mod tests {
                 .await
                 .unwrap()
         );
-        *set.disks.write().await = before.clone();
+        for disk in before.iter().skip(12).flatten() {
+            disk.reset_health_for_store_init_retry();
+        }
         store
             .recover_delete_transactions_at_incarnation(
                 bucket,
@@ -10611,8 +10614,9 @@ mod tests {
                 .await
                 .expect("durable retirement")
         );
-        for slot in 12..16 {
-            set.disks.write().await[slot] = None;
+        for disk in before.iter().skip(12).flatten() {
+            disk.close().await.expect("stop returning member health monitoring");
+            disk.force_offline_for_test();
         }
         store
             .handle_make_bucket(bucket, &create)
@@ -10646,7 +10650,9 @@ mod tests {
                 tokio::fs::write(root.join("xl.meta"), bytes).await.unwrap();
             }
         }
-        *set.disks.write().await = before.clone();
+        for disk in before.iter().skip(12).flatten() {
+            disk.reset_health_for_store_init_retry();
+        }
         let heal = rustfs_heal_contracts::heal_channel::HealOpts {
             remove: true,
             scan_mode: rustfs_heal_contracts::heal_channel::HealScanMode::Deep,
@@ -10730,14 +10736,16 @@ mod tests {
                     .unwrap();
             }
         }
-        set.disks.write().await[15] = None;
+        let offline = before[15].as_ref().expect("cleanup target must exist");
+        offline.close().await.expect("stop cleanup target health monitoring");
+        offline.force_offline_for_test();
         let incomplete = store
             .heal_object_with_proof(bucket, object, &marker.to_string(), &heal)
             .await
             .unwrap();
         assert!(incomplete.error.as_ref().is_some_and(Error::is_retired_marker_deferred));
         assert!(incomplete.absence.is_none(), "offline targets cannot be omitted from a cleanup receipt");
-        set.disks.write().await[15] = before[15].clone();
+        offline.reset_health_for_store_init_retry();
         let failure =
             crate::set_disk::DanglingDeleteFailure::install(bucket, object, 15, crate::disk::error::DiskError::FaultyDisk);
         let partial = store
@@ -10856,9 +10864,13 @@ mod tests {
             .expect("bucket incarnation");
         let set = &store.pools[0].disk_set[0];
         let before = set.disks.read().await.clone();
-        for slot in 12..16 {
-            set.disks.write().await[slot] = None;
+        // Keep the handles attached so reconnect probes inherit the forced
+        // outage instead of recreating healthy handles for these local paths.
+        for disk in before.iter().skip(12).flatten() {
+            disk.close().await.expect("stop stale member health monitoring");
+            disk.force_offline_for_test();
         }
+        set.connect_disks().await;
         store
             .delete_object(
                 bucket,
@@ -10871,8 +10883,6 @@ mod tests {
             )
             .await
             .expect("acknowledged delete should remove the marker from the online quorum");
-        *set.disks.write().await = before.clone();
-
         for disk in before.iter().take(12).flatten() {
             assert!(matches!(
                 disk.read_version("", bucket, object, &marker.to_string(), &crate::disk::ReadOptions::default())
@@ -10881,6 +10891,8 @@ mod tests {
             ));
         }
         for disk in before.iter().skip(12).flatten() {
+            assert_eq!(disk.runtime_state(), crate::disk::health_state::RuntimeDriveHealthState::Offline);
+            disk.reset_health_for_store_init_retry();
             assert!(
                 disk.read_version("", bucket, object, &marker.to_string(), &crate::disk::ReadOptions::default())
                     .await

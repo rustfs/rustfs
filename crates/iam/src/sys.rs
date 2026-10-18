@@ -5293,6 +5293,45 @@ mod tests {
         );
     }
 
+    /// A session policy that requires conditional writes must decode and gate
+    /// PutObject on the `If-None-Match` header; an unknown condition key would fail
+    /// to parse and deny the session everything.
+    #[tokio::test]
+    async fn session_policy_enforces_if_none_match_condition_key() {
+        let session_policy_json = r#"{
+  "Version":"2012-10-17",
+  "Statement":[{"Effect":"Allow","Action":["s3:PutObject"],"Resource":["arn:aws:s3:::bucket/*"],"Condition":{"Null":{"s3:if-none-match":"false"}}}]
+}"#;
+        let encoded = base64_simd::URL_SAFE_NO_PAD.encode_to_string(session_policy_json.as_bytes());
+        decode_session_policy(&encoded).expect("session policy with s3:if-none-match must decode");
+
+        let mut claims = HashMap::new();
+        claims.insert(SESSION_POLICY_NAME.to_string(), Value::String(encoded));
+        let groups: Option<Vec<String>> = None;
+        let with_header = HashMap::from([("if-none-match".to_string(), vec!["*".to_string()])]);
+        let without_header = HashMap::new();
+
+        let mut outcomes = Vec::new();
+        for conditions in [&with_header, &without_header] {
+            let args = Args {
+                account: "sts-conditional-write-user",
+                groups: &groups,
+                action: Action::S3Action(S3Action::PutObjectAction),
+                bucket: "bucket",
+                conditions,
+                is_owner: false,
+                object: "obj",
+                claims: &claims,
+                deny_only: false,
+            };
+            let prepared = prepare_session_policy(&args, false);
+            assert!(matches!(prepared, PreparedSessionPolicy::Policy(_)));
+            outcomes.push(evaluate_prepared_session_policy(&prepared, &args).await);
+        }
+
+        assert_eq!(outcomes, [Some(true), Some(false)]);
+    }
+
     #[tokio::test]
     async fn test_prepare_auth_service_account_inherited_ignores_session_policy_tag_hint() {
         let store = StsTestMockStore::new(false);

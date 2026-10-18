@@ -260,6 +260,17 @@ server's default. Set both key IDs to keys that already exist, and set
 templates should include `kms_keyid`, `kms_keyid2`, and `kms_default_keyid`, or
 the commented placeholders from the bundled template.
 
+### Conditional write contract
+
+The conditional-write patch keeps the upstream tests in the gate while aligning
+their requests with the [S3 write contract](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html):
+`If-None-Match` accepts `*`, and an existing current object returns 412. RustFS
+returns 501 `NotImplemented` for unsupported ETag-valued `If-None-Match`; the S3
+documentation does not specify that error code for PutObject or
+CompleteMultipartUpload. The patched tests assert rejection without replacing
+object contents, successful creation after a delete marker, and the existing
+`If-Match` checks. No conditional-write tests are excluded.
+
 ### Custom Configuration Files
 
 ```bash

@@ -179,6 +179,7 @@ impl DefaultObjectUsecase {
             req.uri.query(),
             req.extensions.get::<VerifiedPresignedRequest>().is_some(),
         )?;
+        reject_non_wildcard_write_if_none_match(req.input.if_none_match.as_ref(), &req.headers)?;
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
