@@ -847,9 +847,6 @@ fn is_invalid_oidc_state_error(error: &str) -> bool {
 mod tests {
     use super::*;
     use http::{Extensions, HeaderMap, HeaderValue, Uri};
-    use rustfs_config::{
-        CONSOLE_OIDC_SESSION_DURATION_MAX_SECS, DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS, ENV_CONSOLE_OIDC_SESSION_DURATION,
-    };
     use temp_env::with_var;
 
     #[tokio::test]
@@ -1376,27 +1373,6 @@ mod tests {
             assert!(
                 block.contains(&format!("authorize_oidc_config_request(&req, {action})")),
                 "{handler} must keep authorizing with {action}"
-            );
-        }
-    }
-
-    #[test]
-    fn console_session_duration_follows_the_environment() {
-        for (configured, expected) in [
-            (None, DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS),
-            (Some("7200"), 7200),
-            (Some("604800"), CONSOLE_OIDC_SESSION_DURATION_MAX_SECS),
-            (Some("604801"), CONSOLE_OIDC_SESSION_DURATION_MAX_SECS),
-            (Some("999999999"), CONSOLE_OIDC_SESSION_DURATION_MAX_SECS),
-            (Some("0"), DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS),
-            (Some("-1"), DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS),
-            (Some("60s"), DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS),
-            (Some(""), DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS),
-        ] {
-            let observed = with_var(ENV_CONSOLE_OIDC_SESSION_DURATION, configured, console_session_duration_secs);
-            assert_eq!(
-                observed, expected,
-                "RUSTFS_CONSOLE_OIDC_SESSION_DURATION={configured:?} must resolve to {expected} seconds"
             );
         }
     }

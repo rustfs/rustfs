@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+use crate::{EVENT_OIDC_DIAGNOSTICS, LOG_COMPONENT_IAM, LOG_SUBSYSTEM_OIDC};
 use base64_simd::URL_SAFE_NO_PAD;
 use rustfs_config::oidc::*;
 use rustfs_config::server_config::{Config as ServerConfig, KVS};
@@ -836,10 +837,14 @@ pub fn console_session_duration_secs() -> usize {
 
     if configured > CONSOLE_OIDC_SESSION_DURATION_MAX_SECS {
         warn!(
+            event = EVENT_OIDC_DIAGNOSTICS,
+            component = LOG_COMPONENT_IAM,
+            subsystem = LOG_SUBSYSTEM_OIDC,
+            state = "console_session_duration_clamped",
+            config_key = ENV_CONSOLE_OIDC_SESSION_DURATION,
             configured,
             max = CONSOLE_OIDC_SESSION_DURATION_MAX_SECS,
-            "RUSTFS_CONSOLE_OIDC_SESSION_DURATION is above the maximum; clamping to {} seconds",
-            CONSOLE_OIDC_SESSION_DURATION_MAX_SECS
+            "Console OIDC session duration exceeds the maximum"
         );
         return CONSOLE_OIDC_SESSION_DURATION_MAX_SECS;
     }

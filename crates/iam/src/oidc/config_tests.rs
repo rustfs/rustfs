@@ -18,6 +18,28 @@ use rustfs_config::server_config::{Config as ServerConfig, KVS};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY};
 
 #[test]
+#[serial_test::serial]
+fn console_session_duration_follows_the_environment() {
+    for (configured, expected) in [
+        (None, DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS),
+        (Some("1"), 1),
+        (Some("7200"), 7200),
+        (Some("604800"), CONSOLE_OIDC_SESSION_DURATION_MAX_SECS),
+        (Some("604801"), CONSOLE_OIDC_SESSION_DURATION_MAX_SECS),
+        (Some("999999999"), CONSOLE_OIDC_SESSION_DURATION_MAX_SECS),
+        (Some("18446744073709551615"), CONSOLE_OIDC_SESSION_DURATION_MAX_SECS),
+        (Some("18446744073709551616"), DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS),
+        (Some("0"), DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS),
+        (Some("-1"), DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS),
+        (Some("60s"), DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS),
+        (Some(""), DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS),
+    ] {
+        let observed = temp_env::with_var(ENV_CONSOLE_OIDC_SESSION_DURATION, configured, console_session_duration_secs);
+        assert_eq!(observed, expected, "Console OIDC session duration for {configured:?}");
+    }
+}
+
+#[test]
 fn test_parse_single_provider_no_config_url() {
     let config = parse_single_provider("_TEST_EMPTY", "test_empty");
     assert!(config.is_none());

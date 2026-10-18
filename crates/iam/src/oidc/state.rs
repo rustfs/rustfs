@@ -312,23 +312,23 @@ mod tests {
 
     #[test]
     #[serial]
-    fn logout_retention_defaults_to_one_hour() {
-        temp_env::with_var(ENV_CONSOLE_OIDC_SESSION_DURATION, None::<&str>, || {
-            let ttl = OidcStateStore::new().logout_cache.policy().time_to_live();
-            assert_eq!(ttl, Some(Duration::from_secs(3600)));
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn logout_retention_tracks_an_extended_session() {
-        temp_env::with_var(ENV_CONSOLE_OIDC_SESSION_DURATION, Some("7200"), || {
-            let ttl = OidcStateStore::new().logout_cache.policy().time_to_live();
-            assert_eq!(
-                ttl,
-                Some(Duration::from_secs(7200)),
-                "a two-hour session must keep its logout token for two hours"
-            );
-        });
+    fn logout_retention_follows_the_bounded_session_duration() {
+        for (configured, expected_seconds) in [
+            (None, 3600),
+            (Some("1"), 1),
+            (Some("7200"), 7200),
+            (Some("604801"), 604_800),
+            (Some("18446744073709551615"), 604_800),
+        ] {
+            temp_env::with_var(ENV_CONSOLE_OIDC_SESSION_DURATION, configured, || {
+                let store = OidcStateStore::new();
+                assert_eq!(
+                    store.logout_cache.policy().time_to_live(),
+                    Some(Duration::from_secs(expected_seconds)),
+                    "logout retention for {configured:?} must match the issued session"
+                );
+                assert_eq!(store.cache.policy().time_to_live(), Some(Duration::from_secs(300)));
+            });
+        }
     }
 }
