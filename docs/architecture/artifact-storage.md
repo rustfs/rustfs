@@ -125,9 +125,10 @@ Bucket deletion settles pending cleanup under its existing write owner and tries
 required namespaces without waiting for a competing volume reader. Successful
 physical volume deletion retires old snapshot state before releasing that owner,
 including when the caller has already been cancelled.
-The incarnation-bound heal path retains its separate admission. Other legacy
-mutation routes and internal metadata publication still need their own admission
-boundary before distributed artifact sealing can be enabled.
+The incarnation-bound heal path retains its separate admission. Internal bucket
+metadata continues to use its existing owned publication transaction. These
+boundaries complement the receiver-side artifact PUT leases; they do not enable
+distributed repair or garbage collection.
 
 Inline `RenameData` retains the backup namespace mutex during rollback-backup
 publication. Because it already owns a volume read lock, it acquires this second
@@ -162,17 +163,20 @@ prevent later PUT, multipart completion, copy, replication, or restore writes.
 
 `ECStore::seal_artifact_attempt_puts` in `crates/ecstore/src/bucket/artifact.rs`
 provides a narrower storage-library operation for ordinary owned ECStore PUTs
-on stores using local disks only.
+on local stores and Unix distributed stores with URL endpoints.
 The record binds the bucket incarnation and full attempt prefix. Only a missing
 record permits a PUT; a matching record rejects it, and malformed records or
 failed reads also reject it. Repeating the seal verifies the same identity.
 
-Distributed or remote-disk configurations reject artifact PUTs and this seal
-operation. Receiver-side fencing is implemented, but the full distributed
-admission boundary is not yet enabled. In particular, classification of a legacy
-RPC as an ordinary-bucket write must remain valid through physical completion,
-including cancellation and bucket deletion/recreation. A remote timeout, quorum
-response or expired lock lease cannot prove that a physical writer stopped.
+Artifact bucket creation, inspection, ordinary PUT and PUT sealing use the
+configured storage topology and require namespace locking. Distributed operation
+requires URL endpoints and Unix physical disk leases on every receiver; merely
+changing the setup mode of local file endpoints does not enable it. Repair,
+repair sealing and version retirement remain local-only; this does not enable
+distributed garbage collection. The legacy RPC boundary retains its admission
+owner through physical completion, including cancellation and bucket recreation.
+A remote timeout, quorum response or expired lock lease cannot prove that a
+physical writer stopped.
 
 Each managed PUT now carries its metadata-derived identity into the physical
 local disk writer. On Unix, a descriptor-pinned directory under
@@ -192,8 +196,9 @@ receivers validate the bucket incarnation; seal requests also bind the expected
 physical disk UUID. Seal response proofs cover the complete request, actual disk
 identity and outcome. Old peers cannot be used through a legacy-method fallback.
 The coordinator requires every configured disk, including offline slots, and
-rejects missing or mismatched identities. These receiver mechanisms alone do
-not authorize enabling distributed artifact buckets or garbage collection.
+rejects missing or mismatched identities, including on retries after the seal
+record already exists. Ordinary PUT retains its write quorum; successful sealing
+requires confirmation from every configured receiver.
 
 The PUT commit path takes locks in this order: bucket lifecycle, attempt record,
 then target object. Same-attempt commits are serialized; uploading a body does
@@ -202,6 +207,19 @@ attempt guard after a quorum response or cancellation of the request waiter.
 The seal takes the same attempt lock and persists its record with all metadata
 writes drained before returning. Thus it waits for admitted ordinary PUTs and
 prevents later ordinary PUT publication, including after a restart.
+
+The four-node scenarios in
+`crates/e2e_test/src/distributed/artifact_seal_test.rs` exercise cross-node
+versioned PUT/GET, full restart, and exact seal retries with an offline receiver,
+including retries after a successful seal. Other attempts in the managed bucket
+and ordinary buckets remain writable. After a receiver restarts, HTTP readiness
+does not imply that peers have re-established its disk connection; retry the
+same seal identity until a successful receipt confirms every receiver.
+
+These scenarios do not inject a disconnected request with an unfinished physical
+write, power loss, disk replacement, or backup restoration. Those fault boundaries
+need separate evidence; successful ordinary PUT sealing does not authorize
+repair, version retirement, or GC on distributed stores.
 
 A failed or cancelled seal request may still leave a record for its original
 incarnation. Retry idempotently to confirm success; an error is not proof that
@@ -420,7 +438,9 @@ This deliberately does not reveal internal record paths or distinguish durable
 record corruption from unavailable storage. It also does not mean the operation
 was rolled back: the cancellation-safe storage transaction may still complete.
 Retry the identical target to obtain confirmation; operators must investigate
-persistent failures. Current distributed-topology rejection is retained.
+persistent failures. Repair sealing and version retirement still reject
+distributed topologies; ordinary PUT sealing uses the receiver confirmations
+described above.
 
 Bucket creation does not change STS vending. Existing v1
 vending requires input and output to share the delegation's bucket;
@@ -441,8 +461,9 @@ The controller needs an explicit `admin:CreatePluginArtifactBucket` Allow on
 original-user, built-in IAM, request-instance and body/deadline checks apply.
 Unknown fields and invalid bucket names or base prefixes are rejected.
 
-The storage helper first requires local-only configured endpoints and enabled
-namespace locking. It invokes the existing creation transaction with an
+The storage helper requires a supported configured topology (local storage or
+Unix distributed URL endpoints) and enabled namespace locking. It invokes the
+existing creation transaction with an
 immutable artifact namespace and versioning enabled. It does not change the
 type of an existing bucket or turn an existing-bucket failure into success.
 `BucketExists` maps to `BucketAlreadyExists`; other unconfirmed storage outcomes
@@ -465,7 +486,7 @@ error and is not a substitute for confirming identity. No GC authority follows.
 The `artifact_bucket_create_*` handler tests reuse the four-disk S4 fixture and
 real IAM. They cover creation and persisted identity, existing-bucket failures
 without changing type, bucket-resource authorization, request-instance isolation,
-distributed-topology rejection before creation, and actual delete/recreate with
+rejection of file endpoints mislabeled as distributed before creation, and actual delete/recreate with
 old-receipt rejection. The handler recreation test performs two completed creations with the same
 prefix, and checks both rejection of the old incarnation and acceptance of the
 current one. The storage test `artifact_bucket_create_observes_current_generation`
@@ -522,4 +543,5 @@ and rejection without retyping or creation. They dispatch the internal handler,
 not a signed network request. The storage tests reopen the store before reading,
 assert that a real pending intent's bytes stay unchanged, and verify that legacy
 volumes and missing buckets gain no metadata or incarnation records. Namespace
-locking and local-topology rejection are covered independently.
+locking and rejection of file endpoints mislabeled as distributed are covered
+independently.

@@ -478,11 +478,10 @@ async fn artifact_put_physical_timeout_case() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(storage_class_env)]
-async fn artifact_put_seal_rejects_distributed_topology_and_preserves_ordinary_local_puts() {
+async fn artifact_put_seal_rejects_mismatched_topology_and_preserves_ordinary_local_puts() {
     use crate::layout::endpoints::SetupType;
 
-    const LOCAL_ONLY_ERROR: &str =
-        "artifact PUT sealing requires local-only storage; distributed or remote endpoints are unsupported";
+    const TOPOLOGY_ERROR: &str = "artifact PUT sealing requires local storage or a distributed Unix URL topology";
     let root = tempfile::tempdir().expect("artifact distributed topology directory");
     let (ctx, store, shutdown) = open_store(root.path()).await;
     ctx.update_erasure_type(SetupType::Erasure).await;
@@ -521,19 +520,19 @@ async fn artifact_put_seal_rejects_distributed_topology_and_preserves_ordinary_l
             },
         )
         .await
-        .expect_err("distributed artifact PUT must be rejected before publication");
-    assert!(rejected.to_string().contains(LOCAL_ONLY_ERROR), "ARTIFACT_PUT_LOCAL_ONLY: {rejected}");
+        .expect_err("file endpoints with distributed lock mode must be rejected before publication");
+    assert!(rejected.to_string().contains(TOPOLOGY_ERROR), "ARTIFACT_PUT_TOPOLOGY: {rejected}");
     assert_eq!(
         disk_metadata(&store, bucket, &object).await,
         before,
-        "ARTIFACT_PUT_LOCAL_ONLY: no disk gains a version"
+        "ARTIFACT_PUT_TOPOLOGY: no disk gains a version"
     );
     let rejected = store
         .clone()
         .seal_artifact_attempt_puts(bucket, incarnation, &prefix)
         .await
-        .expect_err("distributed topology cannot claim a durable PUT seal");
-    assert!(rejected.to_string().contains(LOCAL_ONLY_ERROR), "ARTIFACT_PUT_LOCAL_ONLY: {rejected}");
+        .expect_err("mismatched topology cannot claim a durable PUT seal");
+    assert!(rejected.to_string().contains(TOPOLOGY_ERROR), "ARTIFACT_PUT_TOPOLOGY: {rejected}");
     // This local fixture has no distributed lock clients; ordinary PUT retains its local regression check.
     ctx.update_erasure_type(SetupType::Erasure).await;
     let second = put(&store, ordinary, &object).await;

@@ -99,7 +99,7 @@ impl ArtifactPutTarget {
         object: &str,
         opts: &ObjectOptions,
     ) -> Result<ArtifactPutGuard> {
-        require_local_put_seal_topology(&store).await?;
+        require_put_seal_topology(&store).await?;
         if store.ctx.lock_manager().is_disabled() {
             return Err(Error::other("artifact PUT requires namespace locking"));
         }
@@ -335,6 +335,34 @@ fn local_put_seal_endpoints(endpoints: &[crate::layout::endpoint::Endpoint]) -> 
     !endpoints.is_empty() && endpoints.iter().all(|endpoint| endpoint.is_local)
 }
 
+fn put_seal_endpoints(endpoints: &[crate::layout::endpoint::Endpoint], distributed: bool) -> bool {
+    if !distributed {
+        return local_put_seal_endpoints(endpoints);
+    }
+    cfg!(unix)
+        && !endpoints.is_empty()
+        && endpoints
+            .iter()
+            .all(|endpoint| endpoint.get_type() == crate::layout::endpoint::EndpointType::Url)
+}
+
+async fn require_put_seal_topology(store: &ECStore) -> Result<()> {
+    let distributed = store.ctx.is_dist_erasure().await;
+    // Initialization validates endpoint uniqueness and layout. Check configured
+    // members here, not only online disks; seal confirms every receiver later.
+    if store.pools.is_empty()
+        || store
+            .pools
+            .iter()
+            .any(|pool| !put_seal_endpoints(pool.endpoints.endpoints.as_ref(), distributed))
+    {
+        return Err(Error::other(
+            "artifact PUT sealing requires local storage or a distributed Unix URL topology",
+        ));
+    }
+    Ok(())
+}
+
 async fn require_local_put_seal_topology(store: &ECStore) -> Result<()> {
     // Use the configured endpoints retained by every pool, including offline
     // members. Online disk snapshots cannot prove absence of remote writers.
@@ -397,7 +425,7 @@ impl ECStore {
     /// Create a dedicated versioned bucket and observe its current incarnation.
     /// A successful receipt does not assert that this request created that generation.
     pub async fn make_artifact_bucket(self: Arc<Self>, bucket: &str, base_prefix: &str) -> Result<Uuid> {
-        require_local_put_seal_topology(&self).await?;
+        require_put_seal_topology(&self).await?;
         if self.ctx.lock_manager().is_disabled() {
             return Err(Error::other("artifact bucket creation requires namespace locking"));
         }
@@ -417,7 +445,7 @@ impl ECStore {
     /// Observe an existing managed bucket without creating or migrating metadata.
     /// This identity must still be checked by every subsequent storage operation.
     pub async fn inspect_artifact_bucket(&self, bucket: &str, base_prefix: &str) -> Result<Uuid> {
-        require_local_put_seal_topology(self).await?;
+        require_put_seal_topology(self).await?;
         if self.ctx.lock_manager().is_disabled() {
             return Err(Error::other("artifact bucket inspection requires namespace locking"));
         }
@@ -892,7 +920,7 @@ impl ECStore {
     ) -> Result<()> {
         // Keep the transaction and receiver fan-out out of caller future layouts.
         Box::pin(async move {
-            require_local_put_seal_topology(&self).await?;
+            require_put_seal_topology(&self).await?;
             if self.ctx.lock_manager().is_disabled() {
                 return Err(Error::other("artifact PUT sealing requires namespace locking"));
             }
@@ -940,6 +968,35 @@ mod tests {
         assert!(local_put_seal_endpoints(std::slice::from_ref(&local)));
         assert!(!local_put_seal_endpoints(&[]), "ARTIFACT_PUT_LOCAL_TOPOLOGY_REQUIRED");
         assert!(!local_put_seal_endpoints(&[local, remote]), "ARTIFACT_PUT_LOCAL_TOPOLOGY_REQUIRED");
+    }
+
+    #[test]
+    fn artifact_put_seal_topology_matches_endpoint_and_lock_modes() {
+        use crate::layout::endpoint::Endpoint;
+
+        let local = Endpoint::try_from("/tmp/artifact-local-disk").expect("local endpoint");
+        let mut local_url = Endpoint::try_from("http://127.0.0.1:9000/disk").expect("local URL endpoint");
+        local_url.is_local = true;
+        let remote = Endpoint::try_from("http://192.0.2.1:9000/disk").expect("remote endpoint");
+
+        assert!(put_seal_endpoints(std::slice::from_ref(&local), false));
+        assert!(put_seal_endpoints(std::slice::from_ref(&local_url), false));
+        assert!(
+            !put_seal_endpoints(std::slice::from_ref(&local), true),
+            "dist flag cannot convert file endpoints"
+        );
+        assert!(
+            !put_seal_endpoints(std::slice::from_ref(&remote), false),
+            "remote writers require distributed locks"
+        );
+        assert!(
+            !put_seal_endpoints(&[local, remote.clone()], true),
+            "mixed file and URL endpoints are unsupported"
+        );
+        assert!(!put_seal_endpoints(&[], false));
+        assert!(!put_seal_endpoints(&[], true));
+        // The configured remote member needs no online Disk to be included.
+        assert_eq!(put_seal_endpoints(&[local_url, remote], true), cfg!(unix));
     }
 
     #[test]

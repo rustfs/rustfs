@@ -726,8 +726,12 @@ async fn artifact_bucket_inspect_reopens_without_migrating_other_buckets() {
     let error = store
         .inspect_artifact_bucket(bucket, PREFIX)
         .await
-        .expect_err("remote capability unsupported");
-    assert!(error.to_string().contains("local-only storage"));
+        .expect_err("file endpoints cannot use distributed lock mode");
+    assert!(
+        error
+            .to_string()
+            .contains("artifact PUT sealing requires local storage or a distributed Unix URL topology")
+    );
     shutdown.cancel();
 }
 
