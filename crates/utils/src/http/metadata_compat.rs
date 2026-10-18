@@ -468,6 +468,16 @@ mod tests {
     }
 
     #[test]
+    fn test_consistent_str_rejects_conflicting_mixed_case_aliases() {
+        let metadata = HashMap::from([
+            ("X-RustFS-Internal-transition-tier-destination-id".to_string(), "identity-a".to_string()),
+            ("X-Minio-Internal-Transition-Tier-Destination-Id".to_string(), "identity-b".to_string()),
+        ]);
+
+        assert_eq!(get_consistent_str(&metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID), None);
+    }
+
+    #[test]
     fn test_consistent_bytes_accepts_single_or_matching_values_and_rejects_conflicts() {
         let rustfs_key = internal_key_rustfs(SUFFIX_TRANSITION_TIER_DESTINATION_ID);
         let minio_key = format!("{MINIO_INTERNAL_PREFIX}{SUFFIX_TRANSITION_TIER_DESTINATION_ID}");
