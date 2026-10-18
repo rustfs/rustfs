@@ -193,35 +193,56 @@ impl InlineData {
         Ok(fields_len as usize)
     }
 
+    #[inline]
+    fn read_entry_slice<'a>(buf: &'a [u8], cur: &mut Cursor<&'a [u8]>, reject_empty_key: bool) -> Result<(&'a str, &'a [u8])> {
+        let str_len = rmp::decode::read_str_len(cur)? as usize;
+        if str_len > MAX_MSGP_ELEMENT_SIZE {
+            return Err(Error::other(format!(
+                "corrupt msgpack element: length {str_len} exceeds the {MAX_MSGP_ELEMENT_SIZE} byte limit"
+            )));
+        }
+        let key_start = cur.position() as usize;
+        let key_end = key_start
+            .checked_add(str_len)
+            .ok_or_else(|| Error::other("InlineData key out of range"))?;
+        let key_bytes = buf
+            .get(key_start..key_end)
+            .ok_or_else(|| Error::from(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "failed to fill whole buffer")))?;
+        let field = std::str::from_utf8(key_bytes).map_err(|e| Error::FromUtf8(e.to_string()))?;
+        if reject_empty_key && field.is_empty() {
+            return Err(Error::other("InlineData key empty"));
+        }
+        cur.set_position(key_end as u64);
+
+        let bin_len = rmp::decode::read_bin_len(cur)? as usize;
+        let start = cur.position() as usize;
+        let end = start
+            .checked_add(bin_len)
+            .ok_or_else(|| Error::other("InlineData value out of range"))?;
+        let value = buf
+            .get(start..end)
+            .ok_or_else(|| Error::other("InlineData value out of range"))?;
+        cur.set_position(end as u64);
+        Ok((field, value))
+    }
+
     pub fn find(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        if self.0.is_empty() || !self.version_ok() {
+        Self::find_in_slice(&self.0, key)
+    }
+
+    pub(crate) fn find_in_slice(raw: &[u8], key: &str) -> Result<Option<Vec<u8>>> {
+        if raw.is_empty() || raw[0] == 0 || raw[0] > INLINE_DATA_VER {
             return Ok(None);
         }
 
-        let buf = self.after_version();
-
+        let buf = &raw[1..];
         let mut cur = Cursor::new(buf);
-
         let mut fields_len = rmp::decode::read_map_len(&mut cur)?;
 
         while fields_len > 0 {
             fields_len -= 1;
-
-            let str_len = rmp::decode::read_str_len(&mut cur)?;
-
-            let field_buff = read_exact_vec(&mut cur, str_len as usize)?;
-
-            let field = String::from_utf8(field_buff)?;
-
-            let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
-            let start = cur.position() as usize;
-            let end = start + bin_len;
-            let value = buf
-                .get(start..end)
-                .ok_or_else(|| Error::other("InlineData value out of range"))?;
-            cur.set_position(end as u64);
-
-            if field.as_str() == key {
+            let (field, value) = Self::read_entry_slice(buf, &mut cur, false)?;
+            if field == key {
                 return Ok(Some(value.to_vec()));
             }
         }
@@ -230,34 +251,21 @@ impl InlineData {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.0.is_empty() {
+        Self::validate_slice(&self.0)
+    }
+
+    pub(crate) fn validate_slice(raw: &[u8]) -> Result<()> {
+        if raw.is_empty() {
             return Ok(());
         }
 
-        let buf = self.after_version();
+        let buf = &raw[1..];
         let mut cur = Cursor::new(buf);
-
         let mut fields_len = rmp::decode::read_map_len(&mut cur)?;
 
         while fields_len > 0 {
             fields_len -= 1;
-
-            let str_len = rmp::decode::read_str_len(&mut cur)?;
-
-            let field_buff = read_exact_vec(&mut cur, str_len as usize)?;
-
-            let field = String::from_utf8(field_buff)?;
-            if field.is_empty() {
-                return Err(Error::other("InlineData key empty"));
-            }
-
-            let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
-            let start = cur.position() as usize;
-            let end = start + bin_len;
-            if end > buf.len() {
-                return Err(Error::other("InlineData value out of range"));
-            }
-            cur.set_position(end as u64);
+            let _ = Self::read_entry_slice(buf, &mut cur, true)?;
         }
 
         Ok(())
