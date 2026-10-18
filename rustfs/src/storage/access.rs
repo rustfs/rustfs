@@ -146,7 +146,7 @@ struct RequestedObjectLockRetention(ObjectLockRetention);
 /// These operations stage upload state without publishing an object. Keep this
 /// separate from the marker controlling multipart publication fences.
 #[derive(Clone, Copy, Debug)]
-struct MultipartStagingOperation;
+pub(crate) struct MultipartStagingOperation;
 
 impl MultipartStagingOperation {
     fn for_operation(operation: &str) -> Option<Self> {
