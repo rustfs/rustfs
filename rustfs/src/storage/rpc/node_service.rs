@@ -1705,6 +1705,27 @@ impl Node for NodeService {
         self.handle_artifact_rename_data(request).await
     }
 
+    async fn artifact_repair_rename_data(
+        &self,
+        request: Request<ArtifactRepairRenameDataRequest>,
+    ) -> Result<Response<RenameDataResponse>, Status> {
+        self.handle_artifact_repair_rename_data(request).await
+    }
+
+    async fn artifact_repair_write_metadata(
+        &self,
+        request: Request<ArtifactRepairWriteMetadataRequest>,
+    ) -> Result<Response<WriteMetadataResponse>, Status> {
+        self.handle_artifact_repair_write_metadata(request).await
+    }
+
+    async fn seal_artifact_attempt_repairs(
+        &self,
+        request: Request<SealArtifactAttemptPutsRequest>,
+    ) -> Result<Response<SealArtifactAttemptPutsResponse>, Status> {
+        self.handle_seal_artifact_attempt_repairs(request).await
+    }
+
     async fn seal_artifact_attempt_puts(
         &self,
         request: Request<SealArtifactAttemptPutsRequest>,
@@ -3073,25 +3094,26 @@ mod tests {
     use rustfs_protos::models::PingBodyBuilder;
     use rustfs_protos::proto_gen::node_service::scanner_control_service_server::ScannerControlService as _;
     use rustfs_protos::proto_gen::node_service::{
-        BackgroundHealStatusRequest, BatchGenerallyLockRequest, CancelDecommissionRequest, CheckPartsRequest,
-        ClearDecommissionRequest, CompareAndUpdateFileRequest, ControlPlaneErrorCode, DeleteBucketMetadataRequest,
-        DeleteBucketRequest, DeletePathsRequest, DeletePolicyRequest, DeleteRequest, DeleteServiceAccountRequest,
-        DeleteUserRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest, DiskInfoRequest,
-        DownloadProfileDataRequest, GenerallyLockRequest, GetAllBucketStatsRequest, GetBucketInfoRequest,
-        GetBucketStatsDataRequest, GetCpusRequest, GetMemInfoRequest, GetMetacacheListingRequest, GetMetricsRequest,
-        GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest,
-        GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest, HealBucketRequest, HealControlRequest,
-        HealControlResponse, ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest, LoadGroupRequest,
-        LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
-        LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest, MakeVolumeRequest,
-        MakeVolumesRequest, Mss, PingRequest, PreparePartTransactionRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest,
-        ReadVersionRequest, ReadXlRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest,
-        RenameFileRequest, RenamePartRequest, ScannerActivityRequest, ScannerDirtyUsageSnapshotRequest,
-        ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest, ServerInfoRequest, SettlePartTransactionRequest,
-        SignalServiceRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
-        StartDecommissionRequest, StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest, TierMutationAbortRequest,
-        TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest, UpdateMetacacheListingRequest,
-        UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest, WriteRequest,
+        ArtifactRepairRenameDataRequest, ArtifactRepairWriteMetadataRequest, BackgroundHealStatusRequest,
+        BatchGenerallyLockRequest, CancelDecommissionRequest, CheckPartsRequest, ClearDecommissionRequest,
+        CompareAndUpdateFileRequest, ControlPlaneErrorCode, DeleteBucketMetadataRequest, DeleteBucketRequest, DeletePathsRequest,
+        DeletePolicyRequest, DeleteRequest, DeleteServiceAccountRequest, DeleteUserRequest, DeleteVersionRequest,
+        DeleteVersionsRequest, DeleteVolumeRequest, DiskInfoRequest, DownloadProfileDataRequest, GenerallyLockRequest,
+        GetAllBucketStatsRequest, GetBucketInfoRequest, GetBucketStatsDataRequest, GetCpusRequest, GetMemInfoRequest,
+        GetMetacacheListingRequest, GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest,
+        GetProcInfoRequest, GetSeLinuxInfoRequest, GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest,
+        HealBucketRequest, HealControlRequest, HealControlResponse, ListBucketRequest, ListDirRequest, ListVolumesRequest,
+        LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest,
+        LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest,
+        MakeVolumeRequest, MakeVolumesRequest, Mss, PingRequest, PreparePartTransactionRequest, ReadAllRequest, ReadAtRequest,
+        ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest,
+        RenameDataRequest, RenameFileRequest, RenamePartRequest, ScannerActivityRequest, ScannerDirtyUsageSnapshotRequest,
+        ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest, SealArtifactAttemptPutsRequest, ServerInfoRequest,
+        SettlePartTransactionRequest, SignalServiceRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest,
+        SnapshotLeaseRequest, StartDecommissionRequest, StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest,
+        TierMutationAbortRequest, TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest,
+        UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
+        WriteRequest,
         heal_control_service_client::HealControlServiceClient,
         heal_control_service_server::{HealControlService as _, HealControlServiceServer},
         node_service_client::NodeServiceClient,
@@ -3109,8 +3131,11 @@ mod tests {
     use tonic::{Request, Response, Status};
     use uuid::Uuid;
 
-    const DISK_MUTATION_RPC_METHODS: [&str; 26] = [
+    const DISK_MUTATION_RPC_METHODS: [&str; 29] = [
         "artifactrenamedata",
+        "artifactrepairrenamedata",
+        "artifactrepairwritemetadata",
+        "sealartifactattemptrepairs",
         "sealartifactattemptputs",
         "renamedata",
         "renamedataatincarnation",
@@ -4468,6 +4493,37 @@ mod tests {
             rustfs_protos::canonical_artifact_rename_data_request_body
         );
         assert_gated!(
+            artifact_repair_rename_data,
+            ArtifactRepairRenameDataRequest {
+                rename: Some(RenameDataRequest {
+                    bucket_incarnation_id: vec![1; 16].into(),
+                    ..Default::default()
+                }),
+                expected_disk_id: vec![2; 16].into(),
+            },
+            rustfs_protos::canonical_artifact_repair_rename_data_request_body
+        );
+        assert_gated!(
+            artifact_repair_write_metadata,
+            ArtifactRepairWriteMetadataRequest {
+                metadata: Some(WriteMetadataRequest {
+                    bucket_incarnation_id: vec![1; 16].into(),
+                    ..Default::default()
+                }),
+                expected_disk_id: vec![2; 16].into(),
+            },
+            rustfs_protos::canonical_artifact_repair_write_metadata_request_body
+        );
+        assert_gated!(
+            seal_artifact_attempt_repairs,
+            SealArtifactAttemptPutsRequest {
+                bucket_incarnation_id: vec![1; 16].into(),
+                expected_disk_id: vec![2; 16].into(),
+                ..Default::default()
+            },
+            rustfs_protos::canonical_seal_artifact_attempt_repairs_request_body
+        );
+        assert_gated!(
             seal_artifact_attempt_puts,
             rustfs_protos::proto_gen::node_service::SealArtifactAttemptPutsRequest {
                 disk: disk.clone(),
@@ -4796,6 +4852,21 @@ mod tests {
             artifact_rename_data,
             RenameDataRequest::default(),
             rustfs_protos::canonical_artifact_rename_data_request_body
+        );
+        assert_requires_v2_body!(
+            artifact_repair_rename_data,
+            ArtifactRepairRenameDataRequest::default(),
+            rustfs_protos::canonical_artifact_repair_rename_data_request_body
+        );
+        assert_requires_v2_body!(
+            artifact_repair_write_metadata,
+            ArtifactRepairWriteMetadataRequest::default(),
+            rustfs_protos::canonical_artifact_repair_write_metadata_request_body
+        );
+        assert_requires_v2_body!(
+            seal_artifact_attempt_repairs,
+            SealArtifactAttemptPutsRequest::default(),
+            rustfs_protos::canonical_seal_artifact_attempt_repairs_request_body
         );
         assert_requires_v2_body!(
             seal_artifact_attempt_puts,

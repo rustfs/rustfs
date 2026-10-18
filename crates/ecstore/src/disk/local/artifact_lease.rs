@@ -17,24 +17,55 @@ use std::{fs::File, sync::Arc};
 
 /// A target disk's admitted artifact publication. Physical mutation workers
 /// retain this Arc until their final syscall and rollback have finished.
-pub struct ArtifactPutLease {
+pub struct ArtifactLease {
     _active: File,
     _key_directory: File,
     _seal_directory: File,
     _root: File,
 }
 
-pub(super) async fn pinned_root(disk: Arc<super::LocalDisk>) -> Result<File> {
+pub type ArtifactPutLease = ArtifactLease;
+pub type ArtifactRepairLease = ArtifactLease;
+
+#[derive(Clone, Copy)]
+pub(crate) enum Domain {
+    Put,
+    Repair,
+}
+
+impl Domain {
+    fn directory(self) -> &'static str {
+        match self {
+            Self::Put => ".rustfs-artifact-put-seals",
+            Self::Repair => ".rustfs-artifact-repair-seals",
+        }
+    }
+
+    fn closed(self) -> &'static [u8] {
+        match self {
+            Self::Put => b"rustfs-artifact-put-sealed-v1\n",
+            Self::Repair => b"rustfs-artifact-repair-sealed-v1\n",
+        }
+    }
+}
+
+pub(super) async fn pinned_root(disk: &super::LocalDisk) -> Result<File> {
+    #[cfg(target_os = "linux")]
+    let mount = disk.mount_lease.clone();
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let path = disk.io_root().to_owned();
+    #[cfg(not(unix))]
+    let _ = disk;
     tokio::task::spawn_blocking(move || {
         #[cfg(target_os = "linux")]
         {
-            disk.mount_lease.try_clone().map_err(DiskError::from)
+            mount.try_clone().map_err(DiskError::from)
         }
         #[cfg(all(unix, not(target_os = "linux")))]
         {
             use rustix::fs::{Mode, OFlags, open};
             open(
-                disk.io_root(),
+                path,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )
@@ -44,8 +75,7 @@ pub(super) async fn pinned_root(disk: Arc<super::LocalDisk>) -> Result<File> {
         }
         #[cfg(not(unix))]
         {
-            let _ = disk;
-            Err(DiskError::other("artifact PUT disk leases require Unix"))
+            Err(DiskError::other("artifact disk leases require Unix"))
         }
     })
     .await
@@ -53,26 +83,34 @@ pub(super) async fn pinned_root(disk: Arc<super::LocalDisk>) -> Result<File> {
 }
 
 pub(super) async fn acquire(root: File, key: [u8; 32]) -> Result<Arc<ArtifactPutLease>> {
+    acquire_in(root, key, Domain::Put).await
+}
+
+pub(super) async fn acquire_in(root: File, key: [u8; 32], domain: Domain) -> Result<Arc<ArtifactLease>> {
     #[cfg(unix)]
     {
-        unix::acquire(root, key).await
+        unix::acquire(root, key, domain).await
     }
     #[cfg(not(unix))]
     {
-        let _ = (root, key);
-        Err(DiskError::other("artifact PUT disk leases require Unix"))
+        let _ = (root, key, domain);
+        Err(DiskError::other("artifact disk leases require Unix"))
     }
 }
 
 pub(super) async fn seal(root: File, key: [u8; 32]) -> Result<()> {
+    seal_in(root, key, Domain::Put).await
+}
+
+pub(super) async fn seal_in(root: File, key: [u8; 32], domain: Domain) -> Result<()> {
     #[cfg(unix)]
     {
-        unix::seal(root, key).await
+        unix::seal(root, key, domain).await
     }
     #[cfg(not(unix))]
     {
-        let _ = (root, key);
-        Err(DiskError::other("artifact PUT disk leases require Unix"))
+        let _ = (root, key, domain);
+        Err(DiskError::other("artifact disk leases require Unix"))
     }
 }
 
@@ -83,8 +121,6 @@ mod unix {
     use rustix::io::Errno;
     use std::{io, io::Read, io::Write, os::unix::fs::MetadataExt, time::Duration};
 
-    pub(super) const DIRECTORY: &str = ".rustfs-artifact-put-seals";
-    const CLOSED: &[u8] = b"rustfs-artifact-put-sealed-v1\n";
     const POLL_INTERVAL: Duration = Duration::from_millis(10);
     const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -94,10 +130,11 @@ mod unix {
         key: File,
         admission: File,
         active: File,
+        domain: Domain,
     }
 
     fn invalid() -> io::Error {
-        io::Error::new(io::ErrorKind::InvalidData, "invalid artifact PUT seal filesystem state")
+        io::Error::new(io::ErrorKind::InvalidData, "invalid artifact seal filesystem state")
     }
 
     fn directory(parent: &File, name: &str, device: u64) -> io::Result<File> {
@@ -140,12 +177,12 @@ mod unix {
     }
 
     impl Opened {
-        fn open(root: File, key: [u8; 32]) -> io::Result<Self> {
+        fn open(root: File, key: [u8; 32], domain: Domain) -> io::Result<Self> {
             let metadata = root.metadata()?;
             if !metadata.is_dir() {
                 return Err(invalid());
             }
-            let seals = directory(&root, DIRECTORY, metadata.dev())?;
+            let seals = directory(&root, domain.directory(), metadata.dev())?;
             let name = hex_simd::encode_to_string(key, hex_simd::AsciiCase::Lower);
             let key = directory(&seals, &name, metadata.dev())?;
             // Neither lock inode is ever removed or replaced, including after
@@ -158,6 +195,7 @@ mod unix {
                 key,
                 admission,
                 active,
+                domain,
             })
         }
 
@@ -172,27 +210,30 @@ mod unix {
                 Err(Errno::NOENT) => return Ok(None),
                 Err(error) => return Err(error.into()),
             };
-            let length = u64::try_from(CLOSED.len()).map_err(|_| invalid())?;
+            let length = u64::try_from(self.domain.closed().len()).map_err(|_| invalid())?;
             if regular(&file, self.root.metadata()?.dev())?.len() != length {
                 return Err(invalid());
             }
-            let mut bytes = vec![0; CLOSED.len()];
+            let mut bytes = vec![0; self.domain.closed().len()];
             file.read_exact(&mut bytes)?;
-            if bytes != CLOSED {
+            if bytes != self.domain.closed() {
                 return Err(invalid());
             }
             Ok(Some(file))
         }
 
-        fn admit(self) -> io::Result<Arc<ArtifactPutLease>> {
+        fn admit(self) -> io::Result<Arc<ArtifactLease>> {
             if self.closed()?.is_some() {
-                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "artifact PUT attempt is closed"));
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "artifact attempt mutation domain is closed",
+                ));
             }
             // Admission serializes the closed check with taking this shared
             // physical owner. A sealer cannot pass between those two steps.
             flock(&self.active, FlockOperation::NonBlockingLockShared)?;
             flock(&self.admission, FlockOperation::Unlock)?;
-            Ok(Arc::new(ArtifactPutLease {
+            Ok(Arc::new(ArtifactLease {
                 _active: self.active,
                 _key_directory: self.key,
                 _seal_directory: self.seals,
@@ -211,7 +252,7 @@ mod unix {
                         Mode::RUSR | Mode::WUSR,
                     )?);
                     regular(&marker, self.root.metadata()?.dev())?;
-                    marker.write_all(CLOSED)?;
+                    marker.write_all(self.domain.closed())?;
                     marker
                 }
             };
@@ -239,18 +280,18 @@ mod unix {
             }
         })
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "artifact PUT disk lease lock deadline"))?
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "artifact disk lease lock deadline"))?
     }
 
-    async fn open(root: File, key: [u8; 32]) -> Result<Opened> {
-        tokio::task::spawn_blocking(move || Opened::open(root, key))
+    async fn open(root: File, key: [u8; 32], domain: Domain) -> Result<Opened> {
+        tokio::task::spawn_blocking(move || Opened::open(root, key, domain))
             .await
             .map_err(DiskError::from)?
             .map_err(DiskError::from)
     }
 
-    pub(super) async fn acquire(root: File, key: [u8; 32]) -> Result<Arc<ArtifactPutLease>> {
-        let opened = open(root, key).await?;
+    pub(super) async fn acquire(root: File, key: [u8; 32], domain: Domain) -> Result<Arc<ArtifactLease>> {
+        let opened = open(root, key, domain).await?;
         // Lock order: admission exclusive -> active shared. Contention sleeps
         // asynchronously; no blocking executor thread waits for another owner.
         lock(&opened.admission, FlockOperation::NonBlockingLockExclusive).await?;
@@ -260,8 +301,8 @@ mod unix {
             .map_err(DiskError::from)
     }
 
-    pub(super) async fn seal(root: File, key: [u8; 32]) -> Result<()> {
-        let opened = open(root, key).await?;
+    pub(super) async fn seal(root: File, key: [u8; 32], domain: Domain) -> Result<()> {
+        let opened = open(root, key, domain).await?;
         lock(&opened.admission, FlockOperation::NonBlockingLockExclusive).await?;
         let opened = tokio::task::spawn_blocking(move || opened.close())
             .await
@@ -293,7 +334,7 @@ mod tests {
     }
 
     fn directory(path: &Path) -> std::path::PathBuf {
-        path.join(unix::DIRECTORY)
+        path.join(Domain::Put.directory())
             .join(hex_simd::encode_to_string(KEY, hex_simd::AsciiCase::Lower))
     }
 
@@ -305,6 +346,85 @@ mod tests {
         })
         .await
         .expect("sealer reaches its monotonic close point");
+    }
+
+    #[tokio::test]
+    async fn artifact_repair_closing_domain_is_independent_and_survives_reopen() {
+        let temp = tempfile::tempdir().expect("disk root");
+        seal(root(temp.path()), KEY).await.expect("PUT closes first");
+        let repair = acquire_in(root(temp.path()), KEY, Domain::Repair)
+            .await
+            .expect("PUT closure permits existing-version repair");
+        assert!(acquire(root(temp.path()), KEY).await.is_err());
+        drop(repair);
+        seal_in(root(temp.path()), KEY, Domain::Repair)
+            .await
+            .expect("repair closes independently");
+        assert!(acquire_in(root(temp.path()), KEY, Domain::Repair).await.is_err());
+        seal_in(root(temp.path()), KEY, Domain::Repair)
+            .await
+            .expect("reopened repair close is durable");
+
+        let other = [8; 32];
+        seal_in(root(temp.path()), other, Domain::Repair)
+            .await
+            .expect("close only repair admission");
+        drop(
+            acquire(root(temp.path()), other)
+                .await
+                .expect("repair closure permits PUT domain"),
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_repair_cancelled_waiter_keeps_physical_owner_and_durable_close() {
+        let temp = tempfile::tempdir().expect("disk root");
+        let writer = acquire_in(root(temp.path()), KEY, Domain::Repair)
+            .await
+            .expect("repair admitted");
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, waiting) = std::sync::mpsc::channel();
+        let owner = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let _owner = writer;
+                let _ = entered.send(());
+                let _ = waiting.recv();
+            })
+            .await
+            .expect("repair worker");
+        });
+        started.await.expect("physical repair entered");
+        owner.abort();
+        assert!(owner.await.expect_err("cancel repair waiter").is_cancelled());
+        let sealer = tokio::spawn(seal_in(root(temp.path()), KEY, Domain::Repair));
+        let marker = temp
+            .path()
+            .join(Domain::Repair.directory())
+            .join(hex_simd::encode_to_string(KEY, hex_simd::AsciiCase::Lower))
+            .join("closed");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("repair admission durably closes");
+        assert!(!sealer.is_finished(), "ARTIFACT_REPAIR_CANCELLED_PHYSICAL_TAIL");
+        sealer.abort();
+        assert!(sealer.await.expect_err("cancel repair close waiter").is_cancelled());
+        assert!(acquire_in(root(temp.path()), KEY, Domain::Repair).await.is_err());
+        let pending = seal_in(root(temp.path()), KEY, Domain::Repair);
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut pending).await.is_err(),
+            "ARTIFACT_REPAIR_REOPEN_MUST_DRAIN_PHYSICAL_TAIL"
+        );
+        release.send(()).expect("release physical repair");
+        tokio::time::timeout(Duration::from_secs(5), &mut pending)
+            .await
+            .expect("physical drain bounded")
+            .expect("reopened close confirms repair drain");
+        assert!(acquire_in(root(temp.path()), KEY, Domain::Repair).await.is_err());
     }
 
     #[tokio::test]
@@ -444,10 +564,10 @@ mod tests {
             let sentinel = outside.path().join("untouched");
             std::fs::write(&sentinel, b"unchanged").expect("sentinel");
             let target = match component {
-                "directory" => temp.path().join(unix::DIRECTORY),
+                "directory" => temp.path().join(Domain::Put.directory()),
                 "key" => {
-                    std::fs::create_dir(temp.path().join(unix::DIRECTORY)).expect("seal directory");
-                    std::fs::set_permissions(temp.path().join(unix::DIRECTORY), std::fs::Permissions::from_mode(0o700))
+                    std::fs::create_dir(temp.path().join(Domain::Put.directory())).expect("seal directory");
+                    std::fs::set_permissions(temp.path().join(Domain::Put.directory()), std::fs::Permissions::from_mode(0o700))
                         .expect("private seal directory");
                     directory(temp.path())
                 }
@@ -510,7 +630,7 @@ mod tests {
         std::fs::create_dir(&current).expect("replacement disk root");
         seal(pin, KEY).await.expect("close original disk through its descriptor");
         assert!(directory(&original).join("closed").exists(), "ARTIFACT_PUT_ROOT_PINNED");
-        assert!(!current.join(unix::DIRECTORY).exists(), "ARTIFACT_PUT_REPLACEMENT_UNTOUCHED");
+        assert!(!current.join(Domain::Put.directory()).exists(), "ARTIFACT_PUT_REPLACEMENT_UNTOUCHED");
         assert!(acquire(root(&original), KEY).await.is_err());
     }
 }

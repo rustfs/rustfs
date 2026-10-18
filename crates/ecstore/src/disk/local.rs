@@ -37,7 +37,8 @@ mod uring_read_chunks;
 #[cfg(any(target_os = "linux", test))]
 #[path = "uring_result_budget.rs"]
 mod uring_result_budget;
-pub use artifact_lease::ArtifactPutLease;
+pub(crate) use artifact_lease::Domain as ArtifactLeaseDomain;
+pub use artifact_lease::{ArtifactPutLease, ArtifactRepairLease};
 pub use replacement_lease::ReplacementExecutionLease;
 
 use crate::crash_inject::{self, CrashPoint};
@@ -7373,13 +7374,23 @@ impl LocalDisk {
     }
 
     pub async fn acquire_artifact_put_lease(self: &Arc<Self>, key: [u8; 32]) -> Result<Arc<ArtifactPutLease>> {
-        let root = artifact_lease::pinned_root(Arc::clone(self)).await?;
+        let root = artifact_lease::pinned_root(self).await?;
         artifact_lease::acquire(root, key).await
     }
 
     pub async fn seal_artifact_puts(self: &Arc<Self>, key: [u8; 32]) -> Result<()> {
-        let root = artifact_lease::pinned_root(Arc::clone(self)).await?;
+        let root = artifact_lease::pinned_root(self).await?;
         artifact_lease::seal(root, key).await
+    }
+
+    pub async fn acquire_artifact_repair_lease(&self, key: [u8; 32]) -> Result<Arc<ArtifactRepairLease>> {
+        let root = artifact_lease::pinned_root(self).await?;
+        artifact_lease::acquire_in(root, key, artifact_lease::Domain::Repair).await
+    }
+
+    pub async fn seal_artifact_repairs(self: &Arc<Self>, key: [u8; 32]) -> Result<()> {
+        let root = artifact_lease::pinned_root(self).await?;
+        artifact_lease::seal_in(root, key, artifact_lease::Domain::Repair).await
     }
 
     pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self> {
@@ -13421,7 +13432,17 @@ impl DiskAPI for LocalDisk {
         if let Some(scope) = &repair_scope {
             scope.check().map_err(Error::other)?;
         }
-        let owner = repair_scope.map(|scope| scope as Arc<dyn Send + Sync>);
+        let repair_lease = if let Some(scope) = &repair_scope {
+            if let Some(identity) = scope.receiver_identity() {
+                scope.check_version(fi.version_id).await.map_err(Error::other)?;
+                Some(self.acquire_artifact_repair_lease(identity.receiver_key).await?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let owner = repair_scope.map(|scope| Arc::new((scope, repair_lease)) as Arc<dyn Send + Sync>);
         let namespace_owner: Option<Arc<dyn Send + Sync>> = Some(os::acquire_metadata_mutation_lease(&object_path, owner).await);
         self.write_metadata_with_namespace_owner(volume, path, fi, namespace_owner, None)
             .await

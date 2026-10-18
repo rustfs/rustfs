@@ -172,6 +172,35 @@ fn validate_bootstrap_volume(volume: &str) -> DiskResult<()> {
     Ok(())
 }
 
+fn canonical_artifact_path(path: &str) -> bool {
+    // Directory keys replace their final slash with the longer on-disk suffix.
+    let logical_len = path
+        .strip_suffix(rustfs_utils::path::GLOBAL_DIR_SUFFIX)
+        .map_or(path.len(), |prefix| prefix.len() + 1);
+    !path.is_empty()
+        && logical_len <= 1024
+        && !has_bad_path_component(path)
+        && !path.contains('\\')
+        && !path.contains('\0')
+        && path.split('/').all(|part| !part.is_empty())
+}
+
+fn validate_artifact_repair_target(target: (&str, &str), fi: &FileInfo, disk: Uuid, incarnation: Uuid) -> DiskResult<()> {
+    if disk.is_nil()
+        || incarnation.is_nil()
+        || fi.version_id.is_none_or(|version| version.is_nil())
+        || has_bad_path_component(target.0)
+        || is_meta_bucketname(target.0)
+        || !canonical_artifact_path(target.1)
+        || fi.name != target.1
+        || (!fi.volume.is_empty() && fi.volume != target.0)
+    {
+        return Err(DiskError::FileAccessDenied);
+    }
+    fi.validate_for_metadata_read()?;
+    Ok(())
+}
+
 impl ECStore {
     pub async fn begin_legacy_local_file_write(
         &self,
@@ -284,6 +313,151 @@ impl ECStore {
             },
         )
         .await
+    }
+
+    pub async fn rename_local_artifact_repair_data(
+        &self,
+        disk_ref: &str,
+        expected_disk: Uuid,
+        source: (&str, &str),
+        fi: &FileInfo,
+        destination: (&str, &str),
+        expected_incarnation: Uuid,
+    ) -> DiskResult<RenameDataResp> {
+        validate_artifact_repair_target(destination, fi, expected_disk, expected_incarnation)?;
+        if source.0 != crate::disk::RUSTFS_META_TMP_BUCKET
+            || !canonical_artifact_path(source.1)
+            || self.ctx.lock_manager().is_disabled()
+        {
+            return Err(DiskError::FileAccessDenied);
+        }
+        // Resolve once; every later identity check and physical worker uses this
+        // captured disk even if its registry entry is replaced during admission.
+        let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
+        let lifecycle = Arc::new(
+            self.acquire_bucket_incarnation_fence(destination.0, expected_incarnation)
+                .await
+                .map_err(|_| DiskError::FileAccessDenied)?,
+        );
+        let (identity, retirement) = self
+            .artifact_repair_receiver_identity(destination.0, expected_incarnation, destination.1, fi.version_id)
+            .await
+            .map_err(|_| DiskError::FileAccessDenied)?;
+        let owner = admit_local_disk(&self.ctx, &disk, id, true).await?;
+        if disk.get_disk_id().await? != Some(expected_disk) || lifecycle.is_lock_lost() || retirement.is_lock_lost() {
+            return Err(DiskError::FileAccessDenied);
+        }
+        let Disk::Local(local) = disk.as_ref() else {
+            return Err(DiskError::DiskNotFound);
+        };
+        let lease = local.acquire_artifact_repair_lease(identity.receiver_key).await?;
+        if lifecycle.is_lock_lost() || retirement.is_lock_lost() {
+            return Err(DiskError::FileAccessDenied);
+        }
+        let physical_owner: Arc<dyn Send + Sync> = Arc::new((owner, Arc::clone(&lifecycle), Arc::clone(&retirement), lease));
+        let result = disk
+            .rename_data_borrowed_with_fence_observed(
+                source.0,
+                source.1,
+                fi,
+                destination.0,
+                destination.1,
+                RenameDataGuards {
+                    namespace_owner: Some(physical_owner),
+                    ..Default::default()
+                },
+            )
+            .await
+            .result;
+        if lifecycle.is_lock_lost() || retirement.is_lock_lost() {
+            return Err(DiskError::FileAccessDenied);
+        }
+        result
+    }
+
+    pub async fn write_local_artifact_repair_metadata(
+        &self,
+        disk_ref: &str,
+        expected_disk: Uuid,
+        target: (&str, &str),
+        fi: FileInfo,
+        expected_incarnation: Uuid,
+    ) -> DiskResult<()> {
+        validate_artifact_repair_target(target, &fi, expected_disk, expected_incarnation)?;
+        if self.ctx.lock_manager().is_disabled() {
+            return Err(DiskError::FileAccessDenied);
+        }
+        let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
+        // Lifecycle -> authoritative records -> disk repair admission -> metadata
+        // RMW/publication locks. No receiver reacquires the attempt write lock.
+        let lifecycle = Arc::new(
+            self.acquire_bucket_incarnation_fence(target.0, expected_incarnation)
+                .await
+                .map_err(|_| DiskError::FileAccessDenied)?,
+        );
+        let (identity, retirement) = self
+            .artifact_repair_receiver_identity(target.0, expected_incarnation, target.1, fi.version_id)
+            .await
+            .map_err(|_| DiskError::FileAccessDenied)?;
+        let owner = admit_local_disk(&self.ctx, &disk, id, true).await?;
+        if disk.get_disk_id().await? != Some(expected_disk) || lifecycle.is_lock_lost() || retirement.is_lock_lost() {
+            return Err(DiskError::FileAccessDenied);
+        }
+        let Disk::Local(local) = disk.as_ref() else {
+            return Err(DiskError::DiskNotFound);
+        };
+        let lease = local.acquire_artifact_repair_lease(identity.receiver_key).await?;
+        if lifecycle.is_lock_lost() || retirement.is_lock_lost() {
+            return Err(DiskError::FileAccessDenied);
+        }
+        let physical_owner: Arc<dyn Send + Sync> = Arc::new((owner, Arc::clone(&lifecycle), Arc::clone(&retirement), lease));
+        let publication = disk
+            .begin_legacy_metadata_write_with_namespace_owner(target.0, target.1, Some(physical_owner))
+            .await?;
+        let result = publication.write_metadata(fi).await;
+        if lifecycle.is_lock_lost() || retirement.is_lock_lost() {
+            return Err(DiskError::FileAccessDenied);
+        }
+        result
+    }
+
+    pub async fn seal_local_artifact_repairs(
+        &self,
+        disk_ref: &str,
+        expected_disk: Uuid,
+        bucket: &str,
+        expected_incarnation: Uuid,
+        attempt_prefix: &str,
+    ) -> DiskResult<Uuid> {
+        if expected_disk.is_nil()
+            || expected_incarnation.is_nil()
+            || has_bad_path_component(bucket)
+            || is_meta_bucketname(bucket)
+            || self.ctx.lock_manager().is_disabled()
+        {
+            return Err(DiskError::FileAccessDenied);
+        }
+        let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
+        let lifecycle = self
+            .acquire_bucket_incarnation_fence(bucket, expected_incarnation)
+            .await
+            .map_err(|_| DiskError::FileAccessDenied)?;
+        let identity = self
+            .artifact_receiver_identity(bucket, expected_incarnation, attempt_prefix, true)
+            .await
+            .map_err(|_| DiskError::FileAccessDenied)?;
+        let _owner = admit_local_disk(&self.ctx, &disk, id, true).await?;
+        if disk.get_disk_id().await? != Some(expected_disk) || lifecycle.is_lock_lost() {
+            return Err(DiskError::FileAccessDenied);
+        }
+        let Disk::Local(local) = disk.as_ref() else {
+            return Err(DiskError::DiskNotFound);
+        };
+        local.seal_artifact_repairs(identity.receiver_key).await?;
+        if lifecycle.is_lock_lost() {
+            return Err(DiskError::FileAccessDenied);
+        }
+        Ok(expected_disk)
     }
 
     /// A receiver acknowledgment means this exact disk has durably closed the
@@ -903,6 +1077,23 @@ mod tests {
     use super::*;
     use crate::disk::new_disk;
     use crate::layout::endpoints::{Endpoints, PoolEndpoints};
+
+    #[test]
+    fn artifact_repair_path_length_uses_logical_directory_key() {
+        use rustfs_utils::path::encode_dir_object;
+
+        for len in 1017..=1024 {
+            let key = format!("{}/", "a".repeat(len - 1));
+            assert!(canonical_artifact_path(&encode_dir_object(&key)), "logical length {len}");
+        }
+        assert!(canonical_artifact_path(&"a".repeat(1024)));
+        assert!(!canonical_artifact_path(&"a".repeat(1025)));
+        assert!(!canonical_artifact_path(&encode_dir_object(&format!("{}/", "a".repeat(1024)))));
+        assert!(!canonical_artifact_path(&format!("{}__XLDIR____XLDIR__", "a".repeat(1023))));
+        for path in ["", "a//b", "a/../b", "a\\b", "a\0b"] {
+            assert!(!canonical_artifact_path(path), "noncanonical path {path:?}");
+        }
+    }
 
     fn single_local_disk_pools(dir: &std::path::Path) -> EndpointServerPools {
         let mut endpoint = Endpoint::try_from(dir.to_str().expect("temp dir path should be utf-8")).expect("local endpoint");

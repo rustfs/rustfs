@@ -56,6 +56,7 @@ async fn disk(store: &ECStore) -> (DiskStore, String, Uuid) {
 
 async fn stage(disk: &DiskStore, source: &str, object: &str) -> FileInfo {
     let mut fi = FileInfo::new(object, 1, 0);
+    fi.name = object.to_owned();
     fi.erasure.index = 1;
     fi.version_id = Some(Uuid::new_v4());
     fi.mod_time = Some(time::OffsetDateTime::now_utc());
@@ -449,4 +450,459 @@ fn artifact_receiver_disk_lookup_stays_on_captured_instance() {
         first_shutdown.cancel();
         second_shutdown.cancel();
     });
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_repair_receiver_rejects_wrong_disk_incarnation_version_and_legacy_domain() {
+    run_large_stack_async_test("artifact-repair-receiver-identity", || async {
+        let root = tempfile::tempdir().expect("repair receiver identity root");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(root.path(), "artifact-repair-receiver-identity", &[4])).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let incarnation = bucket(&store, BUCKET, true).await;
+        let ordinary = bucket(&store, "ordinary-repair-receiver", false).await;
+        let (disk, reference, id) = disk(&store).await;
+        let attempt = prefix();
+        let object = format!("{attempt}image.png");
+        let fi = stage(&disk, "repair-identity", &object).await;
+        let mut invalid = Vec::new();
+        invalid.push((fi.clone(), BUCKET, object.clone(), Uuid::nil(), incarnation));
+        invalid.push((fi.clone(), BUCKET, object.clone(), Uuid::new_v4(), incarnation));
+        invalid.push((fi.clone(), BUCKET, object.clone(), id, Uuid::nil()));
+        invalid.push((fi.clone(), BUCKET, object.clone(), id, Uuid::new_v4()));
+        invalid.push((fi.clone(), "ordinary-repair-receiver", object.clone(), id, ordinary));
+        invalid.push((fi.clone(), BUCKET, format!("{attempt}../alias.png"), id, incarnation));
+        invalid.push((fi.clone(), BUCKET, format!("/{object}"), id, incarnation));
+        for version in [None, Some(Uuid::nil())] {
+            let mut candidate = fi.clone();
+            candidate.version_id = version;
+            invalid.push((candidate, BUCKET, object.clone(), id, incarnation));
+        }
+        let mut candidate = fi.clone();
+        candidate.name = format!("{attempt}different.png");
+        invalid.push((candidate, BUCKET, object.clone(), id, incarnation));
+        let mut candidate = fi.clone();
+        candidate.volume = "different-bucket".to_owned();
+        invalid.push((candidate, BUCKET, object.clone(), id, incarnation));
+        for (candidate, volume, path, expected_disk, expected_incarnation) in invalid {
+            assert!(
+                store
+                    .rename_local_artifact_repair_data(
+                        &reference,
+                        expected_disk,
+                        (RUSTFS_META_TMP_BUCKET, "repair-identity"),
+                        &candidate,
+                        (volume, &path),
+                        expected_incarnation
+                    )
+                    .await
+                    .is_err(),
+                "ARTIFACT_REPAIR_RECEIVER_RENAME_IDENTITY"
+            );
+            assert!(
+                store
+                    .write_local_artifact_repair_metadata(
+                        &reference,
+                        expected_disk,
+                        (volume, &path),
+                        candidate,
+                        expected_incarnation
+                    )
+                    .await
+                    .is_err(),
+                "ARTIFACT_REPAIR_RECEIVER_METADATA_IDENTITY"
+            );
+        }
+        assert!(
+            store.reject_legacy_artifact_mutation(BUCKET).await.is_err(),
+            "ARTIFACT_REPAIR_RECEIVER_NO_LEGACY_BYPASS"
+        );
+        assert!(
+            store
+                .rename_local_artifact_repair_data(
+                    &reference,
+                    id,
+                    (BUCKET, "repair-identity"),
+                    &fi,
+                    (BUCKET, &object),
+                    incarnation
+                )
+                .await
+                .is_err(),
+            "ARTIFACT_REPAIR_RECEIVER_INTERNAL_STAGING_ONLY"
+        );
+        assert!(
+            disk.read_version(BUCKET, BUCKET, &object, "", &ReadOptions::default())
+                .await
+                .is_err(),
+            "ARTIFACT_REPAIR_RECEIVER_REJECTION_HAS_NO_PUBLICATION"
+        );
+        store
+            .seal_local_artifact_puts(&reference, id, BUCKET, incarnation, &attempt)
+            .await
+            .expect("PUT domain closes");
+        store
+            .rename_local_artifact_repair_data(
+                &reference,
+                id,
+                (RUSTFS_META_TMP_BUCKET, "repair-identity"),
+                &fi,
+                (BUCKET, &object),
+                incarnation,
+            )
+            .await
+            .expect("existing-version repair permits PUT closure");
+        store
+            .write_local_artifact_repair_metadata(&reference, id, (BUCKET, &object), fi.clone(), incarnation)
+            .await
+            .expect("metadata repair permits PUT closure");
+        assert_version(&disk, &object, &fi).await;
+        assert_eq!(
+            store
+                .seal_local_artifact_repairs(&reference, id, BUCKET, incarnation, &attempt)
+                .await
+                .expect("receiver repair close"),
+            id
+        );
+        assert_eq!(
+            store
+                .seal_local_artifact_repairs(&reference, id, BUCKET, incarnation, &attempt)
+                .await
+                .expect("repair close survives independent reopen"),
+            id
+        );
+        assert!(
+            store
+                .write_local_artifact_repair_metadata(&reference, id, (BUCKET, &object), fi.clone(), incarnation)
+                .await
+                .is_err(),
+            "ARTIFACT_REPAIR_RECEIVER_METADATA_CLOSED"
+        );
+        assert!(
+            store
+                .rename_local_artifact_repair_data(
+                    &reference,
+                    id,
+                    (RUSTFS_META_TMP_BUCKET, "repair-identity"),
+                    &fi,
+                    (BUCKET, &object),
+                    incarnation
+                )
+                .await
+                .is_err(),
+            "ARTIFACT_REPAIR_RECEIVER_RENAME_CLOSED"
+        );
+        let other_object = format!("{}other.png", prefix());
+        let other = stage(&disk, "repair-other-attempt", &other_object).await;
+        store
+            .rename_local_artifact_repair_data(
+                &reference,
+                id,
+                (RUSTFS_META_TMP_BUCKET, "repair-other-attempt"),
+                &other,
+                (BUCKET, &other_object),
+                incarnation,
+            )
+            .await
+            .expect("other attempt remains repairable");
+        shutdown.cancel();
+    });
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_repair_receiver_rejects_authoritative_retirement_and_repair_seal() {
+    run_large_stack_async_test("artifact-repair-receiver-records", || async {
+        let root = tempfile::tempdir().expect("repair receiver records root");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(root.path(), "artifact-repair-receiver-records", &[4])).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let incarnation = bucket(&store, BUCKET, true).await;
+        let (disk, reference, id) = disk(&store).await;
+        let attempt = prefix();
+        let object = format!("{attempt}image.png");
+        let fi = stage(&disk, "repair-retired", &object).await;
+        store
+            .clone()
+            .seal_artifact_attempt_puts(BUCKET, incarnation, &attempt)
+            .await
+            .expect("seal logical PUT attempt");
+        store
+            .clone()
+            .retire_artifact_object_version(
+                BUCKET,
+                incarnation,
+                &attempt,
+                &object,
+                fi.version_id.expect("exact retired fixture version"),
+            )
+            .await
+            .expect("persist exact retirement");
+        assert!(
+            store
+                .rename_local_artifact_repair_data(
+                    &reference,
+                    id,
+                    (RUSTFS_META_TMP_BUCKET, "repair-retired"),
+                    &fi,
+                    (BUCKET, &object),
+                    incarnation
+                )
+                .await
+                .is_err(),
+            "ARTIFACT_REPAIR_RECEIVER_RETIRED_RENAME"
+        );
+        assert!(
+            store
+                .write_local_artifact_repair_metadata(&reference, id, (BUCKET, &object), fi.clone(), incarnation)
+                .await
+                .is_err(),
+            "ARTIFACT_REPAIR_RECEIVER_RETIRED_METADATA"
+        );
+        let another = stage(&disk, "repair-non-retired", &object).await;
+        store
+            .write_local_artifact_repair_metadata(&reference, id, (BUCKET, &object), another.clone(), incarnation)
+            .await
+            .expect("another exact version is not retired");
+        store
+            .clone()
+            .seal_artifact_attempt_repairs(BUCKET, incarnation, &attempt)
+            .await
+            .expect("persist repair seal");
+        assert!(
+            store
+                .write_local_artifact_repair_metadata(&reference, id, (BUCKET, &object), another, incarnation)
+                .await
+                .is_err(),
+            "ARTIFACT_REPAIR_RECEIVER_AUTHORITATIVE_REPAIR_SEAL"
+        );
+        shutdown.cancel();
+    });
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_repair_receiver_rename_owner_survives_rpc_cancellation() {
+    run_repair_physical_tail_case(false, false);
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_repair_receiver_metadata_owner_survives_rpc_timeout() {
+    run_repair_physical_tail_case(true, false);
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_repair_receiver_retirement_waits_for_cancelled_rename() {
+    run_repair_physical_tail_case(false, true);
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_repair_receiver_retirement_waits_for_metadata_timeout() {
+    run_repair_physical_tail_case(true, true);
+}
+
+fn run_repair_physical_tail_case(metadata: bool, retirement: bool) {
+    // Pausing deadlines requires a current-thread runtime; blocking disk workers
+    // still execute independently and retain their physical owners.
+    std::thread::Builder::new()
+        .name(format!("repair-receiver-{metadata}-{retirement}"))
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("receiver timeout runtime")
+                .block_on(temp_env::async_with_vars(
+                    [(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("60"))],
+                    repair_physical_tail_case(metadata, retirement),
+                ));
+        })
+        .expect("receiver physical-tail thread")
+        .join()
+        .expect("receiver physical-tail test completes");
+}
+
+async fn repair_physical_tail_case(metadata: bool, retirement: bool) {
+    let root = tempfile::tempdir().expect("repair receiver physical-tail root");
+    let (ctx, store, shutdown) =
+        without_storage_class_env(build_isolated_test_store(root.path(), "artifact-repair-receiver-tail", &[4])).await;
+    metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+    let incarnation = bucket(&store, BUCKET, true).await;
+    let (disk, reference, id) = disk(&store).await;
+    let attempt = prefix();
+    let object = format!("{attempt}image.png");
+    let fi = stage(&disk, "repair-receiver-paused", &object).await;
+    store
+        .seal_local_artifact_puts(&reference, id, BUCKET, incarnation, &attempt)
+        .await
+        .expect("close PUT domain first");
+    if retirement {
+        store
+            .clone()
+            .seal_artifact_attempt_puts(BUCKET, incarnation, &attempt)
+            .await
+            .expect("retirement requires global PUT seal");
+    }
+    let physical_object = disk
+        .get_object_path_for_io_if_local(BUCKET, &object)
+        .expect("local receiver")
+        .expect("physical object path");
+    let stage = if metadata {
+        LocalPublicationStage::Rename
+    } else {
+        LocalPublicationStage::PreparedRename
+    };
+    let mut pause = LocalPublicationPause::install(&disk, BUCKET, &format!("{object}/xl.meta"), stage)
+        .expect("pause actual repair publication");
+    let owner = Arc::clone(&store);
+    let mutation_reference = reference.clone();
+    let mutation_object = object.clone();
+    let mutation_fi = fi.clone();
+    let mut mutation = tokio::spawn(async move {
+        if metadata {
+            owner
+                .write_local_artifact_repair_metadata(
+                    &mutation_reference,
+                    id,
+                    (BUCKET, &mutation_object),
+                    mutation_fi,
+                    incarnation,
+                )
+                .await
+        } else {
+            owner
+                .rename_local_artifact_repair_data(
+                    &mutation_reference,
+                    id,
+                    (RUSTFS_META_TMP_BUCKET, "repair-receiver-paused"),
+                    &mutation_fi,
+                    (BUCKET, &mutation_object),
+                    incarnation,
+                )
+                .await
+                .map(|_| ())
+        }
+    });
+    let mut joined = false;
+    let mut sealer = None;
+    let mut early_seal = None;
+    let observed = std::panic::AssertUnwindSafe(async {
+        tokio::time::timeout(DEADLINE, async {
+            tokio::select! {
+                result = &mut mutation => { joined = true; panic!("repair returned before physical entry: {result:?}"); }
+                entered = pause.entered() => entered.expect("physical repair worker entered"),
+            }
+        })
+        .await
+        .expect("bounded physical repair entry");
+        if metadata {
+            let before = disk.metrics_snapshot().expect("disk metrics").total_errors_timeout;
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(61)).await;
+            tokio::time::resume();
+            let result = tokio::time::timeout(DEADLINE, &mut mutation)
+                .await
+                .expect("real wrapper timeout returns")
+                .expect("receiver task");
+            joined = true;
+            assert!(
+                matches!(result, Err(crate::disk::error::DiskError::Timeout)),
+                "real metadata wrapper must time out"
+            );
+            assert!(
+                disk.metrics_snapshot().expect("timeout metrics").total_errors_timeout > before,
+                "ARTIFACT_REPAIR_RECEIVER_REAL_METADATA_TIMEOUT"
+            );
+        } else {
+            mutation.abort();
+            assert!((&mut mutation).await.expect_err("cancel only receiver waiter").is_cancelled());
+            joined = true;
+        }
+        let owner = Arc::clone(&store);
+        let seal_reference = reference.clone();
+        let seal_attempt = attempt.clone();
+        let retire_object = object.clone();
+        let version = fi.version_id.expect("exact repair version");
+        sealer = Some(tokio::spawn(async move {
+            if retirement {
+                return owner
+                    .retire_artifact_object_version(BUCKET, incarnation, &seal_attempt, &retire_object, version)
+                    .await
+                    .map(|()| id)
+                    .map_err(crate::disk::error::DiskError::other);
+            }
+            owner
+                .seal_local_artifact_repairs(&seal_reference, id, BUCKET, incarnation, &seal_attempt)
+                .await
+        }));
+        if !retirement {
+            let identity = store
+                .artifact_receiver_identity(BUCKET, incarnation, &attempt, true)
+                .await
+                .expect("repair receiver identity");
+            let marker = disk
+                .path()
+                .join(".rustfs-artifact-repair-seals")
+                .join(hex_simd::encode_to_string(identity.receiver_key, hex_simd::AsciiCase::Lower))
+                .join("closed");
+            tokio::time::timeout(DEADLINE, async {
+                while !marker.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("receiver repair admission durably closes");
+        }
+        if let Ok(result) = tokio::time::timeout(Duration::from_millis(500), sealer.as_mut().expect("sealer launched")).await {
+            early_seal = Some(result);
+            panic!("ARTIFACT_REPAIR_RECEIVER_PHYSICAL_TAIL_BARRIER: seal returned before physical completion");
+        }
+    })
+    .catch_unwind()
+    .await;
+    drop(pause);
+    if !joined {
+        mutation.abort();
+        let _ = (&mut mutation).await;
+    }
+    let drained = tokio::time::timeout(DEADLINE, prepared_publication_test_hooks::drain_namespace_key(&physical_object)).await;
+    let seal_result = match (early_seal, sealer) {
+        (Some(result), _) => Some(Ok(result)),
+        (None, Some(sealer)) => Some(tokio::time::timeout(DEADLINE, sealer).await),
+        (None, None) => None,
+    };
+    let owners_drained = tokio::time::timeout(DEADLINE, async {
+        while ctx.namespace_commits_pending() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if drained.is_err() || owners_drained.is_err() || seal_result.as_ref().is_some_and(Result::is_err) {
+        let retained = root.keep();
+        panic!("ARTIFACT_REPAIR_RECEIVER_DRAIN_FAILED: retained={retained:?}");
+    }
+    if let Err(panic) = observed {
+        std::panic::resume_unwind(panic);
+    }
+    assert_eq!(
+        seal_result
+            .expect("sealer ran")
+            .expect("bounded seal completion")
+            .expect("sealer task")
+            .expect("physical repair drained"),
+        id
+    );
+    assert_version(&disk, &object, &fi).await;
+    assert!(
+        store
+            .write_local_artifact_repair_metadata(&reference, id, (BUCKET, &object), fi.clone(), incarnation)
+            .await
+            .is_err(),
+        "ARTIFACT_REPAIR_RECEIVER_CLOSING_REJECTS_ADMISSION"
+    );
+    shutdown.cancel();
 }

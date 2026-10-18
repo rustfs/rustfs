@@ -18,6 +18,8 @@
 //! `.github/workflows/e2e-distributed.yml`. Excluded from `e2e-full` because
 //! each case starts four real `rustfs` processes.
 
+mod artifact_repair_tail_test;
+mod artifact_repair_test;
 mod artifact_seal_test;
 mod chaos_test;
 mod concurrency_stability_test;

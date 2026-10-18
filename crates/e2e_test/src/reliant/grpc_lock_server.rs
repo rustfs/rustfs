@@ -527,6 +527,27 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn artifact_repair_rename_data(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::ArtifactRepairRenameDataRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::RenameDataResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn artifact_repair_write_metadata(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::ArtifactRepairWriteMetadataRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::WriteMetadataResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn seal_artifact_attempt_repairs(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::SealArtifactAttemptPutsRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::SealArtifactAttemptPutsResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn seal_artifact_attempt_puts(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::SealArtifactAttemptPutsRequest>,

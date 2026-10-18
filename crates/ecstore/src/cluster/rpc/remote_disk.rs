@@ -2122,7 +2122,118 @@ fn validate_decoded_file_info(file_info: &FileInfo) -> Result<()> {
     file_info.validate_for_metadata_read().map_err(Into::into)
 }
 
+fn validate_artifact_repair_seal_response(
+    request: &rustfs_protos::proto_gen::node_service::SealArtifactAttemptPutsRequest,
+    response: &rustfs_protos::proto_gen::node_service::SealArtifactAttemptPutsResponse,
+) -> Result<()> {
+    let canonical = rustfs_protos::canonical_seal_artifact_attempt_repairs_response_body(request, response)
+        .map_err(|_| Error::other("artifact repair seal response is too large"))?;
+    crate::cluster::rpc::verify_tonic_rpc_response_proof(&canonical, &response.response_proof)
+        .map_err(|_| Error::other("artifact repair seal response proof is invalid"))?;
+    if !response.success {
+        return Err(response.error.clone().unwrap_or_default().into());
+    }
+    let expected_disk = Uuid::from_slice(&request.expected_disk_id).ok().filter(|id| !id.is_nil());
+    if response.error.is_some() || expected_disk.is_none() || Uuid::from_slice(&response.disk_id).ok() != expected_disk {
+        return Err(Error::other("artifact repair seal response disk identity mismatch"));
+    }
+    Ok(())
+}
+
 impl RemoteDisk {
+    pub(crate) async fn rename_artifact_repair_data(
+        &self,
+        expected_disk: Uuid,
+        source: (&str, &str),
+        fi: &FileInfo,
+        destination: (&str, &str),
+        expected_incarnation: Uuid,
+    ) -> Result<RenameDataResp> {
+        use rustfs_protos::proto_gen::node_service::ArtifactRepairRenameDataRequest;
+        self.execute_with_timeout_for_op(
+            "artifact_repair_rename_data",
+            || async {
+                let body = ArtifactRepairRenameDataRequest {
+                    rename: Some(RenameDataRequest {
+                        disk: self.endpoint.to_string(),
+                        src_volume: source.0.to_owned(),
+                        src_path: source.1.to_owned(),
+                        dst_volume: destination.0.to_owned(),
+                        dst_path: destination.1.to_owned(),
+                        file_info: compat_json(fi)?,
+                        file_info_bin: encode_file_info_msgpack(fi)?.into(),
+                        scanner_publication_lease_token: Bytes::new(),
+                        bucket_incarnation_id: expected_incarnation.as_bytes().to_vec().into(),
+                    }),
+                    expected_disk_id: expected_disk.as_bytes().to_vec().into(),
+                };
+                let canonical = rustfs_protos::canonical_artifact_repair_rename_data_request_body(&body)
+                    .map_err(|_| Error::other("artifact repair rename request is too large"))?;
+                let mut request = Request::new(body);
+                crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical).map_err(Error::other)?;
+                // Unimplemented is terminal: never downgrade repair publication to PUT or legacy RPCs.
+                let response = self
+                    .get_client()
+                    .await?
+                    .artifact_repair_rename_data(request)
+                    .await?
+                    .into_inner();
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+                decode_msgpack_or_json::<RenameDataResp>(
+                    &response.rename_data_resp_bin,
+                    &response.rename_data_resp,
+                    "RenameDataResp",
+                )
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    pub(crate) async fn write_artifact_repair_metadata(
+        &self,
+        expected_disk: Uuid,
+        target: (&str, &str),
+        fi: &FileInfo,
+        expected_incarnation: Uuid,
+    ) -> Result<()> {
+        use rustfs_protos::proto_gen::node_service::ArtifactRepairWriteMetadataRequest;
+        self.execute_with_timeout_for_op(
+            "artifact_repair_write_metadata",
+            || async {
+                let body = ArtifactRepairWriteMetadataRequest {
+                    metadata: Some(WriteMetadataRequest {
+                        disk: self.endpoint.to_string(),
+                        volume: target.0.to_owned(),
+                        path: target.1.to_owned(),
+                        file_info: compat_json(fi)?,
+                        file_info_bin: encode_file_info_msgpack(fi)?.into(),
+                        bucket_incarnation_id: expected_incarnation.as_bytes().to_vec().into(),
+                    }),
+                    expected_disk_id: expected_disk.as_bytes().to_vec().into(),
+                };
+                let canonical = rustfs_protos::canonical_artifact_repair_write_metadata_request_body(&body)
+                    .map_err(|_| Error::other("artifact repair metadata request is too large"))?;
+                let mut request = Request::new(body);
+                crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical).map_err(Error::other)?;
+                let response = self
+                    .get_client()
+                    .await?
+                    .artifact_repair_write_metadata(request)
+                    .await?
+                    .into_inner();
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     pub(crate) async fn seal_artifact_puts(
         &self,
         expected_disk: Uuid,
@@ -2168,6 +2279,44 @@ impl RemoteDisk {
         .await
     }
 
+    pub(crate) async fn seal_artifact_repairs(
+        &self,
+        expected_disk: Uuid,
+        bucket: &str,
+        incarnation: Uuid,
+        attempt_prefix: &str,
+    ) -> Result<()> {
+        use rustfs_protos::proto_gen::node_service::SealArtifactAttemptPutsRequest;
+        if expected_disk.is_nil() || incarnation.is_nil() {
+            return Err(Error::other("artifact repair seal requires non-nil disk and incarnation identities"));
+        }
+        self.execute_with_timeout_for_op(
+            "seal_artifact_repairs",
+            || async {
+                let body = SealArtifactAttemptPutsRequest {
+                    disk: self.endpoint.to_string(),
+                    bucket: bucket.to_owned(),
+                    bucket_incarnation_id: incarnation.as_bytes().to_vec().into(),
+                    attempt_prefix: attempt_prefix.to_owned(),
+                    expected_disk_id: expected_disk.as_bytes().to_vec().into(),
+                };
+                let canonical = rustfs_protos::canonical_seal_artifact_attempt_repairs_request_body(&body)
+                    .map_err(|_| Error::other("artifact repair seal request is too large"))?;
+                let mut request = Request::new(body.clone());
+                crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical).map_err(Error::other)?;
+                let response = self
+                    .get_client()
+                    .await?
+                    .seal_artifact_attempt_repairs(request)
+                    .await?
+                    .into_inner();
+                validate_artifact_repair_seal_response(&body, &response)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) async fn rename_data_borrowed(
         &self,
@@ -2192,6 +2341,24 @@ impl RemoteDisk {
         scanner_publication_lease_token: Option<Uuid>,
         artifact_incarnation: Option<Uuid>,
     ) -> Result<RenameDataResp> {
+        if let Some(scope) = crate::bucket::artifact::artifact_repair_scope(dst_volume, dst_path)
+            && let Some(identity) = scope.receiver_identity()
+        {
+            scope.check().map_err(Error::other)?;
+            if artifact_incarnation.is_some() || scanner_publication_lease_token.is_some() {
+                return Err(Error::other("artifact repair cannot use a publication lease"));
+            }
+            let expected = self
+                .get_disk_id()
+                .await?
+                .filter(|id| !id.is_nil())
+                .ok_or_else(|| Error::other("artifact repair disk identity is unavailable"))?;
+            let result = self
+                .rename_artifact_repair_data(expected, (src_volume, src_path), fi, (dst_volume, dst_path), identity.incarnation)
+                .await;
+            scope.check().map_err(Error::other)?;
+            return result;
+        }
         trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
@@ -2906,6 +3073,21 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
+        if let Some(scope) = crate::bucket::artifact::artifact_repair_scope(volume, path)
+            && let Some(identity) = scope.receiver_identity()
+        {
+            scope.check().map_err(Error::other)?;
+            let expected = self
+                .get_disk_id()
+                .await?
+                .filter(|id| !id.is_nil())
+                .ok_or_else(|| Error::other("artifact repair disk identity is unavailable"))?;
+            let result = self
+                .write_artifact_repair_metadata(expected, (volume, path), &fi, identity.incarnation)
+                .await;
+            scope.check().map_err(Error::other)?;
+            return result;
+        }
         trace!(
             event = EVENT_REMOTE_DISK_RPC,
             component = LOG_COMPONENT_ECSTORE,
@@ -4085,6 +4267,170 @@ mod tests {
 
     static INIT: Once = Once::new();
 
+    #[tokio::test]
+    async fn artifact_repair_old_peer_unimplemented_never_downgrades_mutations() {
+        runtime_sources::ensure_test_rpc_secret();
+        let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+            .await
+            .expect("loopback test peer");
+        let endpoint = Endpoint {
+            url: url::Url::parse(&format!("{}/data/rustfs0", peer.addr)).expect("test disk endpoint"),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+        let disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            Arc::new(TcpHttpInternodeDataTransport),
+        )
+        .await
+        .expect("remote test disk");
+        let expected_disk = Uuid::new_v4();
+        let incarnation = Uuid::new_v4();
+        let info = FileInfo::default();
+        let rename = disk
+            .rename_artifact_repair_data(
+                expected_disk,
+                ("tmp", "staged"),
+                &info,
+                ("artifacts", "outputs/tenant/run/attempt/image"),
+                incarnation,
+            )
+            .await
+            .expect_err("old peer cannot publish repair data");
+        let metadata = disk
+            .write_artifact_repair_metadata(expected_disk, ("artifacts", "outputs/tenant/run/attempt/image"), &info, incarnation)
+            .await
+            .expect_err("old peer cannot publish repair metadata");
+        let seal = disk
+            .seal_artifact_repairs(expected_disk, "artifacts", incarnation, "outputs/tenant/run/attempt")
+            .await
+            .expect_err("old peer cannot confirm repair closure");
+        for error in [rename, metadata, seal] {
+            let DiskError::Io(error) = error else {
+                panic!("expected gRPC status error");
+            };
+            let status = error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<crate::disk::error::RpcStatusError>())
+                .expect("preserved gRPC status");
+            assert_eq!(status.status().code(), Code::Unimplemented);
+        }
+        let paths = peer.peer.rpc_paths.lock().expect("RPC inventory").clone();
+        for method in [
+            "ArtifactRepairRenameData",
+            "ArtifactRepairWriteMetadata",
+            "SealArtifactAttemptRepairs",
+        ] {
+            assert_eq!(
+                paths.iter().filter(|path| path.ends_with(&format!("/{method}"))).count(),
+                1,
+                "each repair method is sent once"
+            );
+        }
+        assert!(
+            paths.iter().all(|path| matches!(
+                path.rsplit('/').next(),
+                Some("ArtifactRepairRenameData" | "ArtifactRepairWriteMetadata" | "SealArtifactAttemptRepairs" | "Ping")
+            )),
+            "repair cannot downgrade to a legacy mutation: {paths:?}"
+        );
+        disk.cancel_token.cancel();
+        peer.stop().await;
+    }
+
+    #[test]
+    fn artifact_repair_seal_response_requires_proof_full_request_and_physical_identity() {
+        use rustfs_protos::proto_gen::node_service::{
+            Error as WireError, SealArtifactAttemptPutsRequest, SealArtifactAttemptPutsResponse,
+        };
+        runtime_sources::ensure_test_rpc_secret();
+        let request = SealArtifactAttemptPutsRequest {
+            disk: "disk-a".into(),
+            bucket: "artifacts".into(),
+            bucket_incarnation_id: vec![1; 16].into(),
+            attempt_prefix: "outputs/tenant/run/attempt".into(),
+            expected_disk_id: vec![2; 16].into(),
+        };
+        let mut response = SealArtifactAttemptPutsResponse {
+            success: true,
+            disk_id: request.expected_disk_id.clone(),
+            ..Default::default()
+        };
+        let sign = |request: &SealArtifactAttemptPutsRequest, response: &mut SealArtifactAttemptPutsResponse| {
+            let canonical = rustfs_protos::canonical_seal_artifact_attempt_repairs_response_body(request, response)
+                .expect("repair response canonical");
+            response.response_proof = crate::cluster::rpc::http_auth::sign_tonic_rpc_response_proof(&canonical)
+                .expect("repair response proof")
+                .into();
+        };
+        assert!(validate_artifact_repair_seal_response(&request, &response).is_err(), "proof is mandatory");
+        sign(&request, &mut response);
+        validate_artifact_repair_seal_response(&request, &response).expect("signed exact physical receiver");
+        for mutate in [
+            |r: &mut SealArtifactAttemptPutsRequest| r.disk = "other-disk".into(),
+            |r: &mut SealArtifactAttemptPutsRequest| r.bucket = "other-bucket".into(),
+            |r: &mut SealArtifactAttemptPutsRequest| r.bucket_incarnation_id = vec![3; 16].into(),
+            |r: &mut SealArtifactAttemptPutsRequest| r.attempt_prefix = "other-attempt".into(),
+            |r: &mut SealArtifactAttemptPutsRequest| r.expected_disk_id = vec![4; 16].into(),
+        ] {
+            let mut changed = request.clone();
+            mutate(&mut changed);
+            assert!(
+                validate_artifact_repair_seal_response(&changed, &response).is_err(),
+                "another request cannot reuse the proof"
+            );
+        }
+        let legacy = rustfs_protos::canonical_seal_artifact_attempt_puts_response_body(&request, &response).expect("PUT domain");
+        let mut legacy_response = response.clone();
+        legacy_response.response_proof = crate::cluster::rpc::http_auth::sign_tonic_rpc_response_proof(&legacy)
+            .expect("PUT proof")
+            .into();
+        assert!(
+            validate_artifact_repair_seal_response(&request, &legacy_response).is_err(),
+            "PUT proof cannot acknowledge repair seal"
+        );
+        for disk in [vec![], vec![0; 16], vec![3; 16], vec![1; 15]] {
+            let mut changed = response.clone();
+            changed.disk_id = disk.into();
+            sign(&request, &mut changed);
+            assert!(
+                validate_artifact_repair_seal_response(&request, &changed).is_err(),
+                "signed wrong or absent physical identity is invalid"
+            );
+        }
+        for mutate in [
+            |r: &mut SealArtifactAttemptPutsResponse| r.success = false,
+            |r: &mut SealArtifactAttemptPutsResponse| r.error = Some(WireError::default()),
+        ] {
+            let mut changed = response.clone();
+            mutate(&mut changed);
+            assert!(
+                validate_artifact_repair_seal_response(&request, &changed).is_err(),
+                "response fields are bound"
+            );
+            sign(&request, &mut changed);
+            assert!(
+                validate_artifact_repair_seal_response(&request, &changed).is_err(),
+                "signed failure or inconsistent success is invalid"
+            );
+        }
+        let mut nil_request = request;
+        nil_request.expected_disk_id = vec![0; 16].into();
+        let mut nil_response = response;
+        nil_response.disk_id = nil_request.expected_disk_id.clone();
+        sign(&nil_request, &mut nil_response);
+        assert!(
+            validate_artifact_repair_seal_response(&nil_request, &nil_response).is_err(),
+            "nil physical identity is never a receipt"
+        );
+    }
+
     #[test]
     fn compare_and_update_wire_outcome_fails_closed() {
         assert_eq!(
@@ -4390,6 +4736,7 @@ mod tests {
         format_data: Bytes,
         read_all_data: Bytes,
         next_format_read_gate: Arc<StdMutex<Option<Arc<TestFormatReadGate>>>>,
+        rpc_paths: Arc<StdMutex<Vec<String>>>,
     }
 
     #[derive(Debug, Default)]
@@ -4408,6 +4755,7 @@ mod tests {
                 format_data,
                 read_all_data,
                 next_format_read_gate: Arc::default(),
+                rpc_paths: Arc::default(),
             }
         }
 
@@ -4462,6 +4810,11 @@ mod tests {
         }
 
         fn call(&mut self, request: http::Request<B>) -> Self::Future {
+            self.peer
+                .rpc_paths
+                .lock()
+                .expect("RPC path inventory")
+                .push(request.uri().path().to_owned());
             match request.uri().path() {
                 "/node_service.NodeService/DiskInfo" => {
                     #[derive(Clone)]

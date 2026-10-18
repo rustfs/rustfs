@@ -21,13 +21,19 @@ const INSPECT_ROUTE: &str = "/rustfs/admin/v3/plugin-artifacts/buckets/inspect";
 const SEAL_ROUTE: &str = "/rustfs/admin/v3/plugin-artifacts/seal-attempt";
 const ADMIN_BUDGET: Duration = Duration::from_secs(45);
 
-struct ArtifactAdmin {
+pub(super) struct ArtifactAdmin {
     access_key: String,
     secret_key: String,
 }
 
 impl ArtifactAdmin {
-    async fn request(&self, dist: &DistCluster, node: usize, route: &str, body: String) -> TestResult<(StatusCode, String)> {
+    pub(super) async fn request(
+        &self,
+        dist: &DistCluster,
+        node: usize,
+        route: &str,
+        body: String,
+    ) -> TestResult<(StatusCode, String)> {
         timeout(
             ADMIN_BUDGET,
             admin_request(
@@ -59,7 +65,7 @@ async fn create_artifact_admin(dist: &DistCluster, bucket: &str, prefix: &str) -
             },
             {
                 "Effect": "Allow",
-                "Action": "admin:SealPluginArtifactAttempt",
+                "Action": ["admin:SealPluginArtifactAttempt", "admin:SealPluginArtifactRepairs"],
                 "Resource": format!("arn:aws:s3:::{bucket}/{}", prefix.trim_end_matches('/')),
             },
         ],
@@ -74,7 +80,7 @@ async fn create_artifact_admin(dist: &DistCluster, bucket: &str, prefix: &str) -
     Ok(user)
 }
 
-async fn create_artifact_attempt(dist: &DistCluster) -> TestResult<(Value, ArtifactAdmin)> {
+pub(super) async fn create_artifact_attempt(dist: &DistCluster) -> TestResult<(Value, ArtifactAdmin)> {
     let bucket = unique_bucket("artifact");
     let prefix = format!("outputs/6169/{}/{}/", Uuid::new_v4(), Uuid::new_v4());
     let user = create_artifact_admin(dist, &bucket, &prefix).await?;
@@ -131,7 +137,7 @@ async fn assert_bucket_identity(dist: &DistCluster, user: &ArtifactAdmin, node: 
     .await
 }
 
-async fn confirm_seal(dist: &DistCluster, user: &ArtifactAdmin, request: &str, target: &Value) -> TestResult {
+pub(super) async fn confirm_seal(dist: &DistCluster, user: &ArtifactAdmin, request: &str, target: &Value) -> TestResult {
     wait_until(
         ADMIN_BUDGET,
         || async {
@@ -168,7 +174,7 @@ async fn assert_seal_unconfirmed(dist: &DistCluster, user: &ArtifactAdmin, reque
     Ok(())
 }
 
-async fn assert_exact_version(client: &Client, bucket: &str, key: &str, version: &str, body: &[u8]) -> TestResult {
+pub(super) async fn assert_exact_version(client: &Client, bucket: &str, key: &str, version: &str, body: &[u8]) -> TestResult {
     let output = timeout(
         Duration::from_secs(30),
         client.get_object().bucket(bucket).key(key).version_id(version).send(),

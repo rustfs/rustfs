@@ -2396,6 +2396,14 @@ impl LocalDiskWrapper {
         self.disk.seal_artifact_puts(key).await
     }
 
+    pub async fn acquire_artifact_repair_lease(&self, key: [u8; 32]) -> Result<Arc<super::local::ArtifactRepairLease>> {
+        self.disk.acquire_artifact_repair_lease(key).await
+    }
+
+    pub async fn seal_artifact_repairs(&self, key: [u8; 32]) -> Result<()> {
+        self.disk.seal_artifact_repairs(key).await
+    }
+
     /// Create a new LocalDiskWrapper
     pub fn new(disk: Arc<LocalDisk>, health_check: bool) -> Self {
         let admission = DiskIoAdmission::new(disk.endpoint().to_string());

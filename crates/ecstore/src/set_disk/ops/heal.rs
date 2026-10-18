@@ -544,6 +544,15 @@ fn warn_heal_writer_failures(
     );
 }
 
+// Destructive distributed repair needs its own receiver-side drain protocol.
+// Publication repair must not enable the legacy deletion RPCs incidentally.
+async fn check_artifact_repair_delete(bucket: &str, object: &str) -> disk::error::Result<()> {
+    if let Some(scope) = crate::bucket::artifact::artifact_repair_scope(bucket, object) {
+        scope.check_destructive_repair().await?;
+    }
+    Ok(())
+}
+
 impl SetDisks {
     pub(crate) async fn purge_delete_marker_exact(
         &self,
@@ -552,6 +561,7 @@ impl SetDisks {
         version: Uuid,
         marker: rustfs_filemeta::MetaDeleteMarker,
     ) -> Result<bool> {
+        check_artifact_repair_delete(bucket, object).await?;
         let disks = self.get_disks_internal().await;
         if disks.len() != self.set_drive_count || disks.iter().any(Option::is_none) {
             return Err(StorageError::SlowDown);
@@ -1910,6 +1920,7 @@ impl SetDisks {
                                     rename_successes += 1;
                                     healed_disks[index] = Some(disk.clone());
                                     if parts_metadata[index].is_remote() {
+                                        check_artifact_repair_delete(bucket, object).await?;
                                         let rm_data_dir =
                                             parts_metadata[index].data_dir.expect("operation should succeed").to_string();
 
@@ -2289,6 +2300,7 @@ impl SetDisks {
         version: Uuid,
         disks: &[Option<DiskStore>],
     ) -> disk::error::Result<()> {
+        check_artifact_repair_delete(bucket, object).await?;
         let request = FileInfo {
             volume: bucket.to_owned(),
             name: object.to_owned(),
@@ -2492,6 +2504,10 @@ impl SetDisks {
     /// post-heal tail — reclaim identically. Never fails the heal: delete errors
     /// are logged and swallowed. Callers must gate this on `!opts.dry_run`.
     async fn reclaim_orphan_data_dirs_best_effort(&self, bucket: &str, object: &str) {
+        // Keep optional cleanup disabled until distributed deletion is fenced.
+        if check_artifact_repair_delete(bucket, object).await.is_err() {
+            return;
+        }
         match self.reconcile_old_data_cleanup_receipts(bucket, object).await {
             Ok(removed) if removed > 0 => {
                 debug!(
@@ -2605,6 +2621,8 @@ impl SetDisks {
         if dry_run {
             return Ok(Some(cleanup));
         }
+
+        check_artifact_repair_delete(bucket, object).await?;
 
         for (disk_index, data_dir_path) in per_disk_dirs {
             let Some(disk) = disks[disk_index].as_ref() else {
@@ -2736,6 +2754,9 @@ impl SetDisks {
         errs: &[Option<DiskError>],
         disks: &[Option<DiskStore>],
     ) -> disk::error::Result<DanglingDeleteSafety> {
+        if check_artifact_repair_delete(bucket, object).await.is_err() {
+            return Ok(DanglingDeleteSafety::UnsafeToDelete);
+        }
         if disks.iter().any(Option::is_none)
             || errs.iter().flatten().any(|err| {
                 !matches!(
@@ -2860,6 +2881,7 @@ impl SetDisks {
         let errs = stat_all_dirs(&disks, bucket, object).await;
         let dangling_object = is_object_dir_dangling(&errs);
         let delete_errs = if dangling_object && !dry_run && remove {
+            check_artifact_repair_delete(bucket, object).await?;
             let mut futures = Vec::with_capacity(disks.len());
             for (disk_index, disk) in disks.iter().enumerate() {
                 let disk = disk.clone();

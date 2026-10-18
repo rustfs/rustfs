@@ -955,8 +955,18 @@ impl Disk {
         if let Some(scope) = &repair_scope {
             scope.check().map_err(DiskError::other)?;
         }
+        let repair_lease = if let (Self::Local(disk), Some(scope)) = (self, &repair_scope) {
+            if let Some(identity) = scope.receiver_identity() {
+                scope.check_version(fi.version_id).await.map_err(DiskError::other)?;
+                Some(disk.acquire_artifact_repair_lease(identity.receiver_key).await?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let owner: Option<Arc<dyn Send + Sync>> = (bucket_scope.is_some() || repair_scope.is_some())
-            .then(|| Arc::new((bucket_scope, repair_scope)) as Arc<dyn Send + Sync>);
+            .then(|| Arc::new((bucket_scope, repair_scope, repair_lease)) as Arc<dyn Send + Sync>);
         self.rename_data_borrowed_with_fence_and_guard(src_volume, src_path, fi, dst_volume, dst_path, None, owner)
             .await
     }

@@ -171,9 +171,10 @@ failed reads also reject it. Repeating the seal verifies the same identity.
 Artifact bucket creation, inspection, ordinary PUT and PUT sealing use the
 configured storage topology and require namespace locking. Distributed operation
 requires URL endpoints and Unix physical disk leases on every receiver; merely
-changing the setup mode of local file endpoints does not enable it. Repair,
-repair sealing and version retirement remain local-only; this does not enable
-distributed garbage collection. The legacy RPC boundary retains its admission
+changing the setup mode of local file endpoints does not enable it. Repair and
+repair sealing use the same supported topology; version retirement remains
+local-only. This does not enable distributed garbage collection. The legacy RPC
+boundary retains its admission
 owner through physical completion, including cancellation and bucket recreation.
 A remote timeout, quorum response or expired lock lease cannot prove that a
 physical writer stopped.
@@ -218,8 +219,8 @@ same seal identity until a successful receipt confirms every receiver.
 
 These scenarios do not inject a disconnected request with an unfinished physical
 write, power loss, disk replacement, or backup restoration. Those fault boundaries
-need separate evidence; successful ordinary PUT sealing does not authorize
-repair, version retirement, or GC on distributed stores.
+need separate evidence; successful ordinary PUT sealing is not a repair seal, version retirement, or
+GC authorization.
 
 A failed or cancelled seal request may still leave a record for its original
 incarnation. Retry idempotently to confirm success; an error is not proof that
@@ -243,17 +244,33 @@ an error, not evidence that a bucket is ordinary. Internal callers borrowing a
 lifecycle fence must retain its actual owner through physical publication.
 
 Object repair takes the same attempt lock before capacity and object locks.
-Its local rename and metadata-replacement workers retain the lifecycle and
-attempt owners until the physical mutation completes, even if the async waiter
-is cancelled or times out. Repair of an existing version remains allowed after
+Local rename and metadata-replacement workers retain the lifecycle and attempt
+owners until the physical mutation completes, even if the async waiter is
+cancelled or times out. On distributed Unix URL topologies, dedicated
+`ArtifactRepairRenameData` and `ArtifactRepairWriteMetadata` RPCs bind the
+physical disk UUID, bucket incarnation, target and both FileInfo payloads.
+The receiver captures its own ready storage instance and retains an independent
+repair lease and exact-version retirement guard through physical mutation and
+rollback. It does not reacquire the
+coordinator's attempt lock or fall back to legacy RPCs on an older peer.
+
+Repair leases use `.rustfs-artifact-repair-seals`, independent of the existing
+PUT lease directory. Preserve both directories during disk restoration.
+Distributed managed repair rejects destructive cleanup that lacks equivalent
+receiver ownership; optional orphan cleanup is skipped. Ordinary-bucket repair
+keeps its existing behavior. Repair of an existing version remains allowed after
 PUT sealing; it does not reopen logical publication. Ordinary-bucket repair also
 retains lifecycle ownership to prevent publication into a recreated bucket.
 
 `ECStore::seal_artifact_attempt_repairs` separately closes repair admission for
 the entire attempt, including existing versions and minority metadata repair.
 It requires an ordinary PUT seal first. Under lifecycle, attempt, then repair
-record locks, it drains admitted physical repair workers before persisting an
-immutable record bound to the incarnation and full attempt prefix. New repair
+record locks, it persists an immutable record bound to the incarnation and full
+attempt prefix, then closes and drains each configured disk's repair domain.
+`SealArtifactAttemptRepairs` has its own request and response proof domains.
+Confirmation requires every configured receiver with its expected physical
+UUID; quorum is insufficient. Retries repeat this check even when the global
+record already exists. An offline member prevents successful confirmation. New repair
 requests reject a matching record; corrupt, mismatched, or unreadable records
 also fail closed. Retrying confirms the same identity, including after restart.
 Existing bytes remain readable while sufficient healthy shards remain. Other
@@ -261,13 +278,14 @@ attempts retain their repair behavior.
 
 Repair sealing is irreversible through this API and reduces recoverability:
 do not apply it automatically to successful outputs that still need repair.
-It is a local repair fact, not an all-writers or deletion authorization. Do not
+It is a repair fact, not an all-writers or deletion authorization. Do not
 downgrade to a binary that ignores repair seals after using this operation.
 Restoring pre-seal storage can rewind the decision and requires reconciliation
 before relying on the seal again; records must not expire by age.
 
 `ECStore::retire_artifact_object_version` disables repair of one exact version
-inside an already sealed attempt. It requires the current bucket incarnation,
+inside an already sealed attempt. Retirement still requires local topology.
+It requires the current bucket incarnation,
 an object strictly inside the attempt prefix, and a non-null version. Retirement
 does not delete data: existing bytes remain readable, and other versions remain
 repairable. Directory objects use the same canonical identity as storage.
@@ -282,9 +300,9 @@ check the selected version before publication, including when the caller asks
 for the latest version. Refusal is not a physical absence proof.
 
 These operations do not yet prove that every write path is permanently sealed.
-Remote physical completion and all-writes sealing still require enforcement
-and verification. The controller API below exposes the current local storage
-facts; it does not remove those remaining requirements. Runner must not consume PUT sealing or
+Distributed exact-version retirement and all-writes sealing still require
+implementation and verification. The controller API below exposes the current
+storage facts; it does not remove those remaining requirements. Runner must not consume PUT sealing or
 version retirement alone as permanent all-writes authority. Retirement records
 must not expire by age; restoring storage from before a retirement can rewind
 that decision and requires a separate recovery contract.
@@ -349,6 +367,21 @@ also cover restart, corrupt records, other-attempt isolation, and cancelled
 rename/metadata workers whose physical writes must drain before confirmation.
 They do not certify all-writes sealing, backup retention, or safe artifact
 deletion.
+
+The distributed repair scenarios in
+`crates/e2e_test/src/distributed/artifact_repair_test.rs` verify exact-version
+shard and minority metadata recovery after PUT sealing, repair refusal across
+restart, offline-member seal retries, and preservation of dangling metadata.
+`artifact_repair_tail_test.rs` pauses a real receiver filesystem worker after a
+direct authenticated repair RPC. It waits for receiver-side cancellation before
+sealing, requires refusal while the worker remains paused, then verifies physical
+recovery and successful seal retry. This test requires the `e2e-test-hooks`
+server feature; the barrier is absent from production builds.
+
+```sh
+python3 scripts/e2e_binary.py build --features e2e-test-hooks
+python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo test -p e2e_test distributed::artifact_repair -- --test-threads=1
+```
 
 ## Controller API
 
@@ -438,8 +471,8 @@ This deliberately does not reveal internal record paths or distinguish durable
 record corruption from unavailable storage. It also does not mean the operation
 was rolled back: the cancellation-safe storage transaction may still complete.
 Retry the identical target to obtain confirmation; operators must investigate
-persistent failures. Repair sealing and version retirement still reject
-distributed topologies; ordinary PUT sealing uses the receiver confirmations
+persistent failures. Version retirement still rejects distributed topologies.
+Ordinary PUT sealing and repair sealing use their separate receiver confirmations
 described above.
 
 Bucket creation does not change STS vending. Existing v1

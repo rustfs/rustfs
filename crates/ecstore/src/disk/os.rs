@@ -2666,6 +2666,53 @@ async fn reliable_rename_inner(
     .await
 }
 
+// The barrier runs inside the physical worker. Its async observer owns no lease,
+// and separately records cancellation so E2E tests cannot mistake an open RPC
+// waiter for ownership retained by a detached filesystem operation.
+#[cfg(feature = "e2e-test-hooks")]
+struct PhysicalRenameTestBarrier {
+    path: PathBuf,
+    completed: bool,
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+impl PhysicalRenameTestBarrier {
+    fn selected(root: &Path, destination: &Path) -> io::Result<Option<Self>> {
+        let path = root.join(".rustfs.sys/e2e-physical-rename-barrier");
+        let expected = match std::fs::read_to_string(&path) {
+            Ok(expected) => expected,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let Some(parent) = destination.parent() else { return Ok(None) };
+        let Some(name) = destination.file_name() else { return Ok(None) };
+        let Ok(parent) = parent.canonicalize() else { return Ok(None) };
+        let destination = parent.join(name);
+        Ok((destination == Path::new(&expected)).then_some(Self { path, completed: false }))
+    }
+
+    fn wait(path: &Path) -> io::Result<()> {
+        std::fs::write(path.with_extension("arrived"), b"physical worker entered")?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !path.with_extension("release").try_exists()? {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "physical rename test barrier was not released"));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+impl Drop for PhysicalRenameTestBarrier {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = std::fs::write(self.path.with_extension("waiter-dropped"), b"async waiter dropped");
+        }
+    }
+}
+
 async fn reliable_rename_inner_with_lease(
     src_file_path: PathBuf,
     dst_file_path: PathBuf,
@@ -2674,6 +2721,10 @@ async fn reliable_rename_inner_with_lease(
     warn_on_missing_source: bool,
     lease: Arc<NamespaceMutationLease>,
 ) -> io::Result<()> {
+    #[cfg(feature = "e2e-test-hooks")]
+    let mut physical_barrier = PhysicalRenameTestBarrier::selected(publication_root.path(), &dst_file_path)?;
+    #[cfg(feature = "e2e-test-hooks")]
+    let physical_barrier_path = physical_barrier.as_ref().map(|barrier| barrier.path.clone());
     let operation = {
         let src_file_path = src_file_path.clone();
         let dst_file_path = dst_file_path.clone();
@@ -2687,10 +2738,19 @@ async fn reliable_rename_inner_with_lease(
                 prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &src_file_path);
                 prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &dst_file_path);
             }
+            #[cfg(feature = "e2e-test-hooks")]
+            if let Some(path) = physical_barrier_path.as_ref() {
+                PhysicalRenameTestBarrier::wait(path)?;
+            }
             rename_prepared(&src_file_path, &dst_file_path, &preparation)
         }
     };
     let result = run_blocking_namespace_operation(lease, operation).await;
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Some(barrier) = physical_barrier.as_mut() {
+        barrier.completed = true;
+    }
+
     if let Err(err) = &result
         && (warn_on_missing_source || err.kind() != io::ErrorKind::NotFound)
     {

@@ -194,6 +194,18 @@ pub(crate) struct ArtifactRepairScope {
 }
 
 impl ArtifactRepairScope {
+    pub(crate) fn receiver_identity(&self) -> Option<ArtifactPutIdentity> {
+        self.artifact.as_ref().map(PutSealRecord::identity)
+    }
+
+    pub(crate) async fn check_destructive_repair(&self) -> crate::disk::error::Result<()> {
+        self.check().map_err(crate::disk::error::Error::other)?;
+        if self.artifact.is_some() && self.store.ctx.is_dist_erasure().await {
+            return Err(crate::disk::error::Error::other("distributed artifact repair deletion is unsupported"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn check(&self) -> Result<()> {
         if self.attempt.as_ref().is_some_and(WriteCommitGuard::is_lock_lost)
             || self.lifecycle.as_ref().is_some_and(BucketIncarnationFenceGuard::is_lock_lost)
@@ -271,7 +283,7 @@ pub(crate) async fn with_artifact_repair_scope<T>(
     }
     let record = match metadata.artifact_base_prefix.as_deref() {
         Some(base_prefix) => {
-            require_local_put_seal_topology(&store).await?;
+            require_put_seal_topology(&store).await?;
             if ctx.lock_manager().is_disabled() {
                 return Err(Error::other("artifact repair requires namespace locking"));
             }
@@ -420,6 +432,49 @@ impl ECStore {
                 .record
                 .identity())
         }
+    }
+
+    /// Validate a receiver publication without entering the coordinator-owned
+    /// attempt write lock. The independent disk lease closes physical admission.
+    pub(crate) async fn artifact_repair_receiver_identity(
+        &self,
+        bucket: &str,
+        expected: Uuid,
+        object: &str,
+        version: Option<Uuid>,
+    ) -> Result<(ArtifactPutIdentity, Arc<WriteCommitGuard>)> {
+        let metadata = metadata_sys::get_bucket_incarnation_metadata_in(&self.ctx, bucket).await?;
+        if expected.is_nil() || metadata.name != bucket || metadata.bucket_incarnation_id != expected {
+            return Err(Error::other("artifact repair receiver bucket incarnation mismatch"));
+        }
+        let target = ArtifactPutTarget::from_metadata(&metadata, object)?
+            .ok_or_else(|| Error::other("artifact repair receiver requires a managed bucket"))?;
+        let version = version
+            .filter(|value| !value.is_nil())
+            .ok_or_else(|| Error::other("artifact repair receiver requires an exact version"))?;
+        let store = metadata_sys::object_store_in(&self.ctx).await?;
+        if store.id != self.id {
+            return Err(Error::other("artifact repair receiver belongs to another store"));
+        }
+        // Check each independent record before taking a disk repair lease. A
+        // sealer may hold its record lock while draining admitted disk owners.
+        let repair_seal = ArtifactRepairSealRecord::new(&target.record);
+        let lock = self.new_ns_lock(RUSTFS_META_BUCKET, &repair_seal.path()).await?;
+        let guard = WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout()).await?;
+        if repair_seal.exists(Arc::clone(&store), &guard).await? {
+            return Err(Error::other("artifact attempt repairs are sealed"));
+        }
+        drop(guard);
+        let retirement = ArtifactVersionRetirementRecord::new(&target.record, object, version)?;
+        let lock = self.new_ns_lock(RUSTFS_META_BUCKET, &retirement.path()).await?;
+        let guard = WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout()).await?;
+        if retirement.exists(store, &guard).await? {
+            return Err(Error::other("artifact object version is retired"));
+        }
+        // Direct receivers do not own the coordinator attempt lock. Retain this
+        // version fence through physical publication so retirement cannot pass
+        // an admitted receiver whose RPC waiter has already gone away.
+        Ok((target.record.identity(), Arc::new(guard)))
     }
 
     /// Create a dedicated versioned bucket and observe its current incarnation.
@@ -774,7 +829,7 @@ fn attempt_prefix<'a>(base_prefix: &str, object: &'a str) -> Result<&'a str> {
 }
 
 impl ECStore {
-    /// Seal local repair admission for one ordinary-PUT-sealed artifact attempt.
+    /// Seal repair admission for one ordinary-PUT-sealed artifact attempt.
     /// This neither deletes versions nor proves all writers or GC eligibility.
     pub async fn seal_artifact_attempt_repairs(
         self: Arc<Self>,
@@ -782,7 +837,7 @@ impl ECStore {
         expected_incarnation: Uuid,
         attempt_prefix: &str,
     ) -> Result<()> {
-        require_local_put_seal_topology(&self).await?;
+        require_put_seal_topology(&self).await?;
         if self.ctx.lock_manager().is_disabled() {
             return Err(Error::other("artifact repair sealing requires namespace locking"));
         }
@@ -807,8 +862,9 @@ impl ECStore {
             let lock = store.new_ns_lock(RUSTFS_META_BUCKET, &record.path()).await?;
             let guard = WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout()).await?;
             if !record.exists(Arc::clone(&store), &guard).await? {
-                save_config_no_lock(store, &record.path(), serde_json::to_vec(&record)?, &guard).await?;
+                save_config_no_lock(Arc::clone(&store), &record.path(), serde_json::to_vec(&record)?, &guard).await?;
             }
+            Box::pin(store.close_artifact_receivers(&seal, crate::disk::local::ArtifactLeaseDomain::Repair)).await?;
             if lifecycle.is_lock_lost() || attempt.is_lock_lost() || guard.is_lock_lost() {
                 return Err(Error::other("artifact repair seal fence was lost"));
             }
@@ -864,7 +920,11 @@ impl ECStore {
 }
 
 impl ECStore {
-    async fn close_artifact_receivers(&self, record: &PutSealRecord) -> Result<()> {
+    async fn close_artifact_receivers(
+        &self,
+        record: &PutSealRecord,
+        domain: crate::disk::local::ArtifactLeaseDomain,
+    ) -> Result<()> {
         use crate::disk::{Disk, DiskAPI as _};
         use std::collections::BTreeMap;
         let mut disks = BTreeMap::new();
@@ -897,9 +957,17 @@ impl ECStore {
                     .map_err(Error::other)?
                     .filter(|id| !id.is_nil())
                     .ok_or_else(|| Error::other("artifact seal disk identity is unavailable"))?;
-                match disk.as_ref() {
-                    Disk::Local(local) => local.seal_artifact_puts(key).await.map_err(Error::other),
-                    Disk::Remote(remote) => remote
+                use crate::disk::local::ArtifactLeaseDomain;
+                match (disk.as_ref(), domain) {
+                    (Disk::Local(local), ArtifactLeaseDomain::Repair) => {
+                        local.seal_artifact_repairs(key).await.map_err(Error::other)
+                    }
+                    (Disk::Remote(remote), ArtifactLeaseDomain::Repair) => remote
+                        .seal_artifact_repairs(expected, &record.bucket, record.incarnation_id, &record.attempt_prefix)
+                        .await
+                        .map_err(Error::other),
+                    (Disk::Local(local), ArtifactLeaseDomain::Put) => local.seal_artifact_puts(key).await.map_err(Error::other),
+                    (Disk::Remote(remote), ArtifactLeaseDomain::Put) => remote
                         .seal_artifact_puts(expected, &record.bucket, record.incarnation_id, &record.attempt_prefix)
                         .await
                         .map_err(Error::other),
@@ -941,7 +1009,7 @@ impl ECStore {
                 if !record.exists(Arc::clone(&store), &guard).await? {
                     save_config_no_lock(Arc::clone(&store), &record.path(), serde_json::to_vec(&record)?, &guard).await?;
                 }
-                Box::pin(store.close_artifact_receivers(&record)).await?;
+                Box::pin(store.close_artifact_receivers(&record, crate::disk::local::ArtifactLeaseDomain::Put)).await?;
                 if lifecycle.is_lock_lost() || guard.is_lock_lost() {
                     return Err(Error::other("artifact PUT seal fence was lost"));
                 }

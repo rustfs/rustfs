@@ -340,6 +340,17 @@ message RenameDataResponse {
   bytes rename_data_resp_bin = 4;
 }
 
+// Repair publication binds the required receiving physical disk separately from PUT.
+message ArtifactRepairRenameDataRequest {
+  RenameDataRequest rename = 1;
+  bytes expected_disk_id = 2;
+}
+
+message ArtifactRepairWriteMetadataRequest {
+  WriteMetadataRequest metadata = 1;
+  bytes expected_disk_id = 2;
+}
+
 // Receiver derives the managed prefix from authoritative bucket metadata.
 message SealArtifactAttemptPutsRequest {
   string disk = 1;
@@ -1257,6 +1268,9 @@ service NodeService {
   rpc RenameData(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
   rpc RenameDataAtIncarnation(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
   rpc ArtifactRenameData(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
+  rpc ArtifactRepairRenameData(ArtifactRepairRenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
+  rpc ArtifactRepairWriteMetadata(ArtifactRepairWriteMetadataRequest) returns (WriteMetadataResponse) {}; // auth-policy: body-bound
+  rpc SealArtifactAttemptRepairs(SealArtifactAttemptPutsRequest) returns (SealArtifactAttemptPutsResponse) {}; // auth-policy: body-bound
   rpc SealArtifactAttemptPuts(SealArtifactAttemptPutsRequest) returns (SealArtifactAttemptPutsResponse) {}; // auth-policy: body-bound
   rpc MakeVolumes(MakeVolumesRequest) returns (MakeVolumesResponse) {}; // auth-policy: body-bound
   rpc MakeVolume(MakeVolumeRequest) returns (MakeVolumeResponse) {}; // auth-policy: body-bound
