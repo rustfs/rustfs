@@ -65,7 +65,7 @@ async fn create_artifact_admin(dist: &DistCluster, bucket: &str, prefix: &str) -
             },
             {
                 "Effect": "Allow",
-                "Action": ["admin:SealPluginArtifactAttempt", "admin:SealPluginArtifactRepairs"],
+                "Action": ["admin:SealPluginArtifactAttempt", "admin:SealPluginArtifactRepairs", "admin:SealPluginArtifactWrites"],
                 "Resource": format!("arn:aws:s3:::{bucket}/{}", prefix.trim_end_matches('/')),
             },
         ],

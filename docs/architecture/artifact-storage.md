@@ -328,13 +328,12 @@ mismatched records fail closed. Normal repair and minority metadata regeneration
 check the selected version before publication, including when the caller asks
 for the latest version. Refusal is not a physical absence proof.
 
-These operations do not yet prove that every write path is permanently sealed.
-Distributed exact-version retirement and all-writes sealing still require
-implementation and verification. The controller API below exposes the current
-storage facts; it does not remove those remaining requirements. Runner must not consume PUT sealing or
-version retirement alone as permanent all-writes authority. Retirement records
-must not expire by age; restoring storage from before a retirement can rewind
-that decision and requires a separate recovery contract.
+PUT sealing, repair sealing, and version retirement remain separate facts.
+Runner must not combine independently obtained narrow receipts into an
+all-writes claim. Distributed exact-version retirement still requires
+implementation and verification. Retirement records must not expire by age;
+restoring storage from before a retirement can rewind that decision and requires
+a separate recovery contract.
 
 Before Runner can rely on a seal, storage must fence every supported write path
 for the exact bucket incarnation and attempt namespace, retain the fence through
@@ -346,6 +345,49 @@ Automatic garbage collection remains disabled until storage sealing and the
 backup/restore retention contract are both implemented and verified. Unknown
 backup/PITR coverage must retain artifacts; a completed plugin execution does not
 prove that historical results are safe to delete.
+
+## Combined write sealing
+
+`ECStore::seal_artifact_attempt_writes` closes both supported publication domains
+for one managed bucket incarnation and attempt. It persists the existing PUT
+and repair records under lifecycle, attempt, then repair-record ownership. It
+does not introduce a third record or change either narrow operation's meaning.
+
+Both domains use one captured set of configured endpoints, disk instances, and
+non-nil disk UUIDs. Every configured receiver must participate; quorum is not
+enough. Local confirmation reads the actual format through the captured disk
+root, bypasses the ordinary ID cache, and rejects a changed configured root.
+Remote confirmation uses the existing signed, disk-bound seal RPCs. Membership
+and physical identity are rechecked before success. A partial failure leaves
+durable closure in place; an exact retry must confirm both domains again.
+
+Upgrade every configured node to an implementation of the fresh identity and
+shared-root checks before using combined sealing. Mixed-version operation is
+unsupported. These existing RPCs do not negotiate that capability: a peer with
+the older seal implementation can still return a valid signed response. Peers
+without the RPC fail without fallback, but that is not a version gate.
+
+```mermaid
+sequenceDiagram
+    participant C as Controller
+    participant S as Storage coordinator
+    participant R as Every configured receiver
+    C->>S: seal-writes(version, target)
+    S->>S: Own lifecycle and attempt; capture disk IDs; persist PUT record
+    S->>R: Close and drain PUT on the captured receivers
+    S->>S: Own and persist the repair record
+    S->>R: Close and drain repair on the same receivers
+    R-->>S: Durable closure and physical drain confirmed
+    S->>R: Recheck membership and physical identity
+    S-->>C: 200 only after all confirmations
+```
+
+The receipt covers the managed profile: ordinary PUT and repair use their
+respective domains; unsupported mutation paths reject the bucket. It is not a
+cross-disk atomic snapshot, a backup/restore guarantee, or permission to delete
+versions. A failed or cancelled caller may leave one or both domains closed;
+only a successful exact retry confirms completion. As with repair sealing,
+closing an attempt's writes also removes its future repair capability.
 
 ## Verification
 
@@ -362,6 +404,7 @@ cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_put_se
 cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_write_entrypoint -- --test-threads=1
 cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_repair_tests -- --test-threads=1
 cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_retirement -- --test-threads=1
+cargo test --locked -p rustfs-ecstore --lib --features test-util artifact_writes_seal -- --test-threads=1
 ```
 
 `crates/ecstore/src/store/init/tests/artifact_put_seal_tests.rs` pauses real
@@ -390,12 +433,23 @@ unretired-version repair. Physical syscall pauses cover both cancelled repair
 workers and cancelled retirement publication. Retirement leaves GET available
 and never supplies evidence that the version is physically absent.
 
-These checks establish bucket identity, versioning, ordinary PUT sealing,
+The narrow-operation checks establish bucket identity, versioning, ordinary PUT sealing,
 attempt repair sealing, and exact-version repair retirement. Repair-seal tests
 also cover restart, corrupt records, other-attempt isolation, and cancelled
 rename/metadata workers whose physical writes must drain before confirmation.
 They do not certify all-writes sealing, backup retention, or safe artifact
 deletion.
+
+`crates/ecstore/src/store/init/tests/artifact_writes_seal_tests.rs` checks the
+combined operation with real storage, including partial closure, exact retries,
+record corruption, missing members, and changed disk identity without waiting
+for the ordinary format cache to expire. The four-node scenario in
+`crates/e2e_test/src/distributed/artifact_writes_test.rs` checks combined
+confirmation, offline refusal, restart, and continued PUT/repair rejection.
+Its Object Lock requests first enable and read back bucket configuration, so
+retention and legal-hold refusal reaches the object mutation path. The admin
+handler tests similarly use real historical multipart staging when exercising
+the S3 UploadPartCopy entry point.
 
 The distributed repair scenarios in
 `crates/e2e_test/src/distributed/artifact_repair_test.rs` verify exact-version
@@ -414,7 +468,7 @@ python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo test -p e2e
 
 ## Controller API
 
-The admin router exposes five SigV4-authenticated POST operations:
+The admin router exposes six SigV4-authenticated POST operations:
 
 - `/rustfs/admin/v3/plugin-artifacts/buckets`, requiring
   `admin:CreatePluginArtifactBucket` on the bucket ARN.
@@ -424,6 +478,8 @@ The admin router exposes five SigV4-authenticated POST operations:
   `admin:SealPluginArtifactAttempt` on the attempt namespace.
 - `/rustfs/admin/v3/plugin-artifacts/seal-repairs`, requiring
   `admin:SealPluginArtifactRepairs` on the attempt namespace.
+- `/rustfs/admin/v3/plugin-artifacts/seal-writes`, requiring
+  `admin:SealPluginArtifactWrites` on the attempt namespace.
 - `/rustfs/admin/v3/plugin-artifacts/retire-version`, requiring
   `admin:RetirePluginArtifactVersion` on the exact logical object key.
 
@@ -433,7 +489,7 @@ initial profile requires built-in IAM; external authorization plugins cannot
 establish its explicit local Resource contract. No separate signer map is used.
 The controller grant is independent of an execution delegation's expiration.
 
-Both seal operations use this request:
+All three seal operations use this request:
 
 ```json
 {
@@ -454,7 +510,8 @@ The storage call has a 30-second caller deadline.
 IAM uses the existing S3 resource grammar, including its path normalization:
 the namespace's trailing slash is removed during matching. An exact attempt
 controller policy can therefore use these statements (grant repair sealing
-separately only to the component making that irreversible decision):
+separately only to the component making that irreversible decision; the combined
+operation likewise needs its own `admin:SealPluginArtifactWrites` grant):
 
 ```json
 {
@@ -487,11 +544,15 @@ exact bucket generation and version identity are validated by storage.
 
 Only a completed storage operation returns HTTP 200 with `Cache-Control: no-store`.
 PUT seal returns `version`, `target`, and `ordinary_put_sealed: true`. Repair seal
-returns `version`, `target`, and `attempt_repairs_sealed: true`. Retirement
+returns `version`, `target`, and `attempt_repairs_sealed: true`. Combined sealing
+returns `version`, `target`, `ordinary_put_sealed: true`,
+`attempt_repairs_sealed: true`, and `all_writes_sealed: true`. The two narrow
+permissions do not grant access to the combined operation. Retirement
 returns `version`, `target`, `object`, `version_id`, and
 `exact_version_repair_retired: true`. These are idempotent confirmations of
-specific storage facts. They do not attest that all writers are sealed, that
-data was deleted, or that GC is permitted.
+specific storage facts. Only the combined operation attests to both write
+domains on a common receiver set. No receipt attests that data was deleted or
+that GC is permitted.
 
 Malformed requests return InvalidRequest; authentication/resource denial returns
 AccessDenied. All storage failures and caller deadlines return a sanitized

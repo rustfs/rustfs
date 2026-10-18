@@ -919,20 +919,21 @@ impl ECStore {
     }
 }
 
+type ArtifactReceiverSnapshot = std::collections::BTreeMap<String, (crate::disk::DiskStore, Uuid)>;
+
 impl ECStore {
-    async fn close_artifact_receivers(
-        &self,
-        record: &PutSealRecord,
-        domain: crate::disk::local::ArtifactLeaseDomain,
-    ) -> Result<()> {
-        use crate::disk::{Disk, DiskAPI as _};
-        use std::collections::BTreeMap;
-        let mut disks = BTreeMap::new();
-        // Enumerate configured slots, including offline disks. Quorum is not
-        // enough: every possible late receiver must durably close this attempt.
+    async fn artifact_receiver_inventory(&self) -> Result<std::collections::BTreeMap<String, crate::disk::DiskStore>> {
+        use crate::disk::DiskAPI as _;
+        let mut disks = std::collections::BTreeMap::new();
+        // Keep every configured slot, including offline members. A quorum is
+        // insufficient to close a receiver that may still own physical work.
         for pool in &self.pools {
             for set in &pool.disk_set {
-                for disk in set.disk_inventory().await {
+                let members = set.disk_inventory().await;
+                if members.len() != set.set_drive_count {
+                    return Err(Error::other("artifact seal configured disk count mismatch"));
+                }
+                for disk in members {
                     let disk = disk.ok_or_else(|| Error::other("artifact seal requires every configured disk"))?;
                     if disks.insert(disk.endpoint().to_string(), disk).is_some() {
                         return Err(Error::other("artifact seal disk topology is ambiguous"));
@@ -940,42 +941,191 @@ impl ECStore {
                 }
             }
         }
-        let configured: std::collections::BTreeSet<_> = self
-            .pools
-            .iter()
-            .flat_map(|pool| pool.endpoints.endpoints.as_ref().iter().map(ToString::to_string))
-            .collect();
+        let mut configured = std::collections::BTreeSet::new();
+        for endpoint in self.pools.iter().flat_map(|pool| pool.endpoints.endpoints.as_ref()) {
+            if !configured.insert(endpoint.to_string()) {
+                return Err(Error::other("artifact seal configured disk topology is ambiguous"));
+            }
+        }
         if configured.is_empty() || disks.keys().cloned().collect::<std::collections::BTreeSet<_>>() != configured {
             return Err(Error::other("artifact seal configured disk topology mismatch"));
         }
+        Ok(disks)
+    }
+
+    async fn capture_artifact_receivers(&self) -> Result<ArtifactReceiverSnapshot> {
+        use crate::disk::Disk;
+        let mut receivers = ArtifactReceiverSnapshot::new();
+        let mut identities = std::collections::BTreeSet::new();
+        for (endpoint, disk) in self.artifact_receiver_inventory().await? {
+            // Remote IDs are expectations only. The signed close response must
+            // bind that expectation to the actual receiving disk on every call.
+            let expected = disk
+                .cached_disk_id()
+                .await
+                .filter(|id| !id.is_nil())
+                .ok_or_else(|| Error::other("artifact seal disk identity is unavailable"))?;
+            if let Disk::Local(local) = disk.as_ref()
+                && local.artifact_disk_id().await.map_err(Error::other)? != expected
+            {
+                return Err(Error::other("artifact seal physical disk identity changed"));
+            }
+            if !identities.insert(expected) {
+                return Err(Error::other("artifact seal disk identities are ambiguous"));
+            }
+            receivers.insert(endpoint, (disk, expected));
+        }
+        Ok(receivers)
+    }
+
+    async fn close_artifact_receiver_snapshot(
+        &self,
+        record: &PutSealRecord,
+        domain: crate::disk::local::ArtifactLeaseDomain,
+        receivers: &ArtifactReceiverSnapshot,
+    ) -> Result<()> {
+        use crate::disk::{Disk, local::ArtifactLeaseDomain};
         let key = record.identity().receiver_key;
-        futures::future::try_join_all(disks.into_values().map(|disk| {
-            Box::pin(async move {
-                let expected = disk
-                    .get_disk_id()
-                    .await
-                    .map_err(Error::other)?
-                    .filter(|id| !id.is_nil())
-                    .ok_or_else(|| Error::other("artifact seal disk identity is unavailable"))?;
-                use crate::disk::local::ArtifactLeaseDomain;
-                match (disk.as_ref(), domain) {
-                    (Disk::Local(local), ArtifactLeaseDomain::Repair) => {
-                        local.seal_artifact_repairs(key).await.map_err(Error::other)
+        futures::future::try_join_all(receivers.values().map(|(disk, expected)| async move {
+            match (disk.as_ref(), domain) {
+                (Disk::Local(local), domain) => {
+                    if local.artifact_disk_id().await.map_err(Error::other)? != *expected {
+                        return Err(Error::other("artifact seal physical disk identity changed"));
                     }
-                    (Disk::Remote(remote), ArtifactLeaseDomain::Repair) => remote
-                        .seal_artifact_repairs(expected, &record.bucket, record.incarnation_id, &record.attempt_prefix)
-                        .await
-                        .map_err(Error::other),
-                    (Disk::Local(local), ArtifactLeaseDomain::Put) => local.seal_artifact_puts(key).await.map_err(Error::other),
-                    (Disk::Remote(remote), ArtifactLeaseDomain::Put) => remote
-                        .seal_artifact_puts(expected, &record.bucket, record.incarnation_id, &record.attempt_prefix)
-                        .await
-                        .map_err(Error::other),
+                    match domain {
+                        ArtifactLeaseDomain::Put => local.seal_artifact_puts(key).await,
+                        ArtifactLeaseDomain::Repair => local.seal_artifact_repairs(key).await,
+                    }
+                    .map_err(Error::other)?;
+                    if local.artifact_disk_id().await.map_err(Error::other)? != *expected {
+                        return Err(Error::other("artifact seal physical disk identity changed"));
+                    }
+                    Ok(())
                 }
-            })
+                (Disk::Remote(remote), ArtifactLeaseDomain::Put) => remote
+                    .seal_artifact_puts(*expected, &record.bucket, record.incarnation_id, &record.attempt_prefix)
+                    .await
+                    .map_err(Error::other),
+                (Disk::Remote(remote), ArtifactLeaseDomain::Repair) => remote
+                    .seal_artifact_repairs(*expected, &record.bucket, record.incarnation_id, &record.attempt_prefix)
+                    .await
+                    .map_err(Error::other),
+            }
         }))
         .await?;
         Ok(())
+    }
+
+    async fn verify_artifact_receiver_snapshot(
+        &self,
+        record: &PutSealRecord,
+        receivers: &ArtifactReceiverSnapshot,
+    ) -> Result<()> {
+        use crate::disk::Disk;
+        for (endpoint, current) in self.artifact_receiver_inventory().await? {
+            if !receivers
+                .get(&endpoint)
+                .is_some_and(|(captured, _)| Arc::ptr_eq(&current, captured))
+            {
+                return Err(Error::other("artifact seal receiver membership changed"));
+            }
+        }
+        futures::future::try_join_all(receivers.values().map(|(disk, expected)| async move {
+            if disk.cached_disk_id().await != Some(*expected) {
+                return Err(Error::other("artifact seal receiver disk identity changed"));
+            }
+            match disk.as_ref() {
+                Disk::Local(local) => {
+                    if local.artifact_disk_id().await.map_err(Error::other)? != *expected {
+                        return Err(Error::other("artifact seal physical disk identity changed"));
+                    }
+                }
+                Disk::Remote(remote) => {
+                    // Another endpoint may have taken a long time to drain.
+                    // Confirm this receiver again with a fresh signed physical
+                    // identity response; its cached UUID cannot prove that.
+                    remote
+                        .seal_artifact_repairs(*expected, &record.bucket, record.incarnation_id, &record.attempt_prefix)
+                        .await
+                        .map_err(Error::other)?;
+                }
+            }
+            Ok(())
+        }))
+        .await?;
+        for (endpoint, current) in self.artifact_receiver_inventory().await? {
+            if !receivers
+                .get(&endpoint)
+                .is_some_and(|(captured, _)| Arc::ptr_eq(&current, captured))
+            {
+                return Err(Error::other("artifact seal receiver membership changed"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn close_artifact_receivers(
+        &self,
+        record: &PutSealRecord,
+        domain: crate::disk::local::ArtifactLeaseDomain,
+    ) -> Result<()> {
+        let receivers = self.capture_artifact_receivers().await?;
+        self.close_artifact_receiver_snapshot(record, domain, &receivers).await
+    }
+
+    /// Permanently close and drain the managed artifact profile's PUT and
+    /// repair domains on one captured configured receiver set. This is not
+    /// exact-version retirement, physical absence, or GC authorization.
+    pub async fn seal_artifact_attempt_writes(
+        self: Arc<Self>,
+        bucket: &str,
+        expected_incarnation: Uuid,
+        attempt_prefix: &str,
+    ) -> Result<()> {
+        Box::pin(async move {
+            require_put_seal_topology(&self).await?;
+            if self.ctx.lock_manager().is_disabled() {
+                return Err(Error::other("artifact writes sealing requires namespace locking"));
+            }
+            let metadata = metadata_sys::get_bucket_incarnation_metadata_in(&self.ctx, bucket).await?;
+            if expected_incarnation.is_nil() || metadata.name != bucket || metadata.bucket_incarnation_id != expected_incarnation
+            {
+                return Err(Error::other("artifact writes seal bucket incarnation mismatch"));
+            }
+            let put = PutSealRecord::new(&metadata, attempt_prefix)?;
+            let repair = ArtifactRepairSealRecord::new(&put);
+            let lifecycle = self.acquire_bucket_incarnation_fence(bucket, expected_incarnation).await?;
+            let store = Arc::clone(&self);
+            // Lifecycle -> attempt -> repair record. The owned transaction and
+            // disk lease workers survive cancellation of the request waiter.
+            with_config_object_write_lock(self, put.path(), move |attempt| async move {
+                if lifecycle.is_lock_lost() || attempt.is_lock_lost() {
+                    return Err(Error::other("artifact writes seal fence was lost"));
+                }
+                let receivers = store.capture_artifact_receivers().await?;
+                if !put.exists(Arc::clone(&store), &attempt).await? {
+                    save_config_no_lock(Arc::clone(&store), &put.path(), serde_json::to_vec(&put)?, &attempt).await?;
+                }
+                store
+                    .close_artifact_receiver_snapshot(&put, crate::disk::local::ArtifactLeaseDomain::Put, &receivers)
+                    .await?;
+                let lock = store.new_ns_lock(RUSTFS_META_BUCKET, &repair.path()).await?;
+                let guard = WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout()).await?;
+                if !repair.exists(Arc::clone(&store), &guard).await? {
+                    save_config_no_lock(Arc::clone(&store), &repair.path(), serde_json::to_vec(&repair)?, &guard).await?;
+                }
+                store
+                    .close_artifact_receiver_snapshot(&put, crate::disk::local::ArtifactLeaseDomain::Repair, &receivers)
+                    .await?;
+                store.verify_artifact_receiver_snapshot(&put, &receivers).await?;
+                if lifecycle.is_lock_lost() || attempt.is_lock_lost() || guard.is_lock_lost() {
+                    return Err(Error::other("artifact writes seal fence was lost"));
+                }
+                Ok(())
+            })
+            .await?
+        })
+        .await
     }
 
     /// Seal ordinary ECStore PUTs for one artifact attempt. This does not seal

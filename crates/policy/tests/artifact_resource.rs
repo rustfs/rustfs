@@ -210,3 +210,49 @@ fn artifact_repair_seal_action_is_independent_and_round_trips() {
         "out/attempt-a/"
     ));
 }
+
+#[test]
+fn artifact_writes_seal_requires_independent_explicit_attempt_authority() {
+    let wire = "admin:SealPluginArtifactWrites";
+    let action = Action::AdminAction(AdminAction::SealPluginArtifactWritesAction);
+    assert!(AdminAction::SealPluginArtifactWritesAction.is_valid());
+    assert_eq!(Action::try_from(wire).expect("writes seal action"), action);
+    assert_eq!(serde_json::to_value(action).expect("writes seal wire form"), json!(wire));
+    let grant = json!({"Effect":"Allow", "Action":wire, "Resource":"arn:aws:s3:::artifacts/out/attempt-a"});
+    assert!(allowed(json!([grant.clone()]), wire, "artifacts", "out/attempt-a/"));
+    assert!(!allowed(json!([grant.clone()]), wire, "another", "out/attempt-a/"));
+    assert!(!allowed(json!([grant.clone()]), wire, "artifacts", "out/attempt-b/"));
+    for resource in [None, Some("arn:aws:s3:::artifacts/out/attempt-a/object")] {
+        let mut unscoped = json!({"Effect":"Allow", "Action":wire});
+        if let Some(resource) = resource {
+            unscoped["Resource"] = json!(resource);
+        }
+        assert!(!allowed(json!([unscoped]), wire, "artifacts", "out/attempt-a/"));
+    }
+    assert!(!allowed(
+        json!([grant, {"Effect":"Deny", "Action":"admin:*"}]),
+        wire,
+        "artifacts",
+        "out/attempt-a/"
+    ));
+    for old in ["admin:SealPluginArtifactAttempt", "admin:SealPluginArtifactRepairs"] {
+        assert!(!allowed(
+            json!([{"Effect":"Allow", "Action":old, "Resource":"arn:aws:s3:::artifacts/out/attempt-a"}]),
+            wire,
+            "artifacts",
+            "out/attempt-a/"
+        ));
+        assert!(!allowed(
+            json!([{"Effect":"Allow", "Action":wire, "Resource":"arn:aws:s3:::artifacts/out/attempt-a"}]),
+            old,
+            "artifacts",
+            "out/attempt-a/"
+        ));
+    }
+    assert!(!allowed(
+        json!([{"Effect":"Allow", "Action":["admin:SealPluginArtifactAttempt", "admin:SealPluginArtifactRepairs"], "Resource":"arn:aws:s3:::artifacts/out/attempt-a"}]),
+        wire,
+        "artifacts",
+        "out/attempt-a/"
+    ));
+}

@@ -23,6 +23,7 @@ mod artifact_put_tail_test;
 mod artifact_repair_tail_test;
 mod artifact_repair_test;
 mod artifact_seal_test;
+mod artifact_writes_test;
 mod chaos_test;
 mod concurrency_stability_test;
 mod concurrent_data_movement_test;

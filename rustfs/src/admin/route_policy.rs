@@ -21,6 +21,7 @@ const GET_PLUGIN_ARTIFACT_BUCKET: AdminActionRef = AdminActionRef::new("GetPlugi
 const CREATE_PLUGIN_ARTIFACT_BUCKET: AdminActionRef = AdminActionRef::new("CreatePluginArtifactBucketAction");
 const SEAL_PLUGIN_ARTIFACT: AdminActionRef = AdminActionRef::new("SealPluginArtifactAttemptAction");
 const SEAL_PLUGIN_ARTIFACT_REPAIRS: AdminActionRef = AdminActionRef::new("SealPluginArtifactRepairsAction");
+const SEAL_PLUGIN_ARTIFACT_WRITES: AdminActionRef = AdminActionRef::new("SealPluginArtifactWritesAction");
 const RETIRE_PLUGIN_ARTIFACT: AdminActionRef = AdminActionRef::new("RetirePluginArtifactVersionAction");
 const ALL_ADMIN: AdminActionRef = AdminActionRef::new("AllAdminActions");
 const ADD_USER_TO_GROUP: AdminActionRef = AdminActionRef::new("AddUserToGroupAdminAction");
@@ -672,6 +673,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HttpMethod::Post,
         "/rustfs/admin/v3/plugin-artifacts/seal-repairs",
         SEAL_PLUGIN_ARTIFACT_REPAIRS,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-artifacts/seal-writes",
+        SEAL_PLUGIN_ARTIFACT_WRITES,
         RouteRiskLevel::High,
     ),
     admin(
@@ -2480,6 +2487,14 @@ mod tests {
         ] {
             assert_not_action(method, path, SERVER_INFO);
         }
+    }
+
+    #[test]
+    fn artifact_writes_route_policy_requires_independent_action() {
+        let route = "/rustfs/admin/v3/plugin-artifacts/seal-writes";
+        assert_action(HttpMethod::Post, route, SEAL_PLUGIN_ARTIFACT_WRITES);
+        assert_not_action(HttpMethod::Post, route, SEAL_PLUGIN_ARTIFACT);
+        assert_not_action(HttpMethod::Post, route, SEAL_PLUGIN_ARTIFACT_REPAIRS);
     }
 
     #[test]

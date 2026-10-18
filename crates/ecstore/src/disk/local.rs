@@ -5963,6 +5963,8 @@ pub struct LocalDisk {
     /// paths beneath it keeps repair I/O on that mount even if the configured
     /// pathname is later covered by another mount.
     io_root: PathBuf,
+    #[cfg(all(unix, not(target_os = "linux")))]
+    artifact_identity_root: Arc<std::fs::File>,
     #[cfg(target_os = "linux")]
     mount_lease: Arc<std::fs::File>,
     #[cfg(target_os = "linux")]
@@ -7393,6 +7395,75 @@ impl LocalDisk {
         artifact_lease::seal_in(root, key, artifact_lease::Domain::Repair).await
     }
 
+    /// Read the receiving disk's format without the ordinary ID cache, and
+    /// reject a configured endpoint that no longer names this captured root.
+    pub(crate) async fn artifact_disk_id(&self) -> Result<Uuid> {
+        #[cfg(unix)]
+        {
+            #[cfg(target_os = "linux")]
+            let root = artifact_lease::pinned_root(self).await?;
+            #[cfg(not(target_os = "linux"))]
+            let root = self.artifact_identity_root.try_clone()?;
+            let configured = PathBuf::from(self.endpoint.get_file_path());
+            #[cfg(target_os = "linux")]
+            let mount_id = self.mount_lease_mount_id.ok_or(DiskError::DiskNotFound)?;
+            let location = (self.endpoint.set_idx, self.endpoint.disk_idx);
+            tokio::task::spawn_blocking(move || {
+                use rustix::fs::{Mode, OFlags, open, openat};
+                use std::io::Read as _;
+                use std::os::unix::fs::MetadataExt as _;
+
+                let verify_root = || -> Result<()> {
+                    let current = std::fs::File::from(
+                        open(&configured, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
+                            .map_err(std::io::Error::from)?,
+                    );
+                    let pinned = root.metadata()?;
+                    let current_metadata = current.metadata()?;
+                    if (current_metadata.dev(), current_metadata.ino()) != (pinned.dev(), pinned.ino()) {
+                        return Err(DiskError::DiskNotFound);
+                    }
+                    #[cfg(target_os = "linux")]
+                    if mount_id_for_fd(&root) != Some(mount_id) || mount_id_for_fd(&current) != Some(mount_id) {
+                        return Err(DiskError::DiskNotFound);
+                    }
+                    Ok(())
+                };
+                verify_root()?;
+                let metadata = openat(
+                    &root,
+                    RUSTFS_META_BUCKET,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(std::io::Error::from)?;
+                let mut format = std::fs::File::from(
+                    openat(
+                        &metadata,
+                        super::FORMAT_CONFIG_FILE,
+                        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .map_err(std::io::Error::from)?,
+                );
+                let mut bytes = Vec::new();
+                format.read_to_end(&mut bytes)?;
+                let format = FormatV3::try_from(bytes.as_slice()).map_err(|_| DiskError::CorruptedBackend)?;
+                let id = format.erasure.this;
+                let (set, disk) = format.find_disk_index_by_disk_id(id)?;
+                if id.is_nil() || (i32::try_from(set).ok(), i32::try_from(disk).ok()) != (Some(location.0), Some(location.1)) {
+                    return Err(DiskError::InconsistentDisk);
+                }
+                verify_root()?;
+                Ok(id)
+            })
+            .await
+            .map_err(DiskError::from)?
+        }
+        #[cfg(not(unix))]
+        Err(DiskError::other("artifact disk identity requires Unix"))
+    }
+
     pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self> {
         debug!(
             event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
@@ -7432,6 +7503,9 @@ impl LocalDisk {
         let (mount_lease, io_root, mount_lease_mount_id) = Self::open_mount_lease(&root)?;
         #[cfg(not(target_os = "linux"))]
         let io_root = Self::open_mount_lease(&root)?;
+
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let artifact_identity_root = Arc::new(fs::File::open(&root).await?.into_std().await);
 
         ensure_data_usage_layout(&io_root)
             .await
@@ -7569,6 +7643,8 @@ impl LocalDisk {
             root: root.clone(),
             publication_root,
             io_root: io_root.clone(),
+            #[cfg(all(unix, not(target_os = "linux")))]
+            artifact_identity_root,
             #[cfg(target_os = "linux")]
             mount_lease: Arc::new(mount_lease),
             #[cfg(target_os = "linux")]
@@ -34552,5 +34628,42 @@ mod test {
         assert_eq!(generation, before + 1);
         assert_eq!(ctx.namespace_commit_generation(), before + 2);
         assert!(!ctx.namespace_commits_pending());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod artifact_writes_identity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn artifact_writes_seal_missing_mount_identity_fails_closed() {
+        let root = tempfile::tempdir().expect("real identity disk root");
+        let mut endpoint = Endpoint::try_from(root.path().to_str().expect("fixture path")).expect("local endpoint");
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let mut disk = LocalDisk::new(&endpoint, false).await.expect("open real disk descriptor");
+        let mut format = FormatV3::new(1, 1);
+        format.erasure.this = format.erasure.sets[0][0];
+        fs::create_dir_all(disk.io_format_path.parent().expect("format parent"))
+            .await
+            .expect("format directory");
+        fs::write(&disk.io_format_path, serde_json::to_vec(&format).expect("format bytes"))
+            .await
+            .expect("real disk format");
+        assert_eq!(
+            disk.artifact_disk_id().await.expect("baseline fresh physical identity"),
+            format.erasure.this
+        );
+        let mount = disk
+            .mount_lease_mount_id
+            .take()
+            .expect("Linux root has a recorded mount identity");
+        let result = disk.artifact_disk_id().await;
+        disk.mount_lease_mount_id = Some(mount);
+        assert!(
+            matches!(result, Err(DiskError::DiskNotFound)),
+            "missing mount identity cannot authenticate this root"
+        );
+        assert_eq!(disk.artifact_disk_id().await.expect("restored mount identity"), format.erasure.this);
     }
 }

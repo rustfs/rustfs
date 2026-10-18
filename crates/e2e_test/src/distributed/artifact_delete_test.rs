@@ -21,7 +21,7 @@ use tokio::time::timeout;
 const PUBLIC_INTERNAL_ERROR: &str = "We encountered an internal error, please try again.";
 
 #[derive(Debug, PartialEq, Eq)]
-struct PhysicalEntry {
+pub(super) struct PhysicalEntry {
     identity: (u64, u64),
     changed: (i64, i64),
     modified: (i64, i64),
@@ -31,7 +31,7 @@ struct PhysicalEntry {
 // Include directory identity/ctime as well as file bytes. Creating and removing
 // a temporary marker/rollback file cannot hide behind a restored final xl.meta.
 // Reads change atime, which is deliberately excluded.
-fn physical_snapshot(dist: &DistCluster, bucket: &str) -> TestResult<BTreeMap<(usize, PathBuf), PhysicalEntry>> {
+pub(super) fn physical_snapshot(dist: &DistCluster, bucket: &str) -> TestResult<BTreeMap<(usize, PathBuf), PhysicalEntry>> {
     let mut snapshot = BTreeMap::new();
     for (node, instance) in dist.cluster.nodes.iter().enumerate() {
         let root = Path::new(&instance.data_dirs[0]).join(bucket);

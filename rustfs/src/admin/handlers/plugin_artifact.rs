@@ -120,6 +120,15 @@ struct RepairSealReceipt {
 }
 
 #[derive(Serialize)]
+struct WritesSealReceipt {
+    version: u32,
+    target: AttemptIdentity,
+    ordinary_put_sealed: bool,
+    attempt_repairs_sealed: bool,
+    all_writes_sealed: bool,
+}
+
+#[derive(Serialize)]
 struct RetirementReceipt {
     version: u32,
     target: AttemptIdentity,
@@ -178,6 +187,11 @@ pub fn register_plugin_artifact_routes(router: &mut S3Router<AdminOperation>) ->
         Method::POST,
         &format!("{ADMIN_PREFIX}/v3/plugin-artifacts/seal-repairs"),
         AdminOperation(&SealRepairs),
+    )?;
+    router.insert(
+        Method::POST,
+        &format!("{ADMIN_PREFIX}/v3/plugin-artifacts/seal-writes"),
+        AdminOperation(&SealWrites),
     )?;
     router.insert(
         Method::POST,
@@ -314,6 +328,44 @@ impl Operation for SealRepairs {
             version: 1,
             target: input.target,
             attempt_repairs_sealed: true,
+        })
+    }
+}
+
+struct SealWrites;
+#[async_trait::async_trait]
+impl Operation for SealWrites {
+    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        require_builtin_authorization().await?;
+        let input: SealRequest = request_body(&mut req).await?;
+        input.target.validate()?;
+        if input.version != 1 {
+            return Err(s3_error!(InvalidRequest, "unsupported artifact protocol version"));
+        }
+        let store = request_store(&req)?;
+        owner_for_resource(
+            &req,
+            AdminAction::SealPluginArtifactWritesAction,
+            AdminResourceScope::bucket_object(&input.target.bucket, &input.target.attempt_prefix),
+        )
+        .await?;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            store.seal_artifact_attempt_writes(
+                &input.target.bucket,
+                input.target.bucket_incarnation,
+                &input.target.attempt_prefix,
+            ),
+        )
+        .await
+        .map_err(|_| unconfirmed())?
+        .map_err(|_| unconfirmed())?;
+        response(&WritesSealReceipt {
+            version: 1,
+            target: input.target,
+            ordinary_put_sealed: true,
+            attempt_repairs_sealed: true,
+            all_writes_sealed: true,
         })
     }
 }

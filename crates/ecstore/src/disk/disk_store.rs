@@ -2433,6 +2433,10 @@ impl LocalDiskWrapper {
         self.disk.seal_artifact_repairs(key).await
     }
 
+    pub(crate) async fn artifact_disk_id(&self) -> Result<Uuid> {
+        self.disk.artifact_disk_id().await
+    }
+
     /// Create a new LocalDiskWrapper
     pub fn new(disk: Arc<LocalDisk>, health_check: bool) -> Self {
         let admission = DiskIoAdmission::new(disk.endpoint().to_string());

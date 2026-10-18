@@ -18,10 +18,10 @@ const HEAL_BODY: &str =
     r#"{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false}"#;
 const HEAL_BUDGET: Duration = Duration::from_secs(120);
 
-struct RepairObject {
-    key: String,
-    version: String,
-    body: Vec<u8>,
+pub(super) struct RepairObject {
+    pub(super) key: String,
+    pub(super) version: String,
+    pub(super) body: Vec<u8>,
     manifests: Vec<VersionShardCensus>,
 }
 
@@ -34,7 +34,7 @@ fn roots(dist: &DistCluster) -> Vec<PathBuf> {
 }
 
 impl RepairObject {
-    async fn put(dist: &DistCluster, bucket: &str, key: String) -> TestResult<Self> {
+    pub(super) async fn put(dist: &DistCluster, bucket: &str, key: String) -> TestResult<Self> {
         let body = payload_for(&key, 2 * 1024 * 1024);
         let output = timeout(
             Duration::from_secs(30),
@@ -63,7 +63,7 @@ impl RepairObject {
         })
     }
 
-    fn part(&self, disk: &Path, bucket: &str, node: usize) -> TestResult<PathBuf> {
+    pub(super) fn part(&self, disk: &Path, bucket: &str, node: usize) -> TestResult<PathBuf> {
         let data_dir = self.manifests[node]
             .data_dir
             .as_ref()
@@ -71,7 +71,7 @@ impl RepairObject {
         Ok(disk.join(bucket).join(&self.key).join(data_dir).join("part.1"))
     }
 
-    async fn assert_repaired(&self, dist: &DistCluster, bucket: &str) -> TestResult {
+    pub(super) async fn assert_repaired(&self, dist: &DistCluster, bucket: &str) -> TestResult {
         wait_until(
             HEAL_BUDGET,
             || async {
@@ -92,7 +92,7 @@ impl RepairObject {
     }
 }
 
-async fn start_heal(dist: &DistCluster, bucket: &str, prefix: &str, remove: bool) -> TestResult<String> {
+pub(super) async fn start_heal(dist: &DistCluster, bucket: &str, prefix: &str, remove: bool) -> TestResult<String> {
     let url = format!("{}/rustfs/admin/v3/heal/{bucket}/{prefix}?forceStart=true", dist.cluster.nodes[0].url);
     let body = if remove {
         HEAL_BODY.replace("\"remove\":false", "\"remove\":true")
@@ -111,7 +111,7 @@ async fn start_heal(dist: &DistCluster, bucket: &str, prefix: &str, remove: bool
         .to_owned())
 }
 
-async fn finish_heal(dist: &DistCluster, token: &str, rejected_key: Option<&str>) -> TestResult {
+pub(super) async fn finish_heal(dist: &DistCluster, token: &str, rejected_key: Option<&str>) -> TestResult {
     let url = format!("{}/rustfs/admin/v3/heal/?clientToken={token}", dist.cluster.nodes[0].url);
     wait_until(
         HEAL_BUDGET,

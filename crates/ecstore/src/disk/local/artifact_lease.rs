@@ -51,27 +51,15 @@ impl Domain {
 
 pub(super) async fn pinned_root(disk: &super::LocalDisk) -> Result<File> {
     #[cfg(target_os = "linux")]
-    let mount = disk.mount_lease.clone();
+    let root = disk.mount_lease.clone();
     #[cfg(all(unix, not(target_os = "linux")))]
-    let path = disk.io_root().to_owned();
+    let root = disk.artifact_identity_root.clone();
     #[cfg(not(unix))]
     let _ = disk;
     tokio::task::spawn_blocking(move || {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
-            mount.try_clone().map_err(DiskError::from)
-        }
-        #[cfg(all(unix, not(target_os = "linux")))]
-        {
-            use rustix::fs::{Mode, OFlags, open};
-            open(
-                path,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map(File::from)
-            .map_err(std::io::Error::from)
-            .map_err(DiskError::from)
+            root.try_clone().map_err(DiskError::from)
         }
         #[cfg(not(unix))]
         {

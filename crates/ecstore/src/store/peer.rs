@@ -447,14 +447,14 @@ impl ECStore {
             .await
             .map_err(|_| DiskError::FileAccessDenied)?;
         let _owner = admit_local_disk(&self.ctx, &disk, id, true).await?;
-        if disk.get_disk_id().await? != Some(expected_disk) || lifecycle.is_lock_lost() {
-            return Err(DiskError::FileAccessDenied);
-        }
         let Disk::Local(local) = disk.as_ref() else {
             return Err(DiskError::DiskNotFound);
         };
+        if local.artifact_disk_id().await? != expected_disk || lifecycle.is_lock_lost() {
+            return Err(DiskError::FileAccessDenied);
+        }
         local.seal_artifact_repairs(identity.receiver_key).await?;
-        if lifecycle.is_lock_lost() {
+        if local.artifact_disk_id().await? != expected_disk || lifecycle.is_lock_lost() {
             return Err(DiskError::FileAccessDenied);
         }
         Ok(expected_disk)
@@ -483,14 +483,14 @@ impl ECStore {
             .map_err(|_| DiskError::FileAccessDenied)?;
         let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
         let _owner = admit_local_disk(&self.ctx, &disk, id, true).await?;
-        if disk.get_disk_id().await? != Some(expected_disk) || lifecycle.is_lock_lost() {
-            return Err(DiskError::FileAccessDenied);
-        }
         let Disk::Local(local) = disk.as_ref() else {
             return Err(DiskError::DiskNotFound);
         };
+        if local.artifact_disk_id().await? != expected_disk || lifecycle.is_lock_lost() {
+            return Err(DiskError::FileAccessDenied);
+        }
         local.seal_artifact_puts(identity.receiver_key).await?;
-        if lifecycle.is_lock_lost() {
+        if local.artifact_disk_id().await? != expected_disk || lifecycle.is_lock_lost() {
             return Err(DiskError::FileAccessDenied);
         }
         Ok(expected_disk)
