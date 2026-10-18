@@ -1,7 +1,7 @@
 # CI gate matrix
 
 **Use this when:** a check is red and you need to know whether it blocks the merge, which workflow and job produced it, and how to reproduce it locally.
-**Source of truth:** the live `main` ruleset (command below) for required status; `.github/workflows/<file>.yml` for triggers, `paths`, `timeout-minutes`, and cron; `.config/nextest.toml` for e2e profile filters; `.github/scheduled-validations.json` for the freshness-watchdog list.
+**Source of truth:** the live `main` ruleset (command below) for required status; `.github/workflows/<file>.yml` for triggers, `paths`, `timeout-minutes`, and cron; `.config/nextest.toml` for e2e profile filters; `.github/scheduled-validations.json` for the freshness-watchdog list; `.github/workflows/README.md` for runner placement and billing.
 
 A job blocks a merge when its exact check name is required by the live `main` ruleset, or when its result is required by the `Test and Lint` aggregate. A workflow name, a `merge_group` trigger, or an unrelated red PR check does not make a job required by itself.
 

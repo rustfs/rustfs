@@ -66,7 +66,7 @@ jobs:
   # GitHub-hosted runners: they are free for this public repository, and the
   # self-hosted pool is reserved for the lanes that need its CPU count and
   # disk (the workspace test build leaves a ~64GB target/, hosted runners
-  # have 14GB).
+  # have 14GB). Placement and billing rules: README.md in this directory.
   cancel-closed-pr-runs:
     name: Cancel Closed PR Runs
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
