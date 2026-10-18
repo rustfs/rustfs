@@ -99,7 +99,7 @@ fn build_get_object_body_cache_plan_inner(
         return GetObjectBodyCachePlan::Skip;
     };
 
-    // Nil version ids mean "no value" (see CLAUDE.md); map them to None so the
+    // Nil version ids mean "no value" (see AGENTS.md); map them to None so the
     // engine canonicalizes to the same "null" key as unversioned reads.
     let version_id = request
         .info
