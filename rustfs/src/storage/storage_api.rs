@@ -480,9 +480,10 @@ pub(crate) mod ecstore_disk {
     pub(crate) use rustfs_ecstore::api::disk::{
         BUCKET_META_PREFIX, BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, ConditionalFileUpdate, DeleteOptions,
         DiskAPI, DiskInfo, DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, LegacyFileWrite,
-        LegacyMetadataWrite, LegacyRenameData, LegacyRenameFile, OldCurrentSize, PartTransactionAction, RUSTFS_META_BUCKET,
-        ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo,
-        WalkDirOptions, get_object_disk_read_timeout, validate_batch_read_version_item_count,
+        LegacyMetadataWrite, LegacyPartMutation, LegacyPartOperation, LegacyRenameData, LegacyRenameFile, OldCurrentSize,
+        PartTransactionAction, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
+        SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout,
+        validate_batch_read_version_item_count,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::disk::{DiskOption, new_disk};
@@ -737,6 +738,8 @@ pub(crate) type OldCurrentSize = ecstore_disk::OldCurrentSize;
 pub(crate) type PartTransactionAction = ecstore_disk::PartTransactionAction;
 pub(crate) type RenameDataResp = ecstore_disk::RenameDataResp;
 pub(crate) type LegacyRenameData = ecstore_disk::LegacyRenameData;
+pub(crate) type LegacyPartOperation = ecstore_disk::LegacyPartOperation;
+pub(crate) type LegacyPartMutation = ecstore_disk::LegacyPartMutation;
 pub(crate) type LegacyRenameFile = ecstore_disk::LegacyRenameFile;
 pub(crate) type LegacyFileWrite = ecstore_disk::LegacyFileWrite;
 pub(crate) type LegacyMetadataWrite = ecstore_disk::LegacyMetadataWrite;
@@ -1416,32 +1419,6 @@ pub(crate) trait StorageDiskRpcExt {
     async fn read_file(&self, volume: &str, path: &str) -> DiskResult<FileReader>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> DiskResult<FileReader>;
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> DiskResult<()>;
-    async fn rename_file_durable(
-        &self,
-        _src_volume: &str,
-        _src_path: &str,
-        _dst_volume: &str,
-        _dst_path: &str,
-    ) -> DiskResult<()> {
-        Err(DiskError::MethodNotAllowed)
-    }
-    async fn rename_part(
-        &self,
-        src_volume: &str,
-        src_path: &str,
-        dst_volume: &str,
-        dst_path: &str,
-        meta: bytes::Bytes,
-    ) -> DiskResult<()>;
-    async fn prepare_part_transaction(
-        &self,
-        src_volume: &str,
-        src_path: &str,
-        dst_volume: &str,
-        dst_path: &str,
-        meta: bytes::Bytes,
-    ) -> DiskResult<()>;
-    async fn settle_part_transaction(&self, volume: &str, path: &str, action: PartTransactionAction) -> DiskResult<()>;
     async fn delete(&self, volume: &str, path: &str, options: DeleteOptions) -> DiskResult<()>;
     async fn verify_file(&self, volume: &str, path: &str, file_info: &rustfs_filemeta::FileInfo) -> DiskResult<CheckPartsResp>;
     async fn check_parts(&self, volume: &str, path: &str, file_info: &rustfs_filemeta::FileInfo) -> DiskResult<CheckPartsResp>;
@@ -1567,36 +1544,6 @@ where
 
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> DiskResult<()> {
         ecstore_disk::DiskAPI::rename_file(self, src_volume, src_path, dst_volume, dst_path).await
-    }
-
-    async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> DiskResult<()> {
-        ecstore_disk::DiskAPI::rename_file_durable(self, src_volume, src_path, dst_volume, dst_path).await
-    }
-
-    async fn rename_part(
-        &self,
-        src_volume: &str,
-        src_path: &str,
-        dst_volume: &str,
-        dst_path: &str,
-        meta: bytes::Bytes,
-    ) -> DiskResult<()> {
-        ecstore_disk::DiskAPI::rename_part(self, src_volume, src_path, dst_volume, dst_path, meta).await
-    }
-
-    async fn prepare_part_transaction(
-        &self,
-        src_volume: &str,
-        src_path: &str,
-        dst_volume: &str,
-        dst_path: &str,
-        meta: bytes::Bytes,
-    ) -> DiskResult<()> {
-        ecstore_disk::DiskAPI::prepare_part_transaction(self, src_volume, src_path, dst_volume, dst_path, meta).await
-    }
-
-    async fn settle_part_transaction(&self, volume: &str, path: &str, action: PartTransactionAction) -> DiskResult<()> {
-        ecstore_disk::DiskAPI::settle_part_transaction(self, volume, path, action).await
     }
 
     async fn delete(&self, volume: &str, path: &str, options: DeleteOptions) -> DiskResult<()> {

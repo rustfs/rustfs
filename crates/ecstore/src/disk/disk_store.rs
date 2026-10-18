@@ -1702,6 +1702,128 @@ impl LegacyRenameData {
     }
 }
 
+/// The three existing multipart RPC operations; metric labels are never caller-defined.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyPartOperation {
+    Prepare,
+    Rename,
+    Settle,
+}
+
+impl LegacyPartOperation {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Prepare => "prepare_part_transaction",
+            Self::Rename => "rename_part",
+            Self::Settle => "settle_part_transaction",
+        }
+    }
+}
+
+/// A single multipart stage bound to its captured disk and immutable paths.
+pub struct LegacyPartMutation {
+    operation: LegacyPartOperation,
+    disk: LocalDiskWrapper,
+    source: Option<(String, String)>,
+    destination: (String, String),
+    lease: Arc<super::os::NamespaceMutationLease>,
+    permit: crate::disk::io_admission::DiskIoPermit,
+    deadline: tokio::time::Instant,
+}
+
+impl std::fmt::Debug for LegacyPartMutation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LegacyPartMutation")
+            .field("source", &self.source)
+            .field("destination", &self.destination)
+            .finish_non_exhaustive()
+    }
+}
+
+enum PartMutation {
+    Prepare(Bytes),
+    Rename(Bytes),
+    Settle(crate::disk::PartTransactionAction),
+}
+
+impl PartMutation {
+    fn operation(&self) -> LegacyPartOperation {
+        match self {
+            Self::Prepare(_) => LegacyPartOperation::Prepare,
+            Self::Rename(_) => LegacyPartOperation::Rename,
+            Self::Settle(_) => LegacyPartOperation::Settle,
+        }
+    }
+
+    async fn apply(
+        self,
+        disk: &LocalDisk,
+        source: Option<(&str, &str)>,
+        destination: (&str, &str),
+        lease: Arc<super::os::NamespaceMutationLease>,
+    ) -> Result<()> {
+        match self {
+            Self::Prepare(meta) => {
+                disk.prepare_part_transaction_prepared(source.ok_or(DiskError::Unexpected)?, destination, meta, lease)
+                    .await
+            }
+            Self::Rename(meta) => {
+                disk.rename_part_prepared(source.ok_or(DiskError::Unexpected)?, destination, meta, lease)
+                    .await
+            }
+            Self::Settle(action) => disk.settle_part_transaction_prepared(destination, action, lease).await,
+        }
+    }
+}
+
+impl LegacyPartMutation {
+    pub async fn prepare(self, meta: Bytes) -> Result<()> {
+        self.execute(PartMutation::Prepare(meta)).await
+    }
+    pub async fn rename(self, meta: Bytes) -> Result<()> {
+        self.execute(PartMutation::Rename(meta)).await
+    }
+    pub async fn settle(self, action: crate::disk::PartTransactionAction) -> Result<()> {
+        self.execute(PartMutation::Settle(action)).await
+    }
+
+    async fn execute(self, action: PartMutation) -> Result<()> {
+        let Self {
+            operation,
+            disk,
+            source,
+            destination,
+            lease,
+            permit,
+            deadline,
+        } = self;
+        with_disk_io_permit(
+            Some(permit),
+            disk.track_disk_health_with_deadline(
+                operation.name(),
+                |_permit| async {
+                    if action.operation() != operation {
+                        return Err(DiskError::Unexpected);
+                    }
+                    action
+                        .apply(
+                            &disk.disk,
+                            source.as_ref().map(|s| (s.0.as_str(), s.1.as_str())),
+                            (&destination.0, &destination.1),
+                            lease,
+                        )
+                        .await
+                },
+                get_max_timeout_duration(),
+                TimeoutHealthAction::MarkFailure,
+                DiskMetricMutation::Write,
+                Some(deadline),
+            ),
+        )
+        .await
+    }
+}
+
 /// A single file rename bound to both volumes and its physical workers.
 pub struct LegacyRenameFile {
     disk: LocalDiskWrapper,
@@ -1754,6 +1876,90 @@ impl LegacyRenameFile {
 }
 
 impl LocalDiskWrapper {
+    pub(crate) fn record_legacy_part_admission_failure(&self, operation: &'static str, error: &DiskError, started: Instant) {
+        self.metrics.record_operation_call(operation);
+        if *error == DiskError::Timeout {
+            self.record_operation_timeout(operation, started, get_max_timeout_duration(), TimeoutHealthAction::MarkFailure);
+        } else {
+            self.metrics.record_operation_latency(operation, started.elapsed());
+            self.record_result_error_metrics::<()>(&Err(error.clone()));
+        }
+    }
+
+    pub(in crate::disk) async fn begin_legacy_part_mutation(
+        &self,
+        source: Option<(&str, &str)>,
+        destination: (&str, &str),
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        operation: LegacyPartOperation,
+    ) -> Result<LegacyPartMutation> {
+        let deadline = tokio::time::Instant::now() + get_max_timeout_duration();
+        let permit = self.io_admission.foreground();
+        let owner: Arc<dyn Send + Sync> = Arc::new((permit.clone(), namespace_owner));
+        let lease = tokio::time::timeout_at(deadline, self.disk.begin_legacy_part_mutation(source, destination, Some(owner)))
+            .await
+            .map_err(|_| DiskError::Timeout)??;
+        Ok(LegacyPartMutation {
+            operation,
+            disk: self.clone(),
+            source: source.map(|s| (s.0.to_owned(), s.1.to_owned())),
+            destination: (destination.0.to_owned(), destination.1.to_owned()),
+            lease,
+            permit,
+            deadline,
+        })
+    }
+
+    async fn execute_part_mutation(
+        &self,
+        source: Option<(&str, &str)>,
+        destination: (&str, &str),
+        action: PartMutation,
+    ) -> Result<()> {
+        let duration = get_max_timeout_duration();
+        let deadline = tokio::time::Instant::now() + duration;
+        #[cfg(all(test, not(windows)))]
+        if matches!(&action, PartMutation::Settle(_)) {
+            super::os::prepared_publication_test_hooks::run(
+                super::os::prepared_publication_test_hooks::Stage::PartSettle,
+                &self.disk.get_object_path_for_io(destination.0, destination.1)?,
+            );
+        }
+        let permit = self.io_admission.foreground();
+        let result = with_disk_io_permit(
+            Some(permit),
+            self.track_disk_health_with_deadline(
+                action.operation().name(),
+                |permit| async {
+                    let owner = permit.map(|permit| Arc::new(permit) as Arc<dyn Send + Sync>);
+                    let lease = self.disk.begin_legacy_part_mutation(source, destination, owner).await?;
+                    action.apply(&self.disk, source, destination, lease).await
+                },
+                duration,
+                TimeoutHealthAction::MarkFailure,
+                DiskMetricMutation::Write,
+                Some(deadline),
+            ),
+        )
+        .await;
+        #[cfg(all(test, not(windows)))]
+        if source.is_none() && matches!(&result, Err(DiskError::Timeout)) {
+            super::os::prepared_publication_test_hooks::run(
+                super::os::prepared_publication_test_hooks::Stage::PartSettleTimeout,
+                &self.disk.get_object_path_for_io(destination.0, destination.1)?,
+            );
+        }
+        #[cfg(all(test, not(windows)))]
+        if source.is_none() {
+            super::os::prepared_publication_test_hooks::run(
+                super::os::prepared_publication_test_hooks::Stage::PartSettleComplete,
+                &self.disk.get_object_path_for_io(destination.0, destination.1)?,
+            );
+        }
+
+        result
+    }
+
     pub(in crate::disk) async fn begin_legacy_rename_file(
         &self,
         source: (&str, &str),
@@ -2635,7 +2841,9 @@ impl LocalDiskWrapper {
         let stale = if let Some(deadline) = deadline {
             match tokio::time::timeout_at(deadline, self.check_disk_stale()).await {
                 Ok(result) => result,
-                Err(_) => return Err(self.record_operation_timeout(op, stale_started, timeout_duration, timeout_health_action)),
+                Err(_) => {
+                    return Err(self.record_operation_timeout(op, stale_started, timeout_duration, timeout_health_action));
+                }
             }
         } else {
             self.check_disk_stale().await
@@ -2652,6 +2860,11 @@ impl LocalDiskWrapper {
         let _waiting_guard = self.health.waiting_guard();
         let _metric_waiting_guard = self.metrics.waiting_guard();
         let started = Instant::now();
+        // timeout_at may poll its future once after the deadline has elapsed.
+        // Do not start a prepared mutation when its budget is already exhausted.
+        if deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+            return Err(self.record_operation_timeout(op, started, timeout_duration, timeout_health_action));
+        }
         let operation = observe_disk_operation(|| self.endpoint(), op, operation(io_permit));
 
         if timeout_duration == Duration::ZERO && deadline.is_none() {
@@ -3181,13 +3394,8 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
-        self.track_disk_health_mutation(
-            "rename_part",
-            DiskMetricMutation::Write,
-            || async { self.disk.rename_part(src_volume, src_path, dst_volume, dst_path, meta).await },
-            get_max_timeout_duration(),
-        )
-        .await
+        self.execute_part_mutation(Some((src_volume, src_path)), (dst_volume, dst_path), PartMutation::Rename(meta))
+            .await
     }
 
     async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
@@ -3212,27 +3420,13 @@ impl DiskAPI for LocalDiskWrapper {
         dst_path: &str,
         meta: Bytes,
     ) -> Result<()> {
-        self.track_disk_health_mutation(
-            "prepare_part_transaction",
-            DiskMetricMutation::Write,
-            || async {
-                self.disk
-                    .prepare_part_transaction(src_volume, src_path, dst_volume, dst_path, meta)
-                    .await
-            },
-            get_max_timeout_duration(),
-        )
-        .await
+        self.execute_part_mutation(Some((src_volume, src_path)), (dst_volume, dst_path), PartMutation::Prepare(meta))
+            .await
     }
 
     async fn settle_part_transaction(&self, volume: &str, path: &str, action: crate::disk::PartTransactionAction) -> Result<()> {
-        self.track_disk_health_mutation(
-            "settle_part_transaction",
-            DiskMetricMutation::Write,
-            || async { self.disk.settle_part_transaction(volume, path, action).await },
-            get_max_timeout_duration(),
-        )
-        .await
+        self.execute_part_mutation(None, (volume, path), PartMutation::Settle(action))
+            .await
     }
 
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {

@@ -16,8 +16,8 @@ use super::*;
 use crate::bucket::utils::has_bad_path_component;
 use crate::disk::error::{DiskError, Result as DiskResult};
 use crate::disk::{
-    DeleteOptions, Disk, LegacyFileWrite, LegacyMetadataWrite, LegacyRenameData, LegacyRenameFile, RenameDataGuards,
-    RenameDataResp,
+    DeleteOptions, Disk, LegacyFileWrite, LegacyMetadataWrite, LegacyPartMutation, LegacyPartOperation, LegacyRenameData,
+    LegacyRenameFile, RenameDataGuards, RenameDataResp,
 };
 use crate::runtime::instance::{InstanceContext, NamespaceCommitGuard};
 use crate::runtime::sources as runtime_sources;
@@ -36,6 +36,20 @@ pub struct BootstrapLocalTarget {
 }
 
 impl BootstrapLocalTarget {
+    pub async fn begin_legacy_local_part_mutation(
+        &self,
+        disk_ref: &str,
+        source: Option<(&str, &str)>,
+        destination: (&str, &str),
+        operation: LegacyPartOperation,
+    ) -> DiskResult<LegacyPartMutation> {
+        if let Some(source) = source {
+            validate_bootstrap_volume(source.0)?;
+        }
+        validate_bootstrap_volume(destination.0)?;
+        begin_legacy_local_part_mutation_with_ctx(&self.ctx, disk_ref, source, destination, operation).await
+    }
+
     pub async fn begin_legacy_local_rename_file(
         &self,
         disk_ref: &str,
@@ -127,6 +141,16 @@ fn validate_bootstrap_volume(volume: &str) -> DiskResult<()> {
 }
 
 impl ECStore {
+    pub async fn begin_legacy_local_part_mutation(
+        &self,
+        disk_ref: &str,
+        source: Option<(&str, &str)>,
+        destination: (&str, &str),
+        operation: LegacyPartOperation,
+    ) -> DiskResult<LegacyPartMutation> {
+        begin_legacy_local_part_mutation_with_ctx(&self.ctx, disk_ref, source, destination, operation).await
+    }
+
     pub async fn begin_legacy_local_rename_file(
         &self,
         disk_ref: &str,
@@ -227,7 +251,9 @@ impl ECStore {
         if disk.get_disk_id().await? != Some(expected_disk) || lifecycle.is_lock_lost() {
             return Err(DiskError::FileAccessDenied);
         }
-        let Disk::Local(local) = disk.as_ref() else { return Err(DiskError::DiskNotFound) };
+        let Disk::Local(local) = disk.as_ref() else {
+            return Err(DiskError::DiskNotFound);
+        };
         local.seal_artifact_puts(identity.receiver_key).await?;
         if lifecycle.is_lock_lost() {
             return Err(DiskError::FileAccessDenied);
@@ -2392,4 +2418,26 @@ async fn begin_legacy_local_rename_file_with_ctx(
         admit_local_disk(ctx, &disk, disk_id, !is_meta_bucketname(source.0) || !is_meta_bucketname(destination.0)).await?;
     disk.begin_legacy_rename_file(source, destination, durable, owner.map(|owner| owner as Arc<dyn Send + Sync>))
         .await
+}
+
+async fn begin_legacy_local_part_mutation_with_ctx(
+    ctx: &Arc<InstanceContext>,
+    disk_ref: &str,
+    source: Option<(&str, &str)>,
+    destination: (&str, &str),
+    operation: LegacyPartOperation,
+) -> DiskResult<LegacyPartMutation> {
+    let started = std::time::Instant::now();
+    let (disk, disk_id) = local_disk_candidate(ctx, disk_ref).await?;
+    let result = async {
+        let ordinary = source.is_some_and(|s| !is_meta_bucketname(s.0)) || !is_meta_bucketname(destination.0);
+        let owner = admit_local_disk(ctx, &disk, disk_id, ordinary).await?;
+        disk.begin_legacy_part_mutation(source, destination, owner.map(|owner| owner as Arc<dyn Send + Sync>), operation)
+            .await
+    }
+    .await;
+    if let Err(error) = &result {
+        disk.record_legacy_part_admission_failure(operation.name(), error, started);
+    }
+    result
 }

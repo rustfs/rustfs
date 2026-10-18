@@ -20,8 +20,8 @@ use crate::storage::storage_api::rpc_consumer::node_service::{
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use crate::storage::storage_api::{
-    LegacyFileWrite, LegacyMetadataWrite, LegacyRenameData, LegacyRenameFile, PartTransactionAction, RenameDataResp,
-    SnapshotLeaseToken, verify_tonic_mutation_body_digest,
+    LegacyFileWrite, LegacyMetadataWrite, LegacyPartMutation, LegacyPartOperation, LegacyRenameData, LegacyRenameFile,
+    PartTransactionAction, RenameDataResp, SnapshotLeaseToken, verify_tonic_mutation_body_digest,
 };
 use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
@@ -144,6 +144,28 @@ impl LocalMutationTarget {
         match self {
             Self::Ready(store) => store.begin_legacy_local_metadata_mutation(disk_ref, volume, path).await,
             Self::Bootstrap(target) => target.begin_legacy_local_metadata_mutation(disk_ref, volume, path).await,
+            Self::Unbound => Err(DiskError::other("target disk instance is unavailable")),
+        }
+    }
+
+    async fn begin_legacy_local_part_mutation(
+        &self,
+        disk_ref: &str,
+        source: Option<(&str, &str)>,
+        destination: (&str, &str),
+        operation: LegacyPartOperation,
+    ) -> Result<LegacyPartMutation, DiskError> {
+        match self {
+            Self::Ready(store) => {
+                store
+                    .begin_legacy_local_part_mutation(disk_ref, source, destination, operation)
+                    .await
+            }
+            Self::Bootstrap(target) => {
+                target
+                    .begin_legacy_local_part_mutation(disk_ref, source, destination, operation)
+                    .await
+            }
             Self::Unbound => Err(DiskError::other("target disk instance is unavailable")),
         }
     }
@@ -1745,19 +1767,24 @@ impl NodeService {
         )?;
         let request = request.into_inner();
         let target = self.local_mutation_target();
-        if let Some(disk) = target.find_mutation_disk(&request.disk).await {
-            target.reject_legacy_artifact_mutation(&request.src_volume).await?;
-            target.reject_legacy_artifact_mutation(&request.dst_volume).await?;
-            match disk
-                .rename_part(
-                    &request.src_volume,
-                    &request.src_path,
-                    &request.dst_volume,
-                    &request.dst_path,
-                    request.meta,
+        if target.find_mutation_disk(&request.disk).await.is_some() {
+            let result = match target
+                .begin_legacy_local_part_mutation(
+                    &request.disk,
+                    Some((&request.src_volume, &request.src_path)),
+                    (&request.dst_volume, &request.dst_path),
+                    LegacyPartOperation::Rename,
                 )
                 .await
             {
+                Ok(part) => {
+                    target.reject_legacy_artifact_mutation(&request.src_volume).await?;
+                    target.reject_legacy_artifact_mutation(&request.dst_volume).await?;
+                    part.rename(request.meta).await
+                }
+                Err(error) => Err(error),
+            };
+            match result {
                 Ok(_) => Ok(Response::new(RenamePartResponse {
                     success: true,
                     error: None,
@@ -1786,19 +1813,24 @@ impl NodeService {
         )?;
         let request = request.into_inner();
         let target = self.local_mutation_target();
-        if let Some(disk) = target.find_mutation_disk(&request.disk).await {
-            target.reject_legacy_artifact_mutation(&request.src_volume).await?;
-            target.reject_legacy_artifact_mutation(&request.dst_volume).await?;
-            match disk
-                .prepare_part_transaction(
-                    &request.src_volume,
-                    &request.src_path,
-                    &request.dst_volume,
-                    &request.dst_path,
-                    request.meta,
+        if target.find_mutation_disk(&request.disk).await.is_some() {
+            let result = match target
+                .begin_legacy_local_part_mutation(
+                    &request.disk,
+                    Some((&request.src_volume, &request.src_path)),
+                    (&request.dst_volume, &request.dst_path),
+                    LegacyPartOperation::Prepare,
                 )
                 .await
             {
+                Ok(part) => {
+                    target.reject_legacy_artifact_mutation(&request.src_volume).await?;
+                    target.reject_legacy_artifact_mutation(&request.dst_volume).await?;
+                    part.prepare(request.meta).await
+                }
+                Err(error) => Err(error),
+            };
+            match result {
                 Ok(()) => Ok(Response::new(PreparePartTransactionResponse {
                     success: true,
                     error: None,
@@ -1827,14 +1859,28 @@ impl NodeService {
         )?;
         let request = request.into_inner();
         let target = self.local_mutation_target();
-        if let Some(disk) = target.find_mutation_disk(&request.disk).await {
-            target.reject_legacy_artifact_mutation(&request.volume).await?;
-            let action = if request.rollback {
-                PartTransactionAction::Rollback
-            } else {
-                PartTransactionAction::Commit
+        if target.find_mutation_disk(&request.disk).await.is_some() {
+            let result = match target
+                .begin_legacy_local_part_mutation(
+                    &request.disk,
+                    None,
+                    (&request.volume, &request.path),
+                    LegacyPartOperation::Settle,
+                )
+                .await
+            {
+                Ok(part) => {
+                    target.reject_legacy_artifact_mutation(&request.volume).await?;
+                    let action = if request.rollback {
+                        PartTransactionAction::Rollback
+                    } else {
+                        PartTransactionAction::Commit
+                    };
+                    part.settle(action).await
+                }
+                Err(error) => Err(error),
             };
-            match disk.settle_part_transaction(&request.volume, &request.path, action).await {
+            match result {
                 Ok(()) => Ok(Response::new(SettlePartTransactionResponse {
                     success: true,
                     error: None,
@@ -3494,6 +3540,759 @@ mod legacy_artifact_tests {
     ) -> Result<Response<DeleteVersionResponse>, Status> {
         verify_legacy_rpc_request(&request, "DeleteVersion")?;
         service.handle_delete_version(request, false).await
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum LegacyPartStage {
+        Prepare,
+        Publish,
+        Commit,
+        Rollback,
+    }
+
+    impl LegacyPartStage {
+        const ALL: [Self; 4] = [Self::Prepare, Self::Publish, Self::Commit, Self::Rollback];
+
+        fn action(self) -> PartTransactionAction {
+            if matches!(self, Self::Rollback) {
+                PartTransactionAction::Rollback
+            } else {
+                PartTransactionAction::Commit
+            }
+        }
+
+        fn operation(self) -> LegacyPartOperation {
+            match self {
+                Self::Prepare => LegacyPartOperation::Prepare,
+                Self::Publish => LegacyPartOperation::Rename,
+                Self::Commit | Self::Rollback => LegacyPartOperation::Settle,
+            }
+        }
+
+        fn operation_name(self) -> &'static str {
+            match self {
+                Self::Prepare => "prepare_part_transaction",
+                Self::Publish => "rename_part",
+                Self::Commit | Self::Rollback => "settle_part_transaction",
+            }
+        }
+
+        fn has_source(self) -> bool {
+            matches!(self, Self::Prepare | Self::Publish)
+        }
+    }
+
+    struct LegacyPartFixture {
+        source: (String, String),
+        destination: (String, String),
+        src: std::path::PathBuf,
+        dst: std::path::PathBuf,
+        metadata: [Bytes; 2],
+        indices: [(String, Bytes); 2],
+    }
+
+    impl LegacyPartFixture {
+        fn source(&self) -> (&str, &str) {
+            (&self.source.0, &self.source.1)
+        }
+        fn destination(&self) -> (&str, &str) {
+            (&self.destination.0, &self.destination.1)
+        }
+        fn transaction(&self) -> std::path::PathBuf {
+            self.dst.parent().expect("destination parent").join(".part.1.rustfs-txn")
+        }
+    }
+
+    async fn legacy_part_fixture(disk: &ecstore_disk::DiskStore, src_volume: &str, dst_volume: &str) -> LegacyPartFixture {
+        use rustfs_filemeta::shard_integrity::{IntegrityLayout, PartIntegrity};
+        let prefix = format!("outputs/74656e616e74/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+        let source = (src_volume.to_owned(), format!("{prefix}/source/part.1"));
+        let destination = (dst_volume.to_owned(), format!("{prefix}/destination/part.1"));
+        let root = ecstore_disk::DiskAPI::path(disk.as_ref());
+        let src = root.join(&source.0).join(&source.1);
+        let dst = root.join(&destination.0).join(&destination.1);
+        let mut metadata = Vec::new();
+        let mut indices = Vec::new();
+        for (path, byte) in [(&dst, b'a'), (&src, b'b')] {
+            let mut integrity =
+                PartIntegrity::new(IntegrityLayout::new(2, 2, 8, false).expect("layout"), 1).expect("part identity");
+            integrity.size = 8;
+            integrity.stripes = 1;
+            let payload = [byte; 4];
+            let mut record = Vec::new();
+            for index in 0..4 {
+                record.extend_from_slice(&integrity.shard_digest(0, index, &payload).expect("shard digest"));
+            }
+            integrity.root = integrity.root_digest(&integrity.leaf_digest(0, &record).expect("leaf"));
+            integrity.validate().expect("valid integrity metadata");
+            integrity
+                .verify_shard(0, 0, &payload, &record)
+                .expect("valid proof and shard");
+            let mut bytes = integrity.index_header().to_vec();
+            bytes.extend_from_slice(&record);
+            assert_eq!(bytes.len(), integrity.index_size().expect("index size"));
+            let name = integrity.file_name();
+            let meta = Bytes::from(
+                rustfs_filemeta::ObjectPartInfo {
+                    number: 1,
+                    size: 8,
+                    integrity: Some(integrity),
+                    ..Default::default()
+                }
+                .marshal_msg()
+                .expect("part metadata"),
+            );
+            tokio::fs::create_dir_all(path.parent().expect("part parent"))
+                .await
+                .expect("part directory");
+            tokio::fs::write(path, payload).await.expect("part bytes");
+            tokio::fs::write(path.with_extension("1.meta"), &meta)
+                .await
+                .expect("part metadata bytes");
+            tokio::fs::write(path.parent().expect("part parent").join(&name), &bytes)
+                .await
+                .expect("proof bytes");
+            metadata.push(meta);
+            indices.push((name, Bytes::from(bytes)));
+        }
+        LegacyPartFixture {
+            source,
+            destination,
+            src,
+            dst,
+            metadata: metadata.try_into().expect("two metadata generations"),
+            indices: indices.try_into().expect("two proof generations"),
+        }
+    }
+
+    fn legacy_part_snapshot(fixture: &LegacyPartFixture) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
+        let mut pending = vec![
+            fixture.src.parent().expect("source parent").to_path_buf(),
+            fixture.dst.parent().expect("destination parent").to_path_buf(),
+        ];
+        let mut snapshot = Vec::new();
+        while let Some(path) = pending.pop() {
+            if !path.exists() {
+                continue;
+            }
+            if path.is_dir() {
+                snapshot.push((path.clone(), None));
+                pending.extend(
+                    std::fs::read_dir(path)
+                        .expect("fixture directory")
+                        .map(|entry| entry.expect("fixture entry").path()),
+                );
+            } else {
+                snapshot.push((path.clone(), Some(std::fs::read(path).expect("fixture bytes"))));
+            }
+        }
+        snapshot.sort();
+        snapshot
+    }
+
+    async fn prime_legacy_part(disk: &ecstore_disk::DiskStore, fixture: &LegacyPartFixture, stage: LegacyPartStage) {
+        let (sv, sp) = fixture.source();
+        let (dv, dp) = fixture.destination();
+        if !matches!(stage, LegacyPartStage::Prepare) {
+            ecstore_disk::DiskAPI::prepare_part_transaction(disk.as_ref(), sv, sp, dv, dp, fixture.metadata[1].clone())
+                .await
+                .expect("prime real transaction");
+        }
+        if !stage.has_source() {
+            ecstore_disk::DiskAPI::rename_part(disk.as_ref(), sv, sp, dv, dp, fixture.metadata[1].clone())
+                .await
+                .expect("prime real publication");
+        }
+    }
+
+    async fn assert_legacy_part_settled(fixture: &LegacyPartFixture, action: PartTransactionAction) {
+        let retained = usize::from(action == PartTransactionAction::Commit);
+        assert_eq!(
+            tokio::fs::read(&fixture.dst).await.expect("settled data"),
+            if retained == 1 { b"bbbb" } else { b"aaaa" }
+        );
+        assert_eq!(
+            tokio::fs::read(fixture.dst.with_extension("1.meta"))
+                .await
+                .expect("settled metadata"),
+            fixture.metadata[retained]
+        );
+        for (index, (name, bytes)) in fixture.indices.iter().enumerate() {
+            let path = fixture.dst.parent().expect("destination parent").join(name);
+            if index == retained {
+                assert_eq!(tokio::fs::read(path).await.expect("retained proof"), *bytes);
+            } else {
+                assert!(!path.exists(), "obsolete index removed");
+            }
+        }
+        assert!(!fixture.transaction().exists(), "settlement consumes transaction");
+    }
+
+    async fn authenticated_legacy_part(
+        service: &NodeService,
+        disk: &str,
+        fixture: &LegacyPartFixture,
+        stage: LegacyPartStage,
+        tamper: bool,
+    ) -> Result<Result<(), DiskError>, Status> {
+        let (success, error) = match stage {
+            LegacyPartStage::Prepare => {
+                let mut request = Request::new(PreparePartTransactionRequest {
+                    disk: disk.to_owned(),
+                    src_volume: fixture.source.0.clone(),
+                    src_path: fixture.source.1.clone(),
+                    dst_volume: fixture.destination.0.clone(),
+                    dst_path: fixture.destination.1.clone(),
+                    meta: fixture.metadata[1].clone(),
+                });
+                let body =
+                    rustfs_protos::canonical_prepare_part_transaction_request_body(request.get_ref()).expect("canonical prepare");
+                sign_legacy_rpc_request(&mut request, &body, "PreparePartTransaction");
+                if tamper {
+                    request.get_mut().meta = Bytes::from_static(b"tampered");
+                }
+                verify_legacy_rpc_request(&request, "PreparePartTransaction")?;
+                let response = service.handle_prepare_part_transaction(request).await?.into_inner();
+                (response.success, response.error)
+            }
+            LegacyPartStage::Publish => {
+                let mut request = Request::new(RenamePartRequest {
+                    disk: disk.to_owned(),
+                    src_volume: fixture.source.0.clone(),
+                    src_path: fixture.source.1.clone(),
+                    dst_volume: fixture.destination.0.clone(),
+                    dst_path: fixture.destination.1.clone(),
+                    meta: fixture.metadata[1].clone(),
+                });
+                let body = rustfs_protos::canonical_rename_part_request_body(request.get_ref()).expect("canonical rename part");
+                sign_legacy_rpc_request(&mut request, &body, "RenamePart");
+                if tamper {
+                    request.get_mut().meta = Bytes::from_static(b"tampered");
+                }
+                verify_legacy_rpc_request(&request, "RenamePart")?;
+                let response = service.handle_rename_part(request).await?.into_inner();
+                (response.success, response.error)
+            }
+            LegacyPartStage::Commit | LegacyPartStage::Rollback => {
+                let mut request = Request::new(SettlePartTransactionRequest {
+                    disk: disk.to_owned(),
+                    volume: fixture.destination.0.clone(),
+                    path: fixture.destination.1.clone(),
+                    rollback: matches!(stage, LegacyPartStage::Rollback),
+                });
+                let body = rustfs_protos::canonical_settle_part_transaction_request_body(request.get_ref())
+                    .expect("canonical settlement");
+                sign_legacy_rpc_request(&mut request, &body, "SettlePartTransaction");
+                if tamper {
+                    request.get_mut().rollback = !matches!(stage, LegacyPartStage::Rollback);
+                }
+                verify_legacy_rpc_request(&request, "SettlePartTransaction")?;
+                let response = service.handle_settle_part_transaction(request).await?.into_inner();
+                (response.success, response.error)
+            }
+        };
+        if success {
+            assert!(error.is_none());
+            Ok(Ok(()))
+        } else {
+            Ok(Err(error.expect("failed typed envelope").into()))
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_part_mutation_receiver_preserves_signed_stages_and_managed_rejection() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-part-receiver-secret".to_owned());
+        let root = tempfile::tempdir().expect("receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("part-ordinary", true).await;
+        env.ecstore
+            .clone()
+            .make_artifact_bucket("part-managed", "outputs/")
+            .await
+            .expect("managed bucket");
+        let service = service_for(&env).await;
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = service
+            .local_mutation_target()
+            .find_mutation_disk(&disk_ref)
+            .await
+            .expect("receiving disk");
+        for stage in LegacyPartStage::ALL {
+            for (source, destination) in [
+                ("part-ordinary", "part-ordinary"),
+                (".rustfs.sys/tmp", ".rustfs.sys"),
+                ("part-managed", "part-ordinary"),
+                ("part-ordinary", "part-managed"),
+            ] {
+                let fixture = legacy_part_fixture(&disk, source, destination).await;
+                prime_legacy_part(&disk, &fixture, stage).await;
+                let before = legacy_part_snapshot(&fixture);
+                assert_eq!(
+                    authenticated_legacy_part(&service, &disk_ref, &fixture, stage, true)
+                        .await
+                        .expect_err("stage body is signed")
+                        .code(),
+                    tonic::Code::PermissionDenied
+                );
+                assert_eq!(legacy_part_snapshot(&fixture), before);
+                let result = authenticated_legacy_part(&service, &disk_ref, &fixture, stage, false).await;
+                let managed = destination == "part-managed" || (stage.has_source() && source == "part-managed");
+                if managed {
+                    assert_eq!(
+                        result.expect_err("every affected managed volume rejects").code(),
+                        tonic::Code::PermissionDenied
+                    );
+                    assert_eq!(legacy_part_snapshot(&fixture), before);
+                } else {
+                    result.expect("signed envelope").expect("stage succeeds");
+                    if !stage.has_source() {
+                        assert_legacy_part_settled(&fixture, stage.action()).await;
+                    } else if matches!(stage, LegacyPartStage::Prepare) {
+                        assert!(fixture.transaction().is_dir());
+                        assert_eq!(tokio::fs::read(&fixture.dst).await.expect("prepare keeps old data"), b"aaaa");
+                    } else {
+                        assert!(!fixture.src.exists());
+                        assert_eq!(tokio::fs::read(&fixture.dst).await.expect("published data"), b"bbbb");
+                    }
+                }
+            }
+            let fixture = legacy_part_fixture(&disk, "part-ordinary", "part-ordinary").await;
+            let before = legacy_part_snapshot(&fixture);
+            let error = authenticated_legacy_part(&service, "missing-disk", &fixture, stage, false)
+                .await
+                .expect("missing disk envelope")
+                .expect_err("missing disk");
+            assert!(error.to_string().contains("cannot find disk"));
+            assert_eq!(legacy_part_snapshot(&fixture), before);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_part_mutation_receiver_rejects_missing_live_volumes() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-part-receiver-secret".to_owned());
+        let root = tempfile::tempdir().expect("missing-volume root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        let service = service_for(&env).await;
+        let target = service.local_mutation_target();
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = target.find_mutation_disk(&disk_ref).await.expect("receiving disk");
+        for stage in LegacyPartStage::ALL {
+            for missing_source in [false, true] {
+                if missing_source && !stage.has_source() {
+                    continue;
+                }
+                let src_volume = format!("part-src-{}", Uuid::new_v4());
+                let dst_volume = format!("part-dst-{}", Uuid::new_v4());
+                env.make_bucket(&src_volume, true).await;
+                env.make_bucket(&dst_volume, true).await;
+                let fixture = legacy_part_fixture(&disk, &src_volume, &dst_volume).await;
+                prime_legacy_part(&disk, &fixture, stage).await;
+                let missing = if missing_source { &src_volume } else { &dst_volume };
+                let incarnation = env.ecstore.bucket_incarnation_id(missing).await.expect("incarnation");
+                disk.delete_volume(missing, true).await.expect("remove physical volume");
+                assert_eq!(env.ecstore.bucket_incarnation_id(missing).await.expect("retained authority"), incarnation);
+                target
+                    .reject_legacy_artifact_mutation(missing)
+                    .await
+                    .expect("authority still ordinary");
+                let before = legacy_part_snapshot(&fixture);
+                let metrics_before = ecstore_disk::DiskAPI::disk_info(
+                    disk.as_ref(),
+                    &DiskInfoOptions {
+                        metrics: true,
+                        noop: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("metrics before admission failure")
+                .metrics;
+                assert_eq!(
+                    authenticated_legacy_part(&service, &disk_ref, &fixture, stage, false)
+                        .await
+                        .expect("typed failure")
+                        .expect_err("missing live volume"),
+                    DiskError::VolumeNotFound
+                );
+                assert_eq!(legacy_part_snapshot(&fixture), before);
+                assert!(!env.disk_paths[0].join(missing).exists(), "never recreate missing volume");
+                let metrics_after = ecstore_disk::DiskAPI::disk_info(
+                    disk.as_ref(),
+                    &DiskInfoOptions {
+                        metrics: true,
+                        noop: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("metrics after admission failure")
+                .metrics;
+                let op = stage.operation_name();
+                assert_eq!(
+                    metrics_after.api_calls.get(op).copied().unwrap_or(0),
+                    metrics_before.api_calls.get(op).copied().unwrap_or(0) + 1
+                );
+                assert_eq!(
+                    metrics_after.last_minute.get(op).map(|action| action.count).unwrap_or(0),
+                    metrics_before.last_minute.get(op).map(|action| action.count).unwrap_or(0) + 1
+                );
+                assert_eq!(metrics_after.total_writes, metrics_before.total_writes);
+                assert_eq!(metrics_after.total_errors_timeout, metrics_before.total_errors_timeout);
+                assert_eq!(metrics_after.total_errors_availability, metrics_before.total_errors_availability);
+                assert_eq!(metrics_after.total_waiting, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_part_mutation_receiver_binds_instance_and_bootstrap() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-part-receiver-secret".to_owned());
+        let root = tempfile::tempdir().expect("instance root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("part-instance", true).await;
+        let ready = service_for(&env).await;
+        let instance = crate::storage::storage_api::bootstrap_instance_ctx();
+        assert!(super::super::BootstrapLocalTarget::new(instance.clone()).is_for_store(&env.ecstore));
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = ready
+            .local_mutation_target()
+            .find_mutation_disk(&disk_ref)
+            .await
+            .expect("instance disk");
+        let slot = super::super::ServerContextSlot::with_instance_context(instance.clone());
+        let bootstrap = super::super::make_server_for_slot(slot.clone());
+        let unbound = super::super::make_server_for_slot(super::super::ServerContextSlot::new());
+        let mut wrong = super::super::make_server_for_context(ready.context.clone());
+        wrong.server_ctx = Some(super::super::ServerContextSlot::with_instance_context(
+            crate::storage::storage_api::new_instance_ctx(),
+        ));
+        for stage in LegacyPartStage::ALL {
+            for (source, destination) in [
+                (".rustfs.sys/tmp", ".rustfs.sys"),
+                (".rustfs.sys/tmp", "part-instance"),
+                ("part-instance", ".rustfs.sys"),
+            ] {
+                let fixture = legacy_part_fixture(&disk, source, destination).await;
+                prime_legacy_part(&disk, &fixture, stage).await;
+                let before = legacy_part_snapshot(&fixture);
+                for service in [&unbound, &wrong] {
+                    authenticated_legacy_part(service, &disk_ref, &fixture, stage, false)
+                        .await
+                        .expect("unbound envelope")
+                        .expect_err("instance unavailable");
+                    assert_eq!(legacy_part_snapshot(&fixture), before);
+                }
+                let result = authenticated_legacy_part(&bootstrap, &disk_ref, &fixture, stage, false)
+                    .await
+                    .expect("bootstrap envelope");
+                if destination == "part-instance" || (stage.has_source() && source == "part-instance") {
+                    assert_eq!(
+                        result.expect_err("bootstrap only permits involved internal volumes"),
+                        DiskError::FileAccessDenied
+                    );
+                    assert_eq!(legacy_part_snapshot(&fixture), before);
+                } else {
+                    result.expect("internal stage succeeds");
+                }
+            }
+        }
+        let captured = bootstrap.local_mutation_target();
+        slot.try_install(ready.context.clone().expect("ready context"))
+            .expect("publish ready slot");
+        for stage in LegacyPartStage::ALL {
+            let disk = ready
+                .local_mutation_target()
+                .find_mutation_disk(&disk_ref)
+                .await
+                .expect("current disk");
+            let fixture = legacy_part_fixture(&disk, "part-instance", "part-instance").await;
+            prime_legacy_part(&disk, &fixture, stage).await;
+            let source = stage.has_source().then(|| fixture.source());
+            assert_eq!(
+                captured
+                    .begin_legacy_local_part_mutation(&disk_ref, source, fixture.destination(), stage.operation())
+                    .await
+                    .err()
+                    .expect("captured bootstrap cannot upgrade"),
+                DiskError::FileAccessDenied
+            );
+            let admitted = ready
+                .local_mutation_target()
+                .begin_legacy_local_part_mutation(&disk_ref, source, fixture.destination(), stage.operation())
+                .await
+                .expect("captured part token");
+            crate::storage::storage_api::init_local_disks_with_instance_ctx(&instance, env.endpoint_pools.clone())
+                .await
+                .expect("replace registry");
+            let replacement = ready
+                .local_mutation_target()
+                .find_mutation_disk(&disk_ref)
+                .await
+                .expect("replacement disk");
+            assert!(!Arc::ptr_eq(&disk, &replacement));
+            match stage {
+                LegacyPartStage::Prepare => admitted.prepare(fixture.metadata[1].clone()).await,
+                LegacyPartStage::Publish => admitted.rename(fixture.metadata[1].clone()).await,
+                _ => admitted.settle(stage.action()).await,
+            }
+            .expect("admitted token retains original instance");
+            if !stage.has_source() {
+                assert_legacy_part_settled(&fixture, stage.action()).await;
+            } else {
+                assert!(fixture.transaction().is_dir());
+            }
+            let blocked = ready
+                .local_mutation_target()
+                .begin_legacy_local_part_mutation(&disk_ref, source, fixture.destination(), stage.operation())
+                .await
+                .expect("hold common destination namespace");
+            let before = legacy_part_snapshot(&fixture);
+            let metrics_before = ecstore_disk::DiskAPI::disk_info(
+                replacement.as_ref(),
+                &DiskInfoOptions {
+                    metrics: true,
+                    noop: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("metrics before blocked admission")
+            .metrics;
+            let result = temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("1"))], async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    authenticated_legacy_part(&ready, &disk_ref, &fixture, stage, false),
+                )
+                .await
+                .expect("namespace admission has a finite deadline")
+            })
+            .await
+            .expect("timeout typed envelope");
+            assert_eq!(result.expect_err("common destination is held"), DiskError::Timeout);
+            assert_eq!(legacy_part_snapshot(&fixture), before);
+            drop(blocked);
+            let metrics_after = ecstore_disk::DiskAPI::disk_info(
+                replacement.as_ref(),
+                &DiskInfoOptions {
+                    metrics: true,
+                    noop: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("metrics after blocked admission")
+            .metrics;
+            let op = stage.operation_name();
+            assert_eq!(
+                metrics_after.api_calls.get(op).copied().unwrap_or(0),
+                metrics_before.api_calls.get(op).copied().unwrap_or(0) + 1
+            );
+            assert_eq!(
+                metrics_after.last_minute.get(op).map(|action| action.count).unwrap_or(0),
+                metrics_before.last_minute.get(op).map(|action| action.count).unwrap_or(0) + 1
+            );
+            assert_eq!(metrics_after.total_errors_timeout, metrics_before.total_errors_timeout + 1);
+            assert_eq!(metrics_after.total_errors_availability, metrics_before.total_errors_availability);
+            assert_eq!(metrics_after.total_writes, metrics_before.total_writes);
+            assert_eq!(metrics_after.total_waiting, 0);
+        }
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_part_mutation_flow_remote_prepare_publish_settle() {
+        use crate::storage::storage_api::{
+            Endpoint, EndpointServerPools, Endpoints,
+            ecstore_disk::{DiskOption, new_disk},
+            init_local_disks_with_instance_ctx,
+        };
+        use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
+        use tokio_stream::wrappers::TcpListenerStream;
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-part-remote-secret".to_owned());
+        let root = tempfile::tempdir().expect("remote part root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("part-remote", true).await;
+        let ready = service_for(&env).await;
+        let instance = crate::storage::storage_api::bootstrap_instance_ctx();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback listener");
+        let addr = listener.local_addr().expect("loopback address");
+        let mut endpoints = env.endpoint_pools.as_ref()[0].endpoints.as_ref().clone();
+        let mut endpoint =
+            Endpoint::try_from(format!("http://{addr}{}", env.disk_paths[0].display()).as_str()).expect("remote endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        endpoint.is_local = true;
+        endpoints[0] = endpoint.clone();
+        let mut pool = env.endpoint_pools.as_ref()[0].clone();
+        pool.endpoints = Endpoints::from(endpoints);
+        init_local_disks_with_instance_ctx(&instance, EndpointServerPools::from(vec![pool]))
+            .await
+            .expect("register receiving disk");
+        let service = super::super::make_server_for_context(ready.context.clone());
+        let local = service
+            .local_mutation_target()
+            .find_mutation_disk(&endpoint.to_string())
+            .await
+            .expect("local receiving disk");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let audience = addr.to_string();
+        let auth = tower::ServiceBuilder::new().map_request(move |request: http::Request<_>| {
+            let path = request.uri().path();
+            crate::storage::storage_api::ecstore_rpc::verify_tonic_rpc_signature_with_bootstrap(
+                &audience,
+                path,
+                request.headers(),
+                path == "/node_service.NodeService/Ping",
+            )
+            .expect("real remote HMAC signature");
+            if matches!(
+                path,
+                "/node_service.NodeService/PreparePartTransaction"
+                    | "/node_service.NodeService/RenamePart"
+                    | "/node_service.NodeService/SettlePartTransaction"
+            ) {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            request
+        });
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .layer(auth)
+                .add_service(NodeServiceServer::new(service))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = stopped.await;
+                })
+                .await
+                .expect("part server");
+        });
+        endpoint.is_local = false;
+        let remote = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("real remote client");
+        assert!(!ecstore_disk::DiskAPI::is_local(remote.as_ref()));
+        for action in [PartTransactionAction::Commit, PartTransactionAction::Rollback] {
+            let fixture = legacy_part_fixture(&local, ".rustfs.sys/tmp", "part-remote").await;
+            let (sv, sp) = fixture.source();
+            let (dv, dp) = fixture.destination();
+            ecstore_disk::DiskAPI::prepare_part_transaction(remote.as_ref(), sv, sp, dv, dp, fixture.metadata[1].clone())
+                .await
+                .expect("remote prepare");
+            assert!(fixture.transaction().is_dir());
+            assert_eq!(tokio::fs::read(&fixture.dst).await.expect("old data before publish"), b"aaaa");
+            for (name, bytes) in &fixture.indices {
+                assert_eq!(
+                    tokio::fs::read(fixture.dst.parent().expect("parent").join(name))
+                        .await
+                        .expect("both generations retained during prepare"),
+                    *bytes
+                );
+            }
+            ecstore_disk::DiskAPI::rename_part(remote.as_ref(), sv, sp, dv, dp, fixture.metadata[1].clone())
+                .await
+                .expect("remote publish");
+            assert!(!fixture.src.exists());
+            assert_eq!(tokio::fs::read(&fixture.dst).await.expect("published data"), b"bbbb");
+            assert_eq!(
+                tokio::fs::read(fixture.dst.with_extension("1.meta"))
+                    .await
+                    .expect("published metadata"),
+                fixture.metadata[1]
+            );
+            ecstore_disk::DiskAPI::settle_part_transaction(remote.as_ref(), dv, dp, action)
+                .await
+                .expect("remote settlement");
+            assert_legacy_part_settled(&fixture, action).await;
+        }
+        let legacy_meta = Bytes::from(
+            rustfs_filemeta::ObjectPartInfo {
+                number: 1,
+                size: 8,
+                ..Default::default()
+            }
+            .marshal_msg()
+            .expect("legacy metadata"),
+        );
+        let missing_path = "missing/part.1";
+        assert_eq!(
+            ecstore_disk::DiskAPI::prepare_part_transaction(
+                remote.as_ref(),
+                ".rustfs.sys/tmp",
+                missing_path,
+                "part-remote",
+                missing_path,
+                legacy_meta.clone()
+            )
+            .await
+            .expect_err("missing source prepare response"),
+            DiskError::FileNotFound
+        );
+        assert_eq!(
+            ecstore_disk::DiskAPI::rename_part(
+                remote.as_ref(),
+                ".rustfs.sys/tmp",
+                missing_path,
+                "part-remote",
+                missing_path,
+                legacy_meta
+            )
+            .await
+            .expect_err("missing source publish response"),
+            DiskError::FileNotFound
+        );
+        let fixture = legacy_part_fixture(&local, ".rustfs.sys/tmp", "part-remote").await;
+        tokio::fs::write(fixture.transaction(), b"not a transaction directory")
+            .await
+            .expect("corrupt transaction fixture");
+        let before = legacy_part_snapshot(&fixture);
+        assert_eq!(
+            ecstore_disk::DiskAPI::settle_part_transaction(
+                remote.as_ref(),
+                &fixture.destination.0,
+                &fixture.destination.1,
+                PartTransactionAction::Rollback
+            )
+            .await
+            .expect_err("corrupt settlement response"),
+            DiskError::FileCorrupt
+        );
+        assert_eq!(legacy_part_snapshot(&fixture), before);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            9,
+            "six successful and three failed stages cross tonic"
+        );
+        ecstore_disk::DiskAPI::close(remote.as_ref())
+            .await
+            .expect("close remote client");
+        drop(remote);
+        shutdown.send(()).expect("stop server");
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("server drains")
+            .expect("server task");
     }
 
     fn signed_legacy_rename_file_request(

@@ -64,7 +64,9 @@ use crate::cluster::rpc::RemoteDisk;
 use crate::cluster::rpc::build_internode_data_transport_from_env;
 use crate::disk::disk_store::DiskStoreRenameDataExt;
 use crate::disk::disk_store::LocalDiskWrapper;
-pub use crate::disk::disk_store::{LegacyFileWrite, LegacyMetadataWrite, LegacyRenameData, LegacyRenameFile};
+pub use crate::disk::disk_store::{
+    LegacyFileWrite, LegacyMetadataWrite, LegacyPartMutation, LegacyPartOperation, LegacyRenameData, LegacyRenameFile,
+};
 use crate::disk::health_state::RuntimeDriveHealthState;
 use crate::disk::local::ScanGuard;
 use bytes::Bytes;
@@ -268,6 +270,33 @@ impl Disk {
         match self {
             Self::Local(disk) => {
                 disk.begin_legacy_metadata_write_with_namespace_owner(volume, path, namespace_owner)
+                    .await
+            }
+            Self::Remote(_) => Err(DiskError::DiskNotFound),
+        }
+    }
+
+    pub(crate) fn record_legacy_part_admission_failure(
+        &self,
+        operation: &'static str,
+        error: &DiskError,
+        started: std::time::Instant,
+    ) {
+        if let Self::Local(disk) = self {
+            disk.record_legacy_part_admission_failure(operation, error, started);
+        }
+    }
+
+    pub(crate) async fn begin_legacy_part_mutation(
+        &self,
+        source: Option<(&str, &str)>,
+        destination: (&str, &str),
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        operation: LegacyPartOperation,
+    ) -> Result<LegacyPartMutation> {
+        match self {
+            Self::Local(disk) => {
+                disk.begin_legacy_part_mutation(source, destination, namespace_owner, operation)
                     .await
             }
             Self::Remote(_) => Err(DiskError::DiskNotFound),

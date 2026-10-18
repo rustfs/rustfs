@@ -278,6 +278,22 @@ pub(crate) mod prepared_publication_test_hooks {
         DirFsync,
         #[cfg(test)]
         FileSync,
+        #[cfg(test)]
+        PartPrepare,
+        #[cfg(test)]
+        PartRestore,
+        #[cfg(test)]
+        PartCleanup,
+        #[cfg(test)]
+        PartSettle,
+        #[cfg(test)]
+        PartSettleTimeout,
+        #[cfg(test)]
+        PartSettlePlanned,
+        #[cfg(test)]
+        PartSettleComplete,
+        #[cfg(test)]
+        NamespaceWaiting,
     }
 
     type Hook = Box<dyn FnOnce() + Send>;
@@ -1586,7 +1602,25 @@ pub(in crate::disk) async fn acquire_rename_data_mutation_lease_for_volumes(
     destination_object: &Path,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Arc<NamespaceMutationLease> {
-    let namespace_guard = disk_namespace_mutation_lock(destination_object).lock_owned().await;
+    let namespace = disk_namespace_mutation_lock(destination_object).lock_owned();
+    #[cfg(all(test, not(windows)))]
+    let namespace_guard = {
+        // Observe actual mutex contention, not a cooperative-budget yield.
+        let mut namespace = std::pin::pin!(tokio::task::unconstrained(namespace));
+        std::future::poll_fn(|cx| {
+            let poll = std::future::Future::poll(namespace.as_mut(), cx);
+            if poll.is_pending() {
+                prepared_publication_test_hooks::run(
+                    prepared_publication_test_hooks::Stage::NamespaceWaiting,
+                    destination_object,
+                );
+            }
+            poll
+        })
+        .await
+    };
+    #[cfg(not(all(test, not(windows))))]
+    let namespace_guard = namespace.await;
     let source_key = root.join(source_volume);
     let destination_key = root.join(destination_volume);
     let (first, second) = if source_key <= destination_key {
@@ -1607,6 +1641,11 @@ pub(in crate::disk) async fn acquire_rename_data_mutation_lease_for_volumes(
         external_guard: Mutex::new(None),
         _namespace_owner: namespace_owner,
     })
+}
+
+#[cfg(all(test, not(windows)))]
+pub(crate) async fn drain_namespace_for_test(path: &Path) {
+    drop(acquire_namespace_mutation_lease_with_owner(path, None).await);
 }
 
 /// Always acquire the per-disk permit before the process-wide permit. Keeping

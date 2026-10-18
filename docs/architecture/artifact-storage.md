@@ -93,6 +93,15 @@ rename, optional ancestor cleanup and required sync workers retain the same
 admission until physical completion. Durable acknowledgement follows successful
 completion of the destination volume's existing sync policy; a post-rename sync
 failure still reports failure even if the destination has already been published.
+Part preparation, publication and settlement share the destination part's
+namespace admission before acquiring distinct volume read owners. Every required
+extra path, including integrity indexes, is frozen before the first write.
+Settlement waits for the same destination admission before inspecting the
+transaction, so rollback cannot race a timed-out publisher's physical worker.
+The existing transaction files and recovery decisions remain authoritative;
+a timed-out settlement leaves recoverable state instead of claiming completion.
+Admission failures and consumed operations retain their original operation
+metrics without counting a successful write twice.
 The incarnation-bound heal path retains its separate admission. Other legacy
 mutation routes and internal metadata publication still need their own admission
 boundary before distributed artifact sealing can be enabled.

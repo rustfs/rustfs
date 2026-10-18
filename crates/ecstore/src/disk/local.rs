@@ -254,6 +254,51 @@ fn remove_dir_all_if_exists(path: &Path) -> std::io::Result<()> {
     }
 }
 
+fn part_transaction_child_paths(directory: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    [
+        PART_TRANSACTION_OLD_DATA,
+        PART_TRANSACTION_OLD_DATA_ABSENT,
+        PART_TRANSACTION_OLD_META,
+        PART_TRANSACTION_OLD_META_ABSENT,
+        PART_TRANSACTION_NEW_META,
+        PART_TRANSACTION_PUBLISH_META,
+        PART_TRANSACTION_ROLLBACK,
+        "restore.data",
+        "restore.meta",
+    ]
+    .into_iter()
+    .map(|name| directory.join(name))
+}
+
+fn prune_part_source_parents(base: &Path, mut parent: PathBuf) -> Result<()> {
+    if is_root_path(base) {
+        return Ok(());
+    }
+    while parent != base && parent.starts_with(base) && !is_root_path(&parent) {
+        let is_dir = parent.is_dir();
+        let result = if is_dir {
+            std::fs::remove_dir(&parent)
+        } else {
+            std::fs::remove_file(&parent)
+        };
+        if let Err(error) = result {
+            if is_dir && is_dir_not_empty_error(&error) {
+                return Ok(());
+            }
+            if !(is_dir && is_benign_object_rmdir_error(&error) || error.kind() == ErrorKind::NotFound) {
+                return Err(Error::other(FileAccessDeniedWithContext {
+                    path: parent,
+                    source: error,
+                }));
+            }
+        }
+        if !parent.pop() {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn snapshot_part_transaction_file(src: &Path, backup: &Path, absent: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(src) {
         Ok(metadata) if metadata.is_file() => std::fs::hard_link(src, backup),
@@ -6046,6 +6091,568 @@ impl LocalDisk {
         }
     }
 
+    pub(in crate::disk) async fn begin_legacy_part_mutation(
+        &self,
+        source: Option<(&str, &str)>,
+        destination: (&str, &str),
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<Arc<os::NamespaceMutationLease>> {
+        let dst = self.io_get_object_path(destination.0, destination.1)?;
+        check_path_length(dst.to_string_lossy().as_ref())?;
+        let source_scope = source.and_then(|(volume, path)| crate::bucket::artifact::artifact_repair_scope(volume, path));
+        let destination_scope = crate::bucket::artifact::artifact_repair_scope(destination.0, destination.1);
+        for scope in [&source_scope, &destination_scope].into_iter().flatten() {
+            scope.check().map_err(Error::other)?;
+        }
+        #[cfg(target_os = "linux")]
+        let owner: Arc<dyn Send + Sync> = Arc::new((self.mount_lease.clone(), namespace_owner, source_scope, destination_scope));
+        #[cfg(not(target_os = "linux"))]
+        let owner: Arc<dyn Send + Sync> = Arc::new((namespace_owner, source_scope, destination_scope));
+        // All three stages use D before sorted volume READs. In particular,
+        // settlement waits for a timed-out publisher's real worker, not its caller.
+        let lease = os::acquire_rename_data_mutation_lease_for_volumes(
+            &self.root,
+            source.map_or(destination.0, |s| s.0),
+            destination.0,
+            &dst,
+            Some(owner),
+        )
+        .await;
+        for volume in [Some(destination.0), source.map(|s| s.0).filter(|v| *v != destination.0)]
+            .into_iter()
+            .flatten()
+        {
+            if !skip_access_checks(volume) {
+                let metadata = fs::symlink_metadata(self.io_get_bucket_path(volume)?)
+                    .await
+                    .map_err(to_volume_error)?;
+                if !metadata.is_dir() {
+                    return Err(DiskError::VolumeNotFound);
+                }
+            }
+        }
+        Ok(lease)
+    }
+
+    fn freeze_part_mutation_paths(
+        &self,
+        source: Option<(&str, &str)>,
+        destination: (&str, &str),
+        mut paths: Vec<PathBuf>,
+        publication: Arc<os::NamespaceMutationLease>,
+    ) -> Result<Arc<os::NamespaceMutationLease>> {
+        let dst = self.io_get_object_path(destination.0, destination.1)?;
+        let transaction = self.io_get_object_path(destination.0, &crate::disk::part_transaction_path(destination.1))?;
+        paths.push(self.io_get_object_path(destination.0, &format!("{}.meta", destination.1))?);
+        paths.extend(part_transaction_child_paths(&transaction));
+        paths.push(transaction);
+        // Missing destination parents may be created by prepare or rename.
+        let base = self.io_get_bucket_path(destination.0)?;
+        for ancestor in dst
+            .ancestors()
+            .skip(1)
+            .take_while(|path| *path != base.as_path() && path.starts_with(&base))
+        {
+            paths.push(ancestor.to_path_buf());
+        }
+        if let Some((volume, path)) = source {
+            let src = self.io_get_object_path(volume, path)?;
+            paths.push(src.clone());
+            let base = self.io_get_bucket_path(volume)?;
+            for ancestor in src
+                .ancestors()
+                .skip(1)
+                .take_while(|path| *path != base.as_path() && path.starts_with(&base))
+            {
+                paths.push(ancestor.to_path_buf());
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        let mut leases = Vec::with_capacity(paths.len());
+        for path in paths {
+            check_path_length(path.to_string_lossy().as_ref())?;
+            if path != dst {
+                leases.push(os::try_acquire_namespace_mutation_lease_with_owner(&path, publication.clone())?);
+            }
+        }
+        Ok(if let Some(last) = leases.pop() {
+            last.attach_external_guard(Arc::new(leases));
+            last
+        } else {
+            publication
+        })
+    }
+
+    pub(in crate::disk) async fn prepare_part_transaction_prepared(
+        &self,
+        (src_volume, src_path): (&str, &str),
+        (dst_volume, dst_path): (&str, &str),
+        meta: Bytes,
+        lease: Arc<os::NamespaceMutationLease>,
+    ) -> Result<()> {
+        let src_volume_dir = self.io_get_bucket_path(src_volume)?;
+        let dst_volume_dir = self.io_get_bucket_path(dst_volume)?;
+        if !skip_access_checks(src_volume) {
+            super::fs::access_std(&src_volume_dir).map_err(|err| to_access_error(err, DiskError::VolumeAccessDenied))?;
+        }
+        if !skip_access_checks(dst_volume) {
+            super::fs::access_std(&dst_volume_dir).map_err(|err| to_access_error(err, DiskError::VolumeAccessDenied))?;
+        }
+
+        let src_file_path = self.io_get_object_path(src_volume, src_path)?;
+        let dst_file_path = self.io_get_object_path(dst_volume, dst_path)?;
+        let dst_meta_path = self.io_get_object_path(dst_volume, &format!("{dst_path}.meta"))?;
+        let transaction_path = self.io_get_object_path(dst_volume, &crate::disk::part_transaction_path(dst_path))?;
+        for path in [&src_file_path, &dst_file_path, &dst_meta_path, &transaction_path] {
+            check_path_length(path.to_string_lossy().as_ref())?;
+        }
+
+        let durability = effective_durability(dst_volume);
+        let part = ObjectPartInfo::unmarshal(&meta)?;
+        let mut paths = Vec::new();
+        let integrity_paths = if let Some(integrity) = part.integrity {
+            integrity.validate()?;
+            if usize::try_from(integrity.number).map_err(|_| DiskError::FileCorrupt)? != part.number
+                || usize::try_from(integrity.size).map_err(|_| DiskError::FileCorrupt)? != part.size
+                || dst_file_path.file_name().and_then(|name| name.to_str()) != Some(format!("part.{}", part.number).as_str())
+            {
+                return Err(DiskError::FileCorrupt);
+            }
+            let proof_name = integrity.file_name();
+            let source = src_file_path.parent().ok_or(DiskError::FileCorrupt)?.join(&proof_name);
+            let destination = dst_file_path.parent().ok_or(DiskError::FileCorrupt)?.join(&proof_name);
+            check_path_length(source.to_string_lossy().as_ref())?;
+            check_path_length(destination.to_string_lossy().as_ref())?;
+            let stat = fs::symlink_metadata(&source).await.map_err(to_file_error)?;
+            if !stat.is_file() || stat.len() != u64::try_from(integrity.index_size()?).map_err(|_| DiskError::FileCorrupt)? {
+                return Err(DiskError::FileCorrupt);
+            }
+            paths.extend([source.clone(), destination.clone()]);
+            Some((source, destination))
+        } else {
+            None
+        };
+        let staging_path = transaction_path
+            .parent()
+            .ok_or(DiskError::InvalidPath)?
+            .join(format!(".part-txn-{}", Uuid::new_v4()));
+        paths.extend(part_transaction_child_paths(&staging_path));
+        paths.push(staging_path.clone());
+        let lease = self.freeze_part_mutation_paths(Some((src_volume, src_path)), (dst_volume, dst_path), paths, lease)?;
+        if let Some((source, destination)) = integrity_paths {
+            if durability.syncs_data_shards() {
+                let source = source.clone();
+                os::run_blocking_namespace_operation(lease.clone(), move || os::sync_file(&source))
+                    .await
+                    .map_err(to_file_error)?;
+            }
+            // Publish the immutable generation before preparing the part switch.
+            // Rollback retains the old generation; an unreferenced new index is
+            // reclaimed with the upload directory if preparation is interrupted.
+            os::rename_all_with_lease(&source, &destination, &dst_volume_dir, &self.publication_root, lease.clone()).await?;
+            if durability.syncs_commit_metadata() {
+                os::fsync_dir_with_owner(destination.parent().ok_or(DiskError::FileCorrupt)?, Some(lease.clone()))
+                    .await
+                    .map_err(to_file_error)?;
+            }
+        }
+        tokio::task::spawn_blocking(move || {
+            let _lease = lease;
+            #[cfg(all(test, not(windows)))]
+            os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::PartPrepare, &transaction_path);
+            let source = std::fs::symlink_metadata(&src_file_path).map_err(to_file_error)?;
+            if !source.is_file() {
+                return Err(DiskError::FileAccessDenied);
+            }
+            if transaction_path.exists() {
+                return Err(DiskError::FileAccessDenied);
+            }
+
+            let Some(transaction_parent) = transaction_path.parent() else {
+                return Err(DiskError::InvalidPath);
+            };
+            std::fs::create_dir_all(transaction_parent).map_err(to_file_error)?;
+            std::fs::create_dir(&staging_path).map_err(to_file_error)?;
+
+            let prepare_result = (|| -> std::io::Result<()> {
+                snapshot_part_transaction_file(
+                    &dst_file_path,
+                    &staging_path.join(PART_TRANSACTION_OLD_DATA),
+                    &staging_path.join(PART_TRANSACTION_OLD_DATA_ABSENT),
+                )?;
+                snapshot_part_transaction_file(
+                    &dst_meta_path,
+                    &staging_path.join(PART_TRANSACTION_OLD_META),
+                    &staging_path.join(PART_TRANSACTION_OLD_META_ABSENT),
+                )?;
+
+                let mut new_meta = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(staging_path.join(PART_TRANSACTION_NEW_META))?;
+                std::io::Write::write_all(&mut new_meta, &meta)?;
+                if durability.syncs_commit_metadata() {
+                    new_meta.sync_data()?;
+                }
+                // Windows rejects renaming a directory while one of its children is
+                // still open, even when the child handle shares delete access.
+                drop(new_meta);
+                if durability.syncs_commit_metadata() {
+                    os::fsync_dir_std(&staging_path)?;
+                }
+                std::fs::rename(&staging_path, &transaction_path)?;
+                if durability.syncs_commit_metadata() {
+                    os::fsync_dir_std(transaction_parent)?;
+                }
+                Ok(())
+            })();
+
+            if let Err(err) = prepare_result {
+                let _ = remove_dir_all_if_exists(&staging_path);
+                return Err(to_file_error(err).into());
+            }
+
+            Ok(())
+        })
+        .await
+        .map_err(DiskError::from)?
+    }
+
+    pub(in crate::disk) async fn settle_part_transaction_prepared(
+        &self,
+        (volume, path): (&str, &str),
+        action: PartTransactionAction,
+        lease: Arc<os::NamespaceMutationLease>,
+    ) -> Result<()> {
+        self.io_get_bucket_path(volume)?;
+        let current_data_path = self.io_get_object_path(volume, path)?;
+        let current_meta_path = self.io_get_object_path(volume, &format!("{path}.meta"))?;
+        let transaction_path = self.io_get_object_path(volume, &crate::disk::part_transaction_path(path))?;
+        for candidate in [&current_data_path, &current_meta_path, &transaction_path] {
+            check_path_length(candidate.to_string_lossy().as_ref())?;
+        }
+        let durability = effective_durability(volume);
+
+        match fs::symlink_metadata(&transaction_path).await {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(DiskError::FileCorrupt),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(to_file_error(error).into()),
+        }
+        let old_meta = fs::read(transaction_path.join(PART_TRANSACTION_OLD_META)).await;
+        let new_meta = fs::read(transaction_path.join(PART_TRANSACTION_NEW_META)).await;
+        let mut paths = Vec::new();
+        if let Some(parent) = transaction_path.parent() {
+            for bytes in [&old_meta, &new_meta].into_iter().filter_map(|result| result.as_ref().ok()) {
+                if let Ok(part) = ObjectPartInfo::unmarshal(bytes)
+                    && let Some(integrity) = part.integrity
+                    && integrity.validate().is_ok()
+                {
+                    paths.push(parent.join(integrity.file_name()));
+                }
+            }
+        }
+        let cleanup_path = transaction_path
+            .parent()
+            .ok_or(DiskError::InvalidPath)?
+            .join(format!(".part-txn-settled-{}", Uuid::new_v4()));
+        paths.push(cleanup_path.clone());
+        paths.extend(part_transaction_child_paths(&cleanup_path));
+        let lease = self.freeze_part_mutation_paths(None, (volume, path), paths, lease)?;
+        tokio::task::spawn_blocking(move || {
+            let _lease = lease;
+            #[cfg(all(test, not(windows)))]
+            os::prepared_publication_test_hooks::run(
+                os::prepared_publication_test_hooks::Stage::PartSettlePlanned,
+                &transaction_path,
+            );
+            match std::fs::symlink_metadata(&transaction_path) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => return Err(DiskError::FileCorrupt),
+                Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+                Err(err) => return Err(to_file_error(err).into()),
+            }
+
+            if action == PartTransactionAction::Rollback {
+                #[cfg(all(test, not(windows)))]
+                os::prepared_publication_test_hooks::run(
+                    os::prepared_publication_test_hooks::Stage::PartRestore,
+                    &transaction_path,
+                );
+                std::fs::write(transaction_path.join(PART_TRANSACTION_ROLLBACK), []).map_err(to_file_error)?;
+                if durability.syncs_commit_metadata() {
+                    os::fsync_dir_std(&transaction_path).map_err(to_file_error)?;
+                }
+                restore_part_transaction_file(
+                    &current_data_path,
+                    &transaction_path.join(PART_TRANSACTION_OLD_DATA),
+                    &transaction_path.join(PART_TRANSACTION_OLD_DATA_ABSENT),
+                    &transaction_path.join("restore.data"),
+                )
+                .map_err(to_file_error)?;
+                restore_part_transaction_file(
+                    &current_meta_path,
+                    &transaction_path.join(PART_TRANSACTION_OLD_META),
+                    &transaction_path.join(PART_TRANSACTION_OLD_META_ABSENT),
+                    &transaction_path.join("restore.meta"),
+                )
+                .map_err(to_file_error)?;
+                if durability.syncs_commit_metadata()
+                    && let Some(parent) = current_data_path.parent()
+                {
+                    os::fsync_dir_std(parent).map_err(to_file_error)?;
+                }
+            }
+
+            let Some(parent) = transaction_path.parent() else {
+                return Err(DiskError::InvalidPath);
+            };
+            // Delete only the generation made obsolete by this settled switch.
+            // Check the published metadata before removing either proof, so a
+            // repeated or interrupted settlement cannot remove a live index.
+            let (retained, obsolete) = match action {
+                PartTransactionAction::Commit => (new_meta, old_meta),
+                PartTransactionAction::Rollback => (old_meta, new_meta),
+            };
+            // A failed planning read cannot authorize an unadmitted index path.
+            if let (Ok(current), Ok(retained), Ok(obsolete)) = (std::fs::read(&current_meta_path), retained, obsolete)
+                && current == retained
+                && let Ok(obsolete) = ObjectPartInfo::unmarshal(&obsolete)
+                && let Some(integrity) = obsolete.integrity
+                && integrity.validate().is_ok()
+                && usize::try_from(integrity.number).ok() == Some(obsolete.number)
+                && current_data_path.file_name().and_then(|name| name.to_str())
+                    == Some(format!("part.{}", obsolete.number).as_str())
+                && ObjectPartInfo::unmarshal(&retained)
+                    .ok()
+                    .and_then(|part| part.integrity)
+                    .as_ref()
+                    != Some(&integrity)
+            {
+                let obsolete_path = parent.join(integrity.file_name());
+                match std::fs::remove_file(&obsolete_path) {
+                    Ok(()) => {
+                        if durability.syncs_commit_metadata() {
+                            os::fsync_dir_std(parent).map_err(to_file_error)?;
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(to_file_error(error).into()),
+                }
+            }
+            #[cfg(all(test, not(windows)))]
+            os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::PartCleanup, &transaction_path);
+            std::fs::rename(&transaction_path, &cleanup_path).map_err(to_file_error)?;
+            if durability.syncs_commit_metadata() {
+                os::fsync_dir_std(parent).map_err(to_file_error)?;
+            }
+            remove_dir_all_if_exists(&cleanup_path).map_err(to_file_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(DiskError::from)??;
+
+        self.io_backend.invalidate_cached_fd(volume, path).await;
+        Ok(())
+    }
+
+    pub(in crate::disk) async fn rename_part_prepared(
+        &self,
+        (src_volume, src_path): (&str, &str),
+        (dst_volume, dst_path): (&str, &str),
+        meta: Bytes,
+        lease: Arc<os::NamespaceMutationLease>,
+    ) -> Result<()> {
+        let src_volume_dir = self.io_get_bucket_path(src_volume)?;
+        let dst_volume_dir = self.io_get_bucket_path(dst_volume)?;
+        if !skip_access_checks(src_volume) {
+            super::fs::access_std(&src_volume_dir).map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?
+        }
+        if !skip_access_checks(dst_volume) {
+            super::fs::access_std(&dst_volume_dir).map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?
+        }
+
+        let src_is_dir = has_suffix(src_path, SLASH_SEPARATOR);
+        let dst_is_dir = has_suffix(dst_path, SLASH_SEPARATOR);
+
+        if !src_is_dir && dst_is_dir || src_is_dir && !dst_is_dir {
+            warn!(
+                event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                reason = "src_dst_type_mismatch",
+                src_is_dir,
+                dst_is_dir,
+                "Disk local rename rejected"
+            );
+            return Err(DiskError::FileAccessDenied);
+        }
+
+        let src_file_path = self.io_get_object_path(src_volume, src_path)?;
+        let dst_file_path = self.io_get_object_path(dst_volume, dst_path)?;
+
+        // warn!("rename_part src_file_path:{:?}, dst_file_path:{:?}", &src_file_path, &dst_file_path);
+
+        check_path_length(src_file_path.to_string_lossy().as_ref())?;
+        check_path_length(dst_file_path.to_string_lossy().as_ref())?;
+
+        let lease = self.freeze_part_mutation_paths(Some((src_volume, src_path)), (dst_volume, dst_path), Vec::new(), lease)?;
+        if src_is_dir {
+            let meta_op = match lstat_std(&src_file_path).map_err(|e| to_file_error(e).into()) {
+                Ok(meta) => Some(meta),
+                Err(e) => {
+                    return Err(e);
+                }
+            };
+
+            if let Some(meta) = meta_op
+                && !meta.is_dir()
+            {
+                warn!(
+                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    reason = "src_expected_dir_missing",
+                    path = ?src_file_path,
+                    "Disk local rename rejected"
+                );
+                return Err(DiskError::FileAccessDenied);
+            }
+
+            // Clear any stale destination before the directory rename. An absent
+            // destination is the normal case when renaming a directory to a new
+            // location, so tolerate NotFound instead of aborting the whole rename
+            // (MinIO's RenameFile ignores osIsNotExist here).
+            let path = dst_file_path.clone();
+            let removed = os::run_blocking_namespace_operation(lease.clone(), move || remove_std(path)).await;
+            if let Err(e) = removed
+                && e.kind() != ErrorKind::NotFound
+            {
+                return Err(to_file_error(e).into());
+            }
+        } else {
+            let meta = lstat_std(&src_file_path).map_err(|e| -> DiskError { to_file_error(e).into() })?;
+            if meta.is_dir() {
+                warn!(
+                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    reason = "src_unexpected_dir",
+                    path = ?src_file_path,
+                    "Disk local rename rejected"
+                );
+                return Err(DiskError::FileAccessDenied);
+            }
+        }
+
+        let transaction_publish_meta = if src_is_dir {
+            None
+        } else {
+            let transaction_path = self.io_get_object_path(dst_volume, &crate::disk::part_transaction_path(dst_path))?;
+            let transaction_meta_path = transaction_path.join(PART_TRANSACTION_NEW_META);
+            match fs::read(&transaction_meta_path).await {
+                Ok(expected_meta) => {
+                    if expected_meta.as_slice() != meta.as_ref() {
+                        return Err(DiskError::FileCorrupt);
+                    }
+
+                    let publish_meta_path = transaction_path.join(PART_TRANSACTION_PUBLISH_META);
+                    let source_meta_path = transaction_meta_path.clone();
+                    let publish_path = publish_meta_path.clone();
+                    let publish_lease = lease.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _lease = publish_lease;
+                        remove_file_if_exists(&publish_path)?;
+                        std::fs::hard_link(source_meta_path, &publish_path)
+                    })
+                    .await
+                    .map_err(DiskError::from)?
+                    .map_err(to_file_error)?;
+                    Some(publish_meta_path)
+                }
+                // Old peers know only RenamePart. The new coordinator never
+                // reaches rename unless prepare succeeded, so an absent
+                // transaction directory identifies the rolling-upgrade legacy
+                // path. A present directory without new.meta is corruption.
+                Err(err) if err.kind() == ErrorKind::NotFound => match fs::metadata(&transaction_path).await {
+                    Ok(_) => return Err(DiskError::FileCorrupt),
+                    Err(meta_err) if meta_err.kind() == ErrorKind::NotFound => None,
+                    Err(meta_err) => return Err(to_file_error(meta_err).into()),
+                },
+                Err(err) => return Err(to_file_error(err).into()),
+            }
+        };
+
+        // UploadPart is acknowledged once this rename lands, so the part data and
+        // its directory entry must be durable before we return. Relaxed keeps the
+        // part payload fdatasync but leaves the directory entry to the page cache.
+        let durability = effective_durability(dst_volume);
+        if durability.syncs_data_shards() && !src_is_dir {
+            let src = src_file_path.clone();
+            os::run_blocking_namespace_operation(lease.clone(), move || os::sync_file(&src))
+                .await
+                .map_err(to_file_error)?;
+        }
+
+        os::rename_all_with_lease(&src_file_path, &dst_file_path, &dst_volume_dir, &self.publication_root, lease.clone()).await?;
+
+        if durability.syncs_commit_metadata()
+            && let Some(parent) = dst_file_path.parent()
+        {
+            os::fsync_dir_with_owner(parent, Some(lease.clone()))
+                .await
+                .map_err(to_file_error)?;
+        }
+
+        let dst_meta = lstat_std(&dst_file_path).map_err(|e| -> DiskError { to_file_error(e).into() })?;
+        if src_is_dir != dst_meta.is_dir() {
+            warn!(
+                event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                reason = "dst_type_changed_after_rename",
+                path = ?dst_file_path,
+                "Disk local rename rejected"
+            );
+            return Err(DiskError::FileAccessDenied);
+        }
+
+        if let Some(transaction_publish_meta) = transaction_publish_meta {
+            let dst_meta_path = self.io_get_object_path(dst_volume, &format!("{dst_path}.meta"))?;
+            os::rename_all_with_lease(
+                &transaction_publish_meta,
+                &dst_meta_path,
+                &dst_volume_dir,
+                &self.publication_root,
+                lease.clone(),
+            )
+            .await?;
+            if durability.syncs_commit_metadata()
+                && let Some(parent) = dst_meta_path.parent()
+            {
+                os::fsync_dir_with_owner(parent, Some(lease.clone()))
+                    .await
+                    .map_err(to_file_error)?;
+            }
+        } else {
+            self.write_all_with_namespace_owner(dst_volume, format!("{dst_path}.meta").as_str(), meta, Some(lease.clone()))
+                .await?;
+        }
+
+        if let Some(parent) = src_file_path.parent() {
+            let parent = parent.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                let _lease = lease;
+                prune_part_source_parents(&src_volume_dir, parent)
+            })
+            .await
+            .map_err(DiskError::from)??;
+        }
+
+        Ok(())
+    }
+
     pub(in crate::disk) async fn begin_legacy_rename_file(
         &self,
         source: (&str, &str),
@@ -11526,384 +12133,26 @@ impl DiskAPI for LocalDisk {
         dst_path: &str,
         meta: Bytes,
     ) -> Result<()> {
-        let src_volume_dir = self.io_get_bucket_path(src_volume)?;
-        let dst_volume_dir = self.io_get_bucket_path(dst_volume)?;
-        if !skip_access_checks(src_volume) {
-            super::fs::access_std(&src_volume_dir).map_err(|err| to_access_error(err, DiskError::VolumeAccessDenied))?;
-        }
-        if !skip_access_checks(dst_volume) {
-            super::fs::access_std(&dst_volume_dir).map_err(|err| to_access_error(err, DiskError::VolumeAccessDenied))?;
-        }
-
-        let src_file_path = self.io_get_object_path(src_volume, src_path)?;
-        let dst_file_path = self.io_get_object_path(dst_volume, dst_path)?;
-        let dst_meta_path = self.io_get_object_path(dst_volume, &format!("{dst_path}.meta"))?;
-        let transaction_path = self.io_get_object_path(dst_volume, &crate::disk::part_transaction_path(dst_path))?;
-        for path in [&src_file_path, &dst_file_path, &dst_meta_path, &transaction_path] {
-            check_path_length(path.to_string_lossy().as_ref())?;
-        }
-
-        let durability = effective_durability(dst_volume);
-        let part = ObjectPartInfo::unmarshal(&meta)?;
-        if let Some(integrity) = part.integrity {
-            integrity.validate()?;
-            if usize::try_from(integrity.number).map_err(|_| DiskError::FileCorrupt)? != part.number
-                || usize::try_from(integrity.size).map_err(|_| DiskError::FileCorrupt)? != part.size
-                || dst_file_path.file_name().and_then(|name| name.to_str()) != Some(format!("part.{}", part.number).as_str())
-            {
-                return Err(DiskError::FileCorrupt);
-            }
-            let proof_name = integrity.file_name();
-            let source = src_file_path.parent().ok_or(DiskError::FileCorrupt)?.join(&proof_name);
-            let destination = dst_file_path.parent().ok_or(DiskError::FileCorrupt)?.join(&proof_name);
-            check_path_length(source.to_string_lossy().as_ref())?;
-            check_path_length(destination.to_string_lossy().as_ref())?;
-            let stat = fs::symlink_metadata(&source).await.map_err(to_file_error)?;
-            if !stat.is_file() || stat.len() != u64::try_from(integrity.index_size()?).map_err(|_| DiskError::FileCorrupt)? {
-                return Err(DiskError::FileCorrupt);
-            }
-            if durability.syncs_data_shards() {
-                let source = source.clone();
-                tokio::task::spawn_blocking(move || os::sync_file(&source))
-                    .await
-                    .map_err(DiskError::from)?
-                    .map_err(to_file_error)?;
-            }
-            // Publish the immutable generation before preparing the part switch.
-            // Rollback retains the old generation; an unreferenced new index is
-            // reclaimed with the upload directory if preparation is interrupted.
-            rename_all(&source, &destination, &dst_volume_dir, &self.publication_root).await?;
-            if durability.syncs_commit_metadata() {
-                os::fsync_dir(destination.parent().ok_or(DiskError::FileCorrupt)?)
-                    .await
-                    .map_err(to_file_error)?;
-            }
-        }
-        tokio::task::spawn_blocking(move || {
-            let source = std::fs::symlink_metadata(&src_file_path).map_err(to_file_error)?;
-            if !source.is_file() {
-                return Err(DiskError::FileAccessDenied);
-            }
-            if transaction_path.exists() {
-                return Err(DiskError::FileAccessDenied);
-            }
-
-            let Some(transaction_parent) = transaction_path.parent() else {
-                return Err(DiskError::InvalidPath);
-            };
-            std::fs::create_dir_all(transaction_parent).map_err(to_file_error)?;
-            let staging_path = transaction_parent.join(format!(".part-txn-{}", Uuid::new_v4()));
-            std::fs::create_dir(&staging_path).map_err(to_file_error)?;
-
-            let prepare_result = (|| -> std::io::Result<()> {
-                snapshot_part_transaction_file(
-                    &dst_file_path,
-                    &staging_path.join(PART_TRANSACTION_OLD_DATA),
-                    &staging_path.join(PART_TRANSACTION_OLD_DATA_ABSENT),
-                )?;
-                snapshot_part_transaction_file(
-                    &dst_meta_path,
-                    &staging_path.join(PART_TRANSACTION_OLD_META),
-                    &staging_path.join(PART_TRANSACTION_OLD_META_ABSENT),
-                )?;
-
-                let mut new_meta = std::fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(staging_path.join(PART_TRANSACTION_NEW_META))?;
-                std::io::Write::write_all(&mut new_meta, &meta)?;
-                if durability.syncs_commit_metadata() {
-                    new_meta.sync_data()?;
-                }
-                // Windows rejects renaming a directory while one of its children is
-                // still open, even when the child handle shares delete access.
-                drop(new_meta);
-                if durability.syncs_commit_metadata() {
-                    os::fsync_dir_std(&staging_path)?;
-                }
-                std::fs::rename(&staging_path, &transaction_path)?;
-                if durability.syncs_commit_metadata() {
-                    os::fsync_dir_std(transaction_parent)?;
-                }
-                Ok(())
-            })();
-
-            if let Err(err) = prepare_result {
-                let _ = remove_dir_all_if_exists(&staging_path);
-                return Err(to_file_error(err).into());
-            }
-
-            Ok(())
-        })
-        .await
-        .map_err(DiskError::from)?
+        let lease = self
+            .begin_legacy_part_mutation(Some((src_volume, src_path)), (dst_volume, dst_path), None)
+            .await?;
+        self.prepare_part_transaction_prepared((src_volume, src_path), (dst_volume, dst_path), meta, lease)
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn settle_part_transaction(&self, volume: &str, path: &str, action: PartTransactionAction) -> Result<()> {
-        self.io_get_bucket_path(volume)?;
-        let current_data_path = self.io_get_object_path(volume, path)?;
-        let current_meta_path = self.io_get_object_path(volume, &format!("{path}.meta"))?;
-        let transaction_path = self.io_get_object_path(volume, &crate::disk::part_transaction_path(path))?;
-        for candidate in [&current_data_path, &current_meta_path, &transaction_path] {
-            check_path_length(candidate.to_string_lossy().as_ref())?;
-        }
-        let durability = effective_durability(volume);
-
-        tokio::task::spawn_blocking(move || {
-            match std::fs::symlink_metadata(&transaction_path) {
-                Ok(metadata) if metadata.is_dir() => {}
-                Ok(_) => return Err(DiskError::FileCorrupt),
-                Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
-                Err(err) => return Err(to_file_error(err).into()),
-            }
-
-            if action == PartTransactionAction::Rollback {
-                std::fs::write(transaction_path.join(PART_TRANSACTION_ROLLBACK), []).map_err(to_file_error)?;
-                if durability.syncs_commit_metadata() {
-                    os::fsync_dir_std(&transaction_path).map_err(to_file_error)?;
-                }
-                restore_part_transaction_file(
-                    &current_data_path,
-                    &transaction_path.join(PART_TRANSACTION_OLD_DATA),
-                    &transaction_path.join(PART_TRANSACTION_OLD_DATA_ABSENT),
-                    &transaction_path.join("restore.data"),
-                )
-                .map_err(to_file_error)?;
-                restore_part_transaction_file(
-                    &current_meta_path,
-                    &transaction_path.join(PART_TRANSACTION_OLD_META),
-                    &transaction_path.join(PART_TRANSACTION_OLD_META_ABSENT),
-                    &transaction_path.join("restore.meta"),
-                )
-                .map_err(to_file_error)?;
-                if durability.syncs_commit_metadata()
-                    && let Some(parent) = current_data_path.parent()
-                {
-                    os::fsync_dir_std(parent).map_err(to_file_error)?;
-                }
-            }
-
-            let Some(parent) = transaction_path.parent() else {
-                return Err(DiskError::InvalidPath);
-            };
-            // Delete only the generation made obsolete by this settled switch.
-            // Check the published metadata before removing either proof, so a
-            // repeated or interrupted settlement cannot remove a live index.
-            let (retained_name, obsolete_name) = match action {
-                PartTransactionAction::Commit => (PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META),
-                PartTransactionAction::Rollback => (PART_TRANSACTION_OLD_META, PART_TRANSACTION_NEW_META),
-            };
-            if let (Ok(current), Ok(retained), Ok(obsolete)) = (
-                std::fs::read(&current_meta_path),
-                std::fs::read(transaction_path.join(retained_name)),
-                std::fs::read(transaction_path.join(obsolete_name)),
-            ) && current == retained
-                && let Ok(obsolete) = ObjectPartInfo::unmarshal(&obsolete)
-                && let Some(integrity) = obsolete.integrity
-                && integrity.validate().is_ok()
-                && usize::try_from(integrity.number).ok() == Some(obsolete.number)
-                && current_data_path.file_name().and_then(|name| name.to_str())
-                    == Some(format!("part.{}", obsolete.number).as_str())
-                && ObjectPartInfo::unmarshal(&retained)
-                    .ok()
-                    .and_then(|part| part.integrity)
-                    .as_ref()
-                    != Some(&integrity)
-            {
-                let obsolete_path = parent.join(integrity.file_name());
-                match std::fs::remove_file(&obsolete_path) {
-                    Ok(()) => {
-                        if durability.syncs_commit_metadata() {
-                            os::fsync_dir_std(parent).map_err(to_file_error)?;
-                        }
-                    }
-                    Err(error) if error.kind() == ErrorKind::NotFound => {}
-                    Err(error) => return Err(to_file_error(error).into()),
-                }
-            }
-            let cleanup_path = parent.join(format!(".part-txn-settled-{}", Uuid::new_v4()));
-            std::fs::rename(&transaction_path, &cleanup_path).map_err(to_file_error)?;
-            if durability.syncs_commit_metadata() {
-                os::fsync_dir_std(parent).map_err(to_file_error)?;
-            }
-            remove_dir_all_if_exists(&cleanup_path).map_err(to_file_error)?;
-            Ok(())
-        })
-        .await
-        .map_err(DiskError::from)??;
-
-        self.io_backend.invalidate_cached_fd(volume, path).await;
-        Ok(())
+        let lease = self.begin_legacy_part_mutation(None, (volume, path), None).await?;
+        self.settle_part_transaction_prepared((volume, path), action, lease).await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
-        let src_volume_dir = self.io_get_bucket_path(src_volume)?;
-        let dst_volume_dir = self.io_get_bucket_path(dst_volume)?;
-        if !skip_access_checks(src_volume) {
-            super::fs::access_std(&src_volume_dir).map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?
-        }
-        if !skip_access_checks(dst_volume) {
-            super::fs::access_std(&dst_volume_dir).map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?
-        }
-
-        let src_is_dir = has_suffix(src_path, SLASH_SEPARATOR);
-        let dst_is_dir = has_suffix(dst_path, SLASH_SEPARATOR);
-
-        if !src_is_dir && dst_is_dir || src_is_dir && !dst_is_dir {
-            warn!(
-                event = EVENT_DISK_LOCAL_RENAME_REJECTED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                reason = "src_dst_type_mismatch",
-                src_is_dir,
-                dst_is_dir,
-                "Disk local rename rejected"
-            );
-            return Err(DiskError::FileAccessDenied);
-        }
-
-        let src_file_path = self.io_get_object_path(src_volume, src_path)?;
-        let dst_file_path = self.io_get_object_path(dst_volume, dst_path)?;
-
-        // warn!("rename_part src_file_path:{:?}, dst_file_path:{:?}", &src_file_path, &dst_file_path);
-
-        check_path_length(src_file_path.to_string_lossy().as_ref())?;
-        check_path_length(dst_file_path.to_string_lossy().as_ref())?;
-
-        if src_is_dir {
-            let meta_op = match lstat_std(&src_file_path).map_err(|e| to_file_error(e).into()) {
-                Ok(meta) => Some(meta),
-                Err(e) => {
-                    return Err(e);
-                }
-            };
-
-            if let Some(meta) = meta_op
-                && !meta.is_dir()
-            {
-                warn!(
-                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                    reason = "src_expected_dir_missing",
-                    path = ?src_file_path,
-                    "Disk local rename rejected"
-                );
-                return Err(DiskError::FileAccessDenied);
-            }
-
-            // Clear any stale destination before the directory rename. An absent
-            // destination is the normal case when renaming a directory to a new
-            // location, so tolerate NotFound instead of aborting the whole rename
-            // (MinIO's RenameFile ignores osIsNotExist here).
-            if let Err(e) = remove_std(&dst_file_path)
-                && e.kind() != ErrorKind::NotFound
-            {
-                return Err(to_file_error(e).into());
-            }
-        } else {
-            let meta = lstat_std(&src_file_path).map_err(|e| -> DiskError { to_file_error(e).into() })?;
-            if meta.is_dir() {
-                warn!(
-                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                    reason = "src_unexpected_dir",
-                    path = ?src_file_path,
-                    "Disk local rename rejected"
-                );
-                return Err(DiskError::FileAccessDenied);
-            }
-        }
-
-        let transaction_publish_meta = if src_is_dir {
-            None
-        } else {
-            let transaction_path = self.io_get_object_path(dst_volume, &crate::disk::part_transaction_path(dst_path))?;
-            let transaction_meta_path = transaction_path.join(PART_TRANSACTION_NEW_META);
-            match fs::read(&transaction_meta_path).await {
-                Ok(expected_meta) => {
-                    if expected_meta.as_slice() != meta.as_ref() {
-                        return Err(DiskError::FileCorrupt);
-                    }
-
-                    let publish_meta_path = transaction_path.join(PART_TRANSACTION_PUBLISH_META);
-                    let source_meta_path = transaction_meta_path.clone();
-                    let publish_path = publish_meta_path.clone();
-                    tokio::task::spawn_blocking(move || {
-                        remove_file_if_exists(&publish_path)?;
-                        std::fs::hard_link(source_meta_path, &publish_path)
-                    })
-                    .await
-                    .map_err(DiskError::from)?
-                    .map_err(to_file_error)?;
-                    Some(publish_meta_path)
-                }
-                // Old peers know only RenamePart. The new coordinator never
-                // reaches rename unless prepare succeeded, so an absent
-                // transaction directory identifies the rolling-upgrade legacy
-                // path. A present directory without new.meta is corruption.
-                Err(err) if err.kind() == ErrorKind::NotFound => match fs::metadata(&transaction_path).await {
-                    Ok(_) => return Err(DiskError::FileCorrupt),
-                    Err(meta_err) if meta_err.kind() == ErrorKind::NotFound => None,
-                    Err(meta_err) => return Err(to_file_error(meta_err).into()),
-                },
-                Err(err) => return Err(to_file_error(err).into()),
-            }
-        };
-
-        // UploadPart is acknowledged once this rename lands, so the part data and
-        // its directory entry must be durable before we return. Relaxed keeps the
-        // part payload fdatasync but leaves the directory entry to the page cache.
-        let durability = effective_durability(dst_volume);
-        if durability.syncs_data_shards() && !src_is_dir {
-            let src = src_file_path.clone();
-            tokio::task::spawn_blocking(move || os::sync_file(&src))
-                .await
-                .map_err(DiskError::from)?
-                .map_err(to_file_error)?;
-        }
-
-        rename_all(&src_file_path, &dst_file_path, &dst_volume_dir, &self.publication_root).await?;
-
-        if durability.syncs_commit_metadata()
-            && let Some(parent) = dst_file_path.parent()
-        {
-            os::fsync_dir(parent).await.map_err(to_file_error)?;
-        }
-
-        let dst_meta = lstat_std(&dst_file_path).map_err(|e| -> DiskError { to_file_error(e).into() })?;
-        if src_is_dir != dst_meta.is_dir() {
-            warn!(
-                event = EVENT_DISK_LOCAL_RENAME_REJECTED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                reason = "dst_type_changed_after_rename",
-                path = ?dst_file_path,
-                "Disk local rename rejected"
-            );
-            return Err(DiskError::FileAccessDenied);
-        }
-
-        if let Some(transaction_publish_meta) = transaction_publish_meta {
-            let dst_meta_path = self.io_get_object_path(dst_volume, &format!("{dst_path}.meta"))?;
-            rename_all(&transaction_publish_meta, &dst_meta_path, &dst_volume_dir, &self.publication_root).await?;
-            if durability.syncs_commit_metadata()
-                && let Some(parent) = dst_meta_path.parent()
-            {
-                os::fsync_dir(parent).await.map_err(to_file_error)?;
-            }
-        } else {
-            self.write_all(dst_volume, format!("{dst_path}.meta").as_str(), meta).await?;
-        }
-
-        if let Some(parent) = src_file_path.parent() {
-            self.delete_file(&src_volume_dir, &parent.to_path_buf(), false, false).await?;
-        }
-
-        Ok(())
+        let lease = self
+            .begin_legacy_part_mutation(Some((src_volume, src_path)), (dst_volume, dst_path), None)
+            .await?;
+        self.rename_part_prepared((src_volume, src_path), (dst_volume, dst_path), meta, lease)
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -16757,6 +17006,646 @@ mod test {
             .expect("stage the real data for legacy rollback");
         }
         (fi, rollback, original)
+    }
+
+    use crate::disk::LegacyPartOperation;
+
+    struct PartMutationFixture {
+        _root: tempfile::TempDir,
+        disk: Arc<LocalDisk>,
+        wrapper: crate::disk::disk_store::LocalDiskWrapper,
+        source_volume: &'static str,
+        destination_volume: &'static str,
+        old_meta: Bytes,
+        new_meta: Bytes,
+    }
+
+    impl PartMutationFixture {
+        async fn new(source_volume: &'static str, destination_volume: &'static str, old: bool) -> Self {
+            use crate::io_support::shard_integrity::IntegrityBuilder;
+            use rustfs_filemeta::shard_integrity::IntegrityLayout;
+            let root = tempfile::tempdir().expect("part root");
+            let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("endpoint");
+            let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("disk"));
+            ensure_test_volume(&disk, source_volume).await;
+            ensure_test_volume(&disk, destination_volume).await;
+            let mut metadata = Vec::new();
+            for (volume, directory, byte) in [(destination_volume, "object", b'a'), (source_volume, "upload", b'b')] {
+                let mut builder =
+                    IntegrityBuilder::new(IntegrityLayout::new(2, 2, 8, false).expect("layout"), 1).expect("builder");
+                builder.push([[byte; 4].as_slice(); 4].into_iter()).await.expect("stripe");
+                let proof = builder.finish(8).await.expect("index");
+                let meta = Bytes::from(
+                    ObjectPartInfo {
+                        number: 1,
+                        size: 8,
+                        integrity: Some(proof.part.clone()),
+                        ..Default::default()
+                    }
+                    .marshal_msg()
+                    .expect("meta"),
+                );
+                if old || directory == "upload" {
+                    disk.write_all(
+                        volume,
+                        &format!("{directory}/{}", proof.part.file_name()),
+                        proof.inline_bytes().expect("index bytes"),
+                    )
+                    .await
+                    .expect("index file");
+                    disk.write_all(volume, &format!("{directory}/part.1"), Bytes::from(vec![byte; 4]))
+                        .await
+                        .expect("data");
+                    if directory == "object" {
+                        disk.write_all(volume, "object/part.1.meta", meta.clone())
+                            .await
+                            .expect("old metadata");
+                    }
+                }
+                metadata.push(meta);
+            }
+            let wrapper = crate::disk::disk_store::LocalDiskWrapper::new(disk.clone(), false);
+            Self {
+                _root: root,
+                disk,
+                wrapper,
+                source_volume,
+                destination_volume,
+                old_meta: metadata.remove(0),
+                new_meta: metadata.remove(0),
+            }
+        }
+
+        fn destination(&self) -> PathBuf {
+            self.disk
+                .io_get_object_path(self.destination_volume, "object/part.1")
+                .expect("destination")
+        }
+        fn transaction(&self) -> PathBuf {
+            self.disk
+                .io_get_object_path(self.destination_volume, &crate::disk::part_transaction_path("object/part.1"))
+                .expect("transaction")
+        }
+        fn index(&self, old: bool, at_source: bool) -> PathBuf {
+            let part = ObjectPartInfo::unmarshal(if old { &self.old_meta } else { &self.new_meta }).expect("part");
+            let (volume, directory) = if at_source {
+                (self.source_volume, "upload")
+            } else {
+                (self.destination_volume, "object")
+            };
+            self.disk
+                .io_get_object_path(volume, &format!("{directory}/{}", part.integrity.expect("integrity").file_name()))
+                .expect("index")
+        }
+        async fn token(
+            &self,
+            operation: LegacyPartOperation,
+            owner: Option<Arc<dyn Send + Sync>>,
+        ) -> crate::disk::LegacyPartMutation {
+            self.wrapper
+                .begin_legacy_part_mutation(
+                    (operation != LegacyPartOperation::Settle).then_some((self.source_volume, "upload/part.1")),
+                    (self.destination_volume, "object/part.1"),
+                    owner,
+                    operation,
+                )
+                .await
+                .expect("part admission")
+        }
+        async fn prepare(&self) {
+            self.token(LegacyPartOperation::Prepare, None)
+                .await
+                .prepare(self.new_meta.clone())
+                .await
+                .expect("prepare");
+        }
+        async fn publish(&self) {
+            self.token(LegacyPartOperation::Rename, None)
+                .await
+                .rename(self.new_meta.clone())
+                .await
+                .expect("publish");
+        }
+    }
+
+    fn part_tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+        fn visit(base: &Path, path: &Path, entries: &mut std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>) {
+            for entry in std::fs::read_dir(path).expect("snapshot directory") {
+                let entry = entry.expect("snapshot entry");
+                let path = entry.path();
+                if entry.file_type().expect("entry type").is_dir() {
+                    entries.insert(path.strip_prefix(base).expect("relative").to_path_buf(), None);
+                    visit(base, &path, entries);
+                } else {
+                    entries.insert(
+                        path.strip_prefix(base).expect("relative").to_path_buf(),
+                        Some(std::fs::read(&path).expect("snapshot file")),
+                    );
+                }
+            }
+        }
+        let mut entries = std::collections::BTreeMap::new();
+        visit(root, root, &mut entries);
+        entries
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_part_mutation_core_preserves_prepare_publish_settle_semantics() {
+        for (src, dst) in [
+            ("source", "destination"),
+            ("same", "same"),
+            (RUSTFS_META_TMP_BUCKET, crate::disk::RUSTFS_META_MULTIPART_BUCKET),
+        ] {
+            for old in [false, true] {
+                for action in [PartTransactionAction::Commit, PartTransactionAction::Rollback] {
+                    let f = PartMutationFixture::new(src, dst, old).await;
+                    f.prepare().await;
+                    f.publish().await;
+                    f.token(LegacyPartOperation::Settle, None)
+                        .await
+                        .settle(action)
+                        .await
+                        .expect("settle");
+                    assert!(!f.transaction().exists());
+                    if action == PartTransactionAction::Commit {
+                        assert_eq!(fs::read(f.destination()).await.expect("new data"), b"bbbb");
+                        assert_eq!(fs::read(f.destination().with_extension("1.meta")).await.expect("new meta"), f.new_meta);
+                        assert!(f.index(false, false).exists());
+                        assert!(!f.index(true, false).exists());
+                    } else if old {
+                        assert_eq!(fs::read(f.destination()).await.expect("old data"), b"aaaa");
+                        assert_eq!(fs::read(f.destination().with_extension("1.meta")).await.expect("old meta"), f.old_meta);
+                        assert!(f.index(true, false).exists());
+                        assert!(!f.index(false, false).exists());
+                    } else {
+                        assert!(!f.destination().exists());
+                    }
+                    f.token(LegacyPartOperation::Settle, None)
+                        .await
+                        .settle(action)
+                        .await
+                        .expect("idempotent settle");
+                    let metrics = f.wrapper.metrics_snapshot();
+                    assert_eq!(metrics.api_calls.get("prepare_part_transaction"), Some(&1));
+                    assert_eq!(metrics.api_calls.get("rename_part"), Some(&1));
+                    assert_eq!(metrics.api_calls.get("settle_part_transaction"), Some(&2));
+                    assert_eq!(metrics.total_writes, 4);
+                    assert_eq!(metrics.total_waiting, 0);
+                }
+            }
+        }
+        for mode in [DurabilityMode::Strict, DurabilityMode::Relaxed, DurabilityMode::None] {
+            let _mode = durability_mode_override::set(mode);
+            let f = PartMutationFixture::new("source", "destination", true).await;
+            f.prepare().await;
+            f.publish().await;
+            f.token(LegacyPartOperation::Settle, None)
+                .await
+                .settle(PartTransactionAction::Commit)
+                .await
+                .expect("mode-preserving settlement");
+            assert_eq!(fs::read(f.destination()).await.expect("committed data"), b"bbbb");
+        }
+        for missing in [false, true] {
+            let f = PartMutationFixture::new("source", "destination", true).await;
+            f.prepare().await;
+            if missing {
+                fs::remove_file(f.transaction().join(PART_TRANSACTION_NEW_META))
+                    .await
+                    .expect("missing metadata");
+            }
+            let before = part_tree_bytes(f._root.path());
+            let meta = if missing {
+                f.new_meta.clone()
+            } else {
+                Bytes::from_static(b"different metadata")
+            };
+            assert_eq!(
+                f.token(LegacyPartOperation::Rename, None).await.rename(meta).await,
+                Err(DiskError::FileCorrupt)
+            );
+            assert_eq!(part_tree_bytes(f._root.path()), before);
+        }
+        let f = PartMutationFixture::new("source", "destination", true).await;
+        for operation in [
+            LegacyPartOperation::Prepare,
+            LegacyPartOperation::Rename,
+            LegacyPartOperation::Settle,
+        ] {
+            let token = f.token(operation, None).await;
+            let before = part_tree_bytes(f._root.path());
+            let writes = f.wrapper.metrics_snapshot().total_writes;
+            let result = match operation {
+                LegacyPartOperation::Prepare => token.rename(f.new_meta.clone()).await,
+                LegacyPartOperation::Rename => token.settle(PartTransactionAction::Rollback).await,
+                LegacyPartOperation::Settle => token.prepare(f.new_meta.clone()).await,
+            };
+            assert_eq!(result, Err(DiskError::Unexpected));
+            assert_eq!(part_tree_bytes(f._root.path()), before, "wrong stage cannot mutate the tree");
+            assert_eq!(f.wrapper.metrics_snapshot().total_writes, writes);
+        }
+        for operation in [LegacyPartOperation::Prepare, LegacyPartOperation::Rename] {
+            let token = f
+                .wrapper
+                .begin_legacy_part_mutation(None, ("destination", "object/part.1"), None, operation)
+                .await
+                .expect("shape is validated on consumption");
+            let before = part_tree_bytes(f._root.path());
+            let result = match operation {
+                LegacyPartOperation::Prepare => token.prepare(f.new_meta.clone()).await,
+                _ => token.rename(f.new_meta.clone()).await,
+            };
+            assert_eq!(result, Err(DiskError::Unexpected));
+            assert_eq!(part_tree_bytes(f._root.path()), before);
+        }
+        f.token(LegacyPartOperation::Rename, None)
+            .await
+            .rename(f.new_meta.clone())
+            .await
+            .expect("legacy peer without transaction");
+        assert_eq!(fs::read(f.destination()).await.expect("legacy data"), b"bbbb");
+        #[cfg(not(windows))]
+        {
+            use crate::disk::os::prepared_publication_test_hooks as hooks;
+            let f = PartMutationFixture::new("source", "destination", true).await;
+            f.prepare().await;
+            f.publish().await;
+            let old_meta = f.transaction().join(PART_TRANSACTION_OLD_META);
+            let held_meta = f._root.path().join("temporarily-unreadable-old-meta");
+            fs::rename(&old_meta, &held_meta)
+                .await
+                .expect("planning read misses old meta");
+            let _hook = hooks::install_at(hooks::Stage::PartSettlePlanned, &f.transaction(), move || {
+                std::fs::rename(held_meta, old_meta).expect("metadata becomes readable after admission");
+            });
+            let old_index = f.index(true, false);
+            let busy = os::acquire_namespace_mutation_lease_with_owner(&old_index, None).await;
+            f.token(LegacyPartOperation::Settle, None)
+                .await
+                .settle(PartTransactionAction::Commit)
+                .await
+                .expect("settle without unadmitted index deletion");
+            assert!(old_index.exists(), "a failed planning read cannot authorize a later index deletion");
+            drop(busy);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_part_mutation_core_namespace_contention_is_atomic() {
+        for stage in ["prepare", "rename", "settle"] {
+            for path in ["source", "metadata", "transaction", "child", "index", "parent", "destination"] {
+                if stage == "settle" && path == "source" {
+                    continue;
+                }
+                let f = PartMutationFixture::new("source", "destination", true).await;
+                if stage != "prepare" {
+                    f.prepare().await;
+                }
+                if stage == "settle" {
+                    f.publish().await;
+                }
+                let busy_path = match path {
+                    "source" => f.disk.io_get_object_path("source", "upload/part.1").expect("source"),
+                    "metadata" => f.destination().with_extension("1.meta"),
+                    "transaction" => f.transaction(),
+                    "child" => f.transaction().join(PART_TRANSACTION_NEW_META),
+                    "index" if stage == "prepare" => f.index(false, true),
+                    "index" if stage == "settle" => f.index(true, false),
+                    "index" => continue, // Rename does not mutate an integrity generation.
+                    "parent" => f.destination().parent().expect("parent").to_path_buf(),
+                    "destination" => f.destination(),
+                    _ => unreachable!(),
+                };
+                let busy = os::acquire_namespace_mutation_lease_with_owner(&busy_path, None).await;
+                let before = part_tree_bytes(f._root.path());
+                let operation = async {
+                    let token = f
+                        .wrapper
+                        .begin_legacy_part_mutation(
+                            (stage != "settle").then_some(("source", "upload/part.1")),
+                            ("destination", "object/part.1"),
+                            None,
+                            match stage {
+                                "prepare" => LegacyPartOperation::Prepare,
+                                "rename" => LegacyPartOperation::Rename,
+                                _ => LegacyPartOperation::Settle,
+                            },
+                        )
+                        .await?;
+                    match stage {
+                        "prepare" => token.prepare(f.new_meta.clone()).await,
+                        "rename" => token.rename(f.new_meta.clone()).await,
+                        _ => token.settle(PartTransactionAction::Rollback).await,
+                    }
+                };
+                let result = if path == "destination" {
+                    let mut operation = Box::pin(operation);
+                    assert!(matches!(futures::poll!(operation.as_mut()), Poll::Pending));
+                    assert!(
+                        os::disk_volume_mutation_lock(&f.disk.root, "destination")
+                            .try_write_owned()
+                            .is_ok(),
+                        "D is acquired before READ"
+                    );
+                    tokio::time::pause();
+                    tokio::time::advance(get_max_timeout_duration() + Duration::from_secs(1)).await;
+                    let result = operation.await;
+                    tokio::time::resume();
+                    result
+                } else {
+                    operation.await
+                };
+                assert_eq!(
+                    part_tree_bytes(f._root.path()),
+                    before,
+                    "{stage}/{path}: first write requires every namespace"
+                );
+                if path == "destination" {
+                    assert_eq!(result, Err(DiskError::Timeout));
+                } else {
+                    assert!(
+                        matches!(result, Err(DiskError::Io(ref e)) if e.kind() == ErrorKind::WouldBlock),
+                        "{stage}/{path}: {result:?}"
+                    );
+                }
+                drop(busy);
+            }
+        }
+        for operation in [
+            LegacyPartOperation::Prepare,
+            LegacyPartOperation::Rename,
+            LegacyPartOperation::Settle,
+        ] {
+            let f = PartMutationFixture::new("source", "destination", true).await;
+            if operation != LegacyPartOperation::Prepare {
+                f.prepare().await;
+            }
+            if operation == LegacyPartOperation::Settle {
+                f.publish().await;
+            }
+            let token = f.token(operation, None).await;
+            let mut writer = Box::pin(f.disk.delete_volume("destination", true));
+            assert!(matches!(futures::poll!(writer.as_mut()), Poll::Pending));
+            let result = timeout(Duration::from_secs(5), async {
+                match operation {
+                    LegacyPartOperation::Prepare => token.prepare(f.new_meta.clone()).await,
+                    LegacyPartOperation::Rename => token.rename(f.new_meta.clone()).await,
+                    LegacyPartOperation::Settle => token.settle(PartTransactionAction::Rollback).await,
+                }
+            })
+            .await
+            .expect("prepared operation does not reacquire READ behind queued writer");
+            drop(writer);
+            result.expect("operation completes under its existing READ");
+        }
+    }
+
+    #[cfg(not(windows))]
+    async fn assert_part_physical_owner(stage: &str, cancel: bool) {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        let f = PartMutationFixture::new("source", "destination", true).await;
+        let settling = matches!(stage, "restore" | "cleanup");
+        if !stage.starts_with("prepare") {
+            f.prepare().await;
+        }
+        if settling {
+            f.publish().await;
+        }
+        let op = if settling {
+            "settle_part_transaction"
+        } else if stage.starts_with("prepare") {
+            "prepare_part_transaction"
+        } else {
+            "rename_part"
+        };
+        let before = f.wrapper.metrics_snapshot();
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let owner = ctx.begin_namespace_commit();
+        let weak = Arc::downgrade(&owner);
+        let token = f
+            .token(
+                if settling {
+                    LegacyPartOperation::Settle
+                } else if stage.starts_with("prepare") {
+                    LegacyPartOperation::Prepare
+                } else {
+                    LegacyPartOperation::Rename
+                },
+                Some(owner),
+            )
+            .await;
+        let (hook_stage, hook_path) = match stage {
+            "prepare-index" => (hooks::Stage::Rename, f.index(false, false)),
+            "prepare-transaction" => (hooks::Stage::PartPrepare, f.transaction()),
+            "data" => (hooks::Stage::Rename, f.destination()),
+            "metadata" => (hooks::Stage::Rename, f.destination().with_extension("1.meta")),
+            "restore" => (hooks::Stage::PartRestore, f.transaction()),
+            "cleanup" => (hooks::Stage::PartCleanup, f.transaction()),
+            _ => unreachable!(),
+        };
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hook = hooks::install_at(hook_stage, &hook_path, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let meta = f.new_meta.clone();
+        let stage_owned = stage.to_owned();
+        let mutation = tokio::spawn(async move {
+            match stage_owned.as_str() {
+                "prepare-index" | "prepare-transaction" => token.prepare(meta).await,
+                "restore" | "cleanup" => token.settle(PartTransactionAction::Rollback).await,
+                _ => token.rename(meta).await,
+            }
+        });
+        timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("physical worker starts")
+            .expect("entered");
+        if cancel {
+            mutation.abort();
+            assert!(mutation.await.expect_err("cancelled caller").is_cancelled());
+        } else {
+            tokio::time::pause();
+            tokio::time::advance(get_max_timeout_duration() + Duration::from_secs(1)).await;
+            tokio::time::resume();
+            assert_eq!(mutation.await.expect("caller returns"), Err(DiskError::Timeout));
+        }
+        let source_held = settling
+            || os::disk_volume_mutation_lock(&f.disk.root, "source")
+                .try_write_owned()
+                .is_err();
+        let destination_held = os::disk_volume_mutation_lock(&f.disk.root, "destination")
+            .try_write_owned()
+            .is_err();
+        let instance_held = weak.upgrade().is_some();
+        let mut delete = Box::pin(f.disk.delete_volume("destination", true));
+        let delete_waits = matches!(futures::poll!(delete.as_mut()), Poll::Pending);
+        drop(release_tx);
+        drop(
+            timeout(
+                Duration::from_secs(10),
+                os::acquire_namespace_mutation_lease_with_owner(&f.destination(), None),
+            )
+            .await
+            .expect("actual worker drains D"),
+        );
+        assert!(source_held && destination_held, "{stage}: real worker retains every volume READ");
+        assert!(instance_held, "{stage}: real worker retains receiving instance");
+        assert!(delete_waits, "{stage}: real DeleteVolume waits for tail");
+        timeout(Duration::from_secs(10), delete)
+            .await
+            .expect("drained delete")
+            .expect("delete succeeds");
+        assert!(weak.upgrade().is_none());
+        f.disk.make_volume("destination").await.expect("new generation");
+        let sentinel = f.disk.io_get_object_path("destination", "sentinel").expect("sentinel");
+        fs::write(&sentinel, b"new generation").await.expect("new data");
+        assert_eq!(fs::read(&sentinel).await.expect("no old worker"), b"new generation");
+        let after = f.wrapper.metrics_snapshot();
+        assert_eq!(
+            after.api_calls.get(op).copied().unwrap_or_default(),
+            before.api_calls.get(op).copied().unwrap_or_default() + 1
+        );
+        assert_eq!(after.total_errors_timeout - before.total_errors_timeout, u64::from(!cancel));
+        assert_eq!(after.total_waiting, 0);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_part_mutation_core_cancellation_retains_physical_owner() {
+        for stage in [
+            "prepare-index",
+            "prepare-transaction",
+            "data",
+            "metadata",
+            "restore",
+            "cleanup",
+        ] {
+            assert_part_physical_owner(stage, true).await;
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_part_mutation_core_timeout_retains_physical_owner() {
+        for stage in [
+            "prepare-index",
+            "prepare-transaction",
+            "data",
+            "metadata",
+            "restore",
+            "cleanup",
+        ] {
+            assert_part_physical_owner(stage, false).await;
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_part_mutation_core_settlement_waits_for_physical_publish() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        let f = PartMutationFixture::new("source", "destination", true).await;
+        f.prepare().await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hook = hooks::install_at(hooks::Stage::Rename, &f.destination(), move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let token = f.token(LegacyPartOperation::Rename, None).await;
+        let mutation = tokio::spawn(token.rename(f.new_meta.clone()));
+        entered_rx.await.expect("publisher entered");
+        mutation.abort();
+        assert!(mutation.await.expect_err("caller cancelled").is_cancelled());
+        let before = part_tree_bytes(f._root.path());
+        let mut settlement = Box::pin(f.wrapper.settle_part_transaction(
+            "destination",
+            "object/part.1",
+            PartTransactionAction::Rollback,
+        ));
+        assert!(matches!(futures::poll!(settlement.as_mut()), Poll::Pending));
+        assert_eq!(part_tree_bytes(f._root.path()), before, "settle cannot restore before publisher drains");
+        drop(release_tx);
+        timeout(Duration::from_secs(10), settlement)
+            .await
+            .expect("tail drains")
+            .expect("rollback completes");
+        assert_eq!(fs::read(f.destination()).await.expect("restored"), b"aaaa");
+        assert_eq!(fs::read(f.destination().with_extension("1.meta")).await.expect("metadata"), f.old_meta);
+        assert!(f.index(true, false).exists());
+        assert!(!f.index(false, false).exists());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_part_mutation_core_deadline_preserves_recoverable_transaction() {
+        let f = PartMutationFixture::new("source", "destination", true).await;
+        f.prepare().await;
+        let busy = os::acquire_namespace_mutation_lease_with_owner(&f.destination(), None).await;
+        let before = part_tree_bytes(f._root.path());
+        let mut settlement = Box::pin(f.wrapper.settle_part_transaction(
+            "destination",
+            "object/part.1",
+            PartTransactionAction::Rollback,
+        ));
+        assert!(matches!(futures::poll!(settlement.as_mut()), Poll::Pending));
+        tokio::time::pause();
+        tokio::time::advance(get_max_timeout_duration() + Duration::from_secs(1)).await;
+        assert_eq!(settlement.await, Err(DiskError::Timeout));
+        tokio::time::resume();
+        assert_eq!(part_tree_bytes(f._root.path()), before, "timed out settlement preserves recovery inputs");
+        drop(busy);
+        f.token(LegacyPartOperation::Settle, None)
+            .await
+            .settle(PartTransactionAction::Rollback)
+            .await
+            .expect("recovery succeeds");
+        let metrics = f.wrapper.metrics_snapshot();
+        assert_eq!(metrics.api_calls.get("settle_part_transaction"), Some(&2));
+        assert_eq!(metrics.total_errors_timeout, 1);
+        assert_eq!(metrics.total_waiting, 0);
+
+        let stale = PartMutationFixture::new("source", "destination", true).await;
+        let token = stale.token(LegacyPartOperation::Prepare, None).await;
+        stale.wrapper.set_disk_id_state(Some(Uuid::new_v4())).await;
+        let guard = stale.disk.format_info.write().await;
+        let before = part_tree_bytes(stale._root.path());
+        let mut prepare = Box::pin(token.prepare(stale.new_meta.clone()));
+        assert!(matches!(futures::poll!(prepare.as_mut()), Poll::Pending));
+        tokio::time::pause();
+        tokio::time::advance(get_max_timeout_duration() + Duration::from_secs(1)).await;
+        assert_eq!(prepare.await, Err(DiskError::Timeout));
+        tokio::time::resume();
+        drop(guard);
+        assert_eq!(part_tree_bytes(stale._root.path()), before, "stale wait is inside the prepared deadline");
+        assert_eq!(stale.wrapper.metrics_snapshot().total_errors_timeout, 1);
+        let zero = PartMutationFixture::new("source", "destination", true).await;
+        let before = part_tree_bytes(zero._root.path());
+        let result = temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("0"))], async {
+            assert_eq!(get_max_timeout_duration(), Duration::ZERO);
+            timeout(
+                Duration::from_secs(5),
+                zero.wrapper.prepare_part_transaction(
+                    "source",
+                    "upload/part.1",
+                    "destination",
+                    "object/part.1",
+                    zero.new_meta.clone(),
+                ),
+            )
+            .await
+        })
+        .await;
+        assert_eq!(result.expect("zero prepared budget remains finite"), Err(DiskError::Timeout));
+        assert_eq!(part_tree_bytes(zero._root.path()), before);
+        assert_eq!(zero.wrapper.metrics_snapshot().api_calls.get("prepare_part_transaction"), Some(&1));
+        assert_eq!(zero.wrapper.metrics_snapshot().total_errors_timeout, 1);
     }
 
     async fn rename_file_fixture() -> (tempfile::TempDir, Arc<LocalDisk>, crate::disk::disk_store::LocalDiskWrapper) {

@@ -5617,17 +5617,365 @@ mod tests {
         ));
     }
 
+    #[cfg(not(windows))]
+    async fn assert_automatic_part_rollback(settlement_timeout: bool) {
+        use crate::disk::{
+            Disk,
+            disk_store::LocalDiskWrapper,
+            health_state::RuntimeDriveHealthState,
+            os::{drain_namespace_for_test, prepared_publication_test_hooks as hooks},
+        };
+        use crate::io_support::shard_integrity::IntegrityBuilder;
+        use crate::storage_api_contracts::bucket::BucketOperations as _;
+        use rustfs_filemeta::shard_integrity::IntegrityLayout;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::{Duration, timeout};
+
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("5")),
+                (crate::disk::disk_store::ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, Some("true")),
+            ],
+            async {
+                for old in [false, true] {
+                    let (_roots, original_disks, set_disks) = hermetic_set_disks_for_pool_with_default_parity(4, 0, 2).await;
+                    // This fixture normally disables health monitors. Install ordinary
+                    // monitored wrappers before any scenario I/O, on the same four disks.
+                    let disks = original_disks
+                        .iter()
+                        .map(|disk| match disk.as_ref() {
+                            Disk::Local(local) => Arc::new(Disk::Local(Box::new(LocalDiskWrapper::new(local.get_disk(), true)))),
+                            Disk::Remote(_) => unreachable!("four local disks"),
+                        })
+                        .collect::<Vec<_>>();
+                    *set_disks.disks.write().await = disks.iter().cloned().map(Some).collect();
+                    assert!(disks.iter().all(|disk| disk.health_check_enabled_for_test()));
+                    let bucket = "part-tail-rollback";
+                    let object = "object";
+                    crate::bucket::metadata_sys::object_store_in(&set_disks.ctx)
+                        .await
+                        .expect("multipart fixture metadata owner")
+                        .make_bucket(bucket, &Default::default())
+                        .await
+                        .expect("multipart fixture bucket has authoritative quota metadata");
+                    let (destination, completion) = if old {
+                        let payload = vec![0x41; 1 << 20];
+                        let create_opts = ObjectOptions {
+                            shard_integrity_write_mode: Some(crate::object_api::ShardIntegrityWriteMode::Protected),
+                            ..Default::default()
+                        };
+                        let (upload_id, parts) =
+                            stage_upload_with_create_opts(&set_disks, bucket, object, &payload, &create_opts).await;
+                        let (info, _) = set_disks
+                            .check_upload_id_exists(bucket, object, &upload_id, false)
+                            .await
+                            .expect("acknowledged upload");
+                        (
+                            format!(
+                                "{}/{}/part.1",
+                                SetDisks::get_upload_id_dir(bucket, object, &upload_id),
+                                info.data_dir.expect("data directory")
+                            ),
+                            Some((upload_id, parts, payload)),
+                        )
+                    } else {
+                        (format!("{}/part.1", Uuid::new_v4()), None)
+                    };
+                    let source = format!("{}/part.1", Uuid::new_v4());
+                    let mut builder =
+                        IntegrityBuilder::new(IntegrityLayout::new(2, 2, 8, false).expect("layout"), 1).expect("index builder");
+                    builder.push([b"bbbb".as_slice(); 4].into_iter()).await.expect("stripe");
+                    let proof = builder.finish(8).await.expect("proof");
+                    let index = proof.inline_bytes().expect("inline index");
+                    let proof_name = proof.part.file_name();
+                    let meta = Bytes::from(
+                        ObjectPartInfo {
+                            number: 1,
+                            size: 8,
+                            integrity: Some(proof.part),
+                            etag: "tail-retry".to_owned(),
+                            ..Default::default()
+                        }
+                        .marshal_msg()
+                        .expect("metadata"),
+                    );
+                    let mut snapshots = Vec::new();
+                    let mut paths = Vec::new();
+                    for disk in &disks {
+                        let target = disk
+                            .get_object_path_for_io_if_local(RUSTFS_META_MULTIPART_BUCKET, &destination)
+                            .expect("local disk")
+                            .expect("target");
+                        let old_data = std::fs::read(&target).ok();
+                        let old_meta = std::fs::read(target.with_extension("1.meta")).ok();
+                        let old_index = old_meta
+                            .as_ref()
+                            .and_then(|bytes| ObjectPartInfo::unmarshal(bytes).ok())
+                            .and_then(|part| part.integrity)
+                            .map(|integrity| {
+                                let path = target.parent().expect("parent").join(integrity.file_name());
+                                let bytes = std::fs::read(&path).expect("acknowledged index");
+                                (path, bytes)
+                            });
+                        if old {
+                            assert!(old_index.is_some(), "acknowledged protected upload must have an integrity index");
+                        }
+                        snapshots.push((old_data, old_meta, old_index));
+                        paths.push(target);
+                        disk.write_all(RUSTFS_META_TMP_BUCKET, &source, Bytes::from_static(b"bbbb"))
+                            .await
+                            .expect("retry shard");
+                        disk.write_all(
+                            RUSTFS_META_TMP_BUCKET,
+                            &format!("{}/{}", source.rsplit_once('/').expect("directory").0, proof_name),
+                            index.clone(),
+                        )
+                        .await
+                        .expect("retry index");
+                    }
+                    let mut guards = Vec::new();
+                    let mut releases = Vec::new();
+                    let mut entered = Vec::new();
+                    let mut settle_waiting = Vec::new();
+                    let mut settle_completed = Vec::new();
+                    let mut settle_timed_out = Vec::new();
+                    let mut restored = Vec::new();
+                    let mut finished = Vec::new();
+                    // Two of four publications cannot acknowledge the required quorum of three.
+                    for (number, target) in paths.iter().take(2).enumerate() {
+                        let paused_path = if number == 0 {
+                            target.clone()
+                        } else {
+                            target.with_extension("1.meta")
+                        };
+                        let transaction = target.parent().expect("parent").join(".part.1.rustfs-txn");
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        let (release, blocked) = std::sync::mpsc::channel::<()>();
+                        guards.push(hooks::install_at(hooks::Stage::Rename, &paused_path, move || {
+                            let _ = tx.send(());
+                            let _ = blocked.recv();
+                        }));
+                        entered.push(rx);
+                        releases.push(release);
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        guards.push(hooks::install_at(hooks::Stage::NamespaceWaiting, target, move || {
+                            let _ = tx.send(());
+                        }));
+                        settle_waiting.push(rx);
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        guards.push(hooks::install_at(hooks::Stage::PartSettleTimeout, target, move || {
+                            let _ = tx.send(());
+                        }));
+                        settle_timed_out.push(rx);
+                        let restore = Arc::new(AtomicBool::new(false));
+                        let observed = restore.clone();
+                        guards.push(hooks::install_at(hooks::Stage::PartRestore, &transaction, move || {
+                            observed.store(true, Ordering::SeqCst);
+                        }));
+                        restored.push(restore);
+                        let complete = Arc::new(AtomicBool::new(false));
+                        let observed = complete.clone();
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        guards.push(hooks::install_at(hooks::Stage::PartSettleComplete, target, move || {
+                            observed.store(true, Ordering::SeqCst);
+                            let _ = tx.send(());
+                        }));
+                        settle_completed.push(rx);
+                        finished.push(complete);
+                    }
+                    let operation_set = set_disks.clone();
+                    let operation_disks = disks.iter().cloned().map(Some).collect::<Vec<_>>();
+                    let operation_source = source.clone();
+                    let operation_destination = destination.clone();
+                    let operation = tokio::spawn(async move {
+                        operation_set
+                            .rename_part(
+                                &operation_disks,
+                                RUSTFS_META_TMP_BUCKET,
+                                &operation_source,
+                                RUSTFS_META_MULTIPART_BUCKET,
+                                &operation_destination,
+                                meta,
+                                3,
+                                None,
+                            )
+                            .await
+                    });
+                    let mut waited = Vec::new();
+                    let mut before_drain = Vec::new();
+                    let mut after_timeout = Vec::new();
+                    // Keep observations until both physical workers have drained. Even a
+                    // deliberately broken admission path must not strand a test worker.
+                    let observed = async {
+                        for receiver in entered {
+                            timeout(Duration::from_secs(30), receiver)
+                                .await
+                                .map_err(|_| "publisher did not reach barrier")?
+                                .map_err(|_| "publisher hook dropped")?;
+                        }
+                        for (waiting, completed) in settle_waiting.into_iter().zip(settle_completed) {
+                            let pending = timeout(Duration::from_secs(15), async {
+                                tokio::select! {
+                                    result = waiting => result.map(|()| true),
+                                    result = completed => result.map(|()| false),
+                                }
+                            })
+                            .await
+                            .map_err(|_| "automatic settlement neither waited nor completed")?
+                            .map_err(|_| "settlement observation dropped")?;
+                            waited.push(pending);
+                        }
+                        for (number, target) in paths.iter().take(2).enumerate() {
+                            let transaction = target.parent().expect("parent").join(".part.1.rustfs-txn");
+                            before_drain.push((
+                                restored[number].load(Ordering::SeqCst),
+                                finished[number].load(Ordering::SeqCst),
+                                transaction.join("new.meta").exists(),
+                                transaction.join("rollback").exists(),
+                                std::fs::read(target.with_extension("1.meta")).ok(),
+                            ));
+                        }
+                        if settlement_timeout && waited.iter().all(|pending| *pending) {
+                            for receiver in settle_timed_out {
+                                timeout(Duration::from_secs(15), receiver)
+                                    .await
+                                    .map_err(|_| "settlement did not report Timeout")?
+                                    .map_err(|_| "timeout observation dropped")?;
+                            }
+                            for (number, target) in paths.iter().take(2).enumerate() {
+                                let transaction = target.parent().expect("parent").join(".part.1.rustfs-txn");
+                                after_timeout.push((
+                                    transaction.join("new.meta").exists(),
+                                    transaction.join("rollback").exists(),
+                                    restored[number].load(Ordering::SeqCst),
+                                ));
+                            }
+                        }
+                        Ok::<(), &str>(())
+                    }
+                    .await;
+                    drop(releases);
+                    let mut drained = Vec::new();
+                    for target in paths.iter().take(2) {
+                        drained.push(timeout(Duration::from_secs(15), drain_namespace_for_test(target)).await);
+                    }
+                    let result = timeout(Duration::from_secs(30), operation).await;
+                    for result in drained {
+                        result.expect("actual publisher namespace drains");
+                    }
+                    observed.expect("observe automatic rollback under real deadlines");
+                    assert_eq!(waited, [true, true], "automatic rollback must really wait for the publisher's D lock");
+                    for (number, (restored, finished, has_meta, has_rollback, meta)) in before_drain.iter().enumerate() {
+                        assert!(!restored, "automatic rollback must not restore before the old publisher drains");
+                        assert!(!finished, "automatic rollback must wait for D, not return a competing-namespace error");
+                        assert!(*has_meta);
+                        assert!(!has_rollback, "no rollback write precedes physical drain");
+                        assert_eq!(meta, &snapshots[number].1);
+                    }
+                    if settlement_timeout {
+                        assert_eq!(after_timeout.len(), 2);
+                        for (has_meta, has_rollback, restored) in after_timeout {
+                            assert!(has_meta, "timed-out settlement retains recovery input");
+                            assert!(!has_rollback && !restored);
+                        }
+                    }
+                    let result = result.expect("automatic recovery returns").expect("quorum task");
+                    assert!(
+                        matches!(result, Err(DiskError::ErasureWriteQuorum)),
+                        "publication preserves its original quorum failure: {result:?}"
+                    );
+                    if settlement_timeout {
+                        // Two consecutive real timeouts take these drives offline. Only
+                        // production health probes may make them available to recovery.
+                        timeout(Duration::from_secs(30), async {
+                            let mut poll = tokio::time::interval(Duration::from_millis(25));
+                            while disks
+                                .iter()
+                                .any(|disk| disk.runtime_state() != RuntimeDriveHealthState::Online)
+                            {
+                                poll.tick().await;
+                            }
+                        })
+                        .await
+                        .expect("real recovery monitors restore all four disks");
+                        let directory = format!("{}/", destination.rsplit_once('/').expect("directory").0);
+                        set_disks
+                            .recover_part_transactions(&directory, 2, 3)
+                            .await
+                            .expect("existing recovery converges after monitor recovery");
+                    }
+                    // The ordinary case reaches these assertions directly from the
+                    // real rename_part return, with no supplemental recovery call.
+                    for (number, target) in paths.iter().enumerate() {
+                        assert_eq!(std::fs::read(target).ok(), snapshots[number].0, "data on disk {number}");
+                        assert_eq!(
+                            std::fs::read(target.with_extension("1.meta")).ok(),
+                            snapshots[number].1,
+                            "metadata on disk {number}"
+                        );
+                        if let Some((path, bytes)) = &snapshots[number].2 {
+                            assert_eq!(&std::fs::read(path).expect("old index survives"), bytes);
+                        }
+                        assert!(!target.parent().expect("parent").join(".part.1.rustfs-txn").exists());
+                    }
+                    if let Some((upload_id, parts, payload)) = completion {
+                        use tokio::io::AsyncReadExt as _;
+                        set_disks
+                            .clone()
+                            .complete_multipart_upload(bucket, object, &upload_id, parts, &ObjectOptions::default())
+                            .await
+                            .expect("acknowledged old upload stays completable");
+                        let mut reader = set_disks
+                            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                            .await
+                            .expect("completed object");
+                        let mut bytes = Vec::new();
+                        reader.stream.read_to_end(&mut bytes).await.expect("read restored object");
+                        assert_eq!(bytes, payload);
+                    }
+                    drop(guards);
+                    for disk in &disks {
+                        if let Disk::Local(local) = disk.as_ref() {
+                            local.stop_monitoring().await;
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_part_mutation_flow_automatic_quorum_rollback_waits_for_tail() {
+        assert_automatic_part_rollback(false).await;
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_part_mutation_flow_settlement_timeout_retains_recoverable_state() {
+        assert_automatic_part_rollback(true).await;
+    }
+
     async fn assert_quorum_minus_one_retry_preserves_completable_part(
         disk_count: usize,
         parity: usize,
         success_indices: &[usize],
     ) {
+        use crate::storage_api_contracts::bucket::BucketOperations as _;
         use tokio::io::AsyncReadExt as _;
 
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_for_pool_with_default_parity(disk_count, 0, parity).await;
         let bucket = format!("multipart-retry-{disk_count}-{}", success_indices[0]);
         let object = "object";
-        make_bucket_on_all(&disk_stores, &bucket).await;
+        crate::bucket::metadata_sys::object_store_in(&set_disks.ctx)
+            .await
+            .expect("multipart fixture metadata owner")
+            .make_bucket(&bucket, &Default::default())
+            .await
+            .expect("multipart fixture bucket has authoritative quota metadata");
 
         let payload = vec![0x41; 1 << 20];
         let (upload_id, parts) =
@@ -5709,12 +6057,18 @@ mod tests {
 
     #[tokio::test]
     async fn complete_multipart_upload_recovers_interrupted_part_retry() {
+        use crate::storage_api_contracts::bucket::BucketOperations as _;
         use tokio::io::AsyncReadExt as _;
 
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks_for_pool_with_default_parity(6, 0, 2).await;
         let bucket = "multipart-retry-recovery";
         let object = "object";
-        make_bucket_on_all(&disk_stores, bucket).await;
+        crate::bucket::metadata_sys::object_store_in(&set_disks.ctx)
+            .await
+            .expect("multipart fixture metadata owner")
+            .make_bucket(bucket, &Default::default())
+            .await
+            .expect("multipart fixture bucket has authoritative quota metadata");
 
         let payload = vec![0x42; 1 << 20];
         let (upload_id, parts) =
