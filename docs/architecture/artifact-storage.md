@@ -78,8 +78,15 @@ freezes the backup, marker, staging and restoration paths, then tries every requ
 namespace before its first write. Backup publication, reservation, marker commit
 and internal failure restoration retain the same complete ownership. Internal
 restoration reuses the prepared paths and locks instead of acquiring them again;
-optional cleanup remains best effort. Bulk `DeleteVersions` remains outside this
-boundary.
+optional cleanup remains best effort.
+Bulk `DeleteVersions` captures one instance-bound volume admission before
+classification. Each object group tries its metadata and namespace locks, then
+uses the existing group read-modify-write operation and one original backup.
+Contention is reported for that group without blocking later groups. Duplicate
+objects retain input order; empty groups keep their existing mutation semantics.
+One execution deadline preserves completed group results and marks only unfinished
+groups as timed out. Physical workers retain admission after cancellation. Empty
+batches preserve their original classification and response behavior.
 The incarnation-bound heal path retains its separate admission. Other legacy
 mutation routes and internal metadata publication still need their own admission
 boundary before distributed artifact sealing can be enabled.

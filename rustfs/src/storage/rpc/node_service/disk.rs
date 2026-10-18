@@ -20,7 +20,7 @@ use crate::storage::storage_api::rpc_consumer::node_service::{
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use crate::storage::storage_api::{
-    LegacyMetadataWrite, LegacyRenameData, PartTransactionAction, RenameDataResp, SnapshotLeaseToken,
+    LegacyFileWrite, LegacyMetadataWrite, LegacyRenameData, PartTransactionAction, RenameDataResp, SnapshotLeaseToken,
     verify_tonic_mutation_body_digest,
 };
 use bytes::Bytes;
@@ -144,6 +144,14 @@ impl LocalMutationTarget {
         match self {
             Self::Ready(store) => store.begin_legacy_local_metadata_mutation(disk_ref, volume, path).await,
             Self::Bootstrap(target) => target.begin_legacy_local_metadata_mutation(disk_ref, volume, path).await,
+            Self::Unbound => Err(DiskError::other("target disk instance is unavailable")),
+        }
+    }
+
+    async fn begin_legacy_local_delete_versions(&self, disk_ref: &str, volume: &str) -> Result<LegacyFileWrite, DiskError> {
+        match self {
+            Self::Ready(store) => store.begin_legacy_local_delete_versions(disk_ref, volume).await,
+            Self::Bootstrap(target) => target.begin_legacy_local_delete_versions(disk_ref, volume).await,
             Self::Unbound => Err(DiskError::other("target disk instance is unavailable")),
         }
     }
@@ -744,7 +752,9 @@ impl NodeService {
         let request = request.into_inner();
         let target = self.local_mutation_target();
         if let Some(disk) = target.find_mutation_disk(&request.disk).await {
-            target.reject_legacy_artifact_mutation(&request.volume).await?;
+            if request.versions.is_empty() {
+                target.reject_legacy_artifact_mutation(&request.volume).await?;
+            }
             let mut versions = Vec::with_capacity(request.versions.len());
             for (index, version) in request.versions.iter().enumerate() {
                 let version_bin = request.versions_bin.get(index).map(|b| b.as_ref()).unwrap_or(&[]);
@@ -772,8 +782,27 @@ impl NodeService {
                 }
             };
 
-            let (errors, item_errors) =
-                encode_delete_versions_errors(disk.delete_versions(&request.volume, versions, opts).await);
+            let result = if versions.is_empty() {
+                disk.delete_versions(&request.volume, versions, opts).await
+            } else {
+                let write = match target
+                    .begin_legacy_local_delete_versions(&request.disk, &request.volume)
+                    .await
+                {
+                    Ok(write) => write,
+                    Err(error) => {
+                        return Ok(Response::new(DeleteVersionsResponse {
+                            success: false,
+                            errors: Vec::new(),
+                            error: Some(error.into()),
+                            item_errors: Vec::new(),
+                        }));
+                    }
+                };
+                target.reject_legacy_artifact_mutation(&request.volume).await?;
+                write.delete_versions(versions, opts).await
+            };
+            let (errors, item_errors) = encode_delete_versions_errors(result);
 
             Ok(Response::new(DeleteVersionsResponse {
                 success: true,
@@ -3436,6 +3465,593 @@ mod legacy_artifact_tests {
     ) -> Result<Response<DeleteVersionResponse>, Status> {
         verify_legacy_rpc_request(&request, "DeleteVersion")?;
         service.handle_delete_version(request, false).await
+    }
+
+    fn signed_legacy_bulk_request(
+        disk: &str,
+        volume: &str,
+        versions: &[FileInfoVersions],
+        opts: &DeleteOptions,
+        msgpack: bool,
+    ) -> Request<DeleteVersionsRequest> {
+        let mut request = Request::new(DeleteVersionsRequest {
+            disk: disk.to_owned(),
+            volume: volume.to_owned(),
+            versions: versions
+                .iter()
+                .map(|group| {
+                    if msgpack {
+                        "binary must take precedence".to_owned()
+                    } else {
+                        serde_json::to_string(group).expect("JSON version group")
+                    }
+                })
+                .collect(),
+            versions_bin: if msgpack {
+                versions
+                    .iter()
+                    .map(|group| {
+                        encode_msgpack_named(group, "FileInfoVersions")
+                            .expect("binary version group")
+                            .into()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            opts: if msgpack {
+                "binary must take precedence".to_owned()
+            } else {
+                serde_json::to_string(opts).expect("JSON bulk options")
+            },
+            opts_bin: if msgpack {
+                encode_msgpack(opts, "DeleteOptions").expect("binary bulk options").into()
+            } else {
+                Bytes::new()
+            },
+        });
+        let body = rustfs_protos::canonical_delete_versions_request_body(request.get_ref()).expect("canonical bulk body");
+        sign_legacy_rpc_request(&mut request, &body, "DeleteVersions");
+        request
+    }
+
+    async fn authenticated_legacy_bulk(
+        service: &NodeService,
+        request: Request<DeleteVersionsRequest>,
+    ) -> Result<DeleteVersionsResponse, Status> {
+        verify_legacy_rpc_request(&request, "DeleteVersions")?;
+        Ok(service.handle_delete_versions(request).await?.into_inner())
+    }
+
+    fn assert_bulk_results(response: &DeleteVersionsResponse, expected: &[Option<DiskError>]) {
+        assert!(response.success, "bulk envelope: {:?}", response.error);
+        assert!(response.error.is_none());
+        assert_eq!(response.errors.len(), expected.len());
+        assert_eq!(response.item_errors.len(), expected.len());
+        for ((text, typed), expected) in response.errors.iter().zip(&response.item_errors).zip(expected) {
+            match expected {
+                Some(error) => {
+                    assert_eq!(typed.code, error.to_u32());
+                    assert_eq!(&typed.error_info, text);
+                    assert!(!text.is_empty());
+                }
+                None => {
+                    assert!(text.is_empty());
+                    assert_eq!(typed.code, 0);
+                    assert!(typed.error_info.is_empty());
+                }
+            }
+        }
+    }
+
+    async fn prepare_legacy_bulk(
+        disk: &ecstore_disk::DiskStore,
+        volume: &str,
+        prefix: &str,
+    ) -> (Vec<FileInfoVersions>, Vec<(std::path::PathBuf, Vec<u8>)>) {
+        let one = format!("{prefix}/history");
+        let (latest, previous) = stage_legacy_delete(disk, volume, &one, "remaining").await;
+        let previous = previous.expect("two original versions").0;
+        let two = format!("{prefix}/data");
+        let (data, _) = prepare_legacy_delete_rollback(disk, volume, &two, "last").await;
+        let groups = vec![
+            FileInfoVersions {
+                volume: volume.to_owned(),
+                name: one,
+                versions: vec![latest, previous],
+                ..Default::default()
+            },
+            FileInfoVersions {
+                volume: volume.to_owned(),
+                name: two,
+                versions: vec![data],
+                ..Default::default()
+            },
+        ];
+        let mut before = Vec::new();
+        for group in &groups {
+            let object = ecstore_disk::DiskAPI::path(disk.as_ref()).join(volume).join(&group.name);
+            let metadata = object.join("xl.meta");
+            before.push((metadata.clone(), tokio::fs::read(&metadata).await.expect("complete original metadata")));
+            for fi in &group.versions {
+                if let Some(data_dir) = fi.data_dir {
+                    let part = object.join(data_dir.to_string()).join("part.1");
+                    before.push((part.clone(), tokio::fs::read(&part).await.expect("original shard")));
+                }
+            }
+        }
+        (groups, before)
+    }
+
+    async fn assert_bulk_bytes(before: &[(std::path::PathBuf, Vec<u8>)]) {
+        for (path, bytes) in before {
+            assert_eq!(tokio::fs::read(path).await.expect("original file exists"), *bytes, "{}", path.display());
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_bulk_delete_receiver_preserves_signed_group_results_and_rejects_managed() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-bulk-receiver-test-secret".to_owned());
+        let root = tempfile::tempdir().expect("bulk receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("bulk-ordinary", true).await;
+        env.ecstore
+            .clone()
+            .make_artifact_bucket("bulk-managed", "outputs/")
+            .await
+            .expect("managed bucket");
+        let service = service_for(&env).await;
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = service
+            .local_mutation_target()
+            .find_mutation_disk(&disk_ref)
+            .await
+            .expect("local disk");
+        for msgpack in [false, true] {
+            for volume in ["bulk-ordinary", ".rustfs.sys", "bulk-managed"] {
+                let prefix = if volume == "bulk-managed" {
+                    format!("outputs/74656e616e74/{}/{}", Uuid::new_v4(), Uuid::new_v4())
+                } else {
+                    format!("bulk/{msgpack}")
+                };
+                let (groups, before) = prepare_legacy_bulk(&disk, volume, &prefix).await;
+                let rollback = Uuid::new_v4();
+                let opts = DeleteOptions {
+                    old_data_dir: Some(rollback),
+                    ..Default::default()
+                };
+                let mut input = groups.clone();
+                input.insert(
+                    1,
+                    FileInfoVersions {
+                        volume: volume.to_owned(),
+                        name: format!("{prefix}/missing"),
+                        ..Default::default()
+                    },
+                );
+                let result =
+                    authenticated_legacy_bulk(&service, signed_legacy_bulk_request(&disk_ref, volume, &input, &opts, msgpack))
+                        .await;
+                if volume == "bulk-managed" {
+                    assert_eq!(
+                        result.expect_err("managed batch rejects before writes").code(),
+                        tonic::Code::PermissionDenied
+                    );
+                    assert_bulk_bytes(&before).await;
+                    for group in &groups {
+                        assert!(
+                            !env.disk_paths[0]
+                                .join(volume)
+                                .join(&group.name)
+                                .join(rollback.to_string())
+                                .exists()
+                        );
+                    }
+                    continue;
+                }
+                assert_bulk_results(&result.expect("signed forward"), &[None, Some(DiskError::FileNotFound), None]);
+                for (path, original) in &before {
+                    if path.file_name().is_some_and(|name| name == "xl.meta") {
+                        assert!(!path.exists(), "all selected versions removed");
+                        let backup = path.parent().expect("object").join(rollback.to_string()).join("xl.meta.bkp");
+                        assert_eq!(tokio::fs::read(backup).await.expect("one complete group backup"), *original);
+                    }
+                }
+                let undo = DeleteOptions {
+                    undo_write: true,
+                    undo_delete: true,
+                    ..opts
+                };
+                let response =
+                    authenticated_legacy_bulk(&service, signed_legacy_bulk_request(&disk_ref, volume, &groups, &undo, msgpack))
+                        .await
+                        .expect("signed group undo");
+                assert_bulk_results(&response, &[None, None]);
+                assert_bulk_bytes(&before).await;
+                for group in &groups {
+                    assert!(
+                        !env.disk_paths[0]
+                            .join(volume)
+                            .join(&group.name)
+                            .join(rollback.to_string())
+                            .exists()
+                    );
+                }
+            }
+        }
+        let response = authenticated_legacy_bulk(
+            &service,
+            signed_legacy_bulk_request(&disk_ref, "bulk-ordinary", &[], &DeleteOptions::default(), false),
+        )
+        .await
+        .expect("empty batch");
+        assert_bulk_results(&response, &[]);
+        assert_eq!(
+            authenticated_legacy_bulk(
+                &service,
+                signed_legacy_bulk_request(&disk_ref, "bulk-managed", &[], &DeleteOptions::default(), false)
+            )
+            .await
+            .expect_err("empty managed batch still classifies")
+            .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut rejected_empty = signed_legacy_bulk_request(&disk_ref, "bulk-managed", &[], &DeleteOptions::default(), false);
+        rejected_empty.get_mut().opts = "invalid JSON".to_owned();
+        let body = rustfs_protos::canonical_delete_versions_request_body(rejected_empty.get_ref()).expect("empty request body");
+        sign_legacy_rpc_request(&mut rejected_empty, &body, "DeleteVersions");
+        assert_eq!(
+            authenticated_legacy_bulk(&service, rejected_empty)
+                .await
+                .expect_err("empty batch classifies before decoding as before")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        for invalid_group in [true, false] {
+            let mut request = signed_legacy_bulk_request(&disk_ref, "bulk-ordinary", &[], &DeleteOptions::default(), false);
+            if invalid_group {
+                request.get_mut().versions.push("invalid JSON".to_owned());
+            } else {
+                request.get_mut().opts = "invalid JSON".to_owned();
+            }
+            let body = rustfs_protos::canonical_delete_versions_request_body(request.get_ref())
+                .expect("malformed payload has canonical wire bytes");
+            sign_legacy_rpc_request(&mut request, &body, "DeleteVersions");
+            let response = authenticated_legacy_bulk(&service, request)
+                .await
+                .expect("decode failure envelope");
+            assert!(!response.success);
+            assert!(response.errors.is_empty() && response.item_errors.is_empty());
+            assert!(response.error.expect("decode error").error_info.contains(if invalid_group {
+                "decode FileInfoVersions failed"
+            } else {
+                "decode DeleteOptions failed"
+            }));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_bulk_delete_receiver_rejects_missing_volume_with_retained_metadata() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-bulk-receiver-test-secret".to_owned());
+        let root = tempfile::tempdir().expect("bulk missing-volume root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        let service = service_for(&env).await;
+        let target = service.local_mutation_target();
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = target.find_mutation_disk(&disk_ref).await.expect("local disk");
+        for msgpack in [false, true] {
+            let volume = format!("bulk-missing-{msgpack}");
+            env.make_bucket(&volume, true).await;
+            let (groups, _) = prepare_legacy_bulk(&disk, &volume, "objects").await;
+            let incarnation = env.ecstore.bucket_incarnation_id(&volume).await.expect("incarnation");
+            disk.delete_volume(&volume, true).await.expect("remove physical volume");
+            assert_eq!(env.ecstore.bucket_incarnation_id(&volume).await.expect("retained metadata"), incarnation);
+            target.reject_legacy_artifact_mutation(&volume).await.expect("still ordinary");
+            for undo in [false, true] {
+                let opts = DeleteOptions {
+                    old_data_dir: Some(Uuid::new_v4()),
+                    undo_write: undo,
+                    undo_delete: undo,
+                    ..Default::default()
+                };
+                let response =
+                    authenticated_legacy_bulk(&service, signed_legacy_bulk_request(&disk_ref, &volume, &groups, &opts, msgpack))
+                        .await
+                        .expect("admission failure envelope");
+                assert!(!response.success);
+                assert!(response.errors.is_empty() && response.item_errors.is_empty());
+                assert_eq!(DiskError::from(response.error.expect("missing volume")), DiskError::VolumeNotFound);
+                assert!(!env.disk_paths[0].join(&volume).exists());
+            }
+            let response = authenticated_legacy_bulk(
+                &service,
+                signed_legacy_bulk_request(&disk_ref, &volume, &[], &DeleteOptions::default(), msgpack),
+            )
+            .await
+            .expect("empty batch needs no live volume");
+            assert_bulk_results(&response, &[]);
+            assert!(!env.disk_paths[0].join(&volume).exists());
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_bulk_delete_receiver_binds_instance_and_bootstrap_admission() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-bulk-receiver-test-secret".to_owned());
+        let root = tempfile::tempdir().expect("bulk instance root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("bulk-instance", true).await;
+        let ready = service_for(&env).await;
+        let instance = crate::storage::storage_api::bootstrap_instance_ctx();
+        assert!(super::super::BootstrapLocalTarget::new(instance.clone()).is_for_store(&env.ecstore));
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = ready
+            .local_mutation_target()
+            .find_mutation_disk(&disk_ref)
+            .await
+            .expect("instance disk");
+        let slot = super::super::ServerContextSlot::with_instance_context(instance.clone());
+        let bootstrap = super::super::make_server_for_slot(slot.clone());
+        let unbound = super::super::make_server_for_slot(super::super::ServerContextSlot::new());
+        let mut wrong = super::super::make_server_for_context(ready.context.clone());
+        wrong.server_ctx = Some(super::super::ServerContextSlot::with_instance_context(
+            crate::storage::storage_api::new_instance_ctx(),
+        ));
+        for msgpack in [false, true] {
+            for volume in ["bulk-instance", ".rustfs.sys"] {
+                let (groups, before) = prepare_legacy_bulk(&disk, volume, &format!("binding/{msgpack}")).await;
+                let opts = DeleteOptions {
+                    old_data_dir: Some(Uuid::new_v4()),
+                    ..Default::default()
+                };
+                for service in [&unbound, &wrong] {
+                    let response = authenticated_legacy_bulk(
+                        service,
+                        signed_legacy_bulk_request(&disk_ref, volume, &groups, &opts, msgpack),
+                    )
+                    .await
+                    .expect("unbound envelope");
+                    assert!(!response.success);
+                    assert!(response.error.is_some());
+                    assert!(response.errors.is_empty() && response.item_errors.is_empty());
+                    assert_bulk_bytes(&before).await;
+                }
+                let response =
+                    authenticated_legacy_bulk(&bootstrap, signed_legacy_bulk_request(&disk_ref, volume, &groups, &opts, msgpack))
+                        .await
+                        .expect("bootstrap envelope");
+                if volume == ".rustfs.sys" {
+                    assert_bulk_results(&response, &[None, None]);
+                    let undo = DeleteOptions {
+                        undo_write: true,
+                        undo_delete: true,
+                        ..opts
+                    };
+                    assert_bulk_results(
+                        &authenticated_legacy_bulk(
+                            &bootstrap,
+                            signed_legacy_bulk_request(&disk_ref, volume, &groups, &undo, msgpack),
+                        )
+                        .await
+                        .expect("internal undo"),
+                        &[None, None],
+                    );
+                } else {
+                    assert!(!response.success);
+                    assert_eq!(
+                        DiskError::from(response.error.expect("bootstrap cannot write ordinary volume")),
+                        DiskError::FileAccessDenied
+                    );
+                }
+                assert_bulk_bytes(&before).await;
+            }
+        }
+        let captured = bootstrap.local_mutation_target();
+        slot.try_install(ready.context.clone().expect("ready context"))
+            .expect("publish ready slot");
+        assert!(matches!(bootstrap.local_mutation_target(), LocalMutationTarget::Ready(_)));
+        assert_eq!(
+            captured
+                .begin_legacy_local_delete_versions(&disk_ref, "bulk-instance")
+                .await
+                .expect_err("captured bootstrap cannot upgrade")
+                .to_u32(),
+            DiskError::FileAccessDenied.to_u32()
+        );
+        let admitted = ready
+            .local_mutation_target()
+            .begin_legacy_local_delete_versions(&disk_ref, "bulk-instance")
+            .await
+            .expect("capture original disk before replacement");
+        crate::storage::storage_api::init_local_disks_with_instance_ctx(&instance, env.endpoint_pools.clone())
+            .await
+            .expect("replace registry handles on the same disk paths");
+        let replacement = ready
+            .local_mutation_target()
+            .find_mutation_disk(&disk_ref)
+            .await
+            .expect("replacement disk");
+        assert!(!Arc::ptr_eq(&disk, &replacement));
+        let (groups, before) = prepare_legacy_bulk(&replacement, "bulk-instance", "replacement").await;
+        let rollback = Uuid::new_v4();
+        assert_eq!(
+            admitted
+                .delete_versions(
+                    groups.clone(),
+                    DeleteOptions {
+                        old_data_dir: Some(rollback),
+                        ..Default::default()
+                    }
+                )
+                .await,
+            vec![None, None]
+        );
+        let undo = DeleteOptions {
+            old_data_dir: Some(rollback),
+            undo_write: true,
+            undo_delete: true,
+            ..Default::default()
+        };
+        assert_bulk_results(
+            &authenticated_legacy_bulk(&ready, signed_legacy_bulk_request(&disk_ref, "bulk-instance", &groups, &undo, true))
+                .await
+                .expect("replacement handles the next request"),
+            &[None, None],
+        );
+        assert_bulk_bytes(&before).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_bulk_delete_flow_remote_forward_and_undo() {
+        use crate::storage::storage_api::{
+            Endpoint, EndpointServerPools, Endpoints,
+            ecstore_disk::{DiskOption, new_disk},
+            init_local_disks_with_instance_ctx,
+        };
+        use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
+        use tokio_stream::wrappers::TcpListenerStream;
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-bulk-remote-test-secret".to_owned());
+        let root = tempfile::tempdir().expect("bulk remote root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("bulk-remote", true).await;
+        let ready = service_for(&env).await;
+        let instance = crate::storage::storage_api::bootstrap_instance_ctx();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback listener");
+        let addr = listener.local_addr().expect("loopback address");
+        let mut endpoints = env.endpoint_pools.as_ref()[0].endpoints.as_ref().clone();
+        let mut endpoint =
+            Endpoint::try_from(format!("http://{addr}{}", env.disk_paths[0].display()).as_str()).expect("remote endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        endpoint.is_local = true;
+        endpoints[0] = endpoint.clone();
+        let mut pool = env.endpoint_pools.as_ref()[0].clone();
+        pool.endpoints = Endpoints::from(endpoints);
+        init_local_disks_with_instance_ctx(&instance, EndpointServerPools::from(vec![pool]))
+            .await
+            .expect("register loopback disk");
+        let service = super::super::make_server_for_context(ready.context.clone());
+        let local = service
+            .local_mutation_target()
+            .find_mutation_disk(&endpoint.to_string())
+            .await
+            .expect("loopback receiving disk");
+        let (groups, before) = prepare_legacy_bulk(&local, "bulk-remote", "objects").await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let audience = addr.to_string();
+        let auth = tower::ServiceBuilder::new().map_request(move |request: http::Request<_>| {
+            let path = request.uri().path();
+            crate::storage::storage_api::ecstore_rpc::verify_tonic_rpc_signature_with_bootstrap(
+                &audience,
+                path,
+                request.headers(),
+                path == "/node_service.NodeService/Ping",
+            )
+            .expect("real remote HMAC signature");
+            if path == "/node_service.NodeService/DeleteVersions" {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            request
+        });
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .layer(auth)
+                .add_service(NodeServiceServer::new(service))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = stopped.await;
+                })
+                .await
+                .expect("loopback server");
+        });
+        endpoint.is_local = false;
+        let remote = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("real RemoteDisk client");
+        assert!(!ecstore_disk::DiskAPI::is_local(remote.as_ref()));
+        let rollback = Uuid::new_v4();
+        let mut input = groups.clone();
+        input.insert(
+            1,
+            FileInfoVersions {
+                volume: "bulk-remote".to_owned(),
+                name: "objects/missing".to_owned(),
+                ..Default::default()
+            },
+        );
+        let forward = remote
+            .delete_versions(
+                "bulk-remote",
+                input,
+                DeleteOptions {
+                    old_data_dir: Some(rollback),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(
+            forward,
+            vec![None, Some(DiskError::FileNotFound), None],
+            "typed per-group errors cross the real wire"
+        );
+        for (path, bytes) in &before {
+            if path.file_name().is_some_and(|name| name == "xl.meta") {
+                assert!(!path.exists());
+                assert_eq!(
+                    tokio::fs::read(path.parent().expect("object").join(rollback.to_string()).join("xl.meta.bkp"))
+                        .await
+                        .expect("complete backup"),
+                    *bytes
+                );
+            }
+        }
+        let undo = remote
+            .delete_versions(
+                "bulk-remote",
+                groups,
+                DeleteOptions {
+                    old_data_dir: Some(rollback),
+                    undo_write: true,
+                    undo_delete: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(undo, vec![None, None]);
+        assert_bulk_bytes(&before).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "forward and undo used tonic");
+        ecstore_disk::DiskAPI::close(remote.as_ref())
+            .await
+            .expect("close remote handle");
+        drop(remote);
+        shutdown.send(()).expect("stop loopback server");
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("server drained")
+            .expect("server task");
     }
 
     async fn stage_legacy_undo(
