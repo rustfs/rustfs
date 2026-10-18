@@ -1551,7 +1551,8 @@ impl NodeService {
             "make_volume",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        let target = self.local_mutation_target();
+        if let Some(disk) = target.find_mutation_disk(&request.disk).await {
             match disk.make_volume(&request.volume).await {
                 Ok(_) => Ok(Response::new(MakeVolumeResponse {
                     success: true,
@@ -1580,7 +1581,8 @@ impl NodeService {
             "make_volumes",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        let target = self.local_mutation_target();
+        if let Some(disk) = target.find_mutation_disk(&request.disk).await {
             match disk.make_volumes(request.volumes.iter().map(|s| &**s).collect()).await {
                 Ok(_) => Ok(Response::new(MakeVolumesResponse {
                     success: true,
@@ -2945,6 +2947,237 @@ mod legacy_artifact_tests {
             Arc::new(KmsServiceManager::new()),
         ));
         super::super::make_server_for_context(Some(context))
+    }
+
+    async fn authenticated_volume_create(
+        service: &NodeService,
+        disk: &str,
+        volumes: &[&str],
+        batch: bool,
+        tamper: bool,
+    ) -> Result<Result<(), DiskError>, Status> {
+        let (success, error) = if batch {
+            let mut request = Request::new(MakeVolumesRequest {
+                disk: disk.to_owned(),
+                volumes: volumes.iter().map(|volume| (*volume).to_owned()).collect(),
+            });
+            let body = rustfs_protos::canonical_make_volumes_request_body(request.get_ref()).expect("batch body");
+            sign_legacy_rpc_request(&mut request, &body, "MakeVolumes");
+            if tamper {
+                request.get_mut().volumes.push("tampered-volume".to_owned());
+            }
+            verify_legacy_rpc_request(&request, "MakeVolumes")?;
+            let response = service.handle_make_volumes(request).await?.into_inner();
+            (response.success, response.error)
+        } else {
+            let mut request = Request::new(MakeVolumeRequest {
+                disk: disk.to_owned(),
+                volume: volumes[0].to_owned(),
+            });
+            let body = rustfs_protos::canonical_make_volume_request_body(request.get_ref()).expect("single body");
+            sign_legacy_rpc_request(&mut request, &body, "MakeVolume");
+            if tamper {
+                request.get_mut().volume = "tampered-volume".to_owned();
+            }
+            verify_legacy_rpc_request(&request, "MakeVolume")?;
+            let response = service.handle_make_volume(request).await?.into_inner();
+            (response.success, response.error)
+        };
+        assert_eq!(success, error.is_none(), "volume response envelope");
+        Ok(error.map_or(Ok(()), |error| Err(error.into())))
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_volume_create_receiver_isolates_instances_and_slot() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-volume-create-secret".to_owned());
+        let root_a = tempfile::tempdir().expect("A root");
+        let env_a = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root_a.path())
+            .build()
+            .await;
+        let ready_a = service_for(&env_a).await;
+        let root_b = tempfile::tempdir().expect("B root");
+        let instance_b = crate::storage::storage_api::new_instance_ctx();
+        let env_b = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root_b.path())
+            .instance_ctx(instance_b.clone())
+            .init_bucket_metadata(false)
+            .build()
+            .await;
+        let ready_b = service_for(&env_b).await;
+        let disk_a = env_a.disk_paths[0].to_string_lossy().into_owned();
+        let disk_b = env_b.disk_paths[0].to_string_lossy().into_owned();
+        let disk = ready_a
+            .local_mutation_target()
+            .find_mutation_disk(&disk_a)
+            .await
+            .expect("A disk");
+        let id_a = ecstore_disk::DiskAPI::get_disk_id(disk.as_ref())
+            .await
+            .expect("real A disk ID")
+            .expect("formatted A")
+            .to_string();
+        // Reopen the second physical root with the same persisted identity, without reusing A's disk object.
+        tokio::fs::copy(
+            env_a.disk_paths[0].join(".rustfs.sys/format.json"),
+            env_b.disk_paths[0].join(".rustfs.sys/format.json"),
+        )
+        .await
+        .expect("copy real disk identity");
+        crate::storage::storage_api::init_local_disks_with_instance_ctx(&instance_b, env_b.endpoint_pools.clone())
+            .await
+            .expect("reopen B instance registry");
+        let same_id_b = ready_b
+            .local_mutation_target()
+            .find_mutation_disk(&disk_b)
+            .await
+            .expect("reopened real B disk");
+        assert_eq!(
+            ecstore_disk::DiskAPI::get_disk_id(same_id_b.as_ref())
+                .await
+                .expect("real B disk ID")
+                .expect("formatted B")
+                .to_string(),
+            id_a,
+            "both independent roots expose the same disk UUID"
+        );
+        let slot = super::super::ServerContextSlot::with_instance_context(instance_b.clone());
+        let mut slot_b = super::super::make_server_for_context(ready_a.context.clone());
+        slot_b.server_ctx = Some(slot.clone());
+        let unbound = super::super::make_server_for_slot(super::super::ServerContextSlot::new());
+        for batch in [false, true] {
+            for (index, service) in [&ready_b, &slot_b, &unbound].into_iter().enumerate() {
+                let volume = format!("foreign-{batch}-{index}-{}", Uuid::new_v4());
+                let error = authenticated_volume_create(service, &disk_a, &[&volume], batch, false)
+                    .await
+                    .expect("foreign envelope")
+                    .expect_err("receiver cannot use ambient A disk");
+                assert_eq!(error.to_string(), "io error io error cannot find disk");
+                assert!(!env_a.disk_paths[0].join(&volume).exists(), "foreign receiver must not mutate A");
+                assert!(!env_b.disk_paths[0].join(&volume).exists(), "foreign disk reference must not create on B");
+            }
+            let volume = format!("unbound-{}", Uuid::new_v4());
+            let error = authenticated_volume_create(&unbound, &id_a, &[&volume], batch, false)
+                .await
+                .expect("unbound envelope")
+                .expect_err("unbound receiver cannot resolve a globally known UUID");
+            assert_eq!(error.to_string(), "io error io error cannot find disk");
+            assert!(!env_a.disk_paths[0].join(&volume).exists());
+            assert!(!env_b.disk_paths[0].join(&volume).exists());
+            for (service, own, other) in [
+                (&ready_a, &env_a.disk_paths[0], &env_b.disk_paths[0]),
+                (&ready_b, &env_b.disk_paths[0], &env_a.disk_paths[0]),
+                (&slot_b, &env_b.disk_paths[0], &env_a.disk_paths[0]),
+            ] {
+                let volume = format!("same-uuid-{}", Uuid::new_v4());
+                authenticated_volume_create(service, &id_a, &[&volume], batch, false)
+                    .await
+                    .expect("shared UUID envelope")
+                    .expect("captured instance resolves its own same-UUID disk");
+                assert!(own.join(&volume).is_dir(), "captured instance must create on its own physical root");
+                assert!(
+                    !other.join(&volume).exists(),
+                    "same UUID must never select another instance's physical root"
+                );
+            }
+            let volume = format!("bootstrap-b-{}", Uuid::new_v4());
+            authenticated_volume_create(&slot_b, &disk_b, &[&volume], batch, false)
+                .await
+                .expect("B Bootstrap envelope")
+                .expect("slot overrides ambient Ready context");
+            assert!(env_b.disk_paths[0].join(&volume).is_dir());
+            assert!(!env_a.disk_paths[0].join(&volume).exists());
+        }
+        slot.try_install(ready_b.context.clone().expect("B context"))
+            .expect("install B Ready");
+        for batch in [false, true] {
+            for disk_ref in [&disk_b, &id_a] {
+                let volume = format!("ready-b-{}", Uuid::new_v4());
+                authenticated_volume_create(&slot_b, disk_ref, &[&volume], batch, false)
+                    .await
+                    .expect("B Ready envelope")
+                    .expect("Ready slot creates on B");
+                assert!(env_b.disk_paths[0].join(&volume).is_dir());
+                assert!(!env_a.disk_paths[0].join(&volume).exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_volume_create_receiver_preserves_bootstrap_and_batch_semantics() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-volume-create-secret".to_owned());
+        let root = tempfile::tempdir().expect("unformatted startup disk");
+        let instance = crate::storage::storage_api::new_instance_ctx();
+        use crate::storage::storage_api::{
+            Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, init_local_disks_with_instance_ctx,
+        };
+        let mut endpoint = Endpoint::try_from(root.path().to_str().expect("disk path")).expect("startup endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        init_local_disks_with_instance_ctx(
+            &instance,
+            EndpointServerPools::from(vec![PoolEndpoints {
+                legacy: false,
+                set_count: 1,
+                drives_per_set: 1,
+                endpoints: Endpoints::from(vec![endpoint.clone()]),
+                cmd_line: "volume-create-startup-test".to_owned(),
+                platform: "test".to_owned(),
+            }]),
+        )
+        .await
+        .expect("register unformatted startup disk");
+        let service = super::super::make_server_for_slot(super::super::ServerContextSlot::with_instance_context(instance));
+        let disk_ref = endpoint.to_string();
+        assert!(
+            !root.path().join(".rustfs.sys/format.json").exists(),
+            "startup fixture has no disk identity yet"
+        );
+        for (volume, expected) in [
+            (".minio.sys", Ok(())),
+            (".rustfs.sys", Err(DiskError::VolumeExists)),
+            ("ordinary-startup", Ok(())),
+        ] {
+            let result = authenticated_volume_create(&service, &disk_ref, &[volume], false, false)
+                .await
+                .expect("startup envelope");
+            assert_eq!(result, expected, "unformatted startup preserves precreated data-usage volume");
+            assert!(root.path().join(volume).is_dir());
+        }
+        let error = authenticated_volume_create(&service, &disk_ref, &["ordinary-startup"], false, false)
+            .await
+            .expect("duplicate envelope")
+            .expect_err("single duplicate remains typed");
+        assert_eq!(error, DiskError::VolumeExists);
+        authenticated_volume_create(&service, &disk_ref, &["ordinary-startup", "batch-new", "batch-new"], true, false)
+            .await
+            .expect("batch envelope")
+            .expect("batch ignores duplicate volumes");
+        assert!(root.path().join("batch-new").is_dir());
+        authenticated_volume_create(&service, &disk_ref, &[], true, false)
+            .await
+            .expect("empty envelope")
+            .expect("empty batch");
+        let error = authenticated_volume_create(&service, &disk_ref, &["batch-first", "x", "batch-last"], true, false)
+            .await
+            .expect("partial batch envelope")
+            .expect_err("batch stops at first invalid volume");
+        assert_eq!(error.to_string(), "io error io error Invalid arguments specified");
+        assert!(root.path().join("batch-first").is_dir(), "prior successful item remains");
+        assert!(!root.path().join("x").exists());
+        assert!(!root.path().join("batch-last").exists(), "later item must not execute");
+        for batch in [false, true] {
+            let error = authenticated_volume_create(&service, &disk_ref, &["signed-only"], batch, true)
+                .await
+                .expect_err("body changes must be rejected");
+            assert_eq!(error.code(), tonic::Code::PermissionDenied);
+            assert!(!root.path().join("signed-only").exists());
+            assert!(!root.path().join("tampered-volume").exists());
+        }
+        assert!(!root.path().join(".rustfs.sys/format.json").exists());
     }
 
     const LEGACY_RENAME_AUDIENCE: &str = "127.0.0.1:24800";
