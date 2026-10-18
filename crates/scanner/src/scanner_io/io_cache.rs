@@ -1401,16 +1401,7 @@ impl ScannerIOCache for SetDisks {
                             record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
                         }
                         if partial_saved {
-                            debug!(
-                                target: "rustfs::scanner::io",
-                                event = EVENT_SCANNER_CACHE_PERSIST_STATE,
-                                component = LOG_COMPONENT_SCANNER,
-                                subsystem = LOG_SUBSYSTEM_IO,
-                                bucket = %bucket.name,
-                                cache_name = %cache_name,
-                                state = "partial_saved_not_published",
-                                "Scanner partial bucket cache saved without publishing usage aggregate"
-                            );
+                            log_saved_partial_bucket_cache(&partial_cache, &cache_name);
                         }
 
                         continue;

@@ -886,6 +886,16 @@ async fn checkpoint_fixture_hot_digest_retains_partial_progress() {
 #[tokio::test]
 #[serial]
 async fn checkpoint_fixture_hot_bucket_certifies_first_full_sweep_after_mixed_end() {
+    hot_bucket_certifies_first_full_sweep_after_mixed_end(false).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn checkpoint_fixture_hot_bucket_certifies_after_mixed_end_and_leader_handoff() {
+    hot_bucket_certifies_first_full_sweep_after_mixed_end(true).await;
+}
+
+async fn hot_bucket_certifies_first_full_sweep_after_mixed_end(advance_epoch: bool) {
     let logs = CapturedLogs::default();
     let subscriber = tracing_subscriber::fmt()
         .json()
@@ -915,6 +925,8 @@ async fn checkpoint_fixture_hot_bucket_certifies_first_full_sweep_after_mixed_en
     // tail that ends mixed, then fresh unbounded sweeps under new plans.
     let rounds = [(Some(4), false), (None, false), (None, true), (None, true)];
     for (round, (max_objects, expect_complete)) in (0_u64..).zip(rounds) {
+        let cycle = 11 + round;
+        let leader_epoch = if advance_epoch { 7 + round } else { 7 };
         write_checkpoint_object(&root, "hot/current", &[(None, 1)]).await;
         let plan = crate::scanner_io::checkpoint_fixture_bucket_digest(PLAN, Some(round));
         let mut cache = DataUsageCache::default();
@@ -926,8 +938,8 @@ async fn checkpoint_fixture_hot_bucket_certifies_first_full_sweep_after_mixed_en
             &mut cache,
             "bucket",
             SOURCE,
-            11,
-            7,
+            cycle,
+            leader_epoch,
             plan,
             crate::scanner_io::DataUsageCacheReuseOptions {
                 require_source: true,
@@ -970,6 +982,18 @@ async fn checkpoint_fixture_hot_bucket_certifies_first_full_sweep_after_mixed_en
         let saved = store.strict_load().await;
         assert_eq!(complete, expect_complete, "round {round} outcome");
         assert_eq!(saved.info.snapshot_complete, expect_complete, "round {round} saved completion");
+        assert_eq!(saved.info.next_cycle, cycle);
+        assert_eq!(saved.info.leader_epoch, leader_epoch);
+        if round == 1 {
+            assert!(saved.info.scan_resume_after.is_none());
+            assert!(saved.info.scan_checkpoint.is_none());
+            assert!(saved.info.scan_raw_enumeration_cursor.is_none());
+            assert!(saved.info.scan_raw_enumeration_page_index.is_none());
+            assert!(saved.info.scan_coverage_receipt.is_none());
+            let progress = saved.info.scan_progress.expect("mixed tail retains a verification plan");
+            assert_eq!(progress.started_plan, plan);
+            assert_eq!(progress.requested_plan, plan);
+        }
         if expect_complete {
             assert_eq!(saved.info.scan_plan_digest, Some(plan), "round {round} certifies its own plan");
             assert!(saved.info.scan_progress.is_none());
@@ -979,10 +1003,37 @@ async fn checkpoint_fixture_hot_bucket_certifies_first_full_sweep_after_mixed_en
             assert!(saved.info.scan_plan_digest.is_none(), "round {round} must not certify");
         }
     }
-    let events = logs
-        .contents()
+    let captured = logs.contents();
+    let all_events = captured
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("scanner JSON event"))
+        .collect::<Vec<_>>();
+    let admissions = all_events
+        .iter()
+        .filter(|event| event["fields"]["state"] == "bucket_checkpoint_prepared")
+        .collect::<Vec<_>>();
+    assert_eq!(admissions.len(), 4, "every sweep must identify fresh versus resumed admission");
+    for (round, event) in admissions.iter().enumerate() {
+        let fields = &event["fields"];
+        let round_cycle = 11 + u64::try_from(round).expect("round fits u64");
+        assert_eq!(fields["cycle"], round_cycle);
+        assert_eq!(fields["leader_epoch"], if advance_epoch { round_cycle - 4 } else { 7 });
+        assert_eq!(fields["previous_cycle"], if round == 0 { 0 } else { round_cycle - 1 });
+        assert_eq!(
+            fields["previous_leader_epoch"],
+            if round == 0 {
+                0
+            } else if advance_epoch {
+                round_cycle - 5
+            } else {
+                7
+            }
+        );
+        assert_eq!(fields["resume_position"], round == 1);
+        assert_eq!(fields["mixed_coverage"], round == 1);
+    }
+    let events = all_events
+        .iter()
         .filter(|event| event["fields"]["state"] == "bucket_sweep_incomplete")
         .collect::<Vec<_>>();
     assert_eq!(events.len(), 1, "only the mixed tail needs a verification-sweep diagnostic");
@@ -990,7 +1041,12 @@ async fn checkpoint_fixture_hot_bucket_certifies_first_full_sweep_after_mixed_en
     assert_eq!(fields["bucket"], "bucket");
     assert_eq!(fields["pool"], 0);
     assert_eq!(fields["set"], 0);
+    assert_eq!(fields["cycle"], 12);
+    assert_eq!(fields["leader_epoch"], if advance_epoch { 8 } else { 7 });
+    assert_eq!(fields["resume_position_on_entry"], true);
+    assert_eq!(fields["resume_position"], false);
     assert_eq!(fields["mixed_coverage"], true);
+    assert_eq!(fields["unresolved_objects"], false);
     assert_eq!(fields["coverage_gap"], false);
     assert_eq!(fields["failed_objects"], 0);
     assert_eq!(fields["size_reconciliation_entries"], 0);

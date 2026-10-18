@@ -15,6 +15,24 @@
 use super::*;
 use crate::{ScannerConfigObjectDelete, ScannerObjectIO};
 
+pub(crate) fn log_saved_partial_bucket_cache(cache: &DataUsageCache, cache_name: &str) {
+    debug!(
+        target: "rustfs::scanner::io",
+        event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+        component = LOG_COMPONENT_SCANNER,
+        subsystem = LOG_SUBSYSTEM_IO,
+        state = "partial_saved_not_published",
+        bucket = %cache.info.name,
+        pool = cache.info.source.map(|source| source.pool_index),
+        set = cache.info.source.map(|source| source.set_index),
+        cycle = cache.info.next_cycle,
+        leader_epoch = cache.info.leader_epoch,
+        cache_name,
+        resume_position = cache.has_scan_position(),
+        "Scanner partial bucket cache saved without publishing usage aggregate"
+    );
+}
+
 pub(crate) fn scanner_cache_lock_resource(cache_name: &str, source: DataUsageCacheSource) -> String {
     let lock_name = format!("{SCANNER_CACHE_LOCK_SUFFIX}.pool-{}.set-{}", source.pool_index, source.set_index);
     path_join_buf(&[crate::BUCKET_META_PREFIX, cache_name, &lock_name])

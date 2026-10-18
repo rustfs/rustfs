@@ -899,6 +899,14 @@ impl DataUsageCache {
         }
     }
 
+    pub(crate) fn has_scan_position(&self) -> bool {
+        self.info.scan_resume_after.is_some()
+            || self.info.scan_checkpoint.is_some()
+            || self.info.scan_raw_enumeration_cursor.is_some()
+            || self.info.scan_raw_enumeration_page_index.is_some()
+            || self.info.scan_coverage_receipt.is_some()
+    }
+
     pub(crate) fn prepare_bucket_checkpoint(
         &mut self,
         name: &str,
@@ -914,6 +922,8 @@ impl DataUsageCache {
         if self.info.leader_epoch > leader_epoch {
             return DataUsageCachePrepareOutcome::RejectedNewerLeader;
         }
+        let previous_cycle = self.info.next_cycle;
+        let previous_leader_epoch = self.info.leader_epoch;
         // A checkpoint is a durable traversal frontier, not a publication
         // result.  A newer leader may adopt it only when the frontier is
         // independently fenced by the bucket identity and has a validated
@@ -942,22 +952,13 @@ impl DataUsageCache {
         if reusable
             && self.info.snapshot_complete
             && self.info.scan_progress.is_none()
-            && self.info.scan_checkpoint.is_none()
-            && self.info.scan_raw_enumeration_cursor.is_none()
-            && self.info.scan_raw_enumeration_page_index.is_none()
-            && self.info.scan_resume_after.is_none()
-            && self.info.scan_coverage_receipt.is_none()
+            && !self.has_scan_position()
             && self.info.scan_plan_digest == Some(scan_plan_digest)
         {
             return self.prepare_for_scan(name, next_cycle, leader_epoch, source, scan_plan_digest, true);
         }
         if !reusable {
-            let had_resume_state = self.info.scan_checkpoint.is_some()
-                || self.info.scan_resume_after.is_some()
-                || self.info.scan_coverage_receipt.is_some()
-                || self.info.scan_raw_enumeration_cursor.is_some()
-                || self.info.scan_raw_enumeration_page_index.is_some();
-            if had_resume_state {
+            if self.has_scan_position() {
                 let reason = if name == DATA_USAGE_ROOT {
                     "invalid_bucket_scope"
                 } else if !identity.is_valid() {
@@ -1011,11 +1012,7 @@ impl DataUsageCache {
         if self.validated_raw_enumeration_page_index().is_none() {
             self.info.scan_raw_enumeration_page_index = None;
         }
-        let cursor_is_valid = (self.info.scan_checkpoint.is_none()
-            && self.info.scan_raw_enumeration_cursor.is_none()
-            && self.info.scan_raw_enumeration_page_index.is_none()
-            && self.info.scan_resume_after.is_none()
-            && self.info.scan_coverage_receipt.is_none())
+        let cursor_is_valid = !self.has_scan_position()
             || self.validated_scan_frontier().is_some()
             || self.info.scan_raw_enumeration_cursor.is_some()
             || self.info.scan_raw_enumeration_page_index.is_some();
@@ -1043,11 +1040,7 @@ impl DataUsageCache {
         // so it observes nothing under the plan that finished the previous
         // sweep. Keeping that plan would mark every sweep of a bucket written
         // between cycles as mixed, and the bucket could never certify.
-        let has_position = self.info.scan_resume_after.is_some()
-            || self.info.scan_checkpoint.is_some()
-            || self.info.scan_raw_enumeration_cursor.is_some()
-            || self.info.scan_raw_enumeration_page_index.is_some()
-            || self.info.scan_coverage_receipt.is_some();
+        let has_position = self.has_scan_position();
         if let Some(progress) = &mut self.info.scan_progress
             && has_position
         {
@@ -1066,6 +1059,23 @@ impl DataUsageCache {
         // Old readers do not understand coverage sweeps. An absent plan makes
         // their existing prepare path rebuild instead of promoting mixed data.
         self.info.scan_plan_digest = None;
+        debug!(
+            target: "rustfs::scanner::data_usage",
+            event = EVENT_SCANNER_CACHE_LOAD_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_CACHE,
+            state = "bucket_checkpoint_prepared",
+            bucket = %name,
+            pool = source.pool_index,
+            set = source.set_index,
+            cycle = next_cycle,
+            leader_epoch,
+            previous_cycle,
+            previous_leader_epoch,
+            resume_position = self.has_scan_position(),
+            mixed_coverage = self.info.scan_progress.is_some_and(|progress| progress.started_plan != progress.requested_plan),
+            "Scanner bucket checkpoint prepared for a coverage sweep"
+        );
         if reusable {
             DataUsageCachePrepareOutcome::Reused
         } else {
