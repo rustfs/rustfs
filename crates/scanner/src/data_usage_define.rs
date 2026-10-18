@@ -56,9 +56,10 @@ pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 pub(crate) const DATA_USAGE_CACHE_KEY_FORMAT: u16 = 1;
 
 const DATA_USAGE_CACHE_SAVE_RETRIES: u32 = 2;
-const DATA_USAGE_CACHE_BACKUP_SAVE_TIMEOUT_SECS_MAX: u64 = 5;
+const DATA_USAGE_CACHE_BACKUP_SAVE_TIMEOUT_SECS_BASE: u64 = 5;
 const DATA_USAGE_CACHE_BACKUP_SAVE_RETRIES: u32 = 0;
 const DATA_USAGE_CACHE_SAVE_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(350);
+const DATA_USAGE_CACHE_RECONCILE_BACKOFF_MAX: Duration = Duration::from_millis(150);
 const DATA_USAGE_CACHE_PERSISTENCE_MARGIN: Duration = Duration::from_secs(5);
 const METRIC_CACHE_SAVE_ATTEMPT_TOTAL: &str = "rustfs_scanner_cache_save_attempt_total";
 const METRIC_CACHE_SAVE_TIMEOUT_TOTAL: &str = "rustfs_scanner_cache_save_timeout_total";
