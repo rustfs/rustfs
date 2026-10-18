@@ -98,48 +98,6 @@ impl CheckpointJson {
         serde_json::to_vec(self).map_err(|error| Error::InvalidCheckpoint(format!("Failed to encode checkpoint digest: {error}")))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn checkpoint_json_preserves_nested_order_and_scalar_values() {
-        let wire = r#"{"z":{"z":18446744073709551615,"a":-9223372036854775808,"f":1.5,"s":"hello\nworld","b":true,"n":null},"other":[2,1],"processed_objects":["b","a"],"failed_objects":[],"skipped_objects":[],"integrity_digest":"signed"}"#;
-        let mut value: CheckpointJson = serde_json::from_str(wire).expect("parse ordered checkpoint JSON");
-        assert_eq!(serde_json::to_string(&value).expect("encode ordered checkpoint JSON"), wire);
-        let unsigned = value.unsigned_bytes().expect("normalize only checkpoint sets and digest");
-        assert_eq!(
-            String::from_utf8(unsigned).expect("unsigned checkpoint must be UTF-8"),
-            wire.replace("[\"b\",\"a\"]", "[\"a\",\"b\"]").replace("\"signed\"", "null")
-        );
-    }
-
-    #[test]
-    fn checkpoint_json_sorts_nested_objects_without_reordering_other_arrays() {
-        let mut value: CheckpointJson =
-            serde_json::from_str(r#"{"z":[{"z":2,"a":1},3,1],"a":false}"#).expect("parse nested checkpoint JSON");
-        value.sort_all_objects();
-        assert_eq!(
-            serde_json::to_string(&value).expect("encode sorted nested checkpoint JSON"),
-            r#"{"a":false,"z":[{"a":1,"z":2},3,1]}"#
-        );
-    }
-
-    #[test]
-    fn checkpoint_json_bounds_both_input_and_value_conversion_depth() {
-        for depth in [127, 128] {
-            let wire = format!("{}null{}", "[".repeat(depth), "]".repeat(depth));
-            assert_eq!(serde_json::from_str::<CheckpointJson>(&wire).is_ok(), depth == 127);
-            let mut value = Value::Null;
-            for _ in 0..depth {
-                value = Value::Array(vec![value]);
-            }
-            assert_eq!(CheckpointJson::from_value(value).is_ok(), depth == 127);
-        }
-    }
-}
-
 impl Serialize for CheckpointJson {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         match self {
@@ -215,5 +173,46 @@ impl<'de> Deserialize<'de> for CheckpointJson {
         }
 
         deserializer.deserialize_any(JsonVisitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_json_preserves_nested_order_and_scalar_values() {
+        let wire = r#"{"z":{"z":18446744073709551615,"a":-9223372036854775808,"f":1.5,"s":"hello\nworld","b":true,"n":null},"other":[2,1],"processed_objects":["b","a"],"failed_objects":[],"skipped_objects":[],"integrity_digest":"signed"}"#;
+        let mut value: CheckpointJson = serde_json::from_str(wire).expect("parse ordered checkpoint JSON");
+        assert_eq!(serde_json::to_string(&value).expect("encode ordered checkpoint JSON"), wire);
+        let unsigned = value.unsigned_bytes().expect("normalize only checkpoint sets and digest");
+        assert_eq!(
+            String::from_utf8(unsigned).expect("unsigned checkpoint must be UTF-8"),
+            wire.replace("[\"b\",\"a\"]", "[\"a\",\"b\"]").replace("\"signed\"", "null")
+        );
+    }
+
+    #[test]
+    fn checkpoint_json_sorts_nested_objects_without_reordering_other_arrays() {
+        let mut value: CheckpointJson =
+            serde_json::from_str(r#"{"z":[{"z":2,"a":1},3,1],"a":false}"#).expect("parse nested checkpoint JSON");
+        value.sort_all_objects();
+        assert_eq!(
+            serde_json::to_string(&value).expect("encode sorted nested checkpoint JSON"),
+            r#"{"a":false,"z":[{"a":1,"z":2},3,1]}"#
+        );
+    }
+
+    #[test]
+    fn checkpoint_json_bounds_both_input_and_value_conversion_depth() {
+        for depth in [127, 128] {
+            let wire = format!("{}null{}", "[".repeat(depth), "]".repeat(depth));
+            assert_eq!(serde_json::from_str::<CheckpointJson>(&wire).is_ok(), depth == 127);
+            let mut value = Value::Null;
+            for _ in 0..depth {
+                value = Value::Array(vec![value]);
+            }
+            assert_eq!(CheckpointJson::from_value(value).is_ok(), depth == 127);
+        }
     }
 }
