@@ -87,6 +87,12 @@ objects retain input order; empty groups keep their existing mutation semantics.
 One execution deadline preserves completed group results and marks only unfinished
 groups as timed out. Physical workers retain admission after cancellation. Empty
 batches preserve their original classification and response behavior.
+Ordinary and durable `RenameFile` requests bind both source and destination
+volumes to the captured instance before classification. Destination cleanup,
+rename, optional ancestor cleanup and required sync workers retain the same
+admission until physical completion. Durable acknowledgement follows successful
+completion of the destination volume's existing sync policy; a post-rename sync
+failure still reports failure even if the destination has already been published.
 The incarnation-bound heal path retains its separate admission. Other legacy
 mutation routes and internal metadata publication still need their own admission
 boundary before distributed artifact sealing can be enabled.

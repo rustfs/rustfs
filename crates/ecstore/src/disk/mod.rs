@@ -64,7 +64,7 @@ use crate::cluster::rpc::RemoteDisk;
 use crate::cluster::rpc::build_internode_data_transport_from_env;
 use crate::disk::disk_store::DiskStoreRenameDataExt;
 use crate::disk::disk_store::LocalDiskWrapper;
-pub use crate::disk::disk_store::{LegacyFileWrite, LegacyMetadataWrite, LegacyRenameData};
+pub use crate::disk::disk_store::{LegacyFileWrite, LegacyMetadataWrite, LegacyRenameData, LegacyRenameFile};
 use crate::disk::health_state::RuntimeDriveHealthState;
 use crate::disk::local::ScanGuard;
 use bytes::Bytes;
@@ -268,6 +268,22 @@ impl Disk {
         match self {
             Self::Local(disk) => {
                 disk.begin_legacy_metadata_write_with_namespace_owner(volume, path, namespace_owner)
+                    .await
+            }
+            Self::Remote(_) => Err(DiskError::DiskNotFound),
+        }
+    }
+
+    pub(crate) async fn begin_legacy_rename_file(
+        &self,
+        source: (&str, &str),
+        destination: (&str, &str),
+        durable: bool,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<LegacyRenameFile> {
+        match self {
+            Self::Local(disk) => {
+                disk.begin_legacy_rename_file(source, destination, durable, namespace_owner)
                     .await
             }
             Self::Remote(_) => Err(DiskError::DiskNotFound),

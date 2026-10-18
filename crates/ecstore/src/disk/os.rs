@@ -276,6 +276,8 @@ pub(crate) mod prepared_publication_test_hooks {
         Rollback,
         #[cfg(test)]
         DirFsync,
+        #[cfg(test)]
+        FileSync,
     }
 
     type Hook = Box<dyn FnOnce() + Send>;
@@ -1838,6 +1840,8 @@ pub(crate) mod file_sync_probe {
 }
 
 pub(crate) fn sync_file(path: &Path) -> io::Result<()> {
+    #[cfg(all(test, not(windows)))]
+    prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::FileSync, path);
     #[cfg(test)]
     let _probe = file_sync_probe::enter(path);
     #[cfg(test)]
@@ -2111,6 +2115,8 @@ pub(crate) async fn fsync_dir_with_owner(path: &Path, namespace_owner: Option<Ar
         let path = path.to_path_buf();
         fsync_spawn_blocking(move || {
             let _namespace_owner = namespace_owner;
+            #[cfg(all(test, not(windows)))]
+            prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::DirFsync, &path);
             fsync_dir_std(path)
         })
         .await?

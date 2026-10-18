@@ -6046,6 +6046,208 @@ impl LocalDisk {
         }
     }
 
+    pub(in crate::disk) async fn begin_legacy_rename_file(
+        &self,
+        source: (&str, &str),
+        destination: (&str, &str),
+        permit: crate::disk::io_admission::DiskIoPermit,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<Arc<os::NamespaceMutationLease>> {
+        let src = self.io_get_object_path(source.0, source.1)?;
+        let dst = self.io_get_object_path(destination.0, destination.1)?;
+        check_path_length(src.to_string_lossy().as_ref())?;
+        check_path_length(dst.to_string_lossy().as_ref())?;
+        let source_scope = crate::bucket::artifact::artifact_repair_scope(source.0, source.1);
+        let destination_scope = crate::bucket::artifact::artifact_repair_scope(destination.0, destination.1);
+        for scope in [&source_scope, &destination_scope].into_iter().flatten() {
+            scope.check().map_err(Error::other)?;
+        }
+        #[cfg(target_os = "linux")]
+        let owner: Arc<dyn Send + Sync> =
+            Arc::new((permit, self.mount_lease.clone(), namespace_owner, source_scope, destination_scope));
+        #[cfg(not(target_os = "linux"))]
+        let owner: Arc<dyn Send + Sync> = Arc::new((permit, namespace_owner, source_scope, destination_scope));
+        // Destination namespace -> sorted, deduplicated READs -> try source.
+        // The source lease owns the first lease, with no reverse edge.
+        let lease =
+            os::acquire_rename_data_mutation_lease_for_volumes(&self.root, source.0, destination.0, &dst, Some(owner)).await;
+        let lease = if src == dst {
+            lease
+        } else {
+            os::try_acquire_namespace_mutation_lease_with_owner(&src, lease)?
+        };
+        for volume in [Some(source.0), (source.0 != destination.0).then_some(destination.0)]
+            .into_iter()
+            .flatten()
+        {
+            if !skip_access_checks(volume) {
+                let metadata = fs::symlink_metadata(self.io_get_bucket_path(volume)?)
+                    .await
+                    .map_err(to_volume_error)?;
+                if !metadata.is_dir() {
+                    return Err(DiskError::VolumeNotFound);
+                }
+            }
+        }
+        Ok(lease)
+    }
+
+    pub(in crate::disk) async fn rename_file_prepared(
+        &self,
+        source: (&str, &str),
+        destination: (&str, &str),
+        durable: bool,
+        prepared: Arc<os::NamespaceMutationLease>,
+    ) -> Result<()> {
+        if durable {
+            self.rename_file_durable_inner(source, destination, Some(prepared)).await
+        } else {
+            self.rename_file_inner(source, destination, Some(prepared)).await
+        }
+    }
+
+    async fn rename_file_inner(
+        &self,
+        (src_volume, src_path): (&str, &str),
+        (dst_volume, dst_path): (&str, &str),
+        prepared: Option<Arc<os::NamespaceMutationLease>>,
+    ) -> Result<()> {
+        crate::hp_guard!("LocalDisk::rename_file");
+        let src_volume_dir = self.io_get_bucket_path(src_volume)?;
+        let dst_volume_dir = self.io_get_bucket_path(dst_volume)?;
+        if !skip_access_checks(src_volume) {
+            access(&src_volume_dir)
+                .await
+                .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
+        }
+        if !skip_access_checks(dst_volume) {
+            access(&dst_volume_dir)
+                .await
+                .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
+        }
+
+        let src_is_dir = has_suffix(src_path, SLASH_SEPARATOR);
+        let dst_is_dir = has_suffix(dst_path, SLASH_SEPARATOR);
+        if (dst_is_dir || src_is_dir) && (!dst_is_dir || !src_is_dir) {
+            return Err(Error::from(DiskError::FileAccessDenied));
+        }
+
+        let src_file_path = self.io_get_object_path(src_volume, src_path)?;
+        check_path_length(src_file_path.to_string_lossy().as_ref())?;
+
+        let dst_file_path = self.io_get_object_path(dst_volume, dst_path)?;
+        check_path_length(dst_file_path.to_string_lossy().as_ref())?;
+
+        if src_is_dir {
+            let meta_op = match lstat(&src_file_path).await {
+                Ok(meta) => Some(meta),
+                Err(e) => {
+                    let e: DiskError = to_file_error(e).into();
+                    if e != DiskError::FileNotFound {
+                        return Err(e);
+                    } else {
+                        None
+                    }
+                }
+            };
+
+            if let Some(meta) = meta_op
+                && !meta.is_dir()
+            {
+                return Err(DiskError::FileAccessDenied);
+            }
+
+            // Clear any stale destination before the directory rename. An absent
+            // destination is the normal case when renaming a directory to a new
+            // location, so tolerate NotFound instead of aborting the whole rename
+            // (MinIO's RenameFile ignores osIsNotExist here).
+            let removed = if let Some(lease) = &prepared {
+                let path = dst_file_path.clone();
+                os::run_blocking_namespace_operation(lease.clone(), move || {
+                    #[cfg(all(test, not(windows)))]
+                    os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &path);
+                    remove_std(path)
+                })
+                .await
+            } else {
+                remove(&dst_file_path).await
+            };
+            if let Err(e) = removed
+                && e.kind() != ErrorKind::NotFound
+            {
+                return Err(to_file_error(e).into());
+            }
+        }
+
+        if let Some(lease) = &prepared {
+            os::rename_all_with_lease(&src_file_path, &dst_file_path, &dst_volume_dir, &self.publication_root, lease.clone())
+                .await?;
+        } else {
+            rename_all(&src_file_path, &dst_file_path, &dst_volume_dir, &self.publication_root).await?;
+        }
+
+        // Both ends changed identity: the source path no longer exists and the
+        // destination now resolves to a different inode (backlog#1145).
+        self.io_backend.invalidate_cached_fd(src_volume, src_path).await;
+        self.io_backend.invalidate_cached_fd(dst_volume, dst_path).await;
+
+        if let Some(parent) = src_file_path.parent() {
+            let _ = self
+                .delete_file_with_prepared_publication(
+                    &src_volume_dir,
+                    &parent.to_path_buf(),
+                    false,
+                    false,
+                    prepared.as_ref().map(|lease| lease.clone() as Arc<dyn Send + Sync>),
+                    prepared.clone(),
+                    None,
+                )
+                .await;
+        }
+
+        Ok(())
+    }
+
+    async fn rename_file_durable_inner(
+        &self,
+        (src_volume, src_path): (&str, &str),
+        (dst_volume, dst_path): (&str, &str),
+        prepared: Option<Arc<os::NamespaceMutationLease>>,
+    ) -> Result<()> {
+        let source = self.io_get_object_path(src_volume, src_path)?;
+        let destination = self.io_get_object_path(dst_volume, dst_path)?;
+        check_path_length(source.to_string_lossy().as_ref())?;
+        check_path_length(destination.to_string_lossy().as_ref())?;
+        let durability = effective_durability(dst_volume);
+        let stat = fs::symlink_metadata(&source).await.map_err(to_file_error)?;
+        if !stat.is_file() {
+            return Err(DiskError::FileAccessDenied);
+        }
+        if durability.syncs_data_shards() {
+            if let Some(lease) = &prepared {
+                os::run_blocking_namespace_operation(lease.clone(), move || os::sync_file(&source))
+                    .await
+                    .map_err(to_file_error)?;
+            } else {
+                tokio::task::spawn_blocking(move || os::sync_file(&source))
+                    .await
+                    .map_err(DiskError::from)?
+                    .map_err(to_file_error)?;
+            }
+        }
+        self.rename_file_inner((src_volume, src_path), (dst_volume, dst_path), prepared.clone())
+            .await?;
+        if durability.syncs_commit_metadata() {
+            os::fsync_dir_with_owner(
+                destination.parent().ok_or(DiskError::InvalidPath)?,
+                prepared.map(|lease| lease as Arc<dyn Send + Sync>),
+            )
+            .await
+            .map_err(to_file_error)?;
+        }
+        Ok(())
+    }
+
     pub(in crate::disk) async fn begin_legacy_file_write(
         &self,
         volume: &str,
@@ -11706,74 +11908,8 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
-        crate::hp_guard!("LocalDisk::rename_file");
-        let src_volume_dir = self.io_get_bucket_path(src_volume)?;
-        let dst_volume_dir = self.io_get_bucket_path(dst_volume)?;
-        if !skip_access_checks(src_volume) {
-            access(&src_volume_dir)
-                .await
-                .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
-        }
-        if !skip_access_checks(dst_volume) {
-            access(&dst_volume_dir)
-                .await
-                .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
-        }
-
-        let src_is_dir = has_suffix(src_path, SLASH_SEPARATOR);
-        let dst_is_dir = has_suffix(dst_path, SLASH_SEPARATOR);
-        if (dst_is_dir || src_is_dir) && (!dst_is_dir || !src_is_dir) {
-            return Err(Error::from(DiskError::FileAccessDenied));
-        }
-
-        let src_file_path = self.io_get_object_path(src_volume, src_path)?;
-        check_path_length(src_file_path.to_string_lossy().as_ref())?;
-
-        let dst_file_path = self.io_get_object_path(dst_volume, dst_path)?;
-        check_path_length(dst_file_path.to_string_lossy().as_ref())?;
-
-        if src_is_dir {
-            let meta_op = match lstat(&src_file_path).await {
-                Ok(meta) => Some(meta),
-                Err(e) => {
-                    let e: DiskError = to_file_error(e).into();
-                    if e != DiskError::FileNotFound {
-                        return Err(e);
-                    } else {
-                        None
-                    }
-                }
-            };
-
-            if let Some(meta) = meta_op
-                && !meta.is_dir()
-            {
-                return Err(DiskError::FileAccessDenied);
-            }
-
-            // Clear any stale destination before the directory rename. An absent
-            // destination is the normal case when renaming a directory to a new
-            // location, so tolerate NotFound instead of aborting the whole rename
-            // (MinIO's RenameFile ignores osIsNotExist here).
-            if let Err(e) = remove(&dst_file_path).await
-                && e.kind() != ErrorKind::NotFound
-            {
-                return Err(to_file_error(e).into());
-            }
-        }
-
-        rename_all(&src_file_path, &dst_file_path, &dst_volume_dir, &self.publication_root).await?;
-
-        // Both ends changed identity: the source path no longer exists and the
-        // destination now resolves to a different inode (backlog#1145).
-        self.io_backend.invalidate_cached_fd(src_volume, src_path).await;
-        self.io_backend.invalidate_cached_fd(dst_volume, dst_path).await;
-
-        if let Some(parent) = src_file_path.parent() {
-            let _ = self.delete_file(&src_volume_dir, &parent.to_path_buf(), false, false).await;
-        }
-
-        Ok(())
+        self.rename_file_inner((src_volume, src_path), (dst_volume, dst_path), None)
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -11794,28 +11930,8 @@ impl DiskAPI for LocalDisk {
     }
 
     async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
-        let source = self.io_get_object_path(src_volume, src_path)?;
-        let destination = self.io_get_object_path(dst_volume, dst_path)?;
-        check_path_length(source.to_string_lossy().as_ref())?;
-        check_path_length(destination.to_string_lossy().as_ref())?;
-        let durability = effective_durability(dst_volume);
-        let stat = fs::symlink_metadata(&source).await.map_err(to_file_error)?;
-        if !stat.is_file() {
-            return Err(DiskError::FileAccessDenied);
-        }
-        if durability.syncs_data_shards() {
-            tokio::task::spawn_blocking(move || os::sync_file(&source))
-                .await
-                .map_err(DiskError::from)?
-                .map_err(to_file_error)?;
-        }
-        self.rename_file(src_volume, src_path, dst_volume, dst_path).await?;
-        if durability.syncs_commit_metadata() {
-            os::fsync_dir(destination.parent().ok_or(DiskError::InvalidPath)?)
-                .await
-                .map_err(to_file_error)?;
-        }
-        Ok(())
+        self.rename_file_durable_inner((src_volume, src_path), (dst_volume, dst_path), None)
+            .await
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
@@ -12759,6 +12875,7 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInf
 mod test {
     use super::commit::create_local_inline_rollback_backup;
     use super::*;
+    use crate::disk::disk_store::get_max_timeout_duration;
     use rustfs_filemeta::ErasureInfo;
     use std::io::{self, Write};
     use std::pin::Pin;
@@ -16640,6 +16757,559 @@ mod test {
             .expect("stage the real data for legacy rollback");
         }
         (fi, rollback, original)
+    }
+
+    async fn rename_file_fixture() -> (tempfile::TempDir, Arc<LocalDisk>, crate::disk::disk_store::LocalDiskWrapper) {
+        let root = tempfile::tempdir().expect("rename file root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("disk"));
+        for volume in ["source", "destination"] {
+            ensure_test_volume(&disk, volume).await;
+        }
+        let wrapper = crate::disk::disk_store::LocalDiskWrapper::new(disk.clone(), false);
+        (root, disk, wrapper)
+    }
+
+    #[tokio::test]
+    async fn legacy_rename_file_core_preserves_file_directory_and_durable_semantics() {
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        for case in [
+            "file",
+            "same-volume",
+            "same-path",
+            "replace",
+            "missing-source",
+            "missing-parent",
+            "directory-new",
+            "directory-empty",
+            "directory-file",
+            "directory-full",
+            "mismatch",
+            "durable-directory",
+            "durable-file",
+        ] {
+            let mut observations = Vec::new();
+            for prepared in [false, true] {
+                let (_root, disk, wrapper) = rename_file_fixture().await;
+                let directory = case.starts_with("directory-") || case == "durable-directory";
+                let src_key = if directory || case == "mismatch" { "entry/" } else { "entry" };
+                let dst_volume = if matches!(case, "same-volume" | "same-path") {
+                    "source"
+                } else {
+                    "destination"
+                };
+                let dst_key = if case == "same-path" {
+                    "entry"
+                } else if directory {
+                    "target/"
+                } else if case == "missing-parent" {
+                    "parent/target"
+                } else {
+                    "target"
+                };
+                let src = disk.io_get_object_path("source", src_key).expect("source path");
+                let dst = disk.io_get_object_path(dst_volume, dst_key).expect("destination path");
+                if directory || case == "mismatch" {
+                    fs::create_dir_all(&src).await.expect("source directory");
+                    fs::write(src.join("payload"), b"source bytes").await.expect("source child");
+                } else if case != "missing-source" {
+                    fs::write(&src, b"source bytes").await.expect("source bytes");
+                }
+                match case {
+                    "replace" | "directory-file" => {
+                        // Seed a regular entry without the request's directory suffix.
+                        let entry = disk
+                            .io_get_object_path(dst_volume, dst_key.trim_end_matches('/'))
+                            .expect("destination entry");
+                        fs::write(entry, b"old destination").await.expect("old destination");
+                    }
+                    "directory-empty" | "directory-full" => {
+                        fs::create_dir_all(&dst).await.expect("destination directory");
+                        if case == "directory-full" {
+                            fs::write(dst.join("old"), b"old child").await.expect("old child");
+                        }
+                    }
+                    _ => {}
+                }
+                if case == "replace" {
+                    assert_eq!(
+                        disk.read_file_mmap_copy(dst_volume, dst_key, 0, 15)
+                            .await
+                            .expect("warm destination reader"),
+                        Bytes::from_static(b"old destination")
+                    );
+                    assert_eq!(
+                        disk.read_file_mmap_copy("source", src_key, 0, 12)
+                            .await
+                            .expect("warm source reader"),
+                        Bytes::from_static(b"source bytes")
+                    );
+                }
+                let durable = case.starts_with("durable-");
+                let result = if prepared {
+                    wrapper
+                        .begin_legacy_rename_file(("source", src_key), (dst_volume, dst_key), durable, None)
+                        .await
+                        .expect("admission")
+                        .commit()
+                        .await
+                } else if durable {
+                    disk.rename_file_durable("source", src_key, dst_volume, dst_key).await
+                } else {
+                    disk.rename_file("source", src_key, dst_volume, dst_key).await
+                };
+                let result_code = result.as_ref().map(|_| ()).map_err(|error| error.to_u32());
+                if matches!(case, "file" | "same-volume" | "replace" | "missing-parent" | "durable-file") {
+                    assert!(result.is_ok(), "{case}: {result:?}");
+                    assert_eq!(fs::read(&dst).await.expect("published file"), b"source bytes");
+                    assert!(!src.exists());
+                }
+                if case == "replace" {
+                    assert_eq!(
+                        disk.read_file_mmap_copy(dst_volume, dst_key, 0, 12)
+                            .await
+                            .expect("new destination reader"),
+                        Bytes::from_static(b"source bytes")
+                    );
+                    assert!(
+                        disk.read_file_mmap_copy("source", src_key, 0, 12).await.is_err(),
+                        "source cached descriptor must be invalidated"
+                    );
+                }
+                if prepared {
+                    assert_eq!(wrapper.metrics_snapshot().api_calls.get("rename_file"), Some(&1));
+                }
+                observations.push((
+                    result_code,
+                    src.exists(),
+                    dst.exists(),
+                    fs::read(&src).await.ok(),
+                    fs::read(
+                        disk.io_get_object_path(dst_volume, dst_key.trim_end_matches('/'))
+                            .expect("destination entry"),
+                    )
+                    .await
+                    .ok(),
+                    fs::read(src.join("payload")).await.ok(),
+                    fs::read(dst.join("payload")).await.ok(),
+                    fs::read(dst.join("old")).await.ok(),
+                ));
+            }
+            assert_eq!(observations[0], observations[1], "{case}: prepared path preserves legacy semantics");
+        }
+        for missing in ["source", "destination"] {
+            let (_root, disk, wrapper) = rename_file_fixture().await;
+            disk.delete_volume(missing, true).await.expect("remove live volume");
+            assert_eq!(
+                wrapper
+                    .begin_legacy_rename_file(("source", "entry"), ("destination", "target"), false, None)
+                    .await
+                    .expect_err("both volumes must be live"),
+                DiskError::VolumeNotFound
+            );
+            assert!(!disk.io_get_bucket_path(missing).expect("volume path").exists());
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_rename_file_core_namespace_contention_is_atomic() {
+        for destination_busy in [false, true] {
+            let (_root, disk, wrapper) = rename_file_fixture().await;
+            let src = disk.io_get_object_path("source", "entry/").expect("source");
+            let dst = disk.io_get_object_path("destination", "target/").expect("destination");
+            fs::create_dir_all(&src).await.expect("source dir");
+            fs::write(src.join("payload"), b"source bytes").await.expect("source child");
+            fs::create_dir_all(&dst).await.expect("empty destination directory");
+            let held = if destination_busy { &dst } else { &src };
+            let guard = os::acquire_namespace_mutation_lease_with_owner(held, None).await;
+            let mut begin =
+                Box::pin(wrapper.begin_legacy_rename_file(("source", "entry/"), ("destination", "target/"), false, None));
+            let result = if destination_busy {
+                tokio::time::pause();
+                assert!(matches!(futures::poll!(begin.as_mut()), Poll::Pending));
+                tokio::time::advance(get_max_timeout_duration() + Duration::from_secs(1)).await;
+                tokio::time::resume();
+                timeout(Duration::from_secs(5), begin)
+                    .await
+                    .expect("bounded destination wait")
+            } else {
+                begin.await
+            };
+            let result = match result {
+                Ok(token) => token.commit().await,
+                Err(error) => Err(error),
+            };
+            assert_eq!(fs::read(src.join("payload")).await.expect("source unchanged"), b"source bytes");
+            assert!(dst.is_dir(), "pre-remove forbidden before full admission");
+            assert!(
+                fs::read_dir(&dst)
+                    .await
+                    .expect("destination retained")
+                    .next_entry()
+                    .await
+                    .expect("empty destination")
+                    .is_none()
+            );
+            let error = result.expect_err("required namespace unavailable");
+            if destination_busy {
+                assert_eq!(error, DiskError::Timeout);
+            } else {
+                assert!(matches!(error, DiskError::Io(error) if error.kind() == ErrorKind::WouldBlock));
+            }
+            assert!(os::disk_volume_mutation_lock(&disk.root, "source").try_write_owned().is_ok());
+            assert!(
+                os::disk_volume_mutation_lock(&disk.root, "destination")
+                    .try_write_owned()
+                    .is_ok()
+            );
+            drop(guard);
+        }
+        // A queued real volume writer makes a second READ acquisition deadlock.
+        let (_root, disk, wrapper) = rename_file_fixture().await;
+        let src = disk.io_get_object_path("source", "entry").expect("source");
+        fs::write(&src, b"source bytes").await.expect("source bytes");
+        let token = wrapper
+            .begin_legacy_rename_file(("source", "entry"), ("source", "target"), false, None)
+            .await
+            .expect("one deduplicated READ");
+        let mut deletion = Box::pin(disk.delete_volume("source", true));
+        assert!(matches!(futures::poll!(deletion.as_mut()), Poll::Pending));
+        timeout(Duration::from_secs(5), token.commit())
+            .await
+            .expect("commit cannot requeue READ")
+            .expect("rename");
+        assert_eq!(
+            fs::read(disk.io_get_object_path("source", "target").expect("target"))
+                .await
+                .expect("target bytes"),
+            b"source bytes"
+        );
+        drop(deletion);
+    }
+
+    #[cfg(not(windows))]
+    async fn assert_rename_file_physical_owner(stage: &str, cancel: bool) {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        let (_root, disk, wrapper) = rename_file_fixture().await;
+        let src_key = if stage == "remove" { "entry/" } else { "entry" };
+        let dst_key = if stage == "remove" { "target/" } else { "target" };
+        let src = disk.io_get_object_path("source", src_key).expect("source");
+        let dst = disk.io_get_object_path("destination", dst_key).expect("destination");
+        if stage == "remove" {
+            fs::create_dir_all(&src).await.expect("source directory");
+            fs::write(src.join("payload"), b"source bytes").await.expect("source child");
+            fs::create_dir_all(&dst)
+                .await
+                .expect("empty destination directory for real remove");
+        } else {
+            fs::write(&src, b"source bytes").await.expect("source bytes");
+        }
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let owner = ctx.begin_namespace_commit();
+        let weak = Arc::downgrade(&owner);
+        let token = wrapper
+            .begin_legacy_rename_file(
+                ("source", src_key),
+                ("destination", dst_key),
+                matches!(stage, "source-sync" | "parent-sync"),
+                Some(owner),
+            )
+            .await
+            .expect("complete two-volume admission");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (hook_stage, path) = match stage {
+            "remove" => (hooks::Stage::Remove, dst.clone()),
+            "rename" => (hooks::Stage::Rename, dst.clone()),
+            "source-sync" => (hooks::Stage::FileSync, src.clone()),
+            "parent-sync" => (hooks::Stage::DirFsync, dst.parent().expect("parent").to_path_buf()),
+            _ => unreachable!(),
+        };
+        let _hook = hooks::install_at(hook_stage, &path, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let mutation = tokio::spawn(token.commit());
+        timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("real worker starts")
+            .expect("worker entered");
+        if cancel {
+            mutation.abort();
+            assert!(mutation.await.expect_err("caller cancelled").is_cancelled());
+        } else {
+            tokio::time::pause();
+            tokio::time::advance(get_max_timeout_duration() + Duration::from_secs(1)).await;
+            tokio::time::resume();
+            assert_eq!(
+                timeout(Duration::from_secs(5), mutation)
+                    .await
+                    .expect("deadline returns")
+                    .expect("join")
+                    .expect_err("worker outlives caller"),
+                DiskError::Timeout
+            );
+        }
+        let source_held = os::disk_volume_mutation_lock(&disk.root, "source").try_write_owned().is_err();
+        let destination_held = os::disk_volume_mutation_lock(&disk.root, "destination")
+            .try_write_owned()
+            .is_err();
+        let instance_held = weak.upgrade().is_some();
+        let mut source_delete = Box::pin(disk.delete_volume("source", true));
+        let mut destination_delete = Box::pin(disk.delete_volume("destination", true));
+        let source_blocked = matches!(futures::poll!(source_delete.as_mut()), Poll::Pending);
+        let destination_blocked = matches!(futures::poll!(destination_delete.as_mut()), Poll::Pending);
+        drop(release_tx);
+        drop(
+            timeout(Duration::from_secs(10), os::acquire_namespace_mutation_lease_with_owner(&src, None))
+                .await
+                .expect("actual source owner drains"),
+        );
+        assert!(source_held, "{stage}: actual worker retains source READ");
+        assert!(destination_held, "{stage}: actual worker retains destination READ");
+        assert!(instance_held, "{stage}: actual worker retains receiving instance");
+        assert!(source_blocked && destination_blocked, "{stage}: both real DeleteVolumes wait");
+        timeout(Duration::from_secs(5), async {
+            while weak.upgrade().is_some() || ctx.namespace_commits_pending() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("physical drain releases instance");
+        let metrics = wrapper.metrics_snapshot();
+        assert_eq!(metrics.api_calls.get("rename_file"), Some(&1));
+        assert_eq!(metrics.total_waiting, 0);
+        assert_eq!(metrics.total_errors_timeout, u64::from(!cancel));
+        match stage {
+            "remove" => {
+                assert!(!dst.exists());
+                assert_eq!(
+                    fs::read(src.join("payload"))
+                        .await
+                        .expect("caller did not continue to rename"),
+                    b"source bytes"
+                );
+            }
+            "source-sync" => {
+                assert!(!dst.exists());
+                assert_eq!(fs::read(&src).await.expect("caller did not continue to rename"), b"source bytes");
+            }
+            _ => {
+                assert!(!src.exists());
+                assert_eq!(fs::read(&dst).await.expect("physical rename completed"), b"source bytes");
+            }
+        }
+        timeout(Duration::from_secs(10), source_delete)
+            .await
+            .expect("source drains")
+            .expect("source deletion");
+        timeout(Duration::from_secs(10), destination_delete)
+            .await
+            .expect("destination drains")
+            .expect("destination deletion");
+        for volume in ["source", "destination"] {
+            disk.make_volume(volume).await.expect("new generation");
+            let path = disk.io_get_object_path(volume, "new-generation").expect("sentinel");
+            fs::write(&path, b"new generation").await.expect("new bytes");
+            assert_eq!(fs::read(path).await.expect("new generation unchanged"), b"new generation");
+            let mut entries = fs::read_dir(disk.io_get_bucket_path(volume).expect("new volume"))
+                .await
+                .expect("new entries");
+            assert_eq!(
+                entries.next_entry().await.expect("entry").expect("sentinel").file_name(),
+                "new-generation"
+            );
+            assert!(entries.next_entry().await.expect("no old tail write").is_none());
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_rename_file_core_cancellation_retains_physical_owner() {
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        for stage in ["remove", "rename", "source-sync", "parent-sync"] {
+            assert_rename_file_physical_owner(stage, true).await;
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_rename_file_core_timeout_retains_physical_owner() {
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        for stage in ["remove", "rename", "source-sync", "parent-sync"] {
+            assert_rename_file_physical_owner(stage, false).await;
+        }
+        // A zero prepared budget must not inherit the legacy unbounded mode.
+        // Install a real worker barrier: the fixed deadline may prevent the
+        // worker from starting, but the unbounded regression reaches it.
+        let (_root, disk, wrapper) = rename_file_fixture().await;
+        let src = disk.io_get_object_path("source", "entry").expect("source");
+        let dst = disk.io_get_object_path("destination", "target").expect("destination");
+        fs::write(&src, b"payload").await.expect("source bytes");
+        let token = wrapper
+            .begin_legacy_rename_file(("source", "entry"), ("destination", "target"), false, None)
+            .await
+            .expect("normal admission before zero budget");
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hook = os::prepared_publication_test_hooks::install_at(
+            os::prepared_publication_test_hooks::Stage::Rename,
+            &dst,
+            move || {
+                let _ = release_rx.recv();
+            },
+        );
+        let result = temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("0"))], async {
+            assert_eq!(get_max_timeout_duration(), Duration::ZERO);
+            timeout(Duration::from_secs(5), token.commit()).await
+        })
+        .await;
+        drop(release_tx);
+        drop(
+            timeout(Duration::from_secs(5), os::acquire_namespace_mutation_lease_with_owner(&src, None))
+                .await
+                .expect("zero-budget worker drains"),
+        );
+        assert_eq!(
+            result.expect("zero prepared deadline must never wait indefinitely for a worker"),
+            Err(DiskError::Timeout)
+        );
+        let metrics = wrapper.metrics_snapshot();
+        assert_eq!(metrics.api_calls.get("rename_file"), Some(&1));
+        assert_eq!(metrics.total_errors_timeout, 1);
+        assert_eq!(metrics.total_waiting, 0);
+        assert!(os::disk_volume_mutation_lock(&disk.root, "source").try_write_owned().is_ok());
+        assert!(
+            os::disk_volume_mutation_lock(&disk.root, "destination")
+                .try_write_owned()
+                .is_ok()
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn legacy_rename_file_core_durable_failure_preserves_ack_and_metrics() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        for mode in [DurabilityMode::Strict, DurabilityMode::Relaxed, DurabilityMode::None] {
+            let _mode = durability_mode_override::set(mode);
+            let (_root, disk, wrapper) = rename_file_fixture().await;
+            let src = disk.io_get_object_path("source", "entry").expect("source");
+            let dst = disk.io_get_object_path("destination", "target").expect("destination");
+            fs::write(&src, b"payload").await.expect("source bytes");
+            let syncs = Arc::new(AtomicUsize::new(0));
+            let dir_syncs = Arc::new(AtomicUsize::new(0));
+            let count = syncs.clone();
+            let _file = hooks::install_at(hooks::Stage::FileSync, &src, move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            });
+            let count = dir_syncs.clone();
+            let _dir = hooks::install_at(hooks::Stage::DirFsync, dst.parent().expect("parent"), move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            });
+            wrapper
+                .begin_legacy_rename_file(("source", "entry"), ("destination", "target"), true, None)
+                .await
+                .expect("admission")
+                .commit()
+                .await
+                .expect("durable acknowledgement");
+            assert_eq!(syncs.load(Ordering::SeqCst), usize::from(mode.syncs_data_shards()));
+            assert_eq!(dir_syncs.load(Ordering::SeqCst), usize::from(mode.syncs_commit_metadata()));
+            assert_eq!(fs::read(&dst).await.expect("published payload"), b"payload");
+            assert!(!src.exists());
+            assert_eq!(wrapper.metrics_snapshot().api_calls.get("rename_file"), Some(&1));
+        }
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        for stage in ["source-sync", "rename", "parent-sync"] {
+            let (_root, disk, wrapper) = rename_file_fixture().await;
+            let src = disk.io_get_object_path("source", "entry").expect("source");
+            let dst = disk.io_get_object_path("destination", "target").expect("destination");
+            fs::write(&src, b"payload").await.expect("source bytes");
+            fs::write(&dst, b"old destination").await.expect("old bytes");
+            let _hook;
+            if stage == "parent-sync" {
+                os::fsync_dir_recorder::set_failure(dst.parent().expect("parent"), ErrorKind::PermissionDenied);
+                _hook = None;
+            } else {
+                let remove = src.clone();
+                let hook_stage = if stage == "source-sync" {
+                    hooks::Stage::FileSync
+                } else {
+                    hooks::Stage::Rename
+                };
+                _hook = Some(hooks::install_at(hook_stage, &src, move || {
+                    std::fs::remove_file(remove).expect("cause actual syscall failure");
+                }));
+            }
+            let result = wrapper
+                .begin_legacy_rename_file(("source", "entry"), ("destination", "target"), true, None)
+                .await
+                .expect("admission")
+                .commit()
+                .await;
+            assert_eq!(
+                result.expect_err("no successful durable acknowledgement on failure"),
+                if stage == "parent-sync" {
+                    DiskError::FileAccessDenied
+                } else {
+                    DiskError::FileNotFound
+                }
+            );
+            assert_eq!(
+                fs::read(&dst).await.expect("actual publication state"),
+                if stage == "parent-sync" {
+                    b"payload".as_slice()
+                } else {
+                    b"old destination".as_slice()
+                }
+            );
+            let metrics = wrapper.metrics_snapshot();
+            assert_eq!(metrics.api_calls.get("rename_file"), Some(&1));
+            assert_eq!(metrics.total_waiting, 0);
+            assert!(os::disk_volume_mutation_lock(&disk.root, "source").try_write_owned().is_ok());
+            assert!(
+                os::disk_volume_mutation_lock(&disk.root, "destination")
+                    .try_write_owned()
+                    .is_ok()
+            );
+        }
+        // The same execution deadline includes the pre-operation stale lookup.
+        let (_root, disk, wrapper) = rename_file_fixture().await;
+        let src = disk.io_get_object_path("source", "entry").expect("source");
+        let dst = disk.io_get_object_path("destination", "target").expect("destination");
+        fs::write(&src, b"payload").await.expect("source bytes");
+        wrapper.set_disk_id_state(Some(Uuid::new_v4())).await;
+        let token = wrapper
+            .begin_legacy_rename_file(("source", "entry"), ("destination", "target"), true, None)
+            .await
+            .expect("admission");
+        let guard = disk.format_info.write().await;
+        let mut pending = Box::pin(token.commit());
+        tokio::time::pause();
+        assert!(matches!(futures::poll!(pending.as_mut()), Poll::Pending));
+        tokio::time::advance(get_max_timeout_duration() + Duration::from_secs(1)).await;
+        tokio::time::resume();
+        assert_eq!(
+            timeout(Duration::from_secs(5), pending).await.expect("bounded stale lookup"),
+            Err(DiskError::Timeout)
+        );
+        assert_eq!(fs::read(src).await.expect("stale timeout leaves source intact"), b"payload");
+        assert!(!dst.exists());
+        drop(guard);
+        let metrics = wrapper.metrics_snapshot();
+        assert_eq!(metrics.api_calls.get("rename_file"), Some(&1));
+        assert_eq!(metrics.total_waiting, 0);
+        assert_eq!(metrics.total_errors_timeout, 1);
+        assert_eq!(metrics.total_errors_availability, 0);
+        assert!(os::disk_volume_mutation_lock(&disk.root, "source").try_write_owned().is_ok());
+        assert!(
+            os::disk_volume_mutation_lock(&disk.root, "destination")
+                .try_write_owned()
+                .is_ok()
+        );
     }
 
     async fn prepare_bulk_delete_fixture(

@@ -1702,7 +1702,83 @@ impl LegacyRenameData {
     }
 }
 
+/// A single file rename bound to both volumes and its physical workers.
+pub struct LegacyRenameFile {
+    disk: LocalDiskWrapper,
+    source: (String, String),
+    destination: (String, String),
+    durable: bool,
+    lease: Arc<super::os::NamespaceMutationLease>,
+    permit: crate::disk::io_admission::DiskIoPermit,
+}
+
+impl std::fmt::Debug for LegacyRenameFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LegacyRenameFile")
+            .field("source", &self.source)
+            .field("destination", &self.destination)
+            .field("durable", &self.durable)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LegacyRenameFile {
+    pub async fn commit(self) -> Result<()> {
+        let Self {
+            disk,
+            source,
+            destination,
+            durable,
+            lease,
+            permit,
+        } = self;
+        let duration = get_max_timeout_duration();
+        let deadline = tokio::time::Instant::now() + duration;
+        with_disk_io_permit(
+            Some(permit),
+            disk.track_disk_health_with_deadline(
+                "rename_file",
+                |_permit| async {
+                    disk.disk
+                        .rename_file_prepared((&source.0, &source.1), (&destination.0, &destination.1), durable, lease)
+                        .await
+                },
+                duration,
+                TimeoutHealthAction::MarkFailure,
+                DiskMetricMutation::Write,
+                Some(deadline),
+            ),
+        )
+        .await
+    }
+}
+
 impl LocalDiskWrapper {
+    pub(in crate::disk) async fn begin_legacy_rename_file(
+        &self,
+        source: (&str, &str),
+        destination: (&str, &str),
+        durable: bool,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<LegacyRenameFile> {
+        let permit = self.io_admission.foreground();
+        let lease = tokio::time::timeout(
+            get_max_timeout_duration(),
+            self.disk
+                .begin_legacy_rename_file(source, destination, permit.clone(), namespace_owner),
+        )
+        .await
+        .map_err(|_| DiskError::Timeout)??;
+        Ok(LegacyRenameFile {
+            disk: self.clone(),
+            source: (source.0.to_owned(), source.1.to_owned()),
+            destination: (destination.0.to_owned(), destination.1.to_owned()),
+            durable,
+            lease,
+            permit,
+        })
+    }
+
     pub(in crate::disk) async fn begin_legacy_rename_data(
         &self,
         source: (&str, &str),
@@ -2507,6 +2583,23 @@ impl LocalDiskWrapper {
         F: FnOnce(Option<crate::disk::io_admission::DiskIoPermit>) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        self.track_disk_health_with_deadline(op, operation, timeout_duration, timeout_health_action, mutation, None)
+            .await
+    }
+
+    async fn track_disk_health_with_deadline<T, F, Fut>(
+        &self,
+        op: &'static str,
+        operation: F,
+        timeout_duration: Duration,
+        timeout_health_action: TimeoutHealthAction,
+        mutation: DiskMetricMutation,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<T>
+    where
+        F: FnOnce(Option<crate::disk::io_admission::DiskIoPermit>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
         self.metrics.record_operation_call(op);
         // Check if disk is faulty
         if self.health.is_faulty() {
@@ -2522,8 +2615,17 @@ impl LocalDiskWrapper {
             return Err(DiskError::FaultyDisk);
         }
 
-        // Check if disk is stale
-        if let Err(err) = self.check_disk_stale().await {
+        // Prepared rename admission keeps stale lookup and execution in one deadline.
+        let stale_started = Instant::now();
+        let stale = if let Some(deadline) = deadline {
+            match tokio::time::timeout_at(deadline, self.check_disk_stale()).await {
+                Ok(result) => result,
+                Err(_) => return Err(self.record_operation_timeout(op, stale_started, timeout_duration, timeout_health_action)),
+            }
+        } else {
+            self.check_disk_stale().await
+        };
+        if let Err(err) = stale {
             self.metrics.record_availability_error();
             return Err(err);
         }
@@ -2537,7 +2639,7 @@ impl LocalDiskWrapper {
         let started = Instant::now();
         let operation = observe_disk_operation(|| self.endpoint(), op, operation(io_permit));
 
-        if timeout_duration == Duration::ZERO {
+        if timeout_duration == Duration::ZERO && deadline.is_none() {
             let result = operation.await;
             self.metrics.record_operation_latency(op, started.elapsed());
             self.record_result_error_metrics(&result);
@@ -2548,7 +2650,11 @@ impl LocalDiskWrapper {
             return result;
         }
         // Execute the operation with timeout
-        let result = tokio::time::timeout(timeout_duration, operation).await;
+        let result = if let Some(deadline) = deadline {
+            tokio::time::timeout_at(deadline, operation).await
+        } else {
+            tokio::time::timeout(timeout_duration, operation).await
+        };
 
         match result {
             Ok(operation_result) => {
@@ -2561,34 +2667,42 @@ impl LocalDiskWrapper {
                 }
                 operation_result
             }
-            Err(_) => {
-                self.metrics.record_operation_latency(op, started.elapsed());
-                self.metrics.record_timeout_error();
-                // Timeout occurred, mark disk as potentially faulty.
-                if timeout_health_action == TimeoutHealthAction::MarkFailure
-                    && self.health.mark_failure(&self.endpoint(), "operation_timeout")
-                {
-                    self.spawn_recovery_monitor_if_needed();
-                }
-                counter!(
-                    "rustfs_drive_op_timeout_total",
-                    "endpoint" => self.endpoint().to_string(),
-                    "op" => op.to_string()
-                )
-                .increment(1);
-                warn!(
-                    event = EVENT_DISK_HEALTH_CHECK_FAILED,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_DISK,
-                    endpoint = %self.endpoint(),
-                    op,
-                    timeout_ms = timeout_duration.as_millis(),
-                    reason = "operation_timeout",
-                    "Disk operation timed out"
-                );
-                Err(DiskError::Timeout)
-            }
+            Err(_) => Err(self.record_operation_timeout(op, started, timeout_duration, timeout_health_action)),
         }
+    }
+
+    fn record_operation_timeout(
+        &self,
+        op: &'static str,
+        started: Instant,
+        timeout_duration: Duration,
+        timeout_health_action: TimeoutHealthAction,
+    ) -> DiskError {
+        self.metrics.record_operation_latency(op, started.elapsed());
+        self.metrics.record_timeout_error();
+        // Timeout occurred, mark disk as potentially faulty.
+        if timeout_health_action == TimeoutHealthAction::MarkFailure
+            && self.health.mark_failure(&self.endpoint(), "operation_timeout")
+        {
+            self.spawn_recovery_monitor_if_needed();
+        }
+        counter!(
+            "rustfs_drive_op_timeout_total",
+            "endpoint" => self.endpoint().to_string(),
+            "op" => op.to_string()
+        )
+        .increment(1);
+        warn!(
+            event = EVENT_DISK_HEALTH_CHECK_FAILED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DISK,
+            endpoint = %self.endpoint(),
+            op,
+            timeout_ms = timeout_duration.as_millis(),
+            reason = "operation_timeout",
+            "Disk operation timed out"
+        );
+        DiskError::Timeout
     }
 }
 

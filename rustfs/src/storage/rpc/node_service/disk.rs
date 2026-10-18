@@ -20,8 +20,8 @@ use crate::storage::storage_api::rpc_consumer::node_service::{
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use crate::storage::storage_api::{
-    LegacyFileWrite, LegacyMetadataWrite, LegacyRenameData, PartTransactionAction, RenameDataResp, SnapshotLeaseToken,
-    verify_tonic_mutation_body_digest,
+    LegacyFileWrite, LegacyMetadataWrite, LegacyRenameData, LegacyRenameFile, PartTransactionAction, RenameDataResp,
+    SnapshotLeaseToken, verify_tonic_mutation_body_digest,
 };
 use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
@@ -144,6 +144,28 @@ impl LocalMutationTarget {
         match self {
             Self::Ready(store) => store.begin_legacy_local_metadata_mutation(disk_ref, volume, path).await,
             Self::Bootstrap(target) => target.begin_legacy_local_metadata_mutation(disk_ref, volume, path).await,
+            Self::Unbound => Err(DiskError::other("target disk instance is unavailable")),
+        }
+    }
+
+    async fn begin_legacy_local_rename_file(
+        &self,
+        disk_ref: &str,
+        source: (&str, &str),
+        destination: (&str, &str),
+        durable: bool,
+    ) -> Result<LegacyRenameFile, DiskError> {
+        match self {
+            Self::Ready(store) => {
+                store
+                    .begin_legacy_local_rename_file(disk_ref, source, destination, durable)
+                    .await
+            }
+            Self::Bootstrap(target) => {
+                target
+                    .begin_legacy_local_rename_file(disk_ref, source, destination, durable)
+                    .await
+            }
             Self::Unbound => Err(DiskError::other("target disk instance is unavailable")),
         }
     }
@@ -1674,15 +1696,22 @@ impl NodeService {
         )?;
         let request = request.into_inner();
         let target = self.local_mutation_target();
-        if let Some(disk) = target.find_mutation_disk(&request.disk).await {
-            target.reject_legacy_artifact_mutation(&request.src_volume).await?;
-            target.reject_legacy_artifact_mutation(&request.dst_volume).await?;
-            let result = if request.durable {
-                disk.rename_file_durable(&request.src_volume, &request.src_path, &request.dst_volume, &request.dst_path)
-                    .await
-            } else {
-                disk.rename_file(&request.src_volume, &request.src_path, &request.dst_volume, &request.dst_path)
-                    .await
+        if target.find_mutation_disk(&request.disk).await.is_some() {
+            let result = match target
+                .begin_legacy_local_rename_file(
+                    &request.disk,
+                    (&request.src_volume, &request.src_path),
+                    (&request.dst_volume, &request.dst_path),
+                    request.durable,
+                )
+                .await
+            {
+                Ok(rename) => {
+                    target.reject_legacy_artifact_mutation(&request.src_volume).await?;
+                    target.reject_legacy_artifact_mutation(&request.dst_volume).await?;
+                    rename.commit().await
+                }
+                Err(error) => Err(error),
             };
             match result {
                 Ok(_) => Ok(Response::new(RenameFileResponse {
@@ -3465,6 +3494,436 @@ mod legacy_artifact_tests {
     ) -> Result<Response<DeleteVersionResponse>, Status> {
         verify_legacy_rpc_request(&request, "DeleteVersion")?;
         service.handle_delete_version(request, false).await
+    }
+
+    fn signed_legacy_rename_file_request(
+        disk: &str,
+        source: (&str, &str),
+        destination: (&str, &str),
+        durable: bool,
+    ) -> Request<RenameFileRequest> {
+        let mut request = Request::new(RenameFileRequest {
+            disk: disk.to_owned(),
+            src_volume: source.0.to_owned(),
+            src_path: source.1.to_owned(),
+            dst_volume: destination.0.to_owned(),
+            dst_path: destination.1.to_owned(),
+            durable,
+        });
+        let body = rustfs_protos::canonical_rename_file_request_body(request.get_ref()).expect("canonical rename-file body");
+        sign_legacy_rpc_request(&mut request, &body, "RenameFile");
+        request
+    }
+
+    async fn authenticated_legacy_rename_file(
+        service: &NodeService,
+        request: Request<RenameFileRequest>,
+    ) -> Result<RenameFileResponse, Status> {
+        verify_legacy_rpc_request(&request, "RenameFile")?;
+        Ok(service.handle_rename_file(request).await?.into_inner())
+    }
+
+    async fn prepare_legacy_rename_file(
+        disk: &ecstore_disk::DiskStore,
+        source: (&str, &str),
+        destination: (&str, &str),
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = ecstore_disk::DiskAPI::path(disk.as_ref());
+        let source = root.join(source.0).join(source.1);
+        let destination = root.join(destination.0).join(destination.1);
+        for (path, bytes) in [
+            (&source, LEGACY_RENAME_BODY),
+            (&destination, b"previous destination".as_slice()),
+        ] {
+            tokio::fs::create_dir_all(path.parent().expect("fixture parent"))
+                .await
+                .expect("fixture directories");
+            tokio::fs::write(path, bytes).await.expect("fixture bytes");
+        }
+        (source, destination)
+    }
+
+    async fn assert_legacy_rename_file_unchanged(source: &std::path::Path, destination: &std::path::Path) {
+        assert_eq!(tokio::fs::read(source).await.expect("source retained"), LEGACY_RENAME_BODY);
+        assert_eq!(tokio::fs::read(destination).await.expect("destination retained"), b"previous destination");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_rename_file_receiver_preserves_signed_flags_and_managed_rejection() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-rename-file-test-secret".to_owned());
+        let root = tempfile::tempdir().expect("rename-file receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("rename-file-ordinary", true).await;
+        env.ecstore
+            .clone()
+            .make_artifact_bucket("rename-file-managed", "outputs/")
+            .await
+            .expect("managed bucket");
+        let service = service_for(&env).await;
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = service
+            .local_mutation_target()
+            .find_mutation_disk(&disk_ref)
+            .await
+            .expect("receiving disk");
+        for durable in [false, true] {
+            for (src_volume, dst_volume) in [
+                ("rename-file-ordinary", "rename-file-ordinary"),
+                (".rustfs.sys/tmp", ".rustfs.sys"),
+                (".rustfs.sys/tmp", "rename-file-ordinary"),
+                ("rename-file-managed", "rename-file-ordinary"),
+                ("rename-file-ordinary", "rename-file-managed"),
+            ] {
+                let prefix = format!("outputs/74656e616e74/{}/{}", Uuid::new_v4(), Uuid::new_v4());
+                let src_path = format!("{prefix}/source");
+                let dst_path = format!("{prefix}/destination");
+                let source = (src_volume, src_path.as_str());
+                let destination = (dst_volume, dst_path.as_str());
+                let (src, dst) = prepare_legacy_rename_file(&disk, source, destination).await;
+                let mut tampered = signed_legacy_rename_file_request(&disk_ref, source, destination, !durable);
+                tampered.get_mut().durable = durable;
+                assert_eq!(
+                    authenticated_legacy_rename_file(&service, tampered)
+                        .await
+                        .expect_err("durability bit is signed")
+                        .code(),
+                    tonic::Code::PermissionDenied
+                );
+                assert_legacy_rename_file_unchanged(&src, &dst).await;
+                let result = authenticated_legacy_rename_file(
+                    &service,
+                    signed_legacy_rename_file_request(&disk_ref, source, destination, durable),
+                )
+                .await;
+                if src_volume == "rename-file-managed" || dst_volume == "rename-file-managed" {
+                    assert_eq!(result.expect_err("both managed directions reject").code(), tonic::Code::PermissionDenied);
+                    assert_legacy_rename_file_unchanged(&src, &dst).await;
+                } else {
+                    let response = result.expect("signed rename response");
+                    assert!(response.success, "{:?}", response.error);
+                    assert!(response.error.is_none());
+                    assert_eq!(response.durability_applied, durable);
+                    assert!(!src.exists());
+                    assert_eq!(tokio::fs::read(dst).await.expect("published bytes"), LEGACY_RENAME_BODY);
+                }
+            }
+            let response = authenticated_legacy_rename_file(
+                &service,
+                signed_legacy_rename_file_request(
+                    "missing-disk",
+                    ("rename-file-ordinary", "source"),
+                    ("rename-file-ordinary", "destination"),
+                    durable,
+                ),
+            )
+            .await
+            .expect("unknown disk envelope");
+            assert!(!response.success && !response.durability_applied);
+            assert!(response.error.expect("unknown disk").error_info.contains("cannot find disk"));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_rename_file_receiver_rejects_missing_live_source_or_destination() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-rename-file-test-secret".to_owned());
+        let root = tempfile::tempdir().expect("rename-file missing root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        let service = service_for(&env).await;
+        let target = service.local_mutation_target();
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = target.find_mutation_disk(&disk_ref).await.expect("receiving disk");
+        for durable in [false, true] {
+            for missing_source in [false, true] {
+                let src_volume = format!("rename-src-{durable}-{missing_source}");
+                let dst_volume = format!("rename-dst-{durable}-{missing_source}");
+                env.make_bucket(&src_volume, true).await;
+                env.make_bucket(&dst_volume, true).await;
+                let source = (src_volume.as_str(), "nested/source");
+                let destination = (dst_volume.as_str(), "nested/destination");
+                let (src, dst) = prepare_legacy_rename_file(&disk, source, destination).await;
+                let missing = if missing_source { &src_volume } else { &dst_volume };
+                let incarnation = env
+                    .ecstore
+                    .bucket_incarnation_id(missing)
+                    .await
+                    .expect("original incarnation");
+                disk.delete_volume(missing, true).await.expect("remove only physical volume");
+                assert_eq!(
+                    env.ecstore
+                        .bucket_incarnation_id(missing)
+                        .await
+                        .expect("retained bucket metadata"),
+                    incarnation
+                );
+                target
+                    .reject_legacy_artifact_mutation(missing)
+                    .await
+                    .expect("metadata still classifies ordinary");
+                let response = authenticated_legacy_rename_file(
+                    &service,
+                    signed_legacy_rename_file_request(&disk_ref, source, destination, durable),
+                )
+                .await
+                .expect("missing-volume envelope");
+                assert!(!response.success && !response.durability_applied);
+                assert_eq!(
+                    DiskError::from(response.error.expect("live-volume admission error")),
+                    DiskError::VolumeNotFound
+                );
+                assert!(!env.disk_paths[0].join(missing).exists(), "must not recreate missing physical volume");
+                if missing_source {
+                    assert_eq!(tokio::fs::read(dst).await.expect("destination remains"), b"previous destination");
+                } else {
+                    assert_eq!(tokio::fs::read(src).await.expect("source remains"), LEGACY_RENAME_BODY);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_rename_file_receiver_binds_instance_and_bootstrap() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-rename-file-test-secret".to_owned());
+        let root = tempfile::tempdir().expect("rename-file instance root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("rename-file-instance", true).await;
+        let ready = service_for(&env).await;
+        let instance = crate::storage::storage_api::bootstrap_instance_ctx();
+        assert!(super::super::BootstrapLocalTarget::new(instance.clone()).is_for_store(&env.ecstore));
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = ready
+            .local_mutation_target()
+            .find_mutation_disk(&disk_ref)
+            .await
+            .expect("instance disk");
+        let slot = super::super::ServerContextSlot::with_instance_context(instance.clone());
+        let bootstrap = super::super::make_server_for_slot(slot.clone());
+        let unbound = super::super::make_server_for_slot(super::super::ServerContextSlot::new());
+        let mut wrong = super::super::make_server_for_context(ready.context.clone());
+        wrong.server_ctx = Some(super::super::ServerContextSlot::with_instance_context(
+            crate::storage::storage_api::new_instance_ctx(),
+        ));
+        for durable in [false, true] {
+            for (src_volume, dst_volume) in [
+                (".rustfs.sys/tmp", ".rustfs.sys"),
+                (".rustfs.sys/tmp", "rename-file-instance"),
+                ("rename-file-instance", ".rustfs.sys"),
+            ] {
+                let prefix = Uuid::new_v4().to_string();
+                let src_path = format!("binding/{prefix}/source");
+                let dst_path = format!("binding/{prefix}/destination");
+                let source = (src_volume, src_path.as_str());
+                let destination = (dst_volume, dst_path.as_str());
+                let (src, dst) = prepare_legacy_rename_file(&disk, source, destination).await;
+                for service in [&unbound, &wrong] {
+                    let response = authenticated_legacy_rename_file(
+                        service,
+                        signed_legacy_rename_file_request(&disk_ref, source, destination, durable),
+                    )
+                    .await
+                    .expect("unbound envelope");
+                    assert!(!response.success && !response.durability_applied);
+                    assert!(response.error.is_some());
+                    assert_legacy_rename_file_unchanged(&src, &dst).await;
+                }
+                let response = authenticated_legacy_rename_file(
+                    &bootstrap,
+                    signed_legacy_rename_file_request(&disk_ref, source, destination, durable),
+                )
+                .await
+                .expect("bootstrap envelope");
+                if src_volume == ".rustfs.sys/tmp" && dst_volume == ".rustfs.sys" {
+                    assert!(response.success, "{:?}", response.error);
+                    assert!(response.error.is_none());
+                    assert_eq!(response.durability_applied, durable);
+                    assert!(!src.exists());
+                    assert_eq!(tokio::fs::read(dst).await.expect("internal bytes"), LEGACY_RENAME_BODY);
+                } else {
+                    assert!(!response.success && !response.durability_applied);
+                    assert_eq!(
+                        DiskError::from(response.error.expect("bootstrap rejects either ordinary volume")),
+                        DiskError::FileAccessDenied
+                    );
+                    assert_legacy_rename_file_unchanged(&src, &dst).await;
+                }
+            }
+        }
+        let captured = bootstrap.local_mutation_target();
+        slot.try_install(ready.context.clone().expect("ready context"))
+            .expect("install after capture");
+        assert!(matches!(bootstrap.local_mutation_target(), LocalMutationTarget::Ready(_)));
+        let source = ("rename-file-instance", "replacement/source");
+        let destination = ("rename-file-instance", "replacement/destination");
+        let (src, dst) = prepare_legacy_rename_file(&disk, source, destination).await;
+        assert_eq!(
+            captured
+                .begin_legacy_local_rename_file(&disk_ref, source, destination, true)
+                .await
+                .err()
+                .expect("captured bootstrap cannot upgrade"),
+            DiskError::FileAccessDenied
+        );
+        let admitted = ready
+            .local_mutation_target()
+            .begin_legacy_local_rename_file(&disk_ref, source, destination, true)
+            .await
+            .expect("capture original disk");
+        crate::storage::storage_api::init_local_disks_with_instance_ctx(&instance, env.endpoint_pools.clone())
+            .await
+            .expect("replace registry handles");
+        let replacement = ready
+            .local_mutation_target()
+            .find_mutation_disk(&disk_ref)
+            .await
+            .expect("replacement disk");
+        assert!(!Arc::ptr_eq(&disk, &replacement));
+        admitted.commit().await.expect("admitted rename retains original owner");
+        assert!(!src.exists());
+        assert_eq!(tokio::fs::read(&dst).await.expect("admitted bytes"), LEGACY_RENAME_BODY);
+        let response =
+            authenticated_legacy_rename_file(&ready, signed_legacy_rename_file_request(&disk_ref, destination, source, false))
+                .await
+                .expect("next request uses replacement");
+        assert!(response.success && response.error.is_none());
+        assert!(!response.durability_applied);
+        assert!(!dst.exists());
+        assert_eq!(tokio::fs::read(src).await.expect("returned bytes"), LEGACY_RENAME_BODY);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_rename_file_flow_remote_ordinary_and_durable() {
+        use crate::storage::storage_api::{
+            Endpoint, EndpointServerPools, Endpoints,
+            ecstore_disk::{DiskOption, new_disk},
+            init_local_disks_with_instance_ctx,
+        };
+        use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
+        use tokio_stream::wrappers::TcpListenerStream;
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-rename-file-remote-secret".to_owned());
+        let root = tempfile::tempdir().expect("remote rename-file root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("rename-file-remote", true).await;
+        let ready = service_for(&env).await;
+        let instance = crate::storage::storage_api::bootstrap_instance_ctx();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback listener");
+        let addr = listener.local_addr().expect("loopback address");
+        let mut endpoints = env.endpoint_pools.as_ref()[0].endpoints.as_ref().clone();
+        let mut endpoint =
+            Endpoint::try_from(format!("http://{addr}{}", env.disk_paths[0].display()).as_str()).expect("remote endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        endpoint.is_local = true;
+        endpoints[0] = endpoint.clone();
+        let mut pool = env.endpoint_pools.as_ref()[0].clone();
+        pool.endpoints = Endpoints::from(endpoints);
+        init_local_disks_with_instance_ctx(&instance, EndpointServerPools::from(vec![pool]))
+            .await
+            .expect("register receiving disk");
+        let service = super::super::make_server_for_context(ready.context.clone());
+        let local = service
+            .local_mutation_target()
+            .find_mutation_disk(&endpoint.to_string())
+            .await
+            .expect("local receiving disk");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let audience = addr.to_string();
+        let auth = tower::ServiceBuilder::new().map_request(move |request: http::Request<_>| {
+            let path = request.uri().path();
+            crate::storage::storage_api::ecstore_rpc::verify_tonic_rpc_signature_with_bootstrap(
+                &audience,
+                path,
+                request.headers(),
+                path == "/node_service.NodeService/Ping",
+            )
+            .expect("real remote HMAC signature");
+            if path == "/node_service.NodeService/RenameFile" {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            request
+        });
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .layer(auth)
+                .add_service(NodeServiceServer::new(service))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = stopped.await;
+                })
+                .await
+                .expect("rename-file server");
+        });
+        endpoint.is_local = false;
+        let remote = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("real remote client");
+        assert!(!ecstore_disk::DiskAPI::is_local(remote.as_ref()));
+        for durable in [false, true] {
+            let src_path = format!("rename-file/{durable}/source");
+            let dst_path = format!("rename-file/{durable}/destination");
+            let source = (".rustfs.sys/tmp", src_path.as_str());
+            let destination = ("rename-file-remote", dst_path.as_str());
+            let (src, dst) = prepare_legacy_rename_file(&local, source, destination).await;
+            if durable {
+                ecstore_disk::DiskAPI::rename_file_durable(remote.as_ref(), source.0, source.1, destination.0, destination.1)
+                    .await
+                    .expect("durable response acknowledges publication");
+            } else {
+                ecstore_disk::DiskAPI::rename_file(remote.as_ref(), source.0, source.1, destination.0, destination.1)
+                    .await
+                    .expect("ordinary remote publication");
+            }
+            assert!(!src.exists());
+            assert_eq!(tokio::fs::read(&dst).await.expect("remote published bytes"), LEGACY_RENAME_BODY);
+        }
+        let failed_destination = env.disk_paths[0].join("rename-file-remote/failed/destination");
+        let error = ecstore_disk::DiskAPI::rename_file_durable(
+            remote.as_ref(),
+            ".rustfs.sys/tmp",
+            "rename-file/missing",
+            "rename-file-remote",
+            "failed/destination",
+        )
+        .await
+        .expect_err("missing source durable request fails");
+        assert_eq!(error, DiskError::FileNotFound);
+        assert!(!failed_destination.exists());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "all rename-file operations crossed tonic"
+        );
+        ecstore_disk::DiskAPI::close(remote.as_ref())
+            .await
+            .expect("close remote client");
+        drop(remote);
+        shutdown.send(()).expect("stop server");
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("server drains")
+            .expect("server task");
     }
 
     fn signed_legacy_bulk_request(

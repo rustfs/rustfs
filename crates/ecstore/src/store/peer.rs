@@ -16,7 +16,8 @@ use super::*;
 use crate::bucket::utils::has_bad_path_component;
 use crate::disk::error::{DiskError, Result as DiskResult};
 use crate::disk::{
-    DeleteOptions, Disk, LegacyFileWrite, LegacyMetadataWrite, LegacyRenameData, RenameDataGuards, RenameDataResp,
+    DeleteOptions, Disk, LegacyFileWrite, LegacyMetadataWrite, LegacyRenameData, LegacyRenameFile, RenameDataGuards,
+    RenameDataResp,
 };
 use crate::runtime::instance::{InstanceContext, NamespaceCommitGuard};
 use crate::runtime::sources as runtime_sources;
@@ -35,6 +36,18 @@ pub struct BootstrapLocalTarget {
 }
 
 impl BootstrapLocalTarget {
+    pub async fn begin_legacy_local_rename_file(
+        &self,
+        disk_ref: &str,
+        source: (&str, &str),
+        destination: (&str, &str),
+        durable: bool,
+    ) -> DiskResult<LegacyRenameFile> {
+        validate_bootstrap_volume(source.0)?;
+        validate_bootstrap_volume(destination.0)?;
+        begin_legacy_local_rename_file_with_ctx(&self.ctx, disk_ref, source, destination, durable).await
+    }
+
     pub async fn begin_legacy_local_delete_versions(&self, disk_ref: &str, volume: &str) -> DiskResult<LegacyFileWrite> {
         validate_bootstrap_volume(volume)?;
         begin_legacy_local_delete_versions_with_ctx(&self.ctx, disk_ref, volume).await
@@ -114,6 +127,16 @@ fn validate_bootstrap_volume(volume: &str) -> DiskResult<()> {
 }
 
 impl ECStore {
+    pub async fn begin_legacy_local_rename_file(
+        &self,
+        disk_ref: &str,
+        source: (&str, &str),
+        destination: (&str, &str),
+        durable: bool,
+    ) -> DiskResult<LegacyRenameFile> {
+        begin_legacy_local_rename_file_with_ctx(&self.ctx, disk_ref, source, destination, durable).await
+    }
+
     pub async fn begin_legacy_local_delete_versions(&self, disk_ref: &str, volume: &str) -> DiskResult<LegacyFileWrite> {
         begin_legacy_local_delete_versions_with_ctx(&self.ctx, disk_ref, volume).await
     }
@@ -2355,4 +2378,18 @@ mod tests {
         assert!(record_local_disk_id_if_active(&instance_ctx, &replacement, disk_id).await);
         assert_eq!(instance_ctx.local_disk_id_map().read().await.get(&disk_id), Some(&endpoint));
     }
+}
+
+async fn begin_legacy_local_rename_file_with_ctx(
+    ctx: &Arc<InstanceContext>,
+    disk_ref: &str,
+    source: (&str, &str),
+    destination: (&str, &str),
+    durable: bool,
+) -> DiskResult<LegacyRenameFile> {
+    let (disk, disk_id) = local_disk_candidate(ctx, disk_ref).await?;
+    let owner =
+        admit_local_disk(ctx, &disk, disk_id, !is_meta_bucketname(source.0) || !is_meta_bucketname(destination.0)).await?;
+    disk.begin_legacy_rename_file(source, destination, durable, owner.map(|owner| owner as Arc<dyn Send + Sync>))
+        .await
 }
