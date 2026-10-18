@@ -15,6 +15,7 @@
 //! CopyObject path.
 
 use super::*;
+use rustfs_utils::path::fold_object_name_path_separators;
 
 use crate::auth::{VerifiedPresignedRequest, reject_presigned_put_max_content_length_for_other_operation};
 use crate::error::ServerSideSourceReadError;
@@ -94,6 +95,16 @@ fn copy_namespace_lock_error(bucket: &str, object: &str, mode: &'static str, err
         },
         other => StorageError::Lock(other),
     }
+}
+
+/// Object name the namespace lock of a copy endpoint is keyed by: the disk
+/// identity of the stored name. On Windows that folds spellings
+/// `path_join_buf` keeps apart (`a\b\` vs `a/b`), so a copy that is not a
+/// same-object copy can still have its source read guard and destination
+/// write lock on one lock, and must take the self-copy lock to not wait on
+/// itself.
+fn copy_namespace_lock_object(key: &str, backslash_is_separator: bool) -> String {
+    fold_object_name_path_separators(&encode_dir_object(key), backslash_is_separator).into_owned()
 }
 
 async fn acquire_self_copy_namespace_lock<S>(
@@ -340,6 +351,10 @@ impl DefaultObjectUsecase {
         apply_bucket_generation_guard(&req, &bucket, &mut dst_opts)?;
 
         let cp_src_dst_same = path_join_buf(&[&src_bucket, &src_key]) == path_join_buf(&[&bucket, &key]);
+        let backslash_is_separator = cfg!(target_os = "windows");
+        let dst_lock_object = copy_namespace_lock_object(&key, backslash_is_separator);
+        let self_copy_lock = cp_src_dst_same
+            || (src_bucket == bucket && copy_namespace_lock_object(&src_key, backslash_is_separator) == dst_lock_object);
         let expected_current_version_id = expected_current_version_id(&req.headers)?;
         if expected_current_version_id.is_some()
             && (!cp_src_dst_same || version_id.is_none() || dest_version_id.is_some() || !dst_opts.versioned)
@@ -401,7 +416,7 @@ impl DefaultObjectUsecase {
         // with that key (for example, copying `bucket/bucket` onto itself).
         let bucket_sse_config = load_bucket_default_sse_config(&bucket).await?;
         let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
-        if cp_src_dst_same && key == bucket {
+        if self_copy_lock && dst_lock_object == bucket {
             dst_opts.object_lock_config_snapshot =
                 Some(store.object_lock_config_snapshot(&bucket).await.map_err(ApiError::from)?);
         }
@@ -415,7 +430,7 @@ impl DefaultObjectUsecase {
         // expected-current historical copies. With lock optimization disabled, the source
         // stream retains its read guard until EOF; taking the write lock later in ECStore
         // would self-deadlock before the copy can consume that stream.
-        let _self_copy_lock_guard = if cp_src_dst_same {
+        let _self_copy_lock_guard = if self_copy_lock {
             let guard = acquire_self_copy_namespace_lock(store.as_ref(), &bucket, &key).await?;
             src_opts.no_lock = true;
             src_get_opts.no_lock = true;
@@ -930,6 +945,21 @@ mod tests {
     use s3s::dto::{ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule};
     use std::sync::Arc;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn copy_namespace_lock_object_folds_backslash_spellings_only_as_separators() {
+        // `a\b\` is not a same-object copy of `a/b` by `path_join_buf` (the
+        // trailing separator survives), yet on Windows both are the xl.meta
+        // of `a/b` and share one namespace lock.
+        assert_eq!(copy_namespace_lock_object("a\\b\\", true), copy_namespace_lock_object("a/b", true));
+        assert_eq!(copy_namespace_lock_object("\\a\\b", true), "a/b");
+        assert_ne!(copy_namespace_lock_object("a\\b\\", false), copy_namespace_lock_object("a/b", false));
+        // Directory objects keep their encoded identity.
+        assert_eq!(copy_namespace_lock_object("a/b/", true), "a/b__XLDIR__");
+        assert_ne!(copy_namespace_lock_object("a/b/", true), copy_namespace_lock_object("a/b", true));
+        assert_eq!(copy_namespace_lock_object("bucket", true), "bucket");
+        assert_eq!(copy_namespace_lock_object("\\bucket", true), "bucket");
+    }
 
     #[test]
     fn local_copy_does_not_inherit_source_replication_generation() {

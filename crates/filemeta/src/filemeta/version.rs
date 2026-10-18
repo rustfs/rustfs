@@ -588,7 +588,8 @@ impl FileMetaShallowVersion {
     }
 
     pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfo> {
-        self.parse_version_meta()?.into_fileinfo(volume, path, all_parts)
+        self.parse_version_meta()?
+            .into_fileinfo_with_part_checksums(volume, path, all_parts, true)
     }
 
     pub(super) fn to_fileinfo_with_part_checksums(
@@ -599,7 +600,7 @@ impl FileMetaShallowVersion {
         include_part_checksums: bool,
     ) -> Result<FileInfo> {
         self.parse_version_meta()?
-            .to_fileinfo_with_part_checksums(volume, path, all_parts, include_part_checksums)
+            .into_fileinfo_with_part_checksums(volume, path, all_parts, include_part_checksums)
     }
 }
 
@@ -923,6 +924,26 @@ impl FileMetaVersion {
 
     pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfo> {
         self.to_fileinfo_with_part_checksums(volume, path, all_parts, true)
+    }
+
+    pub(super) fn into_fileinfo_with_part_checksums(
+        self,
+        volume: &str,
+        path: &str,
+        all_parts: bool,
+        include_part_checksums: bool,
+    ) -> Result<FileInfo> {
+        if self.version_type == VersionType::Object {
+            let mut fi = self.object.unwrap_or_default().into_fileinfo_with_part_checksums(
+                volume,
+                path,
+                all_parts,
+                include_part_checksums,
+            )?;
+            fi.uses_legacy_checksum = self.uses_legacy_checksum;
+            return Ok(fi);
+        }
+        self.to_fileinfo_with_part_checksums(volume, path, all_parts, include_part_checksums)
     }
 
     pub(super) fn to_fileinfo_with_part_checksums(
@@ -2562,8 +2583,39 @@ impl MetaObject {
         all_parts: bool,
         include_part_checksums: bool,
     ) -> Result<FileInfo> {
+        Self {
+            version_id: self.version_id,
+            data_dir: self.data_dir,
+            erasure_algorithm: self.erasure_algorithm.clone(),
+            erasure_m: self.erasure_m,
+            erasure_n: self.erasure_n,
+            erasure_block_size: self.erasure_block_size,
+            erasure_index: self.erasure_index,
+            erasure_dist: self.erasure_dist.clone(),
+            bitrot_checksum_algo: self.bitrot_checksum_algo.clone(),
+            part_numbers: self.part_numbers.clone(),
+            part_etags: if all_parts { self.part_etags.clone() } else { Vec::new() },
+            part_sizes: self.part_sizes.clone(),
+            part_actual_sizes: self.part_actual_sizes.clone(),
+            part_indices: if all_parts { self.part_indices.clone() } else { Vec::new() },
+            size: self.size,
+            mod_time: self.mod_time,
+            meta_sys: self.meta_sys.clone(),
+            meta_user: self.meta_user.clone(),
+        }
+        .into_fileinfo_with_part_checksums(volume, path, all_parts, include_part_checksums)
+    }
+
+    fn into_fileinfo_with_part_checksums(
+        mut self,
+        volume: &str,
+        path: &str,
+        all_parts: bool,
+        include_part_checksums: bool,
+    ) -> Result<FileInfo> {
         let version_id = self.version_id.filter(|&vid| !vid.is_nil());
-        let derived_metadata = DerivedInternalMetadata::from_meta_sys(&self.meta_sys)?;
+        let meta_sys = std::mem::take(&mut self.meta_sys);
+        let derived_metadata = DerivedInternalMetadata::from_meta_sys(&meta_sys)?;
 
         let parts = if all_parts {
             let n = self.part_numbers.len();
@@ -2578,74 +2630,39 @@ impl MetaObject {
             if n != 0 && (self.part_sizes.len() != n || self.part_actual_sizes.len() != n) {
                 return Err(Error::FileCorrupt);
             }
-            let mut parts = vec![ObjectPartInfo::default(); n];
+            let mut etags = (self.part_etags.len() == n).then(|| self.part_etags.into_iter());
+            let mut indices = (self.part_indices.len() == n).then(|| self.part_indices.into_iter());
+            let mut parts = Vec::with_capacity(n);
 
-            for (i, part) in parts.iter_mut().enumerate() {
-                part.number = self.part_numbers[i];
-                part.size = self.part_sizes[i];
-                part.actual_size = self.part_actual_sizes[i];
-
+            for i in 0..n {
                 // etag/index stay soft-guarded: they are recomputable / optional, an empty
                 // PartETags is legitimate MinIO interop, and a length mismatch there does
                 // not corrupt returned data.
-                if self.part_etags.len() == n {
-                    part.etag = self.part_etags[i].clone();
-                }
-
-                if self.part_indices.len() == n {
-                    part.index = if self.part_indices[i].is_empty() {
-                        None
-                    } else {
-                        Some(self.part_indices[i].clone())
-                    };
-                }
+                parts.push(ObjectPartInfo {
+                    number: self.part_numbers[i],
+                    size: self.part_sizes[i],
+                    actual_size: self.part_actual_sizes[i],
+                    etag: etags.as_mut().and_then(Iterator::next).unwrap_or_default(),
+                    index: indices.as_mut().and_then(Iterator::next).filter(|idx| !idx.is_empty()),
+                    ..Default::default()
+                });
             }
             parts
         } else {
             Vec::new()
         };
 
-        let mut metadata = HashMap::with_capacity(self.meta_user.len() + self.meta_sys.len());
-        for (k, v) in &self.meta_user {
-            if k == AMZ_META_UNENCRYPTED_CONTENT_LENGTH || k == AMZ_META_UNENCRYPTED_CONTENT_MD5 {
-                continue;
-            }
-
-            if k == metadata_keys::STORAGE_CLASS && v == "STANDARD" {
-                continue;
-            }
-
-            metadata.insert(k.to_owned(), v.to_owned());
+        let mut metadata = self.meta_user;
+        metadata.remove(AMZ_META_UNENCRYPTED_CONTENT_LENGTH);
+        metadata.remove(AMZ_META_UNENCRYPTED_CONTENT_MD5);
+        if metadata.get(metadata_keys::STORAGE_CLASS).is_some_and(|v| v == "STANDARD") {
+            metadata.remove(metadata_keys::STORAGE_CLASS);
         }
-
-        for (k, v) in &self.meta_sys {
-            if has_internal_suffix(k, SUFFIX_TIER_FV_ID) || has_internal_suffix(k, SUFFIX_TIER_FV_MARKER) {
-                continue;
-            }
-
-            if k.eq_ignore_ascii_case(metadata_keys::STORAGE_CLASS) && v == b"STANDARD" {
-                continue;
-            }
-
-            if is_internal_key(k) {
-                metadata.insert(k.to_owned(), String::from_utf8(v.to_owned()).unwrap_or_default());
-            }
-        }
-
-        let replication_state_internal = get_internal_replication_state(&metadata);
-
-        let mut deleted = false;
-
-        if let Some(v) = replication_state_internal.as_ref() {
-            if !v.composite_version_purge_status().is_empty() {
-                deleted = true;
-            }
-
-            let st = v.composite_replication_status();
-            if !st.is_empty() {
-                metadata.insert(metadata_keys::REPLICATION_STATUS.to_string(), st.to_string());
-            }
-        }
+        let user_has_internal = metadata.keys().any(|k| is_internal_key(k));
+        let mut has_replication_candidate = user_has_internal;
+        let mut has_part_checksums = user_has_internal || derived_metadata.part_checksums.is_some();
+        let mut has_upload_integrity = user_has_internal;
+        let mut has_shard_or_inline_integrity = user_has_internal;
 
         let checksum = derived_metadata
             .checksum
@@ -2658,7 +2675,7 @@ impl MetaObject {
             parity_blocks: self.erasure_n,
             block_size: self.erasure_block_size,
             index: self.erasure_index,
-            distribution: self.erasure_dist.iter().map(|&v| v as usize).collect(),
+            distribution: self.erasure_dist.into_iter().map(usize::from).collect(),
             ..Default::default()
         };
 
@@ -2677,17 +2694,77 @@ impl MetaObject {
         if derived_metadata.transitioned_version_state.is_some() {
             validate_transition_version_state(transition_version_state, transition_version.as_deref())?;
         }
-        for (key, value) in &self.meta_sys {
-            if is_transition_version_metadata_key(key) {
-                metadata.insert(key.to_owned(), transition_version_metadata_value(value, transition_version.as_deref()));
-            }
-        }
         let transition_version_id = transition_version.as_deref().and_then(|value| Uuid::parse_str(value).ok());
         let transition_tier = derived_metadata
             .transition_tier
             .filter(|value| !value.is_empty())
             .map(|v| String::from_utf8_lossy(v).to_string())
             .unwrap_or_default();
+
+        metadata.reserve(meta_sys.len());
+        for (k, v) in meta_sys {
+            if has_internal_suffix(&k, SUFFIX_TIER_FV_ID) || has_internal_suffix(&k, SUFFIX_TIER_FV_MARKER) {
+                continue;
+            }
+            if k.eq_ignore_ascii_case(metadata_keys::STORAGE_CLASS) && v == b"STANDARD" {
+                continue;
+            }
+            let Some(suffix) = strip_internal_prefix_preserving_case(&k) else {
+                continue;
+            };
+            if suffix.eq_ignore_ascii_case(SUFFIX_TRANSITIONED_VERSION_ID) {
+                let val = transition_version_metadata_value(&v, transition_version.as_deref());
+                metadata.insert(k, val);
+                continue;
+            }
+            if !k.is_ascii() {
+                has_replication_candidate = true;
+                has_part_checksums = true;
+                has_upload_integrity = true;
+                has_shard_or_inline_integrity = true;
+            } else {
+                match suffix.as_bytes().first().map(u8::to_ascii_lowercase) {
+                    Some(b'p') => {
+                        if suffix.eq_ignore_ascii_case(SUFFIX_PURGESTATUS) {
+                            has_replication_candidate = true;
+                        } else if suffix.eq_ignore_ascii_case(SUFFIX_PART_CHECKSUMS) {
+                            has_part_checksums = true;
+                        }
+                    }
+                    Some(b'r') => has_replication_candidate = true,
+                    Some(b's') => {
+                        if suffix.eq_ignore_ascii_case(crate::shard_integrity::SUFFIX_UPLOAD_INTEGRITY) {
+                            has_upload_integrity = true;
+                        } else if suffix.eq_ignore_ascii_case(crate::shard_integrity::SUFFIX_SHARD_INTEGRITY)
+                            || suffix.eq_ignore_ascii_case(crate::shard_integrity::SUFFIX_INLINE_INTEGRITY)
+                        {
+                            has_shard_or_inline_integrity = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            metadata.insert(k, String::from_utf8(v).unwrap_or_default());
+        }
+
+        let replication_state_internal = if has_replication_candidate {
+            get_internal_replication_state(&metadata)
+        } else {
+            None
+        };
+
+        let mut deleted = false;
+
+        if let Some(v) = replication_state_internal.as_ref() {
+            if !v.composite_version_purge_status().is_empty() {
+                deleted = true;
+            }
+
+            let st = v.composite_replication_status();
+            if !st.is_empty() {
+                metadata.insert(metadata_keys::REPLICATION_STATUS.to_string(), st.to_string());
+            }
+        }
 
         let mut file_info = FileInfo {
             version_id,
@@ -2710,15 +2787,18 @@ impl MetaObject {
             transition_tier,
             ..Default::default()
         };
-        if all_parts && include_part_checksums {
+        if all_parts && include_part_checksums && has_part_checksums {
             file_info.hydrate_data_movement_part_checksums()?;
         }
         if !self.part_numbers.is_empty()
+            && has_upload_integrity
             && rustfs_utils::http::contains_key_str(&file_info.metadata, crate::shard_integrity::SUFFIX_UPLOAD_INTEGRITY)
         {
             return Err(Error::FileCorrupt);
         }
-        if let Some(commitments) = crate::shard_integrity::descriptor_from_metadata(&file_info.metadata)? {
+        if has_shard_or_inline_integrity
+            && let Some(commitments) = crate::shard_integrity::descriptor_from_metadata(&file_info.metadata)?
+        {
             let layout = crate::shard_integrity::IntegrityLayout::new(
                 self.erasure_m,
                 self.erasure_n,
@@ -2938,6 +3018,7 @@ impl From<FileInfo> for MetaObject {
 pub fn get_internal_replication_state(metadata: &HashMap<String, String>) -> Option<ReplicationState> {
     let mut rs = ReplicationState::default();
     let mut has = false;
+    let mut has_delete_marker_version_keys = false;
 
     for (k, v) in metadata.iter() {
         if has_internal_suffix(k, SUFFIX_PURGESTATUS) {
@@ -2961,6 +3042,11 @@ pub fn get_internal_replication_state(metadata: &HashMap<String, String>) -> Opt
                 has = true;
                 rs.replication_status_internal = Some(v.clone());
                 rs.targets = replication_statuses_map(v.as_str());
+            } else if sub_key
+                .get(..SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX))
+            {
+                has_delete_marker_version_keys = true;
             } else if let Some(arn) = rustfs_utils::http::internal_key_strip_suffix_prefix(k, SUFFIX_REPLICATION_RESET_ARN_PREFIX)
             {
                 has = true;
@@ -2981,9 +3067,12 @@ pub fn get_internal_replication_state(metadata: &HashMap<String, String>) -> Opt
     // authority. `corrupt` means the dual internal prefixes disagreed: surface it
     // rather than guessing, so callers fail closed instead of purging the wrong
     // target version.
-    (rs.target_delete_marker_version_ids, rs.target_delete_marker_version_ids_corrupt) = target_delete_marker_versions(metadata);
-    has |= !rs.target_delete_marker_version_ids.is_empty();
-    has |= rs.target_delete_marker_version_ids_corrupt;
+    if has_delete_marker_version_keys {
+        (rs.target_delete_marker_version_ids, rs.target_delete_marker_version_ids_corrupt) =
+            target_delete_marker_versions(metadata);
+        has |= !rs.target_delete_marker_version_ids.is_empty();
+        has |= rs.target_delete_marker_version_ids_corrupt;
+    }
 
     if has { Some(rs) } else { None }
 }
@@ -5463,6 +5552,48 @@ mod tests {
             ts,
             "lookup must find the round-tripped reset status"
         );
+    }
+
+    #[test]
+    fn into_fileinfo_preserves_upload_integrity_and_non_ascii_checksum_guards() {
+        for key in [
+            format!("{RUSTFS_INTERNAL_PREFIX}{}", crate::shard_integrity::SUFFIX_UPLOAD_INTEGRITY),
+            format!(
+                "{}{}",
+                rustfs_utils::http::MINIO_INTERNAL_PREFIX,
+                crate::shard_integrity::SUFFIX_UPLOAD_INTEGRITY.to_ascii_uppercase()
+            ),
+        ] {
+            for all_parts in [false, true] {
+                let mut obj = MetaObject {
+                    part_numbers: vec![1],
+                    part_sizes: vec![1024],
+                    part_actual_sizes: vec![1024],
+                    ..Default::default()
+                };
+                obj.meta_sys.insert(key.clone(), b"1".to_vec());
+                assert!(
+                    matches!(obj.into_fileinfo("bucket", "object", all_parts), Err(Error::FileCorrupt)),
+                    "upload-integrity marker {key} with parts must fail closed (all_parts={all_parts})"
+                );
+            }
+        }
+
+        for prefix in [RUSTFS_INTERNAL_PREFIX, rustfs_utils::http::MINIO_INTERNAL_PREFIX] {
+            let mut obj = MetaObject {
+                part_numbers: vec![1],
+                part_sizes: vec![1024],
+                part_actual_sizes: vec![1024],
+                ..Default::default()
+            };
+            let non_ascii_suffix = SUFFIX_PART_CHECKSUMS.replacen('k', "\u{212A}", 1);
+            obj.meta_sys
+                .insert(format!("{prefix}{non_ascii_suffix}"), br#"[[1,[["CRC32","AAAAAA=="]]]]"#.to_vec());
+            assert!(
+                matches!(obj.into_fileinfo("bucket", "object", true), Err(Error::FileCorrupt)),
+                "non-ASCII part-checksums alias under {prefix} must fail closed"
+            );
+        }
     }
 
     #[test]

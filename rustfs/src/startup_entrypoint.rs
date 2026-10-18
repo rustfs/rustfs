@@ -39,7 +39,41 @@ const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const EVENT_SERVER_RUNTIME_FAILED: &str = "server_runtime_failed";
 const OBSERVABILITY_INIT_FATAL_ALREADY_REPORTED: &str = "observability initialization failure already reported";
 
+/// Thread name for the thread that drives the root startup future.
+const STARTUP_THREAD_NAME: &str = "rustfs-main";
+
+/// Stack reserved for the thread that drives the root startup future.
+///
+/// `block_on` polls `async_main` on the calling thread, so the whole startup
+/// chain runs on that thread's stack rather than on a Tokio worker. The native
+/// main thread only gets what the platform hands out: 8 MiB from `ulimit -s`
+/// on Linux and macOS, but the 1 MiB PE default on Windows, where a debug
+/// build overflows before it starts listening. `RUST_MIN_STACK` does not apply
+/// to the native main thread, so the budget is set here explicitly instead.
+/// Startup currently peaks near 2 MiB in a debug build and under 1 MiB in a
+/// release build; 8 MiB keeps the budget Linux and macOS already had.
+const STARTUP_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+
 pub fn run_process() {
+    run_on_startup_thread(run_process_on_current_thread);
+}
+
+/// Run `f` on a thread whose stack is [`STARTUP_THREAD_STACK_SIZE`] on every
+/// platform, propagating its panic so the process exit status is unchanged.
+fn run_on_startup_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    // Failing to spawn the startup thread is a startup fatal boundary.
+    let handle = std::thread::Builder::new()
+        .name(STARTUP_THREAD_NAME.to_owned())
+        .stack_size(STARTUP_THREAD_STACK_SIZE)
+        .spawn(f)
+        .expect("Failed to spawn startup thread");
+    match handle.join() {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+fn run_process_on_current_thread() {
     // Building the process runtime is a startup fatal boundary.
     let (runtime, dial9_guard) = crate::server::build_tokio_runtime().expect("Failed to build Tokio runtime");
     let result = runtime.block_on(async_main());
@@ -2033,5 +2067,37 @@ mod tests {
             format_fatal_stderr_message("Observability initialization failed", "collector unavailable"),
             "[FATAL] Observability initialization failed: collector unavailable"
         );
+    }
+
+    /// Consume roughly `bytes` of stack through non-elidable recursive frames.
+    #[inline(never)]
+    fn consume_stack(bytes: usize) -> u8 {
+        const FRAME: usize = 64 * 1024;
+        let mut frame = [0_u8; FRAME];
+        std::hint::black_box(&mut frame);
+        if bytes <= FRAME {
+            return frame[0];
+        }
+        frame[0].wrapping_add(consume_stack(bytes - FRAME))
+    }
+
+    #[test]
+    fn startup_thread_provides_documented_stack_budget() {
+        // Half the budget exceeds both the 2 MiB Rust thread default and the
+        // 1 MiB Windows main thread, so this overflows unless the startup
+        // thread really gets its explicit budget.
+        let used = STARTUP_THREAD_STACK_SIZE / 2;
+        let name = run_on_startup_thread(move || {
+            std::hint::black_box(consume_stack(used));
+            std::thread::current().name().map(str::to_owned)
+        });
+        assert_eq!(name.as_deref(), Some(STARTUP_THREAD_NAME));
+    }
+
+    #[test]
+    fn startup_thread_propagates_panics() {
+        let result = std::panic::catch_unwind(|| run_on_startup_thread(|| panic!("startup thread panic")));
+        let payload = result.expect_err("startup thread panic must propagate");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"startup thread panic"));
     }
 }

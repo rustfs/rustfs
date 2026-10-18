@@ -157,6 +157,18 @@ struct PeerAdminCache {
     last_server_success: Option<SystemTime>,
 }
 
+fn scanner_publication_lease_acquisition_error(host: &str, observational_only: bool, error: Error) -> Error {
+    let purpose = if observational_only {
+        "observational"
+    } else {
+        "authoritative"
+    };
+    // Retry classification depends on the original error suffix.
+    Error::other(format!(
+        "scanner publication lease acquisition failed: peer={host}, purpose={purpose}: {error}"
+    ))
+}
+
 #[derive(Default)]
 struct TierConfigReloadWorkers {
     peers: HashMap<String, bool>,
@@ -2954,7 +2966,7 @@ impl NotificationSys {
                 Ok(lease) => grants.push(ScannerPublicationLeaseGrant { host, lease }),
                 Err(err) => {
                     let _ = self.release_scanner_publication_leases(grants).await;
-                    return Err(Error::other(format!("scanner publication lease acquisition failed: {err}")));
+                    return Err(scanner_publication_lease_acquisition_error(&host, observational_only, err));
                 }
             }
         }
@@ -3952,6 +3964,22 @@ mod tests {
     use super::*;
     use crate::bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
     use rustfs_data_usage::TierStats;
+
+    #[test]
+    fn scanner_lease_acquisition_error_identifies_peer_and_preserves_retry_suffix() {
+        for (observational_only, purpose) in [(false, "authoritative"), (true, "observational")] {
+            let reason = "scanner publication lease is blocked by pending namespace commit";
+            let error = scanner_publication_lease_acquisition_error(
+                "peer-a.example.invalid:9000",
+                observational_only,
+                Error::other(reason),
+            )
+            .to_string();
+            assert!(error.contains("peer-a.example.invalid:9000"), "missing peer: {error}");
+            assert!(error.contains(purpose), "missing purpose: {error}");
+            assert!(error.ends_with(reason), "retry classification must retain the original suffix");
+        }
+    }
 
     fn ring(total_size: u64) -> LastDayTierStats {
         let mut stats = LastDayTierStats::default();

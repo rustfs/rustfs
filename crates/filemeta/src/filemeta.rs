@@ -696,9 +696,55 @@ impl FileMeta {
         // Ok(())
     }
 
+    /// Apply a disk deletion batch while compacting inline payloads only once.
+    /// Missing non-marker requests retain the disk layer's idempotent semantics.
+    pub fn delete_versions(&mut self, requests: &[FileInfo]) -> Result<Vec<Option<Uuid>>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut inline_keys = self.data.key_set()?;
+        let mut removed_keys = std::collections::HashSet::new();
+        let mut data_dirs = Vec::with_capacity(requests.len());
+        let mut failure = None;
+        for request in requests {
+            // Later requests must observe earlier inline removals even though
+            // the payload buffer is not rebuilt until the batch is complete.
+            let has_inline_data = self.data.version_ok()
+                && (inline_keys.contains(data_key_for_version(request.version_id).as_bytes())
+                    || legacy_data_key_for_version(request.version_id).is_some_and(|key| inline_keys.contains(key.as_bytes())));
+            match self.delete_version_inner(request, Some(has_inline_data)) {
+                Ok(data_dir) => {
+                    if let Some(dir) = data_dir {
+                        for key in [request.version_id.unwrap_or_default(), dir] {
+                            let key = key.to_string().into_bytes();
+                            if inline_keys.remove(&key) {
+                                removed_keys.insert(key);
+                            }
+                        }
+                    }
+                    data_dirs.push(data_dir);
+                }
+                Err(Error::FileNotFound | Error::FileVersionNotFound) if !request.deleted => data_dirs.push(None),
+                Err(err) => {
+                    failure = Some(err);
+                    break;
+                }
+            }
+        }
+        self.data.remove_keys(&removed_keys)?;
+        if let Some(err) = failure {
+            return Err(err);
+        }
+        Ok(data_dirs)
+    }
+
     // delete_version deletes version, returns data_dir
     #[tracing::instrument(level = "debug", skip(self))]
     pub fn delete_version(&mut self, fi: &FileInfo) -> Result<Option<Uuid>> {
+        self.delete_version_inner(fi, None)
+    }
+
+    fn delete_version_inner(&mut self, fi: &FileInfo, has_inline_data: Option<bool>) -> Result<Option<Uuid>> {
         fi.validate_for_delete_operation()?;
 
         let vid = Some(fi.version_id.unwrap_or(Uuid::nil()));
@@ -930,7 +976,7 @@ impl FileMeta {
             return Err(e);
         }
 
-        if self.shared_data_dir_count(obj_version_id, obj_data_dir) > 0 {
+        if self.shared_data_dir_count_with_inline_data(obj_version_id, obj_data_dir, has_inline_data) > 0 {
             return Ok(None);
         }
 

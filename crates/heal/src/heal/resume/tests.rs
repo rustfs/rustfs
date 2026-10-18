@@ -2339,6 +2339,162 @@ async fn test_checkpoint_schema_v5_discarded_on_load() {
     temp_dir.close().expect("remove schema test directory");
 }
 
+// Keep these signed wire fixtures independent of today's struct and its defaults.
+const LEGACY_SIGNED_CHECKPOINTS: [&str; 3] = [
+    r#"{"schema_version":5,"task_id":"00000000-0000-4000-8000-000000000002","checkpoint_time":1700000000,"current_bucket_index":2,"current_object_index":500,"processed_objects":["a","b"],"failed_objects":["c"],"skipped_objects":["d"],"integrity_digest":"/AZPOA1TZttBQ0ieKM0QBVMDnr5s2YWZqb+3rmg+vds="}"#,
+    r#"{"schema_version":6,"task_id":"00000000-0000-4000-8000-000000000002","checkpoint_time":1700000000,"current_bucket_index":2,"current_object_index":500,"processed_objects":["a","b"],"failed_objects":["c"],"skipped_objects":["d"],"integrity_digest":"4IBOlSw4ln91DXRnVZD0D7qDt+DKSp205Y6eFwNpm80="}"#,
+    r#"{"schema_version":6,"task_id":"00000000-0000-4000-8000-000000000002","checkpoint_time":1700000000,"current_bucket_index":2,"current_object_index":500,"processed_objects":["a","b"],"failed_objects":["c"],"skipped_objects":["d"],"integrity_digest":"mkGdi8fQRM6f1yS9NIyf+O8F9FRL4/pBXL79CD/il7k="}"#,
+];
+
+#[tokio::test]
+async fn signed_legacy_checkpoint_verifies_before_schema_upgrade() {
+    for legacy in LEGACY_SIGNED_CHECKPOINTS {
+        let (temp_dir, disk) = schema_test_disk().await;
+        let task_id = "00000000-0000-4000-8000-000000000002";
+        let path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+        disk.write_all(RUSTFS_META_BUCKET, &path, legacy.as_bytes().to_vec().into())
+            .await
+            .expect("write signed legacy checkpoint");
+
+        assert!(
+            CheckpointManager::is_resumable(&disk, task_id)
+                .await
+                .expect("discovery must accept an intact signed legacy checkpoint")
+        );
+        let manager = CheckpointManager::load_from_disk(disk.clone(), task_id)
+            .await
+            .expect("verify the original signed fields before filling defaults");
+        let checkpoint = manager.get_checkpoint().await;
+        assert_eq!(checkpoint.schema_version, CURRENT_CHECKPOINT_SCHEMA);
+        assert_eq!(checkpoint.current_bucket_index, 0);
+        assert_eq!(checkpoint.current_object_index, 0);
+        assert!(checkpoint.processed_objects.is_empty());
+        assert!(checkpoint.failed_objects.is_empty());
+        assert!(checkpoint.skipped_objects.is_empty());
+        assert_eq!(checkpoint.successful_objects, 0);
+        assert_eq!(checkpoint.failed_object_count, 0);
+        assert_eq!(checkpoint.skipped_object_count, 0);
+        assert!(!checkpoint.baseline_known);
+        assert!(!CheckpointManager::is_blocked(&disk, task_id).await);
+
+        manager
+            .update_position(1, 3)
+            .await
+            .expect("save upgraded checkpoint with CAS");
+        let restored = CheckpointManager::load_from_disk(disk, task_id)
+            .await
+            .expect("reload upgraded checkpoint")
+            .get_checkpoint()
+            .await;
+        assert_eq!(restored.current_bucket_index, 1);
+        assert_eq!(restored.current_object_index, 3);
+        temp_dir.close().expect("remove signed legacy checkpoint fixture");
+    }
+}
+
+#[tokio::test]
+async fn signed_legacy_checkpoint_rejects_tampering() {
+    for legacy in LEGACY_SIGNED_CHECKPOINTS {
+        let (temp_dir, disk) = schema_test_disk().await;
+        let task_id = "00000000-0000-4000-8000-000000000002";
+        let path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+        let tampered = legacy.replace("\"current_object_index\":500", "\"current_object_index\":501");
+        disk.write_all(RUSTFS_META_BUCKET, &path, tampered.as_bytes().to_vec().into())
+            .await
+            .expect("write modified signed legacy checkpoint");
+
+        assert!(matches!(
+            CheckpointManager::load_from_disk(disk.clone(), task_id).await,
+            Err(Error::InvalidCheckpoint(message)) if message.contains("digest does not match")
+        ));
+        assert!(CheckpointManager::is_blocked(&disk, task_id).await);
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, &path)
+                .await
+                .expect("invalid snapshot must remain available"),
+            tampered.as_bytes()
+        );
+        temp_dir.close().expect("remove modified legacy checkpoint fixture");
+    }
+}
+
+#[tokio::test]
+async fn signed_checkpoint_rejects_duplicate_fields() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = "00000000-0000-4000-8000-000000000002";
+    let path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+    let duplicate = LEGACY_SIGNED_CHECKPOINTS[2].replace(
+        "\"current_object_index\":500",
+        "\"current_object_index\":501,\"current_object_index\":500",
+    );
+    disk.write_all(RUSTFS_META_BUCKET, &path, duplicate.as_bytes().to_vec().into())
+        .await
+        .expect("write checkpoint with conflicting duplicate fields");
+
+    assert!(matches!(
+        CheckpointManager::load_from_disk(disk.clone(), task_id).await,
+        Err(Error::TaskExecutionFailed { message }) if message.contains("duplicate field")
+    ));
+    assert!(CheckpointManager::is_blocked(&disk, task_id).await);
+    temp_dir.close().expect("remove duplicate field checkpoint fixture");
+}
+
+#[tokio::test]
+async fn checkpoint_writer_preserves_base_reader_canonicalization() {
+    use sha2::{Digest, Sha256};
+
+    for admin in [false, true] {
+        let (temp_dir, disk) = schema_test_disk().await;
+        let task_id = ResumeUtils::generate_task_id();
+        let manager = CheckpointManager::new(disk.clone(), task_id.clone())
+            .await
+            .expect("create rollback-compatible checkpoint");
+        if admin {
+            manager
+                .set_admin(AdminErasureCheckpoint {
+                    set_disk_id: "pool_0_set_0".to_string(),
+                    options: Default::default(),
+                    buckets: [("bucket".to_string(), Some(uuid::Uuid::new_v4()))].into(),
+                    outcome: Default::default(),
+                    completed: false,
+                })
+                .await
+                .expect("save nested administrator checkpoint");
+        }
+        manager.add_processed_object("b".to_string()).await.expect("record object b");
+        manager.add_processed_object("a".to_string()).await.expect("record object a");
+        manager.update_position(2, 9).await.expect("flush rollback fixture");
+        let path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+        let bytes = disk
+            .read_all(RUSTFS_META_BUCKET, &path)
+            .await
+            .expect("read real writer output");
+        let mut wire: serde_json::Value = serde_json::from_slice(&bytes).expect("decode writer output");
+        wire.sort_all_objects();
+        assert_eq!(
+            bytes.as_ref(),
+            serde_json::to_vec(&wire).expect("encode recursively sorted payload"),
+            "persisted keys must have the production base writer's order, including nested admin fields"
+        );
+        let signature = wire["integrity_digest"].take();
+        let unsigned = serde_json::to_vec(&wire).expect("encode base reader signing representation");
+        assert_eq!(
+            signature,
+            base64_simd::STANDARD.encode_to_string(Sha256::digest(&unsigned)),
+            "the production base reader must accept this writer's signature"
+        );
+        let restored = CheckpointManager::load_from_disk(disk, &task_id)
+            .await
+            .expect("same-version control must also load")
+            .get_checkpoint()
+            .await;
+        assert_eq!(restored.current_bucket_index, 2);
+        assert_eq!(restored.current_object_index, 9);
+        assert_eq!(restored.admin.is_some(), admin);
+        temp_dir.close().expect("remove rollback canonicalization fixture");
+    }
+}
+
 #[tokio::test]
 async fn downgraded_unsigned_checkpoint_resets_untrusted_progress() {
     let (temp_dir, disk) = schema_test_disk().await;

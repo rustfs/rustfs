@@ -22,6 +22,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::{debug, warn};
 
+mod integrity;
+use integrity::CheckpointJson;
+
 use super::super::storage_api::owner::{EcstoreConditionalFileUpdate, EcstoreDiskAPI, EcstoreDiskBytes};
 use super::super::{BUCKET_META_PREFIX, DiskStore, HealDiskExt, RUSTFS_META_BUCKET};
 use super::{
@@ -406,8 +409,10 @@ impl CheckpointManager {
 
     async fn load_from_data(disk: DiskStore, task_id: &str, checkpoint_data: Vec<u8>) -> Result<Self> {
         validate_resume_task_id(task_id)?;
-        let mut checkpoint: ResumeCheckpoint = match serde_json::from_slice(&checkpoint_data) {
-            Ok(checkpoint) => checkpoint,
+        let (mut persisted, mut checkpoint) = match serde_json::from_slice::<ResumeCheckpoint>(&checkpoint_data)
+            .and_then(|checkpoint| serde_json::from_slice::<CheckpointJson>(&checkpoint_data).map(|value| (value, checkpoint)))
+        {
+            Ok(decoded) => decoded,
             Err(error) => {
                 Self::block_invalid_snapshot(&disk, task_id).await;
                 return Err(Error::TaskExecutionFailed {
@@ -451,7 +456,15 @@ impl CheckpointManager {
         }
 
         let integrity_verified = if let Some(expected) = checkpoint.integrity_digest.as_deref() {
-            let actual = Self::checkpoint_digest(&Self::serialize_without_digest(&checkpoint)?);
+            // Verify the persisted fields: typed defaults can add fields that
+            // were absent from an otherwise intact older signed checkpoint.
+            let mut actual = Self::checkpoint_digest(&persisted.unsigned_bytes()?);
+            if expected != actual {
+                // RUSTFS_COMPAT_TODO(#2871): retain until snapshots whose
+                // payload order differs from their digest order are retired.
+                persisted.sort_all_objects();
+                actual = Self::checkpoint_digest(&persisted.unsigned_bytes()?);
+            }
             if expected != actual {
                 Self::block_invalid_snapshot(&disk, task_id).await;
                 return Err(Error::InvalidCheckpoint(format!(
@@ -804,10 +817,14 @@ impl CheckpointManager {
         let _save_guard = self.save_lock.lock().await;
         let checkpoint = self.checkpoint.read().await.clone();
         validate_resume_task_id(&checkpoint.task_id)?;
-        let unsigned_checkpoint_data = Self::serialize_without_digest(&checkpoint)?;
+        let checkpoint_value = serde_json::to_value(&checkpoint).map_err(|e| Error::TaskExecutionFailed {
+            message: format!("Failed to serialize checkpoint: {e}"),
+        })?;
+        let mut persisted_checkpoint = CheckpointJson::from_value(checkpoint_value)?;
+        persisted_checkpoint.sort_all_objects();
+        let unsigned_checkpoint_data = persisted_checkpoint.unsigned_bytes()?;
         let digest = Self::checkpoint_digest(&unsigned_checkpoint_data);
-        let mut persisted_checkpoint = checkpoint.clone();
-        persisted_checkpoint.integrity_digest = Some(digest);
+        persisted_checkpoint.set_digest(Some(digest))?;
         let checkpoint_data =
             EcstoreDiskBytes::from(serde_json::to_vec(&persisted_checkpoint).map_err(|e| Error::TaskExecutionFailed {
                 message: format!("Failed to serialize checkpoint: {e}"),
@@ -953,25 +970,6 @@ impl CheckpointManager {
             .map_err(|e| Error::TaskExecutionFailed {
                 message: format!("Failed to read checkpoint file: {e}"),
             })
-    }
-
-    fn serialize_without_digest(checkpoint: &ResumeCheckpoint) -> Result<Vec<u8>> {
-        let mut unsigned = checkpoint.clone();
-        unsigned.integrity_digest = None;
-        let mut value = serde_json::to_value(&unsigned).map_err(|e| Error::TaskExecutionFailed {
-            message: format!("Failed to serialize checkpoint: {e}"),
-        })?;
-        for field in ["processed_objects", "failed_objects", "skipped_objects"] {
-            let Some(values) = value.get_mut(field).and_then(serde_json::Value::as_array_mut) else {
-                return Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to canonicalize checkpoint field: {field}"),
-                });
-            };
-            values.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
-        }
-        serde_json::to_vec(&value).map_err(|e| Error::TaskExecutionFailed {
-            message: format!("Failed to serialize checkpoint: {e}"),
-        })
     }
 
     fn checkpoint_digest(checkpoint_data: &[u8]) -> String {

@@ -318,6 +318,13 @@ pub struct ScannerUsageFreshnessSnapshot {
     pub last_deferred_unix_secs: u64,
     #[serde(rename = "last_deferred_reason", default)]
     pub last_deferred_reason: String,
+    /// Cluster-activity guardrail vetoes, attributed as `<field>@<host>`.
+    #[serde(rename = "guardrail_veto_total", default)]
+    pub guardrail_veto_total: u64,
+    #[serde(rename = "last_guardrail_veto_unix_secs", default)]
+    pub last_guardrail_veto_unix_secs: u64,
+    #[serde(rename = "last_guardrail_veto_reason", default)]
+    pub last_guardrail_veto_reason: String,
 }
 
 impl ScannerUsageFreshnessSnapshot {
@@ -343,6 +350,11 @@ impl ScannerUsageFreshnessSnapshot {
             self.last_publication_reason = other.last_publication_reason.clone();
         }
         self.deferred_total = self.deferred_total.saturating_add(other.deferred_total);
+        self.guardrail_veto_total = self.guardrail_veto_total.saturating_add(other.guardrail_veto_total);
+        if other.last_guardrail_veto_unix_secs > self.last_guardrail_veto_unix_secs {
+            self.last_guardrail_veto_unix_secs = other.last_guardrail_veto_unix_secs;
+            self.last_guardrail_veto_reason = other.last_guardrail_veto_reason.clone();
+        }
         if other_deferred_state_at > self_deferred_state_at {
             self.deferred_pending = other.deferred_pending;
         } else if other_deferred_state_at == self_deferred_state_at {
@@ -1719,6 +1731,26 @@ mod tests {
         .expect("legacy usage freshness should decode");
         assert!(!legacy.deferred_pending);
         assert_eq!(legacy.deferred_total, 0);
+        assert_eq!(legacy.guardrail_veto_total, 0);
+        assert_eq!(legacy.last_guardrail_veto_unix_secs, 0);
+        assert!(legacy.last_guardrail_veto_reason.is_empty());
+
+        let mut vetoes = ScannerUsageFreshnessSnapshot::default();
+        vetoes.merge(&ScannerUsageFreshnessSnapshot {
+            guardrail_veto_total: 2,
+            last_guardrail_veto_unix_secs: 30,
+            last_guardrail_veto_reason: "publication_blocked@<local>".to_string(),
+            ..Default::default()
+        });
+        vetoes.merge(&ScannerUsageFreshnessSnapshot {
+            guardrail_veto_total: 1,
+            last_guardrail_veto_unix_secs: 20,
+            last_guardrail_veto_reason: "movement_generation@node-2".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(vetoes.guardrail_veto_total, 3);
+        assert_eq!(vetoes.last_guardrail_veto_unix_secs, 30);
+        assert_eq!(vetoes.last_guardrail_veto_reason, "publication_blocked@<local>");
 
         let mut merged = ScannerUsageFreshnessSnapshot::default();
         merged.merge(&ScannerUsageFreshnessSnapshot {

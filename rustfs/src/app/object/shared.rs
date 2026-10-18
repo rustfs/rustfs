@@ -1884,6 +1884,7 @@ mod tests {
             noncurrent_days: 0,
             newer_noncurrent_versions: 0,
             storage_class: String::new(),
+            expiry_policy: None,
         };
 
         assert!(build_put_object_expiration_header(&event).is_none());
@@ -1899,6 +1900,7 @@ mod tests {
             noncurrent_days: 0,
             newer_noncurrent_versions: 0,
             storage_class: String::new(),
+            expiry_policy: None,
         };
 
         // HTTP-date, not RFC 3339: the AWS SDKs parse this field with an
@@ -1916,6 +1918,7 @@ mod tests {
             noncurrent_days: 0,
             newer_noncurrent_versions: 0,
             storage_class: String::new(),
+            expiry_policy: None,
         };
 
         assert!(build_put_object_expiration_header(&event).is_none());
@@ -1927,6 +1930,7 @@ mod tests {
             noncurrent_days: 0,
             newer_noncurrent_versions: 0,
             storage_class: String::new(),
+            expiry_policy: None,
         };
 
         assert!(build_put_object_expiration_header(&event).is_none());
