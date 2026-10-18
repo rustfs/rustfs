@@ -23,6 +23,7 @@ use crate::data_usage_define::{
     DATA_USAGE_SCAN_CHECKPOINT_VERSION, DataUsageCache, DataUsageCacheInfo, DataUsageEntry, DataUsageHash, DataUsageHashMap,
     DataUsageRawEnumerationCursor, DataUsageScanCheckpoint, DataUsageScanCheckpointReason, MAX_DATA_USAGE_CACHE_DEPTH,
     PendingScannerHeal, PendingScannerHealKind, ScannerSizeSummaryExt, SizeReconciliationEntry, SizeSummary, hash_path,
+    scan_frontier_covers_path,
 };
 use crate::error::ScannerError;
 use crate::raw_page_index::{RawEnumerationPageIndex, RawEnumerationPageWriter};
@@ -434,10 +435,6 @@ fn folder_resume_match(folder_name: &str, resume_after: &str) -> Option<FolderRe
         .map(|_| FolderResumeMatch::Descendant)
 }
 
-fn folder_is_covered_by_frontier(folder: &str, frontier: &str) -> bool {
-    folder <= frontier && !matches!(folder_resume_match(folder, frontier), Some(FolderResumeMatch::Descendant))
-}
-
 fn order_items_for_resume<T, F>(items: &mut [T], resume_after: Option<&str>, name: F) -> FolderResumeOrder
 where
     F: Fn(&T) -> &str,
@@ -482,6 +479,19 @@ fn checkpoint_reason_from_budget(reason: Option<ScannerCycleBudgetReason>) -> Da
         Some(ScannerCycleBudgetReason::Directories) => DataUsageScanCheckpointReason::Directories,
         None => DataUsageScanCheckpointReason::Unknown,
     }
+}
+
+// Cache entry failures survive diagnostic retry-cache TTL and capacity eviction.
+// Index once per scan; resumed subtree checks must not flatten histograms repeatedly.
+fn failed_scan_paths(cache: &DataUsageCache) -> Vec<String> {
+    let mut paths = cache
+        .cache
+        .iter()
+        .filter(|(_, entry)| entry.failed_objects > 0)
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths
 }
 
 fn data_usage_entry_has_progress(entry: &DataUsageEntry) -> bool {
@@ -765,6 +775,7 @@ pub struct FolderScanner {
     pending_heals_changed: bool,
     coverage_frontier: Option<String>,
     resume_frontier: Option<String>,
+    resume_failed_paths: Vec<String>,
     coverage_gap: bool,
     raw_enumeration_progress: Vec<RawEnumerationProgress>,
     pending_heal_sync_deferred: bool,
@@ -1120,14 +1131,37 @@ impl FolderScanner {
         self.update_cache.info.scan_checkpoint = Some(checkpoint);
     }
 
-    fn record_completed_child(&mut self, folder: &str, healthy: bool) {
-        if self.old_cache.info.scan_progress.is_some() {
-            self.coverage_gap |= !healthy;
-            if !self.coverage_gap {
-                self.coverage_frontier = Some(folder.to_owned());
-            }
+    fn record_completed_child(&mut self, folder: &str) {
+        if self.old_cache.info.scan_progress.is_some()
+            && !self.coverage_gap
+            && !self
+                .coverage_frontier
+                .as_deref()
+                .is_some_and(|frontier| scan_frontier_covers_path(folder, frontier))
+        {
+            self.coverage_frontier = Some(folder.to_owned());
         }
         self.record_scan_resume_hint(folder);
+    }
+
+    fn resume_subtree_has_failures(&self, folder: &str) -> bool {
+        if self.resume_failed_paths.is_empty() {
+            return false;
+        }
+        if self
+            .resume_failed_paths
+            .binary_search_by(|path| path.as_str().cmp(folder))
+            .is_ok()
+        {
+            return true;
+        }
+        let prefix = format!("{folder}/");
+        let index = self
+            .resume_failed_paths
+            .partition_point(|path| path.as_str() < prefix.as_str());
+        self.resume_failed_paths
+            .get(index)
+            .is_some_and(|path| path.starts_with(&prefix))
     }
 
     fn record_scan_resume_hint_if_not_ancestor(&mut self, folder: &str) {
@@ -1301,10 +1335,10 @@ impl FolderScanner {
         // earlier subtree, including a suspended ancestor, must not be signed
         // as completed prefix coverage.
         if self.coverage_frontier.as_deref().is_some_and(|frontier| {
-            folder_is_covered_by_frontier(&folder.name, frontier)
+            scan_frontier_covers_path(&folder.name, frontier)
                 || self.checkpoint_ancestors[..self.checkpoint_depth]
                     .iter()
-                    .any(|ancestor| folder_is_covered_by_frontier(&ancestor.hash.0, frontier))
+                    .any(|ancestor| scan_frontier_covers_path(&ancestor.hash.0, frontier))
         }) {
             return None;
         }
@@ -1375,7 +1409,7 @@ impl FolderScanner {
             if self
                 .coverage_frontier
                 .as_deref()
-                .is_some_and(|frontier| folder_is_covered_by_frontier(&child_hash.0, frontier))
+                .is_some_and(|frontier| scan_frontier_covers_path(&child_hash.0, frontier))
             {
                 self.coverage_frontier = None;
                 self.coverage_gap = true;
@@ -1940,7 +1974,7 @@ impl FolderScanner {
                     // A new FolderScanner starts with an empty seen set, so
                     // cached paths are still rechecked once per cycle. Skip
                     // duplicate listings within this same scanner pass.
-                    self.coverage_gap |= self.old_cache.info.scan_progress.is_some();
+                    into.failed_objects = into.failed_objects.max(1);
                     continue;
                 }
 
@@ -1956,9 +1990,8 @@ impl FolderScanner {
 
                         if failure_action != GetSizeFailureAction::Skip {
                             self.resolved_failed_object_paths.remove(&item.path);
-                            self.coverage_gap |= self.old_cache.info.scan_progress.is_some();
+                            into.failed_objects = into.failed_objects.saturating_add(1);
                             if !retry_suppressed {
-                                into.failed_objects += 1;
                                 self.record_failed(&item.path);
                             }
 
@@ -2111,14 +2144,13 @@ impl FolderScanner {
             }
 
             if self.is_erasure_mode && found_erasure_data_directory && !found_object_metadata {
-                self.coverage_gap |= self.old_cache.info.scan_progress.is_some();
                 found_object_metadata = true;
                 let metadata_path = path_join_buf(&[&dir_path, STORAGE_FORMAT_FILE]);
                 self.mark_failed_path_seen(&metadata_path);
                 let retry_suppressed = self.failed_retry_suppressed(&metadata_path);
 
+                into.failed_objects = into.failed_objects.saturating_add(1);
                 if !retry_suppressed {
-                    into.failed_objects = into.failed_objects.saturating_add(1);
                     self.record_failed(&metadata_path);
 
                     let failed_cache_entries = self.new_cache.info.failed_objects.len();
@@ -2266,8 +2298,9 @@ impl FolderScanner {
                     && !into.compacted
                     && forward_resume_after
                         .as_deref()
-                        .is_some_and(|resume| folder_is_covered_by_frontier(&folder_item.name, resume))
+                        .is_some_and(|resume| scan_frontier_covers_path(&folder_item.name, resume))
                     && self.old_cache.find(&folder_item.name).is_some()
+                    && !self.resume_subtree_has_failures(&folder_item.name)
                 {
                     self.new_cache.copy_with_children(&self.old_cache, &h, &folder_item.parent);
                     into.add_child(&h);
@@ -2336,7 +2369,7 @@ impl FolderScanner {
                     // In compacted mode child totals are accumulated directly into the parent entry.
                     let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), into));
                     fut.await.map_err(|e| ScannerError::Other(e.to_string()))?;
-                    self.record_completed_child(&folder_item.name, into.failed_objects == 0);
+                    self.record_completed_child(&folder_item.name);
                     self.send_update_for_entry(&this_hash, &folder.parent, into).await;
                     tokio::task::yield_now().await;
                 } else {
@@ -2369,7 +2402,7 @@ impl FolderScanner {
                     tokio::task::yield_now().await;
 
                     into.add_child(&h);
-                    self.record_completed_child(&folder_item.name, dst.failed_objects == 0);
+                    self.record_completed_child(&folder_item.name);
                     self.maybe_send_checkpoint(&folder, &this_hash, into);
                     // We scanned a folder, optionally send update.
                     self.update_cache.delete_recursive(&h);
@@ -2931,6 +2964,11 @@ pub(crate) async fn scan_data_folder_scoped(
         info: cache.info.clone(),
         ..Default::default()
     };
+    let resume_failed_paths = if resume_frontier.is_some() {
+        failed_scan_paths(&cache)
+    } else {
+        Vec::new()
+    };
     // Create folder scanner
     let mut scanner = FolderScanner {
         root: base_path,
@@ -2966,6 +3004,7 @@ pub(crate) async fn scan_data_folder_scoped(
         pending_heals_changed: false,
         coverage_frontier: resume_frontier.clone(),
         resume_frontier,
+        resume_failed_paths,
         coverage_gap: false,
         pending_heal_sync_deferred: false,
         pending_heal_batch_dirty: false,
@@ -3009,7 +3048,7 @@ pub(crate) async fn scan_data_folder_scoped(
             new_cache.info.last_update = Some(SystemTime::now());
             new_cache.info.next_cycle = next_cycle;
             let unresolved_objects = coverage_gap
-                || root.failed_objects > 0
+                || new_cache.cache.values().any(|entry| entry.failed_objects > 0)
                 || !new_cache.info.failed_objects.is_empty()
                 || !new_cache.info.size_reconciliation.is_empty();
             let mixed_coverage = new_cache
@@ -3040,6 +3079,23 @@ pub(crate) async fn scan_data_folder_scoped(
 
             close_disk_guard.close().await;
             if unresolved_objects || mixed_coverage {
+                debug!(
+                    target: "rustfs::scanner::folder",
+                    event = EVENT_SCANNER_FOLDER_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_FOLDER,
+                    state = "bucket_sweep_incomplete",
+                    bucket = %bucket_name,
+                    pool = new_cache.info.source.map(|source| source.pool_index),
+                    set = new_cache.info.source.map(|source| source.set_index),
+                    cycle = next_cycle,
+                    coverage_gap,
+                    root_failed_objects = root.failed_objects,
+                    failed_objects = new_cache.info.failed_objects.len(),
+                    size_reconciliation_entries = new_cache.info.size_reconciliation.len(),
+                    mixed_coverage,
+                    "Scanner bucket sweep requires another verification pass"
+                );
                 Err(ScannerError::PartialCache(Box::new(std::mem::take(new_cache))))
             } else {
                 Ok(std::mem::take(new_cache))

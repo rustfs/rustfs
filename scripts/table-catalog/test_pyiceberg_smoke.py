@@ -3,12 +3,13 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from types import SimpleNamespace
 from pathlib import Path
@@ -286,7 +287,9 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
                     {"metadata-location": "s3://lake/tables/id/metadata/v2.metadata.json"},
                 )
 
-    def test_view_probe_drops_smoke_view_after_load_failure(self) -> None:
+    @mock.patch.object(pyiceberg_smoke, "run_namespace_properties_probe")
+    @mock.patch.object(pyiceberg_smoke, "run_encoded_namespace_probe")
+    def test_view_probe_drops_smoke_view_after_load_failure(self, _encoded: object, _properties: object) -> None:
         args = self.parse_with_args(["--namespace", "sales", "--table", "orders"])
         probe_namespace = "smoke-sales-orders-views-12345678"
         namespace_path = pyiceberg_smoke.namespace_endpoint_path(args)
@@ -331,7 +334,9 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         self.assertIn(("DELETE", f"{view_path}/view-b", None), calls)
         self.assertIn(("DELETE", pyiceberg_smoke.namespace_endpoint_path(args, probe_namespace), None), calls)
 
-    def test_view_probe_cleans_candidate_after_create_timeout(self) -> None:
+    @mock.patch.object(pyiceberg_smoke, "run_namespace_properties_probe")
+    @mock.patch.object(pyiceberg_smoke, "run_encoded_namespace_probe")
+    def test_view_probe_cleans_candidate_after_create_timeout(self, _encoded: object, _properties: object) -> None:
         args = self.parse_with_args(["--namespace", "sales", "--table", "orders"])
         probe_namespace = "smoke-sales-orders-views-12345678"
         namespace_path = pyiceberg_smoke.namespace_endpoint_path(args)
@@ -364,7 +369,9 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         self.assertIn(("DELETE", f"{view_path}/view-a", None), calls)
         self.assertIn(("DELETE", pyiceberg_smoke.namespace_endpoint_path(args, probe_namespace), None), calls)
 
-    def test_view_probe_continues_cleanup_after_delete_failure(self) -> None:
+    @mock.patch.object(pyiceberg_smoke, "run_namespace_properties_probe")
+    @mock.patch.object(pyiceberg_smoke, "run_encoded_namespace_probe")
+    def test_view_probe_continues_cleanup_after_delete_failure(self, _encoded: object, _properties: object) -> None:
         args = self.parse_with_args(["--namespace", "sales", "--table", "orders"])
         probe_namespace = "smoke-sales-orders-views-12345678"
         namespace_path = pyiceberg_smoke.namespace_endpoint_path(args)
@@ -440,47 +447,104 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, message):
                         pyiceberg_smoke.paginated_identifier_names(args, mock.Mock(), view_path, page_size=1)
 
-    def test_maintenance_probe_rejects_unknown_worker_status(self) -> None:
-        args = self.parse_with_args(["--namespace", "sales", "--table", "orders"])
-        config_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/config")
-        maintenance_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/metadata")
-        job_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/jobs/job-1")
-        quarantine_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/jobs/job-1/quarantine")
-        scheduler_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/scheduler")
-        scheduler_run_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/scheduler/run")
-        worker_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/worker/run")
+    def maintenance_responses(self, backing="object", *, worker_changes=None, mutate_pointer=False):
+        config = {}
+        worker_ran = False
+        pointer = {"metadata-location": "s3://lake/tables/id/metadata/v2.metadata.json", "version-token": "token-2", "generation": 2}
+        job = {"job_id": "job-2", "status": "QUEUED", "operation": "DRY_RUN"}
+        audit = [{"action": "PLANNED"}]
 
-        def fake_signed_request(
-            _args: object,
-            _deps: object,
-            method: str,
-            path: str,
-            body: object = None,
-        ) -> dict[str, object]:
-            if (method, path) == ("PUT", config_path):
-                return {}
-            if (method, path) == ("GET", config_path):
-                return {"version": 1}
-            if (method, path) == ("POST", maintenance_path):
-                return {"job": {"job_id": "job-1"}, "audit-events": [{"action": "PLANNED"}]}
-            if (method, path) == ("GET", job_path):
-                return {"job": {"job-id": "job-1", "status": "SUCCESSFUL"}, "audit-events": [{"action": "PLANNED"}]}
-            if (method, path) == ("POST", quarantine_path):
-                return {"action": "INSPECT", "report": {"job": {"job_id": "job-1"}}}
-            if (method, path) == ("GET", scheduler_path):
-                return {"status": "DISABLED", "audit_timeline": [{"job_id": "job-1", "audit-events": [{"action": "PLANNED"}]}]}
-            if (method, path) == ("POST", scheduler_run_path):
-                return {
-                    "report": {"job": {"job-id": "job-2", "status": "QUEUED", "scheduler-id": "pyiceberg-smoke-scheduler"}},
-                    "scheduler": {"status": "QUEUED"},
-                }
-            if (method, path) == ("POST", worker_path):
-                return {"job": {"status": "UNKNOWN"}, "audit-events": [{"action": "WORKER_CONTROL"}]}
-            raise AssertionError(f"unexpected REST request: {method} {path}")
+        def request(_args, _deps, method, path, body=None):
+            nonlocal config, worker_ran
+            if (method, path.rsplit("/", 1)[-1]) == ("GET", "metadata-location"):
+                return {**pointer, "generation": 3} if worker_ran and mutate_pointer else pointer.copy()
+            if path.endswith("/maintenance/config"):
+                if method == "PUT":
+                    config = body.copy()
+                return config.copy()
+            if path.endswith("/maintenance/metadata"):
+                if backing == "durable-strong":
+                    envelope = {"error": {"code": 400, "type": "BadRequestException",
+                                          "message": "operation is not supported with durable-strong table catalog backing"}}
+                    raise pyiceberg_smoke.RestRequestError(method, path, 400, json.dumps(envelope))
+                return {"job": {"job_id": "job-1"}, "audit-events": audit}
+            if path.endswith("/maintenance/scheduler"):
+                return {"status": "DISABLED", "audit_timeline": []}
+            if path.endswith("/maintenance/scheduler/run"):
+                return {"report": {"job": {**job, "scheduler-id": body["scheduler-id"]}},
+                        "scheduler": {"status": "QUEUED"}}
+            if path.endswith("/maintenance/jobs/job-2"):
+                return {"job": job.copy(), "audit-events": audit}
+            if path.endswith("/maintenance/jobs/job-2/quarantine"):
+                return {"action": "INSPECT", "report": {"job": job.copy()}}
+            if path.endswith("/maintenance/worker/run"):
+                worker_ran = True
+                completed = {**job, "status": "SUCCESSFUL", "deleted_metadata_file_count": 0, "deleted_object_count": 0}
+                completed.update(worker_changes or {})
+                return {"job": completed, "audit-events": audit}
+            raise AssertionError(f"unexpected maintenance request: {method} {path}")
 
-        with mock.patch.object(pyiceberg_smoke, "signed_rest_request", side_effect=fake_signed_request):
-            with self.assertRaisesRegex(RuntimeError, "stable job status"):
-                pyiceberg_smoke.run_maintenance_probe(args, mock.Mock())
+        return request
+
+    def test_maintenance_dry_run_exercises_both_backings_and_leaves_worker_paused(self) -> None:
+        args = self.parse_with_args([])
+        for backing in ("object", "durable-strong"):
+            with self.subTest(backing=backing), mock.patch.object(
+                pyiceberg_smoke, "signed_rest_request", side_effect=self.maintenance_responses(backing)
+            ) as request:
+                pyiceberg_smoke.run_maintenance_probe(args, mock.Mock(), backing)
+            paths = [call.args[3] for call in request.call_args_list]
+            for suffix in ("/maintenance/scheduler/run", "/maintenance/jobs/job-2",
+                           "/maintenance/jobs/job-2/quarantine", "/maintenance/worker/run"):
+                self.assertTrue(any(path.endswith(suffix) for path in paths), suffix)
+            self.assertEqual(request.call_args.args[2], "PUT")
+            self.assertEqual(request.call_args.args[4], pyiceberg_smoke.default_maintenance_config())
+            for call in request.call_args_list:
+                if call.args[2] == "PUT":
+                    self.assertFalse(call.args[4]["delete-enabled"])
+
+    def test_maintenance_failure_never_counts_as_success_and_restores_safe_config(self) -> None:
+        args = self.parse_with_args([])
+        failures = [
+            ({"status": status}, "complete the dry-run")
+            for status in ("FAILED", "PAUSED", "RUNNING", "QUEUED", "DISABLED", "UNKNOWN", None)
+        ]
+        failures.extend([
+            ({"job_id": "other-job"}, "job identity"),
+            ({"operation": "DELETE"}, "job identity"),
+            ({"deleted_object_count": 1}, "zero deletions"),
+            ({"deleted_metadata_file_count": 1}, "zero deletions"),
+            ({"deleted_object_count": None}, "zero deletions"),
+            ({"deleted_object_count": False}, "zero deletions"),
+        ])
+        for backing in ("object", "durable-strong"):
+            for changes, message in failures:
+                with self.subTest(backing=backing, changes=changes), mock.patch.object(
+                    pyiceberg_smoke, "signed_rest_request",
+                    side_effect=self.maintenance_responses(backing, worker_changes=changes)
+                ) as request:
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        pyiceberg_smoke.run_maintenance_probe(args, mock.Mock(), backing)
+                self.assertEqual(request.call_args.args[4], pyiceberg_smoke.default_maintenance_config())
+
+    def test_maintenance_detects_pointer_advance_and_pauses_after_transport_failure(self) -> None:
+        args = self.parse_with_args([])
+        for backing in ("object", "durable-strong"):
+            for transport_failure in (False, True):
+                base = self.maintenance_responses(backing, mutate_pointer=not transport_failure)
+
+                def request(*args, **kwargs):
+                    if transport_failure and args[3].endswith("/maintenance/worker/run"):
+                        raise OSError("worker connection lost")
+                    return base(*args, **kwargs)
+
+                with self.subTest(backing=backing, transport_failure=transport_failure), mock.patch.object(
+                    pyiceberg_smoke, "signed_rest_request", side_effect=request
+                ) as calls:
+                    expected = OSError if transport_failure else RuntimeError
+                    with self.assertRaises(expected):
+                        pyiceberg_smoke.run_maintenance_probe(args, mock.Mock(), backing)
+                self.assertEqual(calls.call_args.args[4], pyiceberg_smoke.default_maintenance_config())
 
     def test_catalog_api_probe_exercises_extended_rest_surfaces(self) -> None:
         args = self.parse_with_args(["--namespace", "sales", "--table", "orders"])
@@ -490,13 +554,12 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         metadata_location_path = pyiceberg_smoke.table_endpoint_path(args, "/metadata-location")
         refs_path = pyiceberg_smoke.table_ref_endpoint_path(args)
         ref_name = pyiceberg_smoke.safe_ref_segment(args.namespace, args.table)
-        config_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/config")
-        maintenance_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/metadata")
         quarantine_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/jobs/job-1/quarantine")
         scheduler_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/scheduler")
         scheduler_run_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/scheduler/run")
         worker_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/worker/run")
         diagnostics_path = pyiceberg_smoke.table_endpoint_path(args, "/catalog/diagnostics")
+        maintenance_request = self.maintenance_responses()
 
         def fake_signed_request(
             _args: object,
@@ -509,7 +572,9 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             if (method, path) == ("GET", table_path):
                 return {"metadata-location": "s3://lake/tables/id/metadata/v2.metadata.json", "metadata": {"current-snapshot-id": 7}}
             if (method, path) == ("GET", metadata_location_path):
-                return {"metadata-location": "s3://lake/tables/id/metadata/v2.metadata.json", "version-token": "token-2"}
+                return {"metadata-location": "s3://lake/tables/id/metadata/v2.metadata.json", "version-token": "token-2", "generation": 2}
+            if (method, path) == ("GET", pyiceberg_smoke.table_endpoint_path(args, "/catalog/export")):
+                return {"table": {"metadata_location": "s3://lake/tables/id/metadata/v2.metadata.json", "version_token": "token-2", "generation": 2}}
             if method == "PUT" and path.startswith(f"{refs_path}/"):
                 return {}
             if (method, path) == ("GET", refs_path):
@@ -518,31 +583,16 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
                 return {"refs": {}}
             if method == "DELETE" and path.startswith(f"{refs_path}/"):
                 return {}
-            if (method, path) == ("PUT", config_path):
-                return {}
-            if (method, path) == ("GET", config_path):
-                return {"version": 1}
-            if (method, path) == ("POST", maintenance_path):
-                return {"job": {"job_id": "job-1"}, "audit-events": [{"action": "PLANNED"}]}
-            if (method, path) == ("GET", pyiceberg_smoke.table_endpoint_path(args, "/maintenance/jobs/job-1")):
-                return {"job": {"job-id": "job-1", "status": "SUCCESSFUL"}, "audit-events": [{"action": "PLANNED"}]}
-            if (method, path) == ("POST", quarantine_path):
-                return {"action": "INSPECT", "report": {"job": {"job_id": "job-1"}}}
-            if (method, path) == ("GET", scheduler_path):
-                return {"status": "DISABLED", "audit_timeline": [{"job_id": "job-1", "audit-events": [{"action": "PLANNED"}]}]}
-            if (method, path) == ("POST", scheduler_run_path):
-                return {
-                    "report": {"job": {"job-id": "job-2", "status": "QUEUED", "scheduler-id": "pyiceberg-smoke-scheduler"}},
-                    "scheduler": {"status": "QUEUED"},
-                }
-            if (method, path) == ("POST", worker_path):
-                return {"job": {"status": "PAUSED"}, "audit-events": [{"action": "WORKER_CONTROL"}]}
+            if "/maintenance/" in path:
+                return maintenance_request(_args, _deps, method, path, body)
             if (method, path) == ("GET", diagnostics_path):
                 return {"status": "ok"}
             raise AssertionError(f"unexpected REST request: {method} {path}")
 
         with mock.patch.object(pyiceberg_smoke, "signed_rest_request", side_effect=fake_signed_request):
-            with mock.patch.object(pyiceberg_smoke, "run_view_probe") as view_probe:
+            with mock.patch.object(pyiceberg_smoke, "run_view_probe") as view_probe, mock.patch.object(
+                pyiceberg_smoke, "run_table_rename_probe"
+            ), mock.patch.object(pyiceberg_smoke, "run_load_table_delegation_probe"):
                 with mock.patch.object(
                     pyiceberg_smoke,
                     "signed_rest_request_expect_error",
@@ -553,8 +603,10 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
                         "snapshot ref has retention policy; force is required",
                     ),
                 ) as expect_error:
-                    pyiceberg_smoke.run_catalog_api_probes(args, deps)
+                    _, probes = pyiceberg_smoke.run_catalog_api_probes(args, deps, "object")
 
+        self.assertEqual(probes["maintenance-worker-dry-run"], "pass")
+        self.assertEqual(probes["diagnostics"], "pass")
         view_probe.assert_called_once_with(args, deps)
         expect_error.assert_called_once_with(
             args,
@@ -567,8 +619,8 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         self.assertIn(("GET", metadata_location_path, None), calls)
         self.assertIn(("GET", diagnostics_path, None), calls)
         self.assertIn(("GET", scheduler_path, None), calls)
-        self.assertIn(("POST", scheduler_run_path, {"scheduler-id": "pyiceberg-smoke-scheduler"}), calls)
-        self.assertIn(("POST", quarantine_path, {"action": "INSPECT"}), calls)
+        self.assertTrue(any(method == "POST" and path == scheduler_run_path for method, path, _ in calls))
+        self.assertIn(("POST", quarantine_path.replace("job-1", "job-2"), {"action": "INSPECT"}), calls)
         self.assertIn(("POST", worker_path, {}), calls)
 
     def test_table_ref_probe_force_deletes_smoke_ref_after_validation_failure(self) -> None:
@@ -601,11 +653,14 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             calls,
         )
 
-    def run_smoke_with_fakes(self, args: object, probe_calls: list[str]) -> list[str]:
+    def run_smoke_with_fakes(self, args: object, probe_calls: list[str], scanned_rows: list[dict[str, object]] | None = None) -> list[str]:
         events: list[str] = []
 
         class FakeArrowTable:
             num_rows = 2
+
+            def to_pylist(self) -> list[dict[str, object]]:
+                return pyiceberg_smoke.SMOKE_ROWS if scanned_rows is None else scanned_rows
 
         class FakePyArrowTableFactory:
             @staticmethod
@@ -665,7 +720,9 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             },
         )
 
-        with mock.patch.object(pyiceberg_smoke, "ensure_local_proxy_bypass"):
+        with mock.patch.object(pyiceberg_smoke, "ensure_local_proxy_bypass"), mock.patch.object(
+            pyiceberg_smoke, "discover_catalog_backing", return_value="object"
+        ):
             with mock.patch.object(pyiceberg_smoke, "ensure_aws_env"):
                 with mock.patch.object(pyiceberg_smoke, "ensure_bucket"):
                     with mock.patch.object(pyiceberg_smoke, "enable_table_bucket"):
@@ -687,11 +744,19 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
                                             side_effect=lambda *_args: (
                                                 events.append("catalog-probes"),
                                                 probe_calls.append("catalog-probes"),
-                                            ),
+                                                ({}, {"direct-rest": "pass"}),
+                                            )[-1],
                                         ):
                                             with redirect_stdout(StringIO()):
                                                 pyiceberg_smoke.run_smoke(args, deps)
         return events
+
+    def test_run_smoke_rejects_equal_row_count_with_different_data(self) -> None:
+        args = self.parse_with_args(["--bucket", "lake", "--namespace", "sales", "--table", "orders"])
+        calls: list[str] = []
+        with self.assertRaisesRegex(RuntimeError, "different data"):
+            self.run_smoke_with_fakes(args, calls, [{"id": 1, "payload": "wrong"}, {"id": 2, "payload": "beta"}])
+        self.assertEqual(calls, [])
 
     def test_run_smoke_probes_extended_catalog_apis_by_default(self) -> None:
         args = self.parse_with_args(["--bucket", "lake", "--namespace", "sales", "--table", "orders"])
@@ -1052,6 +1117,8 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             row_count=2,
             cleanup_result="not-requested",
             table_warehouse_location="s3://lake/tables/table-id",
+            catalog_backing="durable-strong",
+            catalog_probes=pyiceberg_smoke.engine_compatibility.pyiceberg_catalog_probe_results("durable-strong", skipped=False, vended=False),
         )
 
         record = pyiceberg_smoke.pyiceberg_live_evidence_record(
@@ -1072,6 +1139,217 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         self.assertEqual(record["metadata_location"], "s3://lake/tables/table-id/metadata/v2.metadata.json")
         self.assertEqual(record["row_count"], 2)
         self.assertEqual(record["claim"], "automated-smoke")
+        self.assertEqual(record["catalog_probes"]["metadata-maintenance"], "expected-unsupported")
+        self.assertEqual(record["catalog_probes"]["maintenance-worker-dry-run"], "pass")
+        self.assertEqual(record["rest_signing_name"], "s3")
+        validate = pyiceberg_smoke.engine_compatibility.validate_live_conformance_evidence
+        self.assertEqual(validate(record)["status"], "accepted")
+        record["catalog_probes"]["metadata-maintenance"] = "pass"
+        with self.assertRaisesRegex(ValueError, "capabilities"):
+            validate(record)
+        del record["catalog_probes"]
+        with self.assertRaisesRegex(ValueError, "capabilities"):
+            validate(record)
+
+    def test_backing_discovery_uses_overrides_and_rejects_mismatches(self) -> None:
+        args = self.parse_with_args(["--bucket", "lake", "--catalog-backing", "durable-strong"])
+        config = {"defaults": {"rustfs.catalog-backing": "object"}, "overrides": {"rustfs.catalog-backing": "durable-strong"}}
+        with mock.patch.object(pyiceberg_smoke, "signed_rest_request", return_value=config) as request:
+            self.assertEqual(pyiceberg_smoke.discover_catalog_backing(args, mock.Mock()), "durable-strong")
+        self.assertEqual(request.call_args.args[2:4], ("GET", "/iceberg/v1/config?warehouse=lake"))
+        for response in ({}, {"defaults": {}, "overrides": {}}, {"defaults": {"rustfs.catalog-backing": "unknown"}, "overrides": {}}):
+            with self.subTest(response=response), mock.patch.object(pyiceberg_smoke, "signed_rest_request", return_value=response):
+                with self.assertRaises(RuntimeError):
+                    pyiceberg_smoke.discover_catalog_backing(args, mock.Mock())
+        config["overrides"] = {}
+        with mock.patch.object(pyiceberg_smoke, "signed_rest_request", return_value=config):
+            with self.assertRaisesRegex(RuntimeError, "does not match"):
+                pyiceberg_smoke.discover_catalog_backing(args, mock.Mock())
+            args.catalog_backing = "object-backed"
+            self.assertEqual(pyiceberg_smoke.discover_catalog_backing(args, mock.Mock()), "object")
+
+    def test_client_version_is_observed_and_mismatch_aborts_before_setup(self) -> None:
+        args = self.parse_with_args(["--client-version", "0.11.1"])
+        with mock.patch.object(pyiceberg_smoke.importlib.metadata, "version", return_value="0.11.1"):
+            self.assertEqual(pyiceberg_smoke.pyiceberg_client_version(args), "0.11.1")
+        with mock.patch.object(pyiceberg_smoke.importlib.metadata, "version", return_value="0.10.0"), mock.patch.object(
+            pyiceberg_smoke, "ensure_bucket"
+        ) as bucket, mock.patch.object(pyiceberg_smoke, "discover_catalog_backing") as config:
+            with self.assertRaisesRegex(RuntimeError, "expected PyIceberg 0.11.1, found 0.10.0"):
+                pyiceberg_smoke.run_smoke(args, mock.Mock())
+        bucket.assert_not_called()
+        config.assert_not_called()
+
+    def test_backing_mismatch_fails_before_creating_any_objects(self) -> None:
+        args = self.parse_with_args([])
+        with mock.patch.object(pyiceberg_smoke, "discover_catalog_backing", side_effect=RuntimeError("mismatch")), mock.patch.object(
+            pyiceberg_smoke, "ensure_bucket"
+        ) as bucket, mock.patch.object(pyiceberg_smoke, "ensure_aws_env"):
+            with self.assertRaisesRegex(RuntimeError, "mismatch"):
+                pyiceberg_smoke.run_smoke(args, mock.Mock())
+        bucket.assert_not_called()
+
+    def strong_probe_responses(self, *, status=400, error_type="BadRequestException", mutate=False):
+        pointer = {"metadata-location": "s3://lake/tables/id/metadata/v2.metadata.json", "version-token": "t2", "generation": 2}
+        reads = 0
+
+        def request(_args, _deps, method, path, body=None):
+            nonlocal reads
+            if path.endswith("/metadata-location"):
+                reads += 1
+                return {**pointer, "generation": 3} if mutate and reads > 1 else pointer.copy()
+            self.assertTrue(path.endswith("/maintenance/metadata"), path)
+            error = {"error": {"code": status, "type": error_type,
+                               "message": "operation is not supported with durable-strong table catalog backing"}}
+            raise pyiceberg_smoke.RestRequestError(method, path, status, json.dumps(error))
+
+        return request
+
+    def test_strong_metadata_boundary_checks_error_and_unchanged_pointer(self) -> None:
+        args = self.parse_with_args([])
+        with mock.patch.object(pyiceberg_smoke, "signed_rest_request", side_effect=self.strong_probe_responses()) as request:
+            pyiceberg_smoke.run_strong_backing_boundaries(args, mock.Mock())
+        self.assertEqual(request.call_count, 3)
+        for kwargs, message in (({"status": 403}, "expected one of"), ({"status": 500}, "expected one of"),
+                                ({"error_type": "RESTException"}, "error envelope"), ({"mutate": True}, "commit state")):
+            with self.subTest(kwargs=kwargs), mock.patch.object(
+                pyiceberg_smoke, "signed_rest_request", side_effect=self.strong_probe_responses(**kwargs)
+            ):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    pyiceberg_smoke.run_strong_backing_boundaries(args, mock.Mock())
+
+    def test_catalog_export_checks_pointer_token_and_generation_on_both_backings(self) -> None:
+        args = self.parse_with_args(["--bucket", "lake"])
+        location = "s3://lake/tables/id/metadata/v2.metadata.json"
+        table = {"metadata-location": location, "metadata": {"current-snapshot-id": 7}}
+        pointer = {"metadata-location": location, "version-token": "token-2", "generation": 2}
+        entry = {"metadata_location": location, "version_token": "token-2", "generation": 2}
+        for backing in ("object", "durable-strong"):
+            for mismatch in (None, "metadata_location", "version_token", "generation"):
+                exported = {**entry, mismatch: "stale"} if mismatch else entry
+                with self.subTest(backing=backing, mismatch=mismatch), mock.patch.object(
+                    pyiceberg_smoke, "signed_rest_request",
+                    side_effect=[table, {"status": "HEALTHY"}, {"table": exported}, pointer, table]
+                ), mock.patch.object(pyiceberg_smoke, "run_metadata_location_probe"), mock.patch.object(
+                    pyiceberg_smoke, "run_table_ref_probe"
+                ), mock.patch.object(pyiceberg_smoke, "run_view_probe"), mock.patch.object(
+                    pyiceberg_smoke, "run_table_rename_probe"
+                ), mock.patch.object(pyiceberg_smoke, "run_load_table_delegation_probe"), mock.patch.object(
+                    pyiceberg_smoke, "run_maintenance_probe"
+                ) as maintenance:
+                    if mismatch:
+                        with self.assertRaisesRegex(RuntimeError, "does not match"):
+                            pyiceberg_smoke.run_catalog_api_probes(args, mock.Mock(), backing)
+                    else:
+                        _, probes = pyiceberg_smoke.run_catalog_api_probes(args, mock.Mock(), backing)
+                        self.assertEqual(probes["diagnostics"], "pass")
+                        self.assertEqual(probes["export"], "pass")
+                        self.assertEqual(probes["maintenance-worker-dry-run"], "pass")
+                        self.assertEqual(probes["metadata-maintenance"],
+                                         "expected-unsupported" if backing == "durable-strong" else "pass")
+                self.assertEqual(maintenance.call_args.args[2], backing)
+
+    def test_namespace_properties_detect_partial_or_rejected_writes(self) -> None:
+        args = self.parse_with_args([])
+        before = {"properties": {"rustfs.smoke": "true", "owner": "unchanged"}}
+        after = {"properties": {"rustfs.smoke.updated": "true", "owner": "unchanged"}}
+        update = {"updated": ["rustfs.smoke.updated"], "removed": ["rustfs.smoke"]}
+        error = pyiceberg_smoke.RestRequestError("POST", "/properties", 422, "overlapping keys")
+        for final in (after, before):
+            with self.subTest(final=final), mock.patch.object(
+                pyiceberg_smoke, "signed_rest_request", side_effect=[before, update, after, error, final]
+            ):
+                if final == after:
+                    pyiceberg_smoke.run_namespace_properties_probe(args, mock.Mock(), "probe")
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "rejected namespace"):
+                        pyiceberg_smoke.run_namespace_properties_probe(args, mock.Mock(), "probe")
+
+    def test_encoded_namespace_probe_rejects_aliasing_and_cleans_up(self) -> None:
+        args = self.parse_with_args([])
+        namespace = {"namespace": ["probe", "encoded"]}
+        error = pyiceberg_smoke.RestRequestError("GET", "/namespace", 400, "invalid namespace")
+        for double_encoded_response in (error, namespace):
+            with self.subTest(response=double_encoded_response), mock.patch.object(
+                pyiceberg_smoke, "signed_rest_request", side_effect=[{}, namespace, double_encoded_response, namespace, {}]
+            ) as request:
+                if isinstance(double_encoded_response, Exception):
+                    pyiceberg_smoke.run_encoded_namespace_probe(args, mock.Mock(), "probe")
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "unexpectedly succeeded"):
+                        pyiceberg_smoke.run_encoded_namespace_probe(args, mock.Mock(), "probe")
+            self.assertTrue(request.call_args_list[1].args[3].endswith("probe%1Fencoded"))
+            self.assertTrue(request.call_args_list[2].args[3].endswith("probe%251Fencoded"))
+            self.assertEqual(request.call_args.args[2], "DELETE")
+
+    def test_rename_probe_restores_name_even_when_metadata_changes(self) -> None:
+        args = self.parse_with_args(["--bucket", "lake", "--namespace", "sales", "--table", "orders"])
+        before = {"metadata-location": "s3://lake/tables/id/metadata/v2.metadata.json", "metadata": {"location": "s3://lake/tables/id", "table-uuid": "uuid"}}
+        missing = pyiceberg_smoke.RestRequestError("GET", "/table", 404, "missing")
+        for changed in (False, True):
+            after = {**before, "metadata-location": "other"} if changed else before
+            with self.subTest(changed=changed), mock.patch.object(
+                pyiceberg_smoke, "signed_rest_request", side_effect=[before, {}, missing, after, {}, before]
+            ) as request:
+                if changed:
+                    with self.assertRaisesRegex(RuntimeError, "warehouse identity"):
+                        pyiceberg_smoke.run_table_rename_probe(args, mock.Mock(), "durable-strong")
+                else:
+                    pyiceberg_smoke.run_table_rename_probe(args, mock.Mock(), "durable-strong")
+                renames = [call.args[4] for call in request.call_args_list if call.args[2] == "POST"]
+                self.assertEqual(renames[0]["source"], renames[1]["destination"])
+                self.assertEqual(renames[0]["destination"], renames[1]["source"])
+
+    def test_delegation_requires_exact_token_and_warehouse_scope(self) -> None:
+        args = self.parse_with_args(["--require-vended-credentials"])
+        credential = {"prefix": "s3://lake/tables/id/", "config": {key: "temporary" for key in pyiceberg_smoke.REQUIRED_STORAGE_CREDENTIAL_KEYS}}
+        metadata_credential = {"prefix": "s3://lake/catalog/current.metadata.json", "config": credential["config"].copy()}
+        response = {"metadata": {"location": "s3://lake/tables/id"}, "metadata-location": metadata_credential["prefix"], "storage-credentials": [credential, metadata_credential]}
+        for prefix in ("s3://lake/tables/id/", "s3://lake/tables/other/"):
+            credential["prefix"] = prefix
+            with self.subTest(prefix=prefix), mock.patch.object(
+                pyiceberg_smoke, "signed_rest_request", side_effect=[{"storage-credentials": []}] * 4 + [response]
+            ) as request, mock.patch.object(pyiceberg_smoke, "verify_vended_credential_data_plane_scope") as scope:
+                if prefix.endswith("/other/"):
+                    with self.assertRaisesRegex(RuntimeError, "do not match"):
+                        pyiceberg_smoke.run_load_table_delegation_probe(args, mock.Mock())
+                    scope.assert_not_called()
+                else:
+                    pyiceberg_smoke.run_load_table_delegation_probe(args, mock.Mock())
+                    scope.assert_called_once()
+                    self.assertEqual(scope.call_args.args[-1], "s3://lake/tables/id")
+                self.assertEqual(request.call_args.kwargs["access_delegation"], "remote-signing, vended-credentials")
+        with mock.patch.object(pyiceberg_smoke, "signed_rest_request", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "without exact"):
+                pyiceberg_smoke.run_load_table_delegation_probe(args, mock.Mock())
+        response["storage-credentials"] = [credential, metadata_credential, credential]
+        with mock.patch.object(
+            pyiceberg_smoke, "signed_rest_request", side_effect=[{}] * 4 + [response]
+        ), mock.patch.object(pyiceberg_smoke, "verify_vended_credential_data_plane_scope") as scope:
+            with self.assertRaisesRegex(RuntimeError, "exactly the warehouse"):
+                pyiceberg_smoke.run_load_table_delegation_probe(args, mock.Mock())
+        scope.assert_not_called()
+
+        credential["prefix"] = "s3://lake/tables/id/"
+        metadata_credential["config"]["s3.session-token"] = "different-session"
+        response["storage-credentials"] = [credential, metadata_credential]
+        with mock.patch.object(
+            pyiceberg_smoke, "signed_rest_request", side_effect=[{}] * 4 + [response]
+        ), mock.patch.object(pyiceberg_smoke, "verify_vended_credential_data_plane_scope") as scope:
+            with self.assertRaisesRegex(RuntimeError, "same temporary session"):
+                pyiceberg_smoke.run_load_table_delegation_probe(args, mock.Mock())
+        scope.assert_not_called()
+
+    def test_skipped_probes_are_not_recorded_as_full_rest_evidence(self) -> None:
+        args = self.parse_with_args(["--skip-catalog-api-probes"])
+        result = pyiceberg_smoke.SmokeResult("s3://lake/tables/id/metadata/v2.metadata.json", 2, "not-requested", "s3://lake/tables/id", "object", {"direct-rest": "skipped"})
+        kwargs = dict(client_version="0.11.1", rustfs_build="test", git_sha="abc123", catalog_backing="object", run_timestamp_utc="2026-09-09T00:00:00Z", operator="test", command="smoke")
+        record = pyiceberg_smoke.pyiceberg_live_evidence_record(args, result, **kwargs)
+        self.assertEqual(record["scenario"], "create-append-reload-scan-core")
+        self.assertEqual(record["catalog_probes"], {"direct-rest": "skipped"})
+        kwargs["catalog_backing"] = "durable-strong"
+        with self.assertRaisesRegex(ValueError, "observed server"):
+            pyiceberg_smoke.pyiceberg_live_evidence_record(args, result, **kwargs)
 
     def test_live_evidence_command_redacts_cli_secrets(self) -> None:
         command = pyiceberg_smoke.redacted_command(
@@ -1127,6 +1405,207 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(str(pyiceberg_smoke.unsupported_inventory())))
         self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(str(pyiceberg_smoke.production_readiness_inventory())))
         self.assertIsNone(INTERNAL_ROADMAP_LABEL_RE.search(str(pyiceberg_smoke.failure_coverage.production_failure_matrix())))
+
+
+class SmokeCleanupTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.args = SimpleNamespace(bucket="lake", namespace="sales", table="orders", rest_path="/iceberg")
+        self.original = {
+            "metadata-location": "s3://lake/original/metadata/v2.metadata.json",
+            "metadata": {"table-uuid": "original-id", "location": "s3://lake/original",
+                         "current-schema-id": 0, "schemas": [{"schema-id": 0, "type": "struct", "fields": []}],
+                         "current-snapshot-id": 7, "snapshots": [{"snapshot-id": 7}]},
+        }
+        self.pointer = {"metadata-location": self.original["metadata-location"], "version-token": "token", "generation": 4}
+        self.replacement = {"metadata": {"table-uuid": "fresh-id", "location": "s3://lake/fresh", "snapshots": []}}
+        self.entries = {"orders": copy.deepcopy(self.original)}
+        self.namespace_present = True
+        self.calls = []
+        self.backing = "object"
+        self.after_cleanup = None
+        self.after_cleanup_pointer = None
+
+    def request(self, args: object, deps: object, method: str, path: str, body: object = None) -> dict[str, object]:
+        self.calls.append((method, path, body))
+        if path.endswith("/tables/rename"):
+            source, destination = body["source"]["name"], body["destination"]["name"]
+            value = self.entries.pop(source)
+            if self.backing == "object":
+                self.entries[source] = None  # Retained inactive entry, hidden from load/list.
+            self.entries[destination] = value
+            return {}
+        if path.endswith("/metadata-location"):
+            return copy.deepcopy(self.pointer)
+        if method == "POST" and path.endswith("/tables"):
+            self.entries[body["name"]] = copy.deepcopy(self.replacement)
+            return copy.deepcopy(self.replacement)
+        name = path.rsplit("/", 1)[-1]
+        if method == "GET":
+            value = self.entries.get(name)
+            if value is None:
+                raise pyiceberg_smoke.RestRequestError(method, path, 404, "missing")
+            return copy.deepcopy(value)
+        if method == "DELETE":
+            del self.entries[name]
+            if self.after_cleanup is not None:
+                self.entries["orders"] = self.after_cleanup
+            if self.after_cleanup_pointer is not None:
+                self.pointer = self.after_cleanup_pointer
+            return {}
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    def rename(self) -> None:
+        with mock.patch.object(pyiceberg_smoke.uuid, "uuid4", return_value=SimpleNamespace(hex="owned")), mock.patch.object(
+            pyiceberg_smoke, "signed_rest_request", side_effect=self.request
+        ):
+            pyiceberg_smoke.run_table_rename_probe(self.args, mock.Mock(), self.backing)
+
+    def catalog(self) -> object:
+        catalog = mock.Mock()
+        catalog.table_exists.side_effect = lambda identifier: self.entries.get(identifier[1]) is not None
+        catalog.drop_table.side_effect = lambda identifier: self.entries.pop(identifier[1])
+        catalog.namespace_exists.side_effect = lambda namespace: self.namespace_present
+
+        def drop_namespace(namespace: str) -> None:
+            if self.entries:
+                raise RuntimeError("NamespaceNotEmptyException")
+            self.namespace_present = False
+
+        catalog.drop_namespace.side_effect = drop_namespace
+        return catalog
+
+    def test_object_rename_consumes_only_its_tombstone_before_namespace_cleanup(self) -> None:
+        self.rename()
+        creates = [call for call in self.calls if call[0] == "POST" and call[1].endswith("/tables")]
+        deletes = [call for call in self.calls if call[0] == "DELETE"]
+        self.assertEqual(creates, [("POST", "/iceberg/v1/lake/namespaces/sales/tables",
+                                   {"name": "renamed-owned", "schema": self.original["metadata"]["schemas"][0]})])
+        self.assertEqual(deletes, [("DELETE", "/iceberg/v1/lake/namespaces/sales/tables/renamed-owned", None)])
+        self.assertEqual(self.entries, {"orders": self.original})
+        self.assertEqual(self.pointer, {"metadata-location": self.original["metadata-location"],
+                                        "version-token": "token", "generation": 4})
+        pyiceberg_smoke.cleanup_catalog(self.catalog(), ("sales", "orders"))
+        self.assertFalse(self.namespace_present)
+        self.assertEqual(self.entries, {})
+
+    def test_strong_rename_does_not_create_or_drop_a_cleanup_table(self) -> None:
+        self.backing = "durable-strong"
+        self.rename()
+        self.assertFalse(any(method == "DELETE" or (method == "POST" and path.endswith("/tables"))
+                             for method, path, _ in self.calls))
+        pyiceberg_smoke.cleanup_catalog(self.catalog(), ("sales", "orders"))
+        self.assertFalse(self.namespace_present)
+
+    def test_rename_does_not_sweep_unrelated_inactive_entries(self) -> None:
+        self.entries["unrelated"] = None
+        self.rename()
+        self.assertIn("unrelated", self.entries)
+        with self.assertRaisesRegex(RuntimeError, "NamespaceNotEmptyException"):
+            pyiceberg_smoke.cleanup_catalog(self.catalog(), ("sales", "orders"))
+        self.assertTrue(self.namespace_present)
+
+    def test_rename_rejects_unknown_backing_before_mutation(self) -> None:
+        self.backing = "unknown"
+        with self.assertRaisesRegex(RuntimeError, "known backing"):
+            self.rename()
+        self.assertEqual(self.calls, [])
+
+    def test_replacement_identity_must_be_new_and_empty(self) -> None:
+        cases = [("table-uuid", "original-id"), ("table-uuid", ""), ("location", "s3://lake/original"),
+                 ("location", None), ("snapshots", [{"snapshot-id": 7}]), ("current-snapshot-id", 7)]
+        for key, value in cases:
+            with self.subTest(key=key, value=value):
+                self.setUp()
+                self.replacement["metadata"][key] = value
+                with self.assertRaisesRegex(RuntimeError, "isolated empty table"):
+                    self.rename()
+                self.assertFalse(any(method == "DELETE" for method, _, _ in self.calls))
+                self.assertEqual(self.entries["orders"], self.original)
+
+    def test_missing_schema_or_commit_state_fails_before_create(self) -> None:
+        for missing in ("schemas", "metadata-location", "version-token", "generation"):
+            with self.subTest(missing=missing):
+                self.setUp()
+                if missing == "schemas":
+                    del self.entries["orders"]["metadata"][missing]
+                else:
+                    del self.pointer[missing]
+                with self.assertRaisesRegex(RuntimeError, "rename cleanup requires"):
+                    self.rename()
+                self.assertFalse(any(method == "POST" and path.endswith("/tables") for method, path, _ in self.calls))
+
+    def test_cleanup_detects_original_metadata_or_commit_change(self) -> None:
+        for changed in ("metadata", "metadata-location", "version-token", "generation"):
+            with self.subTest(changed=changed):
+                self.setUp()
+                if changed == "metadata":
+                    self.after_cleanup = copy.deepcopy(self.original)
+                    self.after_cleanup["metadata"]["table-uuid"] = "changed"
+                else:
+                    self.after_cleanup_pointer = {**self.pointer, changed: "changed"}
+                with self.assertRaisesRegex(RuntimeError, "changed the original"):
+                    self.rename()
+
+    def test_cleanup_rejects_namespace_drop_failure_and_does_not_write_evidence(self) -> None:
+        errors = [RuntimeError("NamespaceNotEmptyException"), PermissionError("403"),
+                  RuntimeError("500: object not found during namespace write"), TimeoutError("timeout")]
+        for error in errors:
+            with self.subTest(error=error):
+                catalog = mock.Mock()
+                catalog.table_exists.side_effect = [True, False]
+                catalog.namespace_exists.return_value = True
+                catalog.drop_namespace.side_effect = error
+                with mock.patch.object(pyiceberg_smoke, "parse_args", return_value=object()), mock.patch.object(
+                    pyiceberg_smoke, "printed_metadata", return_value=False
+                ), mock.patch.object(pyiceberg_smoke, "load_runtime_deps"), mock.patch.object(
+                    pyiceberg_smoke, "run_smoke",
+                    side_effect=lambda *args: pyiceberg_smoke.cleanup_catalog(catalog, ("sales", "orders"))
+                ), mock.patch.object(pyiceberg_smoke, "write_live_evidence") as write, redirect_stderr(StringIO()):
+                    self.assertEqual(pyiceberg_smoke.main(), 1)
+                write.assert_not_called()
+
+    def test_cleanup_rejects_false_successful_table_or_namespace_drop(self) -> None:
+        for resource in ("table", "namespace"):
+            with self.subTest(resource=resource):
+                catalog = mock.Mock()
+                catalog.table_exists.side_effect = [True, resource == "table"]
+                catalog.namespace_exists.return_value = True
+                with self.assertRaisesRegex(RuntimeError, resource + " remains"):
+                    pyiceberg_smoke.cleanup_catalog(catalog, ("sales", "orders"))
+
+    def test_cleanup_accepts_observed_already_absent_resources(self) -> None:
+        catalog = mock.Mock()
+        catalog.table_exists.return_value = False
+        catalog.namespace_exists.return_value = False
+        pyiceberg_smoke.cleanup_catalog(catalog, ("sales", "orders"))
+        catalog.drop_table.assert_not_called()
+        catalog.drop_namespace.assert_not_called()
+
+    def test_cleanup_read_failures_are_not_absence(self) -> None:
+        for check in ("table_exists", "namespace_exists"):
+            with self.subTest(check=check):
+                catalog = mock.Mock()
+                catalog.table_exists.return_value = False
+                getattr(catalog, check).side_effect = TimeoutError("read failed")
+                with self.assertRaises(TimeoutError):
+                    pyiceberg_smoke.cleanup_catalog(catalog, ("sales", "orders"))
+                catalog.drop_namespace.assert_not_called()
+
+    def test_rename_transport_and_drop_failure_propagate(self) -> None:
+        for method, suffix in (("POST", "/tables"), ("DELETE", "/renamed-owned")):
+            with self.subTest(method=method):
+                self.setUp()
+
+                def fail(args: object, deps: object, verb: str, path: str, body: object = None) -> dict[str, object]:
+                    if verb == method and path.endswith(suffix):
+                        raise TimeoutError("cleanup interrupted")
+                    return self.request(args, deps, verb, path, body)
+
+                with mock.patch.object(pyiceberg_smoke.uuid, "uuid4", return_value=SimpleNamespace(hex="owned")), mock.patch.object(
+                    pyiceberg_smoke, "signed_rest_request", side_effect=fail
+                ), self.assertRaises(TimeoutError):
+                    pyiceberg_smoke.run_table_rename_probe(self.args, mock.Mock(), self.backing)
+                self.assertEqual(self.entries["orders"], self.original)
 
 
 if __name__ == "__main__":

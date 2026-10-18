@@ -886,6 +886,15 @@ async fn checkpoint_fixture_hot_digest_retains_partial_progress() {
 #[tokio::test]
 #[serial]
 async fn checkpoint_fixture_hot_bucket_certifies_first_full_sweep_after_mixed_end() {
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
     let (scanner, root) = build_test_scanner().await;
     let _guard = TestGuard {
         temp_dir: Some(root.clone()),
@@ -970,6 +979,21 @@ async fn checkpoint_fixture_hot_bucket_certifies_first_full_sweep_after_mixed_en
             assert!(saved.info.scan_plan_digest.is_none(), "round {round} must not certify");
         }
     }
+    let events = logs
+        .contents()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("scanner JSON event"))
+        .filter(|event| event["fields"]["state"] == "bucket_sweep_incomplete")
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1, "only the mixed tail needs a verification-sweep diagnostic");
+    let fields = &events[0]["fields"];
+    assert_eq!(fields["bucket"], "bucket");
+    assert_eq!(fields["pool"], 0);
+    assert_eq!(fields["set"], 0);
+    assert_eq!(fields["mixed_coverage"], true);
+    assert_eq!(fields["coverage_gap"], false);
+    assert_eq!(fields["failed_objects"], 0);
+    assert_eq!(fields["size_reconciliation_entries"], 0);
 }
 
 async fn write_checkpoint_object(root: &std::path::Path, object: &str, versions: &[(Option<Uuid>, i64)]) {

@@ -362,6 +362,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         pending_heals_changed: false,
         coverage_frontier: None,
         resume_frontier: None,
+        resume_failed_paths: Vec::new(),
         coverage_gap: false,
         raw_enumeration_progress: Vec::new(),
         pending_heal_sync_deferred: false,
@@ -2587,7 +2588,7 @@ async fn test_scan_folder_corrupt_xl_meta_stops_erasure_data_dir_descent() {
         .await
         .expect("cached metadata failure must still stop erasure data directory descent");
 
-    assert_eq!(retry_into.failed_objects, 0, "cached failure should not be counted twice");
+    assert_eq!(retry_into.failed_objects, 1, "a rebuilt entry must retain suppressed failure debt");
     assert!(!retry_budget.budget_elapsed());
     assert_eq!(retry_budget.reason(), None);
 
@@ -2712,7 +2713,7 @@ async fn test_scan_folder_missing_xl_meta_stops_erasure_data_dir_descent() {
         .await
         .expect("cached missing metadata must still stop erasure data directory descent");
 
-    assert_eq!(retry_into.failed_objects, 0, "cached failure should not be counted twice");
+    assert_eq!(retry_into.failed_objects, 1, "a rebuilt entry must retain suppressed failure debt");
     assert!(!retry_budget.budget_elapsed());
     assert_eq!(retry_budget.reason(), None);
 }
@@ -3938,6 +3939,15 @@ async fn test_scan_data_folder_success_clears_resume_hint() {
 #[tokio::test]
 #[serial]
 async fn test_scan_data_folder_keeps_unresolved_objects_partial() {
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
     let (scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard {
         temp_dir: Some(temp_dir.clone()),
@@ -3988,6 +3998,18 @@ async fn test_scan_data_folder_keeps_unresolved_objects_partial() {
         "corrupt object failure should remain recorded: {:?}",
         partial.info.failed_objects
     );
+    let events = logs
+        .contents()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("scanner JSON event"))
+        .filter(|event| event["fields"]["state"] == "bucket_sweep_incomplete")
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1, "the incomplete sweep must identify its blocker");
+    let fields = &events[0]["fields"];
+    assert_eq!(fields["bucket"], "bucket");
+    assert_eq!(fields["failed_objects"], 1);
+    assert_eq!(fields["mixed_coverage"], false);
+    assert!(!events[0].to_string().contains(&failed_path), "do not log individual object paths");
 }
 
 #[tokio::test]

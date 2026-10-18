@@ -1032,6 +1032,9 @@ pub struct Metrics {
     scanner_usage_last_publication_unix_secs: AtomicU64,
     scanner_usage_last_publication_state: Mutex<String>,
     scanner_usage_last_publication_reason: Mutex<String>,
+    scanner_guardrail_veto_total: AtomicU64,
+    scanner_guardrail_last_veto_unix_secs: AtomicU64,
+    scanner_guardrail_last_veto_reason: Mutex<String>,
     scanner_usage_last_save_result: AtomicU8,
     scanner_usage_deferred_pending: AtomicBool,
     scanner_usage_deferred_total: AtomicU64,
@@ -1359,6 +1362,14 @@ pub struct ScannerUsageFreshnessSnapshot {
     pub last_deferred_unix_secs: u64,
     #[serde(default)]
     pub last_deferred_reason: String,
+    /// Guardrail vetoes attributed as `<field>@<host>`; a phase-2 peer
+    /// dirty-usage fallback is reported through the same fields.
+    #[serde(default)]
+    pub guardrail_veto_total: u64,
+    #[serde(default)]
+    pub last_guardrail_veto_unix_secs: u64,
+    #[serde(default)]
+    pub last_guardrail_veto_reason: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -2100,6 +2111,9 @@ impl Metrics {
             scanner_usage_last_publication_unix_secs: AtomicU64::new(0),
             scanner_usage_last_publication_state: Mutex::new(String::new()),
             scanner_usage_last_publication_reason: Mutex::new(String::new()),
+            scanner_guardrail_veto_total: AtomicU64::new(0),
+            scanner_guardrail_last_veto_unix_secs: AtomicU64::new(0),
+            scanner_guardrail_last_veto_reason: Mutex::new(String::new()),
             scanner_usage_last_save_result: AtomicU8::new(ScannerUsageSaveResult::Unknown as u8),
             scanner_usage_deferred_pending: AtomicBool::new(false),
             scanner_usage_deferred_total: AtomicU64::new(0),
@@ -2498,6 +2512,19 @@ impl Metrics {
             Err(poisoned) => poisoned.into_inner(),
         };
         *last_reason = reason;
+    }
+
+    /// Record an attributed cluster-activity guardrail veto (`<field>@<host>`)
+    /// so an operator can tell a rebalance or a PUT tail from a broken probe.
+    pub fn record_scanner_guardrail_veto(&self, reason: impl Into<String>) {
+        self.scanner_guardrail_veto_total.fetch_add(1, Ordering::Relaxed);
+        self.scanner_guardrail_last_veto_unix_secs
+            .store(unix_now_secs(), Ordering::Relaxed);
+        let mut last_reason = match self.scanner_guardrail_last_veto_reason.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *last_reason = reason.into();
     }
 
     pub fn record_scanner_usage_durable_success(&self) {
@@ -3590,6 +3617,12 @@ impl Metrics {
             deferred_total: self.scanner_usage_deferred_total.load(Ordering::Relaxed),
             last_deferred_unix_secs: self.scanner_usage_last_deferred_unix_secs.load(Ordering::Relaxed),
             last_deferred_reason: match self.scanner_usage_last_deferred_reason.lock() {
+                Ok(reason) => reason.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            },
+            guardrail_veto_total: self.scanner_guardrail_veto_total.load(Ordering::Relaxed),
+            last_guardrail_veto_unix_secs: self.scanner_guardrail_last_veto_unix_secs.load(Ordering::Relaxed),
+            last_guardrail_veto_reason: match self.scanner_guardrail_last_veto_reason.lock() {
                 Ok(reason) => reason.clone(),
                 Err(poisoned) => poisoned.into_inner().clone(),
             },

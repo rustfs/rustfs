@@ -22,6 +22,7 @@ const OBJECTS: u64 = 8;
 fn prepare_scanner(scanner: &mut FolderScanner, cache: DataUsageCache) {
     scanner.resume_frontier = cache.validated_scan_frontier().map(str::to_owned);
     scanner.coverage_frontier = scanner.resume_frontier.clone();
+    scanner.resume_failed_paths = failed_scan_paths(&cache);
     scanner.new_cache = DataUsageCache {
         info: cache.info.clone(),
         ..Default::default()
@@ -180,6 +181,8 @@ async fn finish_resumed_walk(cache: DataUsageCache, original: &FolderScanner) ->
     scanner.root = original.root.clone();
     scanner.local_disk = original.local_disk.clone();
     prepare_scanner(&mut scanner, cache);
+    scanner.failed_object_ttl_secs = original.failed_object_ttl_secs;
+    scanner.failed_objects_max = original.failed_objects_max;
     let parent = CancellationToken::new();
     scanner.budget = ScannerCycleBudget::new_with_progress_tracking(&parent, Default::default());
     let mut entry = DataUsageEntry::default();
@@ -216,20 +219,22 @@ async fn periodic_nested_snapshot_resumes_after_leader_handoff_with_exact_totals
 
 #[tokio::test]
 #[serial]
-async fn periodic_nested_snapshot_keeps_failed_prefix_outside_resume_frontier() {
+async fn periodic_nested_snapshot_resumes_healthy_progress_after_a_failed_object() {
     let (loaded, _, original, _guard) = nested_periodic_snapshot(true, (0, 0)).await;
-    assert!(
-        loaded.validated_scan_frontier().is_none(),
-        "an earlier corrupt object must block subtree skipping"
+    assert_eq!(
+        loaded.validated_scan_frontier(),
+        Some("bucket/prefix/a/0001"),
+        "object health debt must not freeze completed traversal coverage"
     );
     assert!(!loaded.info.failed_objects.is_empty(), "persisted failure debt must survive handoff");
     let (finished, visits, _unused_guard) = finish_resumed_walk(loaded, &original).await;
-    assert_eq!(visits, OBJECTS - 1, "every healthy object must be re-read after the coverage gap");
+    assert_eq!(visits, OBJECTS - 2, "the healthy covered sibling must skip its metadata read");
     let totals = finished
         .checked_flatten_complete_scope("bucket")
         .expect("failed sweep still has connected accounting");
     assert_eq!(u64::try_from(totals.objects).expect("healthy count"), OBJECTS - 1);
     assert_eq!(u64::try_from(totals.size).expect("healthy bytes"), OBJECTS - 1);
+    assert_eq!(totals.failed_objects, 1, "the retried failed subtree must retain its debt");
     assert!(!finished.info.failed_objects.is_empty(), "unrepaired metadata must remain pending");
 }
 
@@ -790,5 +795,191 @@ async fn periodic_nested_snapshot_does_not_publish_shared_compacted_accumulator_
     assert!(
         matches!(checkpoint_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
         "a shared compacted parent accumulator must not be snapshotted as the current child"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn periodic_failed_object_debt_survives_diagnostic_eviction_and_clears_after_repair() {
+    let (mut loaded, _, mut original, _guard) = nested_periodic_snapshot(true, (0, 0)).await;
+    loaded.info.failed_objects.clear();
+    original.failed_object_ttl_secs = 0;
+    let (failed, visits, _unused_guard) = finish_resumed_walk(loaded.clone(), &original).await;
+    let totals = failed
+        .checked_flatten_complete_scope("bucket")
+        .expect("failed resumed accounting");
+    assert_eq!(visits, OBJECTS - 2);
+    assert_eq!(totals.objects, usize::try_from(OBJECTS - 1).expect("healthy objects"));
+    assert_eq!(totals.failed_objects, 1, "uncapped entry debt must survive without diagnostic entries");
+    assert!(failed.info.failed_objects.is_empty(), "TTL zero must not be needed for correctness");
+
+    write_checkpoint_object(std::path::Path::new(&original.root), "prefix/a/0000", &[(None, 1)]).await;
+    let (repaired, visits, _repair_guard) = finish_resumed_walk(loaded, &original).await;
+    let totals = repaired
+        .checked_flatten_complete_scope("bucket")
+        .expect("repaired resumed accounting");
+    assert_eq!(
+        visits,
+        OBJECTS - 1,
+        "repair must reread the failed object and retain the covered healthy sibling"
+    );
+    assert_eq!(totals.objects, usize::try_from(OBJECTS).expect("all objects"));
+    assert_eq!(totals.size, usize::try_from(OBJECTS).expect("all bytes"));
+    assert_eq!(totals.failed_objects, 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn periodic_failed_subtree_resumes_healthy_descendants_and_compacted_debt() {
+    let (loaded, identity, original, _guard) = nested_periodic_snapshot(true, (0, 0)).await;
+    let (mut complete_walk, _, _unused_guard) = finish_resumed_walk(loaded, &original).await;
+    complete_walk.info.failed_objects.clear();
+    complete_walk
+        .seal_scan_frontier(Some("bucket/prefix/a"))
+        .expect("seal completed unhealthy parent");
+    for compacted in [false, true] {
+        let mut cache = complete_walk.clone();
+        if compacted {
+            cache.reduce_children_of(&hash_path("bucket/prefix/a"), 1, true);
+            assert!(cache.find("bucket/prefix/a").expect("compacted parent").compacted);
+            cache
+                .seal_scan_frontier(Some("bucket/prefix/a"))
+                .expect("reseal compacted accounting");
+        }
+        let store = FixtureStore::new();
+        let revisions = DataUsageCache::default()
+            .load_with_revisions(store.clone(), CACHE_NAME)
+            .await
+            .expect("fresh revisions");
+        cache
+            .save_with_revisions_for_epoch(store.clone(), CACHE_NAME, &revisions, 0)
+            .await
+            .expect("persist failure-bearing coverage");
+        let mut adopted = DataUsageCache::default();
+        adopted
+            .load(store, CACHE_NAME)
+            .await
+            .expect("reload failure-bearing coverage");
+        assert_eq!(
+            adopted.prepare_bucket_checkpoint("bucket", 11, 9, SOURCE, PLAN, identity),
+            crate::DataUsageCachePrepareOutcome::Reused
+        );
+        let (finished, visits, _resumed_guard) = finish_resumed_walk(adopted, &original).await;
+        assert_eq!(
+            visits,
+            if compacted { OBJECTS - 1 } else { 4 },
+            "only healthy independently cached covered subtrees may skip reads"
+        );
+        let totals = finished
+            .checked_flatten_complete_scope("bucket")
+            .expect("resumed failed parent accounting");
+        assert_eq!(totals.objects, usize::try_from(OBJECTS - 1).expect("healthy objects"));
+        assert_eq!(totals.size, usize::try_from(OBJECTS - 1).expect("healthy bytes"));
+        assert_eq!(totals.failed_objects, 1);
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn periodic_resume_uses_traversal_order_for_punctuation_siblings() {
+    let (loaded, _, original, _guard) = nested_periodic_snapshot(true, (0, 0)).await;
+    write_checkpoint_object(std::path::Path::new(&original.root), "prefix/a-", &[(None, 1)]).await;
+    let (mut cache, _, _walk_guard) = finish_resumed_walk(loaded, &original).await;
+    cache.info.failed_objects.clear();
+    cache
+        .seal_scan_frontier(Some("bucket/prefix/a-"))
+        .expect("seal completed punctuation sibling");
+    let (finished, visits, _resumed_guard) = finish_resumed_walk(cache, &original).await;
+    assert_eq!(visits, 4, "healthy children of the earlier failed sibling must remain covered");
+    let totals = finished
+        .checked_flatten_complete_scope("bucket")
+        .expect("punctuation sibling accounting");
+    assert_eq!(
+        totals.objects,
+        usize::try_from(OBJECTS).expect("healthy originals plus punctuation sibling")
+    );
+    assert_eq!(totals.size, totals.objects);
+    assert_eq!(totals.failed_objects, 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn periodic_failed_nested_entries_cannot_certify_a_bucket_with_diagnostics_disabled() {
+    let (loaded, _, original, _guard) = nested_periodic_snapshot(true, (0, 0)).await;
+    let result = temp_env::async_with_vars([(ENV_FAILED_OBJECT_TTL_SECS, Some("0"))], async {
+        let mut cache = loaded;
+        cache.info.failed_objects.clear();
+        cache.info.skip_healing = true;
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new_with_progress_tracking(&parent, Default::default());
+        scan_data_folder(
+            parent,
+            budget,
+            vec![original.local_disk.clone()],
+            original.local_disk.clone(),
+            cache,
+            None,
+            HealScanMode::Normal,
+            DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest),
+        )
+        .await
+    })
+    .await;
+    let Err(ScannerError::PartialCache(cache)) = result else {
+        panic!("nested unresolved object must keep the bucket partial");
+    };
+    assert!(!cache.info.snapshot_complete);
+    assert!(cache.info.failed_objects.is_empty());
+    assert_eq!(
+        cache
+            .checked_flatten_complete_scope("bucket")
+            .expect("partial accounting")
+            .failed_objects,
+        1
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn periodic_resume_debt_index_and_frontier_keep_subtree_boundaries() {
+    let (mut scanner, root) = build_test_scanner().await;
+    let _guard = TestGuard { temp_dir: Some(root) };
+    scanner.resume_failed_paths = vec!["bucket/a-".into(), "bucket/a/z".into(), "bucket/b".into()];
+    assert!(
+        scanner.resume_subtree_has_failures("bucket/a"),
+        "punctuation sibling must not hide a failing descendant"
+    );
+    assert!(scanner.resume_subtree_has_failures("bucket/b"));
+    assert!(!scanner.resume_subtree_has_failures("bucket/ab"));
+    assert!(!scanner.resume_subtree_has_failures("bucket/a/healthy"));
+    let (cache, _) = bound_checkpoint();
+    prepare_scanner(&mut scanner, cache);
+    scanner.coverage_frontier = Some("bucket/prefix/a".into());
+    scanner.record_completed_child("bucket/prefix/a/0000");
+    assert_eq!(
+        scanner.coverage_frontier.as_deref(),
+        Some("bucket/prefix/a"),
+        "debt retry must not narrow inherited coverage"
+    );
+    scanner.record_completed_child("bucket/prefix");
+    assert_eq!(
+        scanner.coverage_frontier.as_deref(),
+        Some("bucket/prefix"),
+        "completed ancestor widens coverage"
+    );
+    scanner.coverage_frontier = Some("bucket/a-".into());
+    assert!(scan_frontier_covers_path("bucket/a/healthy", "bucket/a-"));
+    scanner.record_completed_child("bucket/a/healthy");
+    assert_eq!(
+        scanner.coverage_frontier.as_deref(),
+        Some("bucket/a-"),
+        "component order must preserve a later sibling's frontier"
+    );
+    scanner.coverage_gap = true;
+    scanner.record_completed_child("bucket/z");
+    assert_eq!(
+        scanner.coverage_frontier.as_deref(),
+        Some("bucket/a-"),
+        "structural gaps must still freeze coverage"
     );
 }

@@ -1325,19 +1325,39 @@ pub(super) fn dirty_usage_buckets_excluding_failed(
         .collect()
 }
 
+/// Plan the per-bucket certification of a walk. The returned snapshot is
+/// applied by `clear_dirty_usage_buckets`, which removes only the buckets
+/// whose generation still equals the start snapshot: a bucket written during
+/// the walk keeps its newer generation and stays pending. The dirty-usage
+/// generation therefore does not need to be unchanged; only the guardrail
+/// must have passed.
 pub(super) fn should_clear_dirty_usage_snapshot(
     result_ok: bool,
     completed_all_sets: bool,
     budget_elapsed: bool,
-    activity_and_generation_current: bool,
+    guardrail_passed: bool,
     dirty_buckets: &DirtyUsageBuckets,
     failed_buckets: &HashSet<String>,
 ) -> Option<DirtyUsageBuckets> {
-    if result_ok && completed_all_sets && !budget_elapsed && activity_and_generation_current {
+    if result_ok && completed_all_sets && !budget_elapsed && guardrail_passed {
         return Some(dirty_usage_buckets_excluding_failed(dirty_buckets, failed_buckets));
     }
 
     None
+}
+
+/// Buckets the walk cannot certify against its start snapshot: every dirty
+/// bucket whose generation differs from the snapshot's, including buckets
+/// dirtied after the snapshot was taken. Only a `Complete` cycle reads this,
+/// and a failed bucket never reaches `Complete`, so the failed set that
+/// `dirty_usage_buckets_excluding_failed` removes is empty here.
+pub(super) fn pending_dirty_usage_buckets(snapshot: &DirtyUsageBuckets) -> BTreeSet<String> {
+    let dirty_buckets = dirty_usage_buckets();
+    dirty_buckets
+        .iter()
+        .filter(|(bucket, generation)| snapshot.get(bucket.as_str()) != Some(*generation))
+        .map(|(bucket, _)| bucket.clone())
+        .collect()
 }
 
 pub(super) async fn record_failed_dirty_bucket(failed_buckets: &Arc<Mutex<HashSet<String>>>, bucket: &str) {

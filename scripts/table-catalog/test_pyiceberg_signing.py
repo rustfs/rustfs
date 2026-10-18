@@ -104,6 +104,22 @@ class PyIcebergSigningTest(unittest.TestCase):
                 SigV4Auth(Credentials(args.access_key, args.secret_key), args.rest_signing_name, args.region).add_auth(expected)
                 self.assertEqual(request.headers["Authorization"], expected.headers["Authorization"])
 
+    def test_delegation_header_is_included_in_the_signed_request(self) -> None:
+        args = self.args()
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"{}"
+        with mock.patch.object(pyiceberg_smoke.urllib.request, "urlopen", return_value=response) as send:
+            pyiceberg_smoke.signed_rest_request(
+                args, self.deps, "GET", "/iceberg/v1/warehouse/namespaces/sales/tables/orders",
+                access_delegation="remote-signing, vended-credentials",
+            )
+        wire = send.call_args.args[0]
+        request = Request(wire.method, wire.full_url, headers=dict(wire.header_items())).prepare()
+        self.assertEqual(request.headers["X-Iceberg-Access-Delegation"], "remote-signing, vended-credentials")
+        self.assertEqual(request.headers["Authorization"], self.expected_signature(request, args))
+        request.headers["X-Iceberg-Access-Delegation"] = "remote-signing"
+        self.assertNotEqual(request.headers["Authorization"], self.expected_signature(request, args))
+
     def test_initial_config_and_recreated_sessions_are_signed(self) -> None:
         for profile in sorted(RUSTFS_PROFILES):
             args = self.args(profile)

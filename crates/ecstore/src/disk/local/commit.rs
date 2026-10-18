@@ -1007,13 +1007,20 @@ impl LocalDisk {
                 );
                 let old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
                 let old_version_exists = xlmeta.find_version(Some(version_id)).is_ok();
-                let rollback_data_dir = old_data_dir.or_else(|| {
-                    if old_version_exists && has_dst_buf.is_some() {
-                        Some(inline_metadata_rollback_dir(version_id, &xlmeta))
-                    } else {
-                        None
-                    }
-                });
+                // Healing commits never run set-level post-return rollback; keep
+                // their intra-commit rollback backup in the staging directory so
+                // `<object>/<rollback_data_dir>/xl.meta.bkp` is never stranded.
+                let rollback_data_dir = if fi_healing {
+                    None
+                } else {
+                    old_data_dir.or_else(|| {
+                        if old_version_exists && has_dst_buf.is_some() {
+                            Some(inline_metadata_rollback_dir(version_id, &xlmeta))
+                        } else {
+                            None
+                        }
+                    })
+                };
                 let mut staged_rollback_path = None;
                 if let Some(d) = old_data_dir.as_ref() {
                     let _ = xlmeta.data.remove_two(version_id, *d);
@@ -1029,7 +1036,7 @@ impl LocalDisk {
                 prepared_metadata_source.write_all(&new_buf, sync)?;
                 run_inline_preparation_before_backup(&dst_path_for_failpoint);
                 if let Some(ref old_metadata) = has_dst_buf
-                    && (rollback_data_dir.is_some() || sync || cfg!(test))
+                    && (rollback_data_dir.is_some() || fi_healing || sync || cfg!(test))
                 {
                     #[cfg(windows)]
                     let backup_path = {

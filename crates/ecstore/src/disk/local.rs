@@ -18312,6 +18312,93 @@ mod test {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(dst_dir_fsync_group_commit)]
+    async fn inline_heal_staged_backup_restores_metadata_after_commit_failure() {
+        let _group_commit = os::set_dst_dir_fsync_group_commit_for_test(true);
+        for mode in [DurabilityMode::None, DurabilityMode::Relaxed, DurabilityMode::Strict] {
+            let _mode = durability_mode_override::set(mode);
+            for version in [Uuid::nil(), Uuid::new_v4()] {
+                for old_inline in [true, false] {
+                    let root = tempfile::tempdir().expect("rollback fixture directory");
+                    let endpoint = Endpoint::try_from(root.path().to_str().expect("UTF-8 fixture path")).expect("endpoint");
+                    let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+                    let bucket = "inline-heal-rollback";
+                    let object = "inline-heal-staged-backup-rollback-object";
+                    ensure_test_volume(&disk, bucket).await;
+                    ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+                    let object_dir = disk.io_get_object_path(bucket, object).expect("physical object path");
+                    fs::create_dir_all(&object_dir).await.expect("object directory");
+                    let old_dir = Uuid::new_v4();
+                    let old = if old_inline {
+                        test_file_info(object, version, None, Some(Bytes::from_static(b"old inline bytes")))
+                    } else {
+                        fs::create_dir_all(object_dir.join(old_dir.to_string()))
+                            .await
+                            .expect("external directory");
+                        fs::write(object_dir.join(old_dir.to_string()).join("part.1"), b"x")
+                            .await
+                            .expect("old external shard");
+                        test_file_info(object, version, Some(old_dir), None)
+                    };
+                    let old_metadata = test_meta(old);
+                    fs::write(object_dir.join(STORAGE_FORMAT_FILE), &old_metadata)
+                        .await
+                        .expect("seed old metadata");
+                    if mode == DurabilityMode::Strict {
+                        os::fsync_dir_recorder::set_grouped_failure(&object_dir, io::ErrorKind::PermissionDenied);
+                    } else {
+                        set_rename_data_fail_after_metadata_commit(object);
+                    }
+                    let mut new = test_file_info(object, version, None, Some(Bytes::from_static(b"repaired inline bytes")));
+                    new.set_healing();
+                    let error = disk
+                        .rename_data(RUSTFS_META_TMP_BUCKET, "heal", new, bucket, object)
+                        .await
+                        .expect_err("injected post-publication failure");
+                    let expected_kind = if mode == DurabilityMode::Strict {
+                        io::ErrorKind::PermissionDenied
+                    } else {
+                        io::ErrorKind::Other
+                    };
+                    assert!(
+                        matches!(error, DiskError::Io(ref error) if error.kind() == expected_kind),
+                        "{mode:?}: {error:?}"
+                    );
+                    assert_eq!(
+                        fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+                            .await
+                            .expect("restored metadata"),
+                        old_metadata
+                    );
+                    if !old_inline {
+                        assert_eq!(
+                            fs::read(object_dir.join(old_dir.to_string()).join("part.1"))
+                                .await
+                                .expect("old shard"),
+                            b"x"
+                        );
+                    }
+                    let staging = disk.io_get_object_path(RUSTFS_META_TMP_BUCKET, "heal").expect("staging path");
+                    assert!(
+                        !staging.join(STORAGE_FORMAT_FILE_BACKUP).exists(),
+                        "rollback must consume the staging backup"
+                    );
+                    for entry in std::fs::read_dir(&object_dir).expect("object entries") {
+                        let entry = entry.expect("object entry");
+                        if entry.file_type().expect("entry type").is_dir() {
+                            assert!(
+                                !entry.path().join(STORAGE_FORMAT_FILE_BACKUP).exists(),
+                                "heal must not publish a live rollback backup"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn windows_and_unix_rename_data_inline_post_commit_error_restores_old_metadata() {
         use tempfile::tempdir;

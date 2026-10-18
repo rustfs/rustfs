@@ -195,16 +195,32 @@ impl Operation for RunTableMaintenanceWorkerHandler {
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
         ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let request = read_json_body::<TableMaintenanceWorkerRunRequest>(req.input).await?;
+        let condition = request.condition()?;
         let store = table_catalog_store_from_extensions(&req.extensions)?;
-        let response = store
-            .run_table_metadata_maintenance_worker_once(
-                &warehouse,
-                &namespace.public_name(),
-                &table,
-                request.worker_id().to_string(),
-            )
-            .await
-            .map_err(catalog_store_error)?;
+        let response = match condition {
+            Some(condition) => {
+                store
+                    .run_table_metadata_maintenance_worker_once_conditionally(
+                        &warehouse,
+                        &namespace.public_name(),
+                        &table,
+                        request.worker_id().to_string(),
+                        &condition,
+                    )
+                    .await
+            }
+            None => {
+                store
+                    .run_table_metadata_maintenance_worker_once(
+                        &warehouse,
+                        &namespace.public_name(),
+                        &table,
+                        request.worker_id().to_string(),
+                    )
+                    .await
+            }
+        }
+        .map_err(catalog_store_error)?;
         build_json_response(StatusCode::OK, &response)
     }
 }
