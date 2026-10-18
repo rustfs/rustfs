@@ -6625,7 +6625,7 @@ impl LocalDisk {
         let claim = SnapshotLeaseDeleteClaim::new(&self.snapshot_leases, key);
 
         let result = self
-            .delete_unleased_with_namespace_owner(volume, path, &opts, namespace_owner)
+            .delete_unleased_with_namespace_owner(volume, path, &opts, namespace_owner, None)
             .await;
         claim.finish(result.is_ok());
         result.map(|()| DataDirDeleteStatus::Deleted)
@@ -7040,7 +7040,7 @@ impl LocalDisk {
             )
             .await
         } else {
-            self.delete_file_with_namespace_owner(&volume_dir, &xl_path, true, false, namespace_owner.clone())
+            self.delete_file_with_namespace_owner(&volume_dir, &xl_path, true, false, namespace_owner.clone(), None)
                 .await
         };
 
@@ -7311,12 +7311,19 @@ impl LocalDisk {
         } else {
             false
         };
-        if volume == RUSTFS_META_TMP_BUCKET && opt.recursive {
+        let staging_cleanup = if volume == RUSTFS_META_TMP_BUCKET && opt.recursive {
             let staging = tmp_staging_mutation_path(&self.root, path)?;
-            namespace_owner = Some(os::acquire_namespace_mutation_lease_with_owner(&staging, namespace_owner).await);
-        }
+            let lease = os::acquire_namespace_mutation_lease_with_owner(&staging, namespace_owner.take()).await;
+            namespace_owner = Some(lease.clone());
+            Some(StagingCleanupLease {
+                io_prefix: tmp_staging_mutation_path(self.io_root(), path)?,
+                lease,
+            })
+        } else {
+            None
+        };
         match self
-            .delete_unleased_with_namespace_owner(volume, path, &opt, namespace_owner)
+            .delete_unleased_with_namespace_owner(volume, path, &opt, namespace_owner, staging_cleanup.as_ref())
             .await
         {
             Err(DiskError::FileNotFound) if handled_version_delete => Ok(()),
@@ -7423,7 +7430,7 @@ impl LocalDisk {
     }
 
     async fn delete_unleased(&self, volume: &str, path: &str, opt: &DeleteOptions) -> Result<()> {
-        self.delete_unleased_with_namespace_owner(volume, path, opt, None).await
+        self.delete_unleased_with_namespace_owner(volume, path, opt, None, None).await
     }
 
     async fn delete_unleased_with_namespace_owner(
@@ -7432,6 +7439,7 @@ impl LocalDisk {
         path: &str,
         opt: &DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
+        staging_cleanup: Option<&StagingCleanupLease>,
     ) -> Result<()> {
         let volume_dir = self.io_get_bucket_path(volume)?;
         if !skip_access_checks(volume)
@@ -7598,8 +7606,15 @@ impl LocalDisk {
             })?;
             recursive = false;
         }
-        self.delete_file_with_namespace_owner(&volume_dir, &file_path, recursive, opt.immediate, namespace_owner)
-            .await?;
+        self.delete_file_with_namespace_owner(
+            &volume_dir,
+            &file_path,
+            recursive,
+            opt.immediate,
+            namespace_owner,
+            staging_cleanup,
+        )
+        .await?;
         // A deleted shard must not remain readable through the io_uring fd cache.
         self.io_backend.invalidate_cached_fds_under(volume, path);
         Ok(())
@@ -7612,7 +7627,7 @@ impl LocalDisk {
         recursive: bool,
         immediate_purge: bool,
     ) -> Result<()> {
-        self.delete_file_with_namespace_owner(base_path, delete_path, recursive, immediate_purge, None)
+        self.delete_file_with_namespace_owner(base_path, delete_path, recursive, immediate_purge, None, None)
             .await
     }
 
@@ -7624,6 +7639,7 @@ impl LocalDisk {
         recursive: bool,
         immediate_purge: bool,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
+        staging_cleanup: Option<&'a StagingCleanupLease>,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             // debug!("delete_file {:?}\n base_path:{:?}", &delete_path, &base_path);
@@ -7641,9 +7657,15 @@ impl LocalDisk {
             if recursive {
                 self.move_to_trash_with_namespace_owner(delete_path, recursive, immediate_purge, namespace_owner.clone())
                     .await?;
-            } else if delete_path.is_dir() {
+            } else if staging_cleanup.is_some_and(|staging| staging.io_prefix == *delete_path) || delete_path.is_dir() {
                 // debug!("delete_file remove_dir {:?}", &delete_path);
-                if let Err(err) = os::remove_dir_with_owner(delete_path, namespace_owner.clone()).await {
+                // Pruning can reach the TMP prefix already held by this cleanup.
+                // Reuse its lease in the executor rather than locking it again.
+                let removal = match staging_cleanup.filter(|staging| staging.io_prefix == *delete_path) {
+                    Some(staging) => os::remove_dir_with_lease(delete_path, staging.lease.clone()).await,
+                    None => os::remove_dir_with_owner(delete_path, namespace_owner.clone()).await,
+                };
+                if let Err(err) = removal {
                     // debug!("remove_dir err {:?} when {:?}", &err, &delete_path);
                     // A missing or still-populated directory is benign here; see
                     // is_benign_object_rmdir_error (handles the illumos/Solaris EEXIST
@@ -7692,8 +7714,15 @@ impl LocalDisk {
             }
 
             if let Some(dir_path) = delete_path.parent() {
-                self.delete_file_with_namespace_owner(base_path, &PathBuf::from(dir_path), false, false, namespace_owner.clone())
-                    .await?;
+                self.delete_file_with_namespace_owner(
+                    base_path,
+                    &PathBuf::from(dir_path),
+                    false,
+                    false,
+                    namespace_owner.clone(),
+                    staging_cleanup,
+                )
+                .await?;
             }
 
             // debug!("delete_file done {:?}", &delete_path);
@@ -8364,7 +8393,7 @@ impl LocalDisk {
         // Remove xl.meta when no versions remain
         if fm.versions.is_empty() {
             if let Err(err) = self
-                .delete_file_with_namespace_owner(&volume_dir, &xlpath, true, false, namespace_owner.clone())
+                .delete_file_with_namespace_owner(&volume_dir, &xlpath, true, false, namespace_owner.clone(), None)
                 .await
             {
                 if reserved_version_delete && let Some(rollback_dir) = rollback_dir {
@@ -9762,6 +9791,11 @@ fn skip_access_checks(p: impl AsRef<str>) -> bool {
     false
 }
 
+struct StagingCleanupLease {
+    io_prefix: PathBuf,
+    lease: Arc<os::NamespaceMutationLease>,
+}
+
 // Use the configured root rather than per-handle /proc fd paths. A nested
 // publication and cleanup of its top-level TMP entry must share one lease.
 fn tmp_staging_mutation_path(root: &Path, key: &str) -> Result<PathBuf> {
@@ -10167,6 +10201,7 @@ impl LocalDisk {
                                         ..opts.clone()
                                     },
                                     namespace_owner.clone(),
+                                    None,
                                 )
                                 .await
                             }
@@ -10178,7 +10213,7 @@ impl LocalDisk {
                         // Preserve the legacy marker-only cleanup policy without
                         // upgrading disk-local evidence into a quorum receipt.
                         match self
-                            .delete_unleased_with_namespace_owner(volume, &transaction_path, &opts, namespace_owner.clone())
+                            .delete_unleased_with_namespace_owner(volume, &transaction_path, &opts, namespace_owner.clone(), None)
                             .await
                         {
                             Ok(()) | Err(DiskError::FileNotFound) => self
@@ -18353,6 +18388,66 @@ mod test {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_tmp_parent_pruning_retains_staging_lease_in_executor() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+
+        let root = tempfile::tempdir().expect("cancelled parent pruning fixture");
+        let endpoint = Endpoint::try_from(root.path().to_str().expect("UTF-8 fixture path")).expect("endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        disk.write_all(RUSTFS_META_TMP_BUCKET, "stage/child/payload", Bytes::from_static(b"old staging bytes"))
+            .await
+            .expect("seed nested staging prefix");
+        let parent = disk
+            .io_get_object_path(RUSTFS_META_TMP_BUCKET, "stage")
+            .expect("staging parent path");
+        let staging_key = tmp_staging_mutation_path(&disk.root, "stage").expect("shared staging key");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hook = hooks::install_at(hooks::Stage::Remove, &parent, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(30));
+        });
+        let cleanup_disk = disk.clone();
+        let mut cleanup = tokio::spawn(async move {
+            cleanup_disk
+                .delete(
+                    RUSTFS_META_TMP_BUCKET,
+                    "stage/child",
+                    DeleteOptions {
+                        recursive: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                entered = entered_rx => entered.expect("physical parent rmdir pause"),
+                result = &mut cleanup => panic!("cleanup returned before parent pruning: {result:?}"),
+            }
+        })
+        .await
+        .expect("cleanup must reach its already-leased parent");
+        cleanup.abort();
+        assert!(cleanup.await.expect_err("cleanup waiter cancelled").is_cancelled());
+        let mut next_owner =
+            tokio::spawn(async move { os::acquire_namespace_mutation_lease_with_owner(&staging_key, None).await });
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut next_owner).await.is_err(),
+            "the physical rmdir must retain the staging lease after cancellation"
+        );
+        drop(release_tx);
+        let _next_owner = tokio::time::timeout(Duration::from_secs(10), next_owner)
+            .await
+            .expect("staging lease released after physical rmdir")
+            .expect("next staging owner");
+        assert!(!parent.exists(), "the empty staging parent must actually be pruned");
+        assert!(disk.io_get_bucket_path(RUSTFS_META_TMP_BUCKET).expect("TMP path").is_dir());
+    }
+
     #[test]
     fn tmp_staging_keys_share_top_level_prefix_and_reject_escape() {
         let root = tempfile::tempdir().expect("staging key fixture");
@@ -18395,7 +18490,9 @@ mod test {
                 .expect("physical staging prefix");
             let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-            let _hook = hooks::install_at(hooks::Stage::DirFsync, &object_dir, move || {
+            // Group fsync hooks use canonical paths, including on Linux mount-FD IO paths.
+            let fsync_hook_path = object_dir.canonicalize().expect("canonical group fsync path");
+            let _hook = hooks::install_at(hooks::Stage::DirFsync, &fsync_hook_path, move || {
                 let _ = entered_tx.send(());
                 // Dropping the sender also releases this executor when an assertion fails.
                 let _ = release_rx.recv_timeout(Duration::from_secs(30));
@@ -18408,7 +18505,7 @@ mod test {
             let owner = ctx.begin_namespace_commit();
             let owner_probe = Arc::downgrade(&owner);
             let wrapper = LocalDiskWrapper::new(Arc::clone(&disk), false);
-            let receiver = tokio::spawn(async move {
+            let mut receiver = tokio::spawn(async move {
                 wrapper
                     .rename_data_observed_with_guards(
                         RUSTFS_META_TMP_BUCKET,
@@ -18423,10 +18520,17 @@ mod test {
                     )
                     .await
             });
-            tokio::time::timeout(Duration::from_secs(10), entered_rx)
-                .await
-                .expect("owned receiver must reach post-publication fsync")
-                .expect("physical fsync pause");
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    entered = entered_rx => entered.expect("physical fsync pause"),
+                    result = &mut receiver => match result {
+                        Ok(observation) => panic!("receiver completed before the fsync pause; error: {:?}", observation.result.err()),
+                        Err(error) => panic!("receiver task failed before the fsync pause: {error}"),
+                    },
+                }
+            })
+            .await
+            .expect("owned receiver must reach post-publication fsync");
             assert_ne!(fs::read(&metadata_path).await.expect("published repaired metadata"), old_metadata);
             assert_eq!(
                 fs::read(staging_dir.join(STORAGE_FORMAT_FILE_BACKUP))

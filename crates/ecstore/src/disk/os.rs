@@ -2199,9 +2199,19 @@ pub(crate) async fn remove_dir_with_owner(
     if namespace_owner.is_none() {
         return tokio::fs::remove_dir(path).await;
     }
+    let lease = acquire_namespace_mutation_lease_with_owner(path.as_ref(), namespace_owner).await;
+    remove_dir_with_lease(path, lease).await
+}
+
+/// Remove a directory whose namespace is already leased by the caller.
+pub(crate) async fn remove_dir_with_lease(path: impl AsRef<Path>, lease: Arc<NamespaceMutationLease>) -> io::Result<()> {
     let path = path.as_ref().to_path_buf();
-    let lease = acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await;
-    run_blocking_namespace_operation(lease, move || std::fs::remove_dir(path)).await
+    run_blocking_namespace_operation(lease, move || {
+        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Remove, &path);
+        std::fs::remove_dir(path)
+    })
+    .await
 }
 
 /// Preserve raw rename semantics while retaining a counted owner in the syscall.
