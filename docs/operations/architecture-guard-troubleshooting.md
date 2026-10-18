@@ -57,7 +57,7 @@ consider adding it to the script's `checked_files` list.
 
 ## `check_doc_paths.sh`
 
-Instruction docs (`AGENTS.md`, `CLAUDE.md`, `ARCHITECTURE.md`) and every
+Instruction docs (`AGENTS.md`, `ARCHITECTURE.md`) and every
 Markdown file under `docs/` (architecture, operations, testing, index) must not
 reference repo file paths that no longer exist. If your refactor moved code,
 update the docs that point at it — the error message lists `doc -> stale-path`

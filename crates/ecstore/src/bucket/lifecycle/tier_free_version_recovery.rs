@@ -626,7 +626,7 @@ fn mark_scan_truncated_if_needed(
 
 fn is_recoverable_tier_free_version(oi: &ObjectInfo) -> bool {
     // A free version transitioned to an unversioned remote tier legally carries an
-    // empty `version_id` (see CLAUDE.md: a tier version of `None`/`""` means the
+    // empty `version_id` (see AGENTS.md: a tier version of `None`/`""` means the
     // tier bucket is unversioned). The worker path handles that by issuing a
     // versionless remote delete, so the recovery gate must not treat an empty
     // `version_id` as unrecoverable — the object name and tier are sufficient to
