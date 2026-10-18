@@ -1594,7 +1594,7 @@ fn get_lock_acquire_timeout() -> Duration {
 }
 
 fn data_usage_persist_timeout() -> Duration {
-    DataUsageCache::persistence_timeout()
+    DataUsageCache::publication_timeout()
 }
 
 #[cfg(not(test))]

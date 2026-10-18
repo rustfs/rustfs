@@ -397,13 +397,25 @@ impl DataUsageCache {
         crate::runtime_config::scanner_cache_save_timeout()
     }
 
-    pub(crate) fn persistence_timeout() -> Duration {
+    pub(crate) fn publication_timeout() -> Duration {
+        // Aggregate statistics publication must fit its lease window rather
+        // than inherit the longer checkpoint save/reconciliation allowance.
         let timeout_duration = Self::cache_save_timeout();
         timeout_duration
             .saturating_mul(DATA_USAGE_CACHE_SAVE_RETRIES + 1)
             .saturating_add(DATA_USAGE_CACHE_SAVE_RETRY_BACKOFF_MAX)
-            // A cost-adjusted backup may use the full configured attempt budget.
-            .saturating_add(timeout_duration)
+            .saturating_add(Self::backup_cache_save_timeout(timeout_duration, Duration::ZERO))
+            .saturating_add(DATA_USAGE_CACHE_PERSISTENCE_MARGIN)
+    }
+
+    pub(crate) fn persistence_timeout() -> Duration {
+        // Each save attempt can be followed by a full read-after-error
+        // reconciliation attempt, including the best-effort backup.
+        Self::cache_save_timeout()
+            .saturating_mul(DATA_USAGE_CACHE_SAVE_RETRIES + DATA_USAGE_CACHE_BACKUP_SAVE_RETRIES + 2)
+            .saturating_mul(2)
+            .saturating_add(DATA_USAGE_CACHE_SAVE_RETRY_BACKOFF_MAX)
+            .saturating_add(DATA_USAGE_CACHE_RECONCILE_BACKOFF_MAX)
             .saturating_add(DATA_USAGE_CACHE_PERSISTENCE_MARGIN)
     }
 
