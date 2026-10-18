@@ -4270,6 +4270,79 @@ impl ECStore {
         .await
     }
 
+    /// Capture one logical key's version group for write-triggered expiry.
+    pub(crate) async fn get_object_versions_for_lifecycle(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        bucket_incarnation_id: Uuid,
+    ) -> Result<Vec<ObjectInfo>> {
+        crate::bucket::utils::check_object_args(bucket, object)?;
+        let mut opts = opts.clone();
+        // Lock order matches writes: bucket lifecycle, metadata validation,
+        // then object namespace. Borrow fences supplied by an outer operation.
+        let bucket_guard = if opts.bucket_lifecycle_lock_fence.is_none() {
+            let guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
+            opts.add_bucket_lifecycle_lock_guard(&guard);
+            Some(guard)
+        } else {
+            None
+        };
+        let incarnation = crate::bucket::metadata_sys::get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
+        if incarnation != bucket_incarnation_id {
+            return Err(Error::BucketNotFound(bucket.to_owned()));
+        }
+        let metadata_sys = crate::bucket::metadata_sys::bucket_metadata_sys_of(&self.ctx)?;
+        let metadata_sys = metadata_sys.read().await.clone();
+        let (versioning, _) = metadata_sys.get_versioning_config(bucket).await?;
+        let disk_object = path::encode_dir_object(object);
+        let object_guard = self
+            .acquire_object_read_lock_if_needed("lifecycle_versions", bucket, &disk_object, &mut opts)
+            .await?;
+
+        // As with version listings, include every physical set: migration can
+        // leave a key's history in more than its current hash destination.
+        let reads = self
+            .pools
+            .iter()
+            .flat_map(|pool| &pool.disk_set)
+            .map(|set| set.read_object_versions_for_lifecycle(bucket, object));
+        let mut entries = Vec::new();
+        for result in join_all(reads).await {
+            if let Some(entry) = result.map_err(|error| to_object_err(error.into(), vec![bucket, object]))? {
+                entries.push(entry);
+            }
+        }
+        if self.pools.is_empty()
+            || bucket_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+            || opts
+                .bucket_lifecycle_lock_fence
+                .as_ref()
+                .is_some_and(|fence| fence.is_lock_lost())
+            || opts.namespace_lock_fence.as_ref().is_some_and(|fence| fence.is_lock_lost())
+            || object_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+        {
+            return Err(Error::PreconditionFailed);
+        }
+        let mut entries = entries.into_iter();
+        let Some(mut entry) = entries.next() else {
+            return Ok(Vec::new());
+        };
+        if entries.len() > 0 {
+            merge_object_entry_versions(&mut entry, entries)?;
+        }
+        // This projection excludes tier free-version bookkeeping but retains
+        // pending version purges for the evaluator's replication safeguards.
+        let versions = entry.file_info_versions(bucket)?;
+        let versioned = versioning.versioned(object);
+        Ok(versions
+            .versions
+            .iter()
+            .map(|version| ObjectInfo::from_file_info(version, bucket, object, versioned))
+            .collect())
+    }
+
     async fn inner_list_object_versions_with_projection(
         self: Arc<Self>,
         input: ListObjectVersionsInput<'_>,
@@ -7300,6 +7373,9 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 mod differential_tests;
 
 #[cfg(test)]
+mod lifecycle_exact_tests;
+
+#[cfg(test)]
 mod test {
     use super::{
         ENV_API_LIST_OBJECTS_INDEX_MODE, ENV_API_LIST_OBJECTS_INDEX_PROVIDER, ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION,
@@ -7528,7 +7604,7 @@ mod test {
         }
     }
 
-    fn test_pending_version_purge_meta_entry(bucket: &str, name: &str) -> (MetaCacheEntry, Uuid) {
+    pub(super) fn test_pending_version_purge_meta_entry(bucket: &str, name: &str) -> (MetaCacheEntry, Uuid) {
         let version_id = Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0);
         let data_dir = Uuid::from_u128(0xabcd_ef12_3456_7890_abcd_ef12_3456_7890);
         let mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");

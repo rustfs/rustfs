@@ -541,6 +541,8 @@ def mixed_versions():
         for initiator in (0, 3):
             (code, body) = cluster.clients[initiator].request('DELETE', bucket + '/' + key)
             assert code >= 400, f'mixed initiator{initiator} must fail closed: {code} {body!r}'
+            if initiator == 0:
+                assert code == 503 and b'<Code>ServiceUnavailable</Code>' in body, 'modern mixed-version rejection must remain retryable'
             after = residue_inventory(cluster, bucket, key)
             (ROOT / f'mixed-initiator-{initiator}-inventory.json').write_text(json.dumps({'before': original, 'after': after}, indent=2))
             assert after == original, 'mixed rejection must preserve exact metadata/shards after rollback'
@@ -893,6 +895,50 @@ def deep_key_crash(large_stack=False):
     finally:
         cluster.remove()
 
+def automatic_clean_restart():
+    cluster = Cluster('automatic-clean-restart', drives=4)
+    try:
+        cluster.create()
+        client = cluster.clients[0]
+        bucket = 'automatic-clean-restart'
+        key = 'payload'
+        client.put_bucket(bucket)
+        client.put(bucket, key, b'automatic-recovery' * 150000)
+        nonce = arm_barrier(cluster, 0, bucket, key, 'DECISION')
+        thread, request = async_delete(client, bucket, key)
+        reached_barrier(cluster, 0, nonce)
+        deadline = time.monotonic() + 40
+        while len(list(cluster.barriers[0].glob('reached.' + nonce + '.*.json'))) < 4:
+            if time.monotonic() > deadline:
+                raise TimeoutError('all four receipts must persist before injecting response errors')
+            time.sleep(0.02)
+        # Prevent the live retry worker from completing before the clean stop.
+        # The failure is in task-owned payload directories, never in the proof.
+        deny = "from pathlib import Path; import json,os; roots=list(Path('/data').glob('d*/%s/%s')); dirs=[p for root in roots for p in root.iterdir() if p.is_dir() and (p/'part.1').is_file()]; assert len(dirs)==4; [os.chmod(p,0) for p in dirs]; print(json.dumps({'protected_payload_dirs':len(dirs)}))" % (bucket, key)
+        cluster.inspect_data(deny)
+        (cluster.barriers[0] / ('release.' + nonce)).write_bytes(b'io_error')
+        thread.join(40)
+        assert not thread.is_alive(), 'uncertain publication must return to the client'
+        assert 'response' in request and request['response'][0] >= 400, request
+        clear_barriers(cluster)
+        before = residue_inventory(cluster, bucket, key)
+        assert all(any(path.endswith('delete-quorum-committed') for path in drive['files']) for node in before for drive in node)
+        docker('stop', '--time', '60', cluster.names[0])
+        state = json.loads(docker('inspect', '--format', '{{json .State}}', cluster.names[0]).stdout)
+        assert state['ExitCode'] == 0 and not state['OOMKilled'], state
+        repair = "from pathlib import Path; import json,os; roots=list(Path('/data').glob('d*/%s/%s')); dirs=[p for root in roots for p in root.iterdir() if p.is_dir() and (p/'part.1').is_file()]; assert len(dirs)==4; [os.chmod(p,0o755) for p in dirs]; print(json.dumps({'restored_payload_dirs':len(dirs)}))" % (bucket, key)
+        cluster.inspect_data(repair)
+        cluster.restart()
+        # Only readiness and read-only inventory are polled after restart.
+        # No DELETE or administrator heal may manufacture a new retry hint.
+        wait_inventory(cluster, bucket, key, lambda inventory: all(not drive['exists'] for node in inventory for drive in node), timeout=90)
+        client.request('GET', bucket + '/' + key, expected=404)
+        assert client.list(bucket) == []
+        client.delete_bucket(bucket)
+        return {'case': 'uncertain-publication-clean-restart-automatic-recovery', 'status': 'passed', 'clean_exit_code': state['ExitCode']}
+    finally:
+        cluster.remove()
+
 def receipt_response_loss():
     cluster = Cluster('receipt-response-loss', nodes=4, drives=2)
     try:
@@ -1227,7 +1273,7 @@ def main():
         existing = docker(resource, 'ls', '-q', '--filter', 'label=rustfs.delete-recovery-test=' + PREFIX).stdout.strip()
         if existing:
             parser.error('namespace already owns Docker resources; choose a new namespace')
-    cases = {'unknown-fresh': unknown_predecessor_fresh_delete, 'batch1000': large_batch_delete, 'versions3000': large_version_history, 'admin-smoke': admin_smoke, 'legacy-alias': legacy_transaction_data_dir_alias, 'missing-offline': ordinary_missing_with_offline_peer, 'inverse': retained_decision_newer_undecided, 'deep': deep_key_crash, 'deep-large-stack': lambda : deep_key_crash(True), 'admin-prefix': admin_prefix_scoped, 'response-loss': receipt_response_loss, 'admin-object': lambda : admin_legacy_dry_run(True), 'smoke': smoke, 'legacy1': lambda : legacy_retry(1), 'legacy4': lambda : legacy_retry(4), 'restore': rollback_crash, 'retention': protected_version, 'version-applied': lambda : versioned_crash('APPLIED'), 'version-decision': lambda : versioned_crash('DECISION'), 'returning': returning_drive_new_generation, 'untouched': untouched_returning_peer, 'missing-version': missing_version_returning_peer, 'mixed': mixed_versions, 'admin': admin_legacy_dry_run, 'prefix': uuid_prefix_crash, 'corruption': corruption_repair, 'permission': permission_fault, 'error-prepared': lambda : injected_error('PREPARED'), 'error-applied': lambda : injected_error('APPLIED'), 'error-decision': lambda : injected_error('DECISION')}
+    cases = {'automatic-clean-restart': automatic_clean_restart, 'unknown-fresh': unknown_predecessor_fresh_delete, 'batch1000': large_batch_delete, 'versions3000': large_version_history, 'admin-smoke': admin_smoke, 'legacy-alias': legacy_transaction_data_dir_alias, 'missing-offline': ordinary_missing_with_offline_peer, 'inverse': retained_decision_newer_undecided, 'deep': deep_key_crash, 'deep-large-stack': lambda : deep_key_crash(True), 'admin-prefix': admin_prefix_scoped, 'response-loss': receipt_response_loss, 'admin-object': lambda : admin_legacy_dry_run(True), 'smoke': smoke, 'legacy1': lambda : legacy_retry(1), 'legacy4': lambda : legacy_retry(4), 'restore': rollback_crash, 'retention': protected_version, 'version-applied': lambda : versioned_crash('APPLIED'), 'version-decision': lambda : versioned_crash('DECISION'), 'returning': returning_drive_new_generation, 'untouched': untouched_returning_peer, 'missing-version': missing_version_returning_peer, 'mixed': mixed_versions, 'admin': admin_legacy_dry_run, 'prefix': uuid_prefix_crash, 'corruption': corruption_repair, 'permission': permission_fault, 'error-prepared': lambda : injected_error('PREPARED'), 'error-applied': lambda : injected_error('APPLIED'), 'error-decision': lambda : injected_error('DECISION')}
     cases.update({'multipart-sidecars': completed_multipart_sidecars, 'multipart-integrity': lambda: completed_multipart_sidecars(True), 'multipart-sidecars-applied': lambda: completed_multipart_sidecars(False, True), 'multipart-integrity-applied': lambda: completed_multipart_sidecars(True, True)})
     for stage in ('PREACTIVATION', 'PREPARED', 'APPLIED', 'DECISION'):
         for nodes in (1, 4):

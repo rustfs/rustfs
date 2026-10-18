@@ -17,16 +17,12 @@ use rmp::Marker;
 use std::io::Read;
 
 /// Maximum accepted length for a single length-prefixed msgpack element
-/// (map key, string, binary blob, ext payload, or a whole serialized
-/// xl.meta record inside a metacache stream).
+/// (map key, string, binary blob, or ext payload) inside xl.meta.
 ///
-/// Legitimate elements are far smaller: object keys are at most a few KiB
-/// and even an xl.meta record fully populated up to the 10,000-version
-/// object cap serializes to a few MiB (metacache streams carry xl.meta
-/// without inline data), so 16 MiB leaves ample headroom. A larger value
-/// means the length prefix itself is corrupt; decoding must fail with an
-/// error instead of attempting a huge allocation that aborts the whole
-/// process (see rustfs/rustfs#2715).
+/// This is not a limit on the aggregate xl.meta carried by a metacache
+/// stream: many versions and their inline data can exceed it. Bound each
+/// individual value before allocation so corrupted prefixes return an error
+/// instead of attempting a huge allocation (see rustfs/rustfs#2715).
 pub(crate) const MAX_MSGP_ELEMENT_SIZE: usize = 16 << 20;
 
 /// Reads exactly `len` bytes into a fresh buffer, treating `len` as

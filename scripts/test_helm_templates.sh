@@ -180,6 +180,7 @@ scanner_config_output=$(render_chart \
   --set config.rustfs.scanner.cache_save_timeout_secs=30 \
   --set config.rustfs.scanner.max_concurrent_set_scans=2 \
   --set config.rustfs.scanner.max_concurrent_disk_scans=1 \
+  --set config.rustfs.scanner.walkers_per_disk=2 \
   --set config.rustfs.scanner.yield_every_n_objects=128 \
   --set config.rustfs.scanner.alert_excess_versions=100 \
   --set config.rustfs.scanner.alert_excess_version_size=1099511627776 \
@@ -197,6 +198,7 @@ grep -q 'RUSTFS_SCANNER_IDLE_MODE: "false"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS: "30"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS: "2"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS: "1"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_WALKERS_PER_DISK: "2"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS: "128"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_ALERT_EXCESS_VERSIONS: "100"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_ALERT_EXCESS_VERSION_SIZE: "1099511627776"' <<<"$scanner_config_output"

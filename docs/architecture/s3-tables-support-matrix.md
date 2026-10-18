@@ -38,7 +38,7 @@ RustFS S3 Tables is an Iceberg REST Catalog and table-bucket implementation on t
 
 | Client or engine | Status | Claim |
 |---|---|---|
-| PyIceberg | Automated | Namespace and table create, append, reload, scan, metadata-location, refs, views, maintenance, diagnostics, optional vended credentials with an exact-prefix data-plane scope check. |
+| PyIceberg | Automated | Namespace and table create, append, exact-row reload/scan, metadata-location, refs, views, namespace properties, rename identity and credential negotiation. The smoke discovers the server backing and checks maintenance configuration, scheduler/worker dry-run, diagnostics and export on both backings. Direct metadata maintenance is checked as unsupported on durable-strong. Optional vended credentials include an exact-prefix data-plane scope check. |
 | Spark Iceberg REST catalog | Manual/live harness | Pinned package inputs, catalog properties, atomic CTAS SQL through staged create, expected `row_count=2`, and a CI opt-in gate for create/refresh/count/cleanup. Live execution and commit-conflict probing remain manual unless enabled in the runner. |
 | Trino Iceberg REST catalog | Manual/live harness | Catalog properties and a read-only `SELECT COUNT(*)` against a PyIceberg- or Spark-created table. Write compatibility not claimed. |
 | DuckDB Iceberg 1.5.5 | Automated | `duckdb_smoke.py` covers metadata-location read, single-table create/insert/update/delete/merge, schema evolution, snapshots, concurrent writers, drop, PyIceberg cross-read, and both signing profiles. Purge-on-drop and format v3 are verified fail-closed. Two-table mode runs without claiming cross-table atomicity. AWS `ENDPOINT_TYPE S3_TABLES`, staged-create client integration, and vended-credential integration are not claimed. |
@@ -169,7 +169,7 @@ Do not promote a failure case from live probe or load test to an automated claim
 
 ## Unsupported Or Not Claimed
 
-Full AWS S3 Tables control-plane parity; full MinIO AIStor private extensions; full Cloudflare R2 Data Catalog or Alibaba OSS Tables interoperability; built-in periodic maintenance scheduling; active-active multi-region writes; multi-table transactions; no-long-term-data-credential bootstrap; online vendor SDK polling; external catalog policy mirroring; delete-file rewrite or row-level compaction execution; built-in SQL execution; Delta Lake or Hudi; end-to-end SQL row-level DML validation through Spark, Trino, or another engine.
+Full AWS S3 Tables control-plane parity; full MinIO AIStor private extensions; full Cloudflare R2 Data Catalog or Alibaba OSS Tables interoperability; automatic maintenance execution and failed/expired-job recovery; durable-strong snapshot-expiration and compaction plan/commit; active-active multi-region writes; multi-table transactions; no-long-term-data-credential bootstrap; online vendor SDK polling; external catalog policy mirroring; delete-file rewrite or row-level compaction execution; built-in SQL execution; Delta Lake or Hudi; end-to-end SQL row-level DML validation through Spark or Trino. DuckDB single-table UPDATE/DELETE/MERGE has its own automated smoke coverage as listed above; this does not establish other engines' DML compatibility.
 
 ## Verification
 

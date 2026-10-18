@@ -36,6 +36,7 @@ pub(crate) struct DeleteRecoverySummary {
     pub rolled_back: usize,
     pub blocked: usize,
     pub pending: usize,
+    pub failed: usize,
     pub reclaimed: usize,
     /// Observed removals for this exact key, not aggregated across prefixes.
     pub removed_versions: HashSet<Uuid>,
@@ -52,6 +53,7 @@ pub(crate) struct DeleteRecoveryContext<'a> {
     /// Only the locked heal path may repair a live marker-creation source.
     pub repair_marker_source: bool,
     pub namespace_owner: Option<Arc<dyn Send + Sync>>,
+    pub recovery_ticket: Option<crate::store::delete_recovery_runtime::DeleteRecoveryTicket>,
     pub can_commit: &'a (dyn Fn() -> bool + Sync),
 }
 
@@ -63,6 +65,7 @@ impl<'a> DeleteRecoveryContext<'a> {
             explicit_delete: false,
             repair_marker_source: false,
             namespace_owner: None,
+            recovery_ticket: None,
             can_commit,
         }
     }
@@ -75,6 +78,7 @@ impl DeleteRecoverySummary {
         self.rolled_back += other.rolled_back;
         self.blocked += other.blocked;
         self.pending += other.pending;
+        self.failed += other.failed;
         self.reclaimed += other.reclaimed;
     }
 }
@@ -307,6 +311,9 @@ impl SetDisks {
         {
             // An ordinary missing-key no-op requires no recovery decision.
             // Do not manufacture witness transactions while a drive is offline.
+            if let Some(ticket) = context.recovery_ticket.as_ref() {
+                self.ctx.delete_recovery_hints().ack(ticket);
+            }
             return Ok(());
         }
         let published = join_all(disks.iter().zip(&states).map(|(disk, state)| async {
@@ -336,7 +343,15 @@ impl SetDisks {
         }
         // Physical cleanup is retryable after the certified decision. An
         // unavailable participant retains the decision for its eventual return.
-        let _ = self.recover_delete_key(bucket, object, context).await;
+        let ticket = context.recovery_ticket.clone();
+        if let Ok(summary) = self.recover_delete_key(bucket, object, context).await
+            && summary.pending == 0
+            && summary.blocked == 0
+            && summary.failed == 0
+            && let Some(ticket) = ticket.as_ref()
+        {
+            self.ctx.delete_recovery_hints().ack(ticket);
+        }
         Ok(())
     }
 
@@ -363,6 +378,7 @@ impl SetDisks {
         }
         let pages = join_all(disks.iter().flatten().map(|disk| discover(disk, bucket, None))).await;
         let mut keys = BTreeSet::new();
+        let mut summary = DeleteRecoverySummary::default();
         for page in pages {
             match page {
                 Ok(ids) => {
@@ -373,18 +389,24 @@ impl SetDisks {
                     );
                 }
                 Err(error) if unavailable(&error) => {
-                    return Ok(DeleteRecoverySummary {
-                        pending: 1,
-                        ..Default::default()
-                    });
+                    summary.pending += 1;
                 }
+                Err(DiskError::FileCorrupt) => summary.failed += 1,
                 Err(error) => return Err(error),
             }
         }
-        let mut summary = DeleteRecoverySummary::default();
+        // Every key requires complete participation. Avoid taking each key's
+        // lock and repeating discovery while this sweep already lacks a peer.
+        if summary.pending > 0 {
+            return Ok(summary);
+        }
         // Lock order: caller's bucket lifecycle fence, then one exact key.
         for object in keys {
-            summary.add(self.recover_delete_object(bucket, &object, context.clone()).await?);
+            match self.recover_delete_object(bucket, &object, context.clone()).await {
+                Ok(result) => summary.add(result),
+                Err(DiskError::FileCorrupt) => summary.failed += 1,
+                Err(error) => return Err(error),
+            }
         }
         Ok(summary)
     }
@@ -428,6 +450,7 @@ impl SetDisks {
             repair_marker_source,
             namespace_owner,
             can_commit,
+            recovery_ticket: _,
         } = context;
         let disks = self.disk_inventory().await;
         let complete_inventory = disks.len() == self.set_drive_count && disks.iter().all(Option::is_some);
@@ -505,7 +528,7 @@ impl SetDisks {
             None
         };
         if let Some((transaction, source)) = prerequisite {
-            Box::pin(self.heal_delete_recovery_source(bucket, object, &source, can_commit)).await?;
+            Box::pin(self.heal_delete_recovery_source(bucket, object, &source, can_commit, namespace_owner.as_ref())).await?;
             let refreshed = inspect(&disks, bucket, object, transaction)
                 .await
                 .into_iter()
@@ -1052,6 +1075,131 @@ mod tests {
             report.detail
         );
         assert_eq!(body(&store, bucket, None).await, original);
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_corrupt_bucket_does_not_prevent_other_bucket_rollback() {
+        let bad_bucket = "recover-corrupt-bucket";
+        let good_bucket = "recover-good-bucket";
+        let (dirs, store, disks) = fixture(bad_bucket).await;
+        store
+            .make_bucket(good_bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create healthy bucket");
+        put(&store, bad_bucket, &[61; 4096], false).await;
+        let bad_transaction = applied(&store, &disks, bad_bucket, None, disks.len()).await;
+        let good_bytes = vec![62; 4096];
+        put(&store, good_bucket, &good_bytes, false).await;
+        applied(&store, &disks, good_bucket, None, disks.len()).await;
+        for dir in &dirs {
+            std::fs::write(
+                dir.path()
+                    .join(bad_bucket)
+                    .join("object")
+                    .join(bad_transaction.to_string())
+                    .join("delete-prepared"),
+                b"{broken",
+            )
+            .expect("inject malformed preparation journal");
+        }
+
+        let failed = store
+            .recover_delete_transactions(bad_bucket, &HealOpts::default())
+            .await
+            .expect("bucket corruption is an explicit partial recovery result");
+        assert_eq!(failed.delete_recovery.expect("recovery status").failed, 1);
+        let error = store
+            .recover_delete_transactions_at_incarnation(bad_bucket, Some("object"), None, &HealOpts::default())
+            .await
+            .expect_err("exact object recovery must retain typed corruption");
+        assert!(matches!(error, crate::error::StorageError::FileCorrupt));
+        let recovered = store
+            .recover_delete_transactions(good_bucket, &HealOpts::default())
+            .await
+            .expect("another bucket must remain recoverable");
+        assert!(recovered.detail.contains("rolled_back=1"));
+        assert!(!recovered.delete_recovery.expect("healthy recovery status").has_unresolved());
+        assert_eq!(body(&store, good_bucket, None).await, good_bytes);
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_corrupt_key_does_not_prevent_other_key_rollback() {
+        let bucket = "recover-corrupt-key";
+        let (dirs, store, disks) = fixture(bucket).await;
+        let healthy_bytes = vec![63; 4096];
+        put(&store, bucket, &healthy_bytes, false).await;
+        applied(&store, &disks, bucket, None, disks.len()).await;
+        let mut reader = PutObjReader::from_vec(vec![64; 4096]);
+        store
+            .put_object(
+                bucket,
+                "a-corrupt",
+                &mut reader,
+                &ObjectOptions {
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write corrupt-key fixture");
+        let transaction = Uuid::new_v4();
+        let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("bucket identity");
+        for disk in &disks {
+            disk.delete_version_recoverable(
+                bucket,
+                "a-corrupt",
+                FileInfo {
+                    name: "a-corrupt".to_owned(),
+                    ..Default::default()
+                },
+                false,
+                DeleteOptions {
+                    old_data_dir: Some(transaction),
+                    delete_recovery_bucket_incarnation: Some(incarnation),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("prepare corrupt-key fixture");
+        }
+        let damaged = dirs[0]
+            .path()
+            .join(bucket)
+            .join("a-corrupt")
+            .join(transaction.to_string())
+            .join(crate::disk::STORAGE_FORMAT_FILE_BACKUP);
+        std::fs::write(&damaged, b"corrupt metadata").expect("damage one backup while retaining discoverable journal");
+
+        let report = store
+            .recover_delete_transactions(bucket, &HealOpts::default())
+            .await
+            .expect("per-key corruption must not abort the remaining prefix");
+
+        assert_eq!(report.delete_recovery.expect("recovery status").failed, 1);
+        assert!(report.detail.contains("rolled_back=1"));
+        assert_eq!(std::fs::read(damaged).expect("corrupt proof is retained"), b"corrupt metadata");
+        assert_eq!(body(&store, bucket, None).await, healthy_bytes);
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_offline_bucket_reports_pending_without_hiding_exact_object_error() {
+        let bucket = "recover-offline-status";
+        let (_dirs, store, _disks) = fixture(bucket).await;
+        store.pools[0].disk_set[0].disks.write().await[3] = None;
+
+        let result = store
+            .recover_delete_transactions(bucket, &HealOpts::default())
+            .await
+            .expect("offline recovery must expose a pending summary even with no discovered transactions");
+        let status = result.delete_recovery.expect("offline status is retained");
+        assert_eq!(status.pending, 1);
+        assert_eq!(status.failed, 0);
+        assert!(status.has_unresolved());
+        let error = store
+            .recover_delete_transactions_at_incarnation(bucket, Some("object"), None, &HealOpts::default())
+            .await
+            .expect_err("exact-object workers require a typed retry error");
+        assert!(matches!(error, crate::error::StorageError::ErasureReadQuorum));
     }
 
     fn snapshot(root: &std::path::Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
@@ -2033,13 +2181,18 @@ mod tests {
             }
         }
         let error = store
-            .recover_delete_transactions(bucket, &HealOpts::default())
+            .recover_delete_transactions_at_incarnation(bucket, Some("object"), None, &HealOpts::default())
             .await
             .expect_err("cyclic history cannot settle");
         assert!(
             matches!(error, crate::error::StorageError::FileCorrupt),
             "typed corruption must reject cyclic evidence: {error:?}"
         );
+        let report = store
+            .recover_delete_transactions(bucket, &HealOpts::default())
+            .await
+            .expect("a bucket report must retain its corrupt-key status");
+        assert_eq!(report.delete_recovery.expect("corrupt-key status").failed, 1);
         for (path, bytes) in evidence {
             assert_eq!(std::fs::read(path).expect("all proof retained"), bytes);
         }
@@ -2075,5 +2228,124 @@ mod tests {
             .delete_bucket(bucket, &DeleteBucketOptions::default())
             .await
             .expect("no stale old body or receipts remain");
+    }
+
+    #[tokio::test]
+    async fn heal_mrf_inline_overwrite_does_not_strand_rollback_backup() {
+        use crate::disk::STORAGE_FORMAT_FILE_BACKUP;
+        use crate::disk::local::inline_metadata_rollback_dir;
+        use crate::object_api::ShardIntegrityWriteMode;
+        use rustfs_filemeta::FileMeta;
+        use rustfs_heal_contracts::heal_channel::{HealScanMode, LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL};
+
+        for incoming_inline in [true, false] {
+            let bucket = if incoming_inline {
+                "heal-inline-rollback"
+            } else {
+                "heal-inline-to-external-rollback"
+            };
+            let (dirs, store, disks) = fixture(bucket).await;
+            let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("bucket identity");
+            let synthetic = inline_metadata_rollback_dir(Uuid::nil(), &FileMeta::new());
+            let object = "object";
+            let child = format!("{object}/{synthetic}");
+            let child_body = b"child bytes must survive parent repair".to_vec();
+            let write_options = ObjectOptions {
+                shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Legacy),
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            };
+            for (key, body) in [(child.as_str(), child_body.as_slice()), (object, b"inline-gen-1".as_slice())] {
+                store
+                    .put_object(bucket, key, &mut PutObjReader::from_vec(body.to_vec()), &write_options)
+                    .await
+                    .expect("seed initial inline objects");
+            }
+            let read_options = ReadOptions {
+                read_data: true,
+                ..Default::default()
+            };
+            let old_child = disks[3]
+                .read_version("", bucket, &child, "", &read_options)
+                .await
+                .expect("physical child before repair");
+            let set = &store.pools[0].disk_set[0];
+            set.disks.write().await[3] = None;
+            let payload = if incoming_inline {
+                b"inline-gen-2-updated".to_vec()
+            } else {
+                vec![0x53; 1024 * 1024]
+            };
+            store
+                .put_object(bucket, object, &mut PutObjReader::from_vec(payload.clone()), &write_options)
+                .await
+                .expect("degraded overwrite with a real stale target");
+            set.disks.write().await[3] = Some(disks[3].clone());
+            let donor = disks[0]
+                .read_version("", bucket, object, "", &read_options)
+                .await
+                .expect("current donor generation");
+            assert_eq!(donor.data.is_some(), incoming_inline, "fixture must use the intended commit branch");
+            let heal_opts = HealOpts {
+                scan_mode: HealScanMode::Normal,
+                ..Default::default()
+            };
+            let first = store
+                .heal_mrf_object_at_incarnation(bucket, object, "", incarnation, &heal_opts)
+                .await
+                .expect("first MRF repair");
+            assert!(first.error.is_none(), "first MRF repair: {:?}", first.error);
+            assert_eq!(first.item.drives_healed(), Some(1));
+            assert!(!first.item.repair_verified);
+            assert_eq!(first.item.detail, LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL);
+            let target = disks[3]
+                .read_version("", bucket, object, "", &read_options)
+                .await
+                .expect("repaired target generation");
+            assert_eq!(target.mod_time, donor.mod_time);
+            assert_eq!(target.data_dir, donor.data_dir);
+            assert_eq!(target.size, donor.size);
+            assert_eq!(target.version_id, donor.version_id);
+            let child_after = disks[3]
+                .read_version("", bucket, &child, "", &read_options)
+                .await
+                .expect("physical child survives parent cleanup");
+            assert_eq!(child_after.data, old_child.data);
+            assert!(child_after.data.is_some(), "child fixture must carry its physical inline bytes");
+            let child_dir = dirs[3].path().join(bucket).join(object).join(synthetic.to_string());
+            assert!(!child_dir.join(STORAGE_FORMAT_FILE_BACKUP).exists());
+            assert!(child_dir.join(STORAGE_FORMAT_FILE).exists());
+            let second = store
+                .heal_mrf_object_at_incarnation(bucket, object, "", incarnation, &heal_opts)
+                .await
+                .expect("follow-up MRF check must not return SlowDown");
+            assert!(second.error.is_none(), "second MRF check: {:?}", second.error);
+            assert_eq!(second.item.drives_healed(), Some(0));
+            assert_eq!(second.item.detail, LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL);
+
+            // EC2+2: force the repaired shard to participate in the exact read quorum.
+            let inventory = set.disks.read().await.clone();
+            *set.disks.write().await = vec![None, None, Some(disks[2].clone()), Some(disks[3].clone())];
+            for (key, expected) in [(object, payload), (child.as_str(), child_body)] {
+                let mut reader = set
+                    .get_object_reader(
+                        bucket,
+                        key,
+                        None,
+                        Default::default(),
+                        &ObjectOptions {
+                            no_lock: true,
+                            suppress_read_repair: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("exact-quorum GET using repaired target");
+                let mut body = Vec::new();
+                reader.read_to_end(&mut body).await.expect("read complete parent/child body");
+                assert_eq!(body, expected, "exact-quorum body for {key}");
+            }
+            *set.disks.write().await = inventory;
+        }
     }
 }

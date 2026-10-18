@@ -2220,22 +2220,36 @@ fn prepare_bucket_checkpoint_migrates_legacy_epoch_bound_receipt() {
             ..Default::default()
         },
     );
-    let legacy_digest = cache
-        .legacy_coverage_prefix_digest("bucket/a")
-        .expect("legacy receipt digest");
-    cache.info.scan_coverage_receipt = Some(DataUsageScanCoverageReceipt {
-        through: "bucket/a".to_string(),
-        digest: legacy_digest,
-    });
-    assert_eq!(cache.validated_scan_frontier(), Some("bucket/a"));
-
-    assert_eq!(
-        cache.prepare_bucket_checkpoint("bucket", 9, 2, source, TEST_PLAN_DIGEST, identity),
-        DataUsageCachePrepareOutcome::Reused
-    );
-    assert_eq!(cache.info.leader_epoch, 2);
-    assert_eq!(cache.validated_scan_frontier(), Some("bucket/a"));
-    assert_ne!(cache.info.scan_coverage_receipt.expect("migrated receipt").digest, legacy_digest);
+    for legacy_digest in [
+        cache
+            .legacy_coverage_prefix_digest("bucket/a")
+            .expect("epoch-bound receipt digest"),
+        cache.v2_coverage_prefix_digest("bucket/a").expect("v2 receipt digest"),
+    ] {
+        let mut cache = cache.clone();
+        cache.info.scan_coverage_receipt = Some(DataUsageScanCoverageReceipt {
+            through: "bucket/a".to_string(),
+            digest: legacy_digest,
+        });
+        assert_eq!(cache.validated_scan_frontier(), Some("bucket/a"));
+        assert_eq!(
+            cache.prepare_bucket_checkpoint("bucket", 9, 2, source, TEST_PLAN_DIGEST, identity),
+            DataUsageCachePrepareOutcome::Reused
+        );
+        assert_eq!(cache.info.leader_epoch, 2);
+        assert_eq!(cache.validated_scan_frontier(), Some("bucket/a"));
+        let digest = cache.info.scan_coverage_receipt.as_ref().expect("migrated receipt").digest;
+        assert_ne!(digest, legacy_digest);
+        assert_ne!(digest, cache.v2_coverage_prefix_digest("bucket/a").expect("old reader v2 digest"));
+        assert_ne!(
+            digest,
+            cache
+                .legacy_coverage_prefix_digest("bucket/a")
+                .expect("old reader epoch digest")
+        );
+        cache.cache.get_mut("bucket/a").expect("covered entry").failed_objects = 1;
+        assert!(cache.validated_scan_frontier().is_none(), "tampered health debt invalidates coverage");
+    }
 }
 
 #[test]
@@ -2984,4 +2998,40 @@ async fn test_retry_save_op_times_out_and_returns_error_after_retries() {
 
     assert!(result.is_err());
     assert_eq!(attempts.load(Ordering::SeqCst), (DATA_USAGE_CACHE_SAVE_RETRIES + 1) as usize);
+}
+
+#[test]
+fn scan_frontier_receipt_binds_nested_debt_outside_raw_lexical_prefix() {
+    let mut cache = DataUsageCache::default();
+    cache.prepare_bucket_checkpoint("bucket", 8, 1, DataUsageCacheSource::new(0, 0), TEST_PLAN_DIGEST, valid_scan_identity());
+    cache.replace("bucket", "", DataUsageEntry::default());
+    cache.replace("bucket/a", "bucket", DataUsageEntry::default());
+    cache.replace(
+        "bucket/a/z",
+        "bucket/a",
+        DataUsageEntry {
+            failed_objects: 1,
+            ..Default::default()
+        },
+    );
+    cache.replace(
+        "bucket/a-",
+        "bucket",
+        DataUsageEntry {
+            objects: 1,
+            size: 1,
+            ..Default::default()
+        },
+    );
+    cache
+        .seal_scan_frontier(Some("bucket/a-"))
+        .expect("seal traversal after failed subtree");
+    assert_eq!(cache.validated_scan_frontier(), Some("bucket/a-"));
+    let digest = cache.info.scan_coverage_receipt.as_ref().expect("new receipt").digest;
+    assert_ne!(digest, cache.v2_coverage_prefix_digest("bucket/a-").expect("old reader digest"));
+    cache.cache.get_mut("bucket/a/z").expect("nested failure").failed_objects = 0;
+    assert!(
+        cache.validated_scan_frontier().is_none(),
+        "nested debt must be signed even when '/' sorts after '-'"
+    );
 }

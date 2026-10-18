@@ -18,7 +18,8 @@ use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig};
 use crate::scanner_io::{
     DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerCheckpointPersistContext, ScannerCheckpointPersistResult,
     ScannerDiskScanOptions, ScannerDiskScanOutcome, ScannerIODisk, acquire_scanner_cache_locks, cache_root_entry_info,
-    current_cache_root_or_prepare_with_generation, persist_scanner_checkpoint, scanner_set_disk_inventory,
+    current_cache_root_or_prepare_with_generation, log_saved_partial_bucket_cache, persist_scanner_checkpoint,
+    scanner_set_disk_inventory,
 };
 use crate::storage_api::owner::NS_SCANNER_PROTOCOL_VERSION;
 use crate::{
@@ -681,7 +682,9 @@ async fn scan_and_persist_local_bucket(
         .ok_or_else(|| RemoteScannerServerError::worker("remote namespace scanner object layer is unavailable"))?;
     validate_remote_scanner_request_fence_with_store(next_cycle, leader_epoch, store.clone())
         .await
-        .map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner leader fence is stale: {err}")))?;
+        .map_err(|err| {
+            RemoteScannerServerError::worker(format!("remote namespace scanner leader fence verification failed: {err}"))
+        })?;
     let source = cache_source_for_disk(disk.as_ref())
         .map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner source is unavailable: {err}")))?;
     let set = store
@@ -886,7 +889,7 @@ async fn scan_and_persist_local_bucket(
                     Err(err) => err,
                 };
                 return Err(RemoteScannerServerError::worker(format!(
-                    "remote namespace scanner leader fence changed during bucket scan: {}",
+                    "remote namespace scanner leader fence verification failed during bucket scan: {}",
                     err
                 )));
             }
@@ -923,7 +926,9 @@ async fn scan_and_persist_local_bucket(
     phase_changed.notify_one();
     validate_remote_scanner_request_fence_with_store(next_cycle, leader_epoch, store.clone())
         .await
-        .map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner leader fence changed: {err}")))?;
+        .map_err(|err| {
+            RemoteScannerServerError::worker(format!("remote namespace scanner leader fence verification failed: {err}"))
+        })?;
     let done_save = Metrics::time(Metric::SaveUsage);
     // Each physical main/backup PUT must still prove the epoch captured before
     // the scan. A movement transition that starts and ends during the scan
@@ -943,7 +948,9 @@ async fn scan_and_persist_local_bucket(
     }
     validate_remote_scanner_request_fence_with_store(next_cycle, leader_epoch, store)
         .await
-        .map_err(|err| RemoteScannerServerError::worker(format!("remote namespace scanner leader fence changed: {err}")))?;
+        .map_err(|err| {
+            RemoteScannerServerError::worker(format!("remote namespace scanner leader fence verification failed: {err}"))
+        })?;
     if guard.is_lock_lost() {
         return Err(RemoteScannerServerError::worker(
             "remote namespace scanner cache lock was lost during persistence",
@@ -951,6 +958,9 @@ async fn scan_and_persist_local_bucket(
     }
 
     if let Some(partial_result) = partial_result {
+        if matches!(partial_result, RemoteScannerFrameResult::Partial) {
+            log_saved_partial_bucket_cache(&cache, &cache_name);
+        }
         return Ok(partial_result);
     }
     if cache.info.source != Some(source) || !cache.info.snapshot_complete {

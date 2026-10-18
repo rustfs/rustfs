@@ -25,7 +25,7 @@ Read only the current phase's procedure; retain completed evidence across turns.
 | 4–5 | [Run the downloaded binary, Console CRUD, and latest-rc matrix](references/preview-acceptance.md). Every check must pass. |
 | Confirmation | Complete the gate below and end the turn. |
 | 6 | After fresh confirmation, [publish and verify the final tag](references/final-release.md) at `PREVIEW_HASH`. |
-| 7 | [Maintain milestones, installation references, and the website](references/post-release-updates.md) only after complete publication. |
+| 7 | [Reconcile Security Advisories, milestones, installation references, and the website](references/post-release-updates.md) only after complete publication. |
 
 ## Human Confirmation
 
@@ -39,4 +39,4 @@ Only a new affirmative user reply to that exact report authorizes Phase 6. The o
 - Once the final tag exists, retry publication jobs for that exact tag. A source fix requires a newly confirmed target, not retagging or a newer preview. Phase 7 retries recheck artifact availability and superseding releases.
 - If abandoned after the bump merged, report the unpublished version on main and record whether to revert or let the next release overwrite it. Deleting candidate branches or preview tags requires an explicit decision.
 
-Report completed phase results and incomplete work with evidence: Console previous/latest tags, release need, hash and run/Release URLs; target, branch CI/SHA, previews and hash, confirmation state; preview/final assets, latest-channel state, Console/rc results and cleanup; both milestone states, installation PR checks/merge state, and website text/link/PR/deployment state. Keep artifact publication separate from follow-up delivery; do not call an open PR a live update. Report deviations and their authorization.
+Report completed phase results and incomplete work with evidence: Console previous/latest tags, release need, hash and run/Release URLs; target, branch CI/SHA, previews and hash, confirmation state; preview/final assets, latest-channel state, Console/rc results and cleanup; advisory reconciliation results and pending disclosure decisions; both milestone states, installation PR checks/merge state, and website text/link/PR/deployment state. Keep artifact publication separate from follow-up delivery; do not call an open PR a live update. Report deviations and their authorization.

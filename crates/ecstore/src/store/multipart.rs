@@ -556,7 +556,7 @@ impl ECStore {
         opts: &ObjectOptions,
         mutation_fence: Option<&ObjectLockDiagGuard>,
     ) -> Result<(MultipartUploadResult, usize, Option<Uuid>)> {
-        check_new_multipart_args(bucket, object)?;
+        check_new_object_args(bucket, object, opts.data_movement)?;
         let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
 
         if self.single_pool() {
@@ -564,6 +564,12 @@ impl ECStore {
                 .await;
             let result = self.pools[0].new_multipart_upload(bucket, object, &opts).await?;
             return Ok((result, 0, opts.expected_bucket_incarnation_id));
+        }
+        if opts.http_preconditions.is_some()
+            && !opts.data_movement
+            && let Some(err) = self.check_write_precondition(bucket, object, &opts).await
+        {
+            return Err(err);
         }
 
         let capacity_owner = DecommissionCapacityOwner::from_options(&opts);
@@ -1087,6 +1093,15 @@ impl ECStore {
         Ok(())
     }
 
+    async fn check_write_precondition(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Option<StorageError> {
+        let mut lookup_opts = opts.clone();
+        let http_preconditions = lookup_opts.http_preconditions?;
+        lookup_opts.http_preconditions = None;
+        lookup_opts.no_lock = true;
+        let oi = self.get_object_info_for_delete(bucket, object, &lookup_opts).await;
+        crate::set_disk::SetDisks::evaluate_write_precondition(oi, &http_preconditions, bucket, object, opts)
+    }
+
     #[instrument(skip(self))]
     pub(super) async fn handle_complete_multipart_upload(
         self: Arc<Self>,
@@ -1108,6 +1123,12 @@ impl ECStore {
                 .clone()
                 .complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
                 .await;
+        }
+        if opts.http_preconditions.is_some()
+            && !opts.data_movement
+            && let Some(err) = self.check_write_precondition(bucket, object, opts).await
+        {
+            return Err(err);
         }
 
         match self.multipart_upload_pool_idx(bucket, object, upload_id, opts).await {

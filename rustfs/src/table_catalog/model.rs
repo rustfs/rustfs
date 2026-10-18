@@ -582,6 +582,12 @@ pub(crate) struct TableMaintenanceSchedulerJobSummary {
     pub audit_events: Vec<TableMaintenanceAuditEvent>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableMaintenanceWorkerCondition {
+    pub expected_job_id: String,
+    pub expected_attempt: u16,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TableMetadataMaintenanceJob {
     pub job_id: String,

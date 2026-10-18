@@ -321,6 +321,10 @@ pub struct ResumeState {
     /// the version listing. `None` means "start from the beginning".
     #[serde(default)]
     pub resume_cursor: Option<String>,
+    /// Ordinary coverage overlapped unresolved hidden delete recovery. The
+    /// scan must restart after recovery settles, even if another worker settled it.
+    #[serde(default)]
+    pub delete_recovery_rescan_pending: bool,
     /// task id
     pub task_id: String,
     /// task type
@@ -364,6 +368,11 @@ pub struct ResumeState {
     /// and may receive one bounded compatibility re-arm.
     #[serde(default)]
     pub replacement_legacy_retry_compatibility_done: bool,
+    /// New generations cannot consume the one-shot compatibility handoff for
+    /// a pre-format intent stranded by historical rebalance topology. Missing
+    /// fields in older schema-seven snapshots remain eligible for validation.
+    #[serde(default)]
+    pub replacement_preformat_handoff_retry_done: bool,
     /// The current pass was rewound because the replacement mount was not
     /// ready.  Task-level error persistence must not turn this readiness wait
     /// back into a consumed retry attempt.
@@ -434,6 +443,7 @@ impl ResumeState {
         Self {
             schema_version: CURRENT_RESUME_SCHEMA,
             resume_cursor: None,
+            delete_recovery_rescan_pending: false,
             task_id,
             task_type,
             set_disk_id,
@@ -450,6 +460,7 @@ impl ResumeState {
             replacement_legacy_import: None,
             replacement_legacy_successor: None,
             replacement_legacy_retry_compatibility_done: false,
+            replacement_preformat_handoff_retry_done: false,
             replacement_retry_waiting_for_target: false,
             dangling_delete_retry_not_before: None,
             start_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
@@ -495,6 +506,7 @@ impl ResumeState {
         // New generations already use readiness-aware persistence and must
         // never enter the one-shot compatibility path for legacy snapshots.
         state.replacement_legacy_retry_compatibility_done = true;
+        state.replacement_preformat_handoff_retry_done = true;
         state
     }
 
@@ -1048,6 +1060,30 @@ impl ResumeManager {
         self.state.read().await.clone()
     }
 
+    pub(crate) async fn set_delete_recovery_rescan_pending(&self, pending: bool) -> Result<()> {
+        let mut state = self.state.write().await;
+        let previous = state.delete_recovery_rescan_pending;
+        if previous == pending {
+            return Ok(());
+        }
+        state.delete_recovery_rescan_pending = pending;
+        drop(state);
+        if let Err(error) = self.save_state_strict().await {
+            self.state.write().await.delete_recovery_rescan_pending = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Keep the coverage obligation until the companion checkpoint rewind is durable.
+    pub(crate) async fn restart_scan_after_delete_recovery(&self) -> Result<()> {
+        let mut state = self.state.write().await;
+        state.delete_recovery_rescan_pending = true;
+        state.reset_for_retry();
+        drop(state);
+        self.save_state_strict().await
+    }
+
     /// update progress
     pub async fn update_progress(&self, processed: u64, successful: u64, failed: u64, skipped: u64) -> Result<()> {
         let mut state = self.state.write().await;
@@ -1242,6 +1278,9 @@ impl ResumeManager {
         }
         if state.max_retries == 0 {
             return Ok(false);
+        }
+        if self.rearm_preformat_handoff_retry_if_needed(storage).await? {
+            return Ok(true);
         }
         let legacy_rearm = replacement_retry_is_legacy_transient_skip(&state);
         let ready = storage

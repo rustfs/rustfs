@@ -18,6 +18,9 @@ use datafusion::{
 use std::assert_matches;
 use std::sync::Arc;
 
+mod strong_maintenance_planning;
+mod strong_maintenance_planning_paths;
+
 const TABLE_CATALOG_TEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 #[test]
@@ -10411,6 +10414,927 @@ async fn maintenance_scheduler_run_reuses_active_queued_job() {
     assert_eq!(second.report.job.scheduler_id.as_deref(), Some("scheduler-a"));
     assert_eq!(second.report.job.status, TableMetadataMaintenanceJobStatus::Queued);
     assert_eq!(second.scheduler.audit_timeline.len(), 1);
+}
+
+struct ConditionalMaintenanceFixture {
+    backend: TestCatalogObjectBackend,
+    store: ConfiguredTableCatalogStore<TestCatalogObjectBackend>,
+    queued: TableMetadataMaintenanceReport,
+    entry: TableEntry,
+    old_metadata: String,
+    now: OffsetDateTime,
+}
+
+impl ConditionalMaintenanceFixture {
+    async fn new(mode: TableCatalogBackingMode, max_retry_attempts: u16) -> Self {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ConfiguredTableCatalogStore::new_for_test(backend.clone(), mode);
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let old_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        store.put_table_bucket(test_bucket_entry("analytics")).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry("analytics", &namespace))
+            .await
+            .unwrap();
+        store
+            .create_table(test_table_entry("analytics", &namespace, &table, current.clone()))
+            .await
+            .unwrap();
+        let entry = store.load_table("analytics", "sales", "orders").await.unwrap().unwrap();
+        backend
+            .seed_object("analytics", &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        backend.seed_object("analytics", &old_metadata, b"{}".to_vec()).await;
+        store
+            .put_table_maintenance_config(
+                "analytics",
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    background_enabled: true,
+                    delete_enabled: true,
+                    max_retry_attempts,
+                    retry_initial_backoff_seconds: 1,
+                    retry_max_backoff_seconds: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let queued = store
+            .run_table_maintenance_scheduler_once("analytics", "sales", "orders", "scheduler-a".to_string())
+            .await
+            .unwrap()
+            .report;
+        assert_eq!(queued.job.status, TableMetadataMaintenanceJobStatus::Queued);
+        assert_eq!(queued.deletable_metadata_locations, vec![old_metadata.clone()]);
+        Self {
+            backend,
+            store,
+            queued,
+            entry,
+            old_metadata,
+            now: OffsetDateTime::now_utc(),
+        }
+    }
+
+    async fn run(
+        &self,
+        worker: &str,
+        attempt: u16,
+        now: OffsetDateTime,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        let condition = TableMaintenanceWorkerCondition {
+            expected_job_id: self.queued.job.job_id.clone(),
+            expected_attempt: attempt,
+        };
+        match &self.store {
+            ConfiguredTableCatalogStore::ObjectBacked(store) => {
+                store
+                    .run_table_metadata_maintenance_worker_once_conditionally_with_clock(
+                        "analytics",
+                        "sales",
+                        "orders",
+                        worker.to_string(),
+                        &condition,
+                        || now,
+                    )
+                    .await
+            }
+            ConfiguredTableCatalogStore::DurableStrong(store) => {
+                store
+                    .run_table_metadata_maintenance_worker_once_conditionally_with_clock(
+                        "analytics",
+                        "sales",
+                        "orders",
+                        worker.to_string(),
+                        &condition,
+                        || now,
+                    )
+                    .await
+            }
+        }
+    }
+
+    fn report_paths(&self) -> [String; 3] {
+        let paths = TableCatalogObjectPaths::default();
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        [
+            paths.table_maintenance_job_path("analytics", &namespace, &table, &self.entry.table_id, &self.queued.job.job_id),
+            paths.table_maintenance_latest_job_path("analytics", &namespace, &table, &self.entry.table_id),
+            paths.table_maintenance_current_job_path("analytics", &namespace, &table, &self.entry.table_id),
+        ]
+    }
+
+    async fn seed_report(&self, report: &TableMetadataMaintenanceReport) {
+        for path in self.report_paths() {
+            self.backend
+                .seed_object(RUSTFS_META_BUCKET, &path, serde_json::to_vec(report).unwrap())
+                .await;
+        }
+    }
+
+    async fn report(&self, id: &str) -> TableMetadataMaintenanceReport {
+        self.store
+            .get_table_metadata_maintenance_report("analytics", "sales", "orders", id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn assert_report_views(&self, expected: &TableMetadataMaintenanceReport) {
+        for path in self.report_paths() {
+            let object = self.backend.read_object(RUSTFS_META_BUCKET, &path).await.unwrap().unwrap();
+            let actual: TableMetadataMaintenanceReport = serde_json::from_slice(&object.data).unwrap();
+            assert_eq!(&actual, expected, "report view {path}");
+        }
+        assert_eq!(
+            self.store.load_table("analytics", "sales", "orders").await.unwrap(),
+            Some(self.entry.clone())
+        );
+        assert!(
+            self.backend
+                .object_exists("analytics", &self.entry.metadata_location)
+                .await
+                .unwrap()
+        );
+    }
+
+    async fn delete_attempts(&self) -> usize {
+        self.backend
+            .state
+            .lock()
+            .await
+            .delete_attempts
+            .get(&("analytics".to_string(), self.old_metadata.clone()))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    async fn fail_first_attempt(&self) -> TableMetadataMaintenanceReport {
+        self.backend.fail_delete_attempt("analytics", &self.old_metadata, 1).await;
+        self.run("worker-a", 0, self.now)
+            .await
+            .expect_err("injected delete failure must be surfaced");
+        let failed = self.report(&self.queued.job.job_id).await;
+        assert_eq!(failed.job.status, TableMetadataMaintenanceJobStatus::Failed);
+        assert_eq!(failed.job.attempt, 1);
+        self.assert_report_views(&failed).await;
+        failed
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_claims_queued_job_and_replays_without_writes() {
+    for mode in [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong] {
+        let fixture = ConditionalMaintenanceFixture::new(mode, 0).await;
+        let completed = fixture.run("worker-a", 0, fixture.now).await.unwrap();
+        assert_eq!(completed.job.job_id, fixture.queued.job.job_id);
+        assert_eq!(completed.job.status, TableMetadataMaintenanceJobStatus::Successful);
+        assert_eq!(completed.job.attempt, 1);
+        assert_eq!(completed.job.max_retry_attempts, 0);
+        assert_eq!(completed.job.worker_id.as_deref(), Some("worker-a"));
+        assert_eq!(completed.job.scheduler_id, fixture.queued.job.scheduler_id);
+        assert_eq!(completed.job.deleted_metadata_file_count, 1);
+        assert_eq!(completed.cleanup_candidate_locations, fixture.queued.cleanup_candidate_locations);
+        assert_eq!(
+            completed.job.cleanup_watermark_unix_seconds,
+            fixture.queued.job.cleanup_watermark_unix_seconds
+        );
+        assert!(
+            !fixture
+                .backend
+                .object_exists("analytics", &fixture.old_metadata)
+                .await
+                .unwrap()
+        );
+        fixture.assert_report_views(&completed).await;
+        let before = maintenance_test_object_versions(&fixture.backend).await;
+        let replayed = fixture.run("worker-a", 0, fixture.now + Duration::seconds(1)).await.unwrap();
+        assert_eq!(replayed, completed);
+        assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+        assert_eq!(fixture.delete_attempts().await, 1);
+        assert_eq!(
+            completed
+                .audit_events
+                .iter()
+                .filter(|event| event.action == TableMaintenanceAuditAction::WorkerStarted)
+                .count(),
+            1
+        );
+        assert_eq!(
+            completed
+                .audit_events
+                .iter()
+                .filter(|event| event.action == TableMaintenanceAuditAction::WorkerSucceeded)
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_samples_time_after_publication_wait_and_report_reads() {
+    for mode in [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong] {
+        for expired in [false, true] {
+            let mut fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+            let config = fixture
+                .store
+                .get_table_maintenance_config("analytics", "sales", "orders")
+                .await
+                .unwrap();
+            let deadline = fixture.now;
+            let lease_timeout = Duration::seconds(i64::try_from(config.worker_lease_timeout_seconds).unwrap());
+            fixture.queued.job.scheduled_at = Some(maintenance_timestamp(deadline - lease_timeout));
+            fixture.seed_report(&fixture.queued).await;
+            let fixture = Arc::new(fixture);
+            let before = maintenance_test_object_versions(&fixture.backend).await;
+            let publication_path = default_table_bucket_publication_lock_path();
+            let publication_guard = fixture
+                .backend
+                .acquire_write_lock("analytics", &publication_path)
+                .await
+                .unwrap();
+            let attempts = fixture
+                .backend
+                .write_lock_acquisition_count("analytics", &publication_path)
+                .await;
+            let final_read = fixture
+                .backend
+                .pause_next_read(RUSTFS_META_BUCKET, &fixture.report_paths()[2])
+                .await;
+            let clock = Arc::new(std::sync::Mutex::new((deadline - Duration::seconds(2), 0_usize)));
+            let worker_clock = Arc::clone(&clock);
+            let worker_fixture = Arc::clone(&fixture);
+            let worker = tokio::spawn(async move {
+                let condition = TableMaintenanceWorkerCondition {
+                    expected_job_id: worker_fixture.queued.job.job_id.clone(),
+                    expected_attempt: 0,
+                };
+                let clock = move || {
+                    let mut state = worker_clock.lock().unwrap();
+                    state.1 += 1;
+                    state.0
+                };
+                match &worker_fixture.store {
+                    ConfiguredTableCatalogStore::ObjectBacked(store) => {
+                        store
+                            .run_table_metadata_maintenance_worker_once_conditionally_with_clock(
+                                "analytics",
+                                "sales",
+                                "orders",
+                                "worker-a".to_string(),
+                                &condition,
+                                clock,
+                            )
+                            .await
+                    }
+                    ConfiguredTableCatalogStore::DurableStrong(store) => {
+                        store
+                            .run_table_metadata_maintenance_worker_once_conditionally_with_clock(
+                                "analytics",
+                                "sales",
+                                "orders",
+                                "worker-a".to_string(),
+                                &condition,
+                                clock,
+                            )
+                            .await
+                    }
+                }
+            });
+            tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, async {
+                while fixture
+                    .backend
+                    .write_lock_acquisition_count("analytics", &publication_path)
+                    .await
+                    == attempts
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("conditional worker must reach publication lock contention");
+            assert!(!worker.is_finished(), "worker must wait for publication ownership");
+            assert_eq!(clock.lock().unwrap().1, 0, "claim time must not precede publication ownership");
+            assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+            let claim_time = if expired {
+                deadline
+            } else {
+                deadline - Duration::nanoseconds(1)
+            };
+            clock.lock().unwrap().0 = claim_time;
+            drop(publication_guard);
+            tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, final_read.wait_started())
+                .await
+                .expect("conditional worker must read its final persisted report");
+            assert_eq!(clock.lock().unwrap().1, 0, "claim time must follow every persisted report read");
+            assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+            final_read.release();
+            let result = tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, worker)
+                .await
+                .expect("conditional worker must finish after publication and report reads")
+                .unwrap();
+            assert_eq!(clock.lock().unwrap().1, 1, "claim validation must sample the clock once");
+            if expired {
+                assert_matches!(result, Err(TableCatalogStoreError::Conflict(reason))
+                    if reason == "maintenance job is not eligible for a conditional claim; inspect its status and persisted attempt budget");
+                assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+                fixture.assert_report_views(&fixture.queued).await;
+                assert_eq!(fixture.queued.job.status, TableMetadataMaintenanceJobStatus::Queued);
+                assert_eq!(fixture.queued.job.attempt, 0);
+                assert_eq!(fixture.delete_attempts().await, 0);
+                assert!(
+                    fixture
+                        .backend
+                        .object_exists("analytics", &fixture.old_metadata)
+                        .await
+                        .unwrap()
+                );
+            } else {
+                let completed = result.expect("a queued lease remains claimable immediately before its deadline");
+                assert_eq!(completed.job.status, TableMetadataMaintenanceJobStatus::Successful);
+                assert_eq!(completed.job.attempt, 1);
+                assert_eq!(completed.job.started_at, Some(maintenance_timestamp(claim_time)));
+                assert_eq!(completed.job.heartbeat_at, Some(maintenance_timestamp(claim_time)));
+                assert_eq!(
+                    completed
+                        .audit_events
+                        .iter()
+                        .filter(|event| event.action == TableMaintenanceAuditAction::WorkerStarted)
+                        .map(|event| event.timestamp.clone())
+                        .collect::<Vec<_>>(),
+                    vec![maintenance_timestamp(claim_time)],
+                );
+                assert_eq!(completed.job.deleted_metadata_file_count, 1);
+                assert_eq!(fixture.delete_attempts().await, 1);
+                assert!(
+                    !fixture
+                        .backend
+                        .object_exists("analytics", &fixture.old_metadata)
+                        .await
+                        .unwrap()
+                );
+                fixture.assert_report_views(&completed).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_retries_failed_job_with_persisted_plan_and_budget() {
+    for mode in [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong] {
+        let mut fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+        let failed = fixture.fail_first_attempt().await;
+        let before = maintenance_test_object_versions(&fixture.backend).await;
+        assert_eq!(fixture.run("worker-a", 0, fixture.now).await.unwrap(), failed);
+        assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+        let retry_at = OffsetDateTime::parse(
+            failed.job.next_retry_after.as_deref().unwrap(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        assert_matches!(
+            fixture.run("worker-b", 1, retry_at - Duration::seconds(1)).await,
+            Err(TableCatalogStoreError::Conflict(_))
+        );
+        assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+        let mut config = fixture
+            .store
+            .get_table_maintenance_config("analytics", "sales", "orders")
+            .await
+            .unwrap();
+        config.max_retry_attempts = 10;
+        fixture
+            .store
+            .put_table_maintenance_config("analytics", "sales", "orders", config)
+            .await
+            .unwrap();
+        fixture.store = ConfiguredTableCatalogStore::new_for_test(fixture.backend.clone(), mode);
+        let completed = fixture.run("worker-b", 1, retry_at).await.unwrap();
+        assert_eq!(completed.job.status, TableMetadataMaintenanceJobStatus::Successful);
+        assert_eq!(completed.job.job_id, failed.job.job_id);
+        assert_eq!(completed.job.attempt, 2);
+        assert_eq!(completed.job.max_retry_attempts, 2);
+        assert_ne!(completed.job.lease_id, failed.job.lease_id);
+        assert_eq!(completed.cleanup_candidate_locations, failed.cleanup_candidate_locations);
+        assert_eq!(completed.deletable_metadata_locations, failed.deletable_metadata_locations);
+        assert_eq!(completed.job.cleanup_watermark_unix_seconds, failed.job.cleanup_watermark_unix_seconds);
+        assert_eq!(fixture.delete_attempts().await, 2);
+        fixture.assert_report_views(&completed).await;
+        let before = maintenance_test_object_versions(&fixture.backend).await;
+        assert_eq!(fixture.run("worker-b", 1, retry_at).await.unwrap(), completed);
+        assert_matches!(fixture.run("worker-a", 0, retry_at).await, Err(TableCatalogStoreError::Conflict(_)));
+        assert_matches!(
+            fixture
+                .store
+                .heartbeat_table_metadata_maintenance_job(
+                    "analytics",
+                    "sales",
+                    "orders",
+                    &failed.job.job_id,
+                    &failed.job.lease_id,
+                    "worker-a",
+                )
+                .await,
+            Err(TableCatalogStoreError::Conflict(_))
+        );
+        assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_does_not_reset_exhausted_budget_after_reload() {
+    for mode in [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong] {
+        for budget in [0, 1, 2] {
+            let mut fixture = ConditionalMaintenanceFixture::new(mode, budget).await;
+            let mut failed = fixture.fail_first_attempt().await;
+            if budget == 2 {
+                fixture
+                    .backend
+                    .fail_delete_attempt("analytics", &fixture.old_metadata, 2)
+                    .await;
+                let due = OffsetDateTime::parse(
+                    failed.job.next_retry_after.as_deref().unwrap(),
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .unwrap();
+                fixture
+                    .run("worker-b", 1, due)
+                    .await
+                    .expect_err("second delete failure must be surfaced");
+                failed = fixture.report(&failed.job.job_id).await;
+                assert_eq!(failed.job.attempt, 2);
+            }
+            assert_eq!(failed.job.next_retry_after, None);
+            let mut config = fixture
+                .store
+                .get_table_maintenance_config("analytics", "sales", "orders")
+                .await
+                .unwrap();
+            config.max_retry_attempts = 10;
+            fixture
+                .store
+                .put_table_maintenance_config("analytics", "sales", "orders", config)
+                .await
+                .unwrap();
+            fixture.store = ConfiguredTableCatalogStore::new_for_test(fixture.backend.clone(), mode);
+            let before = maintenance_test_object_versions(&fixture.backend).await;
+            assert_matches!(
+                fixture
+                    .run("worker-c", failed.job.attempt, fixture.now + Duration::hours(1))
+                    .await,
+                Err(TableCatalogStoreError::Conflict(_))
+            );
+            assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+            assert_eq!(fixture.delete_attempts().await, usize::from(budget.max(1)));
+            fixture.assert_report_views(&failed).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_rejects_unsafe_persisted_states_without_effects() {
+    for mode in [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong] {
+        for scenario in [
+            "job",
+            "attempt",
+            "expired-queued",
+            "expired-running",
+            "quarantine",
+            "pointer",
+            "generation",
+            "retention",
+            "paused",
+            "disabled",
+            "delete-disabled",
+        ] {
+            let fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+            let mut report = fixture.queued.clone();
+            let mut attempt = 0;
+            match scenario {
+                "job" => report.job.job_id = "different-job".to_string(),
+                "attempt" => attempt = 2,
+                "expired-queued" => report.job.scheduled_at = Some(maintenance_timestamp(fixture.now - Duration::hours(1))),
+                "expired-running" => {
+                    report.job.status = TableMetadataMaintenanceJobStatus::Running;
+                    report.job.attempt = 1;
+                    report.job.worker_id = Some("worker-a".to_string());
+                    report.job.lease_id = "expired-lease".to_string();
+                    report.job.heartbeat_at = Some(maintenance_timestamp(fixture.now - Duration::hours(1)));
+                }
+                "quarantine" => report.job.quarantined_object_count = 1,
+                "pointer" => report.job.current_metadata_location.push_str(".stale"),
+                "generation" => report.job.current_generation += 1,
+                "retention" => report.job.retain_recent_metadata_files += 1,
+                "paused" | "disabled" | "delete-disabled" => {
+                    let mut config = fixture
+                        .store
+                        .get_table_maintenance_config("analytics", "sales", "orders")
+                        .await
+                        .unwrap();
+                    match scenario {
+                        "paused" => config.worker_paused = true,
+                        "disabled" => config.background_enabled = false,
+                        _ => config.delete_enabled = false,
+                    }
+                    fixture
+                        .store
+                        .put_table_maintenance_config("analytics", "sales", "orders", config)
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            fixture.seed_report(&report).await;
+            let before = maintenance_test_object_versions(&fixture.backend).await;
+            assert_matches!(
+                fixture.run("worker-a", attempt, fixture.now).await,
+                Err(TableCatalogStoreError::Conflict(_)),
+                "{mode:?}: {scenario}"
+            );
+            assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before, "{mode:?}: {scenario}");
+            assert_eq!(fixture.delete_attempts().await, 0, "{mode:?}: {scenario}");
+            assert_eq!(
+                fixture.store.load_table("analytics", "sales", "orders").await.unwrap(),
+                Some(fixture.entry)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_claim_publication_failures_do_not_repeat_effects() {
+    for mode in [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong] {
+        for target in 0..3 {
+            for after_write in [false, true] {
+                let fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+                let path = &fixture.report_paths()[target];
+                if after_write {
+                    fixture.backend.fail_after_next_put(RUSTFS_META_BUCKET, path).await;
+                } else {
+                    fixture.backend.fail_next_put(RUSTFS_META_BUCKET, path).await;
+                }
+                fixture
+                    .run("worker-a", 0, fixture.now)
+                    .await
+                    .expect_err("claim publication fault must be surfaced");
+                assert_eq!(fixture.delete_attempts().await, 0);
+                let before = maintenance_test_object_versions(&fixture.backend).await;
+                let replay = fixture.run("worker-a", 0, fixture.now).await;
+                if target == 0 && !after_write {
+                    let completed = replay.expect("unpublished claim can safely retry");
+                    assert_eq!(completed.job.attempt, 1);
+                    assert_eq!(completed.job.status, TableMetadataMaintenanceJobStatus::Successful);
+                    assert_eq!(fixture.delete_attempts().await, 1);
+                    fixture.assert_report_views(&completed).await;
+                } else if target == 2 && after_write {
+                    let running = replay.expect("fully published running claim can be replayed");
+                    assert_eq!(running.job.attempt, 1);
+                    assert_eq!(running.job.status, TableMetadataMaintenanceJobStatus::Running);
+                    assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+                    fixture.assert_report_views(&running).await;
+                } else {
+                    assert_matches!(replay, Err(TableCatalogStoreError::Conflict(_)));
+                    assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+                    assert_eq!(fixture.delete_attempts().await, 0);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_terminal_publication_faults_never_repeat_deletion() {
+    for mode in [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong] {
+        for target in 0..3 {
+            for after_write in [false, true] {
+                let fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+                let path = fixture.report_paths()[target].clone();
+                let attempt = fixture.backend.put_attempt_count(RUSTFS_META_BUCKET, &path).await + 2;
+                if after_write {
+                    fixture
+                        .backend
+                        .state
+                        .lock()
+                        .await
+                        .fail_after_put_attempts
+                        .entry((RUSTFS_META_BUCKET.to_string(), path))
+                        .or_default()
+                        .insert(attempt);
+                } else {
+                    fixture.backend.fail_put_attempt(RUSTFS_META_BUCKET, &path, attempt).await;
+                }
+                fixture
+                    .run("worker-a", 0, fixture.now)
+                    .await
+                    .expect_err("terminal publication fault must be surfaced");
+                assert_eq!(fixture.delete_attempts().await, 1);
+                assert!(
+                    !fixture
+                        .backend
+                        .object_exists("analytics", &fixture.old_metadata)
+                        .await
+                        .unwrap()
+                );
+                let before = maintenance_test_object_versions(&fixture.backend).await;
+                assert_matches!(fixture.run("worker-b", 0, fixture.now).await, Err(TableCatalogStoreError::Conflict(_)));
+                assert_matches!(fixture.run("worker-a", 1, fixture.now).await, Err(TableCatalogStoreError::Conflict(_)));
+                assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+                let replay = fixture.run("worker-a", 0, fixture.now).await.unwrap();
+                assert_eq!(replay.job.job_id, fixture.queued.job.job_id);
+                assert_eq!(replay.job.attempt, 1);
+                if target == 0 && !after_write {
+                    assert_eq!(replay.job.status, TableMetadataMaintenanceJobStatus::Running);
+                    assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+                } else {
+                    assert_eq!(replay.job.status, TableMetadataMaintenanceJobStatus::Successful);
+                    assert_eq!(replay.job.deleted_metadata_file_count, 1);
+                }
+                fixture.assert_report_views(&replay).await;
+                let repaired = maintenance_test_object_versions(&fixture.backend).await;
+                assert_eq!(fixture.run("worker-a", 0, fixture.now).await.unwrap(), replay);
+                assert_eq!(maintenance_test_object_versions(&fixture.backend).await, repaired);
+                assert_eq!(fixture.delete_attempts().await, 1);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_terminal_repair_requires_exact_running_predecessor() {
+    for mode in [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong] {
+        for mismatch in ["lease", "attempt", "worker", "candidate", "audit", "terminal"] {
+            let fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+            let paths = fixture.report_paths();
+            let attempt = fixture.backend.put_attempt_count(RUSTFS_META_BUCKET, &paths[1]).await + 2;
+            fixture.backend.fail_put_attempt(RUSTFS_META_BUCKET, &paths[1], attempt).await;
+            fixture
+                .run("worker-a", 0, fixture.now)
+                .await
+                .expect_err("latest terminal write must fail");
+            let object = fixture
+                .backend
+                .read_object(RUSTFS_META_BUCKET, &paths[2])
+                .await
+                .unwrap()
+                .unwrap();
+            let mut running: TableMetadataMaintenanceReport = serde_json::from_slice(&object.data).unwrap();
+            assert_eq!(running.job.status, TableMetadataMaintenanceJobStatus::Running);
+            match mismatch {
+                "lease" => running.job.lease_id = "other-lease".to_string(),
+                "attempt" => running.job.attempt += 1,
+                "worker" => running.job.worker_id = Some("worker-b".to_string()),
+                "candidate" => running.cleanup_candidate_locations.clear(),
+                "audit" => {
+                    running.audit_events.pop();
+                }
+                "terminal" => running.job.status = TableMetadataMaintenanceJobStatus::Failed,
+                _ => unreachable!(),
+            }
+            fixture
+                .backend
+                .seed_object(RUSTFS_META_BUCKET, &paths[2], serde_json::to_vec(&running).unwrap())
+                .await;
+            let before = maintenance_test_object_versions(&fixture.backend).await;
+            assert_matches!(
+                fixture.run("worker-a", 0, fixture.now).await,
+                Err(TableCatalogStoreError::Conflict(_)),
+                "{mode:?}: {mismatch}"
+            );
+            assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+            assert_eq!(fixture.delete_attempts().await, 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_failed_terminal_publication_can_be_repaired_and_retried() {
+    for mode in [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong] {
+        let fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+        let latest = fixture.report_paths()[1].clone();
+        let attempt = fixture.backend.put_attempt_count(RUSTFS_META_BUCKET, &latest).await + 2;
+        fixture.backend.fail_put_attempt(RUSTFS_META_BUCKET, &latest, attempt).await;
+        fixture
+            .backend
+            .fail_delete_attempt("analytics", &fixture.old_metadata, 1)
+            .await;
+        fixture
+            .run("worker-a", 0, fixture.now)
+            .await
+            .expect_err("delete and terminal publication faults must surface");
+        let repaired = fixture.run("worker-a", 0, fixture.now).await.unwrap();
+        assert_eq!(repaired.job.status, TableMetadataMaintenanceJobStatus::Failed);
+        assert_eq!(repaired.job.attempt, 1);
+        assert_eq!(fixture.delete_attempts().await, 1);
+        fixture.assert_report_views(&repaired).await;
+        let due = OffsetDateTime::parse(
+            repaired.job.next_retry_after.as_deref().unwrap(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let completed = fixture.run("worker-b", 1, due).await.unwrap();
+        assert_eq!(completed.job.status, TableMetadataMaintenanceJobStatus::Successful);
+        assert_eq!(completed.job.attempt, 2);
+        assert_eq!(fixture.delete_attempts().await, 2);
+        fixture.assert_report_views(&completed).await;
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_serializes_competing_claims_and_same_worker_replays() {
+    for mode in [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong] {
+        for same_worker in [false, true] {
+            let fixture = Arc::new(ConditionalMaintenanceFixture::new(mode, 2).await);
+            let second_worker = if same_worker { "worker-a" } else { "worker-b" };
+            let named_path = fixture.report_paths()[0].clone();
+            let before = maintenance_test_object_versions(&fixture.backend).await;
+            let puts_before = fixture.backend.put_attempt_count(RUSTFS_META_BUCKET, &named_path).await;
+            let pause = fixture.backend.pause_next_put(RUSTFS_META_BUCKET, &named_path).await;
+            let first_fixture = Arc::clone(&fixture);
+            let first = tokio::spawn(async move { first_fixture.run("worker-a", 0, first_fixture.now).await });
+            let (first, second) = tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, async {
+                pause.wait_started().await;
+                // The first Running write has not committed: both workers must
+                // contend while every durable report still describes Queued.
+                let publication_path = default_table_bucket_publication_lock_path();
+                let attempts = fixture
+                    .backend
+                    .write_lock_acquisition_count("analytics", &publication_path)
+                    .await;
+                let second_fixture = Arc::clone(&fixture);
+                let second = tokio::spawn(async move { second_fixture.run(second_worker, 0, second_fixture.now).await });
+                while fixture
+                    .backend
+                    .write_lock_acquisition_count("analytics", &publication_path)
+                    .await
+                    == attempts
+                {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    fixture
+                        .backend
+                        .write_lock_acquisition_count("analytics", &publication_path)
+                        .await,
+                    attempts + 1,
+                );
+                assert!(!first.is_finished(), "the first claim must remain paused before publication");
+                assert!(!second.is_finished(), "the competing claim must wait for publication ownership");
+                assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+                assert_eq!(fixture.backend.put_attempt_count(RUSTFS_META_BUCKET, &named_path).await, puts_before + 1);
+                assert_eq!(fixture.delete_attempts().await, 0);
+                pause.release();
+                (first.await.unwrap(), second.await.unwrap())
+            })
+            .await
+            .expect("concurrent claims must complete without deadlock");
+            let winner = if same_worker {
+                let first = first.unwrap();
+                assert_eq!(second.unwrap(), first);
+                first
+            } else {
+                match (first, second) {
+                    (Ok(report), Err(TableCatalogStoreError::Conflict(_)))
+                    | (Err(TableCatalogStoreError::Conflict(_)), Ok(report)) => report,
+                    other => panic!("exactly one competing claim must win: {other:?}"),
+                }
+            };
+            assert_eq!(winner.job.attempt, 1);
+            assert_eq!(winner.job.status, TableMetadataMaintenanceJobStatus::Successful);
+            assert_eq!(fixture.delete_attempts().await, 1);
+            fixture.assert_report_views(&winner).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_running_retry_rejects_previous_lease_and_takeover() {
+    for mode in [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong] {
+        let fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+        let failed = fixture.fail_first_attempt().await;
+        let due = OffsetDateTime::parse(
+            failed.job.next_retry_after.as_deref().unwrap(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let current = fixture.report_paths()[2].clone();
+        fixture.backend.fail_after_next_put(RUSTFS_META_BUCKET, &current).await;
+        fixture
+            .run("worker-b", 1, due)
+            .await
+            .expect_err("response after complete Running claim is lost");
+        let running = fixture.run("worker-b", 1, due).await.unwrap();
+        assert_eq!(running.job.status, TableMetadataMaintenanceJobStatus::Running);
+        assert_eq!(running.job.attempt, 2);
+        assert_ne!(running.job.lease_id, failed.job.lease_id);
+        let before = maintenance_test_object_versions(&fixture.backend).await;
+        assert_matches!(
+            fixture
+                .store
+                .heartbeat_table_metadata_maintenance_job(
+                    "analytics",
+                    "sales",
+                    "orders",
+                    &failed.job.job_id,
+                    &failed.job.lease_id,
+                    "worker-a",
+                )
+                .await,
+            Err(TableCatalogStoreError::Conflict(_))
+        );
+        assert_matches!(fixture.run("worker-a", 1, due).await, Err(TableCatalogStoreError::Conflict(_)));
+        assert_matches!(fixture.run("worker-c", 2, due).await, Err(TableCatalogStoreError::Conflict(_)));
+        assert_matches!(
+            fixture.run("worker-b", 1, due + Duration::hours(1)).await,
+            Err(TableCatalogStoreError::Conflict(_))
+        );
+        assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+        assert_eq!(fixture.delete_attempts().await, 1);
+        fixture.assert_report_views(&running).await;
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_rejects_invalid_conditions_before_writes() {
+    for mode in [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong] {
+        for invalid in ["empty-worker", "overflow", "current", "latest", "../job", ""] {
+            let mut fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+            let mut worker = "worker-a";
+            let mut attempt = 0;
+            match invalid {
+                "empty-worker" => worker = " \t ",
+                "overflow" => attempt = u16::MAX,
+                job_id => fixture.queued.job.job_id = job_id.to_string(),
+            }
+            let before = maintenance_test_object_versions(&fixture.backend).await;
+            assert_matches!(
+                fixture.run(worker, attempt, fixture.now).await,
+                Err(TableCatalogStoreError::Invalid(_)),
+                "{mode:?}: {invalid}"
+            );
+            assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+            assert_eq!(fixture.delete_attempts().await, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_requires_every_persisted_report_view() {
+    for mode in [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong] {
+        for missing in 0..3 {
+            let fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+            fixture
+                .backend
+                .state
+                .lock()
+                .await
+                .objects
+                .remove(&(RUSTFS_META_BUCKET.to_string(), fixture.report_paths()[missing].clone()));
+            let before = maintenance_test_object_versions(&fixture.backend).await;
+            assert_matches!(fixture.run("worker-a", 0, fixture.now).await, Err(TableCatalogStoreError::Conflict(_)));
+            assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+            assert_eq!(fixture.delete_attempts().await, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_maintenance_worker_rejects_invalid_failed_retry_state() {
+    for mode in [TableCatalogBackingMode::ObjectBacked, TableCatalogBackingMode::DurableStrong] {
+        for invalid in [
+            "missing-backoff",
+            "malformed-backoff",
+            "zero-attempt",
+            "invalid-budget",
+            "exhausted",
+        ] {
+            let fixture = ConditionalMaintenanceFixture::new(mode, 2).await;
+            let mut failed = fixture.fail_first_attempt().await;
+            match invalid {
+                "missing-backoff" => failed.job.next_retry_after = None,
+                "malformed-backoff" => failed.job.next_retry_after = Some("not-a-timestamp".to_string()),
+                "zero-attempt" => failed.job.attempt = 0,
+                "invalid-budget" => failed.job.max_retry_attempts = 11,
+                "exhausted" => failed.job.attempt = failed.job.max_retry_attempts,
+                _ => unreachable!(),
+            }
+            fixture.seed_report(&failed).await;
+            let before = maintenance_test_object_versions(&fixture.backend).await;
+            assert_matches!(
+                fixture
+                    .run("worker-b", failed.job.attempt, fixture.now + Duration::hours(1))
+                    .await,
+                Err(TableCatalogStoreError::Conflict(_)),
+                "{mode:?}: {invalid}"
+            );
+            assert_eq!(maintenance_test_object_versions(&fixture.backend).await, before);
+            assert_eq!(fixture.delete_attempts().await, 1);
+        }
+    }
 }
 
 #[tokio::test]
