@@ -60,8 +60,13 @@ retains on-demand directory creation. Preparation and execution have finite
 deadlines, and scanner/incarnation-bound requests retain their existing paths.
 Ordinary `UndoWrite` prepares metadata admission on that same captured instance
 before classification. Backup restoration, remaining-version rewrites and fresh
-version rollback retain the admission through physical completion. This does not
-cover `undo_delete` or incarnation-bound deletion.
+version rollback retain the admission through physical completion. A single-object
+`UndoDelete` with both undo flags and a rollback directory also uses this admission.
+Before its first mutation, it freezes the restoration paths and tries all required
+extra namespace locks; contention fails before any marker or object changes.
+Physical restoration workers retain the complete lock ownership after cancellation.
+Optional rollback cleanup skips lock contention. Incarnation-bound deletion keeps
+its separate authorization path.
 Ordinary `DeleteVersion` without rollback staging uses the same admission. It
 covers remaining-version rewrites, final-version removal, and forced delete
 markers when metadata is missing. These operations reuse the prepared publication

@@ -878,6 +878,17 @@ impl NodeService {
             if request.force_del_marker {
                 target.reject_legacy_artifact_mutation(&request.volume).await?;
                 Err(DiskError::other("undo_write cannot force a delete marker"))
+            } else if opts.undo_delete && opts.old_data_dir.is_some() {
+                match target
+                    .begin_legacy_local_metadata_mutation(&request.disk, &request.volume, &request.path)
+                    .await
+                {
+                    Ok(write) => {
+                        target.reject_legacy_artifact_mutation(&request.volume).await?;
+                        write.undo_delete(file_info, opts).await
+                    }
+                    Err(err) => Err(err),
+                }
             } else if opts.undo_delete {
                 target.reject_legacy_artifact_mutation(&request.volume).await?;
                 target
@@ -3631,6 +3642,245 @@ mod legacy_artifact_tests {
                 assert!(
                     !env.disk_paths[0].join(&volume).exists(),
                     "retained metadata must not recreate volume or object"
+                );
+            }
+        }
+    }
+
+    async fn stage_legacy_undo_delete(
+        disk: &ecstore_disk::DiskStore,
+        volume: &str,
+        path: &str,
+        case: &str,
+    ) -> (FileInfo, DeleteOptions, Option<Vec<u8>>) {
+        let object_dir = ecstore_disk::DiskAPI::path(disk.as_ref()).join(volume).join(path);
+        let rollback = Uuid::new_v4();
+        let mut fi = inline_rename_file_info(path);
+        fi.data = None;
+        fi.metadata.clear();
+        let original = if case == "marker" {
+            fi.deleted = true;
+            fi.mark_deleted = true;
+            fi.size = 0;
+            fi.parts.clear();
+            fi.erasure = Default::default();
+            assert!(fi.is_canonical_delete_marker(), "fixture must serialize as a delete marker");
+            None
+        } else {
+            let data_dir = Uuid::new_v4();
+            fi.data_dir = Some(data_dir);
+            let data_path = object_dir.join(data_dir.to_string());
+            tokio::fs::create_dir_all(&data_path).await.expect("original data directory");
+            tokio::fs::write(data_path.join("part.1"), LEGACY_RENAME_BODY)
+                .await
+                .expect("original part bytes");
+            ecstore_disk::DiskAPI::write_metadata(disk.as_ref(), "", volume, path, fi.clone())
+                .await
+                .expect("original non-inline version");
+            Some(
+                tokio::fs::read(object_dir.join("xl.meta"))
+                    .await
+                    .expect("original metadata bytes"),
+            )
+        };
+        disk.delete_version(
+            volume,
+            path,
+            fi.clone(),
+            case == "marker",
+            DeleteOptions {
+                old_data_dir: Some(rollback),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("real staged delete");
+        let rollback_path = object_dir.join(rollback.to_string());
+        if case == "marker" {
+            assert!(object_dir.join("xl.meta").exists());
+            assert!(rollback_path.join("xl.meta.delete-marker.rollback").exists());
+            assert!(!rollback_path.join("xl.meta.bkp").exists());
+        } else {
+            assert!(!object_dir.join("xl.meta").exists());
+            assert_eq!(
+                tokio::fs::read(rollback_path.join("xl.meta.bkp")).await.expect("real backup"),
+                *original.as_ref().expect("old metadata")
+            );
+            let data_path = object_dir.join(fi.data_dir.expect("data directory").to_string());
+            let committed = data_path.join(format!("delete-data.{rollback}"));
+            assert!(committed.exists(), "successful staged delete commits its data marker");
+            if case == "staged" {
+                // Older staged deletes moved the data into the rollback directory.
+                tokio::fs::remove_file(committed).await.expect("replace committed layout");
+                tokio::fs::rename(&data_path, rollback_path.join(fi.data_dir.expect("data directory").to_string()))
+                    .await
+                    .expect("real staged data bytes");
+                assert!(!data_path.exists());
+            }
+        }
+        (
+            fi,
+            DeleteOptions {
+                undo_write: true,
+                undo_delete: true,
+                old_data_dir: Some(rollback),
+                ..Default::default()
+            },
+            original,
+        )
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_undo_delete_receiver_restores_staged_versions_and_rejects_managed() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-undo-delete-receiver-test-secret".to_owned());
+        let root = tempfile::tempdir().expect("undo delete receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        env.make_bucket("undo-delete-ordinary", true).await;
+        env.ecstore
+            .clone()
+            .make_artifact_bucket("undo-delete-managed", "outputs/")
+            .await
+            .expect("managed bucket");
+        let service = service_for(&env).await;
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = service
+            .local_mutation_target()
+            .find_mutation_disk(&disk_ref)
+            .await
+            .expect("listener local disk");
+        for msgpack in [false, true] {
+            for volume in ["undo-delete-ordinary", ".rustfs.sys", "undo-delete-managed"] {
+                for case in ["committed", "staged", "marker"] {
+                    let path = if volume == "undo-delete-managed" {
+                        format!("outputs/74656e616e74/{}/{}/{case}-{msgpack}", Uuid::new_v4(), Uuid::new_v4())
+                    } else {
+                        format!("undo-delete/{case}-{msgpack}")
+                    };
+                    let (fi, opts, original) = stage_legacy_undo_delete(&disk, volume, &path, case).await;
+                    let object_dir = env.disk_paths[0].join(volume).join(&path);
+                    let rollback = opts.old_data_dir.expect("rollback directory");
+                    let rollback_path = object_dir.join(rollback.to_string());
+                    let data_name = fi.data_dir.unwrap_or_default().to_string();
+                    let preserved_paths = [
+                        object_dir.join("xl.meta"),
+                        rollback_path.join("xl.meta.bkp"),
+                        rollback_path.join("xl.meta.delete-marker.rollback"),
+                        object_dir.join(&data_name).join("part.1"),
+                        object_dir.join(&data_name).join(format!("delete-data.{rollback}")),
+                        rollback_path.join(&data_name).join("part.1"),
+                    ];
+                    let mut before = Vec::new();
+                    for physical in &preserved_paths {
+                        before.push(tokio::fs::read(physical).await.ok());
+                    }
+                    let result = authenticated_legacy_delete(
+                        &service,
+                        signed_legacy_delete_request(&disk_ref, volume, &path, &fi, &opts, msgpack, false),
+                    )
+                    .await;
+                    if volume == "undo-delete-managed" {
+                        assert_eq!(result.expect_err("managed undo delete must reject").code(), tonic::Code::PermissionDenied);
+                        for (physical, expected) in preserved_paths.iter().zip(before) {
+                            assert_eq!(
+                                tokio::fs::read(physical).await.ok(),
+                                expected,
+                                "managed rollback must remain unchanged: {}",
+                                physical.display()
+                            );
+                        }
+                        continue;
+                    }
+                    let response = result.expect("signed undo delete response").into_inner();
+                    assert!(response.success, "volume={volume}, case={case}, msgpack={msgpack}: {:?}", response.error);
+                    assert!(response.error.is_none());
+                    assert_eq!(response.raw_file_info, "null");
+                    let repeated = authenticated_legacy_delete(
+                        &service,
+                        signed_legacy_delete_request(&disk_ref, volume, &path, &fi, &opts, msgpack, false),
+                    )
+                    .await
+                    .expect("repeated undo response")
+                    .into_inner();
+                    assert!(repeated.success, "repeated undo: {:?}", repeated.error);
+                    assert!(!rollback_path.exists(), "successful undo consumes rollback state");
+                    if let Some(original) = original {
+                        assert_eq!(tokio::fs::read(object_dir.join("xl.meta")).await.expect("restored metadata"), original);
+                        let restored = disk
+                            .read_version(
+                                volume,
+                                volume,
+                                &path,
+                                &fi.version_id.expect("original version").to_string(),
+                                &ReadOptions::default(),
+                            )
+                            .await
+                            .expect("complete restored version");
+                        assert_eq!(restored.version_id, fi.version_id);
+                        assert_eq!(restored.data_dir, fi.data_dir);
+                        assert_eq!(restored.size, fi.size);
+                        assert_eq!(
+                            tokio::fs::read(object_dir.join(&data_name).join("part.1"))
+                                .await
+                                .expect("restored data"),
+                            LEGACY_RENAME_BODY
+                        );
+                        assert!(!object_dir.join(&data_name).join(format!("delete-data.{rollback}")).exists());
+                    } else {
+                        assert!(!object_dir.join("xl.meta").exists(), "marker-only undo removes new metadata");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_undo_delete_receiver_rejects_missing_volume_with_retained_authority() {
+        let _ = rustfs_credentials::set_global_rpc_secret("legacy-undo-delete-receiver-test-secret".to_owned());
+        let root = tempfile::tempdir().expect("missing undo delete receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        let service = service_for(&env).await;
+        let target = service.local_mutation_target();
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = target.find_mutation_disk(&disk_ref).await.expect("listener local disk");
+        for msgpack in [false, true] {
+            for case in ["committed", "staged", "marker"] {
+                let volume = format!("undo-delete-missing-{case}-{msgpack}");
+                env.make_bucket(&volume, true).await;
+                let path = "nested/object";
+                let (fi, opts, _) = stage_legacy_undo_delete(&disk, &volume, path, case).await;
+                let incarnation = env
+                    .ecstore
+                    .bucket_incarnation_id(&volume)
+                    .await
+                    .expect("authoritative incarnation");
+                disk.delete_volume(&volume, true)
+                    .await
+                    .expect("remove only receiving physical volume");
+                assert_eq!(env.ecstore.bucket_incarnation_id(&volume).await.expect("retained authority"), incarnation);
+                target
+                    .reject_legacy_artifact_mutation(&volume)
+                    .await
+                    .expect("ordinary authority still classifies");
+                let response = authenticated_legacy_delete(
+                    &service,
+                    signed_legacy_delete_request(&disk_ref, &volume, path, &fi, &opts, msgpack, false),
+                )
+                .await
+                .expect("missing volume response")
+                .into_inner();
+                assert!(!response.success);
+                assert_eq!(DiskError::from(response.error.expect("missing-volume error")), DiskError::VolumeNotFound);
+                assert!(
+                    !env.disk_paths[0].join(&volume).exists(),
+                    "retained authority must not recreate volume or object"
                 );
             }
         }
