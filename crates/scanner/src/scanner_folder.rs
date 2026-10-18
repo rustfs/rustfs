@@ -2955,6 +2955,7 @@ pub(crate) async fn scan_data_folder_scoped(
     }
     let bucket_name = cache.info.name.clone();
     let next_cycle = cache.info.next_cycle;
+    let resume_position_on_entry = cache.has_scan_position();
     let had_scan_checkpoint = cache.info.scan_checkpoint.is_some();
     let new_cache = DataUsageCache {
         info: cache.info.clone(),
@@ -3089,7 +3090,11 @@ pub(crate) async fn scan_data_folder_scoped(
                     pool = new_cache.info.source.map(|source| source.pool_index),
                     set = new_cache.info.source.map(|source| source.set_index),
                     cycle = next_cycle,
+                    leader_epoch = new_cache.info.leader_epoch,
+                    resume_position_on_entry,
+                    resume_position = new_cache.has_scan_position(),
                     coverage_gap,
+                    unresolved_objects,
                     root_failed_objects = root.failed_objects,
                     failed_objects = new_cache.info.failed_objects.len(),
                     size_reconciliation_entries = new_cache.info.size_reconciliation.len(),
