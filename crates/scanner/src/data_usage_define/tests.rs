@@ -71,6 +71,7 @@ struct BackupFallbackStore {
     recover_main_revision: AtomicBool,
     backup_reads: Mutex<usize>,
     puts: Mutex<Vec<CachePutRecord>>,
+    put_delays: [Duration; 2],
 }
 
 impl BackupFallbackStore {
@@ -82,6 +83,7 @@ impl BackupFallbackStore {
             recover_main_revision: AtomicBool::new(recover_main_revision),
             backup_reads: Mutex::new(0),
             puts: Mutex::new(Vec::new()),
+            put_delays: [Duration::ZERO; 2],
         }
     }
 
@@ -93,6 +95,7 @@ impl BackupFallbackStore {
             recover_main_revision: AtomicBool::new(true),
             backup_reads: Mutex::new(0),
             puts: Mutex::new(Vec::new()),
+            put_delays: [Duration::ZERO; 2],
         }
     }
 
@@ -393,6 +396,10 @@ impl ObjectIO for BackupFallbackStore {
             .as_ref()
             .and_then(HTTPPreconditions::if_none_match_value)
             .map(str::to_owned);
+        let delay = self.put_delays[usize::from(object.ends_with(".bkp"))];
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
         self.puts.lock().await.push(CachePutRecord {
             object: object.to_string(),
             if_match,
@@ -2711,6 +2718,53 @@ fn test_cache_path_type_distinguishes_main_and_backup() {
     assert_eq!(DataUsageCache::cache_path_type("buckets/.usage-cache.bin.bkp"), "backup");
 }
 
+#[tokio::test(start_paused = true)]
+#[serial_test::serial]
+async fn test_save_backup_budget_tracks_primary_cost() {
+    temp_env::async_with_vars([(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("14"))], async {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        let mut store = BackupFallbackStore::new(b"old backup".to_vec(), true);
+        store.put_delays = [Duration::from_secs(6); 2];
+        let store = Arc::new(store);
+        let revisions = DataUsageCacheRevisions {
+            main: DataUsageCacheRevision::Missing,
+            backup: Some(DataUsageCacheRevision::Etag("backup-etag".to_string())),
+        };
+        DataUsageCache::default()
+            .save_with_revisions(store.clone(), DATA_USAGE_CACHE_NAME, &revisions)
+            .await
+            .expect("a backup with the observed primary cost should complete");
+        let puts = store.puts.lock().await;
+        assert_eq!(puts.len(), 2, "best-effort save success must not hide a stale backup");
+        assert!(puts[1].object.ends_with(".bkp"));
+        assert_eq!(puts[0].if_none_match.as_deref(), Some("*"));
+        assert_eq!(puts[1].if_match.as_deref(), Some("backup-etag"));
+    })
+    .await;
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+}
+
+#[tokio::test(start_paused = true)]
+#[serial_test::serial]
+async fn test_save_backup_budget_still_bounds_a_stalled_backup() {
+    temp_env::async_with_vars([(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("14"))], async {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        let mut store = BackupFallbackStore::new(b"old backup".to_vec(), true);
+        store.put_delays = [Duration::from_secs(6), Duration::from_secs(60)];
+        let store = Arc::new(store);
+        let started = Instant::now();
+        DataUsageCache::default()
+            .save(store.clone(), DATA_USAGE_CACHE_NAME)
+            .await
+            .expect("backup failure remains best effort after a successful main save");
+        assert_eq!(store.puts.lock().await.len(), 1, "stalled backup must not commit");
+        assert_eq!(*store.backup_reads.lock().await, 1, "one bounded reconciliation, no backup retry");
+        assert!(started.elapsed() <= Duration::from_secs(6) + DataUsageCache::cache_save_timeout() + Duration::from_millis(10));
+    })
+    .await;
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+}
+
 #[test]
 fn test_cache_save_timeout_uses_default_when_env_missing() {
     with_var_unset(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, || {
@@ -2719,7 +2773,7 @@ fn test_cache_save_timeout_uses_default_when_env_missing() {
             DataUsageCache::cache_save_timeout(),
             Duration::from_secs(rustfs_config::DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS)
         );
-        assert_eq!(DataUsageCache::persistence_timeout(), Duration::from_millis(52_350));
+        assert_eq!(DataUsageCache::persistence_timeout(), Duration::from_millis(61_350));
     });
     crate::runtime_config::refresh_scanner_runtime_config_for_tests();
 }
@@ -2742,7 +2796,7 @@ fn test_cache_save_timeout_respects_env_and_minimum_bound() {
 fn test_cache_persistence_timeout_covers_all_save_attempts() {
     with_var(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("7"), || {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
-        assert_eq!(DataUsageCache::persistence_timeout(), Duration::from_millis(31_350));
+        assert_eq!(DataUsageCache::persistence_timeout(), Duration::from_millis(33_350));
     });
     crate::runtime_config::refresh_scanner_runtime_config_for_tests();
 }
