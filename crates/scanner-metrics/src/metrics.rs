@@ -1035,6 +1035,9 @@ pub struct Metrics {
     scanner_guardrail_veto_total: AtomicU64,
     scanner_guardrail_last_veto_unix_secs: AtomicU64,
     scanner_guardrail_last_veto_reason: Mutex<String>,
+    scanner_scope_fallback_total: AtomicU64,
+    scanner_scope_fallback_last_unix_secs: AtomicU64,
+    scanner_scope_fallback_last_reason: Mutex<String>,
     scanner_usage_last_save_result: AtomicU8,
     scanner_usage_deferred_pending: AtomicBool,
     scanner_usage_deferred_total: AtomicU64,
@@ -1370,6 +1373,14 @@ pub struct ScannerUsageFreshnessSnapshot {
     pub last_guardrail_veto_unix_secs: u64,
     #[serde(default)]
     pub last_guardrail_veto_reason: String,
+    /// Cycles eligible for a dirty-bucket scope that walked the whole
+    /// namespace instead, with the reason of the last one.
+    #[serde(default)]
+    pub scope_fallback_total: u64,
+    #[serde(default)]
+    pub last_scope_fallback_unix_secs: u64,
+    #[serde(default)]
+    pub last_scope_fallback_reason: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -2114,6 +2125,9 @@ impl Metrics {
             scanner_guardrail_veto_total: AtomicU64::new(0),
             scanner_guardrail_last_veto_unix_secs: AtomicU64::new(0),
             scanner_guardrail_last_veto_reason: Mutex::new(String::new()),
+            scanner_scope_fallback_total: AtomicU64::new(0),
+            scanner_scope_fallback_last_unix_secs: AtomicU64::new(0),
+            scanner_scope_fallback_last_reason: Mutex::new(String::new()),
             scanner_usage_last_save_result: AtomicU8::new(ScannerUsageSaveResult::Unknown as u8),
             scanner_usage_deferred_pending: AtomicBool::new(false),
             scanner_usage_deferred_total: AtomicU64::new(0),
@@ -2521,6 +2535,20 @@ impl Metrics {
         self.scanner_guardrail_last_veto_unix_secs
             .store(unix_now_secs(), Ordering::Relaxed);
         let mut last_reason = match self.scanner_guardrail_last_veto_reason.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *last_reason = reason.into();
+    }
+
+    /// Record a cycle that could have been scoped to its dirty buckets but
+    /// walked the whole namespace, so an operator can tell why scoped
+    /// convergence is not happening.
+    pub fn record_scanner_scope_fallback(&self, reason: impl Into<String>) {
+        self.scanner_scope_fallback_total.fetch_add(1, Ordering::Relaxed);
+        self.scanner_scope_fallback_last_unix_secs
+            .store(unix_now_secs(), Ordering::Relaxed);
+        let mut last_reason = match self.scanner_scope_fallback_last_reason.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -3623,6 +3651,12 @@ impl Metrics {
             guardrail_veto_total: self.scanner_guardrail_veto_total.load(Ordering::Relaxed),
             last_guardrail_veto_unix_secs: self.scanner_guardrail_last_veto_unix_secs.load(Ordering::Relaxed),
             last_guardrail_veto_reason: match self.scanner_guardrail_last_veto_reason.lock() {
+                Ok(reason) => reason.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            },
+            scope_fallback_total: self.scanner_scope_fallback_total.load(Ordering::Relaxed),
+            last_scope_fallback_unix_secs: self.scanner_scope_fallback_last_unix_secs.load(Ordering::Relaxed),
+            last_scope_fallback_reason: match self.scanner_scope_fallback_last_reason.lock() {
                 Ok(reason) => reason.clone(),
                 Err(poisoned) => poisoned.into_inner().clone(),
             },

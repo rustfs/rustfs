@@ -17,6 +17,11 @@ use std::collections::BTreeSet;
 use std::sync::RwLock as StdRwLock;
 
 pub(super) static DIRTY_USAGE_BUCKET_GENERATION: AtomicU64 = AtomicU64::new(0);
+// Advances, under the `DIRTY_USAGE_BUCKETS` lock, whenever an entry leaves the
+// dirty map or is overwritten by durable replay. Records only insert or raise
+// generations; this counter is what lets a scanner cycle tell the two apart
+// across its bucket-listing window (`covers_listed_pending`).
+static DIRTY_USAGE_REMOVAL_GENERATION: AtomicU64 = AtomicU64::new(0);
 pub(super) static DIRTY_USAGE_BUCKETS: LazyLock<StdMutex<DirtyUsageBuckets>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
 // Lock order when dirty usage state is updated is `DIRTY_USAGE_BUCKETS`,
 // `DIRTY_USAGE_BUCKET_SCOPES`, then `DIRTY_USAGE_PRODUCER_IDENTITIES`. All
@@ -281,6 +286,7 @@ pub fn replay_durable_dirty_usage_producer_record(
             );
         }
         DIRTY_USAGE_PRODUCER_COVERAGE.fetch_or(coverage, Ordering::AcqRel);
+        advance_generation(&DIRTY_USAGE_REMOVAL_GENERATION);
         dirty_buckets.len()
     };
     global_metrics().record_scanner_dirty_usage_pending(usize_to_u64_saturated(pending));
@@ -415,6 +421,7 @@ pub fn acknowledge_scoped_dirty_usage(
         if cleared > 0 {
             producer_identities.retain(|bucket, _| dirty.contains_key(bucket));
             advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
+            advance_generation(&DIRTY_USAGE_REMOVAL_GENERATION);
         }
         (cleared, dirty.len(), cleared_buckets)
     };
@@ -1196,6 +1203,7 @@ pub fn acknowledge_dirty_usage_generation(
         let cleared_buckets = before.saturating_sub(dirty_buckets.len());
         if cleared_buckets > 0 {
             advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
+            advance_generation(&DIRTY_USAGE_REMOVAL_GENERATION);
         }
         (cleared_buckets, dirty_buckets.len(), cleared)
     };
@@ -1226,6 +1234,9 @@ pub fn clear_dirty_usage_bucket(bucket: &str) {
         producer_identities.remove(bucket);
         DIRTY_USAGE_PRODUCER_COVERAGE.store(0, Ordering::Release);
         advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
+        if cleared.is_some() {
+            advance_generation(&DIRTY_USAGE_REMOVAL_GENERATION);
+        }
         (dirty_buckets.len(), cleared)
     };
     if let Some(cleared) = cleared {
@@ -1234,8 +1245,59 @@ pub fn clear_dirty_usage_bucket(bucket: &str) {
     global_metrics().record_scanner_dirty_usage_clear(usize_to_u64_saturated(pending_buckets));
 }
 
+/// Dirty-usage state captured immediately before a cycle lists its buckets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DirtyUsageListingCutoff {
+    pub(super) generation: u64,
+    /// `None` when the caller did not capture removals; the snapshot then
+    /// admits scoping only under the strict `covers_all_pending` rule.
+    removal_generation: Option<u64>,
+}
+
+pub(super) fn dirty_usage_listing_cutoff() -> DirtyUsageListingCutoff {
+    // Removals advance both counters under this lock, so reading them under
+    // it pairs the generation with every removal that precedes it.
+    let _dirty_buckets = dirty_usage_buckets();
+    DirtyUsageListingCutoff {
+        generation: DIRTY_USAGE_BUCKET_GENERATION.load(Ordering::Acquire),
+        removal_generation: Some(DIRTY_USAGE_REMOVAL_GENERATION.load(Ordering::Acquire)),
+    }
+}
+
+#[cfg(test)]
 pub(super) fn snapshot_dirty_usage_buckets(buckets: &[BucketInfo], absent_generation_cutoff: u64) -> DirtyUsageSnapshot {
-    let (snapshot, scopes, generation, covers_all_pending) = {
+    snapshot_dirty_usage_buckets_after_listing(
+        buckets,
+        DirtyUsageListingCutoff {
+            generation: absent_generation_cutoff,
+            removal_generation: None,
+        },
+    )
+}
+
+/// Snapshot the dirty map after the bucket listing taken at `cutoff`.
+///
+/// The snapshot holds every entry recorded at or before the cutoff and every
+/// later entry for a listed bucket. The only entries it leaves out are
+/// buckets this cycle did not list that became dirty after the cutoff: the
+/// walk cannot visit them, certification never clears them, and
+/// `pending_dirty_usage_buckets` reports them, so the next cycle selects them.
+///
+/// `covers_all_pending` keeps its strict meaning (nothing moved during the
+/// listing) because segment-reuse evidence and `DirtyUsageSnapshotStatus`
+/// bind to an unchanged generation window. `covers_listed_pending` is the
+/// weaker property a bucket-scoped walk needs: no entry was removed or
+/// replaced during the listing, so every bucket changed since the baseline
+/// that this cycle can walk is still in the snapshot. A removal in the window
+/// may be a certification against a publication newer than the baseline the
+/// cycle loaded, and scoping would then reuse a stale baseline value for that
+/// bucket, so any removal keeps the strict rule.
+pub(super) fn snapshot_dirty_usage_buckets_after_listing(
+    buckets: &[BucketInfo],
+    cutoff: DirtyUsageListingCutoff,
+) -> DirtyUsageSnapshot {
+    let absent_generation_cutoff = cutoff.generation;
+    let (snapshot, scopes, generation, covers_all_pending, covers_listed_pending) = {
         let dirty_buckets = dirty_usage_buckets();
         let dirty_scopes = dirty_usage_bucket_scopes();
         let listed_buckets = dirty_buckets
@@ -1266,7 +1328,24 @@ pub(super) fn snapshot_dirty_usage_buckets(buckets: &[BucketInfo], absent_genera
             .collect::<DirtyUsageBucketScopes>();
         let generation = DIRTY_USAGE_BUCKET_GENERATION.load(Ordering::Acquire);
         let covers_all_pending = generation == absent_generation_cutoff && snapshot.len() == dirty_buckets.len();
-        (snapshot, scopes, generation, covers_all_pending)
+        let removal_generation = DIRTY_USAGE_REMOVAL_GENERATION.load(Ordering::Acquire);
+        let no_removal_since_cutoff = cutoff
+            .removal_generation
+            .is_some_and(|before| before == removal_generation && removal_generation != u64::MAX);
+        // The filter above already guarantees the second clause; it is
+        // restated so a change to the filter cannot silently drop a listed
+        // bucket from a scoped walk.
+        let covers_listed_pending = covers_all_pending
+            || (generation != u64::MAX
+                && no_removal_since_cutoff
+                && dirty_buckets.iter().all(|(bucket, dirty_generation)| {
+                    snapshot.contains_key(bucket)
+                        || (*dirty_generation > absent_generation_cutoff
+                            && listed_buckets
+                                .as_ref()
+                                .is_some_and(|listed_buckets| !listed_buckets.contains(bucket.as_str())))
+                }));
+        (snapshot, scopes, generation, covers_all_pending, covers_listed_pending)
     };
     global_metrics().record_scanner_dirty_usage_cycle_snapshot(usize_to_u64_saturated(snapshot.len()));
     DirtyUsageSnapshot {
@@ -1274,6 +1353,7 @@ pub(super) fn snapshot_dirty_usage_buckets(buckets: &[BucketInfo], absent_genera
         scopes: Arc::new(scopes),
         generation,
         covers_all_pending,
+        covers_listed_pending,
     }
 }
 
@@ -1306,6 +1386,7 @@ pub(super) fn clear_dirty_usage_buckets(snapshot: &DirtyUsageBuckets) {
         if cleared_buckets > 0 {
             producer_identities.retain(|bucket, _| dirty_buckets.contains_key(bucket));
             advance_generation(&DIRTY_USAGE_BUCKET_GENERATION);
+            advance_generation(&DIRTY_USAGE_REMOVAL_GENERATION);
         }
         (cleared_buckets, dirty_buckets.len(), cleared)
     };
@@ -1463,6 +1544,7 @@ pub(super) fn dirty_usage_bucket_count() -> usize {
 #[cfg(test)]
 pub(crate) fn clear_dirty_usage_buckets_for_tests() {
     dirty_usage_buckets().clear();
+    advance_generation(&DIRTY_USAGE_REMOVAL_GENERATION);
     dirty_usage_bucket_scopes().clear();
     dirty_usage_producer_identities().clear();
     DIRTY_USAGE_PRODUCER_COVERAGE.store(0, Ordering::Release);

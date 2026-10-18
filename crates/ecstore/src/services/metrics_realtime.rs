@@ -234,6 +234,9 @@ fn to_madmin_scanner_metrics(metrics: rustfs_scanner_metrics::metrics::ScannerMe
             guardrail_veto_total: metrics.usage_freshness.guardrail_veto_total,
             last_guardrail_veto_unix_secs: metrics.usage_freshness.last_guardrail_veto_unix_secs,
             last_guardrail_veto_reason: metrics.usage_freshness.last_guardrail_veto_reason,
+            scope_fallback_total: metrics.usage_freshness.scope_fallback_total,
+            last_scope_fallback_unix_secs: metrics.usage_freshness.last_scope_fallback_unix_secs,
+            last_scope_fallback_reason: metrics.usage_freshness.last_scope_fallback_reason,
         },
         maintenance_control: MadminScannerMaintenanceControlSnapshot {
             primary_control: metrics.maintenance_control.primary_control,
@@ -892,12 +895,18 @@ mod test {
                 guardrail_veto_total: 4,
                 last_guardrail_veto_unix_secs: 17,
                 last_guardrail_veto_reason: "publication_blocked@<local>".to_string(),
+                scope_fallback_total: 5,
+                last_scope_fallback_unix_secs: 18,
+                last_scope_fallback_reason: "dirty_snapshot_incomplete".to_string(),
             },
             ..Default::default()
         });
 
         assert_eq!(scanner.usage_freshness.guardrail_veto_total, 4);
         assert_eq!(scanner.usage_freshness.last_guardrail_veto_unix_secs, 17);
+        assert_eq!(scanner.usage_freshness.scope_fallback_total, 5);
+        assert_eq!(scanner.usage_freshness.last_scope_fallback_unix_secs, 18);
+        assert_eq!(scanner.usage_freshness.last_scope_fallback_reason, "dirty_snapshot_incomplete");
         assert_eq!(scanner.usage_freshness.last_guardrail_veto_reason, "publication_blocked@<local>");
         assert_eq!(scanner.usage_freshness.dirty_pending_buckets, 3);
         assert_eq!(scanner.usage_freshness.last_dirty_mark_unix_secs, 10);

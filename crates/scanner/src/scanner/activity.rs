@@ -167,6 +167,27 @@ pub(super) fn scanner_superseded_retry_interval(
     Some(retry_interval)
 }
 
+/// Pacing for the cycle after a full-namespace scope fallback while dirty
+/// buckets remain. The scoped cycle's immediate dirty-usage wake would run
+/// such full walks back to back under sustained writes, so the next attempt
+/// waits on the capped retry schedule instead. The wait never exceeds the
+/// configured cycle interval: a namespace that stays unscopable is walked at
+/// the ordinary cadence rather than starved by the superseded cap. The next
+/// timer wake still requests a scope, so a scoped cycle resumes as soon as
+/// one is admitted and resets this schedule.
+pub(super) fn scanner_scope_fallback_retry_interval(
+    backoff: ScannerRetryBackoff,
+    runtime_config: &ScannerRuntimeConfig,
+) -> Option<Duration> {
+    let cycle_interval = runtime_config.cycle_interval.max(Duration::from_secs(1));
+    let retry_interval = backoff.retry_interval(runtime_config.cycle_interval)?.min(cycle_interval);
+    // Preserve an operator-selected duty-cycle floor, as superseded retries do.
+    if runtime_config.cycle_interval_source != ScannerRuntimeConfigSource::Default {
+        return Some(cycle_interval);
+    }
+    Some(retry_interval)
+}
+
 const SCANNER_PUBLICATION_PROOF_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(30);
 
 pub(crate) fn scanner_publication_proof_retry_delay(consecutive_failures: u32) -> Duration {

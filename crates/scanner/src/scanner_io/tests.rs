@@ -44,6 +44,7 @@ use temp_env::with_var;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+mod listing_window_scope;
 mod per_bucket_certification;
 mod scoped_entry_fallback;
 mod service_cohort;
@@ -183,6 +184,7 @@ fn scanner_segment_reuse_activation_preflight_for_cycle_reports_cycle_inputs_wit
         scopes: Arc::new(DirtyUsageBucketScopes::default()),
         generation: 7,
         covers_all_pending: true,
+        covers_listed_pending: true,
     };
     let distributed_evidence = DistributedSegmentInvalidationEvidence {
         invalidation_domain: crate::segment_invalidation::SegmentInvalidationDomain::DistributedEc,
@@ -216,6 +218,7 @@ fn scanner_segment_reuse_activation_preflight_for_cycle_blocks_unbounded_inputs(
         scopes: Arc::new(DirtyUsageBucketScopes::default()),
         generation: u64::MAX,
         covers_all_pending: false,
+        covers_listed_pending: false,
     };
 
     let preflight = scanner_segment_reuse_activation_preflight_for_cycle(
@@ -249,6 +252,7 @@ fn scanner_segment_reuse_activation_preflight_for_cycle_skips_distributed_blocke
         scopes: Arc::new(DirtyUsageBucketScopes::default()),
         generation: 7,
         covers_all_pending: true,
+        covers_listed_pending: true,
     };
 
     let preflight = scanner_segment_reuse_activation_preflight_for_cycle(
@@ -2770,6 +2774,7 @@ fn remote_dirty_usage_invalidates_local_prefix_hints_until_distributed_proof_exi
         scopes: Arc::new(dirty_scopes.clone()),
         generation: 7,
         covers_all_pending: true,
+        covers_listed_pending: true,
     };
     let locally_scoped = scoped_scan_scope_from_dirty_buckets(
         ScannerBucketScanScope::default(),
@@ -3088,6 +3093,7 @@ fn remote_dirty_usage_scope_resolution_falls_back_when_ack_batch_exceeds_thresho
             scopes: Arc::new(HashMap::new()),
             generation: 7,
             covers_all_pending: true,
+            covers_listed_pending: true,
         },
         remote_dirty_usage,
         &all_buckets,
@@ -3214,6 +3220,7 @@ async fn distributed_scoped_scan_falls_back_when_remote_scoped_ack_capability_is
         scopes: Arc::new(HashMap::new()),
         generation: 7,
         covers_all_pending: true,
+        covers_listed_pending: true,
     };
     let activity_before = BTreeMap::from([(
         "node-a:9000".to_string(),
