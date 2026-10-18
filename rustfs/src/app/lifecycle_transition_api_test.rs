@@ -589,26 +589,47 @@ async fn put_object_if_none_match_existing_object_returns_precondition_failed() 
         .await
         .expect("Failed to fetch existing object info");
     let existing_etag = existing_info.etag.expect("existing object should have an ETag");
+    let initial_versions = live_object_version_count(&ecstore, bucket.as_str(), object).await;
 
-    let replacement_input = PutObjectInput::builder()
-        .bucket(bucket.clone())
-        .key(object.to_string())
-        .body(Some(streaming_blob_from_bytes(replacement_payload)))
-        .content_length(Some(replacement_payload.len() as i64))
-        .build()
-        .unwrap();
-    let mut req = build_request(replacement_input, Method::PUT);
-    req.headers
-        .insert(IF_NONE_MATCH, HeaderValue::from_str(existing_etag.as_str()).unwrap());
+    for (condition, expected_code) in [
+        (ETagCondition::Any, s3s::S3ErrorCode::PreconditionFailed),
+        (ETagCondition::ETag(ETag::Strong(existing_etag)), s3s::S3ErrorCode::NotImplemented),
+        (
+            ETagCondition::ETag(ETag::Strong("different-etag".to_string())),
+            s3s::S3ErrorCode::NotImplemented,
+        ),
+    ] {
+        let header = condition.to_http_header().expect("conditional PUT header should encode");
+        // Cover header-only callers and the DTO-plus-header shape of parsed HTTP requests.
+        for if_none_match in [None, Some(condition)] {
+            let has_dto = if_none_match.is_some();
+            let replacement_input = PutObjectInput::builder()
+                .bucket(bucket.clone())
+                .key(object.to_string())
+                .body(Some(streaming_blob_from_bytes(replacement_payload)))
+                .content_length(Some(replacement_payload.len() as i64))
+                .if_none_match(if_none_match)
+                .build()
+                .expect("conditional replacement PUT input should build");
+            let mut req = build_request(replacement_input, Method::PUT);
+            req.headers.insert(IF_NONE_MATCH, header.clone());
 
-    let err = Box::pin(usecase.execute_put_object(&fs, req)).await.unwrap_err();
-
-    assert_eq!(err.code(), &s3s::S3ErrorCode::PreconditionFailed);
-    assert_eq!(
-        read_object_bytes(&ecstore, bucket.as_str(), object).await,
-        initial_payload,
-        "failed conditional PutObject must not overwrite the current object"
-    );
+            let err = Box::pin(usecase.execute_put_object(&fs, req))
+                .await
+                .expect_err("conditional PUT must reject the replacement");
+            assert_eq!(err.code(), &expected_code, "header={header:?}, has_dto={has_dto}");
+            assert_eq!(
+                read_object_bytes(&ecstore, bucket.as_str(), object).await,
+                initial_payload,
+                "failed conditional PutObject must not overwrite the current object"
+            );
+            assert_eq!(
+                live_object_version_count(&ecstore, bucket.as_str(), object).await,
+                initial_versions,
+                "failed conditional PutObject must not create a version"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -635,29 +656,50 @@ async fn copy_object_if_none_match_existing_destination_returns_precondition_fai
         .await
         .expect("Failed to fetch destination object info");
     let dst_etag = dst_info.etag.expect("destination object should have an ETag");
+    let initial_versions = live_object_version_count(&ecstore, dst_bucket.as_str(), dst_object).await;
 
-    let copy_input = CopyObjectInput::builder()
-        .copy_source(CopySource::Bucket {
-            bucket: src_bucket.clone().into(),
-            key: src_object.to_string().into(),
-            version_id: None,
-        })
-        .bucket(dst_bucket.clone())
-        .key(dst_object.to_string())
-        .build()
-        .unwrap();
-    let mut req = build_request(copy_input, Method::PUT);
-    req.headers
-        .insert(IF_NONE_MATCH, HeaderValue::from_str(dst_etag.as_str()).unwrap());
+    for (condition, expected_code) in [
+        (ETagCondition::Any, s3s::S3ErrorCode::PreconditionFailed),
+        (ETagCondition::ETag(ETag::Strong(dst_etag)), s3s::S3ErrorCode::NotImplemented),
+        (
+            ETagCondition::ETag(ETag::Strong("different-etag".to_string())),
+            s3s::S3ErrorCode::NotImplemented,
+        ),
+    ] {
+        let header = condition.to_http_header().expect("conditional COPY header should encode");
+        // Cover header-only callers and the DTO-plus-header shape of parsed HTTP requests.
+        for if_none_match in [None, Some(condition)] {
+            let has_dto = if_none_match.is_some();
+            let copy_input = CopyObjectInput::builder()
+                .copy_source(CopySource::Bucket {
+                    bucket: src_bucket.clone().into(),
+                    key: src_object.to_string().into(),
+                    version_id: None,
+                })
+                .bucket(dst_bucket.clone())
+                .key(dst_object.to_string())
+                .if_none_match(if_none_match)
+                .build()
+                .expect("conditional COPY input should build");
+            let mut req = build_request(copy_input, Method::PUT);
+            req.headers.insert(IF_NONE_MATCH, header.clone());
 
-    let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
-
-    assert_eq!(err.code(), &s3s::S3ErrorCode::PreconditionFailed);
-    assert_eq!(
-        read_object_bytes(&ecstore, dst_bucket.as_str(), dst_object).await,
-        dst_payload,
-        "failed conditional CopyObject must not overwrite the current destination object"
-    );
+            let err = Box::pin(usecase.execute_copy_object(req))
+                .await
+                .expect_err("conditional COPY must reject the replacement");
+            assert_eq!(err.code(), &expected_code, "header={header:?}, has_dto={has_dto}");
+            assert_eq!(
+                read_object_bytes(&ecstore, dst_bucket.as_str(), dst_object).await,
+                dst_payload,
+                "failed conditional CopyObject must not overwrite the current destination object"
+            );
+            assert_eq!(
+                live_object_version_count(&ecstore, dst_bucket.as_str(), dst_object).await,
+                initial_versions,
+                "failed conditional CopyObject must not create a version"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
