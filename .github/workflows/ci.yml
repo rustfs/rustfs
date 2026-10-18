@@ -62,10 +62,15 @@ env:
 
 jobs:
 
+  # Compile-free lanes, and lanes that only run a prebuilt binary, use
+  # GitHub-hosted runners: they are free for this public repository, and the
+  # self-hosted pool is reserved for the lanes that need its CPU count and
+  # disk (the workspace test build leaves a ~64GB target/, hosted runners
+  # have 14GB). Placement and billing rules: README.md in this directory.
   cancel-closed-pr-runs:
     name: Cancel Closed PR Runs
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Explain cancellation run
@@ -74,7 +79,7 @@ jobs:
   classify-changes:
     name: Select CI scope
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       mode: ${{ steps.scope.outputs.mode }}
@@ -100,16 +105,12 @@ jobs:
   typos:
     name: Typos
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
-      - name: Install typos download dependency
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends wget
       - name: Typos check with custom config file
         uses: crate-ci/typos@512fc24f32f44ab01972217aaaf3dc86ec234d53 # v1.50.2
 
@@ -117,7 +118,7 @@ jobs:
   quick-checks:
     name: Quick Checks
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout repository
@@ -1100,7 +1101,7 @@ jobs:
   s3-implemented-tests:
     name: S3 Implemented Tests
     needs: [ build-rustfs-debug-binary, e2e-tests ]
-    runs-on: sm-standard-4
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - name: Checkout repository
@@ -1169,12 +1170,12 @@ jobs:
     name: S3 Lifecycle Behavior Tests
     # Also gated on e2e-tests, matching s3-implemented-tests: when the e2e smoke
     # suite is already red this lane cannot tell us anything new, and it holds a
-    # sm-standard-4 for up to 30 minutes doing so. Both lanes only download the
+    # runner for up to 30 minutes doing so. Both lanes only download the
     # prebuilt debug binary (no cargo build), and s3-implemented-tests — which
     # already waits on e2e-tests — finishes later anyway, so a green PR's total
     # wall clock is unchanged.
     needs: [ build-rustfs-debug-binary, e2e-tests ]
-    runs-on: sm-standard-4
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout repository
@@ -1243,7 +1244,7 @@ jobs:
       - build-rustfs-debug-binary-rio-v2
       - e2e-tests-rio-v2
       - e2e-full
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7

@@ -618,8 +618,10 @@ jobs:
   summary:
     name: Summary
     needs: [ resolve, package ]
-    if: always()
-    runs-on: sm-standard-2
+    # Every completed Build and Release run triggers this workflow; when
+    # resolve declined it (not a release tag), there is nothing to summarise.
+    if: always() && needs.resolve.result != 'skipped'
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Print summary
