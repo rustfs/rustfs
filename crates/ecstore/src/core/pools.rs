@@ -2704,7 +2704,6 @@ fn release_decommission_target_inflight(
     let DecommissionCapacityReleaseProof {
         confirmed_absent,
         clear_pending,
-        committed_target,
     } = proof;
     let pool_count = meta.pools.len();
     let pool = meta
@@ -2733,12 +2732,13 @@ fn release_decommission_target_inflight(
         && !has_temporary_mutations
         && target.pending_mutation_id.is_none()
         && target.pending_physical_bytes == 0;
-    // A committed mutation keeps its completion intent pending until the
-    // equivalent-target reconciliation charges it. Without that intent, its
-    // marker carries the completion an earlier routine incarnation adopted, so
-    // release only the bytes this cleanup actually freed and leave the rest
-    // for that reconciliation.
-    let keeps_adopted_completion = committed_target && !pending_belongs_to_mutation;
+    // Unless the cleanup proved that the exact target is absent, a committed
+    // mutation keeps its completion intent pending until the equivalent-target
+    // reconciliation charges it. Without that intent, its marker may carry the
+    // completion an earlier routine incarnation adopted, so release only the
+    // bytes this cleanup actually freed and leave the rest for that
+    // reconciliation.
+    let keeps_adopted_completion = !clear_pending && !pending_belongs_to_mutation;
     let (released, temporary_mutation_changed) = release_decommission_target_temporary_mutation(
         target,
         mutation_id,
@@ -9703,40 +9703,15 @@ enum DecommissionCapacityMutationMode {
 struct DecommissionCapacityReleaseProof {
     confirmed_absent: bool,
     clear_pending: bool,
-    committed_target: bool,
 }
 
 impl DecommissionCapacityReleaseProof {
-    #[cfg(test)]
     const fn confirmed_absence(clear_pending: bool) -> Self {
         Self {
             confirmed_absent: true,
             clear_pending,
-            committed_target: false,
         }
     }
-
-    const fn after_temporary_release(target: DecommissionTemporaryReleaseTarget) -> Self {
-        Self {
-            confirmed_absent: true,
-            clear_pending: matches!(target, DecommissionTemporaryReleaseTarget::Absent),
-            committed_target: matches!(target, DecommissionTemporaryReleaseTarget::Committed),
-        }
-    }
-}
-
-/// What a temporary release proved about the mutation's exact target object
-/// once its staged uploads were confirmed absent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DecommissionTemporaryReleaseTarget {
-    /// No exact target exists, so nothing committed and a pending intent of
-    /// the mutation can be cleared.
-    Absent,
-    /// The exact owned target exists: the mutation committed, and its capacity
-    /// is settled by the equivalent-target reconciliation.
-    Committed,
-    /// A target exists but its identity was not proven.
-    Unproven,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11650,7 +11625,7 @@ impl ECStore {
             capacity_owner,
             expected_data_bytes,
             DecommissionCapacityMutationMode::Durable,
-            |_| DecommissionTemporaryReleaseTarget::Unproven,
+            |_| false,
             |_| operation(),
         )
         .await
@@ -11672,7 +11647,7 @@ impl ECStore {
             capacity_owner,
             expected_data_bytes,
             DecommissionCapacityMutationMode::Durable,
-            |_| DecommissionTemporaryReleaseTarget::Unproven,
+            |_| false,
             operation,
         )
         .await
@@ -12012,7 +11987,7 @@ impl ECStore {
             capacity_owner,
             expected_data_bytes,
             DecommissionCapacityMutationMode::Temporary,
-            |_| DecommissionTemporaryReleaseTarget::Unproven,
+            |_| false,
             |_| operation(),
         )
         .await
@@ -12034,7 +12009,7 @@ impl ECStore {
             capacity_owner,
             expected_data_bytes,
             DecommissionCapacityMutationMode::Temporary,
-            |_| DecommissionTemporaryReleaseTarget::Unproven,
+            |_| false,
             operation,
         )
         .await
@@ -12060,7 +12035,7 @@ impl ECStore {
             capacity_owner,
             expected_data_bytes,
             DecommissionCapacityMutationMode::NonGrowingReplacement,
-            |_| DecommissionTemporaryReleaseTarget::Unproven,
+            |_| false,
             operation,
         )
         .await
@@ -12253,14 +12228,14 @@ impl ECStore {
     ) -> Result<T>
     where
         F: FnOnce(Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>) -> Fut,
-        Fut: std::future::Future<Output = Result<(T, DecommissionTemporaryReleaseTarget)>>,
+        Fut: std::future::Future<Output = Result<(T, bool)>>,
     {
         self.run_decommission_capacity_mutation(
             target_pool_index,
             capacity_owner,
             None,
             DecommissionCapacityMutationMode::TemporaryRelease,
-            |result: &(T, DecommissionTemporaryReleaseTarget)| result.1,
+            |result: &(T, bool)| result.1,
             operation,
         )
         .await
@@ -12273,13 +12248,13 @@ impl ECStore {
         capacity_owner: Option<DecommissionCapacityOwner>,
         expected_data_bytes: Option<usize>,
         mode: DecommissionCapacityMutationMode,
-        temporary_release_target: P,
+        clear_pending_on_temporary_release: P,
         operation: F,
     ) -> Result<T>
     where
         F: FnOnce(Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
-        P: Fn(&T) -> DecommissionTemporaryReleaseTarget,
+        P: Fn(&T) -> bool,
     {
         let temporary = matches!(
             mode,
@@ -12512,10 +12487,7 @@ impl ECStore {
             .ok_or_else(|| decommission_capacity_blocked_error("target capacity snapshot is missing before mutation"))?;
 
         let result = operation.take().expect("capacity-admitted operation should run once")(capacity_lease).await;
-        let released_target = result
-            .as_ref()
-            .ok()
-            .map_or(DecommissionTemporaryReleaseTarget::Unproven, &temporary_release_target);
+        let clear_pending_on_temporary_release = result.as_ref().ok().is_some_and(&clear_pending_on_temporary_release);
         if let Some(target_guard) = target_guard.as_ref() {
             ensure_decommission_capacity_target_fence(target_guard, target_pool_index, "target mutation")?;
             let mut finalize_save_guard = self.pool_meta_save_gate.lock().await;
@@ -12560,7 +12532,7 @@ impl ECStore {
                     target_pool_index,
                     released_physical_bytes,
                     mutation_id,
-                    DecommissionCapacityReleaseProof::after_temporary_release(released_target),
+                    DecommissionCapacityReleaseProof::confirmed_absence(clear_pending_on_temporary_release),
                     now,
                 )?
             } else {
@@ -32145,6 +32117,67 @@ mod pools_tests {
         assert_eq!(reservation.targets[0].pending_mutation_id, Some(mutation_id));
         assert_eq!(reservation.targets[0].pending_physical_bytes, 15);
         assert!(reservation.targets[0].temporary_mutations.is_empty());
+    }
+
+    #[test]
+    fn cleanup_without_an_absence_proof_keeps_an_adopted_completion() {
+        let generation = OffsetDateTime::UNIX_EPOCH;
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1);
+        let completion = uuid::Uuid::new_v4();
+        let mut meta = decommission_test_cleanup_meta(
+            DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION,
+            Vec::new(),
+            0,
+            Some((completion, 15)),
+        );
+        let plan = decommission_capacity_intent_adoption_plan(&meta, 0, generation)
+            .expect("plan adoption")
+            .expect("the interrupted completion should be planned");
+        adopt_decommission_capacity_leftover_intents(&mut meta, 0, generation, &plan, now)
+            .expect("adopt the interrupted completion");
+        let marker = |meta: &PoolMeta| {
+            meta.pools[0]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .and_then(|reservation| {
+                    reservation.targets[0]
+                        .temporary_mutations
+                        .iter()
+                        .find(|mutation| mutation.mutation_id == completion)
+                        .map(|mutation| mutation.physical_bytes)
+                })
+        };
+
+        // A cleanup that found a target, whether or not it proved the target
+        // is this exact copy, frees only staged bytes; the adopted completion
+        // stays for the equivalent-target reconciliation to charge.
+        let mut target_present = meta.clone();
+        release_decommission_target_inflight(
+            &mut target_present,
+            0,
+            1,
+            4,
+            completion,
+            DecommissionCapacityReleaseProof::confirmed_absence(false),
+            now,
+        )
+        .expect("a cleanup that found the target should release what it freed");
+        assert_eq!(marker(&target_present), Some(11));
+
+        // Only a proven-absent target means nothing committed.
+        let mut target_absent = meta;
+        release_decommission_target_inflight(
+            &mut target_absent,
+            0,
+            1,
+            4,
+            completion,
+            DecommissionCapacityReleaseProof::confirmed_absence(true),
+            now,
+        )
+        .expect("a cleanup that proved the target absent should release the marker");
+        assert_eq!(marker(&target_absent), None);
     }
 
     #[test]

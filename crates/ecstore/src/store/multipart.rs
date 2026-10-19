@@ -13,9 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use crate::core::pools::{
-    DecommissionCapacityOwner, DecommissionTemporaryReleaseTarget, ensure_decommission_capacity_mutation_id,
-};
+use crate::core::pools::{DecommissionCapacityOwner, ensure_decommission_capacity_mutation_id};
 use crate::multipart_listing::paginate_multipart_listing;
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::multipart::MultipartOperations as _;
@@ -1060,7 +1058,7 @@ impl ECStore {
                     // The target capacity gate makes the exact target proof,
                     // upload absence proof, and pending-ledger decision one
                     // critical section with cleanup finalize.
-                    let (released_target, cleanup_decision_error) = if capacity_owner.is_some() {
+                    let (clear_pending, cleanup_decision_error) = if capacity_owner.is_some() {
                         let mut lookup_opts = ObjectOptions {
                             versioned: delete_opts.versioned,
                             version_suspended: delete_opts.version_suspended,
@@ -1078,14 +1076,13 @@ impl ECStore {
                             Err(err) => return Err(err),
                         };
                         match decommission_multipart_target_clear_pending(&delete_opts, target.as_ref()) {
-                            Ok(true) => (DecommissionTemporaryReleaseTarget::Absent, None),
-                            Ok(false) => (DecommissionTemporaryReleaseTarget::Committed, None),
-                            Err(err) => (DecommissionTemporaryReleaseTarget::Unproven, Some(err)),
+                            Ok(clear_pending) => (clear_pending, None),
+                            Err(err) => (false, Some(err)),
                         }
                     } else {
-                        (DecommissionTemporaryReleaseTarget::Absent, None)
+                        (true, None)
                     };
-                    Ok(((cleanup_decision_error, guards), released_target))
+                    Ok(((cleanup_decision_error, guards), clear_pending))
                 }
             })
             .await?;
