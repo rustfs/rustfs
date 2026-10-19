@@ -447,6 +447,15 @@ readinessProbe:
   successThreshold: 1
   failureThreshold: 3
 
+# Seconds a replaced pod must stay Ready before the StatefulSet rolling update
+# moves to the next pod. A restarted node is Ready as soon as it can reach the
+# cluster, but surviving nodes keep dialing its previous IP until the platform
+# DNS record expires (kube-dns serves 30s TTLs, CoreDNS 5s by default) and then
+# need a few more probes before they count its drives again. Stopping the next
+# pod inside that window takes two members of an erasure set away from the
+# survivors (#8669). Set to 0 to disable.
+minReadySeconds: 45
+
 nodeSelector: {}
 
 tolerations: []
