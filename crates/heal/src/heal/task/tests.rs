@@ -16,6 +16,7 @@ use super::super::{DiskOption, DiskStore, Endpoint, new_disk};
 use super::*;
 use crate::heal::storage::HealStorageObjectResult;
 
+mod absent_verdict;
 mod concurrent_delete;
 mod deferred_retry;
 mod usage_observation;
@@ -2011,6 +2012,24 @@ fn test_missing_object_dir_heal_result_matches_only_object_level_not_found() {
     ));
     assert!(!is_missing_object_dir_heal_result("x.rnd/", &Error::Other("Disk not found".to_string())));
     assert!(!is_missing_object_dir_heal_result("x.rnd", &Error::Disk(DiskError::FileNotFound)));
+}
+
+#[test]
+fn missing_object_dir_heal_result_not_found_accepts_typed_object_and_version_absence() {
+    assert!(is_missing_object_dir_heal_result(
+        "x.rnd/",
+        &Error::Storage(EcstoreError::ObjectNotFound("bucket".to_string(), "x.rnd/".to_string()))
+    ));
+    assert!(is_missing_object_dir_heal_result(
+        "x.rnd/",
+        &Error::Storage(EcstoreError::VersionNotFound(
+            "bucket".to_string(),
+            "x.rnd/".to_string(),
+            "version".to_string()
+        ))
+    ));
+    assert!(!is_missing_object_dir_heal_result("x.rnd/", &Error::Storage(EcstoreError::DiskNotFound)));
+    assert!(!is_missing_object_dir_heal_result("x.rnd/", &Error::Storage(EcstoreError::VolumeNotFound)));
 }
 
 #[async_trait::async_trait]

@@ -2302,6 +2302,80 @@ mod tests {
             HealObjectOutcome::Failed
         ));
     }
+
+    // backlog#2900: one classifier for every wrapper. These inputs used to
+    // disagree between the erasure-set healer and the task-level predicates.
+    #[test]
+    fn classify_disk_level_object_absence_as_absent() {
+        assert!(matches!(
+            ErasureSetHealer::classify_heal_object_error(&Error::Disk(DiskError::FileNotFound)),
+            HealObjectOutcome::Absent
+        ));
+        assert!(matches!(
+            ErasureSetHealer::classify_heal_object_error(&Error::Disk(DiskError::FileVersionNotFound)),
+            HealObjectOutcome::Absent
+        ));
+    }
+
+    #[test]
+    fn classify_wrapped_transient_errors_as_transient() {
+        for error in [
+            Error::Storage(EcstoreError::RemoteClientUnavailable("rebuilding client".into())),
+            Error::Storage(EcstoreError::Timeout),
+            Error::Disk(DiskError::DiskNotFound),
+            Error::Disk(DiskError::VolumeNotFound),
+            Error::Disk(DiskError::ErasureReadQuorum),
+            Error::Disk(DiskError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock))),
+            Error::TransientSkip {
+                message: "skipped".into(),
+            },
+            Error::Storage(EcstoreError::Io(std::io::Error::other("heal rename incomplete: 1 of 2 targets committed"))),
+        ] {
+            assert!(
+                matches!(ErasureSetHealer::classify_heal_object_error(&error), HealObjectOutcome::Transient),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_partial_not_found_with_lost_quorum_as_transient_not_absent() {
+        // One disk answering NotFound while the others time out surfaces as a
+        // quorum failure from storage; it is never an absence verdict.
+        for error in [
+            Error::Storage(EcstoreError::ErasureReadQuorum),
+            Error::Storage(EcstoreError::InsufficientReadQuorum("bucket".into(), "object".into())),
+            Error::Disk(DiskError::ErasureReadQuorum),
+            Error::Disk(DiskError::Timeout),
+        ] {
+            assert!(
+                matches!(ErasureSetHealer::classify_heal_object_error(&error), HealObjectOutcome::Transient),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_legacy_peer_display_not_found_as_absent() {
+        for message in ["File not found", "File version not found", "Object not found: bucket/object"] {
+            assert!(
+                matches!(
+                    ErasureSetHealer::classify_heal_object_error(&Error::Other(message.into())),
+                    HealObjectOutcome::Absent
+                ),
+                "{message:?}"
+            );
+        }
+        for message in ["file not found", "Disk not found", "Volume not found", "boom"] {
+            assert!(
+                !matches!(
+                    ErasureSetHealer::classify_heal_object_error(&Error::Other(message.into())),
+                    HealObjectOutcome::Absent
+                ),
+                "{message:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

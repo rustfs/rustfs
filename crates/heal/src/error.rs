@@ -674,6 +674,36 @@ mod tests {
     }
 
     #[test]
+    fn classify_legacy_peer_display_not_found_is_object_level_absent() {
+        // backlog#2900: a typed display that lost its type at an old peer or a
+        // format! boundary converts back once, at the boundary.
+        for error in [
+            Error::Other("File not found".to_string()),
+            Error::Other("File version not found".to_string()),
+            Error::Other("Object not found: bucket/object".to_string()),
+            Error::TaskExecutionFailed {
+                message: "Failed to heal object bucket/object: Storage error: File not found".to_string(),
+            },
+        ] {
+            assert!(error.is_recoverable_object_heal(), "{error:?}");
+            assert!(!error.is_recoverable_heal(), "absence must not requeue the whole task: {error:?}");
+        }
+        for error in [
+            Error::Other("file not found".to_string()),
+            Error::Other("Disk not found".to_string()),
+            Error::Other("Volume not found".to_string()),
+        ] {
+            assert!(!error.is_recoverable_object_heal(), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn classify_disk_volume_not_found_is_recoverable_like_storage() {
+        assert!(Error::Disk(DiskError::VolumeNotFound).is_recoverable_heal());
+        assert!(Error::Disk(DiskError::VolumeNotFound).is_recoverable_object_heal());
+    }
+
+    #[test]
     fn remote_client_unavailable_is_recoverable_via_typed_variant() {
         // The detail deliberately avoids every substring needle: the typed
         // variant alone must classify these as retryable.
