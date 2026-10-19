@@ -22812,6 +22812,133 @@ mod tests {
         assert_eq!(attempts, 4, "carry two attempts, then count the entry pass and copy retry");
     }
 
+    /// A pre-versioning null version hidden behind a delete marker must reach
+    /// the target pool intact before the source entry is removed (backlog#2873).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_migrates_null_version_behind_delete_marker() {
+        use crate::object_api::PutObjReader;
+        use tokio::io::AsyncReadExt as _;
+        let (_temp_dirs, store, _other_store) =
+            Box::pin(crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None)).await;
+        let bucket = "decommission-null-version";
+        let object = "pre-versioning.bin";
+        Box::pin(store.make_bucket(bucket, &MakeBucketOptions::default()))
+            .await
+            .expect("create bucket");
+        let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
+        let payload = b"written before versioning was enabled".repeat(128);
+        let payload_sha256 = hex_sha256(&payload, str::to_owned);
+        let source_set = store.pools[0].get_disks_by_key(object);
+        Box::pin(source_set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(payload.clone()),
+            &ObjectOptions {
+                expected_bucket_incarnation_id: Some(incarnation),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("seed null version");
+        let marker = Box::pin(source_set.delete_object(
+            bucket,
+            object,
+            ObjectOptions {
+                versioned: true,
+                expected_bucket_incarnation_id: Some(incarnation),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("seed delete marker over the null version");
+        assert!(marker.delete_marker);
+        let seeded = source_set
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("read seeded versions")
+            .expect("seeded versions must exist");
+        assert_eq!(seeded.versions.len(), 2);
+        assert!(seeded.versions[0].deleted, "the delete marker must be the latest version");
+        assert!(seeded.versions[1].version_id.is_none(), "the oldest version must be the null version");
+
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 16_384, 16_384),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 131_072, 131_072, 0),
+            ]],
+        );
+        Box::pin(store.save_current_pool_meta_for_decommission_start(&[0], Vec::new()))
+            .await
+            .expect("activate reservation");
+        let generation = store.active_decommission_generation(0).await.expect("active generation");
+        let mut attempts = 0;
+        let result = Box::pin(store.decommission_entry(
+            CancellationToken::new(),
+            0,
+            generation,
+            MetaCacheEntry {
+                name: object.into(),
+                ..Default::default()
+            },
+            bucket.into(),
+            source_set.clone(),
+            None,
+            None,
+            None,
+            Some(incarnation),
+            Arc::new(AtomicUsize::new(0)),
+            &mut attempts,
+        ))
+        .await
+        .expect("decommission entry");
+        assert!(matches!(result, DecommissionEntryOutcome::Complete), "{result:?}");
+
+        let target = store.pools[1]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("read target versions")
+            .expect("versions must reach the target pool");
+        assert_eq!(target.versions.len(), 2, "both the marker and the null version must move");
+        assert!(target.versions[0].deleted, "the delete marker must stay the latest version");
+        assert_eq!(target.versions[0].version_id, seeded.versions[0].version_id);
+        assert!(target.versions[1].version_id.is_none(), "the null version must keep its null identity");
+        assert_eq!(target.versions[1].mod_time, seeded.versions[1].mod_time);
+
+        let mut reader = store.pools[1]
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: Some(uuid::Uuid::nil().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the migrated null version must be readable");
+        let mut actual = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut actual)
+            .await
+            .expect("drain the migrated null version");
+        assert_eq!(hex_sha256(&actual, str::to_owned), payload_sha256);
+        assert_eq!(actual, payload);
+        assert!(
+            source_set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("read source versions")
+                .is_none(),
+            "the source entry must be removed only after both versions moved"
+        );
+    }
+
     #[test]
     fn decommission_object_attempt_metric_keeps_the_peak() {
         let mut attempts = 0;
