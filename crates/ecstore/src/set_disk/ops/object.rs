@@ -21109,6 +21109,166 @@ mod put_object_tmp_cleanup_tests {
     }
 
     #[tokio::test]
+    async fn deep_heal_preserves_committed_generation_during_old_data_cleanup() {
+        use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
+
+        for (disk_count, parity, read_repair) in [(4, 2, false), (4, 2, true), (16, 4, false), (16, 4, true)] {
+            let (dirs, disks, set) = super::hermetic_set_disks_support::hermetic_set_disks_for_pool_with_default_parity_isolated(
+                disk_count, 0, parity,
+            )
+            .await;
+            let bucket = "native-heal-commit-cleanup";
+            let object = format!("generation-{disk_count}-{parity}-{read_repair}.bin");
+            for disk in &disks {
+                disk.make_volume(bucket).await.expect("create actual fixture volume");
+            }
+            let options = ObjectOptions {
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                shard_integrity_write_mode: Some(crate::object_api::ShardIntegrityWriteMode::Protected),
+                ..Default::default()
+            };
+            set.put_object(bucket, &object, &mut PutObjReader::from_vec(vec![0x17; TEST_OBJECT_SIZE]), &options)
+                .await
+                .expect("acknowledge original generation on every disk");
+            let old = disks[0]
+                .read_version("", bucket, &object, "", &ReadOptions::default())
+                .await
+                .expect("read actual original generation");
+            let old_dir = old.data_dir.expect("original external data directory");
+            let old_part = dirs[0]
+                .path()
+                .join(bucket)
+                .join(&object)
+                .join(old_dir.to_string())
+                .join("part.1");
+            assert!(tokio::fs::try_exists(&old_part).await.expect("original part exists"));
+
+            let barrier = rename_fanout_barrier::arm(&object, 0, rename_fanout_barrier::PHASE_CLEANUP);
+            let writer_set = Arc::clone(&set);
+            let writer_object = object.clone();
+            let writer_options = options.clone();
+            let payload = vec![0xa3; TEST_OBJECT_SIZE];
+            let writer_payload = payload.clone();
+            let writer = tokio::spawn(async move {
+                writer_set
+                    .put_object(bucket, &writer_object, &mut PutObjReader::from_vec(writer_payload), &writer_options)
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+                .await
+                .expect("overwrite commits before its real old-data cleanup pause");
+            assert!(!writer.is_finished(), "tail-drained ACK must remain pending at cleanup");
+            assert!(
+                tokio::fs::try_exists(&old_part)
+                    .await
+                    .expect("old source still present at pause")
+            );
+
+            let mut committed = Vec::new();
+            let mut healthy_metadata = Vec::new();
+            for disk in &disks {
+                let info = disk
+                    .read_version("", bucket, &object, "", &ReadOptions::default())
+                    .await
+                    .expect("read independently committed physical generation without GET");
+                assert_eq!((info.erasure.data_blocks, info.erasure.parity_blocks), (disk_count - parity, parity));
+                assert!(info.data.is_none(), "use actual external parts");
+                assert_ne!(info.data_dir, Some(old_dir));
+                committed.push(info);
+                healthy_metadata.push(
+                    disk.read_all(bucket, &format!("{object}/xl.meta"))
+                        .await
+                        .expect("committed raw metadata"),
+                );
+            }
+            let new_dir = committed[0].data_dir.expect("new committed data directory");
+            assert!(committed.iter().all(|info| info.data_dir == Some(new_dir)));
+            let new_part = dirs[0]
+                .path()
+                .join(bucket)
+                .join(&object)
+                .join(new_dir.to_string())
+                .join("part.1");
+            let expected_part = tokio::fs::read(&new_part).await.expect("exact new source bytes");
+            tokio::fs::remove_file(&new_part)
+                .await
+                .expect("remove only the newly committed target shard");
+            println!(
+                "native_g01: geometry={disk_count}/{parity} read_repair={read_repair} old_cleanup_paused new_generation_committed target_part_missing"
+            );
+
+            let (result, error) = tokio::time::timeout(
+                Duration::from_secs(30),
+                set.heal_object(
+                    bucket,
+                    &object,
+                    "",
+                    &HealOpts {
+                        scan_mode: HealScanMode::Deep,
+                        read_repair,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .expect("real locked Heal must progress during old cleanup")
+            .expect("complete actual deep Heal");
+            assert!(error.is_none(), "new generation must remain repairable: {error:?}");
+            assert_eq!(result.drives_healed(), Some(1));
+            // Shared data-phase repair deliberately does not certify full integrity.
+            assert_eq!(result.integrity_verified, !read_repair);
+            assert_eq!(tokio::fs::read(&new_part).await.expect("rebuilt part before any GET"), expected_part);
+            let repaired = disks[0]
+                .read_version("", bucket, &object, "", &ReadOptions::default())
+                .await
+                .expect("read actual repaired generation");
+            assert_eq!(repaired.data_dir, Some(new_dir));
+            assert_eq!(repaired.mod_time, committed[0].mod_time);
+            for (disk, expected) in disks.iter().zip(&healthy_metadata).skip(1) {
+                assert_eq!(
+                    disk.read_all(bucket, &format!("{object}/xl.meta"))
+                        .await
+                        .expect("healthy raw metadata after Heal"),
+                    *expected
+                );
+            }
+            println!(
+                "native_g01: geometry={disk_count}/{parity} read_repair={read_repair} locked_heal_completed new_generation_part_rebuilt_before_get"
+            );
+
+            barrier.release();
+            let acknowledged = tokio::time::timeout(Duration::from_secs(30), writer)
+                .await
+                .expect("cleanup drains")
+                .expect("writer joins")
+                .expect("overwrite ACK remains successful");
+            assert_eq!(acknowledged.size, i64::try_from(payload.len()).expect("fixture size fits i64"));
+            drop(barrier);
+            let mut reader = set
+                .get_object_reader(bucket, &object, None, HeaderMap::new(), &options)
+                .await
+                .expect("read final acknowledged generation");
+            let mut body = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("read complete final payload");
+            assert_eq!(body, payload);
+            for disk in &disks {
+                let final_info = disk
+                    .read_version("", bucket, &object, "", &ReadOptions::default())
+                    .await
+                    .expect("final physical generation");
+                assert_eq!(final_info.data_dir, Some(new_dir), "old cleanup must not revert the healed generation");
+            }
+            println!(
+                "native_g01: geometry={disk_count}/{parity} read_repair={read_repair} overwrite_ack_preserved final_physical_generation_and_full_body_verified"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn committed_put_releases_namespace_lock_before_old_data_cleanup() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "put-commit-lock-window";

@@ -160,14 +160,36 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git -C auto-testing rev-parse HEAD)" = "${AUTO_TESTING_SHA}"
-          python3 -B auto-testing/scripts/validation_heal/native_regressions.py build \
-            --source candidate --commit "${CANDIDATE_SHA}" --out native-tools
+          use_race_native=false
+          if [[ -f auto-testing/scripts/validation_heal/race_native.py ]]; then
+            support_rc=0
+            python3 -B auto-testing/scripts/validation_heal/race_native.py supports \
+              --commit "${CANDIDATE_SHA}" || support_rc=$?
+            case "${support_rc}" in
+              0) use_race_native=true ;;
+              2) ;; # The original exact-source collector handles legacy candidates.
+              *) exit "${support_rc}" ;;
+            esac
+          fi
+          if [[ "${use_race_native}" == true ]]; then
+            python3 -B auto-testing/scripts/validation_heal/race_native.py build \
+              --source candidate --commit "${CANDIDATE_SHA}" --testing-commit "${AUTO_TESTING_SHA}" --out native-tools
+          else
+            python3 -B auto-testing/scripts/validation_heal/native_regressions.py build \
+              --source candidate --commit "${CANDIDATE_SHA}" --out native-tools
+          fi
 
       - name: Run exact native regressions separately from fleet validation
         run: |
           set -euo pipefail
-          python3 -B auto-testing/scripts/validation_heal/native_regressions.py run \
-            --directory native-tools --out native-evidence
+          if [[ -f native-tools/race-native.json ]]; then
+            test ! -e native-tools/native-regressions.json
+            python3 -B auto-testing/scripts/validation_heal/race_native.py run \
+              --directory native-tools --out native-evidence
+          else
+            python3 -B auto-testing/scripts/validation_heal/native_regressions.py run \
+              --directory native-tools --out native-evidence
+          fi
 
       - name: Run existing F07 directory fsync failure regressions
         if: ${{ inputs.candidate_sha == '1aa9be87d18cf941e5020f19e8622c26ba4b10ac' }}
@@ -195,6 +217,7 @@ jobs:
           name: rustfs-validation-native-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             native-tools/ecstore-native-tests
+            native-tools/ecstore-race-native-tests
             native-tools/*.json
             native-tools/*.jsonl
             native-tools/*.stderr

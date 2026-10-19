@@ -16,6 +16,100 @@ import functional_chain_evidence as evidence
 import resolve_functional_candidate as candidate
 
 
+class RaceNativeToolsWorkflowTests(unittest.TestCase):
+    def shell_step(self, name):
+        from check_test_wiring import yaml_block
+        source = (candidate.ROOT / '.github/workflows/rustfs-validation-tools.yml').read_text()
+        job = yaml_block(source.splitlines(), 'native-heal-regressions', 2)
+        start = job.index('      - name: ' + name)
+        end = next((index for index in range(start + 1, len(job))
+                    if job[index].startswith('      - name: ')), len(job))
+        step = job[start:end]
+        return '\n'.join(line[10:] for line in step[step.index('        run: |') + 1:]
+                         if not line.strip() or line.startswith('          '))
+
+    def fixture(self, root, *, new_helper):
+        directory = root / 'auto-testing/scripts/validation_heal'
+        directory.mkdir(parents=True)
+        stub = '''import json, os, pathlib, sys
+kind = pathlib.Path(__file__).stem
+with pathlib.Path('calls.jsonl').open('a') as out:
+    out.write(json.dumps({'kind': kind, 'args': sys.argv[1:]}) + '\\n')
+if sys.argv[1] == 'supports': sys.exit(int(os.environ['SUPPORT_STATUS']))
+sys.exit(int(os.environ.get(kind.upper() + '_FAIL', '0')))
+'''
+        (directory / 'native_regressions.py').write_text(stub)
+        if new_helper: (directory / 'race_native.py').write_text(stub)
+        bin_dir = root / 'bin'
+        bin_dir.mkdir()
+        git = bin_dir / 'git'
+        git.write_text('#!/bin/sh\nprintf "%s\\n" "$FAKE_HEAD"\n')
+        git.chmod(0o755)
+        env = dict(os.environ, AUTO_TESTING_SHA='b' * 40, CANDIDATE_SHA='a' * 40,
+                   FAKE_HEAD='b' * 40, SUPPORT_STATUS='2', PATH=str(bin_dir) + os.pathsep + os.environ['PATH'])
+        env.pop('BASH_ENV', None)
+        return env
+
+    def test_actual_native_build_routes_old_new_unknown_and_failed_collectors(self):
+        shell = self.shell_step('Build and enumerate the unmodified candidate test executable')
+        for mode, helper, support, failure, head, expected_code, expected_calls in [
+            ('old-harness', False, 2, None, 'b', 0, [('native_regressions', 'build')]),
+            ('legacy', True, 2, None, 'b', 0, [('race_native', 'supports'), ('native_regressions', 'build')]),
+            ('race', True, 0, None, 'b', 0, [('race_native', 'supports'), ('race_native', 'build')]),
+            ('support-error', True, 42, None, 'b', 42, [('race_native', 'supports')]),
+            ('invalid-support', True, 1, None, 'b', 1, [('race_native', 'supports')]),
+            ('race-build-error', True, 0, 'RACE_NATIVE_FAIL', 'b', 42, [('race_native', 'supports'), ('race_native', 'build')]),
+            ('legacy-build-error', True, 2, 'NATIVE_REGRESSIONS_FAIL', 'b', 42, [('race_native', 'supports'), ('native_regressions', 'build')]),
+            ('wrong-helper', True, 0, None, 'c', 1, []),
+        ]:
+            with tempfile.TemporaryDirectory() as temp, self.subTest(mode=mode):
+                root = Path(temp)
+                env = self.fixture(root, new_helper=helper)
+                env.update(SUPPORT_STATUS=str(support), FAKE_HEAD=head * 40)
+                if failure: env[failure] = '42'
+                result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', shell],
+                                        cwd=root, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, expected_code, result.stderr)
+                calls = [json.loads(line) for line in (root / 'calls.jsonl').read_text().splitlines()] if (root / 'calls.jsonl').exists() else []
+                self.assertEqual([(row['kind'], row['args'][0]) for row in calls], expected_calls)
+                for row in calls:
+                    if row['args'][0] == 'supports':
+                        self.assertEqual(row['args'], ['supports', '--commit', 'a' * 40])
+                    else:
+                        expected = ['build', '--source', 'candidate', '--commit', 'a' * 40]
+                        if row['kind'] == 'race_native': expected += ['--testing-commit', 'b' * 40]
+                        self.assertEqual(row['args'], expected + ['--out', 'native-tools'])
+
+    def test_actual_native_run_rejects_ambiguous_formats_and_propagates_failures(self):
+        shell = self.shell_step('Run exact native regressions separately from fleet validation')
+        for mode, helper, manifests, failure, expected_code, expected_kind in [
+            ('legacy', False, ['native-regressions.json'], None, 0, 'native_regressions'),
+            ('race', True, ['race-native.json'], None, 0, 'race_native'),
+            ('ambiguous', True, ['native-regressions.json', 'race-native.json'], None, 1, None),
+            ('legacy-error', True, ['native-regressions.json'], 'NATIVE_REGRESSIONS_FAIL', 42, 'native_regressions'),
+            ('race-error', True, ['race-native.json'], 'RACE_NATIVE_FAIL', 42, 'race_native'),
+            ('missing-race-helper', False, ['race-native.json'], None, 2, None),
+        ]:
+            with tempfile.TemporaryDirectory() as temp, self.subTest(mode=mode):
+                root = Path(temp)
+                env = self.fixture(root, new_helper=helper)
+                if failure: env[failure] = '42'
+                (root / 'native-tools').mkdir()
+                for manifest in manifests: (root / 'native-tools' / manifest).write_text('{}')
+                result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', shell],
+                                        cwd=root, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, expected_code, result.stderr)
+                calls = [json.loads(line) for line in (root / 'calls.jsonl').read_text().splitlines()] if (root / 'calls.jsonl').exists() else []
+                self.assertEqual(len(calls), int(expected_kind is not None))
+                if expected_kind:
+                    self.assertEqual(calls, [{'kind': expected_kind, 'args': ['run', '--directory', 'native-tools', '--out', 'native-evidence']}])
+
+    def test_native_upload_retains_both_fixed_executable_kinds(self):
+        source = (candidate.ROOT / '.github/workflows/rustfs-validation-tools.yml').read_text()
+        self.assertIn('            native-tools/ecstore-native-tests\n', source)
+        self.assertIn('            native-tools/ecstore-race-native-tests\n', source)
+
+
 class PersistenceToolsWorkflowTests(unittest.TestCase):
     def test_supplement_preserves_old_pins_and_propagates_actual_collector_failure(self):
         from check_test_wiring import yaml_block
