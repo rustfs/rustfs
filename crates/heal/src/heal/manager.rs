@@ -1004,6 +1004,9 @@ pub struct HealManager {
     /// Bounded, low-cardinality admission telemetry exposed through the
     /// existing operations snapshot for cluster E2E assertions.
     admission_telemetry: Arc<StdMutex<HealAdmissionTelemetry>>,
+    /// Node-local memory of terminal per-object verdicts, consulted before
+    /// queue admission (backlog#2900). Not a receipt; empty after a restart.
+    disposition_cache: Arc<StdMutex<HealDispositionCache>>,
 }
 
 /// Where a task-id lookup resolved. The variants carry the resolved state
@@ -1033,6 +1036,7 @@ struct HealQueueContext<'a> {
     notify: &'a Arc<Notify>,
     cancel_token: &'a CancellationToken,
     workload_provider: &'a Option<WorkloadSnapshotProviderRef>,
+    disposition_cache: &'a Arc<StdMutex<HealDispositionCache>>,
 }
 
 impl HealManager {
@@ -1054,6 +1058,31 @@ impl HealManager {
         } else {
             HealAdmissionResult::Merged
         }
+    }
+
+    /// Requests answered from the disposition memory: best-effort object
+    /// heals. Administrator starts, forced starts, high and urgent priorities,
+    /// dry runs and durable MRF repairs always reach the queue.
+    fn disposition_gate(request: &HealRequest, mrf_notice_target: Option<&MrfRepairNoticeTarget>) -> Option<HealDispositionKey> {
+        let HealType::Object {
+            bucket,
+            object,
+            version_id,
+        } = &request.heal_type
+        else {
+            return None;
+        };
+        let durable_mrf = request.expected_mrf_bucket_incarnation_id.is_some()
+            || mrf_notice_target.is_some_and(|target| target.kind.is_durable());
+        if request.force_start
+            || request.source == HealRequestSource::Admin
+            || request.priority > HealPriority::Normal
+            || request.options.dry_run
+            || durable_mrf
+        {
+            return None;
+        }
+        Some(HealDispositionKey::new(bucket, object, version_id.as_deref()))
     }
 
     fn can_displace_queued_work(request: &HealRequest) -> bool {
@@ -1600,6 +1629,7 @@ impl HealManager {
             notify: Arc::new(Notify::new()),
             workload_provider,
             admission_telemetry: Arc::new(StdMutex::new(HealAdmissionTelemetry::default())),
+            disposition_cache: Arc::new(StdMutex::new(HealDispositionCache::default())),
         }
     }
 
@@ -2245,6 +2275,50 @@ impl HealManager {
                 result: HealAdmissionResult::Dropped(reason),
                 task_id: overlap_task_id,
             });
+        }
+
+        // A best-effort resubmission of an object whose last task reached a
+        // terminal verdict is answered from the node-local disposition memory
+        // before it can occupy the queue again (backlog#2900).
+        if let Some(key) = Self::disposition_gate(&request, mrf_notice_target.as_ref()) {
+            let verdict = lock_disposition_cache(&self.disposition_cache).consult(&key, tokio::time::Instant::now());
+            if let Some((disposition, recorded_task_id, hits, retry_after)) = verdict.rejection() {
+                let recorded_task_id = recorded_task_id.to_owned();
+                drop(retrying_heals);
+                drop(queue);
+                drop(active_heals);
+                let lock_phase = lock_phase_start.elapsed();
+                let admission = HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped);
+                Self::record_admission_metric(source, admission, "disposition_cache");
+                self.record_admission_observation(HealAdmissionObservation {
+                    source,
+                    result: admission,
+                    context: "disposition_cache",
+                    force_start,
+                    displaced: false,
+                    start_duration: admission_start.elapsed(),
+                    lock_phase,
+                });
+                debug!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_QUEUE_ADMISSION,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    request_id = %request.id,
+                    priority = ?request.priority,
+                    source = source.as_str(),
+                    disposition = disposition.as_str(),
+                    disposition_task_id = %recorded_task_id,
+                    disposition_hits = hits,
+                    retry_after_ms = retry_after.map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)),
+                    result = "dropped_by_disposition",
+                    "Heal queue admission answered from the disposition memory"
+                );
+                return Ok(HealAdmissionReceipt {
+                    result: admission,
+                    task_id: recorded_task_id,
+                });
+            }
         }
 
         let durable_handoff = root_recovery::is_admin_heal_recovery(&request.heal_type, request.source);
@@ -2947,11 +3021,13 @@ impl std::fmt::Debug for HealManager {
 }
 
 mod auto_scan;
+mod disposition;
 mod queue;
 pub(crate) mod root_recovery;
 mod scheduler;
 mod unclean_shutdown;
 
+use disposition::{HealDispositionCache, HealDispositionKey, lock_disposition_cache};
 use queue::*;
 use scheduler::*;
 use unclean_shutdown::*;

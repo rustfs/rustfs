@@ -149,7 +149,11 @@ async fn disposition_backed_off_failure_is_dropped_then_admitted_after_the_backo
         .await
         .expect("admission decides");
     assert_eq!(admitted.result, HealAdmissionResult::Accepted, "the backoff elapsed");
-    assert_eq!(cached_kind(&manager, "flaky"), Some(HealDispositionKind::RetryExhausted), "admission does not forget the failure");
+    assert_eq!(
+        cached_kind(&manager, "flaky"),
+        Some(HealDispositionKind::RetryExhausted),
+        "admission does not forget the failure"
+    );
 }
 
 fn task_for(request: HealRequest) -> HealTask {
@@ -309,7 +313,10 @@ async fn disposition_read_repair_absent_object_is_remembered_after_one_task() {
     process_manager_queue_once(&manager).await;
     wait_until_idle(&manager).await;
     assert_eq!(
-        manager.get_task_status(&first_id).await.expect("completed status is retained"),
+        manager
+            .get_task_status(&first_id)
+            .await
+            .expect("completed status is retained"),
         HealTaskStatus::Completed,
         "an absent object is a completed heal, not a failed one"
     );

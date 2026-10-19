@@ -71,7 +71,11 @@ async fn absent_object_completes_for_every_source_regardless_of_recreate_missing
                 task.execute()
                     .await
                     .unwrap_or_else(|err| panic!("{source:?} recreate={recreate_missing} outer={outer}: {err}"));
-                assert_eq!(task.get_status().await, HealTaskStatus::Completed, "{source:?} recreate={recreate_missing}");
+                assert_eq!(
+                    task.get_status().await,
+                    HealTaskStatus::Completed,
+                    "{source:?} recreate={recreate_missing}"
+                );
                 let outcome = task.get_outcome().await;
                 assert_eq!(outcome.counters.failed, 0, "{source:?} recreate={recreate_missing}");
                 // One locked storage probe decides the verdict; no second recreate call follows.
@@ -103,7 +107,9 @@ async fn absent_object_with_explicit_version_is_absent_for_read_repair() {
             true,
             storage.clone(),
         );
-        task.execute().await.expect("a missing version is absent, not recreate_failed");
+        task.execute()
+            .await
+            .expect("a missing version is absent, not recreate_failed");
         assert_eq!(task.get_status().await, HealTaskStatus::Completed);
         assert_eq!(task.get_outcome().await.counters.failed, 0);
     }
@@ -143,9 +149,7 @@ async fn absent_object_dir_candidate_follows_the_general_not_found_rule() {
         ] {
             let storage = missing_storage(outcome);
             let task = object_task("bucket-a", "x.rnd/", None, source, true, storage);
-            task.execute()
-                .await
-                .unwrap_or_else(|err| panic!("{source:?}: {err}"));
+            task.execute().await.unwrap_or_else(|err| panic!("{source:?}: {err}"));
             assert_eq!(task.get_status().await, HealTaskStatus::Completed, "{source:?}");
         }
     }
@@ -157,9 +161,7 @@ async fn absent_legacy_display_not_found_is_absent_for_read_repair() {
     for message in ["File not found", "File version not found", "Object not found: bucket-a/x.rnd"] {
         let storage = missing_storage(MockHealObjectOutcome::ErrOther(message));
         let task = object_task("bucket-a", "x.rnd", None, HealRequestSource::ReadRepair, true, storage);
-        task.execute()
-            .await
-            .unwrap_or_else(|err| panic!("{message:?}: {err}"));
+        task.execute().await.unwrap_or_else(|err| panic!("{message:?}: {err}"));
         assert_eq!(task.get_status().await, HealTaskStatus::Completed, "{message:?}");
     }
 }
@@ -176,7 +178,11 @@ async fn not_found_verdict_is_not_granted_to_disk_or_quorum_failures() {
         (MockHealObjectOutcome::ErrOther("Disk not found"), false),
         (MockHealObjectOutcome::PermissionDenied, false),
     ] {
-        for source in [HealRequestSource::ReadRepair, HealRequestSource::Admin, HealRequestSource::Scanner] {
+        for source in [
+            HealRequestSource::ReadRepair,
+            HealRequestSource::Admin,
+            HealRequestSource::Scanner,
+        ] {
             let storage = missing_storage(outcome.clone());
             let task = object_task("bucket-a", "x.rnd", None, source, true, storage);
             let err = task
@@ -195,7 +201,9 @@ async fn not_found_from_lowercase_free_text_is_not_absent() {
     // Only the canonical typed displays convert back; arbitrary text stays a failure.
     let storage = missing_storage(MockHealObjectOutcome::ErrOther("file not found while listing"));
     let task = object_task("bucket-a", "x.rnd", None, HealRequestSource::ReadRepair, true, storage);
-    task.execute().await.expect_err("free text must not become an absence verdict");
+    task.execute()
+        .await
+        .expect_err("free text must not become an absence verdict");
     assert!(matches!(task.get_status().await, HealTaskStatus::Failed { .. }));
 }
 

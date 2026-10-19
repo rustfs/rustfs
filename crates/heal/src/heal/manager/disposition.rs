@@ -35,9 +35,14 @@
 //! bypass it entirely, as do administrator starts, forced starts, high and
 //! urgent priorities, and dry runs.
 
+use crate::error::{HealErrorClass, classify_heal_error};
+use crate::heal::outcome::HealObjectDisposition;
+use crate::heal::task::{HealTask, HealType};
 use metrics::{counter, gauge};
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant};
+use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
+use std::time::Duration;
+use tokio::time::Instant;
 
 /// Default upper bound on retained entries.
 pub(crate) const DEFAULT_DISPOSITION_CACHE_CAPACITY: usize = 100_000;
@@ -98,7 +103,10 @@ pub(crate) struct HealDispositionEntry {
 pub(crate) enum HealDispositionVerdict {
     Admit,
     /// The last locked quorum read found the object absent and the memory is still fresh.
-    Absent { task_id: String, count: u32 },
+    Absent {
+        task_id: String,
+        count: u32,
+    },
     /// The last task failed terminally; re-admission waits for the backoff to elapse.
     BackedOff {
         kind: HealDispositionKind,
@@ -150,6 +158,7 @@ impl HealDispositionCache {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
@@ -162,9 +171,7 @@ impl HealDispositionCache {
     /// Delay before a key with `count` consecutive terminal failures is admitted again.
     pub(crate) fn retry_backoff(count: u32) -> Duration {
         let exponent = count.saturating_sub(1).min(31);
-        RETRY_BACKOFF_BASE
-            .saturating_mul(1_u32 << exponent)
-            .min(RETRY_BACKOFF_MAX)
+        RETRY_BACKOFF_BASE.saturating_mul(1_u32 << exponent).min(RETRY_BACKOFF_MAX)
     }
 
     /// Decide whether a resubmission for `key` may enter the queue at `now`.
@@ -276,6 +283,67 @@ impl HealDispositionCache {
     }
 }
 
+pub(super) fn lock_disposition_cache(cache: &StdMutex<HealDispositionCache>) -> StdMutexGuard<'_, HealDispositionCache> {
+    match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Remember the terminal verdict of a finished single-object task, or forget
+/// the key after a positive completion. Scheduled retries, cancellations,
+/// deadlines, dry runs and durable MRF repairs leave the memory untouched.
+pub(crate) async fn record_task_disposition(
+    cache: &StdMutex<HealDispositionCache>,
+    task: &HealTask,
+    result: &crate::Result<()>,
+    will_retry: bool,
+) {
+    let HealType::Object {
+        bucket,
+        object,
+        version_id,
+    } = &task.heal_type
+    else {
+        return;
+    };
+    if task.options.dry_run || task.expected_mrf_bucket_incarnation_id.is_some() {
+        return;
+    }
+    let key = HealDispositionKey::new(bucket, object, version_id.as_deref());
+    let kind = match result {
+        Ok(()) if task.object_absent() => HealDispositionKind::Absent,
+        Ok(()) => {
+            // A deferral (grace window, transient skip) is neither a repair
+            // nor a failure; only a positive completion forgets the key.
+            let deferred = task
+                .get_outcome()
+                .await
+                .objects
+                .iter()
+                .any(|object| matches!(object.disposition, HealObjectDisposition::Deferred { .. }));
+            if !deferred {
+                lock_disposition_cache(cache).clear(&key);
+            }
+            return;
+        }
+        Err(_) if will_retry => return,
+        Err(error) => match classify_heal_error(error) {
+            HealErrorClass::Aborted => return,
+            HealErrorClass::Absent => HealDispositionKind::Absent,
+            HealErrorClass::NoHealRequired => {
+                lock_disposition_cache(cache).clear(&key);
+                return;
+            }
+            HealErrorClass::Transient | HealErrorClass::LockContention | HealErrorClass::DanglingGrace { .. } => {
+                HealDispositionKind::RetryExhausted
+            }
+            HealErrorClass::Permanent => HealDispositionKind::Permanent,
+        },
+    };
+    lock_disposition_cache(cache).record(key, kind, &task.id, Instant::now());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,7 +392,10 @@ mod tests {
             cache.consult(&key("flaky"), later + Duration::from_secs(119)),
             HealDispositionVerdict::BackedOff { count: 2, .. }
         ));
-        assert_eq!(cache.consult(&key("flaky"), later + Duration::from_secs(120)), HealDispositionVerdict::Admit);
+        assert_eq!(
+            cache.consult(&key("flaky"), later + Duration::from_secs(120)),
+            HealDispositionVerdict::Admit
+        );
         for count in 1..=40 {
             assert!(HealDispositionCache::retry_backoff(count) <= Duration::from_secs(3600), "count={count}");
         }

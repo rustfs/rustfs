@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::error::{HealErrorClass, classify_heal_error};
 use crate::heal::{
     progress::{HealProgress, add_bytes, increment_counter},
     resume::{
@@ -34,7 +35,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, error, warn};
 
-use super::{DiskStore, EcstoreError, POOL_META_NAME, RUSTFS_META_BUCKET};
+use super::{DiskStore, POOL_META_NAME, RUSTFS_META_BUCKET};
 
 /// Outcome of classifying an error returned by [`HealStorageAPI::heal_object`].
 enum HealObjectOutcome {
@@ -311,70 +312,21 @@ impl ErasureSetHealer {
         }
     }
 
-    /// Classify an error returned by [`HealStorageAPI::heal_object`].
+    /// Map the shared heal error class onto this healer's per-object actions.
     ///
-    /// Most heal object failures wrap `Error::Storage(StorageError)`, while
-    /// compatibility markers can also arrive through Disk/Io/task wrappers.
+    /// `classify_heal_error` is the only classifier; this adapter decides what
+    /// a replacement pass does with each class.
     fn classify_heal_object_error(err: &Error) -> HealObjectOutcome {
-        if let Error::DanglingDeleteDeferred { retry_not_before } = err {
-            return HealObjectOutcome::DanglingDeleteDeferred {
-                retry_not_before: *retry_not_before,
-            };
+        match classify_heal_error(err) {
+            HealErrorClass::Absent => HealObjectOutcome::Absent,
+            HealErrorClass::DanglingGrace {
+                retry_not_before: Some(retry_not_before),
+            } => HealObjectOutcome::DanglingDeleteDeferred { retry_not_before },
+            HealErrorClass::DanglingGrace { retry_not_before: None }
+            | HealErrorClass::Transient
+            | HealErrorClass::LockContention => HealObjectOutcome::Transient,
+            HealErrorClass::NoHealRequired | HealErrorClass::Aborted | HealErrorClass::Permanent => HealObjectOutcome::Failed,
         }
-        if err.is_dangling_delete_grace() {
-            if let Some(retry_not_before) = err
-                .dangling_delete_retry_not_before()
-                .and_then(|deadline| deadline.duration_since(UNIX_EPOCH).ok())
-                .and_then(|deadline| deadline.as_secs().checked_add(1))
-            {
-                // Storage reports whole remaining seconds. Round the absolute
-                // deadline up so subsecond grace boundaries cannot hot-loop.
-                return HealObjectOutcome::DanglingDeleteDeferred { retry_not_before };
-            }
-            return HealObjectOutcome::Transient;
-        }
-
-        let Error::Storage(se) = err else {
-            return HealObjectOutcome::Failed;
-        };
-
-        if let EcstoreError::Lock(lock_error) = se
-            && !lock_error.is_fatal()
-        {
-            return HealObjectOutcome::Transient;
-        }
-
-        // Genuine object/version absence: nothing left to heal, treat as handled.
-        if matches!(
-            se,
-            EcstoreError::FileNotFound
-                | EcstoreError::FileVersionNotFound
-                | EcstoreError::ObjectNotFound(_, _)
-                | EcstoreError::VersionNotFound(_, _, _)
-        ) {
-            return HealObjectOutcome::Absent;
-        }
-
-        // Transient infrastructure conditions — skip and retry on a later pass.
-        // NOTE: do NOT use `StorageError::is_not_found()` here: it lumps
-        // `DiskNotFound`/`VolumeNotFound` together with object absence, which is
-        // exactly the conflation that previously let an offline drive be recorded
-        // as "healed/absent" and permanently skipped (backlog#856 / #799 B7).
-        if se.is_quorum_error()
-            || matches!(
-                se,
-                EcstoreError::DiskNotFound
-                    | EcstoreError::VolumeNotFound
-                    | EcstoreError::FaultyDisk
-                    | EcstoreError::FaultyRemoteDisk
-                    | EcstoreError::SlowDown
-                    | EcstoreError::OperationCanceled
-            )
-        {
-            return HealObjectOutcome::Transient;
-        }
-
-        HealObjectOutcome::Failed
     }
 
     pub fn new(
@@ -2207,8 +2159,8 @@ mod tests {
     // classification must not conflate an offline drive (or unmet quorum) with
     // genuine object absence, or transient failures get recorded as "healed" and
     // permanently skipped.
-    use super::{EcstoreError, Error, HealObjectOutcome};
-    use crate::heal::DiskError;
+    use super::{Error, HealObjectOutcome};
+    use crate::heal::{DiskError, EcstoreError};
 
     fn classify(err: EcstoreError) -> HealObjectOutcome {
         ErasureSetHealer::classify_heal_object_error(&Error::Storage(err))
@@ -2329,7 +2281,9 @@ mod tests {
             Error::TransientSkip {
                 message: "skipped".into(),
             },
-            Error::Storage(EcstoreError::Io(std::io::Error::other("heal rename incomplete: 1 of 2 targets committed"))),
+            Error::Storage(EcstoreError::Io(std::io::Error::other(
+                "heal rename incomplete: 1 of 2 targets committed",
+            ))),
         ] {
             assert!(
                 matches!(ErasureSetHealer::classify_heal_object_error(&error), HealObjectOutcome::Transient),

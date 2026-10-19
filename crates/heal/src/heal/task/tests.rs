@@ -14,6 +14,7 @@
 
 use super::super::{DiskOption, DiskStore, Endpoint, new_disk};
 use super::*;
+use crate::heal::EcstoreError;
 use crate::heal::storage::HealStorageObjectResult;
 
 mod absent_verdict;
@@ -2029,7 +2030,10 @@ fn missing_object_dir_heal_result_not_found_accepts_typed_object_and_version_abs
         ))
     ));
     assert!(!is_missing_object_dir_heal_result("x.rnd/", &Error::Storage(EcstoreError::DiskNotFound)));
-    assert!(!is_missing_object_dir_heal_result("x.rnd/", &Error::Storage(EcstoreError::VolumeNotFound)));
+    assert!(!is_missing_object_dir_heal_result(
+        "x.rnd/",
+        &Error::Storage(EcstoreError::VolumeNotFound)
+    ));
 }
 
 #[async_trait::async_trait]
@@ -3917,12 +3921,13 @@ async fn test_heal_admin_missing_object_dir_does_not_canonicalize_plain_object()
     request.source = HealRequestSource::Admin;
     let task = HealTask::from_request(request, storage.clone());
 
-    let err = task
-        .execute()
+    task.execute()
         .await
-        .expect_err("admin object-dir request must not be canonicalized");
+        .expect("an absent admin object-dir target completes under the general not-found rule");
 
-    assert!(matches!(err, Error::TaskExecutionFailed { .. }));
+    assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+    // The invariant under test: an administrator request names an exact key
+    // and is never rewritten to the plain object that happens to exist.
     assert_eq!(storage.heal_object_calls.lock().unwrap().as_slice(), ["x.rnd/".to_string()]);
 }
 
@@ -4091,38 +4096,6 @@ async fn test_heal_recreate_scanner_synthetic_object_dir_skips_err_not_found() {
 }
 
 #[tokio::test]
-async fn test_heal_recreate_scanner_non_dir_not_found_fails() {
-    let storage = Arc::new(MockStorage {
-        object_exists: Mutex::new(Some(false)),
-        heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::ErrOther("File not found"))),
-        ..Default::default()
-    });
-    let mut request = HealRequest::new(
-        HealType::Object {
-            bucket: "bucket-a".to_string(),
-            object: "x.rnd".to_string(),
-            version_id: None,
-        },
-        HealOptions {
-            recreate_missing: true,
-            timeout: None,
-            ..Default::default()
-        },
-        HealPriority::Normal,
-    );
-    request.source = HealRequestSource::Scanner;
-    let task = HealTask::from_request(request, storage);
-
-    let err = task
-        .execute()
-        .await
-        .expect_err("scanner non-dir missing object should still fail recreate");
-
-    assert!(matches!(err, Error::TaskExecutionFailed { .. }));
-    assert!(matches!(task.get_status().await, HealTaskStatus::Failed { .. }));
-}
-
-#[tokio::test]
 async fn mrf_recreate_missing_object_records_exact_absence_receipt_with_scope() {
     let incarnation = Uuid::new_v4();
     let storage = Arc::new(MockStorage {
@@ -4273,38 +4246,6 @@ async fn test_heal_recreate_scanner_synthetic_object_dir_disk_not_found_fails() 
         .execute()
         .await
         .expect_err("scanner synthetic object-dir disk-not-found should not be skipped");
-
-    assert!(matches!(err, Error::TaskExecutionFailed { .. }));
-    assert!(matches!(task.get_status().await, HealTaskStatus::Failed { .. }));
-}
-
-#[tokio::test]
-async fn test_heal_recreate_admin_synthetic_object_dir_not_found_fails() {
-    let storage = Arc::new(MockStorage {
-        object_exists: Mutex::new(Some(false)),
-        heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::ErrOther("File not found"))),
-        ..Default::default()
-    });
-    let mut request = HealRequest::new(
-        HealType::Object {
-            bucket: "bucket-a".to_string(),
-            object: "x.rnd/".to_string(),
-            version_id: None,
-        },
-        HealOptions {
-            recreate_missing: true,
-            timeout: None,
-            ..Default::default()
-        },
-        HealPriority::Normal,
-    );
-    request.source = HealRequestSource::Admin;
-    let task = HealTask::from_request(request, storage);
-
-    let err = task
-        .execute()
-        .await
-        .expect_err("admin object-dir not-found recreate should not be skipped");
 
     assert!(matches!(err, Error::TaskExecutionFailed { .. }));
     assert!(matches!(task.get_status().await, HealTaskStatus::Failed { .. }));

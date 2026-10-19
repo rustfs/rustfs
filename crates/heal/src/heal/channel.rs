@@ -735,6 +735,9 @@ impl HealChannelProcessor {
             HealChannelPriority::Critical => HealPriority::Urgent,
         };
 
+        // `recreate_missing` only reaches storage as the bucket-volume
+        // recreation flag. Whether a missing object is absent is decided by the
+        // locked storage read, never by this per-source default (backlog#2900).
         let recreate_missing = request.recreate_missing.unwrap_or(match request.source {
             HealRequestSource::Scanner => false,
             HealRequestSource::Admin

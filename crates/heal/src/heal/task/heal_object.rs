@@ -11,7 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-/// object-level heal: metadata dir canonicalization and missing-object recreation
+/// object-level heal: metadata dir canonicalization and the storage-decided absent verdict
 use super::*;
 
 impl HealTask {
@@ -179,36 +179,22 @@ impl HealTask {
                 recreate_missing = self.options.recreate_missing,
                 "Heal target object is missing"
             });
-            if self.options.recreate_missing {
-                debug!(
-                    target: "rustfs::heal::task",
-                    event = EVENT_HEAL_OBJECT_STAGE,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_OBJECT,
-                    task_id = %self.id,
-                    bucket,
-                    object,
-                    stage = "recreate_missing",
-                    "Heal object recreate requested"
-                );
-                return self.recreate_missing_object(bucket, object, version_id).await;
-            } else if self.source == HealRequestSource::Scanner {
-                debug!(
-                    target: "rustfs::heal::task",
-                    event = EVENT_HEAL_OBJECT_STAGE,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_OBJECT,
-                    task_id = %self.id,
-                    bucket,
-                    object,
-                    stage = "scanner_missing_probe",
-                    "Heal scanner missing object will be checked by storage layer"
-                );
-            } else {
-                return Err(Error::TaskExecutionFailed {
-                    message: format!("Object not found: {bucket}/{object}"),
-                });
-            }
+            // The unlocked existence check is only a hint. The locked storage
+            // heal below reads every disk; its object-level not-found is the
+            // absence verdict for every source and every `recreate_missing`
+            // value. A recreate from parity happens only on the durable MRF
+            // path above, which carries the write anchor.
+            debug!(
+                target: "rustfs::heal::task",
+                event = EVENT_HEAL_OBJECT_STAGE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_OBJECT,
+                task_id = %self.id,
+                bucket,
+                object,
+                stage = "missing_probe",
+                "Heal missing object will be checked by storage layer"
+            );
         }
 
         {
@@ -267,23 +253,8 @@ impl HealTask {
                         return Ok(());
                     }
 
-                    if Self::is_object_not_found_heal_error(&e) {
-                        debug!(
-                            target: "rustfs::heal::task",
-                            event = EVENT_HEAL_OBJECT_RESULT,
-                            component = LOG_COMPONENT_HEAL,
-                            subsystem = LOG_SUBSYSTEM_OBJECT,
-                            task_id = %self.id,
-                            bucket,
-                            object,
-                            result = "treated_as_deleted",
-                            "Heal missing object treated as deleted"
-                        );
-                        {
-                            let mut progress = self.progress.write().await;
-                            progress.update_stage(3, 3);
-                        }
-                        return Ok(());
+                    if e.is_object_absent() {
+                        return self.complete_absent_object(bucket, object, &e).await;
                     }
 
                     error!(
@@ -373,23 +344,8 @@ impl HealTask {
                     return Ok(());
                 }
 
-                if Self::is_object_not_found_heal_error(&e) {
-                    debug!(
-                        target: "rustfs::heal::task",
-                        event = EVENT_HEAL_OBJECT_RESULT,
-                        component = LOG_COMPONENT_HEAL,
-                        subsystem = LOG_SUBSYSTEM_OBJECT,
-                        task_id = %self.id,
-                        bucket,
-                        object,
-                        result = "treated_as_deleted",
-                        "Heal missing object treated as deleted"
-                    );
-                    {
-                        let mut progress = self.progress.write().await;
-                        progress.update_stage(3, 3);
-                    }
-                    return Ok(());
+                if e.is_object_absent() {
+                    return self.complete_absent_object(bucket, object, &e).await;
                 }
 
                 error!(
@@ -455,133 +411,11 @@ impl HealTask {
         }
     }
 
-    /// Recreate missing object (for EC decode scenarios)
-    async fn recreate_missing_object(&self, bucket: &str, object: &str, version_id: Option<&str>) -> Result<()> {
-        debug!(
-            target: "rustfs::heal::task",
-            event = EVENT_HEAL_OBJECT_STAGE,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_OBJECT,
-            task_id = %self.id,
-            bucket,
-            object,
-            version_id = ?version_id,
-            stage = "recreate_missing",
-            "Heal object recreate started"
-        );
-
-        // Use ecstore's heal_object with recreate option
-        let heal_opts = HealOpts {
-            recursive: false,
-            dry_run: self.options.dry_run,
-            remove: false,
-            recreate: true,
-            scan_mode: HealScanMode::Deep,
-            update_parity: true,
-            no_lock: self.options.no_lock,
-            read_repair: false,
-            pool: None,
-            set: None,
-        };
-
-        match self
-            .await_with_control(self.storage.heal_object(bucket, object, version_id, &heal_opts))
-            .await
-        {
-            Ok((result, error)) => {
-                if let Some(e) = error {
-                    if self.skip_missing_usage_observation(bucket, object, version_id, &e).await
-                        || self.skip_scanner_synthetic_object_dir_missing(bucket, object, &e).await
-                    {
-                        return Ok(());
-                    }
-
-                    error!(
-                        target: "rustfs::heal::task",
-                        event = EVENT_HEAL_OBJECT_RESULT,
-                        component = LOG_COMPONENT_HEAL,
-                        subsystem = LOG_SUBSYSTEM_OBJECT,
-                        task_id = %self.id,
-                        bucket,
-                        object,
-                        result = "recreate_failed",
-                        error = %e,
-                        "Heal object recovery failed"
-                    );
-                    return Err(Error::TaskExecutionFailed {
-                        message: format!("Failed to recreate missing object {bucket}/{object}: {e}"),
-                    });
-                }
-
-                let object_size = result.object_size as u64;
-                debug!(
-                    target: "rustfs::heal::task",
-                    event = EVENT_HEAL_OBJECT_RESULT,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_OBJECT,
-                    task_id = %self.id,
-                    bucket,
-                    object,
-                    object_size,
-                    result = "recreated",
-                    "Heal object recreated"
-                );
-
-                {
-                    let mut progress = self.progress.write().await;
-                    progress.update_object_progress(1, 1, 0, 0, object_size);
-                }
-                self.record_result_item(result).await;
-                Ok(())
-            }
-            Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
-            Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
-            Err(e) => {
-                if self.skip_missing_usage_observation(bucket, object, version_id, &e).await
-                    || self.skip_scanner_synthetic_object_dir_missing(bucket, object, &e).await
-                {
-                    return Ok(());
-                }
-
-                error!(
-                    target: "rustfs::heal::task",
-                    event = EVENT_HEAL_OBJECT_RESULT,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_OBJECT,
-                    task_id = %self.id,
-                    bucket,
-                    object,
-                    result = "recreate_failed",
-                    error = %e,
-                    "Heal object recovery failed"
-                );
-                Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to recreate missing object {bucket}/{object}: {e}"),
-                })
-            }
-        }
-    }
-
-    async fn skip_missing_usage_observation(&self, bucket: &str, object: &str, version_id: Option<&str>, err: &Error) -> bool {
-        // Usage publication may delete an obsolete observation after a degraded
-        // GET has queued read repair. Its absence is not lost user data. Keep
-        // durable MRF completion on its separate, proof-bearing storage path.
-        if self.source != HealRequestSource::ReadRepair
-            || version_id.is_some()
-            || bucket != RUSTFS_META_BUCKET
-            || object
-                .strip_prefix(BUCKET_META_PREFIX)
-                .and_then(|suffix| suffix.strip_prefix('/'))
-                != Some(rustfs_data_usage::DATA_USAGE_OBSERVED_OBJECT_NAME)
-            || !matches!(
-                err,
-                Error::Disk(DiskError::FileNotFound)
-                    | Error::Storage(EcstoreError::FileNotFound | EcstoreError::ObjectNotFound(_, _))
-            )
-        {
-            return false;
-        }
-
+    /// The locked storage read found no replica: there is nothing to repair
+    /// and the heal completes for every source. No absence proof is recorded;
+    /// only storage's incarnation-fenced receipt can carry one.
+    async fn complete_absent_object(&self, bucket: &str, object: &str, err: &Error) -> Result<()> {
+        self.mark_object_absent();
         debug!(
             target: "rustfs::heal::task",
             event = EVENT_HEAL_OBJECT_RESULT,
@@ -591,14 +425,14 @@ impl HealTask {
             bucket,
             object,
             source = self.source.as_str(),
-            result = "usage_observation_missing",
-            "Heal skipped an absent usage observation"
+            result = "treated_as_deleted",
+            error = %err,
+            "Heal missing object treated as deleted"
         );
         let mut progress = self.progress.write().await;
-        progress.set_current_object(Some(format!("skipped: {bucket}/{object}")));
         progress.update_object_progress(1, 0, 0, 1, 0);
-        progress.update_stage(4, 4);
-        true
+        progress.update_stage(3, 3);
+        Ok(())
     }
 
     /// Durable MRF partial writes may complete only with an incarnation-fenced storage proof.

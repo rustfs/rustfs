@@ -601,7 +601,8 @@ pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
     );
     request.source = HealRequestSource::ReadRepair;
     request.object_version_id = version_id.filter(|value| !value.is_empty()).map(str::to_string);
-    request.recreate_missing = Some(true);
+    // A degraded read's surviving minority is not a recreate instruction; the
+    // locked storage read decides whether the target is absent (backlog#2900).
 
     let request_id = request.id.clone();
     let bucket = bucket.to_string();
