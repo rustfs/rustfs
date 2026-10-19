@@ -23,34 +23,38 @@ therefore has three identities:
 If any identity changes before commit, the result is a candidate for retry or
 observation, not an authoritative baseline.
 
-Ordinary PUT rename fanouts also track instance-scoped in-flight work. A quorum
-ACK does not release it: the actual disk tasks retain ownership until their
-rename work ends, including when the request caller is cancelled. Scan admission
-remains movement-only so sustained PUTs do not stop namespace walks and
-scanner-driven lifecycle discovery. The post-walk local publication check and
-remote publication leases reject pending fanouts. Begin/end namespace generations
-invalidate cached plans across the fanout; after acquiring remote leases, the
-coordinator rechecks the guardrail fields of the activity snapshot (the
-structural digest and the movement fields, plus the peers' dirty-usage state
-while per-bucket certification is local only) before publishing an
-authoritative aggregate. This catches a tail that finishes between the scan's
-last probe and lease acquisition. Local namespace and dirty-usage generation
-movement in that window is not a veto: its buckets stay in the dirty map and
-are the next cycle's work, as described in
+Ordinary PUT rename fanouts track instance-scoped in-flight work
+(`NamespaceCommitGuard` in `crates/ecstore/src/runtime/instance.rs`): a quorum
+ACK does not release it, the actual disk tasks retain ownership until their
+rename work ends. A pending ordinary PUT commit is a write-barrier event for
+its bucket, not a usage-publication veto (decision of 2026-10-19). The S3
+handler shades the bucket through `record_dirty_usage_object_from_producer`
+after the ACK, the finalize certification compares the bucket's generation,
+and a peer whose dirty state moved supersedes the cycle until scoped
+acknowledgements exist; together they already cover a tail that lands after
+the walk. The guard drops before the handler records the shade, so a
+pending-commit veto could never close the window ahead of the shade either.
+`scanner_data_usage_publication_blocked` therefore blocks usage publication
+only for data movement (`scanner_data_usage_publication_snapshot_blocked`),
+and the same rule applies on the post-walk probe, the local defer decision,
+the post-lease recheck, the usage-store route probe, and the ECStore
+publication admission and remote lease paths. Scan admission remains
+movement-only so sustained PUTs do not stop namespace walks and
+scanner-driven lifecycle discovery. After acquiring remote leases, the
+coordinator still rechecks the guardrail fields of the activity snapshot (the
+reuse identity and the movement fields, plus the peers' dirty-usage state while
+per-bucket certification is local only) before publishing an authoritative
+aggregate. Local namespace and dirty-usage generation movement in that window
+is not a veto: its buckets stay in the dirty map and are the next cycle's
+work, as described in
 [scanner-per-bucket-convergence.md](scanner-per-bucket-convergence.md).
 
 This adds no namespace or movement lock. An already-verified older snapshot may
-still precede a newly started write. Sustained or stalled PUT tails can delay
-authoritative usage publication, which resumes through the existing retry
-schedule rather than a new immediate-wakeup protocol. Intermediate per-set and
-prefix cache readers retain their existing approximate-cache semantics. A
-prolonged pending tail with no generation changes can also delay cycle advancement
-and fresh rescans of already-current caches; this is not a guarantee of lifecycle
-progress under indefinitely stalled storage I/O.
-
-This PUT-tail protection requires every writer node to be upgraded. It does not
-prove that a failed tail replica has healed, and it does not extend the same
-in-flight tracking to multipart or other namespace mutation paths.
+still precede a newly started write; that write's bucket is the next cycle's
+work. Intermediate per-set and prefix cache readers retain their existing
+approximate-cache semantics. The in-flight tracking does not extend to
+multipart or other namespace mutation paths, and it does not prove that a
+failed tail replica has healed.
 
 ## Dirty producer replay ownership
 
@@ -98,7 +102,7 @@ They must not be collapsed unless the replacement proves the same exclusions.
 | CAS revision | backing config object store | lost updates to usage snapshots, scanner caches, or cycle-state objects |
 | Per-set freshness | scanner aggregation | a merged usage snapshot that combines stale and current set results |
 | Tier registry generation | scanner tier accounting | bytes classified against a different warm-tier registry |
-| Usage floor identity | scanner publication and ECStore quota fallback | empty or legacy values becoming plausible authoritative quota input |
+| Usage floor identity | scanner publication and the ECStore quota fallback for buckets without a reservation protocol | empty or legacy values becoming a plausible degraded quota floor |
 
 A reader that cannot prove the required fence for its surface must fail closed
 or use the documented observed path below. It must not synthesize an empty usage
@@ -182,27 +186,31 @@ available, quota remains unavailable and fails closed.
 
 ## Availability Decision
 
-Decision date: 2026-09-03.
+Decision date: 2026-10-19, superseding 2026-09-03; the record is
+[scanner-usage-authority-decision.md](scanner-usage-authority-decision.md).
 
-RustFS keeps scanner usage as the authority for hard quota admission. The
-publication protocol therefore remains necessary: leadership, storage epoch,
-lease, CAS, observed snapshot, and usage-floor layers are the proof machinery
-that lets a distributed background scan feed a quota decision without accepting
-stale or cross-generation usage as current truth.
+Hard quota admission is owned by the durable reservation ledger. Scanner usage
+is best-effort reporting input and the degraded fallback for quotas that
+predate the reservation protocol. The publication protocol keeps the fences
+that protect consistency across leadership and data movement: leadership
+claim, storage publication epoch, CAS revision, per-set freshness, and tier
+registry generation. The layers that existed only to make scanner usage a
+quota authority are scheduled for staged removal under a compatibility
+window:
+
+- the usage floor as hard-quota input (it remains the degraded fallback for
+  `reservation_protocol = None` buckets until they are migrated);
+- observed-versus-authoritative routing as an admission distinction (it
+  remains a completeness mark for readers);
+- strict publication-lease rejection of pending ordinary namespace commits.
 
 The availability contract is:
 
-- the authoritative fast path reads complete in-memory or persisted scanner
-  usage;
-- during upgrade or publication outage, quota may admit against the persisted
-  per-bucket usage floor;
-- the floor is advisory for the outage window and must converge back to a
-  complete scanner publication;
-- a bucket with neither authoritative usage nor a valid floor fails closed.
-
-Changing this decision to a soft-quota model would be a product change, not a
-scanner refactor. It would need a staged removal of the authority-specific
-layers and compatibility handling for the persisted objects above.
+- a bucket admitted by the reservation ledger never fails a write because
+  scanner usage is unavailable;
+- a bucket without a reservation protocol keeps the degraded floor path and
+  fails closed only when neither authoritative usage nor a floor exists;
+- scanner publication incompleteness is reported, never converted to zero.
 
 ## Deletion And Recovery Rules
 

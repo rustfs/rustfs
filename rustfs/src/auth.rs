@@ -240,7 +240,6 @@ impl S3Auth for IAMAuth {
                         event = EVENT_SECRET_KEY_LOOKUP_FAILED,
                         component = LOG_COMPONENT_AUTH,
                         subsystem = LOG_SUBSYSTEM_CREDENTIALS,
-                        access_key = %MaskedAccessKey(access_key),
                         reason = "no_such_user",
                         "Secret key lookup rejected"
                     );
@@ -250,7 +249,6 @@ impl S3Auth for IAMAuth {
                         event = EVENT_SECRET_KEY_LOOKUP_FAILED,
                         component = LOG_COMPONENT_AUTH,
                         subsystem = LOG_SUBSYSTEM_CREDENTIALS,
-                        access_key = %MaskedAccessKey(access_key),
                         error = ?e,
                         reason = "check_key_error",
                         "Secret key lookup errored"
@@ -263,7 +261,6 @@ impl S3Auth for IAMAuth {
                 event = EVENT_SECRET_KEY_LOOKUP_FAILED,
                 component = LOG_COMPONENT_AUTH,
                 subsystem = LOG_SUBSYSTEM_CREDENTIALS,
-                access_key = %MaskedAccessKey(access_key),
                 reason = "iam_not_initialized",
                 "Secret key lookup skipped"
             );
@@ -1585,6 +1582,58 @@ mod tests {
         let error = result.unwrap_err();
         assert_eq!(error.code(), &S3ErrorCode::UnauthorizedAccess);
         assert!(error.message().unwrap_or("").contains("Your account is not signed up"));
+    }
+
+    #[tokio::test]
+    async fn credential_boundary_rejected_access_key_logs_omit_key_fragments() {
+        use rustfs_iam::{cache::Cache, manager::IamCache};
+        use tracing::instrument::WithSubscriber;
+
+        let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        let (send_chan, _receiver) = tokio::sync::mpsc::channel(1);
+        let cache = Arc::new(IamCache {
+            cache: Cache::default(),
+            api: ObjectStore::new(store.clone()),
+            state: Default::default(),
+            loading: Default::default(),
+            roles: HashMap::new(),
+            send_chan,
+            last_timestamp: Default::default(),
+            sync_failures: Default::default(),
+            sync_successes: Default::default(),
+            last_sync_duration_millis: Default::default(),
+        });
+        let slot = ServerContextSlot::new();
+        let context = AppContext::new(
+            store,
+            Arc::new(ContextIam {
+                handle: Arc::new(IamSys::new(cache)),
+            }),
+            Arc::new(TestKms),
+        );
+        assert!(slot.install(Arc::new(context)));
+        for (slot, reason) in [(slot, "no_such_user"), (ServerContextSlot::new(), "iam_not_initialized")] {
+            let auth = IAMAuth::with_server_context("bootstrap-key", SecretKey::from("bootstrap-secret"), slot);
+            let log = tempfile::NamedTempFile::new().expect("capture file");
+            let writer = log.reopen().expect("capture writer");
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || writer.try_clone().expect("clone capture writer"))
+                .finish();
+            let error = auth
+                .get_secret_key("LEAK-private-access-key-TAIL")
+                .with_subscriber(subscriber)
+                .await
+                .expect_err("unknown credentials must be rejected");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidAccessKeyId);
+            let captured = std::fs::read_to_string(log.path()).expect("read captured logs");
+            assert!(captured.contains(reason), "capture the expected rejection: {captured}");
+            for forbidden in ["LEAK", "TAIL", "private-access-key", "access_key="] {
+                assert!(!captured.contains(forbidden), "rejected access-key material must not be logged");
+            }
+        }
     }
 
     #[test]
