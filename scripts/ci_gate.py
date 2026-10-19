@@ -227,8 +227,10 @@ def check_workflow(root: Path) -> list[str]:
             errors.append(f"{job} must run on every merge-group, scheduled and manual event")
     workspace = "\n".join(yaml_block(jobs, "test-and-lint", 2) or [])
     clippy = re.search(r"^      - name: Run clippy lints\n(?P<body>.*?)(?=^      - name:|\Z)", workspace, re.MULTILINE | re.DOTALL)
-    if clippy is None or scalar(clippy["body"].splitlines(), "if", 8) != "github.event_name != 'pull_request'":
-        errors.append("workspace Clippy must run on every non-PR event")
+    clippy_lines = clippy["body"].splitlines() if clippy else []
+    if (clippy is None or any(re.match(r'''\s{8}["']?if["']?\s*:''', line) for line in clippy_lines)
+            or "cargo clippy --all-targets -- -D warnings" not in clippy["body"]):
+        errors.append("workspace Clippy must run on every event, pull requests included")
     if scalar(gate, "shell", 8) != "bash" or scalar(gate, "run", 8) != "python3 scripts/ci_gate.py verify" or scalar(gate, "CI_NEEDS", 10) != "${{ toJSON(needs) }}":
         errors.append("required-checks must verify the actual needs results")
     if any(re.match(r'''\s+(?:- )?(?:["']?continue-on-error["']?\s*:|["']?if["']?\s*:)''', line) and not line.startswith("    if:") for line in gate):
@@ -393,9 +395,11 @@ class SelfTests(unittest.TestCase):
             (root / ".github/workflows").mkdir(parents=True)
             source = (ROOT / ".github/workflows/ci.yml").read_text()
             path = root / ".github/workflows/ci.yml"
-            for condition in ("false", "github.event_name == 'schedule'", "github.event_name == 'pull_request'"):
-                path.write_text(source.replace("      - name: Run clippy lints\n        if: github.event_name != 'pull_request'", f"      - name: Run clippy lints\n        if: {condition}"))
-                self.assertIn("workspace Clippy must run on every non-PR event", check_workflow(root))
+            for condition in ("false", "github.event_name == 'schedule'", "github.event_name != 'pull_request'"):
+                path.write_text(source.replace("      - name: Run clippy lints\n", f"      - name: Run clippy lints\n        if: {condition}\n", 1))
+                self.assertIn("workspace Clippy must run on every event, pull requests included", check_workflow(root))
+            path.write_text(source.replace("cargo clippy --all-targets -- -D warnings", "cargo clippy --all-targets", 1))
+            self.assertIn("workspace Clippy must run on every event, pull requests included", check_workflow(root))
             for job in EXTENDED_FEATURE_JOBS:
                 before, block = source.split(f"  {job}:\n", 1)
                 for condition in ("false", "github.event_name == 'schedule'", "github.event_name != 'pull_request'"):

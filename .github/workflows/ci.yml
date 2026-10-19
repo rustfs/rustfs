@@ -169,10 +169,13 @@ jobs:
             echo "started_at=$(date --utc --iso-8601=seconds)"
           } > artifacts/test-and-lint/run-metadata.txt
 
-      # Keep full Clippy validation on main, merge groups, and scheduled/manual
-      # runs. PRs retain the complete default test suite and compile-free checks.
+      # Clippy gates every event, pull requests included. When it ran only after
+      # merge, a lint regression merged freely and then failed every main run
+      # until someone fixed it (10 of 12 main runs on 2026-10-17/18). cache-warm
+      # writes the same invocation's check artifacts into ci-dev, so a pull
+      # request re-checks only the crates its diff touches. Main keeps the step
+      # because pull requests can merge without being up to date with main.
       - name: Run clippy lints
-        if: github.event_name != 'pull_request'
         run: |
           ./scripts/ci/resource_sampler.sh start clippy
           trap './scripts/ci/resource_sampler.sh stop' EXIT
