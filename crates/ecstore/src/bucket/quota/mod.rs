@@ -164,6 +164,26 @@ impl BucketQuota {
             .is_some_and(|version| !matches!(version, QUOTA_RESERVATION_PROTOCOL_V1 | QUOTA_RESERVATION_PROTOCOL_V2))
     }
 
+    /// A limit saved before the reservation protocols existed: its writes
+    /// are still admitted from scanner usage snapshots. Durable and unknown
+    /// future protocols are never rewritten.
+    pub fn needs_reservation_protocol_migration(&self) -> bool {
+        self.quota.is_some() && self.reservation_protocol.is_none()
+    }
+
+    /// The same limit and type re-expressed under the sharded durable
+    /// reservation protocol; `created_at` is kept for audit continuity.
+    /// `None` when the quota is not a migration candidate.
+    pub fn migrated_to_sharded_reservations(&self) -> Option<Self> {
+        self.needs_reservation_protocol_migration().then(|| Self {
+            quota: self.quota,
+            quota_type: self.quota_type.clone(),
+            reservation_protocol: Some(QUOTA_RESERVATION_PROTOCOL_V2),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+
     pub fn check_operation_allowed(&self, current_usage: u64, operation_size: u64) -> bool {
         if operation_size == 0 {
             return true;
@@ -198,6 +218,45 @@ pub enum QuotaOperation {
     PostObject,
     CopyObject,
     DeleteObject,
+}
+
+/// Outcome of re-saving one bucket's quota under the sharded durable
+/// reservation protocol (rustfs/backlog#2904).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuotaProtocolMigration {
+    /// No quota limit is configured; nothing to migrate.
+    NoQuota,
+    /// The quota already uses a durable reservation protocol.
+    AlreadyDurable { reservation_protocol: u32 },
+    /// The quota was re-saved under the sharded protocol at this revision.
+    Migrated {
+        reservation_protocol: u32,
+        updated_at: OffsetDateTime,
+    },
+    /// The quota was left untouched for the stated reason.
+    Skipped { reason: QuotaMigrationSkipReason },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaMigrationSkipReason {
+    /// A reservation protocol this node does not understand; rewriting it
+    /// would downgrade a newer fleet's quota.
+    UnsupportedReservationProtocol,
+    /// The quota configuration changed between the cached read and the
+    /// guarded write; the newer configuration wins.
+    QuotaRevisionChanged,
+    /// The bucket was replaced or removed since the cached read.
+    BucketIncarnationChanged,
+}
+
+impl QuotaMigrationSkipReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedReservationProtocol => "unsupported_reservation_protocol",
+            Self::QuotaRevisionChanged => "quota_revision_changed",
+            Self::BucketIncarnationChanged => "bucket_incarnation_changed",
+        }
+    }
 }
 
 #[derive(Debug, Error)]

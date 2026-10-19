@@ -159,6 +159,17 @@ jobs:
           cargo build --workspace --all-targets
           cargo build -p rustfs --bins --features e2e-test-hooks
 
+      # ci.yml runs Clippy on every pull request. Clippy's check-mode artifacts
+      # are separate from the build above, so warm them with the exact
+      # invocation ci.yml uses; a pull request then re-checks only what its diff
+      # touches. A lint failure on main must not stop the warm-up: the cache is
+      # still saved (cache-on-failure), and the failure belongs to ci.yml.
+      - name: Warm Clippy check artifacts
+        run: |
+          if ! cargo clippy --all-targets -- -D warnings; then
+            echo "::warning::cargo clippy reports findings on this commit; check artifacts are still cached"
+          fi
+
       # Runs before rust-cache's post step, so these are the sizes it is about
       # to archive. Reported so the cache-all-crates decision stays evidence-led:
       # registry/src is what that flag prunes, registry/cache is what the pruned

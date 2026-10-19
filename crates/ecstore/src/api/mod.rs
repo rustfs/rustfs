@@ -252,11 +252,11 @@ pub mod bucket {
     pub mod quota {
         pub use crate::bucket::quota::{
             BucketQuota, QUOTA_RESERVATION_PROTOCOL_V1, QUOTA_RESERVATION_PROTOCOL_V2, QuotaCheckResult, QuotaError,
-            QuotaOperation,
+            QuotaMigrationSkipReason, QuotaOperation, QuotaProtocolMigration,
         };
 
         pub mod checker {
-            pub use crate::bucket::quota::checker::QuotaChecker;
+            pub use crate::bucket::quota::checker::{QuotaChecker, record_reservation_protocol_migration};
         }
     }
 
@@ -653,6 +653,14 @@ pub mod set_disk {
         #[must_use]
         pub fn hold_namespace_commit(store: &crate::store::ECStore) -> impl Send + Sync {
             store.ctx.begin_namespace_commit()
+        }
+
+        /// Whether an ordinary namespace commit (a PUT rename fanout, including
+        /// its post-ACK tail) is still pending on this instance. Test fixtures
+        /// drain tails through this probe; the scanner's publication barrier no
+        /// longer reports them.
+        pub fn namespace_commits_pending(store: &crate::store::ECStore) -> bool {
+            store.ctx.namespace_commits_pending()
         }
     }
 }

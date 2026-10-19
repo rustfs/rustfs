@@ -922,35 +922,11 @@ impl ECStoreHealStorage {
     }
 }
 
-fn is_transient_object_exists_message(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-
-    [
-        "failed to acquire read lock",
-        "lock acquisition failed",
-        "lock acquisition timeout",
-        "quorum not reached",
-        "deadline has elapsed",
-        "timed out",
-        "network error",
-        "transport error",
-        "connection refused",
-    ]
-    .iter()
-    .any(|pattern| message.contains(pattern))
-}
-
+/// A transient or contended existence check is skipped and retried; it is
+/// never reported as object absence or as a failure. One classifier decides
+/// (backlog#2900).
 fn is_transient_object_exists_error(err: &StorageError) -> bool {
-    if err.is_quorum_error() {
-        return true;
-    }
-
-    match err {
-        StorageError::Lock(lock_err) => lock_err.is_retryable() || is_transient_object_exists_message(&lock_err.to_string()),
-        StorageError::Io(io_err) => is_transient_object_exists_message(&io_err.to_string()),
-        StorageError::SlowDown | StorageError::OperationCanceled => true,
-        _ => false,
-    }
+    crate::error::classify_storage_error(err).is_retryable()
 }
 
 #[async_trait]
@@ -2142,7 +2118,7 @@ mod tests {
     use super::super::StorageError;
     use super::{
         decode_disk_walk_token, decode_heal_token, encode_disk_walk_token, encode_heal_token, is_transient_object_exists_error,
-        is_transient_object_exists_message, next_heal_listing_token, replacement_resume_conflict_for_other_tasks,
+        next_heal_listing_token, replacement_resume_conflict_for_other_tasks,
     };
     use std::collections::HashSet;
 
@@ -2375,19 +2351,22 @@ mod tests {
     }
 
     #[test]
-    fn transient_object_exists_message_matches_lock_quorum_failures() {
-        assert!(is_transient_object_exists_message(
-            "Failed to acquire read lock: ns_loc: read lock acquisition failed on bucket/object: Quorum not reached: required 2, achieved 0"
-        ));
-        assert!(is_transient_object_exists_message("deadline has elapsed"));
-    }
-
-    #[test]
-    fn transient_object_exists_error_matches_quorum_variants() {
+    fn transient_object_exists_error_matches_quorum_lock_and_offline_variants() {
         assert!(is_transient_object_exists_error(&StorageError::ErasureReadQuorum));
         assert!(is_transient_object_exists_error(&StorageError::InsufficientReadQuorum(
             "bucket".to_string(),
             "object".to_string(),
+        )));
+        assert!(is_transient_object_exists_error(&StorageError::Io(std::io::Error::other(
+            "Failed to acquire read lock: ns_loc: read lock acquisition failed on bucket/object: Quorum not reached: required 2, achieved 0"
+        ))));
+        assert!(is_transient_object_exists_error(&StorageError::Io(std::io::Error::other(
+            "deadline has elapsed"
+        ))));
+        assert!(is_transient_object_exists_error(&StorageError::DiskNotFound));
+        assert!(is_transient_object_exists_error(&StorageError::VolumeNotFound));
+        assert!(is_transient_object_exists_error(&StorageError::RemoteClientUnavailable(
+            "rebuild".to_string()
         )));
     }
 

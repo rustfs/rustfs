@@ -468,6 +468,10 @@ impl InstanceContext {
         self.namespace_commit_generation.load(Ordering::Acquire)
     }
 
+    /// Whether a namespace commit is still pending. The scanner publication
+    /// barrier no longer consults it (an ordinary PUT shades its bucket
+    /// instead); fixtures use it to drain rename tails deterministically.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn namespace_commits_pending(&self) -> bool {
         self.namespace_commits.load(Ordering::Acquire) != 0 || self.namespace_commit_generation() == u64::MAX
     }

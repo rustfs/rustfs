@@ -412,6 +412,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::High,
     ),
     admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/quota-migration",
+        SET_BUCKET_QUOTA,
+        RouteRiskLevel::High,
+    ),
+    admin(
         HttpMethod::Put,
         "/rustfs/admin/v3/bucket-durability/{bucket}",
         CONFIG_UPDATE,

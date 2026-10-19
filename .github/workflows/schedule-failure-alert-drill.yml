@@ -44,7 +44,7 @@ permissions:
 jobs:
   forced-failure:
     name: Forced failure
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Fail on purpose

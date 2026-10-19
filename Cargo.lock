@@ -10001,7 +10001,6 @@ dependencies = [
  "rustfs-common",
  "rustfs-concurrency",
  "rustfs-config",
- "rustfs-data-usage",
  "rustfs-ecstore",
  "rustfs-filemeta",
  "rustfs-heal-contracts",

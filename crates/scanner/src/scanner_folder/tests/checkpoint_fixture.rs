@@ -948,6 +948,7 @@ async fn hot_bucket_certifies_first_full_sweep_after_mixed_end(advance_epoch: bo
                 require_source: true,
                 tier_registry_generation: Some(identity.tier_registry_generation),
                 checkpoint_identity: Some(identity),
+                checkpoint_plan_digest: None,
             },
         );
         cache.info.skip_healing = true;
@@ -1207,6 +1208,7 @@ where
                 require_source: true,
                 tier_registry_generation: None,
                 checkpoint_identity: Some(identity),
+                checkpoint_plan_digest: None,
             },
         );
         let prepared = retained(&cache);
@@ -1346,6 +1348,7 @@ where
                 require_source: true,
                 tier_registry_generation: Some(identity.tier_registry_generation),
                 checkpoint_identity: Some(identity),
+                checkpoint_plan_digest: None,
             },
         );
         cache.info.skip_healing = true;

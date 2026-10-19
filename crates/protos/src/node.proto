@@ -1119,6 +1119,30 @@ message ReplacementRecoveryStatusResponse {
   optional ControlPlaneErrorCode error_code = 4;
 }
 
+// Asks a peer how it currently sees the drives served by `host`, so a
+// restarting node can wait for re-admission before publishing readiness.
+message PeerDriveAdmissionRequest {
+  // Topology host:port of the drives' owner, as written in the endpoint list.
+  string host = 1;
+}
+
+message PeerDriveAdmission {
+  int32 pool_index = 1;
+  int32 set_index = 2;
+  int32 disk_index = 3;
+  // True only when the peer would count this drive towards its own read quorum.
+  bool online = 4;
+  string runtime_state = 5;
+  bool host_online = 6;
+}
+
+message PeerDriveAdmissionResponse {
+  bool success = 1;
+  repeated PeerDriveAdmission drives = 2;
+  optional string error_info = 3;
+  optional ControlPlaneErrorCode error_code = 4;
+}
+
 message HealControlRequest {
   uint32 version = 1;
   string topology_fingerprint = 2;
@@ -1404,6 +1428,7 @@ service NodeService {
   rpc ReleaseScannerPublicationLease(ScannerPublicationLeaseReleaseRequest) returns (ScannerPublicationLeaseReleaseResponse) {}; // auth-policy: body-bound
   rpc BackgroundHealStatus(BackgroundHealStatusRequest) returns (BackgroundHealStatusResponse) {}; // auth-policy: read-only
   rpc ReplacementRecoveryStatus(ReplacementRecoveryStatusRequest) returns (ReplacementRecoveryStatusResponse) {}; // auth-policy: read-only
+  rpc PeerDriveAdmission(PeerDriveAdmissionRequest) returns (PeerDriveAdmissionResponse) {}; // auth-policy: read-only
   rpc GetMetacacheListing(GetMetacacheListingRequest) returns (GetMetacacheListingResponse) {}; // auth-policy: unimplemented
   rpc UpdateMetacacheListing(UpdateMetacacheListingRequest) returns (UpdateMetacacheListingResponse) {}; // auth-policy: unimplemented
   rpc ReloadPoolMeta(ReloadPoolMetaRequest) returns (ReloadPoolMetaResponse) {}; // auth-policy: body-bound

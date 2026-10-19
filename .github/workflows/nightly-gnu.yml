@@ -45,7 +45,7 @@ jobs:
   resolve-source:
     if: github.repository == 'rustfs/rustfs'
     name: Resolve nightly source
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       source_sha: ${{ steps.source.outputs.sha }}

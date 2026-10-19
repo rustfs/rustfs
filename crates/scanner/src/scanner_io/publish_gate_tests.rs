@@ -838,6 +838,7 @@ fn current_cache_root_with_new_tier_generation_resets_old_cache() {
             require_source: false,
             tier_registry_generation: Some(2),
             checkpoint_identity: None,
+            checkpoint_plan_digest: None,
         },
     );
 

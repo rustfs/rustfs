@@ -1038,6 +1038,52 @@ async fn update_quota_if_incarnation_stamped(
     update_under_config_write_guard(sys, &guard, rustfs_config::QUOTA_CONFIG_FILE, data, updated_at).await
 }
 
+/// Rewrite the quota configuration only while the bucket still carries
+/// `expected_incarnation_id` and `expected_quota_revision` (its
+/// `quota_config_updated_at`), under the same guards and fleet proof as
+/// [`update_quota_if_incarnation`].
+///
+/// The revision check turns a stale read into a typed
+/// [`Error::PreconditionFailed`] instead of a lost update: the reservation
+/// protocol migration (rustfs/backlog#2904) rewrites a configuration it read
+/// from the cache, and an admin save landing in between must win. The system
+/// is passed explicitly so the write publishes into the cache the caller
+/// reads from.
+pub async fn update_quota_with_sys_if_incarnation_and_revision(
+    sys: Arc<RwLock<BucketMetadataSys>>,
+    bucket: &str,
+    data: Vec<u8>,
+    expected_incarnation_id: Uuid,
+    expected_quota_revision: OffsetDateTime,
+    proof: &crate::services::notification_sys::CrossPoolFenceFleetProofToken,
+) -> Result<OffsetDateTime> {
+    let guard = Box::pin(acquire_config_write_guard_for_incarnation(
+        sys.clone(),
+        bucket,
+        Some(expected_incarnation_id),
+    ))
+    .await?;
+    if !crate::services::notification_sys::cross_pool_fence_fleet_proof_matches(proof) {
+        return Err(Error::NamespaceLockQuorumUnavailable {
+            mode: "quota_capability",
+            bucket: bucket.to_string(),
+            object: rustfs_config::QUOTA_CONFIG_FILE.to_string(),
+            required: 1,
+            achieved: 0,
+        });
+    }
+    let metadata_sys = sys.read().await.clone();
+    match Box::pin(metadata_sys.read_authoritative_metadata_from_disk_under_transaction_lock(bucket)).await? {
+        BucketMetadataAuthority::Authoritative(current) if current.quota_config_updated_at == expected_quota_revision => {}
+        BucketMetadataAuthority::Authoritative(_) => return Err(Error::PreconditionFailed),
+        BucketMetadataAuthority::MissingBucket => return Err(Error::BucketNotFound(bucket.to_string())),
+        BucketMetadataAuthority::Fabricated => {
+            return Err(Error::other("bucket quota metadata is not authoritative"));
+        }
+    }
+    update_under_config_write_guard(sys, &guard, rustfs_config::QUOTA_CONFIG_FILE, data, None).await
+}
+
 pub async fn update_bucket_targets_under_transaction_lock(
     guard: &BucketMetadataMutationGuard,
     bucket: &str,

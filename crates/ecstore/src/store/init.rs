@@ -3914,7 +3914,7 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(storage_class_env)]
-    async fn early_ack_put_tails_block_scanner_publication_until_all_renames_finish() {
+    async fn early_ack_put_tails_shade_buckets_without_fencing_scanner_publication() {
         use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 
         let temp_dir = tempfile::tempdir().expect("create scanner PUT tail store dir");
@@ -3990,31 +3990,28 @@ mod tests {
             assert!(!active, "ordinary PUT tails are not decommission or rebalance work");
             assert!(!blocked, "ordinary PUT tails must not block the movement-only scan baseline");
             assert_eq!(observed_movement_generation, movement_generation);
-            assert!(store.scanner_data_usage_publication_blocked().await);
+            assert!(
+                !store.scanner_data_usage_publication_blocked().await,
+                "ordinary PUT tails shade their bucket instead of fencing the local usage publication"
+            );
             assert!(store.scanner_data_usage_publication_admission_guard().await.is_some());
             assert!(set.scanner_data_usage_publication_admission_guard().await.is_some());
-            for error in [
-                store
-                    .acquire_scanner_publication_lease(
-                        movement_generation,
-                        crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL,
-                    )
-                    .await
-                    .expect_err("a new remote publication lease must reject pending PUT tails"),
-                store
-                    .validate_scanner_publication_lease(old_lease, movement_generation)
-                    .await
-                    .expect_err("an existing remote lease must not bypass pending PUT tails"),
+            let (tail_lease, tail_generation) = store
+                .acquire_scanner_publication_lease(movement_generation, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL)
+                .await
+                .expect("a remote publication lease is granted while PUT tails are pending");
+            assert_eq!(tail_generation, movement_generation);
+            store
+                .validate_scanner_publication_lease(old_lease, movement_generation)
+                .await
+                .expect("an existing remote lease validates across pending PUT tails");
+            drop(
                 store
                     .acquire_scanner_publication_lease_guard(old_lease)
                     .await
-                    .expect_err("target-side publication admission must reject pending PUT tails"),
-            ] {
-                assert!(
-                    error.to_string().contains("blocked"),
-                    "publication must fail because of active tails: {error}"
-                );
-            }
+                    .expect("target-side publication admission accepts pending PUT tails"),
+            );
+            assert!(store.release_scanner_publication_lease(tail_lease).await);
             store.release_scanner_publication_lease(old_lease).await;
 
             for (index, barrier) in barriers.iter().enumerate() {
@@ -4036,7 +4033,7 @@ mod tests {
                 assert!(store.scanner_namespace_mutation_generation() > namespace_generation);
                 let pending = index + 1 < barriers.len();
                 assert_eq!(ctx.namespace_commits_pending(), pending);
-                assert_eq!(store.scanner_data_usage_publication_blocked().await, pending);
+                assert!(!store.scanner_data_usage_publication_blocked().await);
                 assert!(!store.scanner_data_movement_activity().await.1);
                 assert!(store.scanner_data_usage_publication_admission_guard().await.is_some());
                 assert!(set.scanner_data_usage_publication_admission_guard().await.is_some());
@@ -4155,7 +4152,7 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(storage_class_env)]
-    async fn cancelled_early_ack_put_keeps_scanner_publication_blocked_until_tail_finishes() {
+    async fn cancelled_early_ack_put_keeps_namespace_commit_pending_until_tail_finishes() {
         let temp_dir = tempfile::tempdir().expect("create cancelled scanner PUT tail store dir");
         let (ctx, store, shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "scanner-cancelled-put-tail", &[4])).await;
@@ -4206,7 +4203,7 @@ mod tests {
             assert!(tracker.running() >= 1);
             assert!(ctx.namespace_commits_pending());
             assert!(!store.scanner_data_movement_activity().await.1);
-            assert!(store.scanner_data_usage_publication_blocked().await);
+            assert!(!store.scanner_data_usage_publication_blocked().await);
             assert!(store.scanner_data_usage_publication_admission_guard().await.is_some());
             assert!(
                 store.pools[0].disk_set[0]

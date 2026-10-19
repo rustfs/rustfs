@@ -2841,6 +2841,39 @@ impl Node for NodeService {
         }
     }
 
+    async fn peer_drive_admission(
+        &self,
+        request: Request<PeerDriveAdmissionRequest>,
+    ) -> Result<Response<PeerDriveAdmissionResponse>, Status> {
+        let host = request.into_inner().host;
+        match crate::server::observe_peer_drive_admission(&host).await {
+            Ok(drives) => Ok(Response::new(PeerDriveAdmissionResponse {
+                success: true,
+                drives: drives
+                    .into_iter()
+                    .map(|drive| PeerDriveAdmission {
+                        pool_index: drive.pool_index,
+                        set_index: drive.set_index,
+                        disk_index: drive.disk_index,
+                        online: drive.online,
+                        runtime_state: drive.runtime_state,
+                        host_online: drive.host_online,
+                    })
+                    .collect(),
+                error_info: None,
+                error_code: None,
+            })),
+            Err(err) => Ok(Response::new(PeerDriveAdmissionResponse {
+                success: false,
+                drives: Vec::new(),
+                error_info: Some(err.to_string()),
+                error_code: err
+                    .not_initialized()
+                    .then_some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
+            })),
+        }
+    }
+
     async fn get_metacache_listing(
         &self,
         _request: Request<GetMetacacheListingRequest>,
@@ -6871,7 +6904,7 @@ mod tests {
                 "the standard builder must use this exact instance context"
             );
             super::timeout(Duration::from_secs(10), async {
-                while env.ecstore.scanner_data_usage_publication_blocked().await {
+                while env.ecstore.namespace_commits_pending_for_test() {
                     tokio::task::yield_now().await;
                 }
             })
@@ -8097,7 +8130,7 @@ mod tests {
             before
         );
         assert!(!disk.path().join("target-rpc/destination").exists());
-        assert!(!fixture.env.ecstore.scanner_data_usage_publication_blocked().await);
+        assert!(!fixture.env.ecstore.namespace_commits_pending_for_test());
     }
 
     #[tokio::test]
@@ -8130,7 +8163,7 @@ mod tests {
                 .expect("source remains"),
             before
         );
-        assert!(!fixture.env.ecstore.scanner_data_usage_publication_blocked().await);
+        assert!(!fixture.env.ecstore.namespace_commits_pending_for_test());
     }
 
     #[cfg(not(windows))]
@@ -8358,12 +8391,12 @@ mod tests {
         .expect("bounded physical entry");
         drop(handler);
         assert!(
-            fixture.env.ecstore.scanner_data_usage_publication_blocked().await,
+            fixture.env.ecstore.namespace_commits_pending_for_test(),
             "dropping the actual target handler must not release its physical owner"
         );
         drop(pause);
         super::timeout(Duration::from_secs(10), async {
-            while fixture.env.ecstore.scanner_data_usage_publication_blocked().await {
+            while fixture.env.ecstore.namespace_commits_pending_for_test() {
                 tokio::task::yield_now().await;
             }
         })
@@ -8444,10 +8477,10 @@ mod tests {
         .await
         .expect("bounded physical restore entry");
         drop(handler);
-        assert!(fixture.env.ecstore.scanner_data_usage_publication_blocked().await);
+        assert!(fixture.env.ecstore.namespace_commits_pending_for_test());
         drop(pause);
         super::timeout(Duration::from_secs(10), async {
-            while fixture.env.ecstore.scanner_data_usage_publication_blocked().await {
+            while fixture.env.ecstore.namespace_commits_pending_for_test() {
                 tokio::task::yield_now().await;
             }
         })
@@ -8602,7 +8635,7 @@ mod tests {
             // Copy the complete internal trees, including erasure part data,
             // without editing disk IDs, cluster identity, epochs or pool topology.
             super::timeout(Duration::from_secs(10), async {
-                while store_b.scanner_data_usage_publication_blocked().await {
+                while store_b.namespace_commits_pending_for_test() {
                     tokio::task::yield_now().await;
                 }
             })
@@ -8632,7 +8665,7 @@ mod tests {
             }
             assert_eq!(internal_snapshot(root_a.path()).await, snapshot, "A must receive the complete physical snapshot");
             assert_eq!(internal_snapshot(root_b.path()).await, snapshot, "B's source snapshot must remain unchanged");
-            assert!(!store_b.scanner_data_usage_publication_blocked().await);
+            assert!(!store_b.namespace_commits_pending_for_test());
             assert_eq!(store_b.scanner_namespace_mutation_generation(), snapshot_generation);
             let store_a = build_store(root_a.path()).await;
             assert_eq!(
@@ -8766,8 +8799,8 @@ mod tests {
             assert!(tokio::fs::try_exists(&a_staging).await.expect("A staging exists"));
             assert_ne!(a_before, b_before, "the old on-disk bodies must distinguish A from B");
             super::timeout(Duration::from_secs(10), async {
-                while store_a.scanner_data_usage_publication_blocked().await
-                    || store_b.scanner_data_usage_publication_blocked().await
+                while store_a.namespace_commits_pending_for_test()
+                    || store_b.namespace_commits_pending_for_test()
                 {
                     tokio::task::yield_now().await;
                 }
@@ -8816,8 +8849,8 @@ mod tests {
                 store_b.scanner_namespace_mutation_generation(),
             );
             let pending_after = (
-                store_a.scanner_data_usage_publication_blocked().await,
-                store_b.scanner_data_usage_publication_blocked().await,
+                store_a.namespace_commits_pending_for_test(),
+                store_b.namespace_commits_pending_for_test(),
             );
             for disk in store_a.disk_map.values().chain(store_b.disk_map.values()).flatten().flatten() {
                 disk.close().await.expect("close real fixture disk before assertions and directory cleanup");

@@ -60,6 +60,20 @@ pub const DEFAULT_HEALTH_LOCK_ONLINE_TIMEOUT_MS: u64 = 1000;
 pub const ENV_STARTUP_READINESS_MAX_WAIT_SECS: &str = "RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS";
 pub const DEFAULT_STARTUP_READINESS_MAX_WAIT_SECS: u64 = 120;
 
+/// Wait for peer re-admission before a distributed node publishes startup
+/// readiness.
+///
+/// After this node reaches local readiness it asks the peers in each erasure
+/// set it serves, over the internode RPC channel, whether they count its
+/// drives as online. Startup readiness is published once a strict majority of
+/// each set's peers do, or when the startup budget
+/// ([`ENV_STARTUP_READINESS_MAX_WAIT_SECS`]) elapses, or when unreachable or
+/// older peers make that majority impossible. The gate always fails open; it
+/// never affects steady-state `/health/ready` or request handling. Disable it
+/// to restore the local-view-only startup readiness.
+pub const ENV_STARTUP_PEER_READMISSION_ENABLE: &str = "RUSTFS_STARTUP_PEER_READMISSION_ENABLE";
+pub const DEFAULT_STARTUP_PEER_READMISSION_ENABLE: bool = true;
+
 /// Enable minimal health payload mode for GET `/health*` responses.
 /// When enabled, only `status` and `ready` fields are returned.
 pub const ENV_HEALTH_MINIMAL_RESPONSE_ENABLE: &str = "RUSTFS_HEALTH_MINIMAL_RESPONSE_ENABLE";
