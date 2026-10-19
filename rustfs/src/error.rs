@@ -543,6 +543,16 @@ impl ApiError {
     }
 }
 
+fn error_chain_has_unavailable_rpc(err: &(dyn std::error::Error + 'static)) -> bool {
+    error_chain_find(err, |error| {
+        error
+            .downcast_ref::<tonic::Status>()
+            .is_some_and(|status| status.code() == tonic::Code::Unavailable)
+            .then_some(())
+    })
+    .is_some()
+}
+
 fn error_chain_has_type<T>(err: &(dyn std::error::Error + 'static)) -> bool
 where
     T: std::error::Error + 'static,
@@ -740,6 +750,7 @@ impl From<StorageError> for ApiError {
             StorageError::BucketNameInvalid(_) => S3ErrorCode::InvalidBucketName,
             StorageError::ObjectNameInvalid(_, _) => S3ErrorCode::InvalidArgument,
             StorageError::BucketExists(_) => S3ErrorCode::BucketAlreadyOwnedByYou,
+            StorageError::Io(io_error) if error_chain_has_unavailable_rpc(io_error) => S3ErrorCode::ServiceUnavailable,
             StorageError::StorageFull => S3ErrorCode::ServiceUnavailable,
             StorageError::SlowDown => S3ErrorCode::SlowDown,
             StorageError::FaultyDisk
@@ -886,6 +897,13 @@ impl From<std::io::Error> for ApiError {
                     source: Some(Box::new(err)),
                 };
             }
+        }
+        if error_chain_has_unavailable_rpc(&err) {
+            return ApiError {
+                code: S3ErrorCode::ServiceUnavailable,
+                message: ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable),
+                source: Some(Box::new(err)),
+            };
         }
         ApiError {
             code: S3ErrorCode::InternalError,
@@ -1236,6 +1254,82 @@ mod tests {
             let api_error = ApiError::from(StorageError::Io(IoError::other(MockS3sBodyStreamError(message))));
             assert_eq!(api_error.code, S3ErrorCode::IncompleteBody, "{message}");
             assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
+        }
+    }
+
+    #[test]
+    fn rpc_unavailable_preserves_service_refusal_across_io_boundaries() {
+        let status = || tonic::Status::unavailable("private transport detail must not reach the S3 response");
+        let storage = || StorageError::from(status());
+        for error in [
+            ApiError::from(storage()),
+            ApiError::from(storage().clone()),
+            ApiError::from(StorageError::Io(IoError::other(IoError::other(status())))),
+            ApiError::from(IoError::other(status())),
+            ApiError::from(IoError::other(storage())),
+        ] {
+            assert_eq!(error.code, S3ErrorCode::ServiceUnavailable);
+            assert_eq!(error.message, ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable));
+            assert_eq!(error.diagnostic().rpc_code, Some(tonic::Code::Unavailable));
+            let s3_error = S3Error::from(error);
+            assert_eq!(s3_error.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+        }
+    }
+
+    #[test]
+    fn rpc_unavailable_mapping_does_not_match_other_codes_or_untyped_messages() {
+        for code in [
+            tonic::Code::Cancelled,
+            tonic::Code::Unknown,
+            tonic::Code::InvalidArgument,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::NotFound,
+            tonic::Code::AlreadyExists,
+            tonic::Code::PermissionDenied,
+            tonic::Code::ResourceExhausted,
+            tonic::Code::FailedPrecondition,
+            tonic::Code::Aborted,
+            tonic::Code::OutOfRange,
+            tonic::Code::Unimplemented,
+            tonic::Code::Internal,
+            tonic::Code::DataLoss,
+            tonic::Code::Unauthenticated,
+        ] {
+            for error in [
+                ApiError::from(StorageError::from(tonic::Status::new(code, "rpc unavailable"))),
+                ApiError::from(IoError::other(tonic::Status::new(code, "rpc unavailable"))),
+            ] {
+                assert_eq!(error.code, S3ErrorCode::InternalError, "{code:?}");
+            }
+        }
+        for error in [
+            ApiError::from(StorageError::Io(IoError::other("status: Unavailable"))),
+            ApiError::from(IoError::other("status: Unavailable")),
+        ] {
+            assert_eq!(error.code, S3ErrorCode::InternalError);
+        }
+    }
+
+    #[test]
+    fn rpc_unavailable_mapping_keeps_client_digest_error_precedence() {
+        #[derive(Debug)]
+        struct DigestWithRpcSource(tonic::Status);
+        impl std::fmt::Display for DigestWithRpcSource {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("UploadStreamError: Sha256Mismatch")
+            }
+        }
+        impl std::error::Error for DigestWithRpcSource {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let source = || DigestWithRpcSource(tonic::Status::unavailable("private transport failure"));
+        for error in [
+            ApiError::from(StorageError::Io(IoError::other(source()))),
+            ApiError::from(IoError::other(source())),
+        ] {
+            assert_eq!(error.code, S3ErrorCode::BadDigest);
         }
     }
 

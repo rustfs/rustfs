@@ -2131,7 +2131,7 @@ mod tests {
             .without_time()
             .with_writer(writer.clone())
             .finish();
-        let mut status = tonic::Status::unavailable("secret source message");
+        let mut status = tonic::Status::internal("secret source message");
         status
             .metadata_mut()
             .insert("authorization", "secret-token".parse().expect("metadata"));
@@ -2144,7 +2144,13 @@ mod tests {
             let mut opaque = S3Error::with_message(S3ErrorCode::InternalError, "secret outer message");
             opaque.set_source(Box::new(std::io::Error::other("secret inner message")));
             super::log_object_internal_error("DeleteObject", None, &opaque);
-            super::log_object_internal_error("GetObject", None, &S3Error::new(S3ErrorCode::ServiceUnavailable));
+            let unavailable: S3Error = crate::error::ApiError::from(crate::storage::StorageError::from(
+                tonic::Status::unavailable("secret transport message"),
+            ))
+            .into();
+            assert_eq!(unavailable.code(), &S3ErrorCode::ServiceUnavailable);
+            assert_eq!(unavailable.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+            super::log_object_internal_error("GetObject", None, &unavailable);
         });
         let output = String::from_utf8(writer.0.lock().expect("log buffer").clone()).expect("UTF8 log");
         assert!(!output.contains("secret"));
@@ -2159,7 +2165,7 @@ mod tests {
             assert_eq!(row["fields"]["source_chain_truncated"], false);
         }
         assert_eq!(rows[0]["fields"]["request_id"], "server-owned-request");
-        assert_eq!(rows[0]["fields"]["rpc_error_code"], "Some(Unavailable)");
+        assert_eq!(rows[0]["fields"]["rpc_error_code"], "Some(Internal)");
         assert_eq!(rows[1]["fields"]["request_id"], "unavailable");
         assert_eq!(rows[1]["fields"]["io_error_kind"], "Some(Other)");
         assert_eq!(error.code(), &original_code);
