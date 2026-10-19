@@ -1028,11 +1028,16 @@ fn decommission_capacity_blocked_error(message: impl Display) -> Error {
     }
 }
 
+/// Cloning an `Io` error keeps only its message, so an error that crossed a
+/// shared error slot is still recognized by the rendered variant prefix.
+const DECOMMISSION_CAPACITY_BLOCKED_PREFIX: &str = "decommission_capacity_blocked:";
+
 fn is_decommission_capacity_blocked_error(err: &Error) -> bool {
     if matches!(err, Error::DecommissionCapacityBlocked { .. }) {
         return true;
     }
     data_movement::data_movement_stage_source(err).is_some_and(is_decommission_capacity_blocked_error)
+        || (matches!(err, Error::Io(_)) && err.to_string().contains(DECOMMISSION_CAPACITY_BLOCKED_PREFIX))
 }
 
 fn is_decommission_capacity_intent_conflict(err: &Error) -> bool {
@@ -1040,8 +1045,12 @@ fn is_decommission_capacity_intent_conflict(err: &Error) -> bool {
         return message.contains("unresolved target capacity intent")
             || message.contains("pending capacity intent belongs to another mutation");
     }
-    data_movement::data_movement_stage_source(err).is_some_and(is_decommission_capacity_intent_conflict)
-        || err.to_string().contains("unresolved target capacity intent")
+    if data_movement::data_movement_stage_source(err).is_some_and(is_decommission_capacity_intent_conflict) {
+        return true;
+    }
+    let rendered = err.to_string();
+    rendered.contains("unresolved target capacity intent")
+        || rendered.contains("pending capacity intent belongs to another mutation")
 }
 
 pub(crate) fn decommission_capacity_target_gate_busy_index(err: &Error) -> Option<usize> {
@@ -3108,8 +3117,16 @@ fn is_decommission_set_local_usage_cache(bucket: &str, object: &str) -> bool {
     name.strip_suffix(".bkp").unwrap_or(name) == DATA_USAGE_CACHE_NAME
 }
 
-fn with_decommission_entry_context<E: Display>(stage: &str, bucket: &str, object: &str, err: E) -> Error {
-    Error::other(format!("decommission entry {stage} failed for bucket {bucket} object {object}: {err}"))
+/// Keep the typed cause reachable so the entry retry loop and the routine
+/// classify a wrapped capacity block or intent conflict by type.
+fn with_decommission_entry_context<E>(stage: &str, bucket: &str, object: &str, err: E) -> Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    data_movement::data_movement_context_error(
+        format!("decommission entry {stage} failed for bucket {bucket} object {object}: {err}"),
+        err,
+    )
 }
 
 #[cfg(test)]
@@ -4931,6 +4948,21 @@ fn should_skip_canceled_decommission_routine(cancel_signal: bool, pool: Option<&
             .is_some_and(|info| info.canceled)
 }
 
+/// The first failure of concurrent decommission work cancels its siblings,
+/// which then report `OperationCanceled`, possibly before the failing task
+/// returns. Keep the failure that caused the cancellation so the routine
+/// classifies the real cause: a capacity block pauses instead of ending the
+/// decommission as failed.
+fn keep_decommission_root_cause(first: &mut Option<Error>, err: Error) {
+    let replaces = match first.as_ref() {
+        None => true,
+        Some(existing) => is_err_operation_canceled(existing) && !is_err_operation_canceled(&err),
+    };
+    if replaces {
+        *first = Some(err);
+    }
+}
+
 async fn run_decommission_buckets_bounded<F>(
     rx: CancellationToken,
     buckets: Vec<DecomBucketInfo>,
@@ -4956,9 +4988,7 @@ where
     while let Some(result) = active.next().await {
         if let Err(err) = result {
             rx.cancel();
-            if first_err.is_none() {
-                first_err = Some(err);
-            }
+            keep_decommission_root_cause(&mut first_err, err);
             continue;
         }
 
@@ -11887,16 +11917,18 @@ impl ECStore {
             )
         };
         let expected_target_physical_bytes = capacity_target_physical_bytes(expected_data_bytes.max(1), target_layout)?;
-        // Without its own pending intent, this mutation's inflight marker is
-        // the only unsettled record of it: either bytes it staged or an intent
-        // a previous routine incarnation left and the resumed routine adopted.
-        // The equivalent committed target proves the commit, so settle that
-        // marker into consumption exactly as the lost finalize would have. A
-        // pending intent of another mutation is not this mutation's to check
-        // or resolve, so it does not stand in the way.
+        // A target holds one pending intent at a time, so a pending intent of
+        // another mutation means this mutation has none here; that intent is
+        // not this mutation's to check or resolve. Without its own pending
+        // intent, this mutation's inflight marker is the only unsettled record
+        // of it: either bytes it staged or an intent a previous routine
+        // incarnation left and the resumed routine adopted. The equivalent
+        // committed target proves the commit, so settle that marker into
+        // consumption exactly as the lost finalize would have. With neither,
+        // the commit was already charged.
         let owns_pending = target_pending_physical_bytes > 0 && target_pending_mutation_id == Some(mutation_id);
         let settles_marker_only = has_temporary_mutation && !owns_pending;
-        if target_pending_physical_bytes == 0 && !has_temporary_mutation {
+        if !owns_pending && !has_temporary_mutation {
             if target_consumed_physical_bytes >= expected_target_physical_bytes {
                 let mut pool_meta = self.pool_meta.write().await;
                 ensure_pool_meta_write_fence(&pool_meta_guard, "equivalent target idempotent publication")?;
@@ -12086,7 +12118,10 @@ impl ECStore {
                     .any(|mutation| mutation.mutation_id == mutation_id),
             )
         };
-        if pending_physical_bytes == 0 && !has_temporary_mutation {
+        // A target holds one pending intent at a time, so another mutation's
+        // pending intent means this mutation has none here to settle.
+        let owns_pending = pending_physical_bytes > 0 && pending_mutation_id == Some(mutation_id);
+        if !owns_pending && !has_temporary_mutation {
             // A prior successful attempt already settled both durable halves.
             ensure_pool_meta_write_fence(&pool_meta_guard, "equivalent temporary target reconciliation fence failed")?;
             if let Some(target_guard) = target_guard.as_ref() {
@@ -12098,18 +12133,13 @@ impl ECStore {
             }
             return Ok(());
         }
-        if pending_physical_bytes > 0 && pending_mutation_id != Some(mutation_id) {
-            return Err(decommission_capacity_blocked_error(
-                "equivalent temporary target pending intent belongs to another mutation",
-            ));
-        }
         let expected_target_physical_bytes = capacity_target_physical_bytes(expected_data_bytes.max(1), target_layout)?;
-        if pending_physical_bytes > 0 && pending_physical_bytes != expected_target_physical_bytes {
+        if owns_pending && pending_physical_bytes != expected_target_physical_bytes {
             return Err(decommission_capacity_blocked_error(
                 "equivalent temporary target pending capacity does not match the committed checkpoint",
             ));
         }
-        if pending_physical_bytes > 0 {
+        if owns_pending {
             resolve_decommission_target_pending(
                 &mut snapshot,
                 source_pool_index,
@@ -16870,17 +16900,17 @@ impl ECStore {
         for (set_id, worker) in listing_workers {
             if let Err(err) = resolve_decommission_listing_worker_result(set_id, worker.await) {
                 rx.cancel();
-                if listing_worker_error.is_none() {
-                    listing_worker_error = Some(err);
-                }
+                keep_decommission_root_cause(&mut listing_worker_error, err);
             }
         }
 
-        if let Some(err) = listing_worker_error {
-            return Err(err);
-        }
-
+        // An entry failure cancels the listing workers, so a canceled listing
+        // must not hide the entry error that caused it.
+        let mut bucket_error = listing_worker_error;
         if let Some(err) = entry_error.lock().await.clone() {
+            keep_decommission_root_cause(&mut bucket_error, err);
+        }
+        if let Some(err) = bucket_error {
             return Err(err);
         }
 
@@ -22159,6 +22189,41 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn settled_equivalent_target_does_not_wait_for_another_mutations_pending_slot() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        start_leftover_intent_test_decommission(&store, Vec::new(), DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION).await;
+        // An earlier attempt committed and charged this copy, for example a
+        // delete marker whose source cleanup never ran.
+        let settled = uuid::Uuid::new_v4();
+        let settled_owner = leftover_intent_test_owner(&store, settled).await;
+        store
+            .run_decommission_capacity_admitted_mutation_with_capacity_lease(1, Some(settled_owner), Some(1), |_| async {
+                Ok(())
+            })
+            .await
+            .expect("charge the settled copy");
+        // Another mutation holds the slot between a failed write and its retry.
+        let waiting = uuid::Uuid::new_v4();
+        leave_unfinalized_decommission_target_intent(&store, 1, waiting, 8).await;
+        let before = leftover_intent_test_target(&store, 1).await;
+
+        store
+            .reconcile_decommission_capacity_after_equivalent_target(settled_owner, 1, 0)
+            .await
+            .expect("an equivalent copy that is already charged has nothing to wait for");
+        store
+            .reconcile_decommission_capacity_after_equivalent_temporary_target(settled_owner, 1, 1)
+            .await
+            .expect("an equivalent checkpoint that is already settled has nothing to wait for");
+        assert_eq!(
+            leftover_intent_test_target(&store, 1).await,
+            before,
+            "neither reconciliation may resolve the other mutation's intent or charge the copy again"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn equivalent_target_settles_an_adopted_intent_into_consumption() {
         let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
         start_leftover_intent_test_decommission(&store, Vec::new(), DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION).await;
@@ -23704,6 +23769,32 @@ mod tests {
     }
 
     #[test]
+    fn decommission_capacity_conflict_stays_classified_through_entry_context_and_clone() {
+        let err = with_decommission_entry_context(
+            "delete_marker_copy",
+            "bucket",
+            "object",
+            decommission_capacity_blocked_error(
+                "source pool 0 target pool 1 pending capacity intent belongs to another mutation",
+            ),
+        );
+        // A shared entry error slot hands out clones, which keep only the
+        // rendered message of an I/O error.
+        let cloned = err.clone();
+        assert!(is_decommission_capacity_blocked_error(&err));
+        assert_eq!(
+            decommission_capacity_retry_kind(&err, 0),
+            Some(DecommissionCapacityRetryKind::IntentConflict),
+            "a wrapped conflict must keep the bounded intent-conflict retry"
+        );
+        assert!(is_decommission_capacity_blocked_error(&cloned));
+        assert!(is_decommission_capacity_intent_conflict(&cloned));
+        assert!(!is_decommission_capacity_blocked_error(&Error::other(
+            "decommission entry update_after failed"
+        )));
+    }
+
+    #[test]
     fn decommission_target_capacity_error_rejects_unrelated_errors() {
         assert!(!is_decommission_target_capacity_error(&Error::SlowDown));
     }
@@ -24952,7 +25043,7 @@ mod pools_tests {
         decommission_capacity_blocked_error, decommission_capacity_intent_adoption_plan, decommission_capacity_mutation_id,
         decommission_capacity_target_gate_retry_exhausted, decommission_intent_adoption_failure,
         ensure_decommission_target_owner_admission, ensure_exact_delete_capacity_namespace_fences,
-        ensure_external_decommission_target_admission, is_decommission_capacity_blocked_error,
+        ensure_external_decommission_target_admission, is_decommission_capacity_blocked_error, keep_decommission_root_cause,
         plan_exact_delete_capacity_reconciliations, record_decommission_target_consumption, release_decommission_target_inflight,
         reserve_decommission_target_pending, resolve_decommission_target_pending,
         set_decommission_capacity_info_overrides_for_test, validate_decommission_capacity_reservation,
@@ -28198,6 +28289,60 @@ mod pools_tests {
         assert_eq!(started.load(Ordering::SeqCst), 8);
         assert_eq!(max_running.load(Ordering::SeqCst), 2);
         assert_eq!(running.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn decommission_root_cause_survives_sibling_cancellations() {
+        let capacity = || decommission_capacity_blocked_error("pending capacity intent belongs to another mutation");
+        let mut first = None;
+        keep_decommission_root_cause(&mut first, Error::OperationCanceled);
+        keep_decommission_root_cause(&mut first, capacity());
+        keep_decommission_root_cause(&mut first, Error::OperationCanceled);
+        assert!(first.as_ref().is_some_and(is_decommission_capacity_blocked_error));
+
+        let mut first = None;
+        keep_decommission_root_cause(&mut first, Error::SlowDown);
+        keep_decommission_root_cause(&mut first, capacity());
+        assert!(
+            matches!(first, Some(Error::SlowDown)),
+            "the first real failure stays the reported cause: {first:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_decommission_buckets_bounded_reports_the_failure_behind_a_sibling_cancellation() {
+        let rx = CancellationToken::new();
+        let buckets = ["failing", "sibling"]
+            .into_iter()
+            .map(|name| DecomBucketInfo {
+                name: name.to_string(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        let err = run_decommission_buckets_bounded(rx, buckets, 2, |bucket, rx| {
+            Box::pin(async move {
+                if bucket.name == "failing" {
+                    // A failing bucket cancels the shared token from inside,
+                    // then still drains its own workers before returning.
+                    rx.cancel();
+                    tokio::time::sleep(StdDuration::from_millis(50)).await;
+                    Err(decommission_capacity_blocked_error(
+                        "source pool 0 target pool 1 pending capacity intent belongs to another mutation",
+                    ))
+                } else {
+                    rx.cancelled().await;
+                    Err(Error::OperationCanceled)
+                }
+            })
+        })
+        .await
+        .expect_err("a failed bucket must fail the phase");
+
+        assert!(
+            is_decommission_capacity_blocked_error(&err),
+            "the routine must see the capacity block, not the sibling's cancellation: {err:?}"
+        );
     }
 
     #[tokio::test]
