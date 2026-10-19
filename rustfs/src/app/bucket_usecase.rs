@@ -1257,15 +1257,19 @@ fn build_list_objects_v2_metadata_output(
     }
 }
 
-fn create_bucket_exists_response(is_owner: bool) -> S3Result<S3Response<CreateBucketOutput>> {
-    if is_owner {
+fn create_bucket_exists_response(is_owner: bool, region: &str) -> S3Result<S3Response<CreateBucketOutput>> {
+    if is_owner && region == RUSTFS_REGION {
+        // AWS preserves the legacy idempotent response for buckets recreated in
+        // us-east-1 (the default RustFS region).
         return Ok(S3Response::new(CreateBucketOutput::default()));
     }
 
-    Err(s3_error!(
-        BucketAlreadyExists,
-        "The requested bucket name is not available. The bucket namespace is shared by all users of the system. Please select a different name and try again."
-    ))
+    let error_code = if is_owner {
+        S3ErrorCode::BucketAlreadyOwnedByYou
+    } else {
+        S3ErrorCode::BucketAlreadyExists
+    };
+    Err(S3Error::with_message(error_code, "The requested bucket already exists."))
 }
 
 fn resolve_notification_region(global_region: Option<Region>, request_region: Option<Region>) -> String {
@@ -1526,9 +1530,13 @@ impl DefaultBucketUsecase {
                 .await;
             }
             Err(StorageError::BucketExists(_)) => {
-                // Per S3 spec: bucket namespace is global. Owner recreating returns 200 OK;
-                // non-owner gets 409 BucketAlreadyExists.
-                let result = create_bucket_exists_response(requester_is_owner);
+                // Match AWS CreateBucket semantics: an owned bucket is idempotent in
+                // us-east-1 and returns BucketAlreadyOwnedByYou elsewhere.
+                let region = self
+                    .global_region()
+                    .map(|region| region.to_string())
+                    .unwrap_or_else(|| RUSTFS_REGION.to_string());
+                let result = create_bucket_exists_response(requester_is_owner, &region);
                 let _ = helper.complete(&result);
                 return result;
             }
@@ -4299,14 +4307,20 @@ mod tests {
 
     #[test]
     fn create_bucket_exists_response_returns_ok_for_owner() {
-        let response = create_bucket_exists_response(true).expect("owner recreate should succeed");
+        let response = create_bucket_exists_response(true, RUSTFS_REGION).expect("owner recreate in us-east-1 should succeed");
         assert_eq!(response.output.location, None);
     }
 
     #[test]
     fn create_bucket_exists_response_returns_bucket_already_exists_for_non_owner() {
-        let err = create_bucket_exists_response(false).expect_err("non-owner recreate should fail");
+        let err = create_bucket_exists_response(false, RUSTFS_REGION).expect_err("non-owner recreate should fail");
         assert_eq!(err.code(), &S3ErrorCode::BucketAlreadyExists);
+    }
+
+    #[test]
+    fn create_bucket_exists_response_returns_owned_by_you_outside_us_east_1() {
+        let err = create_bucket_exists_response(true, "eu-west-1").expect_err("owner recreate outside us-east-1 should fail");
+        assert_eq!(err.code(), &S3ErrorCode::BucketAlreadyOwnedByYou);
     }
 
     #[test]

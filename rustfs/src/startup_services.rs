@@ -43,6 +43,7 @@ const LOG_COMPONENT_CONNECT: &str = "connect";
 const LOG_SUBSYSTEM_INVENTORY: &str = "inventory";
 
 pub(crate) struct StartupServiceRuntime {
+    pub(crate) table_maintenance: Option<crate::table_catalog::PeriodicMaintenanceRuntime>,
     pub(crate) oidc_recovery: Option<AbortOnDropHandle<()>>,
     pub(crate) optional_runtimes: OptionalRuntimeServices,
     pub(crate) heartbeat: Option<HeartbeatRuntime>,
@@ -83,6 +84,7 @@ pub(crate) async fn init_startup_runtime_services(
     state_manager: Arc<ServiceStateManager>,
     server_ctx: Arc<ServerContextSlot>,
 ) -> Result<StartupServiceRuntime> {
+    let maintenance_config = crate::table_catalog::PeriodicMaintenanceConfig::from_env().map_err(std::io::Error::other)?;
     init_kms_system(config, store.clone()).await?;
 
     let optional_runtimes = init_optional_runtime_services(server_ctx.clone()).await?;
@@ -102,7 +104,7 @@ pub(crate) async fn init_startup_runtime_services(
     init_deadlock_detector_runtime();
 
     let buckets = init_bucket_metadata_runtime(store.clone(), ctx.clone()).await?;
-    let iam_bootstrap = init_iam_runtime(store.clone(), ctx.clone(), readiness, state_manager, server_ctx).await?;
+    let iam_bootstrap = init_iam_runtime(store.clone(), ctx.clone(), readiness, state_manager, server_ctx.clone()).await?;
 
     // Audit initialization requires the AppContext (server config + object store)
     // which is published by ensure_startup_after_iam inside init_iam_runtime.
@@ -119,7 +121,11 @@ pub(crate) async fn init_startup_runtime_services(
     let heartbeat = start_heartbeat_runtime(heartbeat_config.clone(), heartbeat_nodes, &ctx)?;
     let inventory = start_inventory_runtime(heartbeat_config, heartbeat_nodes, inventory_drives, store, &ctx)?;
 
+    let table_maintenance =
+        maintenance_config.map(|config| crate::table_catalog::PeriodicMaintenanceRuntime::spawn(config, server_ctx, &ctx));
+
     Ok(StartupServiceRuntime {
+        table_maintenance,
         oidc_recovery,
         optional_runtimes,
         heartbeat,

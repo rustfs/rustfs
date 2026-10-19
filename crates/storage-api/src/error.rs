@@ -107,6 +107,9 @@ pub enum StorageErrorCode {
     QuotaExceeded,
     RemoteClientUnavailable,
     RemoteNotInitialized,
+    ConditionalDeleteConflict,
+    GuardedDeleteUnsupported,
+    DeleteRecoveryLegacyAmbiguous,
 }
 
 impl StorageErrorCode {
@@ -196,6 +199,9 @@ impl StorageErrorCode {
             Self::QuotaExceeded => 0x53,
             Self::RemoteClientUnavailable => 0x54,
             Self::RemoteNotInitialized => 0x55,
+            Self::ConditionalDeleteConflict => 0x57,
+            Self::GuardedDeleteUnsupported => 0x58,
+            Self::DeleteRecoveryLegacyAmbiguous => 0x59,
         }
     }
 
@@ -285,6 +291,9 @@ impl StorageErrorCode {
             0x53 => Some(Self::QuotaExceeded),
             0x54 => Some(Self::RemoteClientUnavailable),
             0x55 => Some(Self::RemoteNotInitialized),
+            0x57 => Some(Self::ConditionalDeleteConflict),
+            0x58 => Some(Self::GuardedDeleteUnsupported),
+            0x59 => Some(Self::DeleteRecoveryLegacyAmbiguous),
             _ => None,
         }
     }
@@ -382,6 +391,9 @@ mod tests {
         (StorageErrorCode::SourceStalled, 0x50),
         (StorageErrorCode::Timeout, 0x51),
         (StorageErrorCode::InvalidPath, 0x52),
+        (StorageErrorCode::ConditionalDeleteConflict, 0x57),
+        (StorageErrorCode::GuardedDeleteUnsupported, 0x58),
+        (StorageErrorCode::DeleteRecoveryLegacyAmbiguous, 0x59),
     ];
 
     #[test]

@@ -1059,6 +1059,20 @@ pub fn canonical_rename_data_request_body(
     Ok(body.finish())
 }
 
+pub const QUOTA_MUTATION_TOPOLOGY_HEADER: &str = "x-rustfs-quota-topology";
+
+/// Binds a quota mutation to the coordinator's complete, ordered storage layout.
+/// The inner canonical body retains its operation-specific domain and wire fields.
+pub fn canonical_quota_mutation_request_body(
+    topology_fingerprint: &str,
+    mutation_body: &[u8],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-quota-mutation-topology-request-v1\0");
+    body.push_str(topology_fingerprint)?;
+    body.push_bytes(mutation_body)?;
+    Ok(body.finish())
+}
+
 pub fn canonical_delete_version_request_body(
     request: &proto_gen::node_service::DeleteVersionRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
@@ -1093,6 +1107,17 @@ pub fn canonical_delete_versions_request_body(
         body.push_bytes(version_bin)?;
     }
     body.push_bytes(&request.opts_bin)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_guarded_delete_versions_request_body(
+    request: &proto_gen::node_service::GuardedDeleteVersionsRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-guarded-delete-versions-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_bytes(&request.payload)?;
+    body.push_bool(request.probe_only);
     Ok(body.finish())
 }
 
@@ -1343,6 +1368,58 @@ mod disk_mutation_canonical_tests {
         SnapshotLeaseRenewRequest, SnapshotLeaseRequest, UpdateMetadataRequest, WriteAllRequest, WriteMetadataRequest,
     };
     use super::*;
+
+    #[test]
+    fn quota_mutation_envelope_binds_topology_operation_and_field_boundaries() {
+        let acquire = canonical_snapshot_lease_request_body(&SnapshotLeaseRequest::default()).expect("acquire body");
+        let release =
+            canonical_snapshot_lease_release_request_body(&SnapshotLeaseReleaseRequest::default()).expect("release body");
+        let rename = canonical_rename_data_request_body(&RenameDataRequest::default()).expect("rename body");
+        let topology = "a".repeat(64);
+        let envelope = canonical_quota_mutation_request_body(&topology, &acquire).expect("quota envelope");
+        assert_ne!(envelope, acquire, "quota and ordinary mutation domains must differ");
+        assert_all_distinct(&[
+            envelope,
+            canonical_quota_mutation_request_body(&"b".repeat(64), &acquire).expect("changed topology"),
+            canonical_quota_mutation_request_body(&topology, &release).expect("release envelope"),
+            canonical_quota_mutation_request_body(&topology, &rename).expect("rename envelope"),
+        ]);
+        assert_ne!(
+            canonical_quota_mutation_request_body("ab", b"c").expect("first boundary"),
+            canonical_quota_mutation_request_body("a", b"bc").expect("second boundary"),
+            "topology and operation bytes must be independently length delimited"
+        );
+    }
+
+    #[test]
+    fn guarded_delete_digest_binds_probe_and_payload() {
+        let request = proto_gen::node_service::GuardedDeleteVersionsRequest {
+            disk: "disk-a".into(),
+            volume: "bucket-a".into(),
+            payload: vec![0x80].into(),
+            probe_only: false,
+        };
+        let original = canonical_guarded_delete_versions_request_body(&request).expect("encode guarded body");
+        let mut candidates = Vec::new();
+        let mut changed = request.clone();
+        changed.disk = "disk-b".into();
+        candidates.push(changed);
+        let mut changed = request.clone();
+        changed.volume = "bucket-b".into();
+        candidates.push(changed);
+        let mut changed = request.clone();
+        changed.payload = vec![0x81].into();
+        candidates.push(changed);
+        let mut changed = request;
+        changed.probe_only = true;
+        candidates.push(changed);
+        for changed in candidates {
+            assert_ne!(
+                canonical_guarded_delete_versions_request_body(&changed).expect("encode changed body"),
+                original
+            );
+        }
+    }
 
     #[test]
     fn delete_recovery_canonical_body_binds_all_wire_fields() {

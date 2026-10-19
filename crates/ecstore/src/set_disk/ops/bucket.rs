@@ -31,6 +31,7 @@ use crate::disk::DiskAPI;
 pub(crate) enum BucketInfoQuorum {
     Read,
     Write,
+    HealCandidates,
 }
 
 impl SetDisks {
@@ -104,7 +105,9 @@ impl SetDisks {
             // class. A namespace read must intersect that majority; object
             // readers still enforce the persisted layout's data-shard quorum.
             BucketInfoQuorum::Read => reduce_read_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, disk_count.div_ceil(2).max(1)),
-            BucketInfoQuorum::Write => reduce_write_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, disk_count / 2 + 1),
+            BucketInfoQuorum::Write | BucketInfoQuorum::HealCandidates => {
+                reduce_write_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, disk_count / 2 + 1)
+            }
         };
         if let Some(err) = error {
             return Err(err.into());
@@ -126,6 +129,29 @@ impl SetDisks {
         self.list_bucket_with_quorum(BucketInfoQuorum::Write).await
     }
 
+    pub(crate) async fn bucket_needs_reconstruction(&self, bucket: &str) -> Result<bool> {
+        let results = join_all(self.disk_inventory().await.into_iter().map(|disk| async move {
+            match disk {
+                Some(disk) => disk.stat_volume(bucket).await,
+                None => Err(DiskError::DiskNotFound),
+            }
+        }))
+        .await;
+        let mut present = false;
+        let mut missing = false;
+        for result in results {
+            match result {
+                Ok(_) => present = true,
+                Err(DiskError::VolumeNotFound) => missing = true,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if !present {
+            return Err(Error::VolumeNotFound);
+        }
+        Ok(missing)
+    }
+
     pub(crate) async fn list_bucket_with_quorum(&self, quorum: BucketInfoQuorum) -> Result<(Vec<BucketInfo>, bool)> {
         let disks = self.disk_inventory().await;
         let write_quorum = (disks.len() / 2) + 1;
@@ -134,6 +160,7 @@ impl SetDisks {
         let required = match quorum {
             BucketInfoQuorum::Read => disks.len().div_ceil(2).max(1),
             BucketInfoQuorum::Write => write_quorum,
+            BucketInfoQuorum::HealCandidates => disks.len().max(1),
         };
 
         let mut futures = Vec::with_capacity(disks.len());
@@ -165,7 +192,9 @@ impl SetDisks {
 
         let error = match quorum {
             BucketInfoQuorum::Read => reduce_read_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, required),
-            BucketInfoQuorum::Write => reduce_write_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, required),
+            BucketInfoQuorum::Write | BucketInfoQuorum::HealCandidates => {
+                reduce_write_quorum_errs(&errs, BUCKET_OP_IGNORED_ERRS, required)
+            }
         };
         if let Some(err) = error {
             return Err(err.into());
@@ -190,10 +219,17 @@ impl SetDisks {
             }
         }
 
-        topology_complete &= counts.values().all(|(count, _)| *count >= write_quorum);
+        let minimum_presence = if matches!(quorum, BucketInfoQuorum::HealCandidates) {
+            // Candidate presence is not mutation authority. Every disk must answer,
+            // and the heal owner validates the committed generation before recreation.
+            1
+        } else {
+            topology_complete &= counts.values().all(|(count, _)| *count >= write_quorum);
+            required
+        };
         let mut buckets = counts
             .into_values()
-            .filter_map(|(count, bucket)| (count >= required).then_some(bucket))
+            .filter_map(|(count, bucket)| (count >= minimum_presence).then_some(bucket))
             .collect::<Vec<_>>();
         buckets.sort_by(|left, right| left.name.cmp(&right.name));
         Ok((buckets, topology_complete))

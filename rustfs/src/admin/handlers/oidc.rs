@@ -24,7 +24,7 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_config::{ENV_RUSTFS_BROWSER_REDIRECT_URL, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_iam::federation::{FederatedSessionBindingError, FederationError};
-use rustfs_iam::oidc::{OidcProviderConfigInput, OidcProviderValidationInput};
+use rustfs_iam::oidc::{OidcProviderConfigInput, OidcProviderValidationInput, console_session_duration_secs};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -450,8 +450,9 @@ impl Operation for OidcCallbackHandler {
 
         let redirect_uri = derive_callback_uri(&req, provider_id)?;
 
+        let session_duration_seconds = console_session_duration_secs();
         let login = federation
-            .complete_authorization_code(&state, &code, &redirect_uri, 3600, &DefaultFederatedSessionBinding)
+            .complete_authorization_code(&state, &code, &redirect_uri, session_duration_seconds, &DefaultFederatedSessionBinding)
             .await
             .map_err(|error| {
                 if let FederationError::CodeExchange(message) = &error {
@@ -477,7 +478,7 @@ impl Operation for OidcCallbackHandler {
                 callback_federation_error(error)
             })?;
         let authorization = &login.session.authorization;
-        let actual_provider_id = &authorization.provider_id;
+        let actual_provider_id = authorization.provider_id();
 
         debug!(
             event = EVENT_ADMIN_OIDC_STATE,
@@ -493,10 +494,10 @@ impl Operation for OidcCallbackHandler {
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_OIDC,
             provider_id = %actual_provider_id,
-            policy_count = authorization.policies.len(),
-            group_count = authorization.groups.len(),
-            policies = ?authorization.policies,
-            groups = ?authorization.groups,
+            policy_count = authorization.policies().len(),
+            group_count = authorization.mapped_iam_groups().len(),
+            policies = ?authorization.policies(),
+            groups = ?authorization.mapped_iam_groups(),
             state = "claims_mapped",
             "admin oidc state"
         );
@@ -1374,5 +1375,31 @@ mod tests {
                 "{handler} must keep authorizing with {action}"
             );
         }
+    }
+
+    #[test]
+    fn console_callback_uses_the_configured_session_duration() {
+        let production = include_str!("oidc.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source must precede tests");
+        let callback = production
+            .split_once("impl Operation for OidcCallbackHandler")
+            .expect("the OIDC callback handler must exist")
+            .1;
+        let callback = callback.split_whitespace().collect::<String>();
+
+        assert!(
+            callback.contains("session_duration_seconds=console_session_duration_secs()"),
+            "the callback must resolve the Console session duration from the environment"
+        );
+        assert!(
+            callback.contains(".complete_authorization_code(&state,&code,&redirect_uri,session_duration_seconds,"),
+            "the callback must hand the resolved session duration to the code exchange"
+        );
+        assert!(
+            !callback.contains(".complete_authorization_code(&state,&code,&redirect_uri,3600,"),
+            "the callback must not hard-code the session duration"
+        );
     }
 }

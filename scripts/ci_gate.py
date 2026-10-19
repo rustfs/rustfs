@@ -16,13 +16,14 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 ALWAYS_JOBS = ("classify-changes", "typos", "quick-checks")
 CODE_JOBS = (
-    "test-and-lint", "offline-enrollment-e2e", "test-and-lint-rio-v2",
-    "connect-short-credential-boundary", "test-and-lint-protocols",
-    "build-rustfs-debug-binary", "uring-integration", "e2e-tests",
-    "s3-implemented-tests", "s3-lifecycle-behavior-tests",
+    "test-and-lint", "connect-feature-boundaries", "test-and-lint-rio-v2",
+    "test-and-lint-protocols", "build-rustfs-debug-binary", "uring-integration",
+    "e2e-tests", "s3-implemented-tests", "s3-lifecycle-behavior-tests",
 )
-# Full alternate-feature tests remain mandatory on main, merge groups, and
-# scheduled/manual runs, without repeating four builds on every PR revision.
+# Full alternate-feature tests run on merge groups and on scheduled/manual
+# runs. Pull requests and main pushes skip them: the nightly run reports a
+# feature regression within a day, and repeating four builds per PR revision
+# or per merge bought no earlier signal.
 EXTENDED_FEATURE_JOBS = ("test-and-lint-rio-v2", "test-and-lint-protocols")
 # These jobs still exercise the server and its black-box harness when only E2E
 # Rust sources change. Production code, manifests and shared test configuration
@@ -130,7 +131,7 @@ def expected_results(mode: str, event: str, ref: str) -> dict[str, str]:
         raise ValueError(f"invalid CI selection: {mode!r} for {event!r}")
     expected = {job: "success" for job in ALWAYS_JOBS}
     expected.update({job: "success" if mode == "full" or (mode == "e2e" and job in E2E_JOBS) else "skipped" for job in CODE_JOBS})
-    if event == "pull_request":
+    if event in ("pull_request", "push"):
         expected.update({job: "skipped" for job in EXTENDED_FEATURE_JOBS})
     rio = mode == "full" and event in ("schedule", "workflow_dispatch")
     expected.update({job: "success" if rio else "skipped" for job in OPTIONAL_JOBS[:2]})
@@ -222,12 +223,14 @@ def check_workflow(root: Path) -> list[str]:
         errors.append("required-checks must run after failed or skipped dependencies")
     for job in EXTENDED_FEATURE_JOBS:
         block = yaml_block(jobs, job, 2) or []
-        if scalar(block, "if", 4) != "needs.classify-changes.outputs.mode == 'full' && github.event_name != 'pull_request'":
-            errors.append(f"{job} must retain full validation on every non-PR event")
+        if scalar(block, "if", 4) != "needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('[\"merge_group\", \"schedule\", \"workflow_dispatch\"]'), github.event_name)":
+            errors.append(f"{job} must run on every merge-group, scheduled and manual event")
     workspace = "\n".join(yaml_block(jobs, "test-and-lint", 2) or [])
     clippy = re.search(r"^      - name: Run clippy lints\n(?P<body>.*?)(?=^      - name:|\Z)", workspace, re.MULTILINE | re.DOTALL)
-    if clippy is None or scalar(clippy["body"].splitlines(), "if", 8) != "github.event_name != 'pull_request'":
-        errors.append("workspace Clippy must run on every non-PR event")
+    clippy_lines = clippy["body"].splitlines() if clippy else []
+    if (clippy is None or any(re.match(r'''\s{8}["']?if["']?\s*:''', line) for line in clippy_lines)
+            or "cargo clippy --all-targets -- -D warnings" not in clippy["body"]):
+        errors.append("workspace Clippy must run on every event, pull requests included")
     if scalar(gate, "shell", 8) != "bash" or scalar(gate, "run", 8) != "python3 scripts/ci_gate.py verify" or scalar(gate, "CI_NEEDS", 10) != "${{ toJSON(needs) }}":
         errors.append("required-checks must verify the actual needs results")
     if any(re.match(r'''\s+(?:- )?(?:["']?continue-on-error["']?\s*:|["']?if["']?\s*:)''', line) and not line.startswith("    if:") for line in gate):
@@ -335,7 +338,8 @@ class SelfTests(unittest.TestCase):
         self.assertEqual({job for job, state in e2e.items() if state == "success"}, set(ALWAYS_JOBS + E2E_JOBS))
         for event in ("schedule", "workflow_dispatch", "merge_group", "push"):
             result = expected_results("full", event, "refs/heads/main")
-            self.assertTrue(all(result[job] == "success" for job in CODE_JOBS))
+            for job in CODE_JOBS:
+                self.assertEqual(result[job], "skipped" if event == "push" and job in EXTENDED_FEATURE_JOBS else "success", (event, job))
             self.assertEqual(result["e2e-full"], "skipped" if event == "schedule" else "success")
             self.assertEqual(result["e2e-tests-rio-v2"], "success" if event in ("schedule", "workflow_dispatch") else "skipped")
             with self.assertRaises(ValueError):
@@ -391,15 +395,17 @@ class SelfTests(unittest.TestCase):
             (root / ".github/workflows").mkdir(parents=True)
             source = (ROOT / ".github/workflows/ci.yml").read_text()
             path = root / ".github/workflows/ci.yml"
-            for condition in ("false", "github.event_name == 'schedule'", "github.event_name == 'pull_request'"):
-                path.write_text(source.replace("      - name: Run clippy lints\n        if: github.event_name != 'pull_request'", f"      - name: Run clippy lints\n        if: {condition}"))
-                self.assertIn("workspace Clippy must run on every non-PR event", check_workflow(root))
+            for condition in ("false", "github.event_name == 'schedule'", "github.event_name != 'pull_request'"):
+                path.write_text(source.replace("      - name: Run clippy lints\n", f"      - name: Run clippy lints\n        if: {condition}\n", 1))
+                self.assertIn("workspace Clippy must run on every event, pull requests included", check_workflow(root))
+            path.write_text(source.replace("cargo clippy --all-targets -- -D warnings", "cargo clippy --all-targets", 1))
+            self.assertIn("workspace Clippy must run on every event, pull requests included", check_workflow(root))
             for job in EXTENDED_FEATURE_JOBS:
                 before, block = source.split(f"  {job}:\n", 1)
                 for condition in ("false", "github.event_name == 'schedule'", "github.event_name != 'pull_request'"):
                     changed = re.sub(r"^    if: .*", f"    if: {condition}", block, count=1, flags=re.MULTILINE)
                     path.write_text(before + f"  {job}:\n" + changed)
-                    self.assertIn(f"{job} must retain full validation on every non-PR event", check_workflow(root))
+                    self.assertIn(f"{job} must run on every merge-group, scheduled and manual event", check_workflow(root))
             for job in ALWAYS_JOBS + CODE_JOBS + OPTIONAL_JOBS:
                 before, gate = source.split("  required-checks:\n", 1)
                 path.write_text(before + "  required-checks:\n" + gate.replace(f"      - {job}\n", "", 1))

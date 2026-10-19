@@ -555,6 +555,14 @@ message DeleteVersionsRequest {
   bytes opts_bin = 6;
 }
 
+// Additive, fail-closed conditional batch protocol. Probe requests never mutate disk state.
+message GuardedDeleteVersionsRequest {
+  string disk = 1;
+  string volume = 2;
+  bytes payload = 3;
+  bool probe_only = 4;
+}
+
 message DeleteVersionsResponse {
   bool success = 1;
   repeated string errors = 2;
@@ -1046,6 +1054,30 @@ message ReplacementRecoveryStatusResponse {
   optional ControlPlaneErrorCode error_code = 4;
 }
 
+// Asks a peer how it currently sees the drives served by `host`, so a
+// restarting node can wait for re-admission before publishing readiness.
+message PeerDriveAdmissionRequest {
+  // Topology host:port of the drives' owner, as written in the endpoint list.
+  string host = 1;
+}
+
+message PeerDriveAdmission {
+  int32 pool_index = 1;
+  int32 set_index = 2;
+  int32 disk_index = 3;
+  // True only when the peer would count this drive towards its own read quorum.
+  bool online = 4;
+  string runtime_state = 5;
+  bool host_online = 6;
+}
+
+message PeerDriveAdmissionResponse {
+  bool success = 1;
+  repeated PeerDriveAdmission drives = 2;
+  optional string error_info = 3;
+  optional ControlPlaneErrorCode error_code = 4;
+}
+
 message HealControlRequest {
   uint32 version = 1;
   string topology_fingerprint = 2;
@@ -1235,8 +1267,10 @@ service NodeService {
   rpc DeleteAtIncarnation(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
   rpc RecoverDeleteTransaction(RecoverDeleteTransactionRequest) returns (RecoverDeleteTransactionResponse) {}; // auth-policy: body-bound
   rpc AcquireSnapshotLease(SnapshotLeaseRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
+  rpc AcquireQuotaMutationFence(SnapshotLeaseRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
   rpc RenewSnapshotLease(SnapshotLeaseRenewRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
   rpc ReleaseSnapshotLease(SnapshotLeaseReleaseRequest) returns (SnapshotLeaseMutationResponse) {}; // auth-policy: body-bound
+  rpc ReleaseQuotaMutationFence(SnapshotLeaseReleaseRequest) returns (SnapshotLeaseMutationResponse) {}; // auth-policy: body-bound
   rpc VerifyFile(VerifyFileRequest) returns (VerifyFileResponse) {}; // auth-policy: read-only
   rpc ReadParts(ReadPartsRequest) returns (ReadPartsResponse) {}; // auth-policy: read-only
   rpc CheckParts(CheckPartsRequest) returns (CheckPartsResponse) {}; // auth-policy: read-only
@@ -1252,6 +1286,7 @@ service NodeService {
   rpc WalkDir(WalkDirRequest) returns (stream WalkDirResponse) {}; // auth-policy: streaming
   rpc RenameData(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
   rpc RenameDataAtIncarnation(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
+  rpc RenameDataWithQuotaFence(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
   rpc MakeVolumes(MakeVolumesRequest) returns (MakeVolumesResponse) {}; // auth-policy: body-bound
   rpc MakeVolume(MakeVolumeRequest) returns (MakeVolumeResponse) {}; // auth-policy: body-bound
   rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse) {}; // auth-policy: read-only
@@ -1268,6 +1303,7 @@ service NodeService {
   rpc DeleteVersionAtIncarnation(DeleteVersionRequest) returns (DeleteVersionResponse) {}; // auth-policy: body-bound
   rpc DeleteRetiredMarker(DeleteVersionRequest) returns (DeleteVersionResponse) {}; // auth-policy: body-bound
   rpc DeleteVersions(DeleteVersionsRequest) returns (DeleteVersionsResponse) {}; // auth-policy: body-bound
+  rpc GuardedDeleteVersions(GuardedDeleteVersionsRequest) returns (DeleteVersionsResponse) {}; // auth-policy: body-bound
   rpc ReadMultiple(ReadMultipleRequest) returns (ReadMultipleResponse) {}; // auth-policy: read-only
   rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse) {}; // auth-policy: body-bound
   rpc DiskInfo(DiskInfoRequest) returns (DiskInfoResponse) {}; // auth-policy: read-only
@@ -1321,6 +1357,7 @@ service NodeService {
   rpc ReleaseScannerPublicationLease(ScannerPublicationLeaseReleaseRequest) returns (ScannerPublicationLeaseReleaseResponse) {}; // auth-policy: body-bound
   rpc BackgroundHealStatus(BackgroundHealStatusRequest) returns (BackgroundHealStatusResponse) {}; // auth-policy: read-only
   rpc ReplacementRecoveryStatus(ReplacementRecoveryStatusRequest) returns (ReplacementRecoveryStatusResponse) {}; // auth-policy: read-only
+  rpc PeerDriveAdmission(PeerDriveAdmissionRequest) returns (PeerDriveAdmissionResponse) {}; // auth-policy: read-only
   rpc GetMetacacheListing(GetMetacacheListingRequest) returns (GetMetacacheListingResponse) {}; // auth-policy: unimplemented
   rpc UpdateMetacacheListing(UpdateMetacacheListingRequest) returns (UpdateMetacacheListingResponse) {}; // auth-policy: unimplemented
   rpc ReloadPoolMeta(ReloadPoolMetaRequest) returns (ReloadPoolMetaResponse) {}; // auth-policy: body-bound

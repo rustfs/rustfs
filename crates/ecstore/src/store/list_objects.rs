@@ -24,7 +24,7 @@ use crate::bucket::lifecycle::bucket_lifecycle_ops::free_version_remote_tuple_ma
 use crate::bucket::metadata_sys::{
     get_versioning_config, has_authoritative_never_versioned_state, has_authoritative_never_versioned_state_in,
 };
-use crate::bucket::utils::check_list_objs_args;
+use crate::bucket::utils::{check_list_objs_args, has_bad_path_component};
 use crate::bucket::versioning::VersioningApi;
 use crate::cache_value::metacache_set::{
     FallbackClaimTracker, ListPathRawOptions, list_path_raw_with_claim_tracker, list_path_raw_with_partial_result,
@@ -56,7 +56,7 @@ use rustfs_filemeta::{
 };
 use rustfs_io_metrics::{
     LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED, LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED, LIST_OBJECTS_SOURCE_WALKER,
-    ListObjectsGatherObservation, ListObjectsIndexPageObservation,
+    ListObjectsGatherCaller, ListObjectsGatherObservation, ListObjectsIndexPageObservation,
 };
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
 use std::cmp::Reverse;
@@ -109,6 +109,7 @@ fn recursive_walk_list_path_options(bucket: String, prefix: &str, opts: &WalkOpt
         incl_deleted: true,
         recursive: true,
         versioned: true,
+        caller: ListObjectsGatherCaller::S3ListVersions,
         walkdir_timeout: opts.walkdir_timeout,
         walkdir_stall_timeout: opts.walkdir_stall_timeout,
         ..Default::default()
@@ -274,6 +275,7 @@ fn log_list_path_finished(
 
 #[derive(Debug, Default, Clone)]
 pub struct ListPathOptions {
+    pub caller: ListObjectsGatherCaller,
     pub id: Option<String>,
 
     // Bucket of the listing.
@@ -4112,10 +4114,17 @@ impl ECStore {
         max_keys: i32,
         incl_deleted: bool,
     ) -> Result<ListObjectsInfo> {
+        // Stored keys cannot contain repeated separators. Keep the query literal
+        // and avoid walking or cleaning up an aliased filesystem path.
+        if prefix.contains("//") && !has_bad_path_component(prefix) && !prefix.contains('\0') {
+            check_list_objs_args(bucket, "", &marker)?;
+            return Ok(ListObjectsInfo::default());
+        }
         let max_keys = normalize_max_keys(max_keys);
         let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
         let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
+            caller: ListObjectsGatherCaller::S3List,
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
             // Always request max_keys + 1 to detect if there are more results
@@ -4261,6 +4270,79 @@ impl ECStore {
         .await
     }
 
+    /// Capture one logical key's version group for write-triggered expiry.
+    pub(crate) async fn get_object_versions_for_lifecycle(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        bucket_incarnation_id: Uuid,
+    ) -> Result<Vec<ObjectInfo>> {
+        crate::bucket::utils::check_object_args(bucket, object)?;
+        let mut opts = opts.clone();
+        // Lock order matches writes: bucket lifecycle, metadata validation,
+        // then object namespace. Borrow fences supplied by an outer operation.
+        let bucket_guard = if opts.bucket_lifecycle_lock_fence.is_none() {
+            let guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
+            opts.add_bucket_lifecycle_lock_guard(&guard);
+            Some(guard)
+        } else {
+            None
+        };
+        let incarnation = crate::bucket::metadata_sys::get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
+        if incarnation != bucket_incarnation_id {
+            return Err(Error::BucketNotFound(bucket.to_owned()));
+        }
+        let metadata_sys = crate::bucket::metadata_sys::bucket_metadata_sys_of(&self.ctx)?;
+        let metadata_sys = metadata_sys.read().await.clone();
+        let (versioning, _) = metadata_sys.get_versioning_config(bucket).await?;
+        let disk_object = path::encode_dir_object(object);
+        let object_guard = self
+            .acquire_object_read_lock_if_needed("lifecycle_versions", bucket, &disk_object, &mut opts)
+            .await?;
+
+        // As with version listings, include every physical set: migration can
+        // leave a key's history in more than its current hash destination.
+        let reads = self
+            .pools
+            .iter()
+            .flat_map(|pool| &pool.disk_set)
+            .map(|set| set.read_object_versions_for_lifecycle(bucket, object));
+        let mut entries = Vec::new();
+        for result in join_all(reads).await {
+            if let Some(entry) = result.map_err(|error| to_object_err(error.into(), vec![bucket, object]))? {
+                entries.push(entry);
+            }
+        }
+        if self.pools.is_empty()
+            || bucket_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+            || opts
+                .bucket_lifecycle_lock_fence
+                .as_ref()
+                .is_some_and(|fence| fence.is_lock_lost())
+            || opts.namespace_lock_fence.as_ref().is_some_and(|fence| fence.is_lock_lost())
+            || object_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+        {
+            return Err(Error::PreconditionFailed);
+        }
+        let mut entries = entries.into_iter();
+        let Some(mut entry) = entries.next() else {
+            return Ok(Vec::new());
+        };
+        if entries.len() > 0 {
+            merge_object_entry_versions(&mut entry, entries)?;
+        }
+        // This projection excludes tier free-version bookkeeping but retains
+        // pending version purges for the evaluator's replication safeguards.
+        let versions = entry.file_info_versions(bucket)?;
+        let versioned = versioning.versioned(object);
+        Ok(versions
+            .versions
+            .iter()
+            .map(|version| ObjectInfo::from_file_info(version, bucket, object, versioned))
+            .collect())
+    }
+
     async fn inner_list_object_versions_with_projection(
         self: Arc<Self>,
         input: ListObjectVersionsInput<'_>,
@@ -4289,6 +4371,11 @@ impl ECStore {
         let effective_max_keys = list_versions_scan_limit(max_keys, has_version_marker);
         let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
+            caller: if include_version_purge {
+                ListObjectsGatherCaller::Lifecycle
+            } else {
+                ListObjectsGatherCaller::S3ListVersions
+            },
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
             limit: effective_max_keys,
@@ -4993,11 +5080,45 @@ where
     let _cancel_guard = cancel.clone().drop_guard();
     let (result_tx, mut result_rx) = mpsc::channel(1);
     let mut workers = JoinSet::new();
-    workers.spawn(async move { producer.await.map(|()| None) }.instrument(tracing::Span::current()));
-    let gather_cancel = cancel.clone();
-    workers.spawn(
-        async move { gather_results(gather_cancel, opts, recv, result_tx).await.map(Some) }.instrument(tracing::Span::current()),
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let mut diagnostic_context = crate::cluster::rpc::runtime_sources::ReadVersionDiagnosticContext::capture_entry(
+        rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::ListObjects,
     );
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let request_caller = diagnostic_context.caller.or_else(|| {
+        use rustfs_io_metrics::ListObjectsGatherCaller;
+        use rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller;
+
+        match opts.caller {
+            ListObjectsGatherCaller::S3List | ListObjectsGatherCaller::S3ListVersions => {
+                Some(ReadVersionRequestCaller::ListObjects)
+            }
+            ListObjectsGatherCaller::Lifecycle => Some(ReadVersionRequestCaller::Lifecycle),
+            ListObjectsGatherCaller::Other => Some(ReadVersionRequestCaller::Other),
+            ListObjectsGatherCaller::Unattributed => None,
+        }
+    });
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    {
+        diagnostic_context.caller = request_caller;
+    }
+    let producer = async move { producer.await.map(|()| None) };
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let producer = crate::cluster::rpc::runtime_sources::with_read_version_diagnostic_context(
+        diagnostic_context,
+        rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::ListProducer,
+        producer,
+    );
+    workers.spawn(producer.instrument(tracing::Span::current()));
+    let gather_cancel = cancel.clone();
+    let gather = async move { gather_results(gather_cancel, opts, recv, result_tx).await.map(Some) };
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let gather = crate::cluster::rpc::runtime_sources::with_read_version_diagnostic_context(
+        diagnostic_context,
+        rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::ListGather,
+        gather,
+    );
+    workers.spawn(gather.instrument(tracing::Span::current()));
 
     let mut failure = None;
     let mut stopping = false;
@@ -5133,6 +5254,7 @@ async fn gather_results(
                 let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
                 rustfs_io_metrics::record_list_objects_gather(ListObjectsGatherObservation {
                     source: LIST_OBJECTS_SOURCE_WALKER,
+                    caller: opts.caller,
                     outcome: LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED,
                     limit: opts.limit,
                     scanned_entries,
@@ -5195,6 +5317,7 @@ async fn gather_results(
         let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
         rustfs_io_metrics::record_list_objects_gather(ListObjectsGatherObservation {
             source: LIST_OBJECTS_SOURCE_WALKER,
+            caller: opts.caller,
             outcome: LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED,
             limit: opts.limit,
             scanned_entries,
@@ -5326,6 +5449,23 @@ async fn send_or_cancel(rx: &CancellationToken, out_channel: &Sender<MetaCacheEn
     }
 }
 
+fn listing_merge_corruption(object: &str, version_id: Option<Uuid>, validation: &'static str) -> Error {
+    const EVENT_LISTING_MERGE_REJECTED: &str = "listing_merge_rejected";
+    const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+    const LOG_SUBSYSTEM_LISTING: &str = "listing";
+    error!(
+        event = EVENT_LISTING_MERGE_REJECTED,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_LISTING,
+        result = "rejected",
+        object,
+        version_id = ?version_id,
+        validation,
+        "Listing version merge rejected metadata"
+    );
+    Error::FileCorrupt
+}
+
 /// Each input has already been resolved inside its own erasure set. This is a
 /// union of version histories, never a quorum vote between unrelated pools.
 fn merge_object_entry_versions(first: &mut MetaCacheEntry, others: impl Iterator<Item = MetaCacheEntry>) -> Result<()> {
@@ -5334,23 +5474,26 @@ fn merge_object_entry_versions(first: &mut MetaCacheEntry, others: impl Iterator
     for mut entry in std::iter::once(std::mem::take(first)).chain(others) {
         let meta = match entry.cached.take() {
             Some(meta) => meta,
-            None => FileMeta::load(&entry.metadata).map_err(|_| Error::FileCorrupt)?,
+            None => FileMeta::load(&entry.metadata).map_err(|_| listing_merge_corruption(&name, None, "metadata_decode"))?,
         };
         if meta.versions.is_empty() {
-            return Err(Error::FileCorrupt);
+            return Err(listing_merge_corruption(&name, None, "empty_version_stack"));
         }
         for version in meta.versions {
-            let parsed = version.parse_version_meta().map_err(|_| Error::FileCorrupt)?;
+            let corrupt = |validation| listing_merge_corruption(&name, version.header.version_id, validation);
+            let parsed = version.parse_version_meta().map_err(|_| corrupt("version_decode"))?;
             if !parsed.valid() || parsed.version_type != version.header.version_type {
-                return Err(Error::FileCorrupt);
+                return Err(corrupt("version_type_or_validity"));
             }
-            let fi = parsed.into_fileinfo("", &name, true).map_err(|_| Error::FileCorrupt)?;
+            let fi = parsed
+                .into_fileinfo("", &name, true)
+                .map_err(|_| corrupt("file_info_decode"))?;
             let version_id = fi.version_id.filter(|id| !id.is_nil());
             if version_id != version.header.version_id.filter(|id| !id.is_nil())
                 || fi.mod_time != version.header.mod_time
                 || fi.tier_free_version() != version.header.free_version()
             {
-                return Err(Error::FileCorrupt);
+                return Err(corrupt("version_header_mismatch"));
             }
             let info = ObjectInfo::from_file_info(&fi, "", &name, true);
             let identity = (version_id, version.header.free_version());
@@ -5374,7 +5517,7 @@ fn merge_object_entry_versions(first: &mut MetaCacheEntry, others: impl Iterator
                         crate::data_movement::is_equivalent_data_movement_object_identity(&info, previous_info, true, true)
                     };
                     if !equivalent {
-                        return Err(Error::FileCorrupt);
+                        return Err(corrupt("version_identity_conflict"));
                     }
                     // Equivalent migrated copies can have different coding or
                     // data directories. Choose a stable representation without
@@ -7230,6 +7373,9 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 mod differential_tests;
 
 #[cfg(test)]
+mod lifecycle_exact_tests;
+
+#[cfg(test)]
 mod test {
     use super::{
         ENV_API_LIST_OBJECTS_INDEX_MODE, ENV_API_LIST_OBJECTS_INDEX_PROVIDER, ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION,
@@ -7458,7 +7604,7 @@ mod test {
         }
     }
 
-    fn test_pending_version_purge_meta_entry(bucket: &str, name: &str) -> (MetaCacheEntry, Uuid) {
+    pub(super) fn test_pending_version_purge_meta_entry(bucket: &str, name: &str) -> (MetaCacheEntry, Uuid) {
         let version_id = Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0);
         let data_dir = Uuid::from_u128(0xabcd_ef12_3456_7890_abcd_ef12_3456_7890);
         let mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
@@ -12118,6 +12264,82 @@ mod test {
     }
 
     #[tokio::test]
+    async fn merge_entry_channels_data_movement_accepts_inline_layout_changes() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let external = test_object_meta_entry_with_erasure_versions("key", &[(time, "same-etag", 2, 1)]);
+        let inline = rewrite_test_version(
+            test_object_meta_entry_with_erasure_versions("key", &[(time, "same-etag", 5, 4)]),
+            |version| {
+                rustfs_utils::http::insert_bytes(
+                    &mut version.object.as_mut().expect("object version").meta_sys,
+                    rustfs_utils::http::SUFFIX_INLINE_DATA,
+                    b"true".to_vec(),
+                );
+            },
+        );
+        let legacy_inline = rewrite_test_version(inline.clone(), |version| {
+            version
+                .object
+                .as_mut()
+                .expect("object version")
+                .meta_sys
+                .remove(&rustfs_utils::http::internal_key_rustfs(rustfs_utils::http::SUFFIX_INLINE_DATA));
+        });
+        let copies = [external, legacy_inline, inline];
+        let mut expected = None;
+        for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+            let merged = merge_test_object_entries(order.map(|index| copies[index].clone()).to_vec())
+                .await
+                .expect("physical inline placement and legacy aliases must not change object identity");
+            assert_eq!(
+                merged
+                    .file_info_versions("bucket")
+                    .expect("decode merged history")
+                    .versions
+                    .len(),
+                1
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(&merged.metadata, expected, "representation must not depend on pool order");
+            } else {
+                expected = Some(merged.metadata);
+            }
+        }
+    }
+
+    #[test]
+    fn data_movement_listing_conflict_logs_identity_without_metadata_values() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut original = test_object_meta_entry_with_erasure_versions("failing-key", &[(time, "same-etag", 2, 1)]);
+        let conflicting = rewrite_test_version(original.clone(), |version| {
+            version
+                .object
+                .as_mut()
+                .expect("object version")
+                .meta_user
+                .insert("x-amz-meta-private".to_string(), "sensitive-value-must-not-be-logged".to_string());
+        });
+        assert_eq!(
+            super::merge_object_entry_versions(&mut original, std::iter::once(conflicting))
+                .expect_err("conflicting user metadata must still fail closed"),
+            StorageError::FileCorrupt
+        );
+        let output = logs.contents();
+        assert!(output.contains("listing_merge_rejected"));
+        assert!(output.contains("failing-key"));
+        assert!(output.contains("00000000-0000-0000-0000-000000000001"));
+        assert!(output.contains("version_identity_conflict"));
+        assert!(!output.contains("sensitive-value-must-not-be-logged"));
+    }
+
+    #[tokio::test]
     async fn merge_entry_channels_defers_free_version_while_same_remote_source_is_live() {
         let live = test_transitioned_meta_entry("key", "remote/shared", false);
         let free = test_transitioned_meta_entry("key", "remote/shared", true);
@@ -12292,6 +12514,44 @@ mod test {
                 .to_string()
                 .contains("listing worker panicked")
         );
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn list_path_producer_worker_preserves_s3_and_caller_context() {
+        let mut request = rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard::new("GET");
+        let api_operation = request
+            .in_scope(|| {
+                rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::ListObjectsV2);
+                rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context()
+            })
+            .expect("dispatched list operation should be captured");
+        request.response(200);
+
+        let (sender, recv) = mpsc::channel(1);
+        let opts = ListPathOptions {
+            caller: rustfs_io_metrics::ListObjectsGatherCaller::S3List,
+            ..Default::default()
+        };
+        let result = rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(Some(api_operation), async move {
+            collect_list_path_results(CancellationToken::new(), opts, recv, async move {
+                assert_eq!(
+                    rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(),
+                    Some("s3:ListObjectsV2")
+                );
+                assert_eq!(
+                    crate::cluster::rpc::runtime_sources::current_read_version_request_caller(),
+                    Some(rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller::ListObjects)
+                );
+                drop(sender);
+                Ok(())
+            })
+            .await
+        })
+        .await;
+
+        assert!(result.err.is_some(), "the empty page channel remains an error");
+        assert_eq!(rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(), None);
     }
 
     #[tokio::test]

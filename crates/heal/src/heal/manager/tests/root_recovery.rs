@@ -1844,7 +1844,7 @@ async fn root_recovery_queued_non_root_admin_owner_is_not_priority_displaced() {
 }
 
 #[tokio::test]
-async fn root_recovery_legacy_schema_replays_as_cluster() {
+async fn root_recovery_legacy_cluster_requires_a_fresh_generation_bound_task() {
     #[derive(serde::Serialize)]
     struct LegacyRootHealIntent<'a> {
         schema: u32,
@@ -1873,10 +1873,113 @@ async fn root_recovery_legacy_schema_replays_as_cluster() {
 
     let restarted = recovery_manager(vec![disk]);
     restarted.replay_root_heals().await.expect("replay legacy root record");
-    let queued = restarted.heal_queue.lock().await.requests().cloned().collect::<Vec<_>>();
-    assert_eq!(queued.len(), 1);
-    assert_eq!(queued[0].id, request.id);
-    assert_eq!(queued[0].heal_type, HealType::Cluster);
+    assert!(
+        restarted.heal_queue.lock().await.requests().next().is_none(),
+        "unfenced legacy work must not bind to a later bucket generation"
+    );
+    assert!(
+        restarted
+            .root_recovery
+            .inventory()
+            .await
+            .expect("quarantined legacy task")
+            .quarantined_task_ids
+            .contains(&request.id)
+    );
+}
+
+#[tokio::test]
+async fn root_recovery_cluster_scope_preserves_generations_and_completed_prefix_on_handoff() {
+    use crate::heal::manager::root_recovery::AdminClusterScope;
+    use std::collections::BTreeMap;
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let request = root_request();
+    manager.root_recovery.persist(&request).await.expect("admit cluster task");
+    let task = HealTask::from_request(request.clone(), Arc::new(MockStorage));
+    let mut outcome = HealTaskOutcome::default();
+    outcome.start();
+    let mut scope = AdminClusterScope {
+        buckets: BTreeMap::from([
+            ("alpha-bucket".to_owned(), Uuid::from_u128(42)),
+            ("bravo-bucket".to_owned(), Uuid::from_u128(43)),
+        ]),
+        next_bucket_index: 0,
+        outcome,
+        progress: HealProgress::new(),
+    };
+    manager
+        .root_recovery
+        .checkpoint_cluster_scope(&task, &scope)
+        .await
+        .expect("freeze bucket generations before mutation");
+    scope.next_bucket_index = 1;
+    manager
+        .root_recovery
+        .checkpoint_cluster_scope(&task, &scope)
+        .await
+        .expect("checkpoint completed empty bucket");
+    let retry = task.retry_request();
+    manager
+        .root_recovery
+        .persist(&retry)
+        .await
+        .expect("shutdown/retry handoff retains scope");
+    let mut changed_options = retry.clone();
+    changed_options.options.recursive = !changed_options.options.recursive;
+    assert!(
+        manager.root_recovery.persist(&changed_options).await.is_err(),
+        "handoff cannot reinterpret completed work"
+    );
+    drop(manager);
+    let restarted = recovery_manager(vec![disk]);
+    let replay = HealTask::from_request(retry, Arc::new(MockStorage));
+    assert_eq!(
+        restarted
+            .root_recovery
+            .cluster_scope(&replay)
+            .await
+            .expect("read frozen scope"),
+        Some(scope.clone())
+    );
+    let mut changed = scope.clone();
+    changed.buckets.insert("alpha-bucket".to_owned(), Uuid::from_u128(44));
+    assert!(
+        restarted
+            .root_recovery
+            .checkpoint_cluster_scope(&replay, &changed)
+            .await
+            .is_err(),
+        "never rebind a saved generation"
+    );
+    changed = scope.clone();
+    changed.next_bucket_index = 0;
+    assert!(
+        restarted
+            .root_recovery
+            .checkpoint_cluster_scope(&replay, &changed)
+            .await
+            .is_err(),
+        "never rewind a committed prefix"
+    );
+    changed = scope.clone();
+    changed.buckets.insert("../invalid".to_owned(), Uuid::from_u128(45));
+    assert!(
+        restarted
+            .root_recovery
+            .checkpoint_cluster_scope(&replay, &changed)
+            .await
+            .is_err(),
+        "reject decoded path aliases"
+    );
+    assert_eq!(
+        restarted
+            .root_recovery
+            .cluster_scope(&replay)
+            .await
+            .expect("failed updates preserve scope"),
+        Some(scope)
+    );
 }
 
 #[tokio::test]
@@ -1897,6 +2000,155 @@ async fn root_recovery_rejected_admin_start_does_not_persist() {
     let restarted = recovery_manager(vec![disk]);
     restarted.replay_root_heals().await.expect("replay empty durable state");
     assert_eq!(restarted.get_queue_length().await, 0);
+}
+
+#[tokio::test]
+async fn root_recovery_cluster_replay_rejects_successor_and_preserves_completed_scope() {
+    use crate::heal::manager::root_recovery::AdminClusterScope;
+    use crate::heal::outcome::{HealObjectDisposition, HealObjectIdentity, HealObjectKind, HealObjectOutcome};
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk]);
+    let request = root_request();
+    manager.root_recovery.persist(&request).await.expect("admit cluster task");
+    let task = HealTask::from_request(request.clone(), Arc::new(MockStorage));
+    let bucket = format!("pinned-{}", Uuid::new_v4().simple());
+    let expected = Uuid::from_u128(42);
+    let mut outcome = HealTaskOutcome::default();
+    outcome.start();
+    let mut scope = AdminClusterScope {
+        buckets: std::collections::BTreeMap::from([(bucket.clone(), expected)]),
+        next_bucket_index: 0,
+        outcome,
+        progress: HealProgress::new(),
+    };
+    manager
+        .root_recovery
+        .checkpoint_cluster_scope(&task, &scope)
+        .await
+        .expect("freeze generation");
+    bucket_incarnations()
+        .lock()
+        .expect("generation fixture")
+        .insert(bucket.clone(), Some(Uuid::from_u128(99)));
+    let replay =
+        HealTask::from_request(request.clone(), Arc::new(MockStorage)).with_admin_recovery(manager.root_recovery.clone());
+    assert!(
+        matches!(replay.execute().await, Err(Error::StaleBucketIncarnation { .. })),
+        "replay must reject a successor before traversal"
+    );
+    assert_eq!(replay.get_outcome().await.counters.processed, 0);
+    bucket_incarnations()
+        .lock()
+        .expect("generation fixture")
+        .insert(bucket.clone(), Some(expected));
+    scope.next_bucket_index = 1;
+    scope.outcome.record(HealObjectOutcome {
+        identity: HealObjectIdentity {
+            kind: HealObjectKind::Object,
+            bucket: bucket.clone(),
+            object: "completed-object".to_owned(),
+            version_id: None,
+            bucket_incarnation_id: Some(expected),
+            pool_index: None,
+            set_index: None,
+        },
+        disposition: HealObjectDisposition::VerifiedHealthy,
+        detail: None,
+    });
+    scope.progress.objects_scanned = 1;
+    manager
+        .root_recovery
+        .checkpoint_cluster_scope(&task, &scope)
+        .await
+        .expect("completed bucket with retained outcome");
+    let replay = HealTask::from_request(request, Arc::new(MockStorage)).with_admin_recovery(manager.root_recovery.clone());
+    replay
+        .execute()
+        .await
+        .expect("completed frozen scope needs no rediscovery or repair");
+    assert_eq!(replay.get_outcome().await.coverage, crate::heal::outcome::HealTraversalCoverage::Complete);
+    assert_eq!(replay.get_outcome().await.counters.processed, 1);
+    assert_eq!(replay.get_progress().await.objects_scanned, 1);
+    bucket_incarnations().lock().expect("generation fixture").remove(&bucket);
+}
+
+#[tokio::test]
+async fn root_recovery_cluster_inventory_exceeds_legacy_limit_without_losing_bindings() {
+    use crate::heal::manager::root_recovery::AdminClusterScope;
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let request = root_request();
+    manager.root_recovery.persist(&request).await.expect("admit cluster task");
+    let task = HealTask::from_request(request.clone(), Arc::new(MockStorage));
+    let mut outcome = HealTaskOutcome::default();
+    outcome.start();
+    let scope = AdminClusterScope {
+        buckets: (0..1500)
+            .map(|index| (format!("bucket-{index:05}"), Uuid::from_u128(42)))
+            .collect(),
+        next_bucket_index: 0,
+        outcome,
+        progress: HealProgress::new(),
+    };
+    assert!(scope.checkpoint_interval() > 1, "large inventories must batch durable rewrites");
+    manager
+        .root_recovery
+        .checkpoint_cluster_scope(&task, &scope)
+        .await
+        .expect("persist large frozen inventory");
+    let path = format!("root-heal-{}.json", request.id);
+    let bytes = disk.read_all(RUSTFS_META_BUCKET, &path).await.expect("scope bytes");
+    assert!(bytes.len() > MAX_ROOT_RECOVERY_BYTES, "fixture must cross legacy size limit");
+    assert_eq!(
+        manager
+            .root_recovery
+            .cluster_scope(&task)
+            .await
+            .expect("all bindings survive"),
+        Some(scope)
+    );
+    let json = String::from_utf8(bytes.to_vec()).expect("UTF-8 scope");
+    let binding = format!("\"bucket-00000\":\"{}\"", Uuid::from_u128(42));
+    let duplicate = json.replacen(&binding, &format!("{binding},{binding}"), 1);
+    assert_ne!(duplicate, json, "inject a duplicate map key");
+    disk.write_all(RUSTFS_META_BUCKET, &path, duplicate.into_bytes().into())
+        .await
+        .expect("inject corrupt duplicate binding");
+    assert!(
+        manager.root_recovery.cluster_scope(&task).await.is_err(),
+        "duplicate identity bindings fail closed"
+    );
+}
+
+#[tokio::test]
+async fn root_recovery_cluster_rejects_inventory_without_checkpoint_headroom() {
+    use crate::heal::manager::root_recovery::AdminClusterScope;
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk]);
+    let request = root_request();
+    manager.root_recovery.persist(&request).await.expect("admit cluster task");
+    let task = HealTask::from_request(request, Arc::new(MockStorage));
+    let mut outcome = HealTaskOutcome::default();
+    outcome.start();
+    let scope = AdminClusterScope {
+        // This inventory fits the 16 MiB record limit but leaves too little
+        // space for future object outcomes. Reject it before authorizing repair.
+        buckets: (0..152_000)
+            .map(|index| (format!("bucket-{index:056}"), Uuid::from_u128(42)))
+            .collect(),
+        next_bucket_index: 0,
+        outcome,
+        progress: HealProgress::new(),
+    };
+    assert!(manager.root_recovery.checkpoint_cluster_scope(&task, &scope).await.is_err());
+    assert!(
+        manager
+            .root_recovery
+            .cluster_scope(&task)
+            .await
+            .expect("original admission survives")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -2127,7 +2379,16 @@ async fn root_recovery_force_start_replaces_fresh_queued_and_retrying_admin_root
 
 #[tokio::test]
 async fn root_recovery_invalid_records_are_quarantined_without_blocking_replay() {
-    for kind in ["truncated", "schema", "identity", "option", "no_lock", "oversized"] {
+    use crate::heal::manager::root_recovery::MAX_CLUSTER_RECOVERY_BYTES;
+    for kind in [
+        "truncated",
+        "schema",
+        "identity",
+        "option",
+        "no_lock",
+        "unscoped_oversized",
+        "oversized",
+    ] {
         let (_temp, disk) = recovery_disk().await;
         let manager = recovery_manager(vec![disk.clone()]);
         let valid = root_request();
@@ -2142,7 +2403,7 @@ async fn root_recovery_invalid_records_are_quarantined_without_blocking_replay()
         let original = disk.read_all(RUSTFS_META_BUCKET, &path).await.expect("read root record");
         let mut value: serde_json::Value = serde_json::from_slice(&original).expect("record JSON");
         match kind {
-            "schema" => value["schema"] = 4.into(),
+            "schema" => value["schema"] = u32::MAX.into(),
             "identity" => value["task_id"] = valid.id.clone().into(),
             "option" => value["options"]["future_delete_mode"] = true.into(),
             "no_lock" => value["options"]["no_lock"] = true.into(),
@@ -2150,7 +2411,12 @@ async fn root_recovery_invalid_records_are_quarantined_without_blocking_replay()
         }
         let bytes = match kind {
             "truncated" => b"{".to_vec(),
-            "oversized" => vec![b' '; MAX_ROOT_RECOVERY_BYTES + 1],
+            "oversized" => vec![b' '; MAX_CLUSTER_RECOVERY_BYTES + 1],
+            "unscoped_oversized" => {
+                let mut bytes = serde_json::to_vec(&value).expect("valid unscoped record");
+                bytes.resize(MAX_ROOT_RECOVERY_BYTES + 1, b' ');
+                bytes
+            }
             _ => serde_json::to_vec(&value).expect("modified record"),
         };
         disk.write_all(RUSTFS_META_BUCKET, &path, bytes.clone().into())
@@ -2173,7 +2439,11 @@ async fn root_recovery_invalid_records_are_quarantined_without_blocking_replay()
         let marker: serde_json::Value = serde_json::from_slice(&marker).expect("quarantine marker JSON");
         assert_eq!(marker["task_id"], invalid.id, "kind={kind}");
         assert_eq!(marker["record_kind"], "intent", "kind={kind}");
-        assert_eq!(marker["source_prefix_len"], bytes.len().min(MAX_ROOT_RECOVERY_BYTES + 1), "kind={kind}");
+        assert_eq!(
+            marker["source_prefix_len"],
+            bytes.len().min(MAX_CLUSTER_RECOVERY_BYTES + 1),
+            "kind={kind}"
+        );
         assert_eq!(marker["source_oversized"], kind == "oversized", "kind={kind}");
 
         let mut reused = invalid.clone();
@@ -2196,7 +2466,63 @@ async fn root_recovery_invalid_records_are_quarantined_without_blocking_replay()
 }
 
 #[tokio::test]
-async fn root_recovery_quarantine_source_change_fails_closed() {
+async fn root_recovery_legacy_oversized_quarantine_survives_larger_intent_limit() {
+    use sha2::{Digest, Sha256};
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let request = root_request();
+    let path = format!("root-heal-{}.json", request.id);
+    let mut bytes = vec![b' '; MAX_ROOT_RECOVERY_BYTES + 100];
+    disk.write_all(RUSTFS_META_BUCKET, &path, bytes.clone().into())
+        .await
+        .expect("old oversized intent");
+    let marker = serde_json::json!({
+        "schema": 1,
+        "task_id": request.id,
+        "record_kind": "intent",
+        "source_prefix_len": MAX_ROOT_RECOVERY_BYTES + 1,
+        "source_prefix_sha256": Sha256::digest(&bytes[..MAX_ROOT_RECOVERY_BYTES + 1]).to_vec(),
+        "source_oversized": true,
+        "reason": "legacy size limit",
+        "quarantined_at": SystemTime::now(),
+    });
+    disk.write_all(
+        RUSTFS_META_BUCKET,
+        &format!("quarantined-root-heal-intent-{}.json", request.id),
+        serde_json::to_vec(&marker).unwrap().into(),
+    )
+    .await
+    .expect("old quarantine marker");
+    let inventory = manager
+        .root_recovery
+        .inventory()
+        .await
+        .expect("upgrade preserves old quarantine");
+    assert!(inventory.requests.is_empty());
+    assert!(inventory.quarantined_task_ids.contains(&request.id));
+    bytes[0] = b'{';
+    disk.write_all(RUSTFS_META_BUCKET, &path, bytes.into())
+        .await
+        .expect("alter retained prefix");
+    let inventory = manager
+        .root_recovery
+        .inventory()
+        .await
+        .expect("a changed legacy source is reported per record");
+    assert!(inventory.requests.is_empty(), "the changed source is never replayed");
+    assert!(!inventory.quarantined_task_ids.contains(&request.id));
+    assert!(
+        inventory
+            .conflicted
+            .get(&request.id)
+            .is_some_and(|reason| reason.contains("quarantine source changed")),
+        "{:?}",
+        inventory.conflicted
+    );
+}
+
+#[tokio::test]
+async fn root_recovery_quarantine_source_change_is_fenced_per_record() {
     let (_temp, disk) = recovery_disk().await;
     let manager = recovery_manager(vec![disk.clone()]);
     let request = root_request();
@@ -2208,7 +2534,29 @@ async fn root_recovery_quarantine_source_change_fails_closed() {
     disk.write_all(RUSTFS_META_BUCKET, &path, b"changed".to_vec().into())
         .await
         .expect("change retained source");
-    assert!(manager.root_recovery.pending().await.is_err(), "marker must fence a changed source");
+    assert!(
+        manager
+            .root_recovery
+            .pending()
+            .await
+            .expect("a changed source is reported, not a failed inventory")
+            .is_empty(),
+        "marker must fence a changed source"
+    );
+    let inventory = manager.root_recovery.inventory().await.expect("per-record inventory");
+    assert!(
+        inventory
+            .conflicted
+            .get(&request.id)
+            .is_some_and(|reason| reason.contains("quarantine source changed"))
+    );
+    let mut reused = request.clone();
+    reused.force_start = true;
+    let refused = manager
+        .submit_heal_request(reused)
+        .await
+        .expect_err("a changed source keeps the task id reserved");
+    assert!(refused.to_string().contains("quarantine source changed"), "{refused}");
 }
 
 #[tokio::test]
@@ -2704,6 +3052,77 @@ async fn root_recovery_erasure_bucket_scope_marker_quarantines_conflicts() {
                 .expect("retained record")
                 .as_ref(),
             bytes.as_slice()
+        );
+    }
+}
+
+#[tokio::test]
+async fn root_recovery_conflicting_record_does_not_block_other_replays() {
+    // A record with two durable owners cannot be admitted or quarantined, but
+    // it must not postpone every other accepted responsibility.
+    let (_temp_a, disk_a) = recovery_disk().await;
+    let (_temp_b, disk_b) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk_a.clone(), disk_b.clone()]);
+    let valid = root_request();
+    manager.root_recovery.persist(&valid).await.expect("valid root record");
+    let conflicting = root_request();
+    let bytes = disk_a
+        .read_all(RUSTFS_META_BUCKET, &format!("root-heal-{}.json", valid.id))
+        .await
+        .expect("read valid record bytes")
+        .to_vec();
+    let duplicated = String::from_utf8(bytes)
+        .expect("record JSON")
+        .replace(&valid.id, &conflicting.id);
+    for disk in [&disk_a, &disk_b] {
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            &format!("root-heal-{}.json", conflicting.id),
+            duplicated.clone().into_bytes().into(),
+        )
+        .await
+        .expect("write duplicated owner");
+    }
+
+    manager
+        .replay_root_heals()
+        .await
+        .expect("one conflicting record must not fail the whole replay");
+    assert_eq!(manager.get_queue_length().await, 1, "the valid record replays");
+    assert!(
+        manager
+            .heal_queue
+            .lock()
+            .await
+            .requests()
+            .any(|request| request.id == valid.id)
+    );
+    let inventory = manager.root_recovery.inventory().await.expect("per-record inventory");
+    assert!(
+        inventory.requests.iter().all(|request| request.id != conflicting.id),
+        "a conflicting record is never replayed"
+    );
+    let mut reused = conflicting.clone();
+    reused.force_start = true;
+    let refused = manager
+        .submit_heal_request(reused)
+        .await
+        .expect_err("a conflicting task id stays reserved");
+    assert!(refused.to_string().contains("Multiple root heal recovery owners"), "{refused}");
+    assert!(
+        matches!(
+            manager.get_task_status(&conflicting.id).await,
+            Ok(HealTaskStatus::Failed { error }) if error.contains("Multiple root heal recovery owners")
+        ),
+        "the admin status interface reports why the record cannot run"
+    );
+    for disk in [&disk_a, &disk_b] {
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, &format!("root-heal-{}.json", conflicting.id))
+                .await
+                .expect("conflicting record retained")
+                .as_ref(),
+            duplicated.as_bytes()
         );
     }
 }

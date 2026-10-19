@@ -8,7 +8,9 @@
 replicaCount: 4
 
 # Number of data drives (PVCs) per pod. Combined with replicaCount this
-# determines the total drive count seen by rustfs.
+# determines the total drive count seen by rustfs. When
+# storageclass.dataStorageSize is empty no PVCs are created and the drives come
+# from extraVolumes/extraVolumeMounts instead.
 # - drivesPerNode > 1: each pod gets N volumes mounted at /data/rustfs0.../data/rustfsN-1
 # - drivesPerNode = 1: each pod gets a single volume mounted at /data
 #
@@ -185,6 +187,12 @@ config:
       max_concurrent_set_scans: ""
       # Cap concurrent scanner disk bucket walks per set (0 keeps disk-count-derived concurrency)
       max_concurrent_disk_scans: ""
+      # Bucket walkers per local disk (1-16; default 1 keeps one bucket walk per disk, raise on flash)
+      walkers_per_disk: ""
+      # Per-local-disk scanner I/O ceiling in operations per second (auto, off, or a number)
+      disk_io_budget_iops: ""
+      # Per-local-disk scanner I/O ceiling in bytes per second (auto, off, or a number)
+      disk_io_budget_bytes_per_sec: ""
       # Yield to the async runtime every N scanned objects (0 disables extra yield)
       yield_every_n_objects: ""
       # Version count threshold for scanner alerts
@@ -443,6 +451,15 @@ readinessProbe:
   successThreshold: 1
   failureThreshold: 3
 
+# Seconds a replaced pod must stay Ready before the StatefulSet rolling update
+# moves to the next pod. A restarted node is Ready as soon as it can reach the
+# cluster, but surviving nodes keep dialing its previous IP until the platform
+# DNS record expires (kube-dns serves 30s TTLs, CoreDNS 5s by default) and then
+# need a few more probes before they count its drives again. Stopping the next
+# pod inside that window takes two members of an erasure set away from the
+# survivors (#8669). Set to 0 to disable.
+minReadySeconds: 45
+
 nodeSelector: {}
 
 tolerations: []
@@ -465,6 +482,22 @@ topologySpreadConstraints:
 
 storageclass:
   name: local-path
+  # Size of each data PVC. Set it to an empty string ("") to stop the chart from
+  # creating data PersistentVolumeClaims: the StatefulSet then renders no data
+  # volumeClaimTemplates (standalone mode renders no data PVC) and no data
+  # volumeMounts, so the drives must come from extraVolumes/extraVolumeMounts,
+  # for example JBOD hostPath or local disks. Mount them at the paths RustFS
+  # expects: /data/rustfs0 ... /data/rustfs<drivesPerNode-1> when drivesPerNode
+  # is greater than 1, otherwise /data. Keep drivesPerNode and replicaCount
+  # accurate because they still drive the generated RUSTFS_VOLUMES. A pool
+  # under pools.list can override this value, including with "". Standalone
+  # mode keeps the data volume when mode.standalone.existingClaim.dataClaim is
+  # set. logStorageSize is independent: the logs PVC is still created unless
+  # config.rustfs.obs_log_directory is empty.
+  # WARNING: switching between an empty and a non-empty value changes the
+  # StatefulSet volumeClaimTemplates, which Kubernetes forbids updating in
+  # place. Delete the StatefulSet with --cascade=orphan and recreate it, or
+  # reinstall.
   dataStorageSize: 256Mi
   logStorageSize: 256Mi
   pvcAnnotations:

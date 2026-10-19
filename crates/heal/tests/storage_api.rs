@@ -2,7 +2,7 @@
 pub(crate) mod bug_fixes {
     pub(crate) use rustfs_ecstore::api::disk::DiskStore;
     pub(crate) use rustfs_ecstore::api::disk::endpoint::Endpoint;
-    pub(crate) use rustfs_storage_api::BucketInfo;
+    pub(crate) use rustfs_storage_api::{BucketInfo, DiskSetSelector};
 }
 
 #[allow(unused_imports)]
@@ -21,12 +21,14 @@ pub(crate) mod endpoint_index {
 #[allow(unused_imports)]
 pub(crate) mod integration {
     pub(crate) use rustfs_ecstore::api::disk::{
-        DiskAPI, DiskError, DiskOption, DiskStore, Endpoint, RUSTFS_META_BUCKET, ReadOptions, new_disk,
+        DeleteOptions, DeleteRecoveryAction, DeleteRecoveryState, DiskAPI, DiskError, DiskOption, DiskStore, Endpoint,
+        RUSTFS_META_BUCKET, ReadOptions, new_disk,
     };
     pub(crate) use rustfs_ecstore::api::error::StorageError as EcstoreStorageError;
     pub(crate) use rustfs_ecstore::api::object::{
         ObjectOptions, PutObjReader, ShardIntegrityWriteMode, WriteCommitGuard, WriteCompletion,
     };
+    pub(crate) use rustfs_ecstore::api::rebalance::{RebalStatus, RebalanceMeta, RebalanceStats};
     pub(crate) use rustfs_ecstore::api::storage::ECStore;
     pub(crate) use rustfs_storage_api::BucketOperations;
     pub(crate) use rustfs_storage_api::MakeBucketOptions;

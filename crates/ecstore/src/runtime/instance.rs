@@ -49,6 +49,7 @@ use crate::layout::endpoints::{EndpointServerPools, SetupType};
 use crate::object_api::ObjectEncryptionResolver;
 use crate::services::event_notification::EventNotifier;
 use crate::services::tier::tier::TierConfigMgr;
+use crate::store::delete_recovery_runtime::DeleteRecoveryHints;
 use rustfs_lock::{GlobalLockManager, get_global_lock_manager};
 use s3s::region::Region;
 use std::collections::{HashMap, HashSet};
@@ -240,6 +241,7 @@ pub struct InstanceContext {
     namespace_commit_generation: AtomicU64,
     /// Resolves object-encryption material at the application boundary.
     object_encryption_resolver: OnceLock<Arc<dyn ObjectEncryptionResolver>>,
+    delete_recovery_hints: DeleteRecoveryHints,
     tier_delete_journal_recovery_stores: std::sync::Mutex<HashSet<Uuid>>,
     #[cfg(test)]
     suppress_tier_delete_journal_recovery: bool,
@@ -294,6 +296,7 @@ impl InstanceContext {
             namespace_commits: AtomicU64::new(0),
             namespace_commit_generation: AtomicU64::new(0),
             object_encryption_resolver: OnceLock::new(),
+            delete_recovery_hints: DeleteRecoveryHints::default(),
             tier_delete_journal_recovery_stores: std::sync::Mutex::new(HashSet::new()),
             #[cfg(test)]
             suppress_tier_delete_journal_recovery: false,
@@ -465,6 +468,10 @@ impl InstanceContext {
         self.namespace_commit_generation.load(Ordering::Acquire)
     }
 
+    /// Whether a namespace commit is still pending. The scanner publication
+    /// barrier no longer consults it (an ordinary PUT shades its bucket
+    /// instead); fixtures use it to drain rename tails deterministically.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn namespace_commits_pending(&self) -> bool {
         self.namespace_commits.load(Ordering::Acquire) != 0 || self.namespace_commit_generation() == u64::MAX
     }
@@ -726,6 +733,10 @@ impl InstanceContext {
 
     pub(crate) fn bind_background_cancel_token(&self, token: CancellationToken) -> CancellationToken {
         self.background_cancel_token.get_or_init(|| token).clone()
+    }
+
+    pub(crate) fn delete_recovery_hints(&self) -> &DeleteRecoveryHints {
+        &self.delete_recovery_hints
     }
 
     pub(crate) fn mark_tier_delete_journal_recovery_started(&self, store_id: Uuid) -> bool {

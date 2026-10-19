@@ -180,9 +180,9 @@ impl ScannerIODisk for Disk {
                 .await
                 .unwrap_or_else(|_| (BucketLifecycleConfiguration::default(), OffsetDateTime::now_utc()));
 
-        if lifecycle_config.has_active_rules("") {
-            cache.info.lifecycle = Some(Arc::new(lifecycle_config));
-        }
+        // Persisted usage caches are not an authority for lifecycle policy.
+        // Clear their old snapshot when configuration is absent, disabled, or unreadable.
+        cache.info.lifecycle = lifecycle_config.has_active_rules("").then(|| Arc::new(lifecycle_config));
 
         let (replication_config, _) =
             crate::storage_api::ecstore_with_background_disk_io(ctx.clone(), get_replication_config(&cache.info.name))
@@ -230,7 +230,8 @@ impl ScannerIODisk for Disk {
                 cache,
                 updates,
                 scan_mode,
-                SCANNER_SLEEPER.clone(),
+                // Every walker of this local disk shares its background I/O budget.
+                SCANNER_SLEEPER.for_disk(&self.path()),
                 prefix_scan_scope,
                 checkpoint_tx,
             ),

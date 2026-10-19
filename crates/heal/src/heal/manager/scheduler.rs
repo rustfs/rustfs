@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+use super::disposition::record_task_disposition;
 /// The heal scheduler: queue consumption loop and its skip/metric helpers.
 use super::*;
 
@@ -47,6 +48,7 @@ impl HealManager {
         let storage = self.storage.clone();
         let notify = self.notify.clone();
         let workload_provider = self.workload_provider.clone();
+        let disposition_cache = self.disposition_cache.clone();
 
         tokio::spawn(async move {
             let mut interval = interval(config.read().await.heal_interval);
@@ -82,6 +84,7 @@ impl HealManager {
                             notify: &notify,
                             cancel_token: &cancel_token,
                             workload_provider: &workload_provider,
+                            disposition_cache: &disposition_cache,
                         })
                         .await;
                     }
@@ -102,6 +105,7 @@ impl HealManager {
                             notify: &notify,
                             cancel_token: &cancel_token,
                             workload_provider: &workload_provider,
+                            disposition_cache: &disposition_cache,
                         })
                         .await;
                     }
@@ -131,6 +135,7 @@ impl HealManager {
             notify,
             cancel_token,
             workload_provider,
+            disposition_cache,
         } = context;
 
         let config = config.read().await;
@@ -227,6 +232,7 @@ impl HealManager {
                 let retrying_heals_clone = retrying_heals.clone();
                 let mrf_repair_notice_targets_clone = mrf_repair_notice_targets.clone();
                 let replacement_recovery_anchors_clone = replacement_recovery_anchors.clone();
+                let disposition_cache_clone = disposition_cache.clone();
                 let statistics_clone = statistics.clone();
                 let notify_clone = notify.clone();
                 let root_recovery_clone = root_recovery.clone();
@@ -251,6 +257,7 @@ impl HealManager {
                     );
                     let result = task.execute().await;
                     let retry_request = retry_request_for_result_with_budget(task.as_ref(), &result).await;
+                    record_task_disposition(&disposition_cache_clone, task.as_ref(), &result, retry_request.is_some()).await;
                     match &result {
                         Ok(_) => {
                             debug!(

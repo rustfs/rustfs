@@ -132,6 +132,21 @@ fn unavailable_recreate_error(result: &HealResultItem, opts: &HealOpts) -> Optio
 }
 
 impl HealTask {
+    async fn recover_bucket_delete_transactions(&self, bucket: &str, opts: &HealOpts) -> Result<bool> {
+        if let Some(result) = self
+            .await_with_control(
+                self.storage
+                    .recover_delete_transactions(bucket, None, self.bucket_incarnation_id, opts),
+            )
+            .await?
+        {
+            let unresolved = result.delete_recovery.is_some_and(|status| status.has_unresolved());
+            self.record_result_item(result).await;
+            return Ok(unresolved);
+        }
+        Ok(false)
+    }
+
     pub(super) async fn heal_bucket(&self, bucket: &str) -> Result<()> {
         self.pace_mainline().await?;
         if self.source == HealRequestSource::Admin && matches!(self.heal_type, HealType::Bucket { .. }) {
@@ -169,8 +184,10 @@ impl HealTask {
             "Heal bucket stage entered"
         );
         self.check_control_flags().await?;
-        let bucket_exists = self.await_with_control(self.storage.get_bucket_info(bucket)).await?.is_some();
-        if !bucket_exists {
+        // Bound administrator repair validates existence and generation under the
+        // lifecycle fence. Ordinary read quorum can reject recoverable directory loss.
+        let bound_admin_repair = self.source == HealRequestSource::Admin && self.bucket_incarnation_id.is_some();
+        if !bound_admin_repair && self.await_with_control(self.storage.get_bucket_info(bucket)).await?.is_none() {
             warn!(
                 target: "rustfs::heal::task",
                 event = EVENT_HEAL_BUCKET_RESULT,
@@ -224,18 +241,11 @@ impl HealTask {
             remove: self.source == HealRequestSource::Admin && self.options.remove_corrupted,
             ..heal_opts
         };
-        if let Some(result) = self
-            .await_with_control(self.storage.recover_delete_transactions(
-                bucket,
-                None,
-                self.bucket_incarnation_id,
-                &recovery_opts,
-            ))
-            .await?
-        {
-            self.record_result_item(result).await;
+        // Removal must settle survivor journals before deleting an empty
+        // replica's publication directory; repair must establish it first.
+        if heal_opts.remove && self.recover_bucket_delete_transactions(bucket, &recovery_opts).await? {
+            return Err(Error::transient_skip("Delete recovery must resolve before bucket removal"));
         }
-
         let heal_result = match self.bucket_incarnation_id {
             Some(expected) => {
                 self.await_with_control(self.storage.heal_bucket_at_incarnation(bucket, expected, &heal_opts))
@@ -261,8 +271,14 @@ impl HealTask {
                 );
                 self.record_result_item(result).await;
 
+                let unresolved_delete_recovery =
+                    !heal_opts.remove && self.recover_bucket_delete_transactions(bucket, &recovery_opts).await?;
+
                 if self.options.recursive {
                     self.heal_bucket_objects(bucket, "").await?;
+                }
+                if unresolved_delete_recovery {
+                    return Err(Error::transient_skip("Delete recovery remains unresolved after ordinary bucket heal"));
                 }
 
                 if !self.options.recursive {
@@ -308,17 +324,76 @@ impl HealTask {
             "Heal cluster started"
         );
 
-        let bucket_infos = self.await_with_control(self.storage.list_buckets()).await?;
+        let mut cluster_scope = if self.source == HealRequestSource::Admin && !self.options.dry_run {
+            let saved = if let Some(recovery) = &self.admin_recovery {
+                recovery.cluster_scope(self).await?
+            } else {
+                None
+            };
+            let scope = if let Some(scope) = saved {
+                scope
+            } else {
+                let mut buckets = std::collections::BTreeMap::new();
+                for bucket in self
+                    .await_with_control(self.storage.list_buckets_for_admin_heal(None))
+                    .await?
+                {
+                    let incarnation = self
+                        .await_with_control(self.storage.admit_bucket_incarnation(&bucket.name))
+                        .await?;
+                    buckets.insert(bucket.name, incarnation);
+                }
+                let scope = super::super::manager::root_recovery::AdminClusterScope {
+                    buckets,
+                    next_bucket_index: 0,
+                    outcome: self.get_outcome().await,
+                    progress: self.progress.read().await.clone(),
+                };
+                if let Some(recovery) = &self.admin_recovery {
+                    recovery.checkpoint_cluster_scope(self, &scope).await?;
+                }
+                scope
+            };
+            // Validate the frozen generations on every replay, including completed buckets.
+            for (bucket, incarnation) in &scope.buckets {
+                self.await_with_control(self.storage.validate_bucket_incarnation(bucket, Some(*incarnation)))
+                    .await?;
+            }
+            self.restore_outcome(scope.outcome.clone()).await;
+            *self.progress.write().await = scope.progress.clone();
+            Some(scope)
+        } else {
+            None
+        };
+        let buckets = if let Some(scope) = &cluster_scope {
+            scope
+                .buckets
+                .iter()
+                .map(|(name, incarnation)| (name.clone(), Some(*incarnation)))
+                .collect::<Vec<_>>()
+        } else {
+            let listed = if self.source == HealRequestSource::Admin {
+                self.await_with_control(self.storage.list_buckets_for_admin_heal(None))
+                    .await?
+            } else {
+                self.await_with_control(self.storage.list_buckets()).await?
+            };
+            listed.into_iter().map(|bucket| (bucket.name, None)).collect()
+        };
         let mut failed = 0_u64;
         let mut retryable = 0_u64;
         let mut permanent = 0_u64;
         let mut first_object = None;
         let mut first_error = None;
-        for bucket_info in bucket_infos {
+        let start = cluster_scope.as_ref().map_or(0, |scope| scope.next_bucket_index);
+        let mut checkpointed = start;
+        for (index, (bucket, incarnation)) in buckets.into_iter().enumerate().skip(start) {
             self.check_control_flags().await?;
+            let mut bucket_task = self.clone();
+            bucket_task.bucket_incarnation_id = incarnation;
             let mut retry_attempt = 0_u32;
             loop {
-                match self.heal_bucket(&bucket_info.name).await {
+                match bucket_task.heal_bucket(&bucket).await {
                     Ok(()) => break,
                     Err(Error::TaskCancelled) => return Err(Error::TaskCancelled),
                     Err(Error::TaskTimeout) => return Err(Error::TaskTimeout),
@@ -347,15 +422,37 @@ impl HealTask {
                         } else {
                             permanent = permanent.saturating_add(1);
                         }
-                        first_object.get_or_insert(bucket_info.name.clone());
+                        first_object.get_or_insert(bucket.clone());
                         first_error.get_or_insert_with(|| err.to_string());
                         break;
                     }
                 }
             }
+            // Retain only the successful contiguous prefix. A later retry replays
+            // any work after a failure without inheriting its transient counters.
+            if failed == 0
+                && let Some(scope) = &mut cluster_scope
+            {
+                scope.next_bucket_index = index.saturating_add(1);
+                scope.outcome = self.get_outcome().await;
+                scope.progress = self.progress.read().await.clone();
+                if (scope.next_bucket_index.saturating_sub(checkpointed) >= scope.checkpoint_interval()
+                    || scope.next_bucket_index == scope.buckets.len())
+                    && let Some(recovery) = &self.admin_recovery
+                {
+                    recovery.checkpoint_cluster_scope(self, scope).await?;
+                    checkpointed = scope.next_bucket_index;
+                }
+            }
         }
 
         if failed > 0 {
+            if let Some(scope) = &cluster_scope
+                && scope.next_bucket_index > checkpointed
+                && let Some(recovery) = &self.admin_recovery
+            {
+                recovery.checkpoint_cluster_scope(self, scope).await?;
+            }
             let failure = BatchHealFailure {
                 scope: "cluster".to_string(),
                 failed,
@@ -470,6 +567,7 @@ impl HealTask {
             set: self.options.set_index,
             ..Default::default()
         };
+        let mut unresolved_delete_recovery = false;
         if let Some(result) = self
             .await_with_control(self.storage.recover_delete_prefix_transactions(
                 bucket,
@@ -479,10 +577,15 @@ impl HealTask {
             ))
             .await?
         {
+            unresolved_delete_recovery = result.delete_recovery.is_some_and(|status| status.has_unresolved());
             self.record_result_item(result).await;
         }
 
-        self.heal_bucket_objects(bucket, prefix).await
+        self.heal_bucket_objects(bucket, prefix).await?;
+        if unresolved_delete_recovery {
+            return Err(Error::transient_skip("Delete recovery remains unresolved after ordinary prefix heal"));
+        }
+        Ok(())
     }
 
     #[hotpath::measure]

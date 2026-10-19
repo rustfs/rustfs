@@ -26,6 +26,18 @@ use tokio::io::AsyncReadExt as _;
 const SCANNER_CYCLE_RECOVERY_SCHEMA_VERSION: u16 = 1;
 const MAX_SCANNER_CYCLE_STATE_BYTES: u64 = 1024 * 1024;
 pub(super) const MAX_SCANNER_CYCLE_RECOVERY_RETRIES: u32 = 5;
+/// Longest automatic wait between two leader iterations while a retryable
+/// recovery observation persists. It replaces the former terminal pause: a
+/// fault that outlives the short retry budget keeps retrying at this cadence.
+pub(super) const SCANNER_CYCLE_RECOVERY_BACKOFF_CAP: Duration = Duration::from_secs(10 * 60);
+const SCANNER_CYCLE_RECOVERY_BACKOFF_BASE: Duration = Duration::from_secs(5);
+/// A retryable observation older than this restarts its retry budget so the
+/// visible count and the backoff schedule do not grow without bound.
+const SCANNER_CYCLE_RECOVERY_RETRY_WINDOW_SECS: u64 = 24 * 60 * 60;
+const SCANNER_CYCLE_RECOVERY_STATE_BACKOFF: &str = "backoff";
+const SCANNER_CYCLE_RECOVERY_STATE_REBUILDING: &str = "rebuilding";
+const SCANNER_CYCLE_RECOVERY_NEXT_ATTEMPT_MARKER: &str = "; next automatic attempt at unix ";
+const SCANNER_CYCLE_RECOVERY_REBUILT_FROM_QUARANTINE: &str = "rebuilt_from_quarantine";
 const METRIC_SCANNER_CYCLE_RECOVERY_REQUIRED: &str = "rustfs_scanner_cycle_recovery_required";
 const METRIC_SCANNER_CYCLE_RECOVERY_RETRY_COUNT: &str = "rustfs_scanner_cycle_recovery_retry_count";
 const USAGE_FLOOR_LOAD_FAILED: &str = "usage_floor_load_failed";
@@ -219,6 +231,11 @@ pub struct ScannerCycleRecoveryStatus {
     pub max_retries: u32,
     /// Whether the scanner may retry this state automatically.
     pub retryable: bool,
+    /// Unix time of the next automatic attempt while `retryable` is set.
+    pub next_attempt_at_unix_secs: Option<u64>,
+    /// Unix time at which this node rebuilt a quarantined cycle state through
+    /// its fenced leadership claim; the quarantine marker stays as evidence.
+    pub rebuilt_from_quarantine_at_unix_secs: Option<u64>,
     pub reason: Option<String>,
 }
 
@@ -287,6 +304,12 @@ static SCANNER_CYCLE_RECOVERY_STATUS: LazyLock<RwLock<ScannerCycleRecoveryStatus
 });
 // An old startup observation must not overwrite a newer explicit reset status.
 static SCANNER_CYCLE_RECOVERY_STATUS_VERSION: AtomicU64 = AtomicU64::new(0);
+// Start of the current run of consecutive retryable leader iterations. It
+// survives the healthy observations that individual gates publish inside an
+// iteration (for example a successful cycle-state load before a failed usage
+// floor load), so `first_detected_at_unix_secs` and the daily budget window
+// describe the whole fault rather than the last attempt.
+static SCANNER_CYCLE_RECOVERY_WINDOW_STARTED_AT: AtomicU64 = AtomicU64::new(0);
 
 pub fn scanner_cycle_recovery_status() -> ScannerCycleRecoveryStatus {
     SCANNER_CYCLE_RECOVERY_STATUS
@@ -317,7 +340,8 @@ pub(super) fn publish_scanner_cleanup_status(status: ScannerCycleRecoveryStatus,
     let recovery_required = if matches!(
         status.state.as_str(),
         "blocked"
-            | "paused"
+            | SCANNER_CYCLE_RECOVERY_STATE_BACKOFF
+            | SCANNER_CYCLE_RECOVERY_STATE_REBUILDING
             | "recovery-required"
             | "cleanup-pending"
             | "usage_floor_load_failed"
@@ -353,14 +377,28 @@ fn publish_scanner_cleanup_failure(reason: String, expected: u64) {
     let _ = publish_scanner_cleanup_status(status, Some(expected));
 }
 
+pub(super) fn clear_scanner_transient_cycle_recovery_status() {
+    // Snapshot the version before reading status so any concurrent publish rejects the CAS below.
+    let version = scanner_cleanup_status_version();
+    let status = scanner_cycle_recovery_status();
+    // A follower can discard its failed leadership observation. Durable recovery
+    // markers are revalidated before any later leadership claim.
+    if status.classification.is_none() && matches!(status.state.as_str(), "transient" | SCANNER_CYCLE_RECOVERY_STATE_BACKOFF) {
+        let _ = publish_scanner_cleanup_status(recovery_status("healthy", None, false), Some(version));
+    }
+}
+
 pub(super) fn record_scanner_usage_floor_failure(reason: String) {
     let previous = scanner_cycle_recovery_status();
     let same_failure = previous.classification.as_deref() == Some(USAGE_FLOOR_LOAD_FAILED);
     let now = unix_now_secs();
-    let (first_detected_at_unix_secs, retry_count) = if same_failure {
-        (previous.first_detected_at_unix_secs.or(Some(now)), previous.retry_count)
+    // Only the first detection survives across attempts. The retry budget is
+    // owned by the supervisor; carrying it here made every later attempt
+    // exhaust the budget immediately (rustfs/rustfs#8670).
+    let first_detected_at_unix_secs = if same_failure {
+        previous.first_detected_at_unix_secs.or(Some(now))
     } else {
-        (Some(now), 0)
+        Some(now)
     };
     set_scanner_cycle_recovery_status(ScannerCycleRecoveryStatus {
         path: DATA_USAGE_OBJ_NAME_PATH.clone(),
@@ -368,7 +406,7 @@ pub(super) fn record_scanner_usage_floor_failure(reason: String) {
         classification: Some(USAGE_FLOOR_LOAD_FAILED.to_string()),
         first_detected_at_unix_secs,
         last_attempt_at_unix_secs: Some(now),
-        retry_count,
+        retry_count: 0,
         max_retries: MAX_SCANNER_CYCLE_RECOVERY_RETRIES,
         retryable: true,
         reason: Some(reason),
@@ -459,24 +497,99 @@ pub(super) fn clear_legacy_incomplete_usage_floor_recovery_status() {
     }
 }
 
-pub(super) fn record_scanner_cycle_recovery_retry(attempt: u32) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ScannerCycleRecoveryRetry {
+    /// Effective attempt number the supervisor continues counting from.
+    pub(super) attempt: u32,
+    /// Wait before the next automatic attempt.
+    pub(super) delay: Duration,
+}
+
+/// Bounded exponential backoff for retryable recovery observations: it starts
+/// at the transient retry base (or the configured cycle interval when that is
+/// shorter) and never exceeds [`SCANNER_CYCLE_RECOVERY_BACKOFF_CAP`].
+pub(super) fn scanner_cycle_recovery_backoff_delay(attempt: u32, cycle_interval: Duration) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(31);
+    let multiplier = 1u32.checked_shl(exponent).unwrap_or(u32::MAX);
+    let base = cycle_interval.clamp(Duration::from_secs(1), SCANNER_CYCLE_RECOVERY_BACKOFF_BASE);
+    base.saturating_mul(multiplier).min(SCANNER_CYCLE_RECOVERY_BACKOFF_CAP)
+}
+
+fn reason_with_next_attempt(reason: Option<String>, next_attempt_at_unix_secs: u64, delay: Duration) -> String {
+    let reason = reason.unwrap_or_default();
+    let base = reason
+        .split(SCANNER_CYCLE_RECOVERY_NEXT_ATTEMPT_MARKER)
+        .next()
+        .unwrap_or_default();
+    format!(
+        "{base}{SCANNER_CYCLE_RECOVERY_NEXT_ATTEMPT_MARKER}{next_attempt_at_unix_secs} (in {}s)",
+        delay.as_secs()
+    )
+}
+
+/// Record one automatic retry of the current retryable observation and return
+/// the schedule for the next attempt. The observation never becomes terminal:
+/// once the short retry budget is spent the state reads `backoff` and keeps
+/// retrying at a capped cadence, and the reason names the next attempt time.
+pub(super) fn record_scanner_cycle_recovery_retry(attempt: u32, cycle_interval: Duration) -> ScannerCycleRecoveryRetry {
+    let now = unix_now_secs();
     let mut status = scanner_cycle_recovery_status();
     if status.classification.as_deref() == Some(CACHE_CYCLE_AHEAD) {
-        return true;
+        return ScannerCycleRecoveryRetry {
+            attempt,
+            delay: scanner_cycle_recovery_backoff_delay(attempt, cycle_interval),
+        };
     }
-    status.retry_count = status.retry_count.max(u64::from(attempt));
-    status.last_attempt_at_unix_secs = Some(unix_now_secs());
-    if status.max_retries != 0 && status.retry_count >= u64::from(status.max_retries) {
-        status.state = "paused".to_string();
-        status.retryable = false;
-        status.reason = Some("scanner cycle recovery retry budget reached; sparse backend probes continue".to_string());
-        set_scanner_cycle_recovery_status(status);
-        false
+    let window_started_at = if attempt <= 1 {
+        SCANNER_CYCLE_RECOVERY_WINDOW_STARTED_AT.store(now, Ordering::Relaxed);
+        now
     } else {
-        status.retryable = true;
-        set_scanner_cycle_recovery_status(status);
-        true
+        match SCANNER_CYCLE_RECOVERY_WINDOW_STARTED_AT.load(Ordering::Relaxed) {
+            0 => {
+                SCANNER_CYCLE_RECOVERY_WINDOW_STARTED_AT.store(now, Ordering::Relaxed);
+                now
+            }
+            started => started,
+        }
+    };
+    let first_detected_at_unix_secs = status
+        .first_detected_at_unix_secs
+        .map_or(window_started_at, |first| first.min(window_started_at));
+    if now.saturating_sub(first_detected_at_unix_secs) >= SCANNER_CYCLE_RECOVERY_RETRY_WINDOW_SECS {
+        SCANNER_CYCLE_RECOVERY_WINDOW_STARTED_AT.store(now, Ordering::Relaxed);
+        status.first_detected_at_unix_secs = Some(now);
+        status.retry_count = 1;
+    } else {
+        status.first_detected_at_unix_secs = Some(first_detected_at_unix_secs);
+        status.retry_count = status.retry_count.max(u64::from(attempt));
     }
+    let attempt = u32::try_from(status.retry_count).unwrap_or(u32::MAX);
+    let delay = scanner_cycle_recovery_backoff_delay(attempt, cycle_interval);
+    let next_attempt_at_unix_secs = now.saturating_add(delay.as_secs());
+    let budget_spent = status.max_retries != 0 && status.retry_count >= u64::from(status.max_retries);
+    if budget_spent && status.state != SCANNER_CYCLE_RECOVERY_STATE_BACKOFF {
+        warn!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_CYCLE_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = SCANNER_CYCLE_RECOVERY_STATE_BACKOFF,
+            previous_state = %status.state,
+            classification = status.classification.as_deref().unwrap_or_default(),
+            retry_count = status.retry_count,
+            next_attempt_at_unix_secs,
+            "Scanner cycle recovery retry budget reached; continuing with bounded backoff"
+        );
+    }
+    if budget_spent {
+        status.state = SCANNER_CYCLE_RECOVERY_STATE_BACKOFF.to_string();
+    }
+    status.retryable = true;
+    status.last_attempt_at_unix_secs = Some(now);
+    status.next_attempt_at_unix_secs = Some(next_attempt_at_unix_secs);
+    status.reason = Some(reason_with_next_attempt(status.reason.take(), next_attempt_at_unix_secs, delay));
+    set_scanner_cycle_recovery_status(status);
+    ScannerCycleRecoveryRetry { attempt, delay }
 }
 
 fn unix_now_secs() -> u64 {
@@ -1005,6 +1118,12 @@ pub(crate) enum ScannerCycleStateStartup {
         leader_epoch: u64,
         revision: DataUsageCacheRevision,
     },
+    /// The primary at `revision` is quarantined as corrupt. The caller starts
+    /// from an uninitialized cycle, raises it to the usage floor, and lets the
+    /// leadership claim CAS-replace the quarantined revision.
+    RebuildFromQuarantine {
+        revision: DataUsageCacheRevision,
+    },
     Blocked,
     Transient(ScannerError),
 }
@@ -1029,7 +1148,7 @@ enum CycleStateBodyReadError {
     Backend(#[source] EcstoreError),
 }
 
-fn recovery_status_from_marker(marker: &ScannerCycleRecoveryMarker, state: &str) -> ScannerCycleRecoveryStatus {
+fn recovery_status_from_marker(marker: &ScannerCycleRecoveryMarker, state: &str, retryable: bool) -> ScannerCycleRecoveryStatus {
     ScannerCycleRecoveryStatus {
         path: marker.path.clone(),
         quarantine_path: Some(marker.quarantine_path.clone()),
@@ -1042,9 +1161,79 @@ fn recovery_status_from_marker(marker: &ScannerCycleRecoveryMarker, state: &str)
         last_attempt_at_unix_secs: Some(marker.last_attempt_at_unix_secs),
         retry_count: marker.retry_count,
         max_retries: MAX_SCANNER_CYCLE_RECOVERY_RETRIES,
-        retryable: false,
+        retryable,
         reason: Some(marker.reason.clone()),
+        ..Default::default()
     }
+}
+
+/// Only a counter this reader classified as corrupt is rebuilt automatically.
+/// A future-schema counter belongs to a newer binary, and an operator reset in
+/// progress (`cleanup-pending`) owns the primary until it finishes.
+fn marker_schedules_automatic_rebuild(marker: &ScannerCycleRecoveryMarker) -> bool {
+    marker.state == "blocked" && marker.classification == "corrupt"
+}
+
+/// The durable quarantine marker is the evidence; the rebuild itself goes
+/// through the ordinary fenced leadership claim, which CAS-replaces the
+/// quarantined revision and raises the epoch above the usage floor.
+fn schedule_cycle_state_rebuild(
+    marker: &ScannerCycleRecoveryMarker,
+    revision: DataUsageCacheRevision,
+) -> ScannerCycleStateStartup {
+    let mut status = recovery_status_from_marker(marker, SCANNER_CYCLE_RECOVERY_STATE_REBUILDING, true);
+    status.reason = Some(format!(
+        "{}; rebuilding the cycle counter from the usage floor under a new leadership epoch; quarantine evidence is retained at {}",
+        marker.reason, marker.quarantine_path
+    ));
+    set_scanner_cycle_recovery_status(status);
+    info!(
+        target: "rustfs::scanner",
+        event = EVENT_SCANNER_PERSIST_STATE,
+        component = LOG_COMPONENT_SCANNER,
+        subsystem = LOG_SUBSYSTEM_RUNTIME,
+        path = %marker.path,
+        state = "quarantine_rebuild_scheduled",
+        primary_revision = %marker.primary_revision,
+        quarantine_path = %marker.quarantine_path,
+        "Scanner cycle state rebuild scheduled from quarantine"
+    );
+    ScannerCycleStateStartup::RebuildFromQuarantine { revision }
+}
+
+/// Publish the durable outcome of an automatic rebuild once the leadership
+/// claim persisted the new counter. The marker is intentionally left behind.
+pub(super) fn record_scanner_cycle_state_rebuilt_from_quarantine(next_cycle: u64, leader_epoch: u64) {
+    let previous = scanner_cycle_recovery_status();
+    let now = unix_now_secs();
+    set_scanner_cycle_recovery_status(ScannerCycleRecoveryStatus {
+        path: DATA_USAGE_BLOOM_NAME_PATH.clone(),
+        quarantine_path: Some(DATA_USAGE_BLOOM_RECOVERY_PATH.clone()),
+        state: "healthy".to_string(),
+        generation: Some(next_cycle),
+        leader_epoch: Some(leader_epoch),
+        first_detected_at_unix_secs: previous.first_detected_at_unix_secs,
+        last_attempt_at_unix_secs: Some(now),
+        max_retries: MAX_SCANNER_CYCLE_RECOVERY_RETRIES,
+        rebuilt_from_quarantine_at_unix_secs: Some(now),
+        reason: Some(format!(
+            "cycle state rebuilt from quarantine; evidence retained at {}",
+            DATA_USAGE_BLOOM_RECOVERY_PATH.as_str()
+        )),
+        ..Default::default()
+    });
+    info!(
+        target: "rustfs::scanner",
+        event = EVENT_SCANNER_PERSIST_STATE,
+        component = LOG_COMPONENT_SCANNER,
+        subsystem = LOG_SUBSYSTEM_RUNTIME,
+        path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+        state = SCANNER_CYCLE_RECOVERY_REBUILT_FROM_QUARANTINE,
+        next_cycle,
+        leader_epoch,
+        quarantine_path = %&*DATA_USAGE_BLOOM_RECOVERY_PATH,
+        "Scanner cycle state rebuilt from quarantine"
+    );
 }
 
 fn marker_matches_revision(marker: &ScannerCycleRecoveryMarker, revision: &DataUsageCacheRevision) -> bool {
@@ -1379,6 +1568,7 @@ async fn quarantine_invalid_cycle_state_with_reason(
         max_retries: MAX_SCANNER_CYCLE_RECOVERY_RETRIES,
         retryable: true,
         reason: Some(reason.to_string()),
+        ..Default::default()
     };
     set_scanner_cycle_recovery_status(base_status);
     let Some(expected_epoch) = scanner_publication_epoch(storeapi.clone()).await else {
@@ -1394,10 +1584,21 @@ async fn quarantine_invalid_cycle_state_with_reason(
     match persist_cycle_recovery_marker(storeapi, revision, generation, leader_epoch, classification, reason, expected_epoch)
         .await
     {
-        Ok(marker) => set_scanner_cycle_recovery_status(recovery_status_from_marker(&marker, "blocked")),
+        Ok(marker) => {
+            let automatic_rebuild = marker_schedules_automatic_rebuild(&marker);
+            let mut status = recovery_status_from_marker(&marker, "blocked", automatic_rebuild);
+            if automatic_rebuild {
+                status.reason = Some(format!(
+                    "{}; the next leader iteration rebuilds the cycle counter from the usage floor",
+                    marker.reason
+                ));
+            }
+            set_scanner_cycle_recovery_status(status);
+        }
         Err(CycleRecoveryMarkerReadError::Backend(_)) => {
-            // Keep the poison object untouched and retry marker creation with the
-            // bounded startup backoff; recovery-required never becomes healthy.
+            // Keep the poison object untouched and retry marker creation with
+            // the bounded recovery backoff; the quarantine marker must be
+            // durable before the counter is rebuilt.
             return ScannerCycleStateStartup::Transient(ScannerError::Other(
                 "failed to persist scanner cycle recovery marker".to_string(),
             ));
@@ -1460,6 +1661,23 @@ async fn mark_cycle_recovery_cleanup_pending(
 }
 
 pub(crate) async fn load_scanner_cycle_state_for_startup(
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+) -> ScannerCycleStateStartup {
+    let load = load_scanner_cycle_state_inner(storeapi);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let load = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+        crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::ScannerCycleStateRead,
+        async {
+            crate::storage_api::ecstore_diagnostic::observe_read_version_context_boundary(
+                crate::storage_api::ecstore_diagnostic::ReadVersionContextBoundary::ScannerCycleStateLoad,
+            );
+            load.await
+        },
+    );
+    load.await
+}
+
+async fn load_scanner_cycle_state_inner(
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
 ) -> ScannerCycleStateStartup {
     let marker = match read_cycle_recovery_marker_bytes(storeapi.clone()).await {
@@ -1536,12 +1754,15 @@ pub(crate) async fn load_scanner_cycle_state_for_startup(
             | EcstoreError::ConfigNotFound,
         ) => {
             if let Some((marker, _)) = marker {
+                if marker_schedules_automatic_rebuild(&marker) {
+                    return schedule_cycle_state_rebuild(&marker, DataUsageCacheRevision::Missing);
+                }
                 let state = if marker.state == "cleanup-pending" {
                     "cleanup-pending"
                 } else {
                     "recovery-required"
                 };
-                set_scanner_cycle_recovery_status(recovery_status_from_marker(&marker, state));
+                set_scanner_cycle_recovery_status(recovery_status_from_marker(&marker, state, false));
                 return ScannerCycleStateStartup::Blocked;
             }
             set_scanner_cycle_recovery_status(recovery_status("healthy", None, false));
@@ -1585,12 +1806,15 @@ pub(crate) async fn load_scanner_cycle_state_for_startup(
         .as_ref()
         .filter(|(marker, _)| marker.state == "cleanup-pending" || marker_matches_revision(marker, &revision))
     {
+        if marker_schedules_automatic_rebuild(marker) {
+            return schedule_cycle_state_rebuild(marker, revision);
+        }
         let state = if marker.state == "cleanup-pending" {
             "cleanup-pending"
         } else {
             "blocked"
         };
-        set_scanner_cycle_recovery_status(recovery_status_from_marker(marker, state));
+        set_scanner_cycle_recovery_status(recovery_status_from_marker(marker, state, false));
         return ScannerCycleStateStartup::Blocked;
     }
     let data = match read_cycle_state_body(&mut reader).await {
@@ -1658,7 +1882,7 @@ pub(super) async fn resume_scanner_cycle_cleanup(ctx: CancellationToken, storeap
         }
     };
     let mut observation =
-        publish_scanner_cleanup_status(recovery_status_from_marker(&marker, &marker.state), Some(status_version));
+        publish_scanner_cleanup_status(recovery_status_from_marker(&marker, &marker.state, false), Some(status_version));
     if marker.state != "cleanup-pending" {
         return Ok(());
     }
@@ -1753,7 +1977,7 @@ pub(super) async fn reset_scanner_cycle_recovery_for_intent(
             .ok_or_else(|| {
                 ScannerError::Other("scanner cleanup recovery requires an unchanged cleanup-pending marker".to_string())
             })?;
-        publish_status(recovery_status_from_marker(&marker, "cleanup-pending"));
+        publish_status(recovery_status_from_marker(&marker, "cleanup-pending", false));
     }
     let Some(marker_data) = marker_data else {
         // A delete may commit before its reply is lost. Confirm both durable
@@ -1857,7 +2081,7 @@ pub(super) async fn reset_scanner_cycle_recovery_for_intent(
             let (cleanup_marker, cleanup_marker_revision) =
                 mark_cycle_recovery_cleanup_pending(storeapi.clone(), marker.clone(), &marker_revision, reset_epoch, &owns_reset)
                     .await?;
-            publish_status(recovery_status_from_marker(&cleanup_marker, "cleanup-pending"));
+            publish_status(recovery_status_from_marker(&cleanup_marker, "cleanup-pending", false));
             let usage_floor = persisted_usage_floor(storeapi.clone()).await?;
             let fence_epoch = primary_epoch
                 .max(usage_floor.leader_epoch)
@@ -2057,6 +2281,7 @@ pub(super) async fn reset_scanner_cycle_recovery_for_intent(
             max_retries: MAX_SCANNER_CYCLE_RECOVERY_RETRIES,
             retryable: false,
             reason: Some("cycle state rebuilt but usage epoch fencing failed".to_string()),
+            ..Default::default()
         });
         return Err(err);
     }
@@ -2085,6 +2310,7 @@ pub(super) async fn reset_scanner_cycle_recovery_for_intent(
             max_retries: MAX_SCANNER_CYCLE_RECOVERY_RETRIES,
             retryable: false,
             reason: Some("rebuilt scanner cycle state changed before marker cleanup".to_string()),
+            ..Default::default()
         });
         return Err(ScannerError::Other(
             "rebuilt scanner cycle state changed before recovery marker cleanup".to_string(),
@@ -2598,11 +2824,13 @@ pub async fn reset_scanner_usage_state_for_full_rebuild(
     };
     let (cycle, cycle_epoch, cycle_revision) = read_cycle_state_for_usage_reset(storeapi.clone()).await?;
     let slots = read_usage_state_reset_slots(storeapi.clone()).await?;
+    // Corrupt usage slots without any cycle state carry no epoch to honor:
+    // the operator asked for a full rebuild, so start from the empty baseline
+    // exactly as a missing floor would (rustfs/rustfs#8670). Quota keeps
+    // failing closed for quota-bearing buckets until the rebuilt baseline
+    // publishes, which is the existing bootstrap-pending contract.
     let usage_floor = match usage_state_reset_floor(&slots)? {
         ScannerUsageResetFloor::Trusted(floor) => floor,
-        ScannerUsageResetFloor::Corrupt if matches!(cycle_revision, DataUsageCacheRevision::Missing) => {
-            return Err(ScannerError::Other("scanner usage reset has no trusted cycle or usage floor".to_string()));
-        }
         ScannerUsageResetFloor::Missing | ScannerUsageResetFloor::Corrupt => PersistedUsageFloor {
             next_cycle: cycle.next,
             leader_epoch: cycle_epoch,
@@ -3772,6 +4000,19 @@ pub(super) async fn persist_scanner_cycle_state(
     leader_epoch: u64,
 ) -> bool {
     persist_scanner_cycle_state_for_epoch(ctx, storeapi, cycle_info, revision, leader_epoch, None).await
+        == ScannerCycleStatePersistOutcome::Saved
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ScannerCycleStatePersistOutcome {
+    /// Durable cycle state carries this leader's epoch and progress.
+    Saved,
+    /// Durable state is owned by a newer leadership epoch; this leader yields
+    /// and must not retry under its own epoch.
+    Fenced,
+    /// The save could not be confirmed and no newer owner was observed. The
+    /// caller may reload durable state and continue under the same epoch.
+    Unconfirmed,
 }
 
 pub(super) async fn persist_scanner_cycle_state_for_epoch(
@@ -3781,7 +4022,8 @@ pub(super) async fn persist_scanner_cycle_state_for_epoch(
     revision: &mut DataUsageCacheRevision,
     leader_epoch: u64,
     expected_publication_epoch: Option<u64>,
-) -> bool {
+) -> ScannerCycleStatePersistOutcome {
+    use ScannerCycleStatePersistOutcome::{Fenced, Saved, Unconfirmed};
     let buf = match encode_scanner_cycle_state(cycle_info, leader_epoch) {
         Ok(buf) => buf,
         Err(e) => {
@@ -3795,7 +4037,7 @@ pub(super) async fn persist_scanner_cycle_state_for_epoch(
                 error = %e,
                 "Scanner state encoding failed"
             );
-            return false;
+            return Unconfirmed;
         }
     };
 
@@ -3811,16 +4053,16 @@ pub(super) async fn persist_scanner_cycle_state_for_epoch(
                 retry,
                 "Scanner state persistence cancelled by the leader fence"
             );
-            return false;
+            return Unconfirmed;
         }
 
         #[cfg(test)]
         notify_scanner_cycle_state_persist_test_hook(leader_epoch);
         let Some(read_epoch) = scanner_publication_epoch(storeapi.clone()).await else {
-            return false;
+            return Unconfirmed;
         };
         if expected_publication_epoch.is_some_and(|expected| expected != read_epoch) {
-            return false;
+            return Unconfirmed;
         }
         let save_result = {
             let Some(_publication_admission) = scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch).await else {
@@ -3833,7 +4075,7 @@ pub(super) async fn persist_scanner_cycle_state_for_epoch(
                     state = "publication_admission_unavailable",
                     "Scanner state persistence skipped without movement admission"
                 );
-                return false;
+                return Unconfirmed;
             };
             let save = save_config_with_preconditions(
                 storeapi.clone(),
@@ -3859,7 +4101,7 @@ pub(super) async fn persist_scanner_cycle_state_for_epoch(
             };
             result
         };
-        match save_result {
+        let precondition_failed = match save_result {
             Ok(object_info) => {
                 let Some(etag) = object_info.etag.filter(|etag| !etag.is_empty()) else {
                     error!(
@@ -3871,7 +4113,7 @@ pub(super) async fn persist_scanner_cycle_state_for_epoch(
                         state = "missing_revision",
                         "Scanner state save returned no ETag"
                     );
-                    return false;
+                    return Unconfirmed;
                 };
                 *revision = DataUsageCacheRevision::Etag(etag);
                 if ctx.is_cancelled() {
@@ -3885,14 +4127,14 @@ pub(super) async fn persist_scanner_cycle_state_for_epoch(
                         retry,
                         "Scanner state save completed after the leader fence was cancelled"
                     );
-                    return false;
+                    return Unconfirmed;
                 }
                 if let Some(expected_epoch) = expected_publication_epoch
                     && scanner_publication_admission_for_epoch(storeapi.clone(), expected_epoch)
                         .await
                         .is_none()
                 {
-                    return false;
+                    return Unconfirmed;
                 }
                 debug!(
                     target: "rustfs::scanner",
@@ -3903,153 +4145,158 @@ pub(super) async fn persist_scanner_cycle_state_for_epoch(
                     state = "saved",
                     "Scanner state saved"
                 );
-                return true;
+                return Saved;
             }
-            Err(EcstoreError::PreconditionFailed) => {
-                let (persisted, persisted_revision) =
-                    match read_config_with_revision(storeapi.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str()).await {
-                        Ok(result) => result,
-                        Err(e) => {
-                            error!(
-                                target: "rustfs::scanner",
-                                event = EVENT_SCANNER_PERSIST_STATE,
-                                component = LOG_COMPONENT_SCANNER,
-                                subsystem = LOG_SUBSYSTEM_RUNTIME,
-                                path = %&*DATA_USAGE_BLOOM_NAME_PATH,
-                                state = "conflict_reload_failed",
-                                error = %e,
-                                "Scanner state conflict reconciliation failed"
-                            );
-                            return false;
-                        }
-                    };
-                *revision = persisted_revision;
-                if ctx.is_cancelled() {
-                    debug!(
-                        target: "rustfs::scanner",
-                        event = EVENT_SCANNER_PERSIST_STATE,
-                        component = LOG_COMPONENT_SCANNER,
-                        subsystem = LOG_SUBSYSTEM_RUNTIME,
-                        path = %&*DATA_USAGE_BLOOM_NAME_PATH,
-                        state = "cancelled_after_conflict",
-                        retry,
-                        "Scanner state conflict reconciliation cancelled by the leader fence"
-                    );
-                    return false;
-                }
-
-                if let Some(persisted) = persisted {
-                    if persisted.len() < 8 {
-                        error!(
-                            target: "rustfs::scanner",
-                            event = EVENT_SCANNER_PERSIST_STATE,
-                            component = LOG_COMPONENT_SCANNER,
-                            subsystem = LOG_SUBSYSTEM_RUNTIME,
-                            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
-                            state = "conflict_state_invalid",
-                            length = persisted.len(),
-                            "Scanner state conflict winner is truncated"
-                        );
-                        return false;
-                    }
-
-                    let (persisted_cycle, persisted_epoch) = match decode_scanner_cycle_state(&persisted) {
-                        Ok(state) => state,
-                        Err(e) => {
-                            error!(
-                                target: "rustfs::scanner",
-                                event = EVENT_SCANNER_PERSIST_STATE,
-                                component = LOG_COMPONENT_SCANNER,
-                                subsystem = LOG_SUBSYSTEM_RUNTIME,
-                                path = %&*DATA_USAGE_BLOOM_NAME_PATH,
-                                state = "conflict_state_decode_failed",
-                                error = %e,
-                                "Scanner state conflict winner could not be decoded"
-                            );
-                            return false;
-                        }
-                    };
-                    if persisted_epoch != leader_epoch {
-                        error!(
-                            target: "rustfs::scanner",
-                            event = EVENT_SCANNER_PERSIST_STATE,
-                            component = LOG_COMPONENT_SCANNER,
-                            subsystem = LOG_SUBSYSTEM_RUNTIME,
-                            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
-                            state = "leader_epoch_fenced",
-                            expected_epoch = leader_epoch,
-                            persisted_epoch,
-                            "Scanner state save rejected by a newer leadership epoch"
-                        );
-                        return false;
-                    }
-
-                    if persisted_cycle.next >= cycle_info.next {
-                        if let Some(expected_epoch) = expected_publication_epoch
-                            && scanner_publication_admission_for_epoch(storeapi.clone(), expected_epoch)
-                                .await
-                                .is_none()
-                        {
-                            return false;
-                        }
-                        *cycle_info = persisted_cycle;
-                        debug!(
-                            target: "rustfs::scanner",
-                            event = EVENT_SCANNER_PERSIST_STATE,
-                            component = LOG_COMPONENT_SCANNER,
-                            subsystem = LOG_SUBSYSTEM_RUNTIME,
-                            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
-                            state = "conflict_reconciled",
-                            retry,
-                            "Scanner state adopted the current persisted cycle"
-                        );
-                        return true;
-                    }
-                }
-
-                if retry < SCANNER_PERSIST_CAS_RETRIES {
-                    debug!(
-                        target: "rustfs::scanner",
-                        event = EVENT_SCANNER_PERSIST_STATE,
-                        component = LOG_COMPONENT_SCANNER,
-                        subsystem = LOG_SUBSYSTEM_RUNTIME,
-                        path = %&*DATA_USAGE_BLOOM_NAME_PATH,
-                        state = "conflict_retry",
-                        retry = retry + 1,
-                        "Scanner state CAS conflict will be retried"
-                    );
-                    continue;
-                }
-
-                error!(
-                    target: "rustfs::scanner",
-                    event = EVENT_SCANNER_PERSIST_STATE,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_RUNTIME,
-                    path = %&*DATA_USAGE_BLOOM_NAME_PATH,
-                    state = "conflict_retries_exhausted",
-                    retries = SCANNER_PERSIST_CAS_RETRIES,
-                    "Scanner state CAS conflict retries exhausted"
-                );
-                return false;
-            }
+            Err(EcstoreError::PreconditionFailed) => true,
             Err(e) => {
+                // A timeout or backend error does not change ownership. The
+                // write may still have committed, so reconcile against the
+                // durable revision before retrying under the same epoch
+                // (rustfs/rustfs#8141).
+                warn!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_PERSIST_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                    state = "save_failed",
+                    retry,
+                    error = %e,
+                    "Scanner state save failed; reconciling durable state before retrying"
+                );
+                false
+            }
+        };
+
+        let (persisted, persisted_revision) =
+            match read_config_with_revision(storeapi.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str()).await {
+                Ok(result) => result,
+                Err(e) => {
+                    error!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_PERSIST_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                        state = "conflict_reload_failed",
+                        error = %e,
+                        "Scanner state conflict reconciliation failed"
+                    );
+                    return Unconfirmed;
+                }
+            };
+        *revision = persisted_revision;
+        if ctx.is_cancelled() {
+            debug!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                state = "cancelled_after_conflict",
+                retry,
+                "Scanner state conflict reconciliation cancelled by the leader fence"
+            );
+            return Unconfirmed;
+        }
+
+        if let Some(persisted) = persisted {
+            if persisted.len() < 8 {
                 error!(
                     target: "rustfs::scanner",
                     event = EVENT_SCANNER_PERSIST_STATE,
                     component = LOG_COMPONENT_SCANNER,
                     subsystem = LOG_SUBSYSTEM_RUNTIME,
                     path = %&*DATA_USAGE_BLOOM_NAME_PATH,
-                    state = "failed",
-                    error = %e,
-                    "Scanner state persistence failed"
+                    state = "conflict_state_invalid",
+                    length = persisted.len(),
+                    "Scanner state conflict winner is truncated"
                 );
-                return false;
+                return Unconfirmed;
+            }
+
+            let (persisted_cycle, persisted_epoch) = match decode_scanner_cycle_state(&persisted) {
+                Ok(state) => state,
+                Err(e) => {
+                    error!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_PERSIST_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                        state = "conflict_state_decode_failed",
+                        error = %e,
+                        "Scanner state conflict winner could not be decoded"
+                    );
+                    return Unconfirmed;
+                }
+            };
+            if persisted_epoch != leader_epoch {
+                error!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_PERSIST_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                    state = "leader_epoch_fenced",
+                    expected_epoch = leader_epoch,
+                    persisted_epoch,
+                    "Scanner state save rejected by a newer leadership epoch"
+                );
+                return Fenced;
+            }
+
+            if persisted_cycle.next >= cycle_info.next {
+                if let Some(expected_epoch) = expected_publication_epoch
+                    && scanner_publication_admission_for_epoch(storeapi.clone(), expected_epoch)
+                        .await
+                        .is_none()
+                {
+                    return Unconfirmed;
+                }
+                *cycle_info = persisted_cycle;
+                debug!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_PERSIST_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                    state = if precondition_failed { "conflict_reconciled" } else { "save_confirmed" },
+                    retry,
+                    "Scanner state adopted the current persisted cycle"
+                );
+                return Saved;
             }
         }
+
+        if retry < SCANNER_PERSIST_CAS_RETRIES {
+            debug!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+                state = if precondition_failed { "conflict_retry" } else { "save_retry" },
+                retry = retry + 1,
+                "Scanner state save will be retried under the same epoch"
+            );
+            continue;
+        }
+
+        error!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+            state = if precondition_failed { "conflict_retries_exhausted" } else { "save_retries_exhausted" },
+            retries = SCANNER_PERSIST_CAS_RETRIES,
+            "Scanner state save retries exhausted"
+        );
+        return Unconfirmed;
     }
 
-    false
+    Unconfirmed
 }
 
 #[cfg(test)]
@@ -4102,7 +4349,8 @@ pub(super) async fn finalize_partial_scan_cycle_for_epoch(
         leader_epoch,
         expected_publication_epoch,
     )
-    .await;
+    .await
+        == ScannerCycleStatePersistOutcome::Saved;
     if !persisted
         && let Some(expected_epoch) = expected_publication_epoch
         && scanner_publication_admission_for_epoch(storeapi, expected_epoch)
@@ -4176,7 +4424,8 @@ pub(super) async fn persist_required_scanner_cycle_floor_for_epoch(
         leader_epoch,
         options.expected_publication_epoch,
     )
-    .await;
+    .await
+        == ScannerCycleStatePersistOutcome::Saved;
     if !persisted
         && let Some(expected_epoch) = options.expected_publication_epoch
         && scanner_publication_admission_for_epoch(storeapi, expected_epoch)

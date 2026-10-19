@@ -491,6 +491,10 @@ pub trait HealStorageAPI: Send + Sync {
     /// Get all buckets
     async fn list_buckets(&self) -> Result<Vec<BucketInfo>>;
 
+    /// Return only a complete bucket inventory for an administrator task.
+    /// Incomplete discovery must fail before traversal or scope checkpointing.
+    async fn list_buckets_for_admin_heal(&self, selector: Option<DiskSetSelector>) -> Result<Vec<BucketInfo>>;
+
     /// Check object exists
     async fn object_exists(&self, bucket: &str, object: &str) -> Result<bool>;
 
@@ -732,6 +736,13 @@ pub trait HealStorageAPI: Send + Sync {
         Ok(true)
     }
 
+    /// Admit a one-shot recovery of an old pre-format intent only when the
+    /// current format fence permits its set, rebalance has a quiescent older
+    /// topology, and every target is a blank, unformatted replacement.
+    async fn replacement_preformat_retry_is_safe(&self, _set_disk_id: &str, _targets: &[String]) -> Result<bool> {
+        Ok(false)
+    }
+
     async fn replacement_execution(&self, _targets: &[String]) -> Result<Arc<ReplacementExecution>> {
         Err(Error::other("replacement execution lease acquisition is unsupported"))
     }
@@ -911,35 +922,11 @@ impl ECStoreHealStorage {
     }
 }
 
-fn is_transient_object_exists_message(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-
-    [
-        "failed to acquire read lock",
-        "lock acquisition failed",
-        "lock acquisition timeout",
-        "quorum not reached",
-        "deadline has elapsed",
-        "timed out",
-        "network error",
-        "transport error",
-        "connection refused",
-    ]
-    .iter()
-    .any(|pattern| message.contains(pattern))
-}
-
+/// A transient or contended existence check is skipped and retried; it is
+/// never reported as object absence or as a failure. One classifier decides
+/// (backlog#2900).
 fn is_transient_object_exists_error(err: &StorageError) -> bool {
-    if err.is_quorum_error() {
-        return true;
-    }
-
-    match err {
-        StorageError::Lock(lock_err) => lock_err.is_retryable() || is_transient_object_exists_message(&lock_err.to_string()),
-        StorageError::Io(io_err) => is_transient_object_exists_message(&io_err.to_string()),
-        StorageError::SlowDown | StorageError::OperationCanceled => true,
-        _ => false,
-    }
+    crate::error::classify_storage_error(err).is_retryable()
 }
 
 #[async_trait]
@@ -1333,6 +1320,14 @@ impl HealStorageAPI for ECStoreHealStorage {
                 Ok(false)
             }
         }
+    }
+
+    async fn list_buckets_for_admin_heal(&self, selector: Option<DiskSetSelector>) -> Result<Vec<BucketInfo>> {
+        let listing = self.ecstore.list_buckets_for_admin_heal(selector).await?;
+        if !listing.topology_complete {
+            return Err(Error::BucketDiscoveryIncomplete);
+        }
+        Ok(listing.buckets)
     }
 
     async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
@@ -1993,6 +1988,7 @@ impl HealStorageAPI for ECStoreHealStorage {
     ) -> Result<ReplacementResumeDisk> {
         let disks = self.resume_disk_inventory(set_disk_id).await?;
         let mut selected = None;
+        let mut inspected_other_tasks = HashSet::new();
         let mut observed_other_tasks = HashSet::new();
         for disk_store in &disks {
             if excluded_targets.contains(&disk_store.endpoint().to_string())
@@ -2014,7 +2010,7 @@ impl HealStorageAPI for ECStoreHealStorage {
                 // generation while another durable intent already owns this
                 // set. Inspect one copy of each other task and let the
                 // caller reconcile it through the normal recovery scanner.
-                if candidate_task_id != task_id && !observed_other_tasks.insert(candidate_task_id.clone()) {
+                if candidate_task_id != task_id && !inspected_other_tasks.insert(candidate_task_id.clone()) {
                     continue;
                 }
                 let manager =
@@ -2027,6 +2023,16 @@ impl HealStorageAPI for ECStoreHealStorage {
                     });
                 }
                 if candidate_task_id != task_id {
+                    // A retired record (committed handoff or approved legacy
+                    // migration) transferred its responsibility and no longer
+                    // owns the set (rustfs/rustfs#8664). An orphaned abandoned
+                    // record releases its slots once another generation's
+                    // markers own them.
+                    if super::resume::replacement_generation_reserves_targets(&state)
+                        && !super::resume::abandoned_targets_are_owned_by_another_generation(&state, &disks).await
+                    {
+                        observed_other_tasks.insert(candidate_task_id);
+                    }
                     continue;
                 }
                 let candidate =
@@ -2097,6 +2103,14 @@ impl HealStorageAPI for ECStoreHealStorage {
     async fn replacement_execution(&self, targets: &[String]) -> Result<Arc<ReplacementExecution>> {
         ReplacementExecution::acquire(targets).await
     }
+
+    async fn replacement_preformat_retry_is_safe(&self, set_disk_id: &str, targets: &[String]) -> Result<bool> {
+        let (pool_index, set_index) = crate::heal::utils::parse_set_disk_id(set_disk_id)?;
+        self.ecstore
+            .replacement_preformat_retry_is_safe(pool_index, set_index, targets)
+            .await
+            .map_err(Error::Storage)
+    }
 }
 
 #[cfg(test)]
@@ -2104,7 +2118,7 @@ mod tests {
     use super::super::StorageError;
     use super::{
         decode_disk_walk_token, decode_heal_token, encode_disk_walk_token, encode_heal_token, is_transient_object_exists_error,
-        is_transient_object_exists_message, next_heal_listing_token, replacement_resume_conflict_for_other_tasks,
+        next_heal_listing_token, replacement_resume_conflict_for_other_tasks,
     };
     use std::collections::HashSet;
 
@@ -2337,19 +2351,22 @@ mod tests {
     }
 
     #[test]
-    fn transient_object_exists_message_matches_lock_quorum_failures() {
-        assert!(is_transient_object_exists_message(
-            "Failed to acquire read lock: ns_loc: read lock acquisition failed on bucket/object: Quorum not reached: required 2, achieved 0"
-        ));
-        assert!(is_transient_object_exists_message("deadline has elapsed"));
-    }
-
-    #[test]
-    fn transient_object_exists_error_matches_quorum_variants() {
+    fn transient_object_exists_error_matches_quorum_lock_and_offline_variants() {
         assert!(is_transient_object_exists_error(&StorageError::ErasureReadQuorum));
         assert!(is_transient_object_exists_error(&StorageError::InsufficientReadQuorum(
             "bucket".to_string(),
             "object".to_string(),
+        )));
+        assert!(is_transient_object_exists_error(&StorageError::Io(std::io::Error::other(
+            "Failed to acquire read lock: ns_loc: read lock acquisition failed on bucket/object: Quorum not reached: required 2, achieved 0"
+        ))));
+        assert!(is_transient_object_exists_error(&StorageError::Io(std::io::Error::other(
+            "deadline has elapsed"
+        ))));
+        assert!(is_transient_object_exists_error(&StorageError::DiskNotFound));
+        assert!(is_transient_object_exists_error(&StorageError::VolumeNotFound));
+        assert!(is_transient_object_exists_error(&StorageError::RemoteClientUnavailable(
+            "rebuild".to_string()
         )));
     }
 

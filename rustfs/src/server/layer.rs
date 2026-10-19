@@ -587,6 +587,7 @@ where
                 let watchdog_context = context.clone();
                 async move {
                     tokio::select! {
+                        biased;
                         _ = watchdog.cancelled() => {}
                         _ = tokio::time::sleep(HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD) => {
                             watchdog_context.log_slow_inflight();
@@ -596,11 +597,11 @@ where
             });
         }
 
+        // An unpolled response future must also cancel its watchdog on drop.
+        let watchdog_guard = watchdog.map(CancellationToken::drop_guard);
         Box::pin(async move {
             let result = inner.call(req).await;
-            if let Some(watchdog) = watchdog {
-                watchdog.cancel();
-            }
+            drop(watchdog_guard);
             match &result {
                 Ok(response) => context.log_response(response),
                 Err(error) => context.log_failure(error),
@@ -863,7 +864,20 @@ where
                     }
                     Response::from_parts(parts, HybridBody::Rest { rest_body })
                 }
-                HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
+                HybridBody::Grpc {
+                    grpc_body,
+                    first_frame_started,
+                    body_started,
+                    first_frame_recorded,
+                } => Response::from_parts(
+                    parts,
+                    HybridBody::Grpc {
+                        grpc_body,
+                        first_frame_started,
+                        body_started,
+                        first_frame_recorded,
+                    },
+                ),
             };
 
             Ok(response)
@@ -1012,7 +1026,20 @@ where
                     }
                     Response::from_parts(parts, HybridBody::Rest { rest_body })
                 }
-                HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
+                HybridBody::Grpc {
+                    grpc_body,
+                    first_frame_started,
+                    body_started,
+                    first_frame_recorded,
+                } => Response::from_parts(
+                    parts,
+                    HybridBody::Grpc {
+                        grpc_body,
+                        first_frame_started,
+                        body_started,
+                        first_frame_recorded,
+                    },
+                ),
             };
 
             Ok(response)
@@ -1163,7 +1190,20 @@ where
 
                     Response::from_parts(parts, HybridBody::Rest { rest_body })
                 }
-                HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
+                HybridBody::Grpc {
+                    grpc_body,
+                    first_frame_started,
+                    body_started,
+                    first_frame_recorded,
+                } => Response::from_parts(
+                    parts,
+                    HybridBody::Grpc {
+                        grpc_body,
+                        first_frame_started,
+                        body_started,
+                        first_frame_recorded,
+                    },
+                ),
             };
 
             Ok(response)
@@ -1234,7 +1274,20 @@ where
                         },
                     )
                 }
-                HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
+                HybridBody::Grpc {
+                    grpc_body,
+                    first_frame_started,
+                    body_started,
+                    first_frame_recorded,
+                } => Response::from_parts(
+                    parts,
+                    HybridBody::Grpc {
+                        grpc_body,
+                        first_frame_started,
+                        body_started,
+                        first_frame_recorded,
+                    },
+                ),
             };
 
             Ok(response)
@@ -1302,7 +1355,20 @@ where
                         rest_body: RestBody::from(Bytes::new()),
                     },
                 ),
-                HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
+                HybridBody::Grpc {
+                    grpc_body,
+                    first_frame_started,
+                    body_started,
+                    first_frame_recorded,
+                } => Response::from_parts(
+                    parts,
+                    HybridBody::Grpc {
+                        grpc_body,
+                        first_frame_started,
+                        body_started,
+                        first_frame_recorded,
+                    },
+                ),
             };
 
             Ok(response)
@@ -5680,6 +5746,154 @@ mod tests {
         let uri: http::Uri = "/rustfs/admin/v3/users?token=not-a-download-token".parse().expect("uri");
 
         assert_eq!(redact_sensitive_uri_query(&uri), "/rustfs/admin/v3/users?token=not-a-download-token");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_logging_watchdog_cancels_dropped_futures() {
+        for poll_request in [false, true] {
+            for deadline_ready in [false, true] {
+                let attempts = if deadline_ready { 32 } else { 1 };
+                for attempt in 0..attempts {
+                    let writer = SharedWriter::default();
+                    let captured = writer.buffer.clone();
+                    let _subscriber = tracing::subscriber::set_default(
+                        tracing_subscriber::fmt()
+                            .without_time()
+                            .with_ansi(false)
+                            .with_writer(writer)
+                            .finish(),
+                    );
+                    assert!(tracing::enabled!(target: HTTP_SERVER_LOG_TARGET, Level::WARN));
+                    let inner =
+                        tower::service_fn(|_: HttpRequest<()>| std::future::pending::<Result<Response<()>, Infallible>>());
+                    let mut service = RequestLoggingLayer.layer(inner);
+                    let mut response = service.call(HttpRequest::new(()));
+                    if poll_request {
+                        assert!(futures::poll!(&mut response).is_pending());
+                    }
+                    tokio::task::yield_now().await;
+                    if deadline_ready {
+                        tokio::time::advance(HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD).await;
+                    }
+                    drop(response);
+                    tokio::time::advance(HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD + Duration::from_millis(1)).await;
+                    tokio::task::yield_now().await;
+
+                    let output = String::from_utf8(captured.lock().expect("logs").clone()).expect("UTF-8 logs");
+                    assert!(
+                        !output.contains(HTTP_REQUEST_INFLIGHT_SLOW_EVENT),
+                        "polled={poll_request}, deadline_ready={deadline_ready}, attempt={attempt}: {output}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_logging_watchdog_cancels_panicking_future() {
+        let writer = SharedWriter::default();
+        let captured = writer.buffer.clone();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(writer)
+                .finish(),
+        );
+        assert!(tracing::enabled!(target: HTTP_SERVER_LOG_TARGET, Level::WARN));
+        let inner = tower::service_fn(|_: HttpRequest<()>| {
+            std::future::poll_fn(|_| -> Poll<Result<Response<()>, Infallible>> { panic!("test service panic") })
+        });
+        let mut service = RequestLoggingLayer.layer(inner);
+        let mut response = service.call(HttpRequest::new(()));
+        tokio::task::yield_now().await;
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            response.as_mut().poll(&mut Context::from_waker(std::task::Waker::noop()))
+        }));
+        assert!(panic.is_err());
+        tokio::time::advance(HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+
+        let output = String::from_utf8(captured.lock().expect("logs").clone()).expect("UTF-8 logs");
+        assert!(!output.contains(HTTP_REQUEST_INFLIGHT_SLOW_EVENT), "{output}");
+        drop(response);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_logging_watchdog_cancels_completed_futures() {
+        for fail_request in [false, true] {
+            let writer = SharedWriter::default();
+            let captured = writer.buffer.clone();
+            let _subscriber = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .without_time()
+                    .with_ansi(false)
+                    .with_writer(writer)
+                    .finish(),
+            );
+            assert!(tracing::enabled!(target: HTTP_SERVER_LOG_TARGET, Level::WARN));
+            let inner = tower::service_fn(move |_: HttpRequest<()>| {
+                std::future::ready(if fail_request {
+                    Err(io::Error::other("test service failure"))
+                } else {
+                    Ok(Response::new(()))
+                })
+            });
+            let mut service = RequestLoggingLayer.layer(inner);
+            let mut response = service.call(HttpRequest::new(()));
+            tokio::task::yield_now().await;
+            let Poll::Ready(result) = futures::poll!(&mut response) else {
+                panic!("service should complete immediately");
+            };
+            assert_eq!(result.is_err(), fail_request);
+            // Retaining a completed future must not retain an active watchdog.
+            tokio::time::advance(HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD + Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+
+            let output = String::from_utf8(captured.lock().expect("logs").clone()).expect("UTF-8 logs");
+            assert!(!output.contains(HTTP_REQUEST_INFLIGHT_SLOW_EVENT), "{output}");
+            let expected_event = if fail_request {
+                HTTP_REQUEST_FAILED_EVENT
+            } else {
+                HTTP_REQUEST_COMPLETED_EVENT
+            };
+            assert_eq!(output.matches(expected_event).count(), 1, "{output}");
+            drop(response);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_logging_watchdog_warns_once_for_pending_request() {
+        let writer = SharedWriter::default();
+        let captured = writer.buffer.clone();
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(writer)
+                .finish(),
+        );
+        assert!(tracing::enabled!(target: HTTP_SERVER_LOG_TARGET, Level::WARN));
+        let inner = tower::service_fn(|_: HttpRequest<()>| std::future::pending::<Result<Response<()>, Infallible>>());
+        let mut service = RequestLoggingLayer.layer(inner);
+        let mut response = service.call(HttpRequest::new(()));
+        assert!(futures::poll!(&mut response).is_pending());
+        tokio::task::yield_now().await;
+        tokio::time::advance(HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(captured.lock().expect("logs").is_empty());
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        let output = String::from_utf8(captured.lock().expect("logs").clone()).expect("UTF-8 logs");
+        assert_eq!(output.matches(HTTP_REQUEST_INFLIGHT_SLOW_EVENT).count(), 1, "{output}");
+        assert!(output.contains("response_pending"), "{output}");
+
+        tokio::time::advance(HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD).await;
+        tokio::task::yield_now().await;
+        let output = String::from_utf8(captured.lock().expect("logs").clone()).expect("UTF-8 logs");
+        assert_eq!(output.matches(HTTP_REQUEST_INFLIGHT_SLOW_EVENT).count(), 1, "{output}");
+        drop(response);
     }
 
     #[tokio::test]

@@ -458,6 +458,88 @@ fn apply_scoped_dirty_usage_ack(
 }
 
 #[cfg(test)]
+mod status_class_mutation_tests {
+    use super::*;
+    use crate::segment_invalidation::SegmentInvalidationProducerIdentity;
+    use serial_test::serial;
+
+    fn bucket(name: &str) -> BucketInfo {
+        BucketInfo {
+            name: name.to_string(),
+            created: None,
+            deleted: None,
+            versioning: false,
+            object_locking: false,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn status_class_mutation_is_not_namespace_activity() {
+        clear_dirty_usage_buckets_for_tests();
+        let generation_before = dirty_usage_generation();
+        let snapshot = snapshot_dirty_usage_buckets(&[bucket("photos")], generation_before);
+        assert_eq!(dirty_usage_snapshot_status(&snapshot), DirtyUsageSnapshotStatus::Current);
+
+        record_status_class_mutation("photos", "2026/image.jpg", SegmentInvalidationProducerIdentity::Replication);
+
+        assert_eq!(
+            dirty_usage_generation(),
+            generation_before,
+            "a status-class writeback must not advance the dirty generation"
+        );
+        assert!(
+            !dirty_usage_buckets_pending(),
+            "a status-class writeback must not count as pending dirty usage"
+        );
+        assert!(
+            dirty_usage_buckets_for_tests().is_empty(),
+            "a status-class writeback must not enter the dirty map"
+        );
+        assert_eq!(
+            dirty_usage_snapshot_status(&snapshot),
+            DirtyUsageSnapshotStatus::Current,
+            "a status-class writeback during a walk must not supersede the cycle"
+        );
+        assert_ne!(
+            DIRTY_USAGE_PRODUCER_COVERAGE.load(Ordering::Acquire)
+                & SegmentInvalidationProducerIdentity::Replication
+                    .production_coverage_bit()
+                    .expect("replication has a coverage bit"),
+            0,
+            "producer coverage keeps recording the reclassified producer"
+        );
+        clear_dirty_usage_buckets_for_tests();
+    }
+
+    #[test]
+    #[serial]
+    fn status_class_mutation_does_not_reach_the_mutation_observer() {
+        use std::sync::{Arc, Mutex};
+
+        clear_dirty_usage_buckets_for_tests();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let sink = observed.clone();
+        let previous = set_scanner_dirty_usage_mutation_observer(Some(Arc::new(move |bucket, object, producer| {
+            sink.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((bucket.to_string(), object.to_string(), producer));
+        })));
+
+        record_status_class_mutation("photos", "2026/image.jpg", SegmentInvalidationProducerIdentity::Replication);
+        record_status_class_mutation("", "2026/image.jpg", SegmentInvalidationProducerIdentity::Replication);
+        record_status_class_mutation("photos", "", SegmentInvalidationProducerIdentity::Replication);
+
+        set_scanner_dirty_usage_mutation_observer(previous);
+        assert!(
+            observed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_empty(),
+            "the durable dirty journal must never see a status-class writeback"
+        );
+        clear_dirty_usage_buckets_for_tests();
+    }
+}
+
+#[cfg(test)]
 mod scoped_dirty_usage_tests {
     use super::*;
     use crate::segment_invalidation::SegmentInvalidationProducerIdentity;
@@ -934,6 +1016,31 @@ where
     DIRTY_USAGE_BUCKET_NOTIFY.notify_one();
 }
 
+/// Record a status-class barrier hit: a committed writeback that changed only
+/// replication or restore state on an existing version.
+///
+/// Such a writeback changes no size, version count or delete marker, so it is
+/// not namespace activity: it must not advance the dirty-usage generation,
+/// enter the activity snapshot, wake the scanner or reach the durable dirty
+/// journal, because any of those makes a cycle `Superseded` for as long as
+/// replication runs. It needs no rescan queue either: a deployment with an
+/// active replication rule walks every bucket on every cycle
+/// (`ScannerMaintenanceFeatures::needs_regular_cycle`), and that walk is what
+/// refreshes `replication_stats`. Only the process-local producer coverage is
+/// recorded so segment-reuse evidence keeps its meaning.
+pub fn record_status_class_mutation(
+    bucket: &str,
+    object: &str,
+    producer: crate::segment_invalidation::SegmentInvalidationProducerIdentity,
+) {
+    if bucket.is_empty() || object.is_empty() {
+        return;
+    }
+    if let Some(coverage_bit) = producer.production_coverage_bit() {
+        DIRTY_USAGE_PRODUCER_COVERAGE.fetch_or(coverage_bit, Ordering::AcqRel);
+    }
+}
+
 fn record_segment_invalidation_producer_identities_for_generation<I>(
     identities: &mut DirtyUsageProducerIdentities,
     bucket: &str,
@@ -1218,19 +1325,41 @@ pub(super) fn dirty_usage_buckets_excluding_failed(
         .collect()
 }
 
+/// Plan the per-bucket certification of a walk. The returned snapshot is
+/// applied by `clear_dirty_usage_buckets`, which removes only the buckets
+/// whose generation still equals the start snapshot: a bucket written during
+/// the walk keeps its newer generation and stays pending. The dirty-usage
+/// generation therefore does not need to be unchanged; only the guardrail
+/// must have passed.
 pub(super) fn should_clear_dirty_usage_snapshot(
     result_ok: bool,
     completed_all_sets: bool,
     budget_elapsed: bool,
-    activity_and_generation_current: bool,
+    guardrail_passed: bool,
     dirty_buckets: &DirtyUsageBuckets,
     failed_buckets: &HashSet<String>,
 ) -> Option<DirtyUsageBuckets> {
-    if result_ok && completed_all_sets && !budget_elapsed && activity_and_generation_current {
+    if result_ok && completed_all_sets && !budget_elapsed && guardrail_passed {
         return Some(dirty_usage_buckets_excluding_failed(dirty_buckets, failed_buckets));
     }
 
     None
+}
+
+/// Buckets the walk cannot certify against its start snapshot: every dirty
+/// bucket whose generation differs from the snapshot's, including buckets
+/// dirtied after the snapshot was taken. Only a `Complete` cycle reads this,
+/// and a failed bucket never reaches `Complete`, so the failed set that
+/// `dirty_usage_buckets_excluding_failed` removes is empty here. The caller
+/// adds the buckets whose walk stopped early behind a certified value; they
+/// are pending whether or not the dirty map names them.
+pub(super) fn pending_dirty_usage_buckets(snapshot: &DirtyUsageBuckets) -> BTreeSet<String> {
+    let dirty_buckets = dirty_usage_buckets();
+    dirty_buckets
+        .iter()
+        .filter(|(bucket, generation)| snapshot.get(bucket.as_str()) != Some(*generation))
+        .map(|(bucket, _)| bucket.clone())
+        .collect()
 }
 
 pub(super) async fn record_failed_dirty_bucket(failed_buckets: &Arc<Mutex<HashSet<String>>>, bucket: &str) {

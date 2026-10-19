@@ -130,10 +130,8 @@ impl FileMeta {
         Ok((bin_len, remaining))
     }
 
-    #[hotpath::measure(impl_type = "FileMeta")]
-    pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
-        let i = buf.len() as u64;
-
+    #[inline]
+    pub(super) fn parse_validated_xl_envelope(buf: &[u8]) -> Result<(&[u8], &[u8])> {
         // check version, buf = buf[8..]
         let (buf, _, _) = Self::check_xl2_v1(buf)?;
 
@@ -188,12 +186,11 @@ impl FileMeta {
         }
 
         if !buf.is_empty() {
-            self.data.update(buf);
-            self.data.validate().map_err(|e| {
+            InlineData::validate_slice(buf).map_err(|e| {
                 error!("data validation failed: {}", e);
                 // Validation only examines bytes already read. Classify damage
                 // as repairable corruption only for formats we understand.
-                if self.data.version_ok() && Self::decode_xl_headers(meta).is_ok() {
+                if InlineData::version_ok_slice(buf) && Self::decode_xl_headers(meta).is_ok() {
                     Error::FileCorrupt
                 } else {
                     e
@@ -201,80 +198,108 @@ impl FileMeta {
             })?;
         }
 
+        Ok((meta, buf))
+    }
+
+    #[inline]
+    pub(super) fn read_next_shallow_slice<'a>(
+        meta: &'a [u8],
+        cur: &mut Cursor<&'a [u8]>,
+        header_ver: u8,
+    ) -> Result<(FileMetaVersionHeader, &'a [u8])> {
+        let bin_len = rmp::decode::read_bin_len(cur).map_err(|e| {
+            error!("failed to read binary length for version header: {}", e);
+            Error::other(format!("failed to read binary length for version header: {e}"))
+        })? as usize;
+
+        let start = cur.position() as usize;
+        let remaining = meta.len().saturating_sub(start);
+        if bin_len > remaining {
+            error!("corrupt xl.meta: version header length {} exceeds remaining {} bytes", bin_len, remaining);
+            return Err(Error::other("corrupt xl.meta: version header length exceeds metadata size"));
+        }
+        let end = start + bin_len;
+
+        let mut header = FileMetaVersionHeader::default();
+        header.unmarshal_v(header_ver, &meta[start..end]).map_err(|e| {
+            error!("failed to unmarshal version header: {}", e);
+            e
+        })?;
+        cur.set_position(end as u64);
+
+        let bin_len = rmp::decode::read_bin_len(cur).map_err(|e| {
+            error!("failed to read binary length for version metadata: {}", e);
+            Error::other(format!("failed to read binary length for version metadata: {e}"))
+        })? as usize;
+
+        let start = cur.position() as usize;
+        let remaining = meta.len().saturating_sub(start);
+        if bin_len > remaining {
+            error!(
+                "corrupt xl.meta: version metadata length {} exceeds remaining {} bytes",
+                bin_len, remaining
+            );
+            return Err(Error::other("corrupt xl.meta: version metadata length exceeds metadata size"));
+        }
+        let end = start + bin_len;
+        cur.set_position(end as u64);
+
+        Ok((header, &meta[start..end]))
+    }
+
+    #[hotpath::measure(impl_type = "FileMeta")]
+    pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
+        let i = buf.len() as u64;
+        let (meta, inline_buf) = Self::parse_validated_xl_envelope(buf)?;
+
+        if !inline_buf.is_empty() {
+            self.data.update(inline_buf);
+        }
+
         // Parse meta
         if !meta.is_empty() {
-            let (versions_len, header_ver, meta_ver, meta) = Self::decode_xl_headers(meta).map_err(|e| {
-                error!("failed to decode XL headers: {}", e);
-                e
-            })?;
-
-            // let (_, meta) = meta.split_at(read_size as usize);
+            let (versions_len, header_ver, meta_ver, meta) = Self::decode_validated_xl_headers(meta)?;
 
             self.meta_ver = meta_ver;
-
-            // `versions_len` is decoded from a potentially corrupted buffer.
-            // Every version contributes at least two msgpack bin headers to
-            // `meta`, so a count larger than the remaining bytes is corrupt;
-            // reject it before sizing any allocation from it (rustfs/rustfs#2715).
-            if versions_len > meta.len() {
-                error!(
-                    "corrupt xl.meta: version count {} exceeds remaining metadata size {}",
-                    versions_len,
-                    meta.len()
-                );
-                return Err(Error::other(format!(
-                    "corrupt xl.meta: version count {versions_len} exceeds metadata size {}",
-                    meta.len()
-                )));
-            }
-
             self.versions = Vec::with_capacity(versions_len);
 
             let mut cur: Cursor<&[u8]> = Cursor::new(meta);
             for _ in 0..versions_len {
-                let bin_len = rmp::decode::read_bin_len(&mut cur).map_err(|e| {
-                    error!("failed to read binary length for version header: {}", e);
-                    Error::other(format!("failed to read binary length for version header: {e}"))
-                })? as usize;
-
-                let remaining = meta.len().saturating_sub(cur.position() as usize);
-                if bin_len > remaining {
-                    error!("corrupt xl.meta: version header length {} exceeds remaining {} bytes", bin_len, remaining);
-                    return Err(Error::other("corrupt xl.meta: version header length exceeds metadata size"));
-                }
-                let mut header_buf = vec![0u8; bin_len];
-
-                cur.read_exact(&mut header_buf)?;
-
-                let mut ver = FileMetaShallowVersion::default();
-                ver.header.unmarshal_v(header_ver, &header_buf).map_err(|e| {
-                    error!("failed to unmarshal version header: {}", e);
-                    e
-                })?;
-
-                let bin_len = rmp::decode::read_bin_len(&mut cur).map_err(|e| {
-                    error!("failed to read binary length for version metadata: {}", e);
-                    Error::other(format!("failed to read binary length for version metadata: {e}"))
-                })? as usize;
-
-                let remaining = meta.len().saturating_sub(cur.position() as usize);
-                if bin_len > remaining {
-                    error!(
-                        "corrupt xl.meta: version metadata length {} exceeds remaining {} bytes",
-                        bin_len, remaining
-                    );
-                    return Err(Error::other("corrupt xl.meta: version metadata length exceeds metadata size"));
-                }
-                let mut ver_meta_buf = vec![0u8; bin_len];
-                cur.read_exact(&mut ver_meta_buf)?;
-
-                ver.meta.extend_from_slice(&ver_meta_buf);
-
-                self.versions.push(ver);
+                let (header, ver_meta) = Self::read_next_shallow_slice(meta, &mut cur, header_ver)?;
+                self.versions.push(FileMetaShallowVersion {
+                    header,
+                    meta: ver_meta.to_vec(),
+                });
             }
         }
 
         Ok(i)
+    }
+
+    #[inline]
+    pub(super) fn decode_validated_xl_headers(meta: &[u8]) -> Result<(usize, u8, u8, &[u8])> {
+        let (versions_len, header_ver, meta_ver, meta) = Self::decode_xl_headers(meta).map_err(|e| {
+            error!("failed to decode XL headers: {}", e);
+            e
+        })?;
+
+        // `versions_len` is decoded from a potentially corrupted buffer.
+        // Every version contributes at least two msgpack bin headers to
+        // `meta`, so a count larger than the remaining bytes is corrupt;
+        // reject it before sizing any allocation from it (rustfs/rustfs#2715).
+        if versions_len > meta.len() {
+            error!(
+                "corrupt xl.meta: version count {} exceeds remaining metadata size {}",
+                versions_len,
+                meta.len()
+            );
+            return Err(Error::other(format!(
+                "corrupt xl.meta: version count {versions_len} exceeds metadata size {}",
+                meta.len()
+            )));
+        }
+
+        Ok((versions_len, header_ver, meta_ver, meta))
     }
 
     // decode_xl_headers parses meta header, returns (versions count, xl_header_version, xl_meta_version, read data length)
@@ -359,7 +384,8 @@ impl FileMeta {
 
     #[hotpath::measure(impl_type = "FileMeta")]
     pub fn marshal_msg(&self) -> Result<Vec<u8>> {
-        let mut wr = Vec::new();
+        let mut wr =
+            Vec::with_capacity(24 + self.versions.iter().map(|v| 48 + v.meta.len()).sum::<usize>() + self.data.as_slice().len());
 
         // header
         wr.write_all(XL_FILE_HEADER.as_slice())?;
@@ -382,9 +408,12 @@ impl FileMeta {
 
         rmp::encode::write_sint(&mut wr, self.versions.len() as i64)?;
 
+        let mut hbuf = [0u8; 48];
         for ver in self.versions.iter() {
-            let hmsg = ver.header.marshal_msg()?;
-            rmp::encode::write_bin(&mut wr, &hmsg)?;
+            let mut hcur = Cursor::new(&mut hbuf[..]);
+            ver.header.encode_to(&mut hcur)?;
+            let hlen = hcur.position() as usize;
+            rmp::encode::write_bin(&mut wr, &hbuf[..hlen])?;
 
             rmp::encode::write_bin(&mut wr, &ver.meta)?;
         }

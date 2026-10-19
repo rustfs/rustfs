@@ -23,7 +23,7 @@ pub use heal::{
     HealSourceCounts, HealType,
     channel::HealChannelProcessor,
     progress::{HealProgress, aggregate_heal_progress},
-    resume::{ReplacementRecoveryRecord, ReplacementRecoveryState, ResumeUtils},
+    resume::{ReplacementRecoveryBlock, ReplacementRecoveryRecord, ReplacementRecoveryState, ResumeUtils},
 };
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use std::collections::BTreeMap;
@@ -268,6 +268,15 @@ pub async fn current_heal_progress_snapshot() -> Option<HealProgress> {
     }
 }
 
+/// Durable replacement generations that this node's discovery could not
+/// verify or resolve, with their reasons. Node-local; empty when the heal
+/// runtime is not initialized.
+pub fn current_replacement_recovery_blocks() -> Vec<ReplacementRecoveryBlock> {
+    get_heal_manager()
+        .map(|manager| manager.replacement_recovery_blocks())
+        .unwrap_or_default()
+}
+
 /// Read all local survivor-disk replacement records without conflating an I/O
 /// failure or conflicting copies with successful completion.
 pub async fn current_replacement_recovery_snapshot() -> ReplacementRecoverySnapshot {
@@ -396,6 +405,13 @@ mod tests {
 
         async fn get_bucket_info(&self, _bucket: &str) -> Result<Option<BucketInfo>, Error> {
             Ok(None)
+        }
+
+        async fn list_buckets_for_admin_heal(
+            &self,
+            _selector: Option<crate::heal::storage_api::storage::DiskSetSelector>,
+        ) -> Result<Vec<BucketInfo>, Error> {
+            self.list_buckets().await
         }
 
         async fn list_buckets(&self) -> Result<Vec<BucketInfo>, Error> {

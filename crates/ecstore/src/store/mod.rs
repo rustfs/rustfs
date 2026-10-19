@@ -27,6 +27,7 @@ use crate::bucket::utils::check_get_obj_args;
 use crate::bucket::utils::check_list_multipart_args;
 use crate::bucket::utils::check_list_parts_args;
 use crate::bucket::utils::check_new_multipart_args;
+use crate::bucket::utils::check_new_object_args;
 use crate::bucket::utils::check_object_args;
 use crate::bucket::utils::check_put_object_args;
 use crate::bucket::utils::check_put_object_part_args;
@@ -428,6 +429,7 @@ mod bucket;
 mod bucket_fence;
 pub(crate) use bucket::await_bucket_namespace_operation;
 pub use bucket_fence::BucketIncarnationFenceGuard;
+pub(crate) mod delete_recovery_runtime;
 mod heal;
 pub use heal::{HealObjectAbsenceProof, HealObjectStorageResult};
 pub(crate) use heal::{bucket_heal_scope, bucket_heal_scope_for_object};
@@ -438,7 +440,7 @@ pub(crate) mod init_format;
 pub(crate) mod list_objects;
 mod multipart;
 mod object;
-#[cfg(feature = "test-util")]
+#[cfg(any(test, feature = "test-util"))]
 pub use object::DeleteAfterObjectLockSnapshotBarrier;
 pub(crate) use object::{
     DecommissionFixedReadAnchor, ObjectLockDiagGuard, RemoteTuplePublicationCommitGuard, RemoteTuplePublicationFence,
@@ -926,12 +928,27 @@ impl ECStore {
     /// Returns whether scanner metadata may still be hidden by a local
     /// data-movement state. Terminal failed/canceled decommission entries
     /// remain suspended until an operator clears or retries them, so they are
-    /// a publication barrier even after the worker has stopped. Active PUT
-    /// rename fanouts also defer publication, including post-ACK tails.
+    /// a publication barrier even after the worker has stopped.
+    ///
+    /// An ordinary PUT whose rename fanout is still pending is not a barrier.
+    /// Its bucket is shaded through the dirty-usage generation and certified
+    /// per bucket by the scanner, so a sustained write load cannot hold the
+    /// authoritative usage snapshot back (rustfs/rustfs#8494). The scanner
+    /// publication leases below are movement-only for the same reason
+    /// (rustfs/rustfs#8305).
     pub async fn scanner_data_usage_publication_blocked(&self) -> bool {
         let operation_gate = self.ctx.data_movement_operation_gate();
         let _operation_guard = operation_gate.read_owned().await;
-        self.scanner_data_usage_publication_snapshot_blocked().await || self.ctx.namespace_commits_pending()
+        self.scanner_data_usage_publication_snapshot_blocked().await
+    }
+
+    /// Whether an ordinary namespace commit (a PUT rename fanout, including a
+    /// tail that outlives a cancelled handler) still holds its physical owner.
+    /// Usage publication no longer consults it; tests use it to observe owner
+    /// retention directly.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn namespace_commits_pending_for_test(&self) -> bool {
+        self.ctx.namespace_commits_pending()
     }
 
     pub async fn scanner_data_movement_pause_status(&self) -> ScannerDataMovementPauseStatus {
@@ -1118,9 +1135,13 @@ impl ECStore {
         } else {
             ScannerPublicationLeasePurpose::Authoritative
         };
-        // Strict leases bind the namespace generation before their async
-        // admission checks. An observation only needs the movement fence, but
-        // still fails closed if generation tracking is exhausted.
+        // Both purposes fence data movement only. An ordinary namespace commit
+        // on this node is not a reason to withhold the lease: the bucket it
+        // writes is shaded for the coordinator's next cycle, and a commit
+        // pending at every lease attempt would otherwise keep a continuously
+        // written peer from ever granting one (rustfs/rustfs#8305). The
+        // namespace generation is still recorded on an authoritative lease
+        // for diagnostics, and generation exhaustion still fails closed.
         let observed_namespace_generation = self.scanner_namespace_mutation_generation();
         let operation_gate = self.ctx.data_movement_operation_gate();
         let operation_guard = operation_gate.read_owned().await;
@@ -1135,17 +1156,7 @@ impl ECStore {
             return Err(Error::other("scanner publication lease is blocked by data movement"));
         }
 
-        let namespace_generation = if observational_only {
-            None
-        } else {
-            if self.ctx.namespace_commits_pending() {
-                return Err(Error::other("scanner publication lease is blocked by pending namespace commit"));
-            }
-            if self.scanner_namespace_mutation_generation() != observed_namespace_generation {
-                return Err(Error::other("scanner publication lease namespace changed during acquisition"));
-            }
-            Some(observed_namespace_generation)
-        };
+        let namespace_generation = (!observational_only).then_some(observed_namespace_generation);
 
         let token = Uuid::new_v4();
         let expires_at = tokio::time::Instant::now() + ttl;
@@ -1209,20 +1220,12 @@ impl ECStore {
         if self.scanner_data_movement_snapshot_locked().await.1 {
             return Err(Error::other("scanner publication lease is blocked by data movement"));
         }
-        let Some((lease_generation, lease_namespace_generation, purpose)) =
-            self.ctx.scanner_publication_lease_generations(token).await
-        else {
+        let Some((lease_generation, _, _)) = self.ctx.scanner_publication_lease_generations(token).await else {
             return Err(Error::other("scanner publication lease is unknown or expired"));
         };
-        if purpose == ScannerPublicationLeasePurpose::Authoritative && self.ctx.namespace_commits_pending() {
-            return Err(Error::other("scanner publication lease is blocked by pending namespace commit"));
-        }
-        let namespace_generation = self.scanner_namespace_mutation_generation();
-        if lease_generation != self.ctx.data_movement_generation()
-            || namespace_generation == u64::MAX
-            || (purpose == ScannerPublicationLeasePurpose::Authoritative
-                && lease_namespace_generation != Some(namespace_generation))
-        {
+        // Ordinary namespace commits neither block nor stale a lease; only the
+        // movement generation and generation exhaustion do.
+        if lease_generation != self.ctx.data_movement_generation() || self.scanner_namespace_mutation_generation() == u64::MAX {
             return Err(Error::other("scanner publication lease generation is stale"));
         }
         Ok(())
@@ -1274,9 +1277,7 @@ impl ECStore {
         if self.scanner_data_movement_snapshot_locked().await.1 {
             return Err(Error::other("scanner publication lease is blocked by data movement"));
         }
-        let Some((lease_generation, lease_namespace_generation, purpose)) =
-            self.ctx.scanner_publication_lease_generations(token).await
-        else {
+        let Some((lease_generation, _, purpose)) = self.ctx.scanner_publication_lease_generations(token).await else {
             return Err(Error::other("scanner publication lease is unknown or expired"));
         };
         if expected_purpose.is_some_and(|expected| expected != purpose) {
@@ -1285,15 +1286,11 @@ impl ECStore {
         if purpose == ScannerPublicationLeasePurpose::Observational && observed_target.is_none() && !validation_only {
             return Err(Error::other("observational lease is limited to observed usage publication"));
         }
-        if purpose == ScannerPublicationLeasePurpose::Authoritative && self.ctx.namespace_commits_pending() {
-            return Err(Error::other("scanner publication lease is blocked by pending namespace commit"));
-        }
-        let namespace_generation = self.scanner_namespace_mutation_generation();
-        if lease_generation != self.ctx.data_movement_generation()
-            || namespace_generation == u64::MAX
-            || (purpose == ScannerPublicationLeasePurpose::Authoritative
-                && lease_namespace_generation != Some(namespace_generation))
-        {
+        // An ordinary namespace commit pending or completed on this node
+        // neither blocks nor stales the target admission: the bucket it
+        // writes is shaded for the next cycle, and the aggregate rename below
+        // touches only scanner-owned metadata.
+        if lease_generation != self.ctx.data_movement_generation() || self.scanner_namespace_mutation_generation() == u64::MAX {
             return Err(Error::other("scanner publication lease generation is stale"));
         }
         Ok(operation_guard)
@@ -1363,7 +1360,13 @@ impl crate::storage_api_contracts::object::ObjectIO for ECStore {
         h: HeaderMap,
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
-        self.handle_get_object_reader(bucket, object, range, h, opts).await
+        let read = self.handle_get_object_reader(bucket, object, range, h, opts);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let read = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::StoreObjectReader,
+            read,
+        );
+        read.await
     }
     #[instrument(level = "debug", skip(self, data))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
@@ -2672,11 +2675,22 @@ mod tests {
         let ctx = Arc::new(InstanceContext::new());
         let store = build_store_with_ctx(ctx.clone());
         let namespace_commit = ctx.begin_namespace_commit();
-        let strict_error = store
+        let (strict_token, strict_generation) = store
             .acquire_scanner_publication_lease(0, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL)
             .await
-            .expect_err("authoritative lease must wait for namespace commits");
-        assert!(strict_error.to_string().contains("pending namespace commit"));
+            .expect("an authoritative lease is granted while an ordinary namespace commit is pending");
+        assert_eq!(strict_generation, 0);
+        store
+            .validate_scanner_publication_lease(strict_token, 0)
+            .await
+            .expect("the pending commit does not invalidate the authoritative lease");
+        drop(
+            store
+                .acquire_scanner_publication_lease_guard(strict_token)
+                .await
+                .expect("target-side admission accepts the pending commit"),
+        );
+        assert!(store.release_scanner_publication_lease(strict_token).await);
 
         let (token, movement_generation) = store
             .acquire_scanner_publication_lease_with_purpose(0, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL, true)
@@ -2747,7 +2761,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scanner_publication_lease_rejects_namespace_change_during_admission() {
+    async fn scanner_publication_lease_survives_namespace_change_during_admission() {
         let ctx = Arc::new(InstanceContext::new());
         let store = build_store_with_ctx(ctx.clone());
         let snapshot_blocker = store.rebalance_meta.write().await;
@@ -2759,19 +2773,21 @@ mod tests {
         assert_eq!(ctx.namespace_commit_generation(), 2);
         assert!(!ctx.namespace_commits_pending());
         drop(snapshot_blocker);
-        let error = tokio::time::timeout(Duration::from_secs(1), acquire)
+        let (token, generation) = tokio::time::timeout(Duration::from_secs(1), acquire)
             .await
             .expect("snapshot admission must finish")
-            .expect_err("a namespace change during admission must not install a lease");
-        assert_eq!(
-            error.to_string(),
-            "Io error: scanner publication lease namespace changed during acquisition"
+            .expect("an ordinary namespace commit during admission shades its bucket; it does not reject the lease");
+        assert_eq!(generation, 0);
+        assert!(
+            ctx.data_movement_operation_gate().try_write_owned().is_err(),
+            "the installed lease holds the movement permit"
         );
-        assert!(ctx.data_movement_operation_gate().try_write_owned().is_ok(), "no lease was installed");
+        assert!(store.release_scanner_publication_lease(token).await);
+        assert!(ctx.data_movement_operation_gate().try_write_owned().is_ok());
     }
 
     #[tokio::test]
-    async fn scanner_publication_lease_rechecks_namespace_after_validate_snapshot() {
+    async fn scanner_publication_lease_validates_across_a_completed_namespace_commit() {
         let ctx = Arc::new(InstanceContext::new());
         let store = build_store_with_ctx(ctx.clone());
         let (token, generation) = store
@@ -2792,14 +2808,13 @@ mod tests {
         assert_eq!(ctx.namespace_commit_generation(), 2);
         assert!(!ctx.namespace_commits_pending());
         drop(next_writer);
-        let error = tokio::time::timeout(Duration::from_secs(1), validate)
+        tokio::time::timeout(Duration::from_secs(1), validate)
             .await
             .expect("validation must finish without nesting movement read locks")
-            .expect_err("the final snapshot must reject a completed namespace commit");
-        assert_eq!(error.to_string(), "Io error: scanner publication lease generation is stale");
+            .expect("a completed ordinary namespace commit does not stale the lease");
         assert!(
             ctx.data_movement_operation_gate().try_write_owned().is_err(),
-            "stale lookup retains the lease permit"
+            "validation retains the lease permit"
         );
         assert!(store.release_scanner_publication_lease(token).await);
         assert!(ctx.data_movement_operation_gate().try_write_owned().is_ok());

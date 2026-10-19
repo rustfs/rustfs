@@ -409,6 +409,69 @@ mod tests {
     }
 
     #[test]
+    fn actual_sdk_exports_bucket_size_and_object_count_as_current_gauges() {
+        use crate::metrics::collectors::{BucketUsageStats, collect_bucket_usage_metrics};
+
+        let (provider, exporter, mut snapshot) = setup_unscoped();
+        let mut buckets = vec![
+            BucketUsageStats {
+                bucket: "client-a".into(),
+                total_bytes: 4096,
+                objects_count: 3,
+                ..Default::default()
+            },
+            BucketUsageStats {
+                bucket: "client-b".into(),
+                total_bytes: 8192,
+                objects_count: 7,
+                ..Default::default()
+            },
+            BucketUsageStats {
+                bucket: "empty".into(),
+                ..Default::default()
+            },
+        ];
+
+        for expected in [
+            vec![("client-a", 4096.0, 3.0), ("client-b", 8192.0, 7.0), ("empty", 0.0, 0.0)],
+            vec![("client-a", 1024.0, 1.0), ("empty", 0.0, 0.0)],
+        ] {
+            let metrics = collect_bucket_usage_metrics(&buckets);
+            assert!(
+                metrics.iter().all(|metric| metric.metric_type == MetricType::Gauge),
+                "bucket inventory values must decrease without counter semantics"
+            );
+            snapshot.replace(metrics).expect("publish current bucket usage");
+            let points = flush(&provider, &exporter);
+            for (name, index) in [
+                ("rustfs_cluster_usage_buckets_total_bytes", 0),
+                ("rustfs_cluster_usage_buckets_objects_count", 1),
+            ] {
+                let mut actual = points
+                    .iter()
+                    .filter(|point| point.name == name)
+                    .map(|point| {
+                        assert_eq!(point.scope, "service-test");
+                        assert_eq!(point.attributes.len(), 1, "usage is cluster-wide, not a per-node count");
+                        assert_eq!(point.attributes[0].key.as_str(), "bucket");
+                        (point.attributes[0].value.to_string(), point.value)
+                    })
+                    .collect::<Vec<_>>();
+                actual.sort_by(|a, b| a.0.cmp(&b.0));
+                let values = expected
+                    .iter()
+                    .map(|(bucket, bytes, objects)| (bucket.to_string(), if index == 0 { *bytes } else { *objects }))
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, values, "{name} must preserve each bucket's current value");
+            }
+            buckets.remove(1);
+            buckets[0].total_bytes = 1024;
+            buckets[0].objects_count = 1;
+        }
+        provider.shutdown().expect("shut down bucket usage test provider");
+    }
+
+    #[test]
     fn failed_or_stalled_collection_cannot_refresh_last_success_or_export_old_points() {
         let (provider, exporter, mut snapshot) = setup();
         snapshot

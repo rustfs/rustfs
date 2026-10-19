@@ -1,0 +1,163 @@
+diff --git a/s3tests/functional/test_s3.py b/s3tests/functional/test_s3.py
+index e28021325..b1187e44e 100644
+--- a/s3tests/functional/test_s3.py
++++ b/s3tests/functional/test_s3.py
+@@ -3203,11 +3203,12 @@ def test_put_object_ifnonmatch_good():
+
+     lf = (lambda **kwargs: kwargs['params']['headers'].update({'If-None-Match': 'ABCORZ'}))
+     client.meta.events.register('before-call.s3.PutObject', lf)
+-    response = client.put_object(Bucket=bucket_name,Key='foo', Body='zar')
++    e = assert_raises(ClientError, client.put_object, Bucket=bucket_name, Key='foo', Body='zar')
++    assert (501, 'NotImplemented') == _get_status_and_error_code(e.response)
+
+     response = client.get_object(Bucket=bucket_name, Key='foo')
+     body = _get_body(response)
+-    assert body == 'zar'
++    assert body == 'bar'
+
+ @pytest.mark.fails_on_aws
+ @pytest.mark.fails_on_dbstore
+@@ -3227,8 +3228,8 @@ def test_put_object_ifnonmatch_failed():
+     e = assert_raises(ClientError, client.put_object, Bucket=bucket_name, Key='foo', Body='zar')
+
+     status, error_code = _get_status_and_error_code(e.response)
+-    assert status == 412
+-    assert error_code == 'PreconditionFailed'
++    assert status == 501
++    assert error_code == 'NotImplemented'
+
+     response = client.get_object(Bucket=bucket_name, Key='foo')
+     body = _get_body(response)
+@@ -19498,10 +19499,9 @@ def test_put_object_if_match():
+
+     e = assert_raises(ClientError, client.put_object, Bucket=bucket, Key=key, IfNoneMatch='*')
+     assert (412, 'PreconditionFailed') == _get_status_and_error_code(e.response)
+-    e = assert_raises(ClientError, client.put_object, Bucket=bucket, Key=key, IfNoneMatch=etag)
+-    assert (412, 'PreconditionFailed') == _get_status_and_error_code(e.response)
+-    response = client.put_object(Bucket=bucket, Key=key, IfNoneMatch='badetag')
+-    assert 200 == response['ResponseMetadata']['HTTPStatusCode']
++    for unsupported in (etag, 'badetag'):
++        e = assert_raises(ClientError, client.put_object, Bucket=bucket, Key=key, IfNoneMatch=unsupported)
++        assert (501, 'NotImplemented') == _get_status_and_error_code(e.response)
+
+     client.put_object(Bucket=bucket, Key=key, IfMatch=etag)
+
+@@ -19512,7 +19512,9 @@ def test_put_object_if_match():
+     e = assert_raises(ClientError, client.put_object, Bucket=bucket, Key=key, IfMatch='badetag')
+     assert (404, 'NoSuchKey') == _get_status_and_error_code(e.response)
+
+-    response = client.put_object(Bucket=bucket, Key=key, IfNoneMatch=etag)
++    e = assert_raises(ClientError, client.put_object, Bucket=bucket, Key=key, IfNoneMatch=etag)
++    assert (501, 'NotImplemented') == _get_status_and_error_code(e.response)
++    response = client.put_object(Bucket=bucket, Key=key, IfNoneMatch='*')
+     assert 200 == response['ResponseMetadata']['HTTPStatusCode']
+     response = client.put_object(Bucket=bucket, Key=key, IfMatch='*')
+     assert 200 == response['ResponseMetadata']['HTTPStatusCode']
+@@ -19560,11 +19562,8 @@ def test_multipart_put_object_if_match():
+     etag = response['ETag']
+
+     failing_conditional_multipart_upload((412, 'PreconditionFailed'), client, bucket, key, IfNoneMatch='*')
+-    failing_conditional_multipart_upload((412, 'PreconditionFailed'), client, bucket, key, IfNoneMatch=etag)
+-
+-    response = successful_conditional_multipart_upload(client, bucket, key, IfNoneMatch='badetag')
+-    etag = response['ETag']
+-    assert 200 == response['ResponseMetadata']['HTTPStatusCode']
++    for unsupported in (etag, 'badetag'):
++        failing_conditional_multipart_upload((501, 'NotImplemented'), client, bucket, key, IfNoneMatch=unsupported)
+
+     response = successful_conditional_multipart_upload(client, bucket, key, IfMatch=etag)
+     etag = response['ETag']
+@@ -19574,7 +19573,8 @@ def test_multipart_put_object_if_match():
+     failing_conditional_multipart_upload((404, 'NoSuchKey'), client, bucket, key, IfMatch='*')
+     failing_conditional_multipart_upload((404, 'NoSuchKey'), client, bucket, key, IfMatch='badetag')
+
+-    response = successful_conditional_multipart_upload(client, bucket, key, IfNoneMatch=etag)
++    failing_conditional_multipart_upload((501, 'NotImplemented'), client, bucket, key, IfNoneMatch=etag)
++    response = successful_conditional_multipart_upload(client, bucket, key, IfNoneMatch='*')
+     etag = response['ETag']
+     assert 200 == response['ResponseMetadata']['HTTPStatusCode']
+     response = successful_conditional_multipart_upload(client, bucket, key, IfMatch='*')
+@@ -19602,16 +19602,16 @@ def test_put_current_object_if_none_match():
+
+     e = assert_raises(ClientError, client.put_object, Bucket=bucket, Key=key, IfNoneMatch='*')
+     assert (412, 'PreconditionFailed') == _get_status_and_error_code(e.response)
+-    e = assert_raises(ClientError, client.put_object, Bucket=bucket, Key=key, IfNoneMatch=etag2)
+-    assert (412, 'PreconditionFailed') == _get_status_and_error_code(e.response)
+-
+-    # we can't specify a version, so we only check against current object
+-    response = client.put_object(Bucket=bucket, Key=key, IfNoneMatch=etag)
+-    assert 200 == response['ResponseMetadata']['HTTPStatusCode']
+-    response = client.put_object(Bucket=bucket, Key=key, IfNoneMatch='badetag')
+-    assert 200 == response['ResponseMetadata']['HTTPStatusCode']
++    for unsupported in (etag2, etag, 'badetag'):
++        e = assert_raises(ClientError, client.put_object, Bucket=bucket, Key=key, IfNoneMatch=unsupported)
++        assert (501, 'NotImplemented') == _get_status_and_error_code(e.response)
++    assert _get_body(client.get_object(Bucket=bucket, Key=key)) == data2
+
++    # If-None-Match checks the current version; a delete marker permits creation.
+     client.delete_object(Bucket=bucket, Key=key)
++    response = client.put_object(Bucket=bucket, Key=key, Body=data1, IfNoneMatch='*')
++    assert 200 == response['ResponseMetadata']['HTTPStatusCode']
++    assert _get_body(client.get_object(Bucket=bucket, Key=key)) == data1
+
+ @pytest.mark.conditional_write
+ @pytest.mark.fails_on_dbstore
+@@ -19630,15 +19630,15 @@ def test_multipart_put_current_object_if_none_match():
+     etag2 = response['ETag']
+
+     failing_conditional_multipart_upload((412, 'PreconditionFailed'), client, bucket, key, IfNoneMatch='*')
+-    failing_conditional_multipart_upload((412, 'PreconditionFailed'), client, bucket, key, IfNoneMatch=etag2)
+-
+-    # we can't specify a version, so we only check against current object
+-    response = successful_conditional_multipart_upload(client, bucket, key, IfNoneMatch=etag)
+-    assert 200 == response['ResponseMetadata']['HTTPStatusCode']
+-    response = successful_conditional_multipart_upload(client, bucket, key, IfNoneMatch='badetag')
+-    assert 200 == response['ResponseMetadata']['HTTPStatusCode']
++    for unsupported in (etag2, etag, 'badetag'):
++        failing_conditional_multipart_upload((501, 'NotImplemented'), client, bucket, key, IfNoneMatch=unsupported)
++    assert _get_body(client.get_object(Bucket=bucket, Key=key)) == data2
+
++    # If-None-Match checks the current version; a delete marker permits creation.
+     client.delete_object(Bucket=bucket, Key=key)
++    response = successful_conditional_multipart_upload(client, bucket, key, data1, IfNoneMatch='*')
++    assert 200 == response['ResponseMetadata']['HTTPStatusCode']
++    assert _get_body(client.get_object(Bucket=bucket, Key=key)) == data1
+
+ @pytest.mark.conditional_write
+ @pytest.mark.fails_on_dbstore
+@@ -19656,7 +19656,7 @@ def test_put_current_object_if_match():
+     e = assert_raises(ClientError, client.put_object, Bucket=bucket, Key=key, IfMatch='badetag')
+     assert (404, 'NoSuchKey') == _get_status_and_error_code(e.response)
+
+-    response = client.put_object(Bucket=bucket, Key=key, Body=data1, IfNoneMatch=etag)
++    response = client.put_object(Bucket=bucket, Key=key, Body=data1, IfNoneMatch='*')
+     assert 200 == response['ResponseMetadata']['HTTPStatusCode']
+     etag = response['ETag']
+     versionId = response['VersionId']
+@@ -19685,7 +19685,7 @@ def test_multipart_put_current_object_if_match():
+     failing_conditional_multipart_upload((404, 'NoSuchKey'), client, bucket, key, IfMatch='*')
+     failing_conditional_multipart_upload((404, 'NoSuchKey'), client, bucket, key, IfMatch='badetag')
+
+-    response = successful_conditional_multipart_upload(client, bucket, key, data1, IfNoneMatch=etag)
++    response = successful_conditional_multipart_upload(client, bucket, key, data1, IfNoneMatch='*')
+     assert 200 == response['ResponseMetadata']['HTTPStatusCode']
+     etag = response['ETag']
+     versionId = response['VersionId']
+@@ -19711,7 +19711,7 @@ def test_put_object_current_if_match():
+     e = assert_raises(ClientError, client.put_object, Bucket=bucket, Key=key, IfNoneMatch='*')
+     assert (412, 'PreconditionFailed') == _get_status_and_error_code(e.response)
+     e = assert_raises(ClientError, client.put_object, Bucket=bucket, Key=key, IfNoneMatch=etag)
+-    assert (412, 'PreconditionFailed') == _get_status_and_error_code(e.response)
++    assert (501, 'NotImplemented') == _get_status_and_error_code(e.response)
+
+     client.put_object(Bucket=bucket, Key=key, IfMatch=etag)
+
+@@ -19723,7 +19723,7 @@ def test_put_object_current_if_match():
+     e = assert_raises(ClientError, client.put_object, Bucket=bucket, Key=key, IfMatch='badetag')
+     assert (404, 'NoSuchKey') == _get_status_and_error_code(e.response)
+
+-    client.put_object(Bucket=bucket, Key=key, IfNoneMatch=etag)
++    client.put_object(Bucket=bucket, Key=key, IfNoneMatch='*')
+
+ @pytest.mark.fails_on_aws # only supported for directory buckets
+ @pytest.mark.conditional_write

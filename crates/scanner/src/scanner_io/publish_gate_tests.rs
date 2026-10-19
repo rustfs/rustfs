@@ -20,6 +20,41 @@ const TEST_PLAN_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([7; 32
 const TEST_COVERAGE_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([6; 32]);
 
 #[test]
+fn partial_progress_requires_complete_scope_and_no_hard_failure() {
+    for plan_complete in [false, true] {
+        for scope_matches in [false, true] {
+            for set_failed in [false, true] {
+                for missing_namespace in [false, true] {
+                    for status in [
+                        ScannerBucketScanStatus::Complete,
+                        ScannerBucketScanStatus::Partial,
+                        ScannerBucketScanStatus::Failed,
+                        ScannerBucketScanStatus::NamespaceNotFound,
+                    ] {
+                        let expected = plan_complete
+                            && scope_matches
+                            && !set_failed
+                            && !missing_namespace
+                            && status == ScannerBucketScanStatus::Partial;
+                        assert_eq!(
+                            scanner_partial_progress_is_usable(
+                                plan_complete,
+                                scope_matches,
+                                status,
+                                set_failed,
+                                missing_namespace
+                            ),
+                            expected,
+                            "plan={plan_complete}, scope={scope_matches}, status={status:?}, set_failed={set_failed}, missing_namespace={missing_namespace}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn scanner_bucket_inventory_requires_exact_unique_set_union() {
     let first = BucketInfo {
         name: "first".to_string(),
@@ -803,6 +838,7 @@ fn current_cache_root_with_new_tier_generation_resets_old_cache() {
             require_source: false,
             tier_registry_generation: Some(2),
             checkpoint_identity: None,
+            checkpoint_plan_digest: None,
         },
     );
 
@@ -899,12 +935,14 @@ fn completed_data_usage_info_publishes_confirmed_empty_namespace() {
 }
 
 #[test]
-fn complete_usage_candidate_with_changed_generation_is_superseded() {
+fn complete_usage_candidate_with_changed_generation_is_certified_per_bucket() {
     let all_buckets = vec!["bucket".to_string()];
     let completed_set = completed_root_cache("bucket", 2, 10, DataUsageCacheSource::new(0, 0));
     let completed_usage = completed_data_usage_info_for_test(&[completed_set], &all_buckets, false, false);
 
     assert!(completed_usage.is_some());
+    // A moved dirty generation shades buckets for the next cycle; only a
+    // guardrail veto supersedes a structurally complete candidate.
     assert_eq!(
         classify_nsscanner_cycle(
             completed_usage.is_some(),
@@ -913,6 +951,17 @@ fn complete_usage_candidate_with_changed_generation_is_superseded() {
             ScannerBucketScanStatus::Complete,
             DirtyUsageSnapshotStatus::Changed,
             ScannerCycleActivityStatus::Unchanged,
+        ),
+        ScannerCycleStatus::Complete
+    );
+    assert_eq!(
+        classify_nsscanner_cycle(
+            completed_usage.is_some(),
+            false,
+            false,
+            ScannerBucketScanStatus::Complete,
+            DirtyUsageSnapshotStatus::Changed,
+            ScannerCycleActivityStatus::Changed,
         ),
         ScannerCycleStatus::Superseded
     );
@@ -1527,4 +1576,56 @@ async fn requeued_bucket_remains_pending_for_another_worker() {
     assert_eq!(remaining.load(Ordering::Acquire), 1);
     assert!(!complete.is_cancelled());
     assert_eq!(rx.recv().await.expect("requeued bucket").name, "photos");
+}
+
+#[test]
+fn replication_execution_digest_is_canonical_and_tracks_statistics() {
+    use rustfs_data_usage::{ReplicationAllStats, ReplicationTargetUsage};
+    let execution = DataUsageScanPlanDigest([9; 32]);
+    let mut cache = DataUsageCache::default();
+    assert_eq!(super::cache::scanner_replication_execution_digest(execution, &cache), execution);
+    let first = ReplicationTargetUsage {
+        replicated_size: 7,
+        replicated_count: 1,
+        ..Default::default()
+    };
+    let second = ReplicationTargetUsage {
+        pending_size: 3,
+        pending_count: 1,
+        ..Default::default()
+    };
+    cache.cache.insert(
+        "photos".to_string(),
+        DataUsageEntry {
+            replication_stats: Some(ReplicationAllStats {
+                replica_size: 0,
+                replica_count: 0,
+                targets: HashMap::from([("arn:a".to_string(), first.clone()), ("arn:b".to_string(), second.clone())]),
+            }),
+            ..Default::default()
+        },
+    );
+    let digest = super::cache::scanner_replication_execution_digest(execution, &cache);
+    assert_ne!(digest, execution);
+    let stats = cache
+        .cache
+        .get_mut("photos")
+        .expect("cached bucket")
+        .replication_stats
+        .as_mut()
+        .expect("replication stats");
+    stats.targets = HashMap::from([("arn:b".to_string(), second), ("arn:a".to_string(), first)]);
+    assert_eq!(super::cache::scanner_replication_execution_digest(execution, &cache), digest);
+    cache
+        .cache
+        .get_mut("photos")
+        .expect("cached bucket")
+        .replication_stats
+        .as_mut()
+        .expect("replication stats")
+        .targets
+        .get_mut("arn:a")
+        .expect("target stats")
+        .failed_count = 1;
+    assert_ne!(super::cache::scanner_replication_execution_digest(execution, &cache), digest);
 }

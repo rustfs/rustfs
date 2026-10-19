@@ -370,6 +370,17 @@ impl DataUsageCache {
             }
         };
 
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let load_fut = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+            crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::DataUsageCacheRead,
+            async {
+                crate::storage_api::ecstore_diagnostic::observe_read_version_context_boundary(
+                    crate::storage_api::ecstore_diagnostic::ReadVersionContextBoundary::ScannerCacheLoad,
+                );
+                load_fut.await
+            },
+        );
+
         match timeout(timeout_duration, load_fut).await {
             Ok(Ok((Some(cache), revision, _))) => Ok(DataUsageCacheLoadAttempt::Loaded {
                 cache: Box::new(cache),
@@ -386,16 +397,36 @@ impl DataUsageCache {
         crate::runtime_config::scanner_cache_save_timeout()
     }
 
-    pub(crate) fn persistence_timeout() -> Duration {
-        Self::cache_save_timeout()
+    pub(crate) fn publication_timeout() -> Duration {
+        // Aggregate statistics publication must fit its lease window rather
+        // than inherit the longer checkpoint save/reconciliation allowance.
+        let timeout_duration = Self::cache_save_timeout();
+        timeout_duration
             .saturating_mul(DATA_USAGE_CACHE_SAVE_RETRIES + 1)
             .saturating_add(DATA_USAGE_CACHE_SAVE_RETRY_BACKOFF_MAX)
-            .saturating_add(Self::backup_cache_save_timeout(Self::cache_save_timeout()))
+            .saturating_add(Self::backup_cache_save_timeout(timeout_duration, Duration::ZERO))
             .saturating_add(DATA_USAGE_CACHE_PERSISTENCE_MARGIN)
     }
 
-    fn backup_cache_save_timeout(timeout_duration: Duration) -> Duration {
-        timeout_duration.min(Duration::from_secs(DATA_USAGE_CACHE_BACKUP_SAVE_TIMEOUT_SECS_MAX))
+    pub(crate) fn persistence_timeout() -> Duration {
+        // Each save attempt can be followed by a full read-after-error
+        // reconciliation attempt, including the best-effort backup.
+        Self::cache_save_timeout()
+            .saturating_mul(DATA_USAGE_CACHE_SAVE_RETRIES + DATA_USAGE_CACHE_BACKUP_SAVE_RETRIES + 2)
+            .saturating_mul(2)
+            .saturating_add(DATA_USAGE_CACHE_SAVE_RETRY_BACKOFF_MAX)
+            .saturating_add(DATA_USAGE_CACHE_RECONCILE_BACKOFF_MAX)
+            .saturating_add(DATA_USAGE_CACHE_PERSISTENCE_MARGIN)
+    }
+
+    fn backup_cache_save_timeout(timeout_duration: Duration, primary_elapsed: Duration) -> Duration {
+        // Both copies write and verify the same body. Allow headroom over the
+        // observed primary cost without exceeding the configured attempt cap;
+        // fast checkpoints keep the short best-effort budget and zero retries.
+        primary_elapsed
+            .saturating_mul(2)
+            .max(Duration::from_secs(DATA_USAGE_CACHE_BACKUP_SAVE_TIMEOUT_SECS_BASE))
+            .min(timeout_duration)
     }
 
     fn record_save_attempt(path_type: &'static str, result: &'static str, duration: Duration) {
@@ -617,6 +648,7 @@ impl DataUsageCache {
         let timeout_duration = Self::cache_save_timeout();
 
         let path = path_join_buf(&[BUCKET_META_PREFIX, name]);
+        let primary_save_started = Instant::now();
         Self::save_path_with_retry(
             store.clone(),
             &path,
@@ -630,7 +662,7 @@ impl DataUsageCache {
 
         let backup_name = format!("{name}.bkp");
         let backup_path = path_join_buf(&[BUCKET_META_PREFIX, &backup_name]);
-        let backup_timeout_duration = Self::backup_cache_save_timeout(timeout_duration);
+        let backup_timeout_duration = Self::backup_cache_save_timeout(timeout_duration, primary_save_started.elapsed());
         let backup_revision = revisions.and_then(|revisions| revisions.backup.clone());
         if revisions.is_some() && backup_revision.is_none() {
             return Ok(());
@@ -668,6 +700,28 @@ impl DataUsageCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_budget_tracks_cost_within_configured_cap() {
+        for (cap, cost, expected) in [
+            (Duration::ZERO, Duration::ZERO, Duration::ZERO),
+            (Duration::from_secs(14), Duration::ZERO, Duration::from_secs(5)),
+            (Duration::from_secs(14), Duration::from_millis(2499), Duration::from_secs(5)),
+            (Duration::from_secs(14), Duration::from_millis(2500), Duration::from_secs(5)),
+            (Duration::from_secs(14), Duration::from_millis(2501), Duration::from_millis(5002)),
+            (Duration::from_secs(14), Duration::from_secs(6), Duration::from_secs(12)),
+            (Duration::from_secs(14), Duration::from_secs(7), Duration::from_secs(14)),
+            (Duration::from_secs(14), Duration::from_secs(60), Duration::from_secs(14)),
+            (Duration::from_secs(2), Duration::from_secs(6), Duration::from_secs(2)),
+            (Duration::MAX, Duration::MAX, Duration::MAX),
+        ] {
+            assert_eq!(
+                DataUsageCache::backup_cache_save_timeout(cap, cost),
+                expected,
+                "cap={cap:?}, cost={cost:?}"
+            );
+        }
+    }
 
     #[test]
     fn interrupted_checkpoint_admission_is_not_retried() {

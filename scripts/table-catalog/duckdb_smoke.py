@@ -41,6 +41,7 @@ class DuckDBSmokeResult:
     row_count: int
     cleanup_result: str
     checks: dict[str, str]
+    catalog_backing: str
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -335,6 +336,7 @@ def pyiceberg_args(args: argparse.Namespace) -> argparse.Namespace:
         require_vended_credentials=False,
         timeout=args.timeout,
         insecure=args.insecure,
+        catalog_backing=args.catalog_backing,
     )
 
 
@@ -417,6 +419,7 @@ def run_smoke(args: argparse.Namespace, deps: pyiceberg_smoke.RuntimeDeps) -> Du
     pyiceberg_smoke.ensure_local_proxy_bypass(endpoint)
     pyiceberg_smoke.ensure_aws_env(args.access_key, args.secret_key, args.region)
     iceberg_args = pyiceberg_args(args)
+    backing = pyiceberg_smoke.discover_catalog_backing(iceberg_args, deps)
     pyiceberg_smoke.ensure_bucket(iceberg_args, deps)
     pyiceberg_smoke.enable_table_bucket(iceberg_args, deps)
 
@@ -581,7 +584,7 @@ def run_smoke(args: argparse.Namespace, deps: pyiceberg_smoke.RuntimeDeps) -> Du
                 drop_namespace=not namespace_preexisting,
             )
 
-    return DuckDBSmokeResult(client_version, metadata_location, 2, cleanup_result, checks)
+    return DuckDBSmokeResult(client_version, metadata_location, 2, cleanup_result, checks, backing)
 
 
 def current_utc_timestamp() -> str:
@@ -598,7 +601,7 @@ def write_live_evidence(args: argparse.Namespace, result: DuckDBSmokeResult) -> 
         scenario="rest-catalog-single-table-read-write-cross-engine-negative-boundaries",
         rustfs_build=args.rustfs_build,
         git_sha=args.git_sha,
-        catalog_backing=args.catalog_backing,
+        catalog_backing=result.catalog_backing,
         endpoint=args.endpoint,
         warehouse=args.bucket,
         rest_path="/iceberg",

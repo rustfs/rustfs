@@ -141,6 +141,11 @@ impl Evaluator {
                 events[i] = event;
             }
         }
+        for event in &mut events {
+            if event.requires_expiry_policy() {
+                event.expiry_policy = Some(Arc::clone(&self.policy).into());
+            }
+        }
         events
     }
 
@@ -219,6 +224,30 @@ mod tests {
     use rustfs_replication::{ReplicationStatusType, VersionPurgeStatusType};
 
     #[tokio::test]
+    async fn expiration_events_retain_the_evaluated_policy() {
+        let policy = latest_expiration_lifecycle();
+        let object = current_object_opts(ReplicationStatusType::Completed);
+        let event = Evaluator::new(Arc::clone(&policy))
+            .eval(std::slice::from_ref(&object))
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(event.action, IlmAction::DeleteAction);
+        assert_eq!(Arc::strong_count(&policy), 2, "the event should share the evaluated policy");
+        assert!(event.expiry_policy.as_ref().unwrap().matches_configuration(Some(&policy)));
+        assert!(
+            policy
+                .eval(&object)
+                .await
+                .expiry_policy
+                .as_ref()
+                .unwrap()
+                .matches_configuration(Some(&policy))
+        );
+        assert!(!format!("{event:?}").contains("BucketLifecycleConfiguration"));
+    }
+
+    #[tokio::test]
     async fn adversarial_restore_expiry_survives_legal_hold() {
         let mut policy = (*latest_expiration_lifecycle()).clone();
         policy.rules[0].status = ExpirationStatus::from_static(ExpirationStatus::DISABLED);
@@ -247,6 +276,7 @@ mod tests {
             .await
             .expect("unlocked restored versions should evaluate");
         assert_eq!(unlocked.iter().map(|event| event.action).collect::<Vec<_>>(), expected);
+        assert!(unlocked.iter().all(|event| event.expiry_policy.is_none()));
 
         for object in &mut objects {
             object

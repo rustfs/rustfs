@@ -8,6 +8,11 @@ collection:
 
 ## Operations
 
+- [Table maintenance periodic queueing](operations/s3-tables-maintenance-scheduler.md) — opt-in scheduling, limits, worker handoff, and recovery.
+
+For PUT cleanup admission, blocking-pool isolation, and optional CPU affinity,
+see [PUT cleanup isolation](operations/put-cleanup-isolation.md).
+
 - [External certificate issuance and TLS rotation](operations/tls-certificate-rotation.md) — publication, native reload, trust separation and failure handling.
 
 - [Architecture guard troubleshooting](operations/architecture-guard-troubleshooting.md) — diagnose repository guard failures.
@@ -25,6 +30,9 @@ For legacy protection assessment and bounded protected copies, see [Object integ
 
 For encrypted listing compatibility and older stored fingerprints, see
 [Encrypted object ETags](operations/encrypted-etags.md).
+
+For durable hard quota accounting, node-outage behavior, and fence protocol
+upgrades, see [Durable hard quotas](operations/durable-quota-reservation-v2.md).
 
 Operational runbooks live under [`operations/`](operations/). Replication
 operators should start with:
@@ -62,6 +70,9 @@ procedure is required.
 
 For storage dashboards, see [Storage metrics and observer selection](operations/storage-metrics.md):
 drive ownership, snapshot freshness, counter queries, and rolling upgrades.
+
+For per-bucket capacity and object counts, see [Bucket usage metrics](operations/bucket-usage-metrics.md):
+OTLP export, cluster deduplication, accounting semantics, and scanner freshness.
 
 For optional shard commitments, see [Independent shard integrity rollout](operations/shard-integrity-rollout.md):
 activation, legacy repair results, multipart mode changes, and rollback limits.

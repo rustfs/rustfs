@@ -2983,6 +2983,11 @@ fn resolve_decommission_partial_listing_entry(
     if let Some(entry) = entries.resolve(resolver) {
         return Ok(entry);
     }
+    if disk_error_count == 0
+        && let Some(prefix_dir) = decommission_prefix_directory_candidate(entries.as_ref())
+    {
+        return Ok(prefix_dir);
+    }
 
     let object = entries
         .as_ref()
@@ -3003,6 +3008,24 @@ fn resolve_decommission_partial_listing_entry(
         observed_at: OffsetDateTime::now_utc(),
         reason: "metadata_resolution_failed".to_string(),
     })
+}
+
+/// The prefix directory a partial listing sample consists of, when every
+/// candidate is one.
+///
+/// The walker emits a directory with empty metadata only when it holds no
+/// `xl.meta`, so such a sample is listing structure rather than erasure-coded
+/// data: node-local files such as the MRF journal under
+/// `.rustfs.sys/buckets/.heal/` create one on a single drive, and the
+/// recursive walk lists any object beneath it as its own entry. Below the
+/// directory quorum there is nothing to reconcile, so the callback receives the
+/// prefix exactly as a quorum-resolved one and skips it. Objects whose metadata
+/// is present but unreadable keep their metadata bytes and never match here;
+/// mixed samples stay unresolved.
+fn decommission_prefix_directory_candidate(candidates: &[Option<MetaCacheEntry>]) -> Option<MetaCacheEntry> {
+    let mut candidates = candidates.iter().flatten();
+    let first = candidates.next()?;
+    (first.is_dir() && candidates.all(MetaCacheEntry::is_dir)).then(|| first.clone())
 }
 
 fn validate_decommission_durable_ilm_copy(
@@ -3691,6 +3714,55 @@ fn activation_pool_meta_lock_error(err: rustfs_lock::LockError) -> Error {
     }
 }
 
+fn rebalance_worker_read_lock_error(err: rustfs_lock::LockError, object: &str) -> Error {
+    match err {
+        rustfs_lock::LockError::QuorumNotReached { required, achieved } => Error::NamespaceLockQuorumUnavailable {
+            mode: "read",
+            bucket: RUSTFS_META_BUCKET.to_string(),
+            object: object.to_string(),
+            required,
+            achieved,
+        },
+        other => Error::Lock(other),
+    }
+}
+
+/// Read-only admission to an already durable rebalance run. Keeping this
+/// separate from the activation writer prevents admission from authorizing a
+/// pool or rebalance metadata write under shared namespace locks.
+pub(crate) struct PoolRebalanceWorkerFence {
+    pool_meta_guard: rustfs_lock::NamespaceLockGuard,
+    rebalance_meta_guard: rustfs_lock::NamespaceLockGuard,
+    fleet_proof: Option<crate::services::notification_sys::CrossPoolFenceFleetProofToken>,
+}
+
+impl PoolRebalanceWorkerFence {
+    pub(crate) fn set_fleet_proof(
+        &mut self,
+        fleet_proof: Option<crate::services::notification_sys::CrossPoolFenceFleetProofToken>,
+    ) {
+        self.fleet_proof = fleet_proof;
+    }
+
+    pub(crate) fn ensure_held(&self) -> Result<()> {
+        if self.pool_meta_guard.is_lock_lost()
+            || self.pool_meta_guard.is_released()
+            || self.rebalance_meta_guard.is_lock_lost()
+            || self.rebalance_meta_guard.is_released()
+        {
+            return Err(Error::other("worker admission lock lost before rebalance activation"));
+        }
+        if self
+            .fleet_proof
+            .as_ref()
+            .is_some_and(|proof| !crate::services::notification_sys::cross_pool_fence_fleet_proof_matches(proof))
+        {
+            return Err(Error::other(POOL_ACTIVATION_FLEET_PROOF_EXPIRED));
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct PoolRebalanceActivationFence {
     pool_meta_guard: Arc<rustfs_lock::NamespaceLockGuard>,
     rebalance_meta_guard: Arc<rustfs_lock::NamespaceLockGuard>,
@@ -3760,6 +3832,35 @@ impl PoolRebalanceActivationFence {
 #[cfg(test)]
 tokio::task_local! {
     pub(crate) static REBALANCE_ACTIVATION_LOCK_ATTEMPT: Arc<tokio::sync::Notify>;
+}
+
+pub(crate) async fn acquire_pool_rebalance_worker_locks<S>(pool: Arc<S>) -> Result<PoolRebalanceWorkerFence>
+where
+    S: crate::storage_api_contracts::namespace::NamespaceLocking<
+            Error = Error,
+            NamespaceLock = rustfs_lock::NamespaceLockWrapper,
+        >,
+{
+    // Match activation and entry admission: rebalance.bin -> pool.bin. Joining
+    // the same durable run must coexist with entries retaining their run fence.
+    let rebalance_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, REBAL_META_NAME).await?;
+    #[cfg(test)]
+    let _ = REBALANCE_ACTIVATION_LOCK_ATTEMPT.try_with(|attempted| attempted.notify_one());
+    let rebalance_meta_guard = rebalance_meta_lock
+        .get_read_lock(get_lock_acquire_timeout())
+        .await
+        .map_err(|err| rebalance_worker_read_lock_error(err, REBAL_META_NAME))?;
+    let pool_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
+    let pool_meta_guard = pool_meta_lock
+        .get_read_lock(get_lock_acquire_timeout())
+        .await
+        .map_err(|err| rebalance_worker_read_lock_error(err, POOL_META_NAME))?;
+
+    Ok(PoolRebalanceWorkerFence {
+        pool_meta_guard,
+        rebalance_meta_guard,
+        fleet_proof: None,
+    })
 }
 
 pub(crate) async fn acquire_pool_rebalance_activation_locks<S>(
@@ -6685,12 +6786,12 @@ fn pool_meta_cas_options(object: &str, token: &PoolMetaCasToken, fence: &PoolMet
     fence.ensure_held()?;
     let mut opts = ObjectOptions {
         max_parity: true,
-        write_completion: crate::object_api::WriteCompletion::TailDrained,
         no_lock: true,
         http_preconditions: Some(pool_meta_cas_preconditions(token, object)?),
         ..Default::default()
     };
     fence.add_to_options(&mut opts, object);
+    opts.write_completion = crate::object_api::WriteCompletion::TailDrainedWithOwnerRepair;
     Ok(opts)
 }
 
@@ -6721,6 +6822,72 @@ async fn execute_pool_meta_object_cas<S>(
 where
     S: EcstoreObjectIO,
 {
+    // Bound the CAS state retained by callers, including ordinary metadata
+    // transactions that never enter identity repair. Large inline retry states
+    // otherwise propagate through startup and cross-crate storage futures.
+    Box::pin(async move {
+        if object != POOL_META_IDENTITY_NAME {
+            return execute_pool_meta_object_cas_once(pool, object, data, opts, fence, phase).await;
+        }
+        // Keep the exact identity owned by this transaction. A quorum read alone
+        // cannot discharge repair responsibility for a missing disk replica.
+        let identity = data;
+        let mut outcome = execute_pool_meta_object_cas_once(pool.clone(), object, identity.clone(), opts, fence, phase).await;
+        for delay_secs in [1, 2, 4] {
+            if !outcome.source.as_deref().is_some_and(|err| {
+                matches!(err, Error::Io(inner) if inner.get_ref().is_some_and(|source| source.is::<crate::set_disk::SystemMetadataRepairRequired>()))
+            }) {
+                break;
+            }
+            // The caller's transaction arm remains live across reconnect waits,
+            // verification and repair. Cancellation must retain its sticky gate.
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+            let repair_options = async {
+                fence.ensure_held()?;
+                let (current, info) = read_config_no_lock_preserve_empty_with_metadata(pool.clone(), object).await?;
+                if current != identity {
+                    return Err(Error::PreconditionFailed);
+                }
+                let token = info
+                    .etag
+                    .filter(|etag| !etag.trim().is_empty())
+                    .map(PoolMetaCasToken::Existing)
+                    .unwrap_or(PoolMetaCasToken::Unsafe);
+                pool_meta_cas_options(object, &token, fence)
+            }
+            .await;
+            outcome = match repair_options {
+                Ok(opts) => execute_pool_meta_object_cas_once(pool.clone(), object, identity.clone(), opts, fence, phase).await,
+                Err(err) => PoolMetaCasWriteOutcome::not_dispatched(err),
+            };
+            // A rejected repair cannot turn the preceding committed write into a
+            // harmless CAS conflict that the outer loop could accept on readback.
+            outcome.may_have_mutated = true;
+            outcome.result = outcome.result.map_err(|err| {
+                let original = outcome.source.get_or_insert_with(|| Arc::new(err));
+                Error::other(pool_metadata_error(
+                    crate::error::PoolMetadataFailure::TransactionUnknown,
+                    phase,
+                    Some(Arc::clone(original)),
+                ))
+            });
+        }
+        outcome
+    })
+    .await
+}
+
+async fn execute_pool_meta_object_cas_once<S>(
+    pool: Arc<S>,
+    object: &str,
+    data: Vec<u8>,
+    opts: ObjectOptions,
+    fence: &PoolMetaPersistenceFence<'_>,
+    phase: &'static str,
+) -> PoolMetaCasWriteOutcome
+where
+    S: EcstoreObjectIO,
+{
     // A bounded phase can wait for another replica before this write is polled.
     if let Err(err) = fence.ensure_held() {
         return PoolMetaCasWriteOutcome::not_dispatched(err);
@@ -6735,7 +6902,11 @@ where
             "payload_sha256": rustfs_utils::crypto::hex(Sha256::digest(&data)),
             "if_match": opts.http_preconditions.as_ref().and_then(|p| p.if_match.as_deref()),
             "if_none_match": opts.http_preconditions.as_ref().and_then(|p| p.if_none_match.as_deref()),
-            "tail_drained": opts.write_completion == crate::object_api::WriteCompletion::TailDrained,
+            "tail_drained": matches!(
+                opts.write_completion,
+                crate::object_api::WriteCompletion::TailDrained
+                    | crate::object_api::WriteCompletion::TailDrainedWithOwnerRepair
+            ),
             "no_lock": opts.no_lock,
         })
     });
@@ -12427,6 +12598,18 @@ impl ECStore {
         write_state.observe_replicas(replica_state);
         write_state.ensure_missing_metadata_can_initialize()?;
         write_state.ensure_write_safe(operation)?;
+        Ok(pool_meta)
+    }
+
+    pub(crate) async fn load_runtime_pool_meta_under_worker_fence(
+        &self,
+        write_state: &mut PoolMetaWriteState,
+        worker_fence: &PoolRebalanceWorkerFence,
+        operation: &str,
+    ) -> Result<PoolMeta> {
+        worker_fence.ensure_held()?;
+        let pool_meta = self.load_runtime_pool_meta_observing(write_state, operation).await?;
+        worker_fence.ensure_held()?;
         Ok(pool_meta)
     }
 
@@ -24124,7 +24307,7 @@ mod pools_tests {
     };
     use crate::bucket::metadata_sys;
     use crate::data_movement;
-    use crate::disk::{STORAGE_FORMAT_FILE, endpoint::Endpoint};
+    use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE, endpoint::Endpoint};
     use crate::error::{Error, StorageError};
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::object_api::{ObjectInfo, ObjectOptions};
@@ -24214,6 +24397,335 @@ mod pools_tests {
         revision: AtomicUsize,
         stored: StdMutex<Option<(Vec<u8>, String)>>,
         identity: StdMutex<Option<(Vec<u8>, String)>>,
+    }
+
+    #[test]
+    fn pool_meta_cas_future_remains_stack_bounded() {
+        let pool = Arc::new(PartialPoolMetaWriteStorage::default());
+        let fence = PoolMetaPersistenceFence::OfflineRecovery;
+        let future = super::execute_pool_meta_object_cas(
+            pool.clone(),
+            POOL_META_IDENTITY_NAME,
+            b"owned-identity".to_vec(),
+            ObjectOptions::default(),
+            &fence,
+            "identity_cas",
+        );
+        let original = super::execute_pool_meta_object_cas_once(
+            pool,
+            POOL_META_IDENTITY_NAME,
+            b"owned-identity".to_vec(),
+            ObjectOptions::default(),
+            &fence,
+            "identity_cas",
+        );
+        let future_size = std::mem::size_of_val(&future);
+        let original_size = std::mem::size_of_val(&original);
+        assert!(
+            future_size <= 4 * 1024,
+            "pool metadata CAS future must remain stack-bounded; measured {future_size} bytes versus {original_size} without repair"
+        );
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum IdentityRepairFault {
+        Healthy,
+        Once,
+        Always,
+        Changed,
+        Unreadable,
+        TypedReadFailure,
+        MissingEtag,
+        EmptyEtag,
+        Reject,
+        Unknown,
+        BlockBackoff,
+        BlockRead,
+        BlockWrite,
+    }
+
+    #[derive(Debug)]
+    struct IdentityRepairStorage {
+        inner: PartialPoolMetaWriteStorage,
+        fault: IdentityRepairFault,
+        writes: AtomicUsize,
+        reads: AtomicUsize,
+        blocked: tokio::sync::Notify,
+    }
+
+    impl IdentityRepairStorage {
+        fn new(fault: IdentityRepairFault) -> Arc<Self> {
+            Arc::new(Self {
+                inner: PartialPoolMetaWriteStorage::default(),
+                fault,
+                writes: AtomicUsize::new(0),
+                reads: AtomicUsize::new(0),
+                blocked: tokio::sync::Notify::new(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectIO for IdentityRepairStorage {
+        type Error = Error;
+        type RangeSpec = HTTPRangeSpec;
+        type HeaderMap = http::HeaderMap;
+        type ObjectOptions = ObjectOptions;
+        type ObjectInfo = ObjectInfo;
+        type GetObjectReader = crate::object_api::GetObjectReader;
+        type PutObjectReader = crate::object_api::PutObjReader;
+
+        async fn get_object_reader(
+            &self,
+            bucket: &str,
+            object: &str,
+            range: Option<HTTPRangeSpec>,
+            headers: http::HeaderMap,
+            opts: &ObjectOptions,
+        ) -> std::result::Result<Self::GetObjectReader, Error> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.fault == IdentityRepairFault::Unreadable {
+                return Err(Error::ErasureReadQuorum);
+            }
+            if self.fault == IdentityRepairFault::TypedReadFailure {
+                return Err(Error::other(super::pool_metadata_error(
+                    crate::error::PoolMetadataFailure::ReadUnavailable,
+                    "identity_repair_read",
+                    Some(Arc::new(Error::ErasureReadQuorum)),
+                )));
+            }
+            if self.fault == IdentityRepairFault::BlockRead {
+                self.blocked.notify_one();
+                std::future::pending::<()>().await;
+            }
+            let mut reader = self.inner.get_object_reader(bucket, object, range, headers, opts).await?;
+            match self.fault {
+                IdentityRepairFault::Changed => {
+                    reader.stream = Box::new(Cursor::new(b"other-identity".to_vec()));
+                    reader.object_info.size = 14;
+                }
+                IdentityRepairFault::MissingEtag => reader.object_info.etag = None,
+                IdentityRepairFault::EmptyEtag => reader.object_info.etag = Some(" ".to_owned()),
+                _ => {}
+            }
+            Ok(reader)
+        }
+
+        async fn put_object(
+            &self,
+            bucket: &str,
+            object: &str,
+            data: &mut Self::PutObjectReader,
+            opts: &ObjectOptions,
+        ) -> std::result::Result<ObjectInfo, Error> {
+            let attempt = self.writes.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(opts.write_completion, crate::object_api::WriteCompletion::TailDrainedWithOwnerRepair);
+            assert!(opts.max_parity && opts.no_lock);
+            if attempt > 0 {
+                assert_eq!(
+                    opts.http_preconditions
+                        .as_ref()
+                        .and_then(HTTPPreconditions::if_none_match_value),
+                    None
+                );
+                assert_eq!(
+                    opts.http_preconditions.as_ref().and_then(HTTPPreconditions::if_match_value),
+                    self.inner
+                        .identity
+                        .lock()
+                        .expect("identity lock")
+                        .as_ref()
+                        .map(|(_, etag)| etag.as_str()),
+                    "repair must use the observed post-commit CAS token",
+                );
+                if self.fault == IdentityRepairFault::Reject {
+                    return Err(Error::PreconditionFailed);
+                }
+                if self.fault == IdentityRepairFault::BlockWrite {
+                    self.blocked.notify_one();
+                    std::future::pending::<()>().await;
+                }
+            }
+            let info = self.inner.put_object(bucket, object, data, opts).await?;
+            if self.fault == IdentityRepairFault::Unknown {
+                return Err(Error::Timeout);
+            }
+            if self.fault != IdentityRepairFault::Healthy && (attempt == 0 || self.fault == IdentityRepairFault::Always) {
+                if self.fault == IdentityRepairFault::BlockBackoff {
+                    self.blocked.notify_one();
+                }
+                return Err(Error::other(crate::set_disk::SystemMetadataRepairRequired));
+            }
+            Ok(info)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pool_identity_owner_repair_preserves_cas_and_fail_closed_boundaries() {
+        for (fault, object, expected_writes, expected_reads, succeeds) in [
+            (IdentityRepairFault::Healthy, POOL_META_IDENTITY_NAME, 1, 0, true),
+            (IdentityRepairFault::Once, POOL_META_IDENTITY_NAME, 2, 1, true),
+            (IdentityRepairFault::Always, POOL_META_IDENTITY_NAME, 4, 3, false),
+            (IdentityRepairFault::Changed, POOL_META_IDENTITY_NAME, 1, 1, false),
+            (IdentityRepairFault::Unreadable, POOL_META_IDENTITY_NAME, 1, 1, false),
+            (IdentityRepairFault::TypedReadFailure, POOL_META_IDENTITY_NAME, 1, 1, false),
+            (IdentityRepairFault::MissingEtag, POOL_META_IDENTITY_NAME, 1, 1, false),
+            (IdentityRepairFault::EmptyEtag, POOL_META_IDENTITY_NAME, 1, 1, false),
+            (IdentityRepairFault::Reject, POOL_META_IDENTITY_NAME, 2, 1, false),
+            (IdentityRepairFault::Unknown, POOL_META_IDENTITY_NAME, 1, 0, false),
+            (IdentityRepairFault::Once, POOL_META_NAME, 1, 0, false),
+        ] {
+            let pool = IdentityRepairStorage::new(fault);
+            let state = super::PoolMetaWriteState::default();
+            let mut transaction = state.arm_transaction();
+            let started = tokio::time::Instant::now();
+            let result = save_pool_meta_object_cas(
+                pool.clone(),
+                object,
+                b"owned-identity".to_vec(),
+                &PoolMetaCasToken::Missing,
+                &PoolMetaPersistenceFence::OfflineRecovery,
+                "identity_cas",
+                &mut transaction,
+            )
+            .await;
+            assert_eq!(result.is_ok(), succeeds, "{fault:?}: {result:?}");
+            let original_source = result
+                .as_ref()
+                .err()
+                .and_then(|err| err.pool_metadata_failure())
+                .and_then(|failure| failure.source.clone());
+            if fault == IdentityRepairFault::TypedReadFailure {
+                assert_eq!(
+                    original_source
+                        .as_ref()
+                        .expect("read failure source")
+                        .pool_metadata_failure()
+                        .expect("retain the original read context")
+                        .kind,
+                    crate::error::PoolMetadataFailure::ReadUnavailable
+                );
+            }
+            if succeeds {
+                transaction.disarm();
+            } else {
+                assert_eq!(
+                    result
+                        .expect_err("failed repair")
+                        .pool_metadata_failure()
+                        .expect("typed uncertainty")
+                        .kind,
+                    crate::error::PoolMetadataFailure::TransactionUnknown,
+                    "{fault:?}"
+                );
+            }
+            drop(transaction);
+            let status = state.ensure_write_safe("after repair");
+            assert_eq!(status.is_ok(), succeeds, "{fault:?}");
+            if let Err(blocked) = status {
+                let source = blocked
+                    .pool_metadata_failure()
+                    .expect("blocked transaction context")
+                    .source
+                    .as_ref()
+                    .expect("blocked transaction source");
+                assert!(
+                    Arc::ptr_eq(source, original_source.as_ref().expect("caller failure source")),
+                    "caller and latch must retain the same original cause: {fault:?}"
+                );
+            }
+            assert_eq!(pool.writes.load(Ordering::SeqCst), expected_writes, "{fault:?}");
+            assert_eq!(pool.reads.load(Ordering::SeqCst), expected_reads, "{fault:?}");
+            if fault == IdentityRepairFault::Always {
+                assert_eq!(started.elapsed(), StdDuration::from_secs(7), "repair backoff must be bounded");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pool_identity_owner_repair_cancellation_keeps_the_transaction_armed() {
+        for fault in [
+            IdentityRepairFault::BlockBackoff,
+            IdentityRepairFault::BlockRead,
+            IdentityRepairFault::BlockWrite,
+        ] {
+            let pool = IdentityRepairStorage::new(fault);
+            let state = Arc::new(tokio::sync::Mutex::new(super::PoolMetaWriteState::default()));
+            let task = tokio::spawn({
+                let pool = pool.clone();
+                let state = state.clone();
+                async move {
+                    let state = state.lock().await;
+                    let mut transaction = state.arm_transaction();
+                    save_pool_meta_object_cas(
+                        pool,
+                        POOL_META_IDENTITY_NAME,
+                        b"owned-identity".to_vec(),
+                        &PoolMetaCasToken::Missing,
+                        &PoolMetaPersistenceFence::OfflineRecovery,
+                        "identity_cas",
+                        &mut transaction,
+                    )
+                    .await
+                }
+            });
+            pool.blocked.notified().await;
+            task.abort();
+            assert!(task.await.expect_err("cancelled repair").is_cancelled());
+            let state = state.lock().await;
+            let error = state
+                .ensure_write_safe("cancelled repair")
+                .expect_err("partial identity remains blocked");
+            assert_eq!(error.pool_metadata_failure().expect("typed uncertainty").phase, "identity_cas");
+            assert_eq!(state.active_transactions.load(Ordering::SeqCst), 0);
+            assert!(pool.inner.identity.lock().expect("identity lock").is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_identity_owner_repair_stops_after_fence_loss() {
+        let client = Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new())));
+        let lock = NamespaceLock::with_clients_and_quorum("identity-repair-fence".to_string(), vec![client], 1);
+        let request = LockRequest::new(
+            ObjectKey::new(super::RUSTFS_META_BUCKET, POOL_META_NAME),
+            LockType::Exclusive,
+            "identity-repair-owner",
+        )
+        .with_acquire_timeout(StdDuration::from_secs(1))
+        .with_ttl(StdDuration::from_millis(50))
+        .with_refresh_interval(StdDuration::from_millis(50));
+        let owner = Arc::new(
+            lock.acquire_guard(&request)
+                .await
+                .expect("acquire fence")
+                .expect("available fence"),
+        );
+        let fence = PoolMetaPersistenceFence::Owned(owner.clone());
+        let pool = IdentityRepairStorage::new(IdentityRepairFault::Once);
+        let state = super::PoolMetaWriteState::default();
+        let mut transaction = state.arm_transaction();
+        let error = save_pool_meta_object_cas(
+            pool.clone(),
+            POOL_META_IDENTITY_NAME,
+            b"owned-identity".to_vec(),
+            &PoolMetaCasToken::Missing,
+            &fence,
+            "identity_cas",
+            &mut transaction,
+        )
+        .await
+        .expect_err("expired owner must not repair");
+        assert!(owner.is_lock_lost());
+        assert_eq!(
+            error.pool_metadata_failure().expect("typed uncertainty").kind,
+            crate::error::PoolMetadataFailure::TransactionUnknown
+        );
+        assert_eq!(pool.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.reads.load(Ordering::SeqCst), 0);
+        drop(transaction);
+        state
+            .ensure_write_safe("lost repair fence")
+            .expect_err("lost fence retains the write gate");
     }
 
     #[test]
@@ -24692,7 +25204,7 @@ mod pools_tests {
                     _ => panic!("phase fixture must receive valid pool metadata"),
                 };
                 assert!(opts.max_parity && opts.no_lock);
-                assert_eq!(opts.write_completion, crate::object_api::WriteCompletion::TailDrained);
+                assert_eq!(opts.write_completion, crate::object_api::WriteCompletion::TailDrainedWithOwnerRepair);
                 self.trace.calls.lock().expect("trace lock").push(WriteCall {
                     pool: self.pool,
                     phase,
@@ -28293,6 +28805,122 @@ mod pools_tests {
         assert!(message.contains("1 disk error(s)"));
     }
 
+    fn decommission_listing_resolver() -> MetadataResolutionParams {
+        MetadataResolutionParams {
+            dir_quorum: 2,
+            obj_quorum: 2,
+            bucket: RUSTFS_META_BUCKET.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn node_local_prefix_directory_entry() -> MetaCacheEntry {
+        MetaCacheEntry {
+            name: "buckets/.heal/".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn single_version_object_entry(name: &str) -> MetaCacheEntry {
+        let mut meta = rustfs_filemeta::FileMeta::new();
+        meta.add_version(FileInfo {
+            volume: RUSTFS_META_BUCKET.to_string(),
+            name: name.to_string(),
+            size: 1,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        })
+        .expect("test file metadata should accept object version");
+        MetaCacheEntry {
+            name: name.to_string(),
+            metadata: meta.marshal_msg().expect("test file metadata should marshal"),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_resolve_decommission_partial_listing_entry_passes_prefix_directory_below_dir_quorum() {
+        let entry = resolve_decommission_partial_listing_entry(
+            MetaCacheEntries(vec![Some(node_local_prefix_directory_entry()), None, None]),
+            decommission_listing_resolver(),
+            RUSTFS_META_BUCKET,
+            BUCKET_META_PREFIX,
+            0,
+            1,
+            0,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("a prefix directory on one healthy drive is listing structure, not unresolved metadata");
+
+        assert_eq!(entry.name, "buckets/.heal/");
+        assert!(entry.is_dir());
+    }
+
+    #[test]
+    fn test_resolve_decommission_partial_listing_entry_keeps_prefix_directory_fail_closed_on_disk_error() {
+        let unresolved_entry = resolve_decommission_partial_listing_entry(
+            MetaCacheEntries(vec![Some(node_local_prefix_directory_entry()), None, None]),
+            decommission_listing_resolver(),
+            RUSTFS_META_BUCKET,
+            BUCKET_META_PREFIX,
+            1,
+            1,
+            0,
+            OffsetDateTime::now_utc(),
+        )
+        .expect_err("a prefix directory sampled beside a drive error must stay fail-closed");
+
+        assert_eq!(unresolved_entry.bucket, RUSTFS_META_BUCKET);
+        assert_eq!(unresolved_entry.object, "buckets/.heal/");
+        assert_eq!(unresolved_entry.candidate_count, 1);
+        assert_eq!(unresolved_entry.disk_error_count, 1);
+        assert_eq!(unresolved_entry.reason, "metadata_resolution_failed");
+    }
+
+    #[test]
+    fn test_resolve_decommission_partial_listing_entry_rejects_object_below_obj_quorum() {
+        let object = "buckets/photos/.metadata.bin";
+        let unresolved_entry = resolve_decommission_partial_listing_entry(
+            MetaCacheEntries(vec![Some(single_version_object_entry(object)), None, None]),
+            decommission_listing_resolver(),
+            RUSTFS_META_BUCKET,
+            BUCKET_META_PREFIX,
+            0,
+            1,
+            0,
+            OffsetDateTime::now_utc(),
+        )
+        .expect_err("an object sampled below the metadata quorum must stay unresolved");
+
+        assert_eq!(unresolved_entry.object, object);
+        assert_eq!(unresolved_entry.candidate_count, 1);
+        assert_eq!(unresolved_entry.disk_error_count, 0);
+        assert_eq!(unresolved_entry.reason, "metadata_resolution_failed");
+    }
+
+    #[test]
+    fn test_resolve_decommission_partial_listing_entry_rejects_mixed_prefix_and_directory_object_sample() {
+        let unresolved_entry = resolve_decommission_partial_listing_entry(
+            MetaCacheEntries(vec![
+                Some(node_local_prefix_directory_entry()),
+                Some(single_version_object_entry("buckets/.heal/")),
+                None,
+            ]),
+            decommission_listing_resolver(),
+            RUSTFS_META_BUCKET,
+            BUCKET_META_PREFIX,
+            0,
+            1,
+            0,
+            OffsetDateTime::now_utc(),
+        )
+        .expect_err("a prefix directory beside a same-name directory object must stay unresolved");
+
+        assert_eq!(unresolved_entry.object, "buckets/.heal/");
+        assert_eq!(unresolved_entry.candidate_count, 2);
+        assert_eq!(unresolved_entry.disk_error_count, 0);
+    }
+
     #[test]
     fn unresolved_entry_ledger_requires_individual_verification_before_completion() {
         let generation = OffsetDateTime::now_utc();
@@ -28455,6 +29083,100 @@ mod pools_tests {
                 .expect("reloaded decommission should exist")
                 .unresolved_entries,
             in_memory_entries
+        );
+    }
+
+    #[tokio::test]
+    async fn decommission_listing_skips_node_local_heal_journal_prefix() {
+        let (dirs, store) = metadata_sys::test_support::isolated_store_over_temp_disks().await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let generation = OffsetDateTime::now_utc();
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            pool_meta.dont_save = false;
+            pool_meta.pools[0].decommission = Some(PoolDecommissionInfo {
+                start_time: Some(generation),
+                ..Default::default()
+            });
+        }
+        store
+            .save_current_pool_meta_for_test(&[0])
+            .await
+            .expect("active decommission metadata should be persisted before listing");
+
+        // The MRF queue writes its journals with raw local-disk writes on the
+        // node that owns them, so one drive ends up with a plain directory tree
+        // that holds no xl.meta anywhere.
+        let journal_dir = dirs[0]
+            .path()
+            .join(RUSTFS_META_BUCKET)
+            .join(BUCKET_META_PREFIX)
+            .join(".heal")
+            .join("mrf");
+        tokio::fs::create_dir_all(&journal_dir)
+            .await
+            .expect("node-local journal directory should be created");
+        tokio::fs::write(journal_dir.join("journal.bin"), b"")
+            .await
+            .expect("legacy journal should be written");
+        tokio::fs::write(journal_dir.join("journal-scoped.bin"), b"scoped-journal")
+            .await
+            .expect("scoped journal should be written");
+
+        let listed = Arc::new(tokio::sync::Mutex::new(Vec::<MetaCacheEntry>::new()));
+        let listed_cb = listed.clone();
+        let callback: ListCallback = Arc::new(move |entry: MetaCacheEntry| {
+            let listed = listed_cb.clone();
+            Box::pin(async move {
+                listed.lock().await.push(entry);
+            })
+        });
+        let entry_error = Arc::new(tokio::sync::Mutex::new(None::<Error>));
+
+        store.pools[0].disk_set[0]
+            .list_objects_to_decommission(
+                store.clone(),
+                CancellationToken::new(),
+                DecomBucketInfo {
+                    name: RUSTFS_META_BUCKET.to_string(),
+                    prefix: BUCKET_META_PREFIX.to_string(),
+                },
+                callback,
+                entry_error.clone(),
+                0,
+                0,
+                generation,
+                false,
+            )
+            .await
+            .expect("a node-local journal directory must not fail the decommission listing");
+
+        assert!(entry_error.lock().await.is_none(), "{:?}", entry_error.lock().await);
+        assert!(
+            store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("decommission should remain active")
+                .unresolved_entries
+                .is_empty(),
+            "a node-local prefix must not be recorded as unresolved object metadata"
+        );
+
+        let listed = listed.lock().await;
+        let heal_entries = listed
+            .iter()
+            .filter(|entry| entry.name.starts_with("buckets/.heal/"))
+            .collect::<Vec<_>>();
+        assert!(
+            heal_entries
+                .iter()
+                .any(|entry| entry.name == "buckets/.heal/" && entry.is_dir()),
+            "the journal prefix should reach the callback as a skippable directory: {heal_entries:?}"
+        );
+        assert!(
+            heal_entries.iter().all(|entry| !entry.is_object()),
+            "raw journal files must never surface as objects: {heal_entries:?}"
         );
     }
 

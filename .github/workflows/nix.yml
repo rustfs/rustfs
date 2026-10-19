@@ -54,7 +54,7 @@ jobs:
   cancel-closed-pr-runs:
     name: Cancel Closed PR Runs
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Explain cancellation run

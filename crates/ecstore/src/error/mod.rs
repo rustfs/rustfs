@@ -264,6 +264,11 @@ pub enum StorageError {
     StorageFull,
     #[error("Please reduce your request rate")]
     SlowDown,
+    /// Delete recovery found a legacy residue it cannot classify. This is a
+    /// deterministic ambiguity that retrying cannot resolve; the object is
+    /// retained for operator inspection.
+    #[error("delete recovery found an ambiguous legacy residue; operator inspection is required")]
+    DeleteRecoveryLegacyAmbiguous,
     #[error("Decommission not started")]
     DecommissionNotStarted,
     #[error("Decommission already running")]
@@ -290,6 +295,10 @@ pub enum StorageError {
     ConfigNotFound,
     #[error("Precondition failed")]
     PreconditionFailed,
+    #[error("Object generation changed during conditional deletion")]
+    ConditionalDeleteConflict,
+    #[error("The storage peer does not support guarded deletion")]
+    GuardedDeleteUnsupported,
     #[error("Not modified")]
     NotModified,
     #[error("Invalid range specified: {0}")]
@@ -469,6 +478,8 @@ impl From<DiskError> for StorageError {
             DiskError::SourceStalled => StorageError::SourceStalled,
             DiskError::Timeout => StorageError::Timeout,
             DiskError::InvalidPath => StorageError::InvalidPath,
+            DiskError::ConditionalDeleteConflict => StorageError::ConditionalDeleteConflict,
+            DiskError::GuardedDeleteUnsupported => StorageError::GuardedDeleteUnsupported,
             DiskError::RemoteClientUnavailable(detail) => StorageError::RemoteClientUnavailable(detail),
         }
     }
@@ -512,6 +523,8 @@ impl StorageError {
             StorageError::SourceStalled => DiskError::SourceStalled,
             StorageError::Timeout => DiskError::Timeout,
             StorageError::InvalidPath => DiskError::InvalidPath,
+            StorageError::ConditionalDeleteConflict => DiskError::ConditionalDeleteConflict,
+            StorageError::GuardedDeleteUnsupported => DiskError::GuardedDeleteUnsupported,
             StorageError::ErasureReadQuorum => DiskError::ErasureReadQuorum,
             StorageError::ErasureWriteQuorum => DiskError::ErasureWriteQuorum,
             StorageError::TooManyOpenFiles => DiskError::TooManyOpenFiles,
@@ -696,6 +709,7 @@ impl Clone for StorageError {
             StorageError::BucketExists(a) => StorageError::BucketExists(a.clone()),
             StorageError::StorageFull => StorageError::StorageFull,
             StorageError::SlowDown => StorageError::SlowDown,
+            StorageError::DeleteRecoveryLegacyAmbiguous => StorageError::DeleteRecoveryLegacyAmbiguous,
             StorageError::PrefixAccessDenied(a, b) => StorageError::PrefixAccessDenied(a.clone(), b.clone()),
             StorageError::InvalidUploadIDKeyCombination(a, b) => {
                 StorageError::InvalidUploadIDKeyCombination(a.clone(), b.clone())
@@ -758,6 +772,8 @@ impl Clone for StorageError {
             StorageError::InsufficientReadQuorum(a, b) => StorageError::InsufficientReadQuorum(a.clone(), b.clone()),
             StorageError::InsufficientWriteQuorum(a, b) => StorageError::InsufficientWriteQuorum(a.clone(), b.clone()),
             StorageError::PreconditionFailed => StorageError::PreconditionFailed,
+            StorageError::ConditionalDeleteConflict => StorageError::ConditionalDeleteConflict,
+            StorageError::GuardedDeleteUnsupported => StorageError::GuardedDeleteUnsupported,
             StorageError::NotModified => StorageError::NotModified,
             StorageError::InvalidPartNumber(a) => StorageError::InvalidPartNumber(*a),
             StorageError::InvalidRangeSpec(a) => StorageError::InvalidRangeSpec(a.clone()),
@@ -835,6 +851,7 @@ impl StorageError {
             StorageError::BucketExists(_) => StorageErrorCode::BucketExists,
             StorageError::StorageFull => StorageErrorCode::StorageFull,
             StorageError::SlowDown => StorageErrorCode::SlowDown,
+            StorageError::DeleteRecoveryLegacyAmbiguous => StorageErrorCode::DeleteRecoveryLegacyAmbiguous,
             StorageError::PrefixAccessDenied(_, _) => StorageErrorCode::PrefixAccessDenied,
             StorageError::InvalidUploadIDKeyCombination(_, _) => StorageErrorCode::InvalidUploadIDKeyCombination,
             StorageError::MalformedUploadID(_) => StorageErrorCode::MalformedUploadID,
@@ -871,6 +888,8 @@ impl StorageError {
             StorageError::InsufficientReadQuorum(_, _) => StorageErrorCode::InsufficientReadQuorum,
             StorageError::InsufficientWriteQuorum(_, _) => StorageErrorCode::InsufficientWriteQuorum,
             StorageError::PreconditionFailed => StorageErrorCode::PreconditionFailed,
+            StorageError::ConditionalDeleteConflict => StorageErrorCode::ConditionalDeleteConflict,
+            StorageError::GuardedDeleteUnsupported => StorageErrorCode::GuardedDeleteUnsupported,
             StorageError::EntityTooSmall(_, _, _) => StorageErrorCode::EntityTooSmall,
             StorageError::EntityTooLarge(_, _) => StorageErrorCode::EntityTooLarge,
             StorageError::InvalidRangeSpec(_) => StorageErrorCode::InvalidRangeSpec,
@@ -938,6 +957,7 @@ impl StorageError {
             StorageErrorCode::BucketExists => Some(StorageError::BucketExists(Default::default())),
             StorageErrorCode::StorageFull => Some(StorageError::StorageFull),
             StorageErrorCode::SlowDown => Some(StorageError::SlowDown),
+            StorageErrorCode::DeleteRecoveryLegacyAmbiguous => Some(StorageError::DeleteRecoveryLegacyAmbiguous),
             StorageErrorCode::PrefixAccessDenied => {
                 Some(StorageError::PrefixAccessDenied(Default::default(), Default::default()))
             }
@@ -992,6 +1012,8 @@ impl StorageError {
                 Some(StorageError::InsufficientWriteQuorum(Default::default(), Default::default()))
             }
             StorageErrorCode::PreconditionFailed => Some(StorageError::PreconditionFailed),
+            StorageErrorCode::ConditionalDeleteConflict => Some(StorageError::ConditionalDeleteConflict),
+            StorageErrorCode::GuardedDeleteUnsupported => Some(StorageError::GuardedDeleteUnsupported),
             StorageErrorCode::EntityTooSmall => {
                 Some(StorageError::EntityTooSmall(Default::default(), Default::default(), Default::default()))
             }

@@ -31,6 +31,7 @@ workspace = true
 
 [features]
 default = []
+diagnostic-read-version-caller = ["rustfs-io-metrics/diagnostic-read-version-caller"]
 gcs = ["dep:google-cloud-storage", "dep:google-cloud-auth"]
 # Compiles the controlled list-objects namespace-journal chaos injector into a
 # production binary (it is always available to tests). Off by default so the
@@ -183,6 +184,7 @@ sha2 = { workspace = true }
 hex-simd = { workspace = true }
 tempfile.workspace = true
 hyper = { workspace = true, features = ["http2", "http1", "server"] }
+h2 = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio", "server-auto", "server-graceful", "tracing"] }
 hyper-rustls = { workspace = true, default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs"] }
 hostname.workspace = true
@@ -200,8 +202,8 @@ md-5.workspace = true
 memmap2 = { workspace = true }
 libc.workspace = true
 # "process" adds getrlimit for the io_uring fd-cache RLIMIT_NOFILE gate
-# (backlog#1178); "fs" comes from the workspace default.
-rustix = { workspace = true, features = ["process", "fs"] }
+# (backlog#1178); "thread" provides cleanup affinity; "fs" is a workspace default.
+rustix = { workspace = true, features = ["process", "fs", "thread"] }
 rustfs-madmin.workspace = true
 reqwest = { workspace = true }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
@@ -248,6 +250,7 @@ windows-sys = { workspace = true, features = ["Win32_System_Ioctl"] }
 
 [dev-dependencies]
 aws-smithy-async.workspace = true
+rustfs-s3-ops.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "fs"] }
 criterion = { workspace = true, features = ["html_reports"] }
 temp-env = { workspace = true, features = ["async_closure"] }

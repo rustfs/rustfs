@@ -56,9 +56,10 @@ pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 pub(crate) const DATA_USAGE_CACHE_KEY_FORMAT: u16 = 1;
 
 const DATA_USAGE_CACHE_SAVE_RETRIES: u32 = 2;
-const DATA_USAGE_CACHE_BACKUP_SAVE_TIMEOUT_SECS_MAX: u64 = 5;
+const DATA_USAGE_CACHE_BACKUP_SAVE_TIMEOUT_SECS_BASE: u64 = 5;
 const DATA_USAGE_CACHE_BACKUP_SAVE_RETRIES: u32 = 0;
 const DATA_USAGE_CACHE_SAVE_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(350);
+const DATA_USAGE_CACHE_RECONCILE_BACKOFF_MAX: Duration = Duration::from_millis(150);
 const DATA_USAGE_CACHE_PERSISTENCE_MARGIN: Duration = Duration::from_secs(5);
 const METRIC_CACHE_SAVE_ATTEMPT_TOTAL: &str = "rustfs_scanner_cache_save_attempt_total";
 const METRIC_CACHE_SAVE_TIMEOUT_TOTAL: &str = "rustfs_scanner_cache_save_timeout_total";
@@ -100,19 +101,17 @@ pub(crate) async fn read_config_with_revision<S: ScannerObjectIO>(
     store: Arc<S>,
     path: &str,
 ) -> StorageResult<(Option<Vec<u8>>, DataUsageCacheRevision)> {
-    match store
-        .get_object_reader(
-            RUSTFS_META_BUCKET,
-            path,
-            None,
-            HeaderMap::new(),
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
-        )
-        .await
-    {
+    let opts = ObjectOptions {
+        no_lock: true,
+        ..Default::default()
+    };
+    let read = store.get_object_reader(RUSTFS_META_BUCKET, path, None, HeaderMap::new(), &opts);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let read = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+        crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::ScannerRevisionRead,
+        read,
+    );
+    match read.await {
         Ok(mut reader) => {
             let revision = reader
                 .object_info
@@ -170,19 +169,17 @@ fn error_chain_has_usage_floor_corruption_signature(error: &(dyn std::error::Err
 
 /// Read only the object revision without materializing its body.
 pub(crate) async fn read_config_revision<S: ScannerObjectIO>(store: Arc<S>, path: &str) -> StorageResult<DataUsageCacheRevision> {
-    match store
-        .get_object_reader(
-            RUSTFS_META_BUCKET,
-            path,
-            None,
-            HeaderMap::new(),
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
-        )
-        .await
-    {
+    let opts = ObjectOptions {
+        no_lock: true,
+        ..Default::default()
+    };
+    let read = store.get_object_reader(RUSTFS_META_BUCKET, path, None, HeaderMap::new(), &opts);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let read = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+        crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::ScannerRevisionRead,
+        read,
+    );
+    match read.await {
         Ok(reader) => reader
             .object_info
             .etag
@@ -516,6 +513,14 @@ impl Serialize for DataUsageScanCoverageReceipt {
         map.serialize_entry("digest", &self.digest)?;
         map.end()
     }
+}
+
+/// Coverage follows depth-first directory traversal, rather than raw path order.
+/// A completed subtree includes its descendants but never an unfinished ancestor.
+pub(crate) fn scan_frontier_covers_path(path: &str, frontier: &str) -> bool {
+    let ancestor = frontier.strip_prefix(path).is_some_and(|suffix| suffix.starts_with('/'));
+    let descendant = path.strip_prefix(frontier).is_some_and(|suffix| suffix.starts_with('/'));
+    (path.split('/').cmp(frontier.split('/')).is_le() && !ancestor) || descendant
 }
 
 struct CheckpointDigestWriter(Sha256);
@@ -895,6 +900,16 @@ impl DataUsageCache {
         }
     }
 
+    pub(crate) fn has_scan_position(&self) -> bool {
+        self.info.scan_resume_after.is_some()
+            || self.info.scan_checkpoint.is_some()
+            || self.info.scan_raw_enumeration_cursor.is_some()
+            || self.info.scan_raw_enumeration_page_index.is_some()
+            || self.info.scan_coverage_receipt.is_some()
+    }
+
+    /// Resume and reuse under one plan; fixtures that model a single digest.
+    #[cfg(test)]
     pub(crate) fn prepare_bucket_checkpoint(
         &mut self,
         name: &str,
@@ -904,12 +919,42 @@ impl DataUsageCache {
         scan_plan_digest: DataUsageScanPlanDigest,
         identity: DataUsageScanIdentity,
     ) -> DataUsageCachePrepareOutcome {
+        self.prepare_bucket_checkpoint_with_coverage(
+            name,
+            next_cycle,
+            leader_epoch,
+            source,
+            scan_plan_digest,
+            scan_plan_digest,
+            identity,
+        )
+    }
+
+    /// `scan_plan_digest` is the reuse plan a complete cache is current under;
+    /// `checkpoint_plan_digest` is the coverage plan a sweep is started and
+    /// resumed under (`scanner_activity_coverage_digest`). The two differ by
+    /// the inputs that force a new walk without changing the namespace a
+    /// walk traverses, so a coordinator restart invalidates finished results
+    /// but not a sweep in progress.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_bucket_checkpoint_with_coverage(
+        &mut self,
+        name: &str,
+        next_cycle: u64,
+        leader_epoch: u64,
+        source: DataUsageCacheSource,
+        scan_plan_digest: DataUsageScanPlanDigest,
+        checkpoint_plan_digest: DataUsageScanPlanDigest,
+        identity: DataUsageScanIdentity,
+    ) -> DataUsageCachePrepareOutcome {
         if self.info.next_cycle > next_cycle {
             return DataUsageCachePrepareOutcome::RejectedNewerCycle;
         }
         if self.info.leader_epoch > leader_epoch {
             return DataUsageCachePrepareOutcome::RejectedNewerLeader;
         }
+        let previous_cycle = self.info.next_cycle;
+        let previous_leader_epoch = self.info.leader_epoch;
         // A checkpoint is a durable traversal frontier, not a publication
         // result.  A newer leader may adopt it only when the frontier is
         // independently fenced by the bucket identity and has a validated
@@ -938,22 +983,13 @@ impl DataUsageCache {
         if reusable
             && self.info.snapshot_complete
             && self.info.scan_progress.is_none()
-            && self.info.scan_checkpoint.is_none()
-            && self.info.scan_raw_enumeration_cursor.is_none()
-            && self.info.scan_raw_enumeration_page_index.is_none()
-            && self.info.scan_resume_after.is_none()
-            && self.info.scan_coverage_receipt.is_none()
+            && !self.has_scan_position()
             && self.info.scan_plan_digest == Some(scan_plan_digest)
         {
             return self.prepare_for_scan(name, next_cycle, leader_epoch, source, scan_plan_digest, true);
         }
         if !reusable {
-            let had_resume_state = self.info.scan_checkpoint.is_some()
-                || self.info.scan_resume_after.is_some()
-                || self.info.scan_coverage_receipt.is_some()
-                || self.info.scan_raw_enumeration_cursor.is_some()
-                || self.info.scan_raw_enumeration_page_index.is_some();
-            if had_resume_state {
+            if self.has_scan_position() {
                 let reason = if name == DATA_USAGE_ROOT {
                     "invalid_bucket_scope"
                 } else if !identity.is_valid() {
@@ -1007,11 +1043,7 @@ impl DataUsageCache {
         if self.validated_raw_enumeration_page_index().is_none() {
             self.info.scan_raw_enumeration_page_index = None;
         }
-        let cursor_is_valid = (self.info.scan_checkpoint.is_none()
-            && self.info.scan_raw_enumeration_cursor.is_none()
-            && self.info.scan_raw_enumeration_page_index.is_none()
-            && self.info.scan_resume_after.is_none()
-            && self.info.scan_coverage_receipt.is_none())
+        let cursor_is_valid = !self.has_scan_position()
             || self.validated_scan_frontier().is_some()
             || self.info.scan_raw_enumeration_cursor.is_some()
             || self.info.scan_raw_enumeration_page_index.is_some();
@@ -1039,19 +1071,15 @@ impl DataUsageCache {
         // so it observes nothing under the plan that finished the previous
         // sweep. Keeping that plan would mark every sweep of a bucket written
         // between cycles as mixed, and the bucket could never certify.
-        let has_position = self.info.scan_resume_after.is_some()
-            || self.info.scan_checkpoint.is_some()
-            || self.info.scan_raw_enumeration_cursor.is_some()
-            || self.info.scan_raw_enumeration_page_index.is_some()
-            || self.info.scan_coverage_receipt.is_some();
+        let has_position = self.has_scan_position();
         if let Some(progress) = &mut self.info.scan_progress
             && has_position
         {
-            progress.requested_plan = scan_plan_digest;
+            progress.requested_plan = checkpoint_plan_digest;
         } else {
             self.info.scan_progress = Some(DataUsageScanProgress {
-                started_plan: scan_plan_digest,
-                requested_plan: scan_plan_digest,
+                started_plan: checkpoint_plan_digest,
+                requested_plan: checkpoint_plan_digest,
             });
             self.info.scan_resume_after = None;
             self.info.scan_checkpoint = None;
@@ -1062,6 +1090,23 @@ impl DataUsageCache {
         // Old readers do not understand coverage sweeps. An absent plan makes
         // their existing prepare path rebuild instead of promoting mixed data.
         self.info.scan_plan_digest = None;
+        debug!(
+            target: "rustfs::scanner::data_usage",
+            event = EVENT_SCANNER_CACHE_LOAD_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_CACHE,
+            state = "bucket_checkpoint_prepared",
+            bucket = %name,
+            pool = source.pool_index,
+            set = source.set_index,
+            cycle = next_cycle,
+            leader_epoch,
+            previous_cycle,
+            previous_leader_epoch,
+            resume_position = self.has_scan_position(),
+            mixed_coverage = self.info.scan_progress.is_some_and(|progress| progress.started_plan != progress.requested_plan),
+            "Scanner bucket checkpoint prepared for a coverage sweep"
+        );
         if reusable {
             DataUsageCachePrepareOutcome::Reused
         } else {
@@ -1070,17 +1115,22 @@ impl DataUsageCache {
     }
 
     fn coverage_prefix_digest(&self, through: &str) -> Result<[u8; 32], serde_json::Error> {
-        self.coverage_prefix_digest_with_epoch(through, None)
+        self.coverage_prefix_digest_with_epoch(through, None, 3)
+    }
+
+    fn v2_coverage_prefix_digest(&self, through: &str) -> Result<[u8; 32], serde_json::Error> {
+        self.coverage_prefix_digest_with_epoch(through, None, 2)
     }
 
     fn legacy_coverage_prefix_digest(&self, through: &str) -> Result<[u8; 32], serde_json::Error> {
-        self.coverage_prefix_digest_with_epoch(through, Some(self.info.leader_epoch))
+        self.coverage_prefix_digest_with_epoch(through, Some(self.info.leader_epoch), 0)
     }
 
     fn coverage_prefix_digest_with_epoch(
         &self,
         through: &str,
         legacy_leader_epoch: Option<u64>,
+        domain_version: u8,
     ) -> Result<[u8; 32], serde_json::Error> {
         let mut writer = CheckpointDigestWriter(Sha256::new());
         if let Some(leader_epoch) = legacy_leader_epoch {
@@ -1104,10 +1154,12 @@ impl DataUsageCache {
             // process-local leader epoch is intentionally excluded because it
             // changes during a safe handoff.  The domain version also keeps
             // old epoch-bound receipts from colliding with this digest.
+            // Domain 3 permits object-health debt behind the frontier. Older
+            // readers must reject it because they skip covered failures.
             serde_json::to_writer(
                 &mut writer,
                 &(
-                    2u8,
+                    domain_version,
                     &self.info.name,
                     self.info.scan_identity,
                     self.info.source,
@@ -1121,6 +1173,11 @@ impl DataUsageCache {
             .cache
             .iter()
             .filter(|(key, _)| {
+                // Sign exactly the subtrees the reader can reuse, including
+                // descendants whose raw path order differs from traversal order.
+                if legacy_leader_epoch.is_none() && domain_version >= 3 {
+                    return scan_frontier_covers_path(key, through);
+                }
                 let ancestor = through
                     .strip_prefix(key.as_str())
                     .is_some_and(|suffix| suffix.starts_with('/'));
@@ -1156,6 +1213,7 @@ impl DataUsageCache {
                 .is_some_and(|suffix| suffix.starts_with('/'))
             && self.find(&receipt.through).is_some()
             && (self.coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest)
+                || self.v2_coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest)
                 || self.legacy_coverage_prefix_digest(&receipt.through).ok() == Some(receipt.digest)))
         .then_some(receipt.through.as_str())
     }

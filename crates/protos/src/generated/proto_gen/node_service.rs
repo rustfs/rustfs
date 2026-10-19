@@ -785,6 +785,18 @@ pub struct DeleteVersionsRequest {
     #[prost(bytes = "bytes", tag = "6")]
     pub opts_bin: ::prost::bytes::Bytes,
 }
+/// Additive, fail-closed conditional batch protocol. Probe requests never mutate disk state.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GuardedDeleteVersionsRequest {
+    #[prost(string, tag = "1")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub volume: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub payload: ::prost::bytes::Bytes,
+    #[prost(bool, tag = "4")]
+    pub probe_only: bool,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeleteVersionsResponse {
     #[prost(bool, tag = "1")]
@@ -1494,6 +1506,41 @@ pub struct ReplacementRecoveryStatusResponse {
     #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "4")]
     pub error_code: ::core::option::Option<i32>,
 }
+/// Asks a peer how it currently sees the drives served by `host`, so a
+/// restarting node can wait for re-admission before publishing readiness.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PeerDriveAdmissionRequest {
+    /// Topology host:port of the drives' owner, as written in the endpoint list.
+    #[prost(string, tag = "1")]
+    pub host: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PeerDriveAdmission {
+    #[prost(int32, tag = "1")]
+    pub pool_index: i32,
+    #[prost(int32, tag = "2")]
+    pub set_index: i32,
+    #[prost(int32, tag = "3")]
+    pub disk_index: i32,
+    /// True only when the peer would count this drive towards its own read quorum.
+    #[prost(bool, tag = "4")]
+    pub online: bool,
+    #[prost(string, tag = "5")]
+    pub runtime_state: ::prost::alloc::string::String,
+    #[prost(bool, tag = "6")]
+    pub host_online: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PeerDriveAdmissionResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(message, repeated, tag = "2")]
+    pub drives: ::prost::alloc::vec::Vec<PeerDriveAdmission>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "4")]
+    pub error_code: ::core::option::Option<i32>,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HealControlRequest {
     #[prost(uint32, tag = "1")]
@@ -2135,6 +2182,21 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "AcquireSnapshotLease"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn acquire_quota_mutation_fence(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SnapshotLeaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::SnapshotLeaseResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/AcquireQuotaMutationFence");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "AcquireQuotaMutationFence"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn renew_snapshot_lease(
             &mut self,
             request: impl tonic::IntoRequest<super::SnapshotLeaseRenewRequest>,
@@ -2163,6 +2225,21 @@ pub mod node_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("node_service.NodeService", "ReleaseSnapshotLease"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn release_quota_mutation_fence(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SnapshotLeaseReleaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::SnapshotLeaseMutationResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/ReleaseQuotaMutationFence");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "ReleaseQuotaMutationFence"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn verify_file(
@@ -2374,6 +2451,21 @@ pub mod node_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("node_service.NodeService", "RenameDataAtIncarnation"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn rename_data_with_quota_fence(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RenameDataRequest>,
+        ) -> std::result::Result<tonic::Response<super::RenameDataResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/RenameDataWithQuotaFence");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "RenameDataWithQuotaFence"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn make_volumes(
@@ -2614,6 +2706,21 @@ pub mod node_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("node_service.NodeService", "DeleteVersions"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn guarded_delete_versions(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GuardedDeleteVersionsRequest>,
+        ) -> std::result::Result<tonic::Response<super::DeleteVersionsResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/GuardedDeleteVersions");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "GuardedDeleteVersions"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn read_multiple(
@@ -3278,6 +3385,21 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "ReplacementRecoveryStatus"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn peer_drive_admission(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PeerDriveAdmissionRequest>,
+        ) -> std::result::Result<tonic::Response<super::PeerDriveAdmissionResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/PeerDriveAdmission");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "PeerDriveAdmission"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn get_metacache_listing(
             &mut self,
             request: impl tonic::IntoRequest<super::GetMetacacheListingRequest>,
@@ -3509,11 +3631,19 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::SnapshotLeaseRequest>,
         ) -> std::result::Result<tonic::Response<super::SnapshotLeaseResponse>, tonic::Status>;
+        async fn acquire_quota_mutation_fence(
+            &self,
+            request: tonic::Request<super::SnapshotLeaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::SnapshotLeaseResponse>, tonic::Status>;
         async fn renew_snapshot_lease(
             &self,
             request: tonic::Request<super::SnapshotLeaseRenewRequest>,
         ) -> std::result::Result<tonic::Response<super::SnapshotLeaseResponse>, tonic::Status>;
         async fn release_snapshot_lease(
+            &self,
+            request: tonic::Request<super::SnapshotLeaseReleaseRequest>,
+        ) -> std::result::Result<tonic::Response<super::SnapshotLeaseMutationResponse>, tonic::Status>;
+        async fn release_quota_mutation_fence(
             &self,
             request: tonic::Request<super::SnapshotLeaseReleaseRequest>,
         ) -> std::result::Result<tonic::Response<super::SnapshotLeaseMutationResponse>, tonic::Status>;
@@ -3586,6 +3716,10 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::RenameDataRequest>,
         ) -> std::result::Result<tonic::Response<super::RenameDataResponse>, tonic::Status>;
+        async fn rename_data_with_quota_fence(
+            &self,
+            request: tonic::Request<super::RenameDataRequest>,
+        ) -> std::result::Result<tonic::Response<super::RenameDataResponse>, tonic::Status>;
         async fn make_volumes(
             &self,
             request: tonic::Request<super::MakeVolumesRequest>,
@@ -3649,6 +3783,10 @@ pub mod node_service_server {
         async fn delete_versions(
             &self,
             request: tonic::Request<super::DeleteVersionsRequest>,
+        ) -> std::result::Result<tonic::Response<super::DeleteVersionsResponse>, tonic::Status>;
+        async fn guarded_delete_versions(
+            &self,
+            request: tonic::Request<super::GuardedDeleteVersionsRequest>,
         ) -> std::result::Result<tonic::Response<super::DeleteVersionsResponse>, tonic::Status>;
         async fn read_multiple(
             &self,
@@ -3828,6 +3966,10 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::ReplacementRecoveryStatusRequest>,
         ) -> std::result::Result<tonic::Response<super::ReplacementRecoveryStatusResponse>, tonic::Status>;
+        async fn peer_drive_admission(
+            &self,
+            request: tonic::Request<super::PeerDriveAdmissionRequest>,
+        ) -> std::result::Result<tonic::Response<super::PeerDriveAdmissionResponse>, tonic::Status>;
         async fn get_metacache_listing(
             &self,
             request: tonic::Request<super::GetMetacacheListingRequest>,
@@ -4335,6 +4477,34 @@ pub mod node_service_server {
                     };
                     Box::pin(fut)
                 }
+                "/node_service.NodeService/AcquireQuotaMutationFence" => {
+                    #[allow(non_camel_case_types)]
+                    struct AcquireQuotaMutationFenceSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::SnapshotLeaseRequest> for AcquireQuotaMutationFenceSvc<T> {
+                        type Response = super::SnapshotLeaseResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::SnapshotLeaseRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::acquire_quota_mutation_fence(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AcquireQuotaMutationFenceSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/node_service.NodeService/RenewSnapshotLease" => {
                     #[allow(non_camel_case_types)]
                     struct RenewSnapshotLeaseSvc<T: NodeService>(pub Arc<T>);
@@ -4382,6 +4552,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ReleaseSnapshotLeaseSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/ReleaseQuotaMutationFence" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReleaseQuotaMutationFenceSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::SnapshotLeaseReleaseRequest> for ReleaseQuotaMutationFenceSvc<T> {
+                        type Response = super::SnapshotLeaseMutationResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::SnapshotLeaseReleaseRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::release_quota_mutation_fence(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReleaseQuotaMutationFenceSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)
@@ -4777,6 +4975,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = RenameDataAtIncarnationSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/RenameDataWithQuotaFence" => {
+                    #[allow(non_camel_case_types)]
+                    struct RenameDataWithQuotaFenceSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::RenameDataRequest> for RenameDataWithQuotaFenceSvc<T> {
+                        type Response = super::RenameDataResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::RenameDataRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::rename_data_with_quota_fence(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RenameDataWithQuotaFenceSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)
@@ -5225,6 +5451,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = DeleteVersionsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/GuardedDeleteVersions" => {
+                    #[allow(non_camel_case_types)]
+                    struct GuardedDeleteVersionsSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::GuardedDeleteVersionsRequest> for GuardedDeleteVersionsSvc<T> {
+                        type Response = super::DeleteVersionsResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::GuardedDeleteVersionsRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::guarded_delete_versions(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GuardedDeleteVersionsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)
@@ -6464,6 +6718,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ReplacementRecoveryStatusSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/PeerDriveAdmission" => {
+                    #[allow(non_camel_case_types)]
+                    struct PeerDriveAdmissionSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::PeerDriveAdmissionRequest> for PeerDriveAdmissionSvc<T> {
+                        type Response = super::PeerDriveAdmissionResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::PeerDriveAdmissionRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::peer_drive_admission(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PeerDriveAdmissionSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

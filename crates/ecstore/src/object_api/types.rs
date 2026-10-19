@@ -898,6 +898,10 @@ pub enum WriteCompletion {
     /// Drain the rename fan-out before returning. Minority failures still heal
     /// after a successful quorum commit; this does not require every disk to succeed.
     TailDrained,
+    /// Drain the rename fan-out and return system-metadata repair to the
+    /// caller's existing deployment/transaction owner. This does not grant
+    /// write or heal authority and does not change the quorum requirement.
+    TailDrainedWithOwnerRepair,
 }
 
 /// Storage-owned write mode inherited by physical rewrites. This selects the
@@ -922,6 +926,10 @@ pub struct ObjectOptions {
     /// Lifecycle-only staged purge request checked under the object write lock.
     #[doc(hidden)]
     pub lifecycle_delete_all: Option<LifecycleDeleteAllRequest>,
+    /// Policy observed by lifecycle evaluation, checked under the metadata
+    /// transaction lock before logical deletion. Not persisted or sent over RPC.
+    #[doc(hidden)]
+    pub lifecycle_expiry_policy: Option<rustfs_lifecycle::ExpiryPolicySnapshot>,
     #[doc(hidden)]
     pub lifecycle_delete_all_journal: Option<Arc<parking_lot::Mutex<LifecycleDeleteAllJournalState>>>,
     /// Whole-operation authorization created only by consuming a validated
@@ -942,6 +950,11 @@ pub struct ObjectOptions {
     /// serialized or copied into object metadata.
     #[doc(hidden)]
     pub delete_mutation_owner: Option<Arc<dyn Send + Sync>>,
+    /// Pool-local generations for admitted current-object conditional actions.
+    /// Ordinary actions execute in a separate phase without this transient map.
+    /// This must never be populated from client metadata.
+    #[doc(hidden)]
+    pub conditional_delete_generations: Option<Arc<HashMap<String, crate::disk::CurrentDeleteGeneration>>>,
     /// Internal read-only inspection must not enqueue metadata or payload repairs.
     pub suppress_read_repair: bool,
     /// Control-plane writers that immediately read or CAS the same namespace
@@ -1006,6 +1019,9 @@ pub struct ObjectOptions {
     /// Proves an upper layer holds the bucket lifecycle sentinel. A separate
     /// fence avoids recursively acquiring the read lock behind a queued writer.
     pub bucket_lifecycle_lock_fence: Option<NamespaceLockFence>,
+    /// Retains the actual lifecycle guard for an owned multipart commit. A
+    /// lock-loss fence alone does not keep a cancelled caller's lock alive.
+    pub bucket_lifecycle_lock_owner: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
     pub replication_request: bool,
     /// True when the inbound request carried the
     /// `{x-rustfs-,x-minio-}source-proxy-request` header family with the
@@ -1163,8 +1179,10 @@ impl std::fmt::Debug for ObjectOptions {
             .field("delete_replication", &self.delete_replication.is_some())
             .field("delete_replication_config_snapshot", &self.delete_replication_config_snapshot)
             .field("delete_mutation_owner", &self.delete_mutation_owner.is_some())
+            .field("conditional_delete_generations", &self.conditional_delete_generations.is_some())
             .field("namespace_lock_fence", &self.namespace_lock_fence.is_some())
             .field("bucket_lifecycle_lock_fence", &self.bucket_lifecycle_lock_fence.is_some())
+            .field("bucket_lifecycle_lock_owner", &self.bucket_lifecycle_lock_owner.is_some())
             .field("replication_request", &self.replication_request)
             .field("proxy_request", &self.proxy_request)
             .field("proxy_header_set", &self.proxy_header_set)

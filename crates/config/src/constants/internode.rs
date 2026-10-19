@@ -242,7 +242,7 @@ const _: () = assert!(!DEFAULT_INTERNODE_OFFLINE_BYPASS);
 /// read-after-write window can erode the read quorum and surface as a spurious
 /// `InsufficientReadQuorum` (issue #2761). One bounded retry absorbs that transient failure.
 /// **Only** idempotent reads use this; write/lock RPCs (`WriteAll`/`RenameData`/`Delete*`/`Lock`
-/// /`UnLock`) must never auto-retry, to preserve quorum and idempotency semantics (see `CLAUDE.md`).
+/// /`UnLock`) must never auto-retry, to preserve quorum and idempotency semantics (see `AGENTS.md`).
 pub const ENV_INTERNODE_IDEMPOTENT_READ_RETRIES: &str = "RUSTFS_INTERNODE_IDEMPOTENT_READ_RETRIES";
 pub const DEFAULT_INTERNODE_IDEMPOTENT_READ_RETRIES: usize = 1;
 

@@ -18,6 +18,8 @@ DEFAULT_ICEBERG_VERSION = "1.7.1"
 DEFAULT_SCALA_VERSION = "2.12"
 DEFAULT_TRINO_VERSION = "477"
 DEFAULT_DUCKDB_VERSION = "1.5.5"
+PYICEBERG_BACKING_SCENARIO = "create-append-reload-scan-backing-contracts-v2"
+PYICEBERG_CORE_SCENARIO = "create-append-reload-scan-core"
 DEFAULT_SNOWFLAKE_CLIENT_VERSION = "operator-recorded"
 DEFAULT_DATABEND_VERSION = "operator-recorded"
 DEFAULT_TRINO_SERVER = "http://127.0.0.1:8080"
@@ -738,6 +740,21 @@ def live_conformance_evidence(
     )
 
 
+def pyiceberg_catalog_probe_results(backing: str, *, skipped: bool, vended: bool) -> dict[str, str]:
+    if backing not in {"object", "durable-strong"}:
+        raise ValueError("PyIceberg probe evidence requires an observed RustFS backing")
+    if skipped:
+        return {"direct-rest": "skipped"}
+    probes = dict.fromkeys(("metadata-location", "refs", "views-and-namespace-properties", "rename", "load-table-delegation"), "pass")
+    probes["load-table-vended-credentials"] = "pass" if vended else "skipped"
+    probes.update(dict.fromkeys((
+        "maintenance-config", "maintenance-scheduler", "maintenance-worker-dry-run",
+        "maintenance-job", "maintenance-quarantine-inspect", "diagnostics", "export",
+    ), "pass"))
+    probes["metadata-maintenance"] = "expected-unsupported" if backing == "durable-strong" else "pass"
+    return probes
+
+
 def live_conformance_evidence_schema() -> OrderedDict[str, Any]:
     return OrderedDict(
         [
@@ -878,6 +895,18 @@ def validate_live_conformance_evidence(record: dict[str, Any]) -> OrderedDict[st
         raise ValueError("live conformance evidence row_count must be a non-negative integer")
     if expected_status == "pass" and client_name in LIVE_EVIDENCE_ROW_COUNT_CLIENTS and row_count != 2:
         raise ValueError("live conformance evidence row_count must be 2 for successful table smoke/read probes")
+
+    if client_name == "PyIceberg" and record["scenario"] in {PYICEBERG_CORE_SCENARIO, PYICEBERG_BACKING_SCENARIO}:
+        vended = record.get("credential_vending_required")
+        if not isinstance(vended, bool):
+            raise ValueError("PyIceberg probe evidence requires the credential negotiation mode")
+        expected_probes = pyiceberg_catalog_probe_results(
+            record["catalog_backing"], skipped=record["scenario"] == PYICEBERG_CORE_SCENARIO, vended=vended
+        )
+        if record.get("catalog_probes") != expected_probes:
+            raise ValueError("PyIceberg probe evidence does not match the scenario and backing capabilities")
+        if record.get("rest_signing_name") not in {"s3", "s3tables"}:
+            raise ValueError("PyIceberg probe evidence requires the REST signing name")
 
     return OrderedDict(
         [

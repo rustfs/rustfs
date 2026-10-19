@@ -21,7 +21,7 @@ use crate::{
     startup_iam::{IamBootstrapDisposition, publish_ready_for_iam_bootstrap},
     startup_runtime_sources,
     startup_services::StartupServiceRuntime,
-    startup_shutdown::run_startup_shutdown_sequence,
+    startup_shutdown::{StartupBackgroundTasks, run_startup_shutdown_sequence},
 };
 use rustfs_common::GlobalReadiness;
 use rustfs_object_capacity::capacity_manager::CapacityBackgroundTasks;
@@ -130,6 +130,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         readiness,
     } = lifecycle;
     let StartupServiceRuntime {
+        table_maintenance,
         oidc_recovery,
         optional_runtimes,
         heartbeat,
@@ -163,7 +164,10 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         s3_shutdown_tx,
         console_shutdown_tx,
         optional_runtimes,
-        capacity_tasks,
+        StartupBackgroundTasks {
+            capacity: capacity_tasks,
+            table_maintenance,
+        },
         shutdown_token,
     )
     .await;

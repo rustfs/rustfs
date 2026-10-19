@@ -38,7 +38,7 @@ RustFS S3 Tables is an Iceberg REST Catalog and table-bucket implementation on t
 
 | Client or engine | Status | Claim |
 |---|---|---|
-| PyIceberg | Automated | Namespace and table create, append, reload, scan, metadata-location, refs, views, maintenance, diagnostics, optional vended credentials with an exact-prefix data-plane scope check. |
+| PyIceberg | Automated | Namespace and table create, append, exact-row reload/scan, metadata-location, refs, views, namespace properties, rename identity and credential negotiation. The smoke discovers the server backing and checks maintenance configuration, scheduler/worker dry-run, diagnostics and export on both backings. Direct metadata maintenance is checked as unsupported on durable-strong. Optional vended credentials include an exact-prefix data-plane scope check. |
 | Spark Iceberg REST catalog | Manual/live harness | Pinned package inputs, catalog properties, atomic CTAS SQL through staged create, expected `row_count=2`, and a CI opt-in gate for create/refresh/count/cleanup. Live execution and commit-conflict probing remain manual unless enabled in the runner. |
 | Trino Iceberg REST catalog | Manual/live harness | Catalog properties and a read-only `SELECT COUNT(*)` against a PyIceberg- or Spark-created table. Write compatibility not claimed. |
 | DuckDB Iceberg 1.5.5 | Automated | `duckdb_smoke.py` covers metadata-location read, single-table create/insert/update/delete/merge, schema evolution, snapshots, concurrent writers, drop, PyIceberg cross-read, and both signing profiles. Purge-on-drop and format v3 are verified fail-closed. Two-table mode runs without claiming cross-table atomicity. AWS `ENDPOINT_TYPE S3_TABLES`, staged-create client integration, and vended-credential integration are not claimed. |
@@ -87,6 +87,42 @@ RustFS S3 Tables is an Iceberg REST Catalog and table-bucket implementation on t
 
 ## Maintenance Matrix
 
+Object-backed and durable-strong catalogs support the configuration, scheduler,
+worker, job inspection, heartbeat, and quarantine endpoints. Durable-strong
+maintenance resolves table identity from the authoritative catalog snapshot;
+recoverable job and configuration records remain separate objects. The worker
+performs metadata and unreferenced-object cleanup without changing the catalog
+pointer. The direct `/maintenance/metadata` endpoint, including snapshot
+expiration and compaction plan/commit, remains object-backed only. A configured
+`background-enabled` table still requires explicit worker ticks. The standalone
+server has opt-in, allowlisted periodic queue admission; see the
+[scheduler runbook](../operations/s3-tables-maintenance-scheduler.md).
+
+Renamed tables retain their original metadata paths. Durable-strong scheduling
+and cleanup fail closed with a conflict if another table shares a scanned
+metadata or warehouse directory, including a recreated source name after rename.
+Such tables require disjoint cleanup roots before maintenance can run; enabling
+deletion does not override this ownership check.
+
+Durable-strong rename preserves maintenance configuration, job identifiers,
+current/latest aliases, history, audit events, and quarantine state. A persisted
+rename intent protects sidecar migration across interruption: the source remains
+authoritative until the catalog CAS succeeds, and the destination records are
+ready before publication. Retry the same rename to finish pending recovery.
+Backup, restore, register, drop, and subsequent rename operations recover a
+pending migration before proceeding. Complete pending rename recovery before
+rolling back to a version that does not understand maintenance migration intents.
+
+Durable-strong scheduler reports read an observational history set, not an atomic
+snapshot of all maintenance jobs. They fix at most 4096 history-object names
+under the publication read fence, scan those objects outside the fence, and
+refresh the selected 10-job audit window, effective configuration, and current
+job under a final read fence. Exceeding the history budget fails closed with an
+unavailable response; retrying does not remove that size limit. A listed object
+that disappears during the scan also returns unavailable; retry after concurrent
+rename or maintenance activity has settled. No history object is silently omitted
+when a rename removes its old path.
+
 | Capability | Status | Claim |
 |---|---|---|
 | Metadata retention dry-run | Supported | Reports retained metadata and deletion candidates without moving the pointer. |
@@ -103,7 +139,7 @@ RustFS S3 Tables is an Iceberg REST Catalog and table-bucket implementation on t
 | Compaction planning | Preview / controlled | Partition-local and sort-order-local binpack candidates for Parquet; never mixes partitions or sort orders in one group. |
 | Delete-file or row-level compaction planning | Preview / controlled | Position or equality delete files force machine-readable planning into manual review. |
 | Compaction commit | Preview / controlled | Commits a safe partition-local Parquet rewrite preserving sort order IDs. |
-| Built-in periodic scheduler | Not claimed | Ticks are operator-triggered; no continuous in-process scheduling. |
+| Built-in periodic scheduler | Preview / queue-only | Default off; allowlisted, paged admission with jitter, per-pass quotas, current-job checks, and cooperative drain. Workers and failed/expired-job recovery remain operator-triggered; no automatic execution or hard per-table I/O deadline. |
 | Delete-file or row-level compaction execution | Not claimed | Manual-review maintenance item. |
 
 ## Recovery And Strong Backing Matrix
@@ -133,7 +169,7 @@ Do not promote a failure case from live probe or load test to an automated claim
 
 ## Unsupported Or Not Claimed
 
-Full AWS S3 Tables control-plane parity; full MinIO AIStor private extensions; full Cloudflare R2 Data Catalog or Alibaba OSS Tables interoperability; built-in periodic maintenance scheduling; active-active multi-region writes; multi-table transactions; no-long-term-data-credential bootstrap; online vendor SDK polling; external catalog policy mirroring; delete-file rewrite or row-level compaction execution; built-in SQL execution; Delta Lake or Hudi; end-to-end SQL row-level DML validation through Spark, Trino, or another engine.
+Full AWS S3 Tables control-plane parity; full MinIO AIStor private extensions; full Cloudflare R2 Data Catalog or Alibaba OSS Tables interoperability; automatic maintenance execution and failed/expired-job recovery; durable-strong snapshot-expiration and compaction plan/commit; active-active multi-region writes; multi-table transactions; no-long-term-data-credential bootstrap; online vendor SDK polling; external catalog policy mirroring; delete-file rewrite or row-level compaction execution; built-in SQL execution; Delta Lake or Hudi; end-to-end SQL row-level DML validation through Spark or Trino. DuckDB single-table UPDATE/DELETE/MERGE has its own automated smoke coverage as listed above; this does not establish other engines' DML compatibility.
 
 ## Verification
 

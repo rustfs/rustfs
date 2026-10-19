@@ -77,6 +77,8 @@ where
         service_cohort: None,
         #[cfg(test)]
         resolved_scope_observer: None,
+        #[cfg(test)]
+        post_walk_gate: None,
     };
     nsscanner_with_storage_status_scoped(store, request).await
 }
@@ -96,6 +98,11 @@ pub(crate) struct ScannerCycleRequest {
     pub(crate) service_cohort: Option<Arc<StdMutex<ScannerServiceCohort>>>,
     #[cfg(test)]
     pub(crate) resolved_scope_observer: Option<tokio::sync::oneshot::Sender<ScannerBucketScanScope>>,
+    /// Holds the post-walk guardrail probe until the test releases it, so a
+    /// write issued after `resolved_scope_observer` fired is ordered before
+    /// certification regardless of how fast the walk finishes.
+    #[cfg(test)]
+    pub(crate) post_walk_gate: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 pub(super) struct ScannerBucketScopeResolution<'a> {
@@ -287,6 +294,8 @@ where
         service_cohort,
         #[cfg(test)]
         resolved_scope_observer,
+        #[cfg(test)]
+        post_walk_gate,
     } = request;
     let child_token = ctx.child_token();
     let _tier_cycle_guard = begin_tier_registry_cycle(want_cycle, leader_epoch);
@@ -325,7 +334,7 @@ where
 
     let distributed = store.setup_is_dist_erasure().await;
     let activity_before = match scanner_activity_preflight(crate::scanner::probe_scanner_activity(store, distributed).await) {
-        ScannerActivityPreflight::Ready(snapshot) => snapshot,
+        ScannerActivityPreflight::Ready(snapshot) => Arc::new(snapshot),
         ScannerActivityPreflight::ActivityBaselineUnavailable(err) => {
             warn!(
                 target: "rustfs::scanner::io",
@@ -388,6 +397,8 @@ where
     let scan_plan_digest = scanner_bucket_work_digest(structural_scan_plan_digest, scan_mode, requires_full_scan);
     let activity_digest = crate::scanner::scanner_activity_snapshot_digest(&activity_before);
     let bucket_coverage_digest = scanner_bucket_plan_digest(&all_buckets, activity_digest);
+    let checkpoint_coverage_digest =
+        scanner_bucket_plan_digest(&all_buckets, crate::scanner::scanner_activity_coverage_digest(&activity_before));
     let execution_digest = scanner_bucket_work_digest(bucket_coverage_digest, scan_mode, requires_full_scan);
     let dirty_usage_snapshot = Arc::new(snapshot_dirty_usage_buckets(&all_buckets, dirty_generation_before_bucket_list));
     let scope_resolution = resolve_scanner_bucket_scan_scope(
@@ -442,6 +453,11 @@ where
             dirty_usage_status,
             activity_status,
         );
+        let pending_buckets = if status == ScannerCycleStatus::Complete {
+            pending_dirty_usage_buckets(&dirty_usage_snapshot.buckets)
+        } else {
+            ScannerCyclePendingBuckets::new()
+        };
         let Some(candidate) = empty_namespace_usage_candidate(
             &all_buckets,
             &expected_sources,
@@ -456,13 +472,13 @@ where
         ) else {
             return Ok(ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None).with_publication_epoch(publication_epoch));
         };
-        let (empty_usage, publication_expectation) = candidate.prepare(status);
-        let observational_snapshot_published = if should_publish_observational_snapshot(status) {
+        let (empty_usage, publication_expectation) = candidate.prepare(status, &pending_buckets);
+        let usage_update_emitted = if should_publish_observational_snapshot(status) {
             publish_observational_snapshot(&updates, empty_usage).await?
         } else {
-            publish_usage_snapshot(&updates, status, empty_usage).await?
+            publish_usage_snapshot(&updates, status, &pending_buckets, empty_usage).await?
         };
-        if !observational_snapshot_published {
+        if !usage_update_emitted {
             return Ok(ScannerCycleResult::new(status, None).with_publication_epoch(publication_epoch));
         }
         if status == ScannerCycleStatus::Complete {
@@ -484,7 +500,9 @@ where
         return Ok(ScannerCycleResult::new(status, dirty_usage_clear)
             .with_publication_epoch(publication_epoch)
             .with_activity_digest(activity_digest)
-            .with_observational_snapshot_published(observational_snapshot_published)
+            .with_activity_baseline(activity_before)
+            .with_pending_dirty_usage_buckets(pending_buckets.len())
+            .with_usage_update_emitted(usage_update_emitted)
             .with_remote_publication_lease_targets(remote_publication_lease_targets)
             .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
             .with_segment_reuse_activation_preflight(segment_reuse_activation_preflight)
@@ -597,6 +615,7 @@ where
             scope: scan_scope.clone(),
             digest: structural_scan_plan_digest,
             bucket_coverage_digest,
+            checkpoint_coverage_digest,
             requires_full_scan,
             service_cohort: service_cohort.clone(),
             execution_digest,
@@ -698,19 +717,27 @@ where
     record_set_scan_concurrency_limit(0);
     record_set_scans_queued(0);
     record_set_scans_active(0);
+    #[cfg(test)]
+    if let Some(gate) = post_walk_gate {
+        let _ = gate.await;
+    }
 
     let first_err = first_err_mutex.lock().await.take();
+    let has_set_failure = first_err.is_some();
     let results = results_mutex.lock().await.clone();
     let completed_all_sets = bucket_plan_complete && scanner_results_form_complete_snapshot(&results, &expected_sources);
     let result = finalize_nsscanner_result(&results, first_err);
     let failed_buckets = bucket_failures.hard.lock().await.clone();
     let partial_buckets = bucket_failures.partial.lock().await.clone();
+    let carried_partial_buckets = bucket_failures.partial_carried.lock().await.clone();
     let namespace_not_found_buckets = bucket_failures.namespace_not_found.lock().await.clone();
     let scan_scope_matches = scanner_results_match_scan_scope(&results, &expected_sources);
+    let has_uncarried_partial = partial_buckets.iter().any(|bucket| !carried_partial_buckets.contains(bucket));
     let bucket_scan_status = scanner_bucket_scan_status(
         !failed_buckets.is_empty(),
-        scan_scope_matches && !partial_buckets.is_empty(),
+        scan_scope_matches && has_uncarried_partial,
         scan_scope_matches && !namespace_not_found_buckets.is_empty(),
+        scan_scope_matches && !partial_buckets.is_empty(),
     );
     let cold_zero_walk_oracle = scanner_cycle_cold_zero_walk_oracle(
         &scan_scope,
@@ -731,8 +758,19 @@ where
     let observed_cycle_floor = cache_cycle_floor.load(Ordering::Acquire);
     let required_cycle_floor = (observed_cycle_floor > want_cycle).then_some(observed_cycle_floor);
     let budget_elapsed = budget.budget_elapsed();
+    // A mixed-plan tail can save its checkpoint without producing a root
+    // candidate. Do not infer progress from an arbitrary missing update, or
+    // let a successful set hide another set's worker/persistence failure.
+    let partial_bucket_progress = !budget_elapsed
+        && !ctx.is_cancelled()
+        && scanner_partial_progress_is_usable(
+            bucket_plan_complete,
+            scan_scope_matches,
+            bucket_scan_status,
+            has_set_failure,
+            !namespace_not_found_buckets.is_empty(),
+        );
     let dirty_usage_status = dirty_usage_snapshot_status(&dirty_usage_snapshot);
-    let dirty_usage_current = dirty_usage_status == DirtyUsageSnapshotStatus::Current;
     let (activity_status, remote_publication_lease_targets) =
         scanner_cycle_activity_status(store, distributed, &activity_before).await;
     let all_bucket_names = all_buckets.iter().map(|bucket| bucket.name.clone()).collect::<Vec<_>>();
@@ -777,14 +815,27 @@ where
         dirty_usage_status,
         activity_status,
     );
+    // Certification is per bucket: the pending set is read after the
+    // guardrail verdict so a bucket written during the walk is reported in
+    // the same publication that certifies the others. A bucket whose walk
+    // stopped early is pending for the same reason: the publication carries
+    // its last certified value, not this walk's (a `Complete` cycle has only
+    // carried partial buckets, see `classify_nsscanner_cycle`).
+    let pending_buckets = if cycle_status == ScannerCycleStatus::Complete {
+        let mut pending = pending_dirty_usage_buckets(&dirty_usage_snapshot.buckets);
+        pending.extend(partial_buckets.iter().cloned());
+        pending
+    } else {
+        ScannerCyclePendingBuckets::new()
+    };
     let mut publication_expectation = None;
-    let observational_snapshot_published = if let Some(candidate) = completed_usage {
-        let (data_usage_info, expectation) = candidate.prepare(cycle_status);
+    let usage_update_emitted = if let Some(candidate) = completed_usage {
+        let (data_usage_info, expectation) = candidate.prepare(cycle_status, &pending_buckets);
         publication_expectation = expectation;
         if should_publish_observational_snapshot(cycle_status) {
             publish_observational_snapshot(&updates, data_usage_info).await?
         } else {
-            publish_usage_snapshot(&updates, cycle_status, data_usage_info).await?
+            publish_usage_snapshot(&updates, cycle_status, &pending_buckets, data_usage_info).await?
         }
     } else if !ctx.is_cancelled()
         && let Some((data_usage_info, _)) = observational_usage
@@ -793,13 +844,16 @@ where
     } else {
         false
     };
+    // A walk that stopped early certifies nothing: the bucket keeps its
+    // dirty generation like a failed one and is walked again next cycle.
+    let uncertified_buckets = failed_buckets.union(&partial_buckets).cloned().collect::<HashSet<_>>();
     let dirty_usage_clear = should_clear_dirty_usage_snapshot(
         result.is_ok(),
         structurally_complete_snapshot,
         budget_elapsed,
-        activity_status == ScannerCycleActivityStatus::Unchanged && dirty_usage_current,
+        activity_status == ScannerCycleActivityStatus::Unchanged,
         &dirty_usage_snapshot.buckets,
-        &failed_buckets,
+        &uncertified_buckets,
     );
     result?;
     if cycle_status == ScannerCycleStatus::Complete {
@@ -816,7 +870,10 @@ where
     Ok(ScannerCycleResult::new(cycle_status, dirty_usage_clear)
         .with_publication_epoch(publication_epoch)
         .with_activity_digest(activity_digest)
-        .with_observational_snapshot_published(observational_snapshot_published)
+        .with_activity_baseline(activity_before)
+        .with_pending_dirty_usage_buckets(pending_buckets.len())
+        .with_usage_update_emitted(usage_update_emitted)
+        .with_partial_bucket_progress(partial_bucket_progress)
         .with_remote_publication_lease_targets(remote_publication_lease_targets)
         .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
         .with_distributed_segment_invalidation_evidence(distributed_segment_invalidation_evidence)

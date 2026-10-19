@@ -13,10 +13,13 @@
 // limitations under the License.
 
 use super::{LocalMutationTarget, NodeService};
+use crate::storage::storage_api::ecstore_disk::{
+    QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, is_quota_mutation_fence_path,
+};
 use crate::storage::storage_api::rpc_consumer::node_service::{
     BatchReadVersionReq, BatchReadVersionResp, ConditionalFileUpdate, DeleteOptions, DiskError, DiskInfoOptions,
-    FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts,
-    validate_batch_read_version_item_count,
+    FileInfoVersions, GuardedDeleteVersionsPayload, ReadMultipleReq, ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _,
+    UpdateMetadataOpts, validate_batch_read_version_item_count,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use crate::storage::storage_api::{
@@ -286,6 +289,33 @@ fn verify_disk_mutation_digest<T>(
         .map_err(|err| Status::permission_denied(format!("{op} authentication failed: {err}")))
 }
 
+fn verify_quota_mutation_digest<T>(
+    request: &Request<T>,
+    canonical_body: std::result::Result<Vec<u8>, std::num::TryFromIntError>,
+) -> Result<String, Status> {
+    let values = request.metadata().get_all(rustfs_protos::QUOTA_MUTATION_TOPOLOGY_HEADER);
+    let mut values = values.iter();
+    let topology = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| Status::permission_denied("quota mutation requires a valid topology header"))?;
+    if values.next().is_some() {
+        return Err(Status::permission_denied("quota mutation requires exactly one topology header"));
+    }
+    let body = canonical_body.map_err(|_| Status::invalid_argument("quota mutation request length cannot be represented"))?;
+    let body = rustfs_protos::canonical_quota_mutation_request_body(topology, &body)
+        .map_err(|_| Status::invalid_argument("quota mutation envelope length cannot be represented"))?;
+    verify_tonic_canonical_body_digest(request, &body)
+        .map_err(|_| Status::permission_denied("quota mutation requires topology-bound v2 authentication"))?;
+    Ok(topology.to_owned())
+}
+
 /// JSON compatibility string for a dual-encoded response field. Returns an empty string when
 /// msgpack-only mode and its explicit fleet confirmation guard are both enabled, or when
 /// request-local `_bin` payloads prove the caller can consume the paired response `_bin` field,
@@ -391,19 +421,71 @@ fn encode_rename_data_response_payloads(
 }
 
 impl NodeService {
+    pub(super) fn quota_store_for_topology<'a>(
+        &self,
+        target: &'a LocalMutationTarget,
+        coordinator_topology: &str,
+    ) -> Result<&'a Arc<super::ECStore>, Status> {
+        let LocalMutationTarget::Ready(store) = target else {
+            return Err(Status::failed_precondition("quota mutation requires a ready storage instance"));
+        };
+        let mut cache = self
+            .quota_topology_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let identity = Arc::downgrade(store);
+        if !cache.as_ref().is_some_and(|entry| entry.store.ptr_eq(&identity)) {
+            // Instance endpoints are immutable once initialized. Keep one weak
+            // identity so a replacement instance cannot inherit this layout,
+            // even when its deployment or disk UUIDs are unchanged.
+            let endpoints = store
+                .instance_endpoints()
+                .ok_or_else(|| Status::failed_precondition("quota mutation target topology is unavailable"))?;
+            let fingerprint = super::heal::heal_topology_fingerprint(&endpoints)
+                .map_err(|_| Status::failed_precondition("quota mutation target topology is invalid"))?;
+            #[cfg(test)]
+            self.quota_topology_computations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *cache = Some(super::QuotaTopologyCacheEntry {
+                store: identity,
+                fingerprint,
+            });
+        }
+        if cache.as_ref().is_none_or(|entry| entry.fingerprint != coordinator_topology) {
+            return Err(Status::failed_precondition(
+                "quota mutation coordinator topology does not match the target",
+            ));
+        }
+        Ok(store)
+    }
+
     pub(super) async fn handle_acquire_snapshot_lease(
         &self,
         request: Request<SnapshotLeaseRequest>,
+        quota_fence: bool,
     ) -> Result<Response<SnapshotLeaseResponse>, Status> {
-        verify_disk_mutation_digest(
-            &request,
-            rustfs_protos::canonical_snapshot_lease_request_body(request.get_ref()),
-            "acquire_snapshot_lease",
-        )?;
+        let body = rustfs_protos::canonical_snapshot_lease_request_body(request.get_ref());
+        let quota_store = if quota_fence {
+            let topology = verify_quota_mutation_digest(&request, body)?;
+            if request.get_ref().volume != RUSTFS_META_BUCKET || !is_quota_mutation_fence_path(&request.get_ref().path) {
+                return Err(Status::invalid_argument("quota fence requires its internal mutation fence path"));
+            }
+            Some(Arc::clone(self.quota_store_for_topology(&self.local_mutation_target(), &topology)?))
+        } else {
+            verify_disk_mutation_digest(&request, body, "acquire_snapshot_lease")?;
+            None
+        };
         let request = request.into_inner();
-        let result = match self.find_disk(&request.disk).await {
-            Some(disk) => disk.acquire_snapshot_lease(&request.volume, &request.path).await,
-            None => Err(DiskError::other("cannot find disk")),
+        let disk = match quota_store {
+            Some(store) => store.quota_mutation_fence_disk(&request.disk).await,
+            None => self
+                .find_disk(&request.disk)
+                .await
+                .ok_or_else(|| DiskError::other("cannot find disk")),
+        };
+        let result = match disk {
+            Ok(disk) => disk.acquire_snapshot_lease(&request.volume, &request.path).await,
+            Err(err) => Err(err),
         };
         Ok(snapshot_lease_response(result))
     }
@@ -430,25 +512,37 @@ impl NodeService {
     pub(super) async fn handle_release_snapshot_lease(
         &self,
         request: Request<SnapshotLeaseReleaseRequest>,
+        quota_fence: bool,
     ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
-        verify_disk_mutation_digest(
-            &request,
-            rustfs_protos::canonical_snapshot_lease_release_request_body(request.get_ref()),
-            "release_snapshot_lease",
-        )?;
+        let body = rustfs_protos::canonical_snapshot_lease_release_request_body(request.get_ref());
+        let quota_store = if quota_fence {
+            let topology = verify_quota_mutation_digest(&request, body)?;
+            if request.get_ref().volume != RUSTFS_META_BUCKET || !is_quota_mutation_fence_path(&request.get_ref().path) {
+                return Err(Status::invalid_argument("quota fence requires its internal mutation fence path"));
+            }
+            Some(Arc::clone(self.quota_store_for_topology(&self.local_mutation_target(), &topology)?))
+        } else {
+            verify_disk_mutation_digest(&request, body, "release_snapshot_lease")?;
+            None
+        };
         let request = request.into_inner();
         let token = if request.token.as_ref() == SnapshotLeaseToken::revoke_all().as_bytes() {
             SnapshotLeaseToken::revoke_all()
         } else {
             SnapshotLeaseToken::from_slice(&request.token).map_err(|_| Status::invalid_argument("invalid lease token"))?
         };
-        let Some(disk) = self.find_disk(&request.disk).await else {
-            return Ok(Response::new(SnapshotLeaseMutationResponse {
-                success: false,
-                error: Some(DiskError::other("cannot find disk").into()),
-            }));
+        let disk = match quota_store {
+            Some(store) => store.quota_mutation_fence_disk(&request.disk).await,
+            None => self
+                .find_disk(&request.disk)
+                .await
+                .ok_or_else(|| DiskError::other("cannot find disk")),
         };
-        match disk.release_snapshot_lease(&request.volume, &request.path, token).await {
+        let result = match disk {
+            Ok(disk) => disk.release_snapshot_lease(&request.volume, &request.path, token).await,
+            Err(err) => Err(err),
+        };
+        match result {
             Ok(()) => Ok(Response::new(SnapshotLeaseMutationResponse {
                 success: true,
                 error: None,
@@ -688,6 +782,58 @@ impl NodeService {
                 error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
+    }
+
+    pub(super) async fn handle_guarded_delete_versions(
+        &self,
+        request: Request<GuardedDeleteVersionsRequest>,
+    ) -> Result<Response<DeleteVersionsResponse>, Status> {
+        if request.get_ref().payload.len() > rustfs_protos::DELETE_RECOVERY_MAX_PAYLOAD_BYTES {
+            return Err(Status::resource_exhausted("guarded delete payload exceeds limit"));
+        }
+        let body = rustfs_protos::canonical_guarded_delete_versions_request_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("invalid guarded delete body length"))?;
+        verify_tonic_canonical_body_digest(&request, &body)
+            .map_err(|_| Status::permission_denied("guarded delete requires body-bound v2 authentication"))?;
+        let request = request.into_inner();
+        let disk = self
+            .find_disk(&request.disk)
+            .await
+            .ok_or_else(|| Status::not_found("cannot find disk"))?;
+        if request.probe_only {
+            if !request.payload.is_empty() || !request.volume.is_empty() {
+                return Err(Status::invalid_argument("guarded capability probe must have no mutation payload"));
+            }
+            if let Err(error) = disk.supports_guarded_delete_versions().await {
+                return Ok(Response::new(DeleteVersionsResponse {
+                    success: false,
+                    errors: Vec::new(),
+                    error: Some(error.into()),
+                    item_errors: Vec::new(),
+                }));
+            }
+            return Ok(Response::new(DeleteVersionsResponse {
+                success: true,
+                errors: Vec::new(),
+                error: None,
+                item_errors: Vec::new(),
+            }));
+        }
+        let payload: GuardedDeleteVersionsPayload = rustfs_protos::decode_delete_recovery_payload(&request.payload)
+            .map_err(|_| Status::invalid_argument("invalid guarded delete payload"))?;
+        payload
+            .validate()
+            .map_err(|_| Status::invalid_argument("invalid guarded delete options or batch"))?;
+        let (errors, item_errors) = encode_delete_versions_errors(
+            disk.delete_versions_guarded_recoverable(&request.volume, payload.versions, payload.opts)
+                .await,
+        );
+        Ok(Response::new(DeleteVersionsResponse {
+            success: true,
+            errors,
+            error: None,
+            item_errors,
+        }))
     }
 
     pub(super) async fn handle_delete_versions(
@@ -1364,7 +1510,10 @@ impl NodeService {
     pub(super) async fn handle_rename_data(
         &self,
         request: Request<RenameDataRequest>,
+        quota_fence: bool,
     ) -> Result<Response<RenameDataResponse>, Status> {
+        let service_return_started = rustfs_io_metrics::put_stage_timer();
+        let service_entry_started = rustfs_io_metrics::put_stage_timer();
         if !request.get_ref().scanner_publication_lease_token.is_empty() || !request.get_ref().bucket_incarnation_id.is_empty() {
             let has_body_digest = request
                 .metadata()
@@ -1372,14 +1521,40 @@ impl NodeService {
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|value| value != "UNSIGNED-PAYLOAD");
             if !has_body_digest {
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_ENTRY,
+                    service_entry_started,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_RETURN,
+                    service_return_started,
+                );
                 return Err(Status::permission_denied("scanner publication lease rename requires a body-bound digest"));
             }
         }
-        verify_disk_mutation_digest(
-            &request,
-            rustfs_protos::canonical_rename_data_request_body(request.get_ref()),
-            "rename_data",
-        )?;
+        let body = rustfs_protos::canonical_rename_data_request_body(request.get_ref());
+        let mut quota_topology = None;
+        let authenticated = if quota_fence {
+            verify_quota_mutation_digest(&request, body).map(|topology| quota_topology = Some(topology))
+        } else {
+            verify_disk_mutation_digest(&request, body, "rename_data")
+        };
+        if let Err(err) = authenticated {
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_ENTRY,
+                service_entry_started,
+            );
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_RETURN,
+                service_return_started,
+            );
+            return Err(err);
+        }
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_ENTRY,
+            service_entry_started,
+        );
+        let before_handler_started = rustfs_io_metrics::put_stage_timer();
         let request = request.into_inner();
         let target = self.local_mutation_target();
         let bucket_incarnation = if request.bucket_incarnation_id.is_empty() {
@@ -1390,6 +1565,14 @@ impl NodeService {
                 .filter(|id| !id.is_nil())
                 .ok_or_else(|| Status::invalid_argument("bucket incarnation must be a non-nil UUID"))?;
             if !request.scanner_publication_lease_token.is_empty() {
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_BEFORE_HANDLER,
+                    before_handler_started,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_RETURN,
+                    service_return_started,
+                );
                 return Err(Status::invalid_argument(
                     "heal incarnation and scanner publication lease cannot be combined",
                 ));
@@ -1401,12 +1584,26 @@ impl NodeService {
         let decoded_file_info = match decode_rename_data_request_file_info(&request.file_info_bin, &request.file_info) {
             Ok(file_info) => file_info,
             Err(err) => {
-                return Ok(Response::new(RenameDataResponse {
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_BEFORE_HANDLER,
+                    before_handler_started,
+                );
+                let response_build_started = rustfs_io_metrics::put_stage_timer();
+                let response = Response::new(RenameDataResponse {
                     success: false,
                     rename_data_resp: String::new(),
                     rename_data_resp_bin: Vec::new().into(),
                     error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
-                }));
+                });
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_BUILD,
+                    response_build_started,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_RETURN,
+                    service_return_started,
+                );
+                return Ok(response);
             }
         };
         let scanner_publication_lease_token = if request.scanner_publication_lease_token.is_empty() {
@@ -1415,13 +1612,42 @@ impl NodeService {
             let token = Uuid::from_slice(&request.scanner_publication_lease_token)
                 .map_err(|_| Status::invalid_argument("scanner publication lease token must be a UUID"))?;
             if token.is_nil() {
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_BEFORE_HANDLER,
+                    before_handler_started,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_RETURN,
+                    service_return_started,
+                );
                 return Err(Status::invalid_argument("scanner publication lease token must not be nil"));
             }
             Some(token)
         };
+        if quota_fence {
+            let token = rustfs_utils::http::metadata_compat::get_consistent_str(
+                &decoded_file_info.value.metadata,
+                QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+            )
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .filter(|token| !token.is_nil());
+            if token.is_none() {
+                return Err(Status::invalid_argument(
+                    "quota rename requires a consistent non-nil mutation fence token",
+                ));
+            }
+        }
+        if let Some(topology) = quota_topology {
+            self.quota_store_for_topology(&target, &topology)?;
+        }
         let request_decoded_from_msgpack = decoded_file_info.from_msgpack;
         #[cfg(feature = "e2e-test-hooks")]
         let observation = startup_cas_rename_observation(&target, &request, &decoded_file_info.value);
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_BEFORE_HANDLER,
+            before_handler_started,
+        );
+        let handler_await_started = rustfs_io_metrics::put_stage_timer();
         let result = target
             .rename_local_data(
                 &request.disk,
@@ -1432,6 +1658,11 @@ impl NodeService {
                 bucket_incarnation,
             )
             .await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_HANDLER_AWAIT,
+            handler_await_started,
+        );
+        let after_handler_started = rustfs_io_metrics::put_stage_timer();
         #[cfg(feature = "e2e-test-hooks")]
         if let Some(mut observation) = observation {
             observation["ok"] = serde_json::json!(result.is_ok());
@@ -1439,28 +1670,47 @@ impl NodeService {
             let line = format!("RUSTFS_E2E_STARTUP_CAS {observation}\n");
             let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
         }
-        match result {
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_AFTER_HANDLER,
+            after_handler_started,
+        );
+        let response_build_started = rustfs_io_metrics::put_stage_timer();
+        let response_encode_started = rustfs_io_metrics::put_stage_timer();
+        let response = match result {
             Ok(rename_data_resp) => match encode_rename_data_response_payloads(&rename_data_resp, request_decoded_from_msgpack) {
-                Ok((rename_data_resp, rename_data_resp_bin)) => Ok(Response::new(RenameDataResponse {
+                Ok((rename_data_resp, rename_data_resp_bin)) => Response::new(RenameDataResponse {
                     success: true,
                     rename_data_resp,
                     rename_data_resp_bin: rename_data_resp_bin.into(),
                     error: None,
-                })),
-                Err(err) => Ok(Response::new(RenameDataResponse {
+                }),
+                Err(err) => Response::new(RenameDataResponse {
                     success: false,
                     rename_data_resp: String::new(),
                     rename_data_resp_bin: Vec::new().into(),
                     error: Some(err.into()),
-                })),
+                }),
             },
-            Err(err) => Ok(Response::new(RenameDataResponse {
+            Err(err) => Response::new(RenameDataResponse {
                 success: false,
                 rename_data_resp: String::new(),
                 rename_data_resp_bin: Vec::new().into(),
                 error: Some(err.into()),
-            })),
-        }
+            }),
+        };
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_ENCODE,
+            response_encode_started,
+        );
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_BUILD,
+            response_build_started,
+        );
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_RETURN,
+            service_return_started,
+        );
+        Ok(response)
     }
 
     pub(super) async fn handle_list_dir(&self, request: Request<ListDirRequest>) -> Result<Response<ListDirResponse>, Status> {
@@ -1651,6 +1901,7 @@ impl NodeService {
                     || opts.undo_write
                     || opts.recursive
                     || opts.immediate
+                    || opts.orphan_data_dir
                     || opts.expected_delete_marker.is_some()
                     || opts
                         .delete_recovery_bucket_incarnation
@@ -1672,6 +1923,14 @@ impl NodeService {
         }
         let result = if let Some(disk) = self.find_disk(&request.disk).await {
             match operation {
+                DeleteRecoveryRpcOperation::Exists { object } => disk
+                    .has_delete_transaction_evidence(&request.volume, &object)
+                    .await
+                    .map(|present| DeleteRecoveryRpcReply::Evidence { present }),
+                DeleteRecoveryRpcOperation::InspectOrphanDataDir { path } => disk
+                    .is_plain_orphan_data_dir(&request.volume, &path)
+                    .await
+                    .map(|plain| DeleteRecoveryRpcReply::OrphanDataDir { plain }),
                 DeleteRecoveryRpcOperation::ApplyVersion {
                     object,
                     file_info,

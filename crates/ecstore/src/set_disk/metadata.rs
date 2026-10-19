@@ -35,6 +35,58 @@ struct FileInfoIdentityGroup {
 }
 
 impl SetDisks {
+    /// Read one key's complete version stack without enumerating its parent.
+    pub(crate) async fn read_object_versions_for_lifecycle(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> disk::error::Result<Option<rustfs_filemeta::MetaCacheEntry>> {
+        let disks = self.get_disks_internal().await;
+        if disks.len() != self.set_drive_count || disks.is_empty() {
+            return Err(DiskError::ErasureReadQuorum);
+        }
+        let disk_object = rustfs_utils::path::encode_dir_object(object);
+        let (mut raw, mut errors) = Self::read_all_raw_file_info(&disks, bucket, &disk_object, false).await;
+        for (metadata, error) in raw.iter_mut().zip(&mut errors) {
+            if metadata.as_ref().is_some_and(|metadata| metadata.buf.is_empty()) {
+                *metadata = None;
+                *error = Some(DiskError::FileCorrupt);
+            }
+        }
+        // An unavailable disk is not evidence that a version group is absent.
+        // Unlike a walk, an exact read must also decide the all-missing case.
+        if raw.iter().all(Option::is_none) {
+            return if errors.iter().all(|error| {
+                matches!(
+                    error,
+                    Some(DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound)
+                )
+            }) {
+                Ok(None)
+            } else {
+                Err(DiskError::ErasureReadQuorum)
+            };
+        }
+        let entries = rustfs_filemeta::MetaCacheEntries(
+            raw.into_iter()
+                .map(|raw| {
+                    raw.map(|raw| rustfs_filemeta::MetaCacheEntry {
+                        name: object.to_owned(),
+                        metadata: raw.buf,
+                        cached: None,
+                        reusable: false,
+                    })
+                })
+                .collect(),
+        );
+        // Reuse the listing's per-version authority, including the object's
+        // actual erasure layout. Never turn unreadable/stale metadata into a
+        // singleton made from the preceding write's ObjectInfo.
+        Self::resolve_listed_versions(bucket, entries, &errors, self.set_drive_count, self.default_parity_count)?
+            .map(Some)
+            .ok_or(DiskError::ErasureReadQuorum)
+    }
+
     /// Resolve each listed version using the same metadata authority as an exact read.
     pub(crate) fn resolve_listed_versions(
         bucket: &str,

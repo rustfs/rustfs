@@ -19,11 +19,13 @@
 //! or deletion.
 
 use super::*;
+use crate::heal::outcome::HealExecutionOutcome;
 use crate::heal::resume::CheckpointManager;
 use crate::heal::storage_api::owner::{EcstoreConditionalFileUpdate, EcstoreDiskAPI, EcstoreDiskBytes};
 use crate::heal::{DiskStore, RUSTFS_META_BUCKET};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
@@ -36,12 +38,15 @@ const ROOT_RECOVERY_PREFIX: &str = "root-heal-";
 const ROOT_TERMINAL_PREFIX: &str = "terminal-root-heal-";
 const LEGACY_ROOT_RECOVERY_SCHEMA: u32 = 1;
 const SCOPED_ROOT_RECOVERY_SCHEMA: u32 = 2;
-const ROOT_RECOVERY_SCHEMA: u32 = 3;
+const BUCKET_ROOT_RECOVERY_SCHEMA: u32 = 3;
+const ROOT_RECOVERY_SCHEMA: u32 = 4;
 const ROOT_TERMINAL_SCHEMA: u32 = 1;
 const ROOT_QUARANTINE_INTENT_PREFIX: &str = "quarantined-root-heal-intent-";
 const ROOT_QUARANTINE_TERMINAL_PREFIX: &str = "quarantined-root-heal-terminal-";
 const ROOT_QUARANTINE_SCHEMA: u32 = 1;
 pub(super) const MAX_ROOT_RECOVERY_BYTES: usize = 64 * 1024;
+// Cluster checkpoints additionally retain a frozen inventory and the bounded outcome window.
+pub(super) const MAX_CLUSTER_RECOVERY_BYTES: usize = 16 * 1024 * 1024;
 const ROOT_TERMINAL_GC_SCAN_BUDGET: usize = 1024;
 const ROOT_TERMINAL_GC_DELETE_BUDGET: usize = 64;
 
@@ -237,7 +242,83 @@ fn default_recovery_heal_type() -> RecoveryHealType {
     RecoveryHealType::Cluster
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdminClusterScope {
+    #[serde(deserialize_with = "decode_cluster_buckets")]
+    pub(crate) buckets: std::collections::BTreeMap<String, Uuid>,
+    pub(crate) next_bucket_index: usize,
+    pub(crate) outcome: HealTaskOutcome,
+    pub(crate) progress: HealProgress,
+}
+
+fn decode_cluster_buckets<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<std::collections::BTreeMap<String, Uuid>, D::Error> {
+    struct Buckets;
+    impl<'de> serde::de::Visitor<'de> for Buckets {
+        type Value = std::collections::BTreeMap<String, Uuid>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("unique bucket generation bindings")
+        }
+        fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> std::result::Result<Self::Value, M::Error> {
+            let mut buckets = std::collections::BTreeMap::new();
+            while let Some((bucket, incarnation)) = map.next_entry::<String, Uuid>()? {
+                if buckets.insert(bucket, incarnation).is_some() {
+                    return Err(serde::de::Error::custom("duplicate administrator cluster bucket"));
+                }
+            }
+            Ok(buckets)
+        }
+    }
+    deserializer.deserialize_map(Buckets)
+}
+
+impl AdminClusterScope {
+    pub(crate) fn checkpoint_interval(&self) -> usize {
+        // Cap full-inventory rewrites per traversal, including many empty buckets.
+        self.buckets.len().div_ceil(32).max(1)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.next_bucket_index > self.buckets.len()
+            || self.outcome.execution != HealExecutionOutcome::Running
+            || self.outcome.coverage != crate::heal::outcome::HealTraversalCoverage::Partial
+            || self.outcome.counters.failed != 0
+        {
+            return Err(Error::InvalidCheckpoint("Invalid administrator cluster checkpoint progress".to_string()));
+        }
+        for (bucket, incarnation) in &self.buckets {
+            if bucket.contains('/')
+                || bucket.trim() != bucket
+                || crate::heal::storage_api::owner::ecstore_is_reserved_or_invalid_bucket(bucket, false)
+            {
+                return Err(Error::InvalidCheckpoint("Invalid administrator cluster bucket name".to_string()));
+            }
+            if incarnation.is_nil() {
+                return Err(Error::InvalidCheckpoint(
+                    "Administrator cluster checkpoint lacks a bucket incarnation".to_string(),
+                ));
+            }
+        }
+        let completed_through = self
+            .next_bucket_index
+            .checked_sub(1)
+            .and_then(|index| self.buckets.keys().nth(index));
+        if self.outcome.objects.iter().any(|item| {
+            completed_through.is_none_or(|last| item.identity.bucket > *last)
+                || self.buckets.get(&item.identity.bucket).copied() != item.identity.bucket_incarnation_id
+        }) || (self.next_bucket_index == 0 && self.outcome.counters.processed != 0)
+        {
+            return Err(Error::InvalidCheckpoint(
+                "Administrator cluster checkpoint outcome is outside its completed scope".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RootHealIntent {
     schema: u32,
@@ -246,6 +327,8 @@ struct RootHealIntent {
     heal_type: RecoveryHealType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bucket_incarnation_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cluster_scope: Option<AdminClusterScope>,
     #[serde(deserialize_with = "decode_options")]
     options: HealOptions,
     priority: HealPriority,
@@ -292,10 +375,46 @@ struct RootHealSource {
     source_oversized: bool,
 }
 
+impl RootHealQuarantine {
+    fn matches_source(&self, source: &RootHealSource) -> bool {
+        if self.source_prefix_len == source.bytes.len()
+            && self.source_prefix_sha256 == source.source_prefix_sha256
+            && self.source_oversized == source.source_oversized
+        {
+            return true;
+        }
+        // Before schema 4, oversized intents retained only the 64 KiB prefix.
+        // Keep that quarantine fence across upgrades without reinterpreting its source.
+        self.record_kind == RootHealRecordKind::Intent
+            && self.source_oversized
+            && self.source_prefix_len == MAX_ROOT_RECOVERY_BYTES + 1
+            && source
+                .bytes
+                .get(..self.source_prefix_len)
+                .is_some_and(|prefix| Sha256::digest(prefix).as_slice() == self.source_prefix_sha256.as_slice())
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct RootHealInventory {
     pub(super) requests: Vec<HealRequest>,
     pub(super) quarantined_task_ids: HashSet<String>,
+    /// Records that can neither be admitted nor quarantined, with the reason.
+    /// They are reported, refused for admission, and retained for operator
+    /// repair; every other record keeps replaying.
+    pub(super) conflicted: BTreeMap<String, String>,
+}
+
+impl RootHealInventory {
+    /// Why a durable record cannot run, for admission refusals and status.
+    pub(super) fn record_issue(&self, task_id: &str) -> Option<String> {
+        if let Some(reason) = self.conflicted.get(task_id) {
+            return Some(reason.clone());
+        }
+        self.quarantined_task_ids
+            .contains(task_id)
+            .then(|| "durable record is quarantined".to_string())
+    }
 }
 
 impl RootHealTerminal {
@@ -362,12 +481,38 @@ impl RootHealTerminal {
 }
 
 impl RootHealIntent {
+    fn encode(&self) -> Result<EcstoreDiskBytes> {
+        let limit = match &self.cluster_scope {
+            // Reserve headroom for the bounded outcome window and progress so
+            // completing work cannot overflow an inventory admitted at the limit.
+            Some(scope) if scope.next_bucket_index == 0 => MAX_CLUSTER_RECOVERY_BYTES - 1024 * 1024,
+            Some(_) => MAX_CLUSTER_RECOVERY_BYTES,
+            None => MAX_ROOT_RECOVERY_BYTES,
+        };
+        encode_root_record(self, limit)
+    }
+
+    fn validate_task(&self, task: &HealTask) -> Result<()> {
+        let mut options = self.options.clone();
+        options.timeout = task.options.timeout;
+        if HealType::from(self.heal_type.clone()) != task.heal_type
+            || self.bucket_incarnation_id != task.bucket_incarnation_id
+            || self.created_at != task.created_at
+            || self.priority != task.priority
+            || options != task.options
+        {
+            return Err(Error::InvalidCheckpoint(format!("Root heal recovery owner changed for {}", task.id)));
+        }
+        Ok(())
+    }
+
     fn from_request(request: &HealRequest) -> Result<Self> {
         Ok(Self {
             schema: ROOT_RECOVERY_SCHEMA,
             task_id: request.id.clone(),
             heal_type: RecoveryHealType::try_from(&request.heal_type)?,
             bucket_incarnation_id: request.bucket_incarnation_id,
+            cluster_scope: None,
             options: request.options.clone(),
             priority: request.priority,
             retry_attempts: request.retry_attempts,
@@ -384,6 +529,32 @@ impl RootHealIntent {
         request.created_at = self.created_at;
         request
     }
+}
+
+fn encode_root_record(value: &impl Serialize, limit: usize) -> Result<EcstoreDiskBytes> {
+    struct BoundedWriter {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+    impl std::io::Write for BoundedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+                return Err(std::io::Error::other("root heal record exceeds its size limit"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = BoundedWriter {
+        bytes: Vec::new(),
+        limit,
+    };
+    serde_json::to_writer(&mut writer, value)
+        .map_err(|error| Error::Serialization(format!("Serialize root heal record: {error}")))?;
+    Ok(writer.bytes.into())
 }
 
 #[derive(Default)]
@@ -490,10 +661,18 @@ async fn read_bounded(disk: &DiskStore, path: &str) -> Result<Option<EcstoreDisk
     };
     let mut bytes = Vec::new();
     reader
-        .take(u64::try_from(MAX_ROOT_RECOVERY_BYTES + 1).map_err(Error::other)?)
+        .take(u64::try_from(root_record_read_limit(path) + 1).map_err(Error::other)?)
         .read_to_end(&mut bytes)
         .await?;
     Ok(Some(bytes.into()))
+}
+
+fn root_record_read_limit(path: &str) -> usize {
+    if path.starts_with(ROOT_RECOVERY_PREFIX) {
+        MAX_CLUSTER_RECOVERY_BYTES
+    } else {
+        MAX_ROOT_RECOVERY_BYTES
+    }
 }
 
 async fn read_source(disk: &DiskStore, path: &str) -> Result<Option<RootHealSource>> {
@@ -502,7 +681,7 @@ async fn read_source(disk: &DiskStore, path: &str) -> Result<Option<RootHealSour
     };
     Ok(Some(RootHealSource {
         source_prefix_sha256: Sha256::digest(&bytes).to_vec(),
-        source_oversized: bytes.len() > MAX_ROOT_RECOVERY_BYTES,
+        source_oversized: bytes.len() > root_record_read_limit(path),
         bytes,
     }))
 }
@@ -544,7 +723,7 @@ fn encode_quarantine(
 
 fn decode_intent(task_id: &str, bytes: &[u8]) -> Result<RootHealIntent> {
     let _ = intent_path(task_id)?;
-    if bytes.len() > MAX_ROOT_RECOVERY_BYTES {
+    if bytes.len() > MAX_CLUSTER_RECOVERY_BYTES {
         return Err(Error::Other(format!("Root heal recovery record exceeds its size limit {task_id}")));
     }
     let mut intent: RootHealIntent = serde_json::from_slice(bytes)
@@ -556,8 +735,24 @@ fn decode_intent(task_id: &str, bytes: &[u8]) -> Result<RootHealIntent> {
         LEGACY_ROOT_RECOVERY_SCHEMA
             if intent.heal_type == RecoveryHealType::Cluster && intent.bucket_incarnation_id.is_none() => {}
         SCOPED_ROOT_RECOVERY_SCHEMA if intent.bucket_incarnation_id.is_none() => {}
+        BUCKET_ROOT_RECOVERY_SCHEMA if intent.cluster_scope.is_none() => {}
         ROOT_RECOVERY_SCHEMA => {}
         _ => return Err(Error::Other(format!("Unsupported or mismatched root heal recovery record {task_id}"))),
+    }
+    if intent.heal_type == RecoveryHealType::Cluster && intent.schema != ROOT_RECOVERY_SCHEMA {
+        return Err(Error::InvalidCheckpoint(
+            "Legacy cluster heal has no frozen bucket generations; start a fresh task".to_string(),
+        ));
+    }
+    match &intent.cluster_scope {
+        Some(scope) if intent.schema == ROOT_RECOVERY_SCHEMA && intent.heal_type == RecoveryHealType::Cluster => {
+            scope.validate()?;
+        }
+        Some(_) => return Err(Error::InvalidCheckpoint("Unexpected administrator cluster scope".to_string())),
+        None if bytes.len() > MAX_ROOT_RECOVERY_BYTES => {
+            return Err(Error::InvalidCheckpoint("Root heal recovery record exceeds its size limit".to_string()));
+        }
+        None => {}
     }
     if !matches!(intent.heal_type, RecoveryHealType::Bucket { .. }) && intent.bucket_incarnation_id.is_some() {
         return Err(Error::Other(format!(
@@ -723,17 +918,18 @@ impl RootHealRecovery {
             }
         };
         let marker = decode_quarantine(task_id, record_kind, &marker_bytes)?;
-        if marker.source_prefix_len != source.bytes.len()
-            || marker.source_prefix_sha256 != source.source_prefix_sha256
-            || marker.source_oversized != source.source_oversized
-        {
+        if !marker.matches_source(source) {
             return Err(Error::other(format!("Root heal quarantine source changed {task_id}")));
         }
         Ok(marker)
     }
 
+    /// Index quarantine markers by record. A marker that cannot be read or
+    /// decoded, or that has several owners, marks its task as conflicted
+    /// instead of failing the whole inventory; such a task is never replayed.
     async fn quarantine_marker_map(
         disks: &[DiskStore],
+        conflicted: &mut BTreeMap<String, String>,
     ) -> Result<HashMap<(RootHealRecordKind, String), (DiskStore, RootHealQuarantine)>> {
         let mut markers = HashMap::new();
         for disk in disks {
@@ -747,14 +943,24 @@ impl RootHealRecovery {
                     continue;
                 };
                 let Some(bytes) = read_bounded(disk, &entry).await? else {
-                    return Err(Error::other(format!("Root heal quarantine marker disappeared {task_id}")));
+                    conflicted.insert(task_id.to_owned(), format!("Root heal quarantine marker disappeared {task_id}"));
+                    continue;
                 };
-                let marker = decode_quarantine(task_id, record_kind, &bytes)?;
+                let marker = match decode_quarantine(task_id, record_kind, &bytes) {
+                    Ok(marker) => marker,
+                    Err(error) => {
+                        conflicted.insert(task_id.to_owned(), error.to_string());
+                        continue;
+                    }
+                };
                 let key = (record_kind, task_id.to_owned());
                 if markers.insert(key, (disk.clone(), marker)).is_some() {
-                    return Err(Error::other(format!("Multiple root heal quarantine owners for {task_id}")));
+                    conflicted.insert(task_id.to_owned(), format!("Multiple root heal quarantine owners for {task_id}"));
                 }
             }
+        }
+        for task_id in conflicted.keys() {
+            markers.retain(|(_, marked), _| marked != task_id);
         }
         Ok(markers)
     }
@@ -785,7 +991,8 @@ impl RootHealRecovery {
             }
         }
 
-        let markers = Self::quarantine_marker_map(disks).await?;
+        let mut conflicted = BTreeMap::new();
+        let markers = Self::quarantine_marker_map(disks, &mut conflicted).await?;
         for (record_kind, task_id) in markers.keys() {
             match record_kind {
                 RootHealRecordKind::Intent => {
@@ -799,20 +1006,30 @@ impl RootHealRecovery {
         let mut inventory = RootHealInventory {
             requests: Vec::new(),
             quarantined_task_ids: markers.keys().map(|(_, task_id)| task_id.clone()).collect(),
+            conflicted,
         };
+        // One record's conflict never postpones the others: it is recorded
+        // with its reason, refused for admission, and retained for repair.
         for task_id in intent_ids.union(&terminal_ids) {
+            if inventory.conflicted.contains_key(task_id) {
+                continue;
+            }
             let terminal_raw = Self::read_raw(disks, &terminal_path(task_id)?).await?;
             if terminal_raw.len() > 1 {
-                return Err(Error::other(format!("Multiple root heal terminal owners for {task_id}")));
+                inventory
+                    .conflicted
+                    .insert(task_id.clone(), format!("Multiple root heal terminal owners for {task_id}"));
+                continue;
             }
             if let Some((owner, source)) = terminal_raw.into_iter().next() {
                 if let Some(marker) = markers.get(&(RootHealRecordKind::Terminal, task_id.clone())) {
                     if EcstoreDiskAPI::endpoint(marker.0.as_ref()) != EcstoreDiskAPI::endpoint(owner.as_ref())
-                        || marker.1.source_prefix_len != source.bytes.len()
-                        || marker.1.source_prefix_sha256 != source.source_prefix_sha256
-                        || marker.1.source_oversized != source.source_oversized
+                        || !marker.1.matches_source(&source)
                     {
-                        return Err(Error::other(format!("Root heal quarantine source changed {task_id}")));
+                        inventory
+                            .conflicted
+                            .insert(task_id.clone(), format!("Root heal quarantine source changed {task_id}"));
+                        continue;
                     }
                     inventory.quarantined_task_ids.insert(task_id.clone());
                     continue;
@@ -828,32 +1045,43 @@ impl RootHealRecovery {
                 }
             }
             if let Some(marker) = markers.get(&(RootHealRecordKind::Terminal, task_id.clone())) {
-                return Err(Error::other(format!(
-                    "Root heal quarantine marker has no retained terminal source {} ({} bytes)",
-                    task_id, marker.1.source_prefix_len
-                )));
+                inventory.conflicted.insert(
+                    task_id.clone(),
+                    format!(
+                        "Root heal quarantine marker has no retained terminal source {} ({} bytes)",
+                        task_id, marker.1.source_prefix_len
+                    ),
+                );
+                continue;
             }
 
             let intent_raw = Self::read_raw(disks, &intent_path(task_id)?).await?;
             if intent_raw.len() > 1 {
-                return Err(Error::other(format!("Multiple root heal recovery owners for {task_id}")));
+                inventory
+                    .conflicted
+                    .insert(task_id.clone(), format!("Multiple root heal recovery owners for {task_id}"));
+                continue;
             }
             let Some((owner, source)) = intent_raw.into_iter().next() else {
                 if let Some(marker) = markers.get(&(RootHealRecordKind::Intent, task_id.clone())) {
-                    return Err(Error::other(format!(
-                        "Root heal quarantine marker has no retained intent source {} ({} bytes)",
-                        task_id, marker.1.source_prefix_len
-                    )));
+                    inventory.conflicted.insert(
+                        task_id.clone(),
+                        format!(
+                            "Root heal quarantine marker has no retained intent source {} ({} bytes)",
+                            task_id, marker.1.source_prefix_len
+                        ),
+                    );
                 }
                 continue;
             };
             if let Some(marker) = markers.get(&(RootHealRecordKind::Intent, task_id.clone())) {
                 if EcstoreDiskAPI::endpoint(marker.0.as_ref()) != EcstoreDiskAPI::endpoint(owner.as_ref())
-                    || marker.1.source_prefix_len != source.bytes.len()
-                    || marker.1.source_prefix_sha256 != source.source_prefix_sha256
-                    || marker.1.source_oversized != source.source_oversized
+                    || !marker.1.matches_source(&source)
                 {
-                    return Err(Error::other(format!("Root heal quarantine source changed {task_id}")));
+                    inventory
+                        .conflicted
+                        .insert(task_id.clone(), format!("Root heal quarantine source changed {task_id}"));
+                    continue;
                 }
                 inventory.quarantined_task_ids.insert(task_id.clone());
                 continue;
@@ -866,6 +1094,9 @@ impl RootHealRecovery {
                 }
             }
         }
+        inventory
+            .quarantined_task_ids
+            .retain(|task_id| !inventory.conflicted.contains_key(task_id));
         inventory
             .requests
             .sort_by(|left, right| left.created_at.cmp(&right.created_at).then_with(|| left.id.cmp(&right.id)));
@@ -924,18 +1155,29 @@ impl RootHealRecovery {
         if request.options.no_lock {
             return Err(Error::Other("Administrator root heal cannot skip namespace locking".to_string()));
         }
-        let intent = RootHealIntent::from_request(request)?;
+        let mut intent = RootHealIntent::from_request(request)?;
         intent.heal_type.validate()?;
-        let bytes =
-            serde_json::to_vec(&intent).map_err(|error| Error::Other(format!("Serialize root heal recovery record: {error}")))?;
         let path = intent_path(&request.id)?;
         if let Some((disk, expected)) = existing {
+            let previous = decode_intent(&request.id, &expected)?;
+            let mut previous_options = previous.options.clone();
+            previous_options.timeout = intent.options.timeout;
+            if previous.heal_type != intent.heal_type
+                || previous.bucket_incarnation_id != intent.bucket_incarnation_id
+                || previous.created_at != intent.created_at
+                || previous.priority != intent.priority
+                || previous_options != intent.options
+            {
+                return Err(Error::InvalidCheckpoint("Root heal recovery owner changed during handoff".to_string()));
+            }
+            intent.cluster_scope = previous.cluster_scope;
+            let bytes = intent.encode()?;
             return match EcstoreDiskAPI::compare_and_update_file(
                 disk.as_ref(),
                 RUSTFS_META_BUCKET,
                 &path,
                 Some(expected),
-                Some(bytes.into()),
+                Some(bytes),
             )
             .await?
             {
@@ -944,19 +1186,15 @@ impl RootHealRecovery {
             };
         }
 
+        let bytes = intent.encode()?;
+
         if disks.is_empty() {
             return Err(Error::Other("No local disk available for root heal shutdown recovery".to_string()));
         }
         let mut last_not_committed = None;
         for disk in &disks {
-            match EcstoreDiskAPI::compare_and_update_file(
-                disk.as_ref(),
-                RUSTFS_META_BUCKET,
-                &path,
-                None,
-                Some(bytes.clone().into()),
-            )
-            .await
+            match EcstoreDiskAPI::compare_and_update_file(disk.as_ref(), RUSTFS_META_BUCKET, &path, None, Some(bytes.clone()))
+                .await
             {
                 Ok(EcstoreConditionalFileUpdate::Updated) => return Ok(()),
                 Ok(_) => return Err(Error::Other(format!("Root heal recovery record changed for {}", request.id))),
@@ -967,6 +1205,63 @@ impl RootHealRecovery {
         match last_not_committed {
             Some(error) => Err(Error::Disk(error)),
             None => Err(Error::Other("No local disk accepted the root heal recovery record".to_string())),
+        }
+    }
+
+    pub(crate) async fn cluster_scope(&self, task: &HealTask) -> Result<Option<AdminClusterScope>> {
+        #[cfg(any(test, feature = "test-util"))]
+        if self.disabled_for_tests {
+            return Ok(None);
+        }
+        let _guard = self.mutation.lock().await;
+        let (_, bytes) = Self::find(&self.disks().await?, &task.id)
+            .await?
+            .ok_or_else(|| Error::InvalidCheckpoint("Administrator cluster intent is missing".to_string()))?;
+        let intent = decode_intent(&task.id, &bytes)?;
+        intent.validate_task(task)?;
+        Ok(intent.cluster_scope)
+    }
+
+    pub(crate) async fn checkpoint_cluster_scope(&self, task: &HealTask, scope: &AdminClusterScope) -> Result<()> {
+        scope.validate()?;
+        #[cfg(any(test, feature = "test-util"))]
+        if self.disabled_for_tests {
+            return Ok(());
+        }
+        let _guard = self.mutation.lock().await;
+        let (disk, expected) = Self::find(&self.disks().await?, &task.id)
+            .await?
+            .ok_or_else(|| Error::InvalidCheckpoint("Administrator cluster intent is missing".to_string()))?;
+        let mut intent = decode_intent(&task.id, &expected)?;
+        intent.validate_task(task)?;
+        if intent.heal_type != RecoveryHealType::Cluster {
+            return Err(Error::InvalidCheckpoint("Cluster scope requires a cluster task".to_string()));
+        }
+        if let Some(previous) = &intent.cluster_scope {
+            if previous.buckets != scope.buckets
+                || scope.next_bucket_index < previous.next_bucket_index
+                || scope.next_bucket_index > previous.next_bucket_index.saturating_add(scope.checkpoint_interval())
+            {
+                return Err(Error::InvalidCheckpoint(
+                    "Administrator cluster scope changed during recovery".to_string(),
+                ));
+            }
+        } else if scope.next_bucket_index != 0 {
+            return Err(Error::InvalidCheckpoint("Administrator cluster scope was not initialized".to_string()));
+        }
+        intent.cluster_scope = Some(scope.clone());
+        let bytes = intent.encode()?;
+        match EcstoreDiskAPI::compare_and_update_file(
+            disk.as_ref(),
+            RUSTFS_META_BUCKET,
+            &intent_path(&task.id)?,
+            Some(expected),
+            Some(bytes),
+        )
+        .await?
+        {
+            EcstoreConditionalFileUpdate::Updated => Ok(()),
+            _ => Err(Error::InvalidCheckpoint("Administrator cluster checkpoint owner changed".to_string())),
         }
     }
 
@@ -1015,16 +1310,7 @@ impl RootHealRecovery {
             return Ok(());
         };
         let mut intent = decode_intent(&task.id, &expected)?;
-        if HealType::from(intent.heal_type.clone()) != task.heal_type
-            || intent.bucket_incarnation_id != task.bucket_incarnation_id
-        {
-            return Err(Error::Other(format!("Root heal recovery owner changed for {}", task.id)));
-        }
-        let mut expected_options = intent.options.clone();
-        expected_options.timeout = task.options.timeout;
-        if intent.created_at != task.created_at || intent.priority != task.priority || expected_options != task.options {
-            return Err(Error::Other(format!("Root heal recovery owner changed for {}", task.id)));
-        }
+        intent.validate_task(task)?;
         // A terminal timeout leaves no runtime owner for stop() to snapshot.
         // Checkpoint its consumed budget before publishing terminal status;
         // never refund time if an earlier checkpoint is already stricter.
@@ -1033,14 +1319,13 @@ impl RootHealRecovery {
             (previous, remaining) => previous.or(remaining),
         };
         intent.retry_attempts = intent.retry_attempts.max(task.retry_attempts);
-        let bytes = serde_json::to_vec(&intent)
-            .map_err(|error| Error::Other(format!("Serialize root heal recovery checkpoint: {error}")))?;
+        let bytes = intent.encode()?;
         match EcstoreDiskAPI::compare_and_update_file(
             disk.as_ref(),
             RUSTFS_META_BUCKET,
             &intent_path(&task.id)?,
             Some(expected),
-            Some(bytes.into()),
+            Some(bytes),
         )
         .await?
         {
@@ -1360,6 +1645,17 @@ impl RootHealRecovery {
     pub(super) async fn pending(&self) -> Result<Vec<HealRequest>> {
         Ok(self.inventory().await?.requests)
     }
+
+    /// Why a durable record for `task_id` cannot run, if the inventory can be
+    /// read. Status queries are best-effort: an unreadable inventory reports
+    /// no issue rather than failing the query.
+    pub(crate) async fn record_issue(&self, task_id: &str) -> Option<String> {
+        #[cfg(any(test, feature = "test-util"))]
+        if self.disabled_for_tests {
+            return None;
+        }
+        self.inventory().await.ok()?.record_issue(task_id)
+    }
 }
 
 impl HealManager {
@@ -1367,7 +1663,20 @@ impl HealManager {
         // Decode every record before admitting anything. These are already
         // accepted responsibilities, so restore distinct IDs even when their
         // paths overlap or the configured admission capacity has changed.
-        let pending = self.root_recovery.inventory().await?.requests;
+        let inventory = self.root_recovery.inventory().await?;
+        for (task_id, reason) in &inventory.conflicted {
+            warn!(
+                target: "rustfs::heal::manager",
+                event = EVENT_HEAL_MANAGER_STATE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_MANAGER,
+                task_id,
+                result = "conflicting_record_skipped",
+                reason,
+                "Root heal recovery record skipped; operator repair required"
+            );
+        }
+        let pending = inventory.requests;
         let mut requests = Vec::with_capacity(pending.len());
         for request in pending {
             if let HealType::Bucket { bucket } = &request.heal_type {

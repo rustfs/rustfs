@@ -16,11 +16,11 @@ use super::ObjectOptions;
 use super::ecfs::FS;
 use super::{ECStore, PolicySys, ReplicationStatusType, StorageError, get_lock_acquire_timeout, is_err_bucket_not_found};
 use crate::auth::{
-    AuthType, OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION, RUSTFS_MAX_CONTENT_LENGTH_QUERY,
-    RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY, VerifiedPresignedRequest, VerifiedSigV4Request, check_key_valid_with_context,
-    get_condition_values_with_client_info, get_condition_values_with_query_and_client_info, get_request_auth_type_with_query,
-    get_session_token, parse_presigned_multipart_max_total_object_size, parse_presigned_put_max_content_length,
-    reject_unsigned_amz_headers_on_sigv4_request,
+    AuthType, OBJECT_CREATION_OPERATION_CONDITION, OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION,
+    RUSTFS_MAX_CONTENT_LENGTH_QUERY, RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY, VerifiedPresignedRequest, VerifiedSigV4Request,
+    check_key_valid_with_context, get_condition_values_with_client_info, get_condition_values_with_query_and_client_info,
+    get_request_auth_type_with_query, get_session_token, parse_presigned_multipart_max_total_object_size,
+    parse_presigned_put_max_content_length, reject_unsigned_amz_headers_on_sigv4_request,
 };
 use crate::error::{ApiError, normalize_put_read_quorum_error};
 use crate::license::license_check;
@@ -142,6 +142,17 @@ struct RequestedObjectLockRetainUntil(OffsetDateTime);
 
 #[derive(Clone, Debug)]
 struct RequestedObjectLockRetention(ObjectLockRetention);
+
+/// These operations stage upload state without publishing an object. Keep this
+/// separate from the marker controlling multipart publication fences.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MultipartStagingOperation;
+
+impl MultipartStagingOperation {
+    fn for_operation(operation: &str) -> Option<Self> {
+        matches!(operation, "CreateMultipartUpload" | "UploadPart" | "UploadPartCopy").then_some(Self)
+    }
+}
 
 #[derive(Clone, Debug)]
 struct StagedMultipartPartAuthorization;
@@ -887,8 +898,15 @@ fn authorization_conditions<T>(
         req.uri.query(),
         client_info,
     );
-    if req.extensions.get::<InternalObjectAuthorization>().is_some() {
+    let internal_object_authorization = req.extensions.get::<InternalObjectAuthorization>().is_some();
+    if internal_object_authorization {
         retain_internal_object_authorization_conditions(&mut conditions, cred);
+    }
+    if action == Action::S3Action(S3Action::PutObjectAction) {
+        let creates_object = internal_object_authorization || req.extensions.get::<MultipartStagingOperation>().is_none();
+        conditions.insert(OBJECT_CREATION_OPERATION_CONDITION.to_string(), vec![creates_object.to_string()]);
+    }
+    if internal_object_authorization {
         return Ok(conditions);
     }
     merge_list_bucket_query_conditions(action, req.uri.query(), &mut conditions);
@@ -1749,11 +1767,7 @@ fn table_catalog_store_for_data_plane<T>(
 }
 
 fn table_publication_guard_error(err: crate::table_catalog::TableCatalogStoreError) -> S3Error {
-    let code = match &err {
-        crate::table_catalog::TableCatalogStoreError::Unavailable(_) => S3ErrorCode::ServiceUnavailable,
-        _ => S3ErrorCode::InternalError,
-    };
-    S3Error::with_message(code, format!("failed to acquire table publication guard: {err}"))
+    S3Error::from(ApiError::from(err))
 }
 
 async fn retain_table_data_plane_publication_guard<T>(
@@ -1889,8 +1903,8 @@ fn table_list_cursor_key<T>(req: &S3Request<T>) -> S3Result<[u8; 32]> {
 }
 
 fn table_list_catalog_error(err: crate::table_catalog::TableCatalogStoreError) -> S3Error {
-    if matches!(err, crate::table_catalog::TableCatalogStoreError::Unavailable(_)) {
-        S3Error::from(ApiError::service_unavailable())
+    if err.is_unavailable() {
+        S3Error::from(ApiError::from(err))
     } else {
         S3Error::from(ApiError::access_denied())
     }
@@ -2032,11 +2046,7 @@ async fn table_data_plane_resource_for_request<T>(
             error = %err,
             "failed to resolve table data-plane resource"
         );
-        if matches!(err, crate::table_catalog::TableCatalogStoreError::Unavailable(_)) {
-            S3Error::from(ApiError::service_unavailable())
-        } else {
-            s3_error!(AccessDenied, "Access Denied")
-        }
+        table_list_catalog_error(err)
     })?;
     let resource = require_owned_reserved_table_object(object, resource)?;
     let bucket_fence_key = (bucket.to_string(), crate::table_catalog::default_table_bucket_publication_lock_path());
@@ -2224,12 +2234,16 @@ impl S3Access for FS {
         let auth_type = get_request_auth_type_with_query(cx.headers(), cx.uri().query());
         let verified_presigned = matches!(auth_type, AuthType::Presigned);
         let verified_sigv4 = matches!(auth_type, AuthType::Presigned | AuthType::Signed);
+        let multipart_staging_operation = MultipartStagingOperation::for_operation(cx.s3_op().name());
         // Publish this server's context slot so downstream data-plane handlers
         // resolve the same store (backlog#1052 S6).
         {
             let ext = cx.extensions_mut();
             ext.insert(self.server_ctx().clone());
             ext.insert(req_info);
+            if let Some(operation) = multipart_staging_operation {
+                ext.insert(operation);
+            }
             if verified_presigned {
                 ext.insert(VerifiedPresignedRequest);
             }
@@ -3827,7 +3841,7 @@ mod tests {
             "",
         ] {
             let error = TableCatalogStoreError::Unavailable(message.to_string());
-            let expected_message = format!("failed to acquire table publication guard: {error}");
+            let expected_message = ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable);
             let err = table_publication_guard_error(error);
             assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable, "{message}");
             assert_eq!(
@@ -3835,6 +3849,8 @@ mod tests {
                 Some(http::StatusCode::SERVICE_UNAVAILABLE)
             );
             assert_eq!(err.message(), Some(expected_message.as_str()));
+            let response = err.to_http_response().expect("serialize catalog failure");
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
         }
     }
 
@@ -3853,7 +3869,7 @@ mod tests {
             TableCatalogStoreError::AlreadyExists(message.clone()),
             TableCatalogStoreError::Conflict(message),
         ] {
-            let expected_message = format!("failed to acquire table publication guard: {error}");
+            let expected_message = ApiError::error_code_to_message(&S3ErrorCode::InternalError);
             let err = table_publication_guard_error(error);
             assert_eq!(err.code(), &S3ErrorCode::InternalError);
             assert_eq!(
@@ -3861,13 +3877,16 @@ mod tests {
                 Some(http::StatusCode::INTERNAL_SERVER_ERROR)
             );
             assert_eq!(err.message(), Some(expected_message.as_str()));
+            let response = err.to_http_response().expect("serialize catalog failure");
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
         }
     }
 
     #[tokio::test]
     #[serial]
-    async fn table_publication_guard_timeout_blocks_put_and_multipart_authorization() {
+    async fn table_publication_guard_timeout_blocks_put_delete_and_multipart_authorization() {
         use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
+        use http_body_util::BodyExt as _;
         use std::time::Duration;
 
         let store = crate::app::gating_test_env::shared_gating_ecstore().await;
@@ -3880,7 +3899,7 @@ mod tests {
             .await
             .expect("test bucket should be created");
         let policy_json = format!(
-            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:PutObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:PutObject","s3:DeleteObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
         );
         let mut metadata = (*crate::storage::get_bucket_metadata(&bucket)
             .await
@@ -3916,6 +3935,16 @@ mod tests {
                 .expect("multipart input should build"),
             Method::POST,
         );
+        let mut delete_req = build_request(
+            DeleteObjectInput::builder()
+                .bucket(bucket.clone())
+                .key("object".to_string())
+                .build()
+                .expect("DELETE input should build"),
+            Method::DELETE,
+        );
+        ensure_req_info(&mut delete_req);
+        delete_req.extensions.insert(fs.server_ctx().clone());
         ensure_req_info(&mut put_req);
         ensure_req_info(&mut multipart_req);
         put_req.extensions.insert(fs.server_ctx().clone());
@@ -3929,6 +3958,12 @@ mod tests {
                     .expect_err("PUT must wait for the publication writer"),
             ),
             (
+                "DeleteObject",
+                fs.delete_object(&mut delete_req)
+                    .await
+                    .expect_err("DELETE must wait for the publication writer"),
+            ),
+            (
                 "CreateMultipartUpload",
                 fs.create_multipart_upload(&mut multipart_req)
                     .await
@@ -3936,8 +3971,24 @@ mod tests {
             ),
         ] {
             assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable, "{operation}: {err}");
+            let source = err.source().expect("retain the typed publication lock failure");
+            let storage = source
+                .downcast_ref::<crate::storage_api::error::StorageError>()
+                .expect("use the canonical storage error boundary");
+            assert!(matches!(
+                storage,
+                crate::storage_api::error::StorageError::Lock(rustfs_lock::LockError::Timeout { .. })
+            ));
+            let response = err.to_http_response().expect("serialize publication failure");
+            assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
+            let body = response.into_body().collect().await.expect("read error XML").to_bytes();
+            let body = String::from_utf8(body.to_vec()).expect("S3 XML is UTF-8");
+            assert!(body.contains("<Code>ServiceUnavailable</Code>"));
+            assert!(!body.contains(&bucket));
+            assert!(!body.contains(&lock_object));
         }
-        for extensions in [&put_req.extensions, &multipart_req.extensions] {
+        for extensions in [&put_req.extensions, &delete_req.extensions, &multipart_req.extensions] {
             assert!(extensions.get::<TableDataPlanePublicationGuards>().is_none());
         }
 
@@ -3949,7 +4000,10 @@ mod tests {
             fs.create_multipart_upload(&mut multipart_req)
                 .await
                 .expect("multipart initialization may retry after publication finishes");
-            for extensions in [&put_req.extensions, &multipart_req.extensions] {
+            fs.delete_object(&mut delete_req)
+                .await
+                .expect("DELETE may retry after publication finishes");
+            for extensions in [&put_req.extensions, &delete_req.extensions, &multipart_req.extensions] {
                 let retained = extensions
                     .get::<TableDataPlanePublicationGuards>()
                     .expect("successful admission retains the guard");
@@ -3960,6 +4014,7 @@ mod tests {
         }
         drop(put_req);
         drop(multipart_req);
+        drop(delete_req);
         lock.get_write_lock(Duration::from_secs(1))
             .await
             .expect("dropping the request must release its publication guard");
@@ -4372,6 +4427,170 @@ mod tests {
                     deny_only: false,
                 };
                 assert_eq!(policy.is_allowed(&args).await, version.is_none(), "version selector {version:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn object_creation_operation_classifies_only_multipart_staging() {
+        for (operation, staging) in [
+            ("CreateMultipartUpload", true),
+            ("UploadPart", true),
+            ("UploadPartCopy", true),
+            ("PutObject", false),
+            ("CopyObject", false),
+            ("CompleteMultipartUpload", false),
+            ("PostObject", false),
+            ("GetObject", false),
+            ("InternalObjectWrite", false),
+        ] {
+            assert_eq!(
+                super::MultipartStagingOperation::for_operation(operation).is_some(),
+                staging,
+                "{operation}"
+            );
+        }
+    }
+
+    #[test]
+    fn object_creation_operation_ignores_request_and_claim_spoofing() {
+        use crate::auth::{OBJECT_CREATION_OPERATION_CONDITION, get_condition_values};
+        for forged in ["false", "true"] {
+            for claim in [
+                "ObjectCreationOperation",
+                "objectcreationoperation",
+                "OBJECTCREATIONOPERATION",
+                "ldapObjectCreationOperation",
+                "ldapldapObjectCreationOperation",
+            ] {
+                let credentials = rustfs_credentials::Credentials {
+                    claims: Some(HashMap::from([(claim.to_string(), serde_json::json!(forged))])),
+                    ..Default::default()
+                };
+                let mut req = build_request((), Method::GET);
+                req.uri = format!("/bucket/key?ObjectCreationOperation={forged}&uploadId=fake&partNumber=1")
+                    .parse()
+                    .expect("spoofed query should parse");
+                req.headers
+                    .insert("objectcreationoperation", HeaderValue::from_str(forged).expect("header should parse"));
+                assert!(
+                    !get_condition_values(&req.headers, &credentials, None, None, None)
+                        .keys()
+                        .any(|key| key.eq_ignore_ascii_case(OBJECT_CREATION_OPERATION_CONDITION))
+                );
+                for staging in [false, true] {
+                    if staging {
+                        req.extensions.insert(super::MultipartStagingOperation);
+                    }
+                    for internal in [false, true] {
+                        if internal {
+                            req.extensions.insert(InternalObjectAuthorization);
+                        } else {
+                            req.extensions.remove::<InternalObjectAuthorization>();
+                        }
+                        for action in [
+                            S3Action::PutObjectAction,
+                            S3Action::GetObjectAction,
+                            S3Action::GetObjectVersionAction,
+                        ] {
+                            let conditions =
+                                authorization_conditions(&req, &credentials, None, None, None, None, Action::S3Action(action))
+                                    .expect("conditions should build");
+                            let values = conditions
+                                .iter()
+                                .filter(|(key, _)| key.eq_ignore_ascii_case(OBJECT_CREATION_OPERATION_CONDITION))
+                                .collect::<Vec<_>>();
+                            if action == S3Action::PutObjectAction {
+                                assert_eq!(values.len(), 1, "one canonical server-derived value");
+                                assert_eq!(values[0].0, OBJECT_CREATION_OPERATION_CONDITION);
+                                assert_eq!(
+                                    values[0].1,
+                                    &vec![(internal || !staging).to_string()],
+                                    "{claim}, internal={internal}, staging={staging}"
+                                );
+                            } else {
+                                assert!(values.is_empty(), "non-PutObject action {action:?} must have no creation condition");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn object_creation_operation_controls_identity_and_bucket_policies() {
+        use rustfs_policy::policy::{Args, Policy};
+        for effect in ["Allow", "Deny"] {
+            for expected in [false, true] {
+                let mut statements = vec![serde_json::json!({
+                    "Effect": effect, "Action": "s3:PutObject", "Resource": "arn:aws:s3:::bucket/*",
+                    "Condition": { "Bool": { "s3:ObjectCreationOperation": expected.to_string() } }
+                })];
+                if effect == "Deny" {
+                    statements.push(serde_json::json!({
+                        "Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::bucket/*"
+                    }));
+                }
+                let identity: Policy = serde_json::from_str(
+                    &serde_json::json!({
+                        "Version": "2012-10-17", "Statement": statements
+                    })
+                    .to_string(),
+                )
+                .expect("identity policy should accept the AWS Bool key");
+                for statement in &mut statements {
+                    statement["Principal"] = serde_json::json!("*");
+                }
+                let bucket: BucketPolicy = serde_json::from_str(
+                    &serde_json::json!({
+                        "Version": "2012-10-17", "Statement": statements
+                    })
+                    .to_string(),
+                )
+                .expect("bucket policy should accept the AWS Bool key");
+                for actual in [None, Some(false), Some(true)] {
+                    let conditions = actual
+                        .map(|value| HashMap::from([("ObjectCreationOperation".to_string(), vec![value.to_string()])]))
+                        .unwrap_or_default();
+                    let allowed = if effect == "Allow" {
+                        actual == Some(expected)
+                    } else {
+                        actual != Some(expected)
+                    };
+                    assert_eq!(
+                        identity
+                            .is_allowed(&Args {
+                                account: "writer",
+                                groups: &None,
+                                action: Action::S3Action(S3Action::PutObjectAction),
+                                bucket: "bucket",
+                                object: "object",
+                                conditions: &conditions,
+                                is_owner: false,
+                                claims: &HashMap::new(),
+                                deny_only: false,
+                            })
+                            .await,
+                        allowed,
+                        "identity {effect}, expected={expected}, actual={actual:?}"
+                    );
+                    assert_eq!(
+                        bucket
+                            .is_allowed(&BucketPolicyArgs {
+                                account: "writer",
+                                groups: &None,
+                                action: Action::S3Action(S3Action::PutObjectAction),
+                                bucket: "bucket",
+                                object: "object",
+                                conditions: &conditions,
+                                is_owner: false,
+                            })
+                            .await,
+                        allowed,
+                        "bucket {effect}, expected={expected}, actual={actual:?}"
+                    );
+                }
             }
         }
     }

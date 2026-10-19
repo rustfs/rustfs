@@ -142,11 +142,11 @@ fn same_replication_service(edited: &BucketTarget, previous: &BucketTarget) -> b
         && access_key(edited) == access_key(previous)
 }
 
-/// Page size and page budget for [`TargetClient::locate_replica_by_etag`].
+/// Page size and page budget for [`TargetClient::replica_candidates`].
 const FIND_VERSION_BY_ETAG_PAGE_SIZE: i32 = 1000;
 const FIND_VERSION_BY_ETAG_MAX_PAGES: usize = 8;
-/// Candidate cap for [`TargetClient::replica_candidates_by_etag`]: more than
-/// this many same-content versions of one key is ambiguity by any measure.
+/// Candidate cap for [`TargetClient::replica_candidates`]: more than this
+/// many matching versions of one key is ambiguity by any measure.
 const FIND_VERSION_BY_ETAG_MAX_MATCHES: usize = 16;
 pub type GetObjectSdkError = Box<SdkError<GetObjectError>>;
 pub type GetObjectTaggingSdkError = Box<SdkError<GetObjectTaggingError>>;
@@ -2030,27 +2030,28 @@ impl TargetClient {
 
     /// Candidate replicas by content identity on a target that mints its own
     /// version ids: page `ListObjectVersions` under the exact key and report
-    /// the live versions whose ETag matches `source_etag`, newest first.
-    /// Delete markers and prefix siblings never match. Bounded to
+    /// the live versions that match `identity`, newest first. Delete markers
+    /// and prefix siblings never match. Bounded to
     /// [`FIND_VERSION_BY_ETAG_MAX_PAGES`] pages and
-    /// [`FIND_VERSION_BY_ETAG_MAX_MATCHES`] candidates so a key with a very
-    /// deep history cannot turn one convergence check into an unbounded scan;
-    /// a replica beyond that window reads as missing, which only costs a
-    /// re-PUT (today's behaviour), never a lost object.
+    /// [`FIND_VERSION_BY_ETAG_MAX_MATCHES`] candidates per kind so a key with
+    /// a very deep history cannot turn one convergence check into an
+    /// unbounded scan; a replica beyond that window reads as missing, which
+    /// only costs a re-PUT (today's behaviour), never a lost object.
     ///
     /// Content identity is not version identity: two source generations with
-    /// the same bytes have the same ETag. Callers drop the candidates other
-    /// source versions already claim through their ledgers and refuse an
-    /// [`ReplicaLocation::Ambiguous`] remainder before mutating or deleting.
-    pub async fn replica_candidates_by_etag(
+    /// the same bytes have the same ETag, and two with the same size have the
+    /// same shape. Callers drop the candidates other source versions already
+    /// claim through their ledgers and decide through
+    /// [`ReplicaCandidates::locate`].
+    pub async fn replica_candidates(
         &self,
         bucket: &str,
         object: &str,
-        source_etag: &str,
-    ) -> Result<Vec<String>, Box<SdkError<aws_sdk_s3::operation::list_object_versions::ListObjectVersionsError>>> {
+        identity: &ReplicaIdentity<'_>,
+    ) -> Result<ReplicaCandidates, Box<SdkError<aws_sdk_s3::operation::list_object_versions::ListObjectVersionsError>>> {
         let mut key_marker: Option<String> = None;
         let mut version_id_marker: Option<String> = None;
-        let mut matches: Vec<String> = Vec::new();
+        let mut candidates = ReplicaCandidates::default();
         for _ in 0..FIND_VERSION_BY_ETAG_MAX_PAGES {
             let page = self
                 .client
@@ -2063,19 +2064,27 @@ impl TargetClient {
                 .send()
                 .await
                 .map_err(Box::new)?;
-            matches.extend(
-                page.versions()
-                    .iter()
-                    .filter(|version| {
-                        version.key() == Some(object)
-                            && version.version_id().is_some_and(|id| !id.is_empty())
-                            && replication_etags_match(Some(source_etag), version.e_tag())
-                    })
-                    .filter_map(|version| version.version_id().map(str::to_string)),
-            );
+            for version in page.versions() {
+                let Some(version_id) = version.version_id().filter(|id| !id.is_empty()) else {
+                    continue;
+                };
+                if version.key() != Some(object) {
+                    continue;
+                }
+                match identity.evidence(version.e_tag(), version.size(), version.last_modified()) {
+                    Some(ReplicaEvidence::Etag) => candidates.exact.push(version_id.to_string()),
+                    // An unversioned target overwrites the key in place: its
+                    // `null` version holds whichever generation was written
+                    // last, so a shape match there identifies nothing.
+                    Some(ReplicaEvidence::Shape) if version_id != "null" => candidates.shaped.push(version_id.to_string()),
+                    Some(ReplicaEvidence::Shape) => {}
+                    None => {}
+                }
+            }
             // A listing that moved past the exact key (every listed key is >=
-            // the prefix), ended, or already filled the candidate cap decides.
-            if matches.len() >= FIND_VERSION_BY_ETAG_MAX_MATCHES
+            // the prefix), ended, or already filled a candidate cap decides.
+            if candidates.exact.len() >= FIND_VERSION_BY_ETAG_MAX_MATCHES
+                || candidates.shaped.len() >= FIND_VERSION_BY_ETAG_MAX_MATCHES
                 || page
                     .versions()
                     .iter()
@@ -2090,8 +2099,9 @@ impl TargetClient {
                 break;
             }
         }
-        matches.truncate(FIND_VERSION_BY_ETAG_MAX_MATCHES);
-        Ok(matches)
+        candidates.exact.truncate(FIND_VERSION_BY_ETAG_MAX_MATCHES);
+        candidates.shaped.truncate(FIND_VERSION_BY_ETAG_MAX_MATCHES);
+        Ok(candidates)
     }
 
     /// PutObjectRetention against a replica version on a target that does not
@@ -2614,19 +2624,18 @@ impl TargetClient {
 }
 
 /// Where a replica stands on a target that mints its own version ids, by
-/// content identity (exact key + ETag) after the candidates other source
-/// versions claim were removed. See
-/// [`TargetClient::replica_candidates_by_etag`].
+/// content identity after the candidates other source versions claim were
+/// removed. See [`TargetClient::replica_candidates`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplicaLocation {
-    /// No live version under the key carries the source ETag.
+    /// No live version under the key matches the source.
     Missing,
-    /// Exactly one live version carries it: safe to address.
+    /// Exactly one live version matches: safe to address.
     Unique(String),
-    /// More than one live version carries it (same bytes replicated for
-    /// several source generations). `newest` is the most recently listed
-    /// one — good enough to prove the replica exists, never good enough to
-    /// pick which one to mutate or delete.
+    /// More than one live version carries the source ETag (same bytes
+    /// replicated for several source generations). `newest` is the most
+    /// recently listed one — good enough to prove the replica exists, never
+    /// good enough to pick which one to mutate or delete.
     Ambiguous { newest: String },
 }
 
@@ -2649,6 +2658,107 @@ impl ReplicaLocation {
             Self::Missing => None,
             Self::Unique(version_id) | Self::Ambiguous { newest: version_id } => Some(version_id),
         }
+    }
+}
+
+/// What a replica of an encrypted source version still has in common with
+/// it on a target that computes its own ETags. The source ETag is a keyed
+/// fingerprint (docs/operations/encrypted-etags.md) or a legacy plaintext
+/// MD5 the target's re-encrypted replica never reports, so the replica is
+/// recognised by the byte count the replication PUT sent and by a write time
+/// no earlier than the source version's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncryptedReplicaShape {
+    /// Bytes on the replication wire: the plaintext size for managed SSE,
+    /// the stored ciphertext size for an SSE-C passthrough.
+    pub size: i64,
+    /// The source version's mtime in whole seconds; listings and HEAD report
+    /// second-precision times.
+    pub not_before_secs: i64,
+}
+
+impl EncryptedReplicaShape {
+    pub fn matches(&self, size: Option<i64>, last_modified: Option<&aws_sdk_s3::primitives::DateTime>) -> bool {
+        size == Some(self.size) && last_modified.is_some_and(|written| written.secs() >= self.not_before_secs)
+    }
+}
+
+/// How a source version recognises its replica among a key's target
+/// versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaIdentity<'a> {
+    /// Unencrypted source: its ETag is the MD5 of the replicated bytes, which
+    /// every target reports back — exact identity.
+    Etag(&'a str),
+    /// Encrypted source: a target that adopts the source ETag (RustFS,
+    /// MinIO) still reports `etag`; any other target only keeps the shape.
+    Encrypted {
+        etag: Option<&'a str>,
+        shape: EncryptedReplicaShape,
+    },
+}
+
+/// Which kind of evidence tied a target version to the source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaEvidence {
+    /// The target reports the source ETag.
+    Etag,
+    /// Encrypted source on a target that computes its own ETag: same size,
+    /// written no earlier than the source version.
+    Shape,
+}
+
+impl ReplicaIdentity<'_> {
+    pub fn evidence(
+        &self,
+        etag: Option<&str>,
+        size: Option<i64>,
+        last_modified: Option<&aws_sdk_s3::primitives::DateTime>,
+    ) -> Option<ReplicaEvidence> {
+        match *self {
+            Self::Etag(source_etag) => replication_etags_match(Some(source_etag), etag).then_some(ReplicaEvidence::Etag),
+            Self::Encrypted {
+                etag: source_etag,
+                shape,
+            } => {
+                if replication_etags_match(source_etag, etag) {
+                    Some(ReplicaEvidence::Etag)
+                } else {
+                    shape.matches(size, last_modified).then_some(ReplicaEvidence::Shape)
+                }
+            }
+        }
+    }
+}
+
+/// Content-identity candidates of one key, newest first, by evidence kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplicaCandidates {
+    /// Versions that report the source ETag.
+    pub exact: Vec<String>,
+    /// Encrypted sources only: versions without the source ETag whose shape
+    /// matches.
+    pub shaped: Vec<String>,
+}
+
+impl ReplicaCandidates {
+    pub fn is_empty(&self) -> bool {
+        self.exact.is_empty() && self.shaped.is_empty()
+    }
+
+    /// Drop the candidates other source versions claim and decide. An ETag
+    /// match outranks any shape match. A shape is weaker evidence than an
+    /// ETag — two generations of one size share it — so several shape
+    /// matches are never resolved by picking one: they read as
+    /// [`ReplicaLocation::Missing`] for convergence (the caller re-PUTs, a
+    /// duplicate at worst) and as ambiguous for a purge (it refuses).
+    pub fn locate(mut self, claimed: &HashSet<String>) -> (ReplicaLocation, ReplicaEvidence) {
+        self.exact.retain(|candidate| !claimed.contains(candidate));
+        if !self.exact.is_empty() {
+            return (ReplicaLocation::from_matches(self.exact), ReplicaEvidence::Etag);
+        }
+        self.shaped.retain(|candidate| !claimed.contains(candidate));
+        (ReplicaLocation::from_matches(self.shaped), ReplicaEvidence::Shape)
     }
 }
 

@@ -43,56 +43,25 @@ fn missing_storage(error: MockHealObjectOutcome) -> Arc<MockStorage> {
 
 #[tokio::test]
 async fn missing_usage_observation_completes_without_claiming_repair_or_absence_proof() {
+    // rustfs/rustfs#8132: the observation follows the general not-found rule
+    // (see `absent_verdict`); the completion still records no proof.
     for outer in [false, true] {
         let storage = missing_storage(MockHealObjectOutcome::MissingObject { outer });
         let task = task(RUSTFS_META_BUCKET, OBSERVATION, HealRequestSource::ReadRepair, None, storage.clone());
         task.execute()
             .await
-            .expect("a removed observation is a normal read-repair skip");
+            .expect("a removed observation is a normal read-repair completion");
         assert_eq!(task.get_status().await, HealTaskStatus::Completed);
         let outcome = task.get_outcome().await;
         assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
         assert_eq!(outcome.counters.failed, 0);
-        assert_eq!(outcome.counters.skipped, 1);
         assert_eq!(outcome.objects[0].disposition, HealObjectDisposition::Unknown);
         let progress = task.get_progress().await;
         assert_eq!(progress.objects_healed, 0);
-        assert_eq!(progress.skipped_objects, 1);
+        assert_eq!(progress.objects_failed, 0);
         let calls = storage.object_heal_opts.lock().expect("heal calls");
         assert_eq!(calls.len(), 1);
-        assert!(calls[0].recreate, "the test must reach the actual recreation branch");
-    }
-}
-
-#[tokio::test]
-async fn missing_usage_observation_exclusion_is_limited_to_the_exact_read_repair_target() {
-    for (bucket, object, source, version) in [
-        ("user-bucket", OBSERVATION, HealRequestSource::ReadRepair, None),
-        (RUSTFS_META_BUCKET, "buckets/.usage.json", HealRequestSource::ReadRepair, None),
-        (
-            RUSTFS_META_BUCKET,
-            "buckets/.usage.observed.json.bkp",
-            HealRequestSource::ReadRepair,
-            None,
-        ),
-        (
-            RUSTFS_META_BUCKET,
-            "buckets/nested/.usage.observed.json",
-            HealRequestSource::ReadRepair,
-            None,
-        ),
-        (RUSTFS_META_BUCKET, OBSERVATION, HealRequestSource::Admin, None),
-        (RUSTFS_META_BUCKET, OBSERVATION, HealRequestSource::Internal, None),
-        (RUSTFS_META_BUCKET, OBSERVATION, HealRequestSource::Scanner, None),
-        (RUSTFS_META_BUCKET, OBSERVATION, HealRequestSource::AutoHeal, None),
-        (RUSTFS_META_BUCKET, OBSERVATION, HealRequestSource::ReadRepair, Some("version-a")),
-    ] {
-        let storage = missing_storage(MockHealObjectOutcome::MissingObject { outer: false });
-        let task = task(bucket, object, source, version, storage);
-        task.execute()
-            .await
-            .expect_err("other requests must retain their missing-object failure");
-        assert_eq!(task.get_outcome().await.counters.failed, 1, "{bucket}/{object}: {source:?}");
+        assert!(calls[0].read_repair, "the request still reaches the locked storage read once");
     }
 }
 
@@ -102,12 +71,13 @@ async fn usage_observation_does_not_hide_non_absence_errors() {
         MockHealObjectOutcome::PermissionDenied,
         MockHealObjectOutcome::OkWithReadQuorum,
         MockHealObjectOutcome::FaultyStorageDisk(false),
-        MockHealObjectOutcome::MissingVersion,
-        MockHealObjectOutcome::ErrOther("File not found"),
+        MockHealObjectOutcome::ErrOther("Disk not found"),
     ] {
         let storage = missing_storage(error);
         let task = task(RUSTFS_META_BUCKET, OBSERVATION, HealRequestSource::ReadRepair, None, storage);
-        task.execute().await.expect_err("only a typed object absence may be skipped");
+        task.execute()
+            .await
+            .expect_err("only an object-level absence completes the heal");
         assert_eq!(task.get_outcome().await.counters.failed, 1);
     }
 }

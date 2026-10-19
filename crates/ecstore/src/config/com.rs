@@ -574,17 +574,20 @@ where
         >,
 {
     let h = HeaderMap::new();
-    let mut rd = api
-        .get_object_reader(RUSTFS_META_BUCKET, file, None, h, opts)
-        .await
-        .map_err(|err| {
-            if err == Error::FileNotFound || matches!(err, Error::ObjectNotFound(_, _)) {
-                Error::ConfigNotFound
-            } else {
-                warn!("read_config_with_metadata: err: {:?}, file: {}", err, file);
-                err
-            }
-        })?;
+    let read = api.get_object_reader(RUSTFS_META_BUCKET, file, None, h, opts);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let read = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+        rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::ConfigRead,
+        read,
+    );
+    let mut rd = read.await.map_err(|err| {
+        if err == Error::FileNotFound || matches!(err, Error::ObjectNotFound(_, _)) {
+            Error::ConfigNotFound
+        } else {
+            warn!("read_config_with_metadata: err: {:?}, file: {}", err, file);
+            err
+        }
+    })?;
 
     let data = if let Some(max_bytes) = max_bytes {
         let object_size = usize::try_from(rd.object_info.size).map_err(|_| Error::CorruptedFormat)?;
@@ -807,7 +810,18 @@ where
         >,
 {
     let mut put_data = PutObjReader::from_vec(data);
-    match api.put_object(RUSTFS_META_BUCKET, file, &mut put_data, opts).await {
+    let write = api.put_object(RUSTFS_META_BUCKET, file, &mut put_data, opts);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let write = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+        rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::ConfigWrite,
+        async {
+            crate::cluster::rpc::runtime_sources::observe_read_version_context_boundary(
+                rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::ConfigWrite,
+            );
+            write.await
+        },
+    );
+    match write.await {
         Ok(object_info) => Ok(object_info),
         Err(err) => {
             if log_error {
@@ -2839,7 +2853,7 @@ mod tests {
     use rustfs_config::{
         DEFAULT_DELIMITER, ENABLE_KEY, EnableState, HEAL_BITROT_CYCLE, HEAL_SUB_SYS, MYSQL_DSN_STRING,
         MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_TABLE, SCANNER_CYCLE, SCANNER_IDLE_MODE, SCANNER_KEYS, SCANNER_SPEED,
-        SCANNER_SUB_SYS,
+        SCANNER_SUB_SYS, SCANNER_WALKERS_PER_DISK,
     };
 
     #[tokio::test]
@@ -2869,6 +2883,11 @@ mod tests {
     #[derive(Debug, Default)]
     struct MetadataWriteStore {
         error: Option<Error>,
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        observations:
+            std::sync::Mutex<Vec<(Option<rustfs_io_metrics::internode_metrics::ReadVersionEntrySource>, Option<&'static str>)>>,
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        pending: bool,
     }
 
     #[async_trait::async_trait]
@@ -2899,7 +2918,20 @@ mod tests {
             _data: &mut Self::PutObjectReader,
             _opts: &Self::ObjectOptions,
         ) -> core::result::Result<Self::ObjectInfo, Self::Error> {
-            Err(self.error.clone().expect("test store error should be configured"))
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            {
+                self.observations.lock().expect("observations lock").push((
+                    crate::cluster::rpc::runtime_sources::current_read_version_entry_source(),
+                    rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(),
+                ));
+                if self.pending {
+                    std::future::pending::<()>().await;
+                }
+            }
+            match self.error.clone() {
+                Some(error) => Err(error),
+                None => Ok(ObjectInfo::default()),
+            }
         }
     }
 
@@ -2907,6 +2939,10 @@ mod tests {
     async fn save_config_preserves_retryable_system_volume_errors() {
         let store = Arc::new(MetadataWriteStore {
             error: Some(Error::BucketNotFound(RUSTFS_META_BUCKET.to_string())),
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            observations: Default::default(),
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            pending: false,
         });
         let error =
             save_config_with_opts_inner(store, "buckets/example/.metadata.bin", Vec::new(), &ObjectOptions::default(), false)
@@ -2917,6 +2953,59 @@ mod tests {
             error,
             Error::InsufficientWriteQuorum(RUSTFS_META_BUCKET.to_string(), "buckets/example/.metadata.bin".to_string())
         );
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn diagnostic_config_write_retains_origin_and_api_for_results_and_cancellation() {
+        use crate::cluster::rpc::runtime_sources::{current_read_version_entry_source, with_read_version_entry};
+        use rustfs_io_metrics::internode_metrics::ReadVersionEntrySource;
+        use rustfs_io_metrics::s3_http_metrics::{S3HttpRequestGuard, current_s3_http_operation_context};
+
+        let mut guard = S3HttpRequestGuard::new("PUT");
+        let put = guard.in_scope(|| {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::PutObject);
+            current_s3_http_operation_context().expect("captured PutObject")
+        });
+        for earlier in [None, Some(ReadVersionEntrySource::TierConfigReload)] {
+            for api in [None, Some(put)] {
+                for case in ["success", "error", "cancelled"] {
+                    let store = Arc::new(MetadataWriteStore {
+                        error: (case == "error").then_some(Error::VolumeNotFound),
+                        pending: case == "cancelled",
+                        ..Default::default()
+                    });
+                    let opts = ObjectOptions::default();
+                    let write = async {
+                        let result = tokio::time::timeout(
+                            std::time::Duration::from_secs(1),
+                            save_config_with_opts_inner(store.clone(), "buckets/diagnostic/state", Vec::new(), &opts, false),
+                        )
+                        .await;
+                        match case {
+                            "success" => assert!(result.expect("write completes").is_ok()),
+                            "error" => {
+                                assert!(matches!(result.expect("error completes"), Err(Error::InsufficientWriteQuorum(_, _))))
+                            }
+                            _ => assert!(result.is_err(), "pending write is cancelled"),
+                        }
+                    };
+                    rustfs_io_metrics::s3_http_metrics::with_isolated_s3_http_operation_context(api, async {
+                        match earlier {
+                            Some(source) => with_read_version_entry(source, write).await,
+                            None => write.await,
+                        }
+                    })
+                    .await;
+                    assert_eq!(
+                        *store.observations.lock().expect("observations lock"),
+                        vec![(Some(earlier.unwrap_or(ReadVersionEntrySource::ConfigWrite)), api.map(|_| "s3:PutObject"))]
+                    );
+                    assert_eq!(current_read_version_entry_source(), None, "write scope restores: {case}");
+                    assert_eq!(current_s3_http_operation_context(), None, "API scope restores: {case}");
+                }
+            }
+        }
     }
     use rustfs_lock::client::LockClient;
     use rustfs_lock::client::local::LocalClient;
@@ -4112,6 +4201,8 @@ mod tests {
             let value = match *key {
                 SCANNER_SPEED => "fast",
                 SCANNER_IDLE_MODE => "false",
+                // "1" is this key's default, which the diff encoding omits.
+                SCANNER_WALKERS_PER_DISK => "2",
                 _ => "1",
             };
             scanner_kvs.insert((*key).to_string(), value.to_string());
@@ -4133,6 +4224,8 @@ mod tests {
             let expected = match *key {
                 SCANNER_SPEED => "fast",
                 SCANNER_IDLE_MODE => "false",
+                // "1" is this key's default, which the diff encoding omits.
+                SCANNER_WALKERS_PER_DISK => "2",
                 _ => "1",
             };
             assert_eq!(decoded_scanner.get(key), expected, "scanner key {key} should survive roundtrip");

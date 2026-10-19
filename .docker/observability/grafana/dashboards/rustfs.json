@@ -1748,7 +1748,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (job, bucket) (rustfs_cluster_usage_buckets_objects_count{job=~\"$job\", bucket=~\"$bucket\"})",
+          "expr": "max by (rustfs_cluster_id, job, bucket) (rustfs_cluster_usage_buckets_objects_count{rustfs_cluster_id=\"$storage_cluster\", job=~\"$job\", bucket=~\"$bucket\"})",
           "legendFormat": "{{bucket}}",
           "range": true,
           "refId": "A"
@@ -1848,7 +1848,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (job, bucket) (rustfs_cluster_usage_buckets_total_bytes{job=~\"$job\", bucket=~\"$bucket\"})",
+          "expr": "max by (rustfs_cluster_id, job, bucket) (rustfs_cluster_usage_buckets_total_bytes{rustfs_cluster_id=\"$storage_cluster\", job=~\"$job\", bucket=~\"$bucket\"})",
           "legendFormat": "{{bucket}}",
           "range": true,
           "refId": "A"

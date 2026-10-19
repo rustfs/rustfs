@@ -120,8 +120,11 @@ pub fn object_lock_put_integrity(
 /// stored bytes differ from what the source sent — e.g. a target that does not
 /// decode `aws-chunked` framing stores the frames verbatim and returns their
 /// ETag. Only a plain single-part MD5 ETag on both sides is decidable; a
-/// multipart or opaque (encrypted) ETag, or a withheld replica ETag, returns
-/// `false` because no corruption can be concluded from it.
+/// multipart ETag, or a withheld replica ETag, returns `false` because no
+/// corruption can be concluded from it. An encrypted source's keyed
+/// fingerprint is also 32 hex characters and cannot be told apart from an MD5
+/// here, so callers must exempt encrypted sources before asking (the ecstore
+/// resyncer does so through its source-encryption classifier).
 pub fn single_part_replica_etag_mismatch(source_etag: Option<&str>, replica_etag: Option<&str>) -> bool {
     let Some(source) = source_etag.map(trim_etag) else {
         return false;

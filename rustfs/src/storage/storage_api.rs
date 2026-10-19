@@ -27,6 +27,15 @@ pub(crate) mod ecstore_integrity {
         IntegrityError, JobRequest, control_job, create_job, get_job, inventory, readiness, resume_job,
     };
 }
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+pub(crate) mod ecstore_diagnostic {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::diagnostic::current_read_version_entry_source;
+    pub(crate) use rustfs_ecstore::api::diagnostic::{
+        ReadVersionContextBoundary, ReadVersionEntrySource, with_read_version_spawn_context,
+    };
+}
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 
@@ -59,6 +68,8 @@ fn bucket_targets_metadata_lock_shard(bucket: &str) -> usize {
 
 pub(crate) mod contract {
     pub(crate) mod admin {
+        #[cfg(test)]
+        pub(crate) use super::super::storage_contracts::DiskSetSelector;
         pub(crate) use super::super::storage_contracts::StorageAdminApi;
     }
 
@@ -125,10 +136,10 @@ pub(crate) use super::sse::{
 
 pub(crate) mod access_consumer {
     pub(crate) use super::super::access::{
-        PostObjectRequestMarker, ReqInfo, TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess,
-        TableDataPlaneListCursorPosition, TableDataPlanePublicationGuards, apply_bucket_generation_guard,
-        apply_copy_source_bucket_generation_guard, authorize_internal_object_request, authorize_request,
-        bucket_config_mutation_incarnation, delete_object_authorize_action, has_bypass_governance_header,
+        MultipartStagingOperation, PostObjectRequestMarker, ReqInfo, TABLE_DATA_PLANE_LIST_CURSOR_PREFIX,
+        TableDataPlaneListAccess, TableDataPlaneListCursorPosition, TableDataPlanePublicationGuards,
+        apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, authorize_internal_object_request,
+        authorize_request, bucket_config_mutation_incarnation, delete_object_authorize_action, has_bypass_governance_header,
         load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
         prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller,
         replication_request_authorized, req_info_mut, req_info_ref, retained_table_data_plane_publication_guards,
@@ -270,12 +281,13 @@ pub(crate) mod rpc_consumer {
         };
         pub(crate) use super::super::{
             BatchReadVersionReq, BatchReadVersionResp, CollectMetricsOpts, ConditionalFileUpdate, DeleteOptions, DiskError,
-            DiskInfoOptions, DiskStore, ECStore, Error, FileInfoVersions, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MetricType,
-            PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-            SCANNER_PUBLICATION_LEASE_TTL_MS, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt,
-            StoragePeerS3ClientExt, TierDailyStatsWire, UpdateMetadataOpts, all_local_disk_path, collect_local_metrics,
-            find_local_disk_by_ref, get_global_transition_state, get_local_server_property, reload_bucket_metadata,
-            reload_transition_tier_config, remove_bucket_metadata_if_absent, validate_batch_read_version_item_count,
+            DiskInfoOptions, DiskStore, ECStore, Error, FileInfoVersions, GuardedDeleteVersionsPayload, KMS_SIGNAL_SUBSYSTEM,
+            LocalPeerS3Client, MetricType, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq,
+            ReadMultipleResp, ReadOptions, SCANNER_PUBLICATION_LEASE_TTL_MS, SERVICE_SIGNAL_REFRESH_CONFIG,
+            SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt, StoragePeerS3ClientExt, TierDailyStatsWire, UpdateMetadataOpts,
+            all_local_disk_path, collect_local_metrics, find_local_disk_by_ref, get_global_transition_state,
+            get_local_server_property, reload_bucket_metadata, reload_transition_tier_config, remove_bucket_metadata_if_absent,
+            validate_batch_read_version_item_count,
         };
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
@@ -482,12 +494,13 @@ pub(crate) mod ecstore_disk {
         BUCKET_META_PREFIX, BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, ConditionalFileUpdate,
         DELETE_RECOVERY_PROTOCOL_VERSION, DeleteOptions, DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest,
         DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DiskAPI, DiskInfo,
-        DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, OldCurrentSize, PartTransactionAction,
-        RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken,
-        UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout, validate_batch_read_version_item_count,
+        DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, GuardedDeleteVersionsPayload,
+        GuardedFileInfoVersions, OldCurrentSize, PartTransactionAction, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET,
+        ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo,
+        WalkDirOptions, get_object_disk_read_timeout, is_quota_mutation_fence_path, validate_batch_read_version_item_count,
     };
     #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::disk::{DiskOption, new_disk};
+    pub(crate) use rustfs_ecstore::api::disk::{CurrentDeleteGeneration, DiskOption, new_disk};
     pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
 }
 
@@ -528,12 +541,14 @@ pub(crate) mod ecstore_metrics {
 
 #[allow(unused_imports)]
 pub(crate) mod ecstore_notification {
-    #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::notification::rotate_cross_pool_fence_fleet_proof_for_test;
     pub(crate) use rustfs_ecstore::api::notification::{
         ClusterTierDailyStats, CrossPoolFenceFleetProofToken, NotificationSys, acquire_cross_pool_fence_fleet_proof,
-        cross_pool_fence_fleet_proof_matches, get_global_notification_sys, ilm_recovery_export_local_process_epoch,
-        new_global_notification_sys, start_remote_version_state_fleet_probe,
+        configured_fleet_topology_fingerprint, cross_pool_fence_fleet_proof_matches, get_global_notification_sys,
+        ilm_recovery_export_local_process_epoch, new_global_notification_sys, start_remote_version_state_fleet_probe,
+    };
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::notification::{
+        rotate_cross_pool_fence_fleet_proof_for_test, without_cross_pool_fence_fleet_proof_for_test,
     };
 }
 
@@ -708,6 +723,8 @@ pub(crate) type EndpointServerPools = ecstore_layout::EndpointServerPools;
 pub(crate) type EventArgs = ecstore_event::EventArgs;
 pub(crate) type ExpiryState = ecstore_bucket::lifecycle::bucket_lifecycle_ops::ExpiryState;
 pub(crate) type FileInfoVersions = ecstore_disk::FileInfoVersions;
+pub(crate) type GuardedFileInfoVersions = ecstore_disk::GuardedFileInfoVersions;
+pub(crate) type GuardedDeleteVersionsPayload = ecstore_disk::GuardedDeleteVersionsPayload;
 pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type FileWriter = ecstore_disk::FileWriter;
 pub(crate) type SnapshotLeaseToken = ecstore_disk::SnapshotLeaseToken;
@@ -716,7 +733,6 @@ pub(crate) type HashReader = ecstore_rio::HashReader;
 pub(crate) type InstanceContext = ecstore_runtime::InstanceContext;
 pub(crate) type ServerContextSlot = crate::storage::runtime_sources::ServerContextSlot;
 pub(crate) type LocalPeerS3Client = ecstore_rpc::LocalPeerS3Client;
-#[cfg(test)]
 pub(crate) type PeerRestClient = ecstore_rpc::PeerRestClient;
 #[cfg(test)]
 pub(crate) type ScannerScopedDirtyUsageAckEntry = ecstore_rpc::ScannerScopedDirtyUsageAckEntry;
@@ -975,23 +991,45 @@ pub(crate) async fn get_local_server_property() -> rustfs_madmin::ServerProperti
     ecstore_admin::get_local_server_property().await
 }
 
+/// Bridge an ECStore committed replication-path mutation into the scanner's
+/// dirty-usage tracking.
+///
+/// A replication status writeback changes only replication state on an
+/// existing version. It is status class: it must not count as namespace
+/// activity, or every scanner cycle is `Superseded` for as long as replication
+/// runs (#8375). The scanner's own queued replication heals write back through
+/// the same path and are covered by the same rule. Tier-expiration cleanup
+/// removes data and stays on the namespace path.
+pub(crate) fn record_committed_replication_mutation(
+    bucket: &str,
+    object: &str,
+    source: ecstore_bucket::replication::ScannerDirtyUsageMutationSource,
+) {
+    match source {
+        ecstore_bucket::replication::ScannerDirtyUsageMutationSource::Replication => {
+            rustfs_scanner::record_status_class_mutation(
+                bucket,
+                object,
+                rustfs_scanner::SegmentInvalidationProducerIdentity::Replication,
+            );
+        }
+        ecstore_bucket::replication::ScannerDirtyUsageMutationSource::TierExpiration => {
+            rustfs_scanner::record_dirty_usage_object_from_producer(
+                bucket,
+                object,
+                rustfs_scanner::SegmentInvalidationProducerIdentity::TierExpiration,
+            );
+        }
+    }
+}
+
 pub(crate) async fn init_background_replication(store: Arc<ECStore>) {
     let durable_dirty_usage_journal = super::scanner_dirty_journal::start_durable_dirty_usage_journal(store.clone()).await;
     let mutation_journal = durable_dirty_usage_journal.clone();
     rustfs_scanner::set_scanner_dirty_usage_mutation_observer(Some(Arc::new(move |bucket, object, producer| {
         mutation_journal.record_committed_mutation(bucket, object, producer);
     })));
-    ecstore_bucket::replication::set_scanner_dirty_usage_mutation_observer(Some(Arc::new(move |bucket, object, source| {
-        let producer = match source {
-            ecstore_bucket::replication::ScannerDirtyUsageMutationSource::Replication => {
-                rustfs_scanner::SegmentInvalidationProducerIdentity::Replication
-            }
-            ecstore_bucket::replication::ScannerDirtyUsageMutationSource::TierExpiration => {
-                rustfs_scanner::SegmentInvalidationProducerIdentity::TierExpiration
-            }
-        };
-        rustfs_scanner::record_dirty_usage_object_from_producer(bucket, object, producer);
-    })));
+    ecstore_bucket::replication::set_scanner_dirty_usage_mutation_observer(Some(Arc::new(record_committed_replication_mutation)));
     rustfs_scanner::set_scanner_dirty_usage_clear_observer(Some(Arc::new(move |cleared| {
         durable_dirty_usage_journal.clear_confirmed_buckets(cleared);
     })));
@@ -1380,6 +1418,13 @@ pub(crate) async fn try_migrate_server_config(store: Arc<ECStore>) {
 }
 
 pub(crate) trait StorageDiskRpcExt {
+    async fn supports_guarded_delete_versions(&self) -> DiskResult<()>;
+    async fn delete_versions_guarded_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>>;
     async fn disk_info(&self, opts: &DiskInfoOptions) -> DiskResult<DiskInfo>;
     async fn delete_volume(&self, volume: &str, force_delete: bool) -> DiskResult<()>;
     async fn read_multiple(&self, req: ReadMultipleReq) -> DiskResult<Vec<ReadMultipleResp>>;
@@ -1469,6 +1514,7 @@ pub(crate) trait StorageDiskRpcExt {
         versions: Vec<FileInfoVersions>,
         opts: DeleteOptions,
     ) -> Vec<Option<DiskError>>;
+    async fn has_delete_transaction_evidence(&self, volume: &str, object: &str) -> DiskResult<bool>;
     async fn discover_delete_transactions(
         &self,
         volume: &str,
@@ -1513,6 +1559,17 @@ impl<T> StorageDiskRpcExt for T
 where
     T: ecstore_disk::DiskAPI,
 {
+    async fn supports_guarded_delete_versions(&self) -> DiskResult<()> {
+        ecstore_disk::DiskAPI::supports_guarded_delete_versions(self).await
+    }
+    async fn delete_versions_guarded_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        ecstore_disk::DiskAPI::delete_versions_guarded_recoverable(self, volume, versions, opts).await
+    }
     async fn disk_info(&self, opts: &DiskInfoOptions) -> DiskResult<DiskInfo> {
         ecstore_disk::DiskAPI::disk_info(self, opts).await
     }
@@ -1679,6 +1736,10 @@ where
         opts: DeleteOptions,
     ) -> Vec<Option<DiskError>> {
         ecstore_disk::DiskAPI::delete_versions_recoverable(self, volume, versions, opts).await
+    }
+
+    async fn has_delete_transaction_evidence(&self, volume: &str, object: &str) -> DiskResult<bool> {
+        ecstore_disk::DiskAPI::has_delete_transaction_evidence(self, volume, object).await
     }
 
     async fn discover_delete_transactions(
@@ -2378,6 +2439,34 @@ mod tests {
         lock_bucket_targets_metadata, new_instance_ctx, retry_bucket_resync_transaction_lock, scanner_maintenance_config_file,
     };
     use std::time::Duration;
+
+    #[test]
+    #[serial_test::serial]
+    fn replication_status_writebacks_are_status_class_and_tier_expiration_is_namespace() {
+        use ecstore_bucket::replication::ScannerDirtyUsageMutationSource;
+        let bucket = format!("status-class-{}", uuid::Uuid::new_v4().simple());
+        let before = rustfs_scanner::scanner_dirty_usage_state();
+
+        super::record_committed_replication_mutation(&bucket, "2026/object", ScannerDirtyUsageMutationSource::Replication);
+        let after_replication = rustfs_scanner::scanner_dirty_usage_state();
+        assert_eq!(
+            after_replication.generation, before.generation,
+            "a replication status writeback must not advance the scanner dirty-usage generation"
+        );
+        assert!(
+            rustfs_scanner::scanner_dirty_usage_bucket_generation(&bucket).is_none(),
+            "a replication status writeback must not mark the bucket dirty"
+        );
+
+        super::record_committed_replication_mutation(&bucket, "2026/object", ScannerDirtyUsageMutationSource::TierExpiration);
+        let after_expiry = rustfs_scanner::scanner_dirty_usage_state();
+        assert!(
+            after_expiry.generation > before.generation,
+            "tier expiration removes data and must stay on the namespace path"
+        );
+        assert!(rustfs_scanner::scanner_dirty_usage_bucket_generation(&bucket).is_some());
+        rustfs_scanner::clear_dirty_usage_bucket(&bucket);
+    }
 
     #[tokio::test]
     async fn site_metrics_snapshot_includes_live_failure_windows() {

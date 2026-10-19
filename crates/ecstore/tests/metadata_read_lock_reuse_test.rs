@@ -18,6 +18,7 @@ mod storage_api;
 
 use std::sync::Arc;
 use std::time::Duration;
+use storage_api::contract_compat::ECStore;
 use storage_api::metadata_lock::{
     BucketOperations, CompletePart, Error, MakeBucketOptions, MultipartOperations, NamespaceLocking, ObjectIO, ObjectOperations,
     ObjectOptions, PutObjReader, PutObjectCommitBarrier, PutObjectCommitPause, init_bucket_metadata_sys,
@@ -168,6 +169,100 @@ async fn reused_metadata_lock_still_enforces_quota() {
         .await
         .expect("release metadata reader after denial")
         .expect("acquire writer");
+}
+
+#[tokio::test]
+async fn authoritative_quota_read_does_not_ignore_later_quota() {
+    let (_dirs, store) = isolated_store_over_temp_disks().await;
+    init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+    let bucket = "authoritative-quota-quota-set";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create bucket");
+
+    let mut first = PutObjReader::from_vec(b"cache no quota".to_vec());
+    store
+        .put_object(bucket, "warm", &mut first, &ObjectOptions::default())
+        .await
+        .expect("warm no-quota metadata cache");
+    store
+        .update_bucket_metadata_config(bucket, "quota.json", br#"{"quota":1}"#.to_vec())
+        .await
+        .expect("set quota after no-quota cache was observed");
+
+    let mut opts = quota_snapshot_options(&store, bucket).await;
+    assert!(opts.set_quota_admission(0, 1));
+    let mut data = PutObjReader::from_vec(b"too large".to_vec());
+    let error = store
+        .put_object(bucket, "object", &mut data, &opts)
+        .await
+        .expect_err("quota set after a no-quota cache hit must still reject growth");
+    assert!(matches!(error, Error::QuotaExceeded { limit: 1, .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn authoritative_quota_read_allows_write_after_quota_is_cleared() {
+    let (_dirs, store) = isolated_store_over_temp_disks().await;
+    init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+    let bucket = "authoritative-quota-quota-cleared";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create bucket");
+    store
+        .update_bucket_metadata_config(bucket, "quota.json", br#"{"quota":1}"#.to_vec())
+        .await
+        .expect("set quota");
+    store
+        .update_bucket_metadata_config(bucket, "quota.json", Vec::new())
+        .await
+        .expect("clear quota");
+
+    let mut data = PutObjReader::from_vec(b"allowed after clear".to_vec());
+    store
+        .put_object(bucket, "object", &mut data, &ObjectOptions::default())
+        .await
+        .expect("authoritatively cleared quota should allow writes");
+
+    let mut reader = store
+        .get_object_reader(bucket, "object", None, Default::default(), &ObjectOptions::default())
+        .await
+        .expect("read object written after quota clear");
+    let mut bytes = Vec::new();
+    reader.stream.read_to_end(&mut bytes).await.expect("read body");
+    assert_eq!(bytes, b"allowed after clear");
+}
+
+#[tokio::test]
+async fn authoritative_quota_read_fails_closed_on_invalid_quota_json() {
+    let (_dirs, store) = isolated_store_over_temp_disks().await;
+    init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+    let bucket = "authoritative-quota-invalid-quota";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create bucket");
+    store
+        .update_bucket_metadata_config(bucket, "quota.json", b"{not-json".to_vec())
+        .await
+        .expect("persist invalid quota bytes for fail-closed read");
+
+    let mut data = PutObjReader::from_vec(b"must fail".to_vec());
+    store
+        .put_object(bucket, "object", &mut data, &ObjectOptions::default())
+        .await
+        .expect_err("invalid quota JSON must not degrade to no-quota");
+}
+
+async fn quota_snapshot_options(store: &Arc<ECStore>, bucket: &str) -> ObjectOptions {
+    ObjectOptions {
+        versioned: true,
+        version_id: Some(Uuid::new_v4().to_string()),
+        expected_bucket_incarnation_id: Some(store.bucket_incarnation_id(bucket).await.expect("load incarnation")),
+        object_lock_config_snapshot: Some(store.object_lock_config_snapshot(bucket).await.expect("capture snapshot")),
+        ..Default::default()
+    }
 }
 
 #[tokio::test]

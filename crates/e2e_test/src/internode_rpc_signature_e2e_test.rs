@@ -264,7 +264,7 @@ async fn call_make_volume_response(
     request: MakeVolumeRequest,
     headers: HeaderMap,
 ) -> Result<Response<MakeVolumeResponse>, Status> {
-    let mut client = node_service_time_out_client_no_auth(&url.to_string())
+    let mut client = node_service_time_out_client_no_auth(url)
         .await
         .map_err(|err| Status::unavailable(format!("cannot reach the node service: {err}")))?;
     let mut rpc_request = Request::new(request);
@@ -273,7 +273,7 @@ async fn call_make_volume_response(
 }
 
 async fn call_ping_response(url: &str, headers: HeaderMap) -> Result<Response<PingResponse>, Status> {
-    let mut client = node_service_time_out_client_no_auth(&url.to_string())
+    let mut client = node_service_time_out_client_no_auth(url)
         .await
         .map_err(|err| Status::unavailable(format!("cannot reach the node service: {err}")))?;
     let mut rpc_request = Request::new(PingRequest {

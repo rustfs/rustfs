@@ -29,6 +29,8 @@ use tempfile::TempDir;
 pub(super) mod admin_overlap;
 mod root_recovery;
 use uuid::Uuid;
+mod auto_scan;
+mod disposition;
 mod running_mainline;
 
 use super::super::{DiskOption, DiskStore, Endpoint, new_disk, storage_api::status::BucketInfo};
@@ -104,6 +106,7 @@ async fn process_manager_queue_once(manager: &HealManager) {
         notify: &manager.notify,
         cancel_token: &manager.cancel_token,
         workload_provider: &manager.workload_provider,
+        disposition_cache: &manager.disposition_cache,
     })
     .await;
 }
@@ -599,6 +602,13 @@ impl HealStorageAPI for MockStorage {
 
     async fn get_bucket_info(&self, _bucket: &str) -> Result<Option<BucketInfo>> {
         Ok(None)
+    }
+
+    async fn list_buckets_for_admin_heal(
+        &self,
+        _selector: Option<crate::heal::storage_api::storage::DiskSetSelector>,
+    ) -> Result<Vec<BucketInfo>> {
+        self.list_buckets().await
     }
 
     async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
@@ -3141,13 +3151,48 @@ fn replacement_target_reservation_ends_only_after_an_explicit_transfer() {
 }
 
 #[test]
-fn replacement_recovery_blocker_is_set_scoped() {
+fn replacement_recovery_blocker_is_generation_scoped() {
     let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
+    let conflicted = Uuid::new_v4().to_string();
+    let sibling = Uuid::new_v4().to_string();
 
-    manager.block_replacement_recovery_set("pool_0_set_0");
+    manager.block_replacement_recovery_generation_for_test(&conflicted, "pool_0_set_0", "durable copies diverge", true);
 
-    assert!(manager.replacement_recovery_set_is_blocked("pool_0_set_0"));
-    assert!(!manager.replacement_recovery_set_is_blocked("pool_0_set_1"));
+    assert!(manager.replacement_recovery_generation_is_blocked(&conflicted));
+    assert!(
+        !manager.replacement_recovery_generation_is_blocked(&sibling),
+        "a sibling generation of the same set is not blocked"
+    );
+    assert!(manager.replacement_recovery_set_has_reserving_block("pool_0_set_0"));
+    assert!(!manager.replacement_recovery_set_has_reserving_block("pool_0_set_1"));
+    let blocks = manager.replacement_recovery_blocks();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].task_id, conflicted);
+    assert_eq!(blocks[0].set_disk_id, "pool_0_set_0");
+    assert_eq!(blocks[0].reason, "durable copies diverge");
+    assert!(blocks[0].reserves_targets);
+    assert!(blocks[0].blocked_since > 0);
+    assert_eq!(blocks[0].blocked_since, blocks[0].last_observed);
+
+    // A refreshed block keeps its first observation and follows the latest reason.
+    manager.block_replacement_recovery_generation_for_test(&conflicted, "pool_0_set_0", "retired", false);
+    let refreshed = manager.replacement_recovery_blocks();
+    assert_eq!(refreshed[0].reason, "retired");
+    assert!(!refreshed[0].reserves_targets);
+    assert_eq!(refreshed[0].blocked_since, blocks[0].blocked_since);
+    assert!(
+        !manager.replacement_recovery_set_has_reserving_block("pool_0_set_0"),
+        "a released block no longer defers fresh admission for the set"
+    );
+}
+
+#[test]
+fn legacy_ambiguous_delete_residue_is_not_a_retryable_heal_error() {
+    // rustfs/rustfs#8608: the residue is deterministic; it must not be retried
+    // as request-rate pressure.
+    let error = Error::Storage(EcstoreError::DeleteRecoveryLegacyAmbiguous);
+    assert!(!error.is_recoverable_heal());
+    assert!(Error::Storage(EcstoreError::SlowDown).is_recoverable_heal());
 }
 
 #[test]
@@ -3198,24 +3243,6 @@ fn replacement_recovery_discovery_unformatted_is_quiet_only_for_deferred_endpoin
         "endpoint-a",
         &deferred
     ));
-}
-
-#[test]
-fn replacement_recovery_retry_barrier_requires_all_set_records_to_validate() {
-    let mut blocked = HashSet::from(["pool_0_set_0".to_string(), "pool_0_set_1".to_string()]);
-    let retry_succeeded = HashSet::from(["pool_0_set_0".to_string(), "pool_0_set_1".to_string()]);
-    let retry_failed = HashSet::from(["pool_0_set_0".to_string()]);
-
-    unblock_replacement_recovery_sets_after_validation(&mut blocked, retry_succeeded, &retry_failed);
-
-    assert!(
-        blocked.contains("pool_0_set_0"),
-        "one failed disk record must keep the whole replacement set blocked"
-    );
-    assert!(
-        !blocked.contains("pool_0_set_1"),
-        "a blocked set may resume only after every retried record validates"
-    );
 }
 
 #[tokio::test]
@@ -5695,7 +5722,7 @@ async fn configured_task_timeout_applies_only_when_request_timeout_is_absent() {
     process_manager_queue_once(&manager).await;
     let explicit_status = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            if let Ok(status @ HealTaskStatus::Failed { .. }) = manager.get_task_status(&explicit_id).await {
+            if let Ok(status @ HealTaskStatus::Completed) = manager.get_task_status(&explicit_id).await {
                 break status;
             }
             tokio::task::yield_now().await;
@@ -5703,7 +5730,8 @@ async fn configured_task_timeout_applies_only_when_request_timeout_is_absent() {
     })
     .await
     .expect("explicit timeout request should finish without using the zero default");
-    assert!(matches!(explicit_status, HealTaskStatus::Failed { .. }));
+    // Generation-bound admin tasks reach the successful mock heal without a namespace preflight.
+    assert_eq!(explicit_status, HealTaskStatus::Completed);
 }
 
 #[tokio::test]
@@ -5932,5 +5960,27 @@ fn test_heal_config_respects_feature_flags() {
             assert!(!config.set_bulkhead_enable);
             assert!(!config.page_parallel_enable);
         },
+    );
+}
+
+#[test]
+fn admin_bucket_discovery_retries_keep_the_existing_budget() {
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    let mut request = HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::Normal);
+    request.source = HealRequestSource::Admin;
+    let id = request.id.clone();
+    let error = Err(Error::BucketDiscoveryIncomplete);
+    for attempt in 1..=MAX_RECOVERABLE_HEAL_RETRIES {
+        let task = HealTask::from_request(request, storage.clone());
+        let (retry, delay, _) = retry_request_for_result(&task, &error).expect("discovery can recover within budget");
+        assert_eq!(retry.id, id);
+        assert_eq!(retry.retry_attempts, attempt);
+        assert!(delay > Duration::ZERO);
+        request = retry;
+    }
+    let task = HealTask::from_request(request, storage);
+    assert!(
+        retry_request_for_result(&task, &error).is_none(),
+        "persistent incompleteness must terminate"
     );
 }

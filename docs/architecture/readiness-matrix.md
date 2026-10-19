@@ -22,6 +22,7 @@
 | IamReady | Inline IAM bootstrap or deferred IAM recovery publication. | Yes. | Deferred recovery can publish IAM readiness after HTTP has already started. |
 | Lock quorum | Per-set write quorum readiness. | Yes. | Do not replace the distributed lock quorum check with node count or endpoint count. |
 | Peer health | `peer_health_ready` runtime status. | Only when `RUSTFS_HEALTH_PEER_READY_CHECK_ENABLE` is enabled. | The gate is disabled by default; unknown peer health degrades readiness only when enabled. |
+| Peer re-admission | A strict majority of the peers in each erasure set this node serves count all of its drives in that set as online (`PeerDriveAdmission` internode RPC). | Startup transition only, while `RUSTFS_STARTUP_PEER_READMISSION_ENABLE` is enabled (default on). | Bounded and fail-open: publishes `FullReady` with a WARN log when `RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS` elapses, immediately when older peers cannot answer and the majority is out of reach, or after 15 s of unreachable peers keeping it out of reach. Not part of steady-state `/health/ready`. Distinct from peer health, which is this node's view of its peers. |
 | KMS compatibility | KMS health compatibility readiness. | Only when `RUSTFS_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE` is enabled (default off; `crates/config/src/constants/health.rs`). | When enabled, `/health/ready` additionally requires the KMS service to be running if a global KMS manager exists. KMS startup fatality and health reporting remain separate from pure docs work. |
 
 Effective `FullReady` is:
@@ -34,6 +35,8 @@ storage_ready && iam_ready && lock_quorum_ready && peer_health_ready
 `RUSTFS_HEALTH_PEER_READY_CHECK_ENABLE` is enabled. When that flag is enabled,
 an unknown or unsupported peer-health snapshot degrades readiness with
 `peer_health_unavailable`.
+
+In a distributed deployment, startup publishes `FullReady` only after that local condition holds and the peer re-admission gate has finished. The gate answers how the peers see this node, so a rolling update does not stop the next node while survivors still count this one as unavailable (rustfs/rustfs#8669). It asks over the authenticated internode channel rather than scraping peers' `/health/ready`, so it works before the peers' own HTTP admission opens. The peer answers from the same cached inputs as its `/health/ready` (lock-client reachability and the in-memory drive state), without disk I/O. While the gate waits, `/health/ready` returns 503 with `startup_finalization_pending` and the gated S3 surfaces report `startup_finalization`.
 
 ## Probe Semantics
 
@@ -93,6 +96,7 @@ The new fields are additive. Their absence in an older response is not evidence 
 - Do not move peer-health checks into the S3 data hot path.
 - Do not make peer health affect readiness unless
   `RUSTFS_HEALTH_PEER_READY_CHECK_ENABLE` is enabled.
+- Keep the peer re-admission gate on the startup `FullReady` transition only. It must stay bounded and fail open, and it must not run in steady-state probes or on the S3 request path.
 - Do not use this matrix to change the early HTTP listener plus readiness-gate
   split.
 - Do not simplify distributed lock quorum, IAM deferred recovery, or KMS fatal

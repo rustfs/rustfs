@@ -1,4 +1,4 @@
-{{- if and .Values.mode.standalone.enabled (not .Values.mode.standalone.existingClaim.dataClaim) }}
+{{- if and .Values.mode.standalone.enabled (not .Values.mode.standalone.existingClaim.dataClaim) (not (empty .Values.storageclass.dataStorageSize)) }}
 {{- with .Values.storageclass }}
 apiVersion: v1
 kind: PersistentVolumeClaim

@@ -15,6 +15,24 @@
 use super::*;
 use crate::{ScannerConfigObjectDelete, ScannerObjectIO};
 
+pub(crate) fn log_saved_partial_bucket_cache(cache: &DataUsageCache, cache_name: &str) {
+    debug!(
+        target: "rustfs::scanner::io",
+        event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+        component = LOG_COMPONENT_SCANNER,
+        subsystem = LOG_SUBSYSTEM_IO,
+        state = "partial_saved_not_published",
+        bucket = %cache.info.name,
+        pool = cache.info.source.map(|source| source.pool_index),
+        set = cache.info.source.map(|source| source.set_index),
+        cycle = cache.info.next_cycle,
+        leader_epoch = cache.info.leader_epoch,
+        cache_name,
+        resume_position = cache.has_scan_position(),
+        "Scanner partial bucket cache saved without publishing usage aggregate"
+    );
+}
+
 pub(crate) fn scanner_cache_lock_resource(cache_name: &str, source: DataUsageCacheSource) -> String {
     let lock_name = format!("{SCANNER_CACHE_LOCK_SUFFIX}.pool-{}.set-{}", source.pool_index, source.set_index);
     path_join_buf(&[crate::BUCKET_META_PREFIX, cache_name, &lock_name])
@@ -268,6 +286,10 @@ pub(crate) struct DataUsageCacheReuseOptions {
     pub(crate) require_source: bool,
     pub(crate) tier_registry_generation: Option<u64>,
     pub(crate) checkpoint_identity: Option<crate::DataUsageScanIdentity>,
+    /// The coverage plan a sweep is started and resumed under
+    /// (`scanner_activity_coverage_digest`); `None` resumes under the reuse
+    /// plan itself, as a remote worker does with the single digest on the wire.
+    pub(crate) checkpoint_plan_digest: Option<DataUsageScanPlanDigest>,
 }
 
 #[cfg(test)]
@@ -291,6 +313,7 @@ pub(crate) fn current_cache_root_or_prepare(
             require_source,
             tier_registry_generation: None,
             checkpoint_identity: None,
+            checkpoint_plan_digest: None,
         },
     )
 }
@@ -304,6 +327,7 @@ pub(crate) fn current_cache_root_or_prepare_with_generation(
     scan_plan_digest: DataUsageScanPlanDigest,
     options: DataUsageCacheReuseOptions,
 ) -> DataUsageCacheScanState {
+    let checkpoint_plan_digest = options.checkpoint_plan_digest.unwrap_or(scan_plan_digest);
     if cache.info.next_cycle <= next_cycle
         && cache.info.leader_epoch <= leader_epoch
         && cache.info.scan_identity != options.checkpoint_identity
@@ -319,6 +343,24 @@ pub(crate) fn current_cache_root_or_prepare_with_generation(
         // an older registry cannot be reused under the new cycle generation.
         cache.info.scan_plan_digest = None;
     }
+    if cache.info.name == name
+        && cache.info.next_cycle <= next_cycle
+        && cache.info.leader_epoch <= leader_epoch
+        && cache.info.snapshot_complete
+        && cache
+            .info
+            .replication
+            .as_ref()
+            .is_some_and(|config| config.has_active_rules("", true))
+    {
+        // Replication writebacks leave namespace generations unchanged. A
+        // completed cache must start a fresh coverage sweep, even on retry.
+        cache.info.scan_progress = Some(crate::DataUsageScanProgress {
+            started_plan: checkpoint_plan_digest,
+            requested_plan: checkpoint_plan_digest,
+        });
+        cache.info.scan_plan_digest = None;
+    }
     match current_cache_root_entry_with_generation(
         cache,
         name,
@@ -332,9 +374,15 @@ pub(crate) fn current_cache_root_or_prepare_with_generation(
         current => DataUsageCacheScanState::Prepared {
             invalid_current: current.err(),
             outcome: match options.checkpoint_identity.filter(crate::DataUsageScanIdentity::is_valid) {
-                Some(identity) => {
-                    cache.prepare_bucket_checkpoint(name, next_cycle, leader_epoch, source, scan_plan_digest, identity)
-                }
+                Some(identity) => cache.prepare_bucket_checkpoint_with_coverage(
+                    name,
+                    next_cycle,
+                    leader_epoch,
+                    source,
+                    scan_plan_digest,
+                    checkpoint_plan_digest,
+                    identity,
+                ),
                 None => cache.prepare_for_scan(name, next_cycle, leader_epoch, source, scan_plan_digest, options.require_source),
             },
         },
@@ -354,6 +402,96 @@ pub(super) fn cache_snapshot_is_current(
         current_cache_root_entry_with_generation(cache, name, source, next_cycle, leader_epoch, scan_plan_digest, None),
         Ok(Some(_))
     )
+}
+
+/// A set cache that stands in for buckets whose walk stopped early is not
+/// the execution a full walk of the same cycle produces. Bind the carried
+/// bucket names so neither snapshot is adopted in place of the other by the
+/// same-execution reuse in `persist_and_publish_cache_snapshot`.
+pub(super) fn scanner_carried_execution_digest(
+    execution_digest: DataUsageScanPlanDigest,
+    carried_buckets: &[String],
+) -> DataUsageScanPlanDigest {
+    if carried_buckets.is_empty() {
+        return execution_digest;
+    }
+    let mut carried = carried_buckets.to_vec();
+    carried.sort_unstable();
+    let mut hasher = Sha256::new();
+    hasher.update(b"scanner-carried-execution-v1");
+    hasher.update(execution_digest.0);
+    hasher.update(u64::try_from(carried.len()).unwrap_or(u64::MAX).to_be_bytes());
+    for bucket in carried {
+        hasher.update(u64::try_from(bucket.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(bucket.as_bytes());
+    }
+    DataUsageScanPlanDigest(hasher.finalize().into())
+}
+
+/// Replication statistics are observational and may change within one
+/// namespace execution. Bind them without relaxing same-execution reuse.
+pub(super) fn scanner_replication_execution_digest(
+    execution_digest: DataUsageScanPlanDigest,
+    cache: &DataUsageCache,
+) -> DataUsageScanPlanDigest {
+    let mut entries = cache
+        .cache
+        .iter()
+        .filter_map(|(key, entry)| {
+            entry
+                .replication_stats
+                .as_ref()
+                .filter(|stats| stats.replica_size != 0 || stats.replica_count != 0 || !stats.targets.is_empty())
+                .map(|stats| (key, stats))
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return execution_digest;
+    }
+    entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    let mut hasher = Sha256::new();
+    hasher.update(b"scanner-replication-execution-v1");
+    hasher.update(execution_digest.0);
+    for (key, stats) in entries {
+        hasher.update(u64::try_from(key.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(key.as_bytes());
+        hasher.update(stats.replica_size.to_be_bytes());
+        hasher.update(stats.replica_count.to_be_bytes());
+        let mut targets = stats.targets.iter().collect::<Vec<_>>();
+        targets.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        hasher.update(u64::try_from(targets.len()).unwrap_or(u64::MAX).to_be_bytes());
+        for (arn, target) in targets {
+            hasher.update(u64::try_from(arn.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(arn.as_bytes());
+            let rustfs_data_usage::ReplicationTargetUsage {
+                pending_size,
+                replicated_size,
+                failed_size,
+                failed_count,
+                pending_count,
+                missed_threshold_size,
+                after_threshold_size,
+                missed_threshold_count,
+                after_threshold_count,
+                replicated_count,
+            } = target;
+            for value in [
+                pending_size,
+                replicated_size,
+                failed_size,
+                failed_count,
+                pending_count,
+                missed_threshold_size,
+                after_threshold_size,
+                missed_threshold_count,
+                after_threshold_count,
+                replicated_count,
+            ] {
+                hasher.update(value.to_be_bytes());
+            }
+        }
+    }
+    DataUsageScanPlanDigest(hasher.finalize().into())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -494,8 +632,12 @@ pub(super) fn empty_namespace_usage_candidate(
 }
 
 impl ValidatedUsageCandidate {
-    pub(super) fn prepare(mut self, status: ScannerCycleStatus) -> (DataUsageInfo, Option<ScannerPublicationExpectation>) {
-        self.data.usage_snapshot_converged = Some(status == ScannerCycleStatus::Complete);
+    pub(super) fn prepare(
+        mut self,
+        status: ScannerCycleStatus,
+        pending_buckets: &ScannerCyclePendingBuckets,
+    ) -> (DataUsageInfo, Option<ScannerPublicationExpectation>) {
+        apply_scanner_cycle_publication_marks(&mut self.data, status, pending_buckets);
         let expectation = if status == ScannerCycleStatus::Complete {
             struct DigestWriter(Sha256);
             impl std::io::Write for DigestWriter {

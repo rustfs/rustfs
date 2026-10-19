@@ -427,11 +427,51 @@ impl TableMaintenanceSchedulerRunRequest {
 struct TableMaintenanceWorkerRunRequest {
     #[serde(default, rename = "worker-id")]
     worker_id: Option<String>,
+    #[serde(
+        default,
+        rename = "expected-job-id",
+        deserialize_with = "deserialize_present_worker_condition_field"
+    )]
+    expected_job_id: Option<String>,
+    #[serde(
+        default,
+        rename = "expected-attempt",
+        deserialize_with = "deserialize_present_worker_condition_field"
+    )]
+    expected_attempt: Option<u16>,
+}
+
+// Explicit null must not turn a conditional request into an unconditional run.
+fn deserialize_present_worker_condition_field<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 impl TableMaintenanceWorkerRunRequest {
     fn worker_id(&self) -> &str {
         self.worker_id.as_deref().unwrap_or(DEFAULT_TABLE_MAINTENANCE_WORKER_ID)
+    }
+
+    fn condition(&self) -> S3Result<Option<crate::table_catalog::TableMaintenanceWorkerCondition>> {
+        match (&self.expected_job_id, self.expected_attempt) {
+            (None, None) => Ok(None),
+            (Some(job_id), Some(attempt)) => {
+                if job_id.trim().is_empty() || self.worker_id().trim().is_empty() {
+                    return Err(s3_error!(InvalidRequest, "conditional maintenance requires non-empty job and worker ids"));
+                }
+                Ok(Some(crate::table_catalog::TableMaintenanceWorkerCondition {
+                    expected_job_id: job_id.clone(),
+                    expected_attempt: attempt,
+                }))
+            }
+            _ => Err(s3_error!(
+                InvalidRequest,
+                "expected-job-id and expected-attempt must be supplied together"
+            )),
+        }
     }
 }
 
@@ -1860,6 +1900,16 @@ where
         publication
             .catalog_migration_read_permit
             .then(|| publication.guards.iter().all(|guard| !guard.is_lock_lost()))
+    }
+
+    fn table_commit_object_mutation_fence(&self) -> Option<crate::table_catalog::TableCatalogObjectMutationFence> {
+        let publication = self.publication.lock();
+        Some(crate::table_catalog::TableCatalogObjectMutationFence::from_signals(
+            publication
+                .guards
+                .iter()
+                .map(crate::table_catalog::TableCatalogLockGuard::lock_lost_signal),
+        ))
     }
 
     fn complete_table_commit_publication(&self) {
@@ -5497,7 +5547,8 @@ fn catalog_store_error(err: crate::table_catalog::TableCatalogStoreError) -> S3E
         crate::table_catalog::TableCatalogStoreError::Unsupported(message) => {
             iceberg_rest_error(ICEBERG_ERROR_UNSUPPORTED_OPERATION, StatusCode::NOT_ACCEPTABLE, message)
         }
-        crate::table_catalog::TableCatalogStoreError::Unavailable(_) => iceberg_rest_error(
+        crate::table_catalog::TableCatalogStoreError::Unavailable(_)
+        | crate::table_catalog::TableCatalogStoreError::LockUnavailable { .. } => iceberg_rest_error(
             ICEBERG_ERROR_REST,
             StatusCode::SERVICE_UNAVAILABLE,
             "table catalog is temporarily unavailable",

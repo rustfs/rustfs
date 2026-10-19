@@ -63,7 +63,7 @@ jobs:
   build:
     needs: resolve-source
     name: Build immutable validation DEB
-    runs-on: sm-standard-4
+    runs-on: ubuntu-latest
     timeout-minutes: 150
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -83,7 +83,7 @@ jobs:
       - name: Setup Rust environment
         uses: ./.github/actions/setup
         with:
-          cache-shared-key: validation-package-x86_64-unknown-linux-gnu
+          cache-shared-key: validation-package-hosted-x86_64-unknown-linux-gnu
           cache-save-if: "false"
           install-build-packaging-tools: "false"
           install-test-tools: "false"

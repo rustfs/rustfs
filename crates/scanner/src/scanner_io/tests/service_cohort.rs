@@ -73,6 +73,7 @@ async fn run_cohort_cycle(
                 requires_full_scan: false,
                 service_cohort: Some(cohort),
                 resolved_scope_observer: None,
+                post_walk_gate: None,
             },
         ),
     )

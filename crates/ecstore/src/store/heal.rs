@@ -117,6 +117,47 @@ enum HealFormatPoolSkip {
     Retryable,
 }
 
+#[derive(Debug)]
+enum HealFormatRebalance {
+    Missing,
+    Current(RebalanceMeta),
+    Historical,
+}
+
+impl HealFormatRebalance {
+    fn current(&self) -> Option<&RebalanceMeta> {
+        match self {
+            Self::Current(meta) => Some(meta),
+            Self::Missing | Self::Historical => None,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "format repair blocked: rebalance metadata describes {stored_pools} pools but the deployment has {current_pools}; the historical run is not confirmed terminal"
+)]
+struct HealFormatRebalanceTopologyMismatch {
+    stored_pools: usize,
+    current_pools: usize,
+}
+
+fn classify_heal_format_rebalance(meta: Option<RebalanceMeta>, current_pools: usize) -> Result<HealFormatRebalance> {
+    let Some(meta) = meta else {
+        return Ok(HealFormatRebalance::Missing);
+    };
+    if meta.pool_stats.len() == current_pools {
+        return Ok(HealFormatRebalance::Current(meta));
+    }
+    if meta.has_terminal_topology() {
+        return Ok(HealFormatRebalance::Historical);
+    }
+    Err(Error::other(HealFormatRebalanceTopologyMismatch {
+        stored_pools: meta.pool_stats.len(),
+        current_pools,
+    }))
+}
+
 fn classify_heal_format_pool(
     pool_idx: usize,
     pool_cmd_line: &str,
@@ -365,13 +406,18 @@ impl ECStore {
                     }
                 }
             }
-            if summary.pending > 0 {
+            if object.is_some() && summary.pending > 0 {
                 return Err(StorageError::ErasureReadQuorum);
             }
             if object.is_some() && !opts.dry_run && summary.blocked > 0 {
                 return Err(StorageError::SlowDown);
             }
-            if summary.discovered == 0 {
+            let delete_recovery = rustfs_madmin::heal_commands::DeleteRecoveryStatus {
+                pending: summary.pending,
+                blocked: summary.blocked,
+                failed: summary.failed,
+            };
+            if summary.discovered == 0 && !delete_recovery.has_unresolved() {
                 return Ok(None);
             }
             Ok(Some(HealResultItem {
@@ -384,14 +430,17 @@ impl ECStore {
                 object: object.or(prefix).unwrap_or_default(),
                 bucket,
                 detail: format!(
-                    "delete recovery{}: discovered={}, committed={}, rolled_back={}, reclaimed={}, blocked={}",
+                    "delete recovery{}: discovered={}, committed={}, rolled_back={}, reclaimed={}, blocked={}, pending={}, failed={}",
                     if opts.dry_run { " (dry run)" } else { "" },
                     summary.discovered,
                     summary.committed,
                     summary.rolled_back,
                     summary.reclaimed,
-                    summary.blocked
+                    summary.blocked,
+                    summary.pending,
+                    summary.failed
                 ),
+                delete_recovery: Some(delete_recovery),
                 ..Default::default()
             }))
         })
@@ -404,7 +453,17 @@ impl ECStore {
         expected: uuid::Uuid,
         opts: &HealOpts,
     ) -> Result<HealResultItem> {
-        self.run_bucket_heal_at_incarnation(bucket, expected, opts, |store, bucket, opts| async move {
+        self.run_bucket_heal_at_incarnation(bucket, expected, opts, move |store, bucket, mut opts| async move {
+            if !opts.recreate && !opts.remove {
+                let mut missing = false;
+                for (pool, set) in store.heal_erasure_set_scopes(&opts).await? {
+                    missing |= store.pools[pool].get_disks(set).bucket_needs_reconstruction(&bucket).await?;
+                }
+                if missing {
+                    crate::bucket::metadata_sys::validate_bucket_reconstruction_in(&store.ctx, &bucket, expected).await?;
+                    opts.recreate = true;
+                }
+            }
             store.heal_bucket(&bucket, &opts).await
         })
         .await
@@ -469,7 +528,7 @@ impl ECStore {
         NamespaceLockGuard,
         NamespaceLockGuard,
         PoolMeta,
-        Option<RebalanceMeta>,
+        HealFormatRebalance,
     )> {
         let metadata_pool = self
             .pools
@@ -525,12 +584,9 @@ impl ECStore {
             Err(err) => return Err(err),
         };
 
-        if rebalance_meta
-            .as_ref()
-            .is_some_and(|meta| meta.pool_stats.len() != self.pools.len())
-        {
-            return Err(heal_format_fence_lost_error());
-        }
+        // Keep historical status on disk, but never use its obsolete indices
+        // to gate the current pools. The current pool identity remains fenced.
+        let rebalance_meta = classify_heal_format_rebalance(rebalance_meta, self.pools.len())?;
 
         write_state.ensure_write_safe("heal format fence failed")?;
         if pool_guard.is_lock_lost() || rebalance_guard.is_lock_lost() {
@@ -733,7 +789,8 @@ impl ECStore {
                 first_error.get_or_insert(heal_format_fence_lost_error());
                 break;
             }
-            if let Some(skip) = classify_heal_format_pool(pool_idx, &pool.endpoints.cmd_line, &pool_meta, rebalance_meta.as_ref())
+            if let Some(skip) =
+                classify_heal_format_pool(pool_idx, &pool.endpoints.cmd_line, &pool_meta, rebalance_meta.current())
             {
                 if matches!(skip, HealFormatPoolSkip::Completed) {
                     count_completed += 1;
@@ -807,6 +864,74 @@ impl ECStore {
         Ok((r, None))
     }
 
+    /// Read-only admission for one legacy pre-format recovery handoff. The
+    /// caller holds the target execution leases and validates their owners.
+    pub async fn replacement_preformat_retry_is_safe(
+        &self,
+        pool_index: usize,
+        set_index: usize,
+        targets: &[String],
+    ) -> Result<bool> {
+        let pool = self
+            .pools
+            .get(pool_index)
+            .ok_or_else(|| invalid_heal_pool_index(pool_index, self.pools.len()))?;
+        let Some(set) = pool.disk_set.get(set_index) else {
+            return Err(StorageError::PreconditionFailed);
+        };
+        let (write_state, pool_guard, rebalance_guard, pool_meta, rebalance_meta) = self.acquire_heal_format_fence().await?;
+        if !matches!(rebalance_meta, HealFormatRebalance::Historical)
+            || classify_heal_format_pool(pool_index, &pool.endpoints.cmd_line, &pool_meta, None).is_some()
+            || targets.is_empty()
+        {
+            return Ok(false);
+        }
+
+        let mut slots = BTreeSet::new();
+        let mut target_disks = Vec::with_capacity(targets.len());
+        for target in targets {
+            let Some((slot, endpoint)) = set
+                .set_endpoints
+                .iter()
+                .enumerate()
+                .find(|(_, endpoint)| endpoint.to_string() == *target)
+            else {
+                return Ok(false);
+            };
+            if !endpoint.is_local || !slots.insert(slot) {
+                return Ok(false);
+            }
+            // Open the current mounted target; a cached disk handle can still
+            // refer to the previous disk at the same endpoint.
+            let target_disk = disk::new_disk(
+                endpoint,
+                &disk::DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+            )
+            .await?;
+            if !target_disk.is_blank_replacement_target().await? {
+                return Ok(false);
+            }
+            target_disks.push(target_disk);
+        }
+
+        let (_, error) = set
+            .heal_replacement_format_with_fence(true, targets, || pool_guard.is_lock_lost() || rebalance_guard.is_lock_lost())
+            .await?;
+        write_state.ensure_write_safe("pre-format recovery admission fence failed")?;
+        if pool_guard.is_lock_lost() || rebalance_guard.is_lock_lost() {
+            return Err(heal_format_fence_lost_error());
+        }
+        for target_disk in target_disks {
+            if !target_disk.is_blank_replacement_target().await? {
+                return Ok(false);
+            }
+        }
+        Ok(error.is_none())
+    }
+
     #[instrument(skip(self, targets), fields(pool_index, set_index, target_count = targets.len()))]
     pub async fn heal_replacement_format(
         &self,
@@ -828,7 +953,8 @@ impl ECStore {
         })?;
 
         let (mut write_state, pool_guard, rebalance_guard, pool_meta, rebalance_meta) = self.acquire_heal_format_fence().await?;
-        if let Some(skip) = classify_heal_format_pool(pool_index, &pool.endpoints.cmd_line, &pool_meta, rebalance_meta.as_ref()) {
+        if let Some(skip) = classify_heal_format_pool(pool_index, &pool.endpoints.cmd_line, &pool_meta, rebalance_meta.current())
+        {
             return Ok((HealResultItem::default(), Some(heal_format_pool_skip_error(skip))));
         }
 
@@ -1449,6 +1575,178 @@ mod tests {
         )
         .await
         .expect("minimal pool should build")
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admin_bucket_recovery_recreates_missing_directories_at_current_incarnation() {
+        let (root, store, shutdown) = multi_pool_heal_store().await;
+        let bucket = "admin-bucket-recovery";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create a committed bucket generation");
+        let incarnation = store
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("persisted generation");
+        for disk in 1..4 {
+            tokio::fs::remove_dir(root.path().join(format!("pool0-disk{disk}/{bucket}")))
+                .await
+                .expect("remove only an empty fixture bucket directory");
+        }
+        store
+            .heal_bucket_at_incarnation(bucket, incarnation, &HealOpts::default())
+            .await
+            .expect("default administrator recovery should use committed generation authority");
+        for disk in 0..4 {
+            assert!(root.path().join(format!("pool0-disk{disk}/{bucket}")).is_dir());
+        }
+        assert_eq!(
+            store
+                .bucket_incarnation_id_from_disk(bucket)
+                .await
+                .expect("recovered generation"),
+            incarnation
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admin_bucket_recovery_rejects_missing_corrupt_uncommitted_and_retired_authority() {
+        let (root, store, shutdown) = multi_pool_heal_store().await;
+        for state in ["missing", "corrupt", "uncommitted", "mismatched", "retired"] {
+            let bucket = format!("recovery-authority-{state}");
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create fixture generation");
+            let incarnation = store
+                .bucket_incarnation_id_from_disk(&bucket)
+                .await
+                .expect("fixture identity");
+            let (mut metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&store.ctx, &bucket)
+                .await
+                .expect("committed metadata");
+            assert!(persisted && metadata.bucket_creation_committed);
+            let path = metadata.save_file_path();
+            match state {
+                "missing" => delete_config(store.clone(), &path).await.expect("remove metadata authority"),
+                "corrupt" => save_config(store.clone(), &path, b"corrupt bucket metadata".to_vec())
+                    .await
+                    .expect("corrupt authority"),
+                "uncommitted" | "mismatched" => {
+                    if state == "uncommitted" {
+                        metadata.bucket_creation_committed = false;
+                    } else {
+                        metadata.bucket_incarnation_id = Uuid::new_v4();
+                    }
+                    metadata
+                        .save_with_store_committed(store.clone())
+                        .await
+                        .expect("inject inconsistent metadata authority");
+                }
+                "retired" => {
+                    // A returning disk may retain a directory after retirement was committed.
+                    crate::bucket::retirement::commit_retirement(store.clone(), &bucket, incarnation, &ObjectOptions::default())
+                        .await
+                        .expect("persist retirement evidence");
+                }
+                _ => unreachable!("fixed fixture states"),
+            }
+            for disk in 1..4 {
+                tokio::fs::remove_dir(root.path().join(format!("pool0-disk{disk}/{bucket}")))
+                    .await
+                    .expect("lose fixture directories");
+            }
+            assert!(
+                store
+                    .heal_bucket_at_incarnation(&bucket, incarnation, &HealOpts::default())
+                    .await
+                    .is_err(),
+                "must reject {state}"
+            );
+            for disk in 1..4 {
+                assert!(
+                    !root.path().join(format!("pool0-disk{disk}/{bucket}")).exists(),
+                    "{state} cannot authorize reconstruction"
+                );
+            }
+        }
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admin_bucket_recovery_rejects_offline_disks_and_fully_missing_sets() {
+        for offline in [false, true] {
+            let (root, store, shutdown) = multi_pool_heal_store().await;
+            let bucket = "recovery-unproven-set";
+            store
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("fixture bucket");
+            let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("fixture identity");
+            let first_missing = usize::from(offline);
+            for disk in first_missing..4 {
+                tokio::fs::remove_dir(root.path().join(format!("pool0-disk{disk}/{bucket}")))
+                    .await
+                    .expect("remove fixture directories");
+            }
+            if offline {
+                let disk = store.pools[0].disk_set[0].disks.read().await[0]
+                    .clone()
+                    .expect("online fixture disk");
+                disk.close().await.expect("stop disk monitoring");
+                disk.force_offline_for_test();
+            }
+            assert!(
+                store
+                    .heal_bucket_at_incarnation(bucket, incarnation, &HealOpts::default())
+                    .await
+                    .is_err()
+            );
+            for disk in first_missing..4 {
+                assert!(!root.path().join(format!("pool0-disk{disk}/{bucket}")).exists());
+            }
+            shutdown.cancel();
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admin_bucket_recovery_dry_run_preserves_missing_directories() {
+        let (root, store, shutdown) = multi_pool_heal_store().await;
+        let bucket = "recovery-dry-run";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("fixture bucket");
+        let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("fixture identity");
+        for disk in 1..4 {
+            tokio::fs::remove_dir(root.path().join(format!("pool0-disk{disk}/{bucket}")))
+                .await
+                .expect("remove fixture directories");
+        }
+        store
+            .heal_bucket_at_incarnation(
+                bucket,
+                incarnation,
+                &HealOpts {
+                    dry_run: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("dry run can inspect eligible recovery");
+        for disk in 1..4 {
+            assert!(
+                !root.path().join(format!("pool0-disk{disk}/{bucket}")).exists(),
+                "dry run must not reconstruct directories"
+            );
+        }
+        shutdown.cancel();
     }
 
     #[tokio::test]
@@ -2151,9 +2449,13 @@ mod tests {
     }
 
     async fn multi_pool_heal_store() -> (tempfile::TempDir, Arc<ECStore>, CancellationToken) {
+        heal_store_with_pool_count(2).await
+    }
+
+    async fn heal_store_with_pool_count(pool_count: usize) -> (tempfile::TempDir, Arc<ECStore>, CancellationToken) {
         let temp_dir = tempfile::tempdir().expect("multi-pool heal test directory should be created");
         let mut pool_endpoints = Vec::new();
-        for pool_index in 0..2 {
+        for pool_index in 0..pool_count {
             let mut endpoints = Vec::new();
             for disk_index in 0..4 {
                 let disk_path = temp_dir.path().join(format!("pool{pool_index}-disk{disk_index}"));
@@ -2468,6 +2770,224 @@ mod tests {
                 .expect("replacement target format path should be inspectable"),
             "format heal must not write the replacement target"
         );
+    }
+
+    fn completed_two_pool_rebalance() -> RebalanceMeta {
+        RebalanceMeta {
+            id: Uuid::new_v4().to_string(),
+            pool_stats: vec![
+                RebalanceStats {
+                    participating: true,
+                    info: RebalanceInfo {
+                        status: RebalStatus::Completed,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                RebalanceStats::default(),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn historical_rebalance_topology_requires_every_pool_to_be_terminal() {
+        use crate::services::rebalance::{RebalanceStopPropagationRecord, encode_rebalance_stop_propagation_record};
+
+        assert!(matches!(
+            classify_heal_format_rebalance(Some(completed_two_pool_rebalance()), 1),
+            Ok(HealFormatRebalance::Historical)
+        ));
+        // Expansion has the same historical-index problem as removal.
+        assert!(matches!(
+            classify_heal_format_rebalance(Some(completed_two_pool_rebalance()), 3),
+            Ok(HealFormatRebalance::Historical)
+        ));
+        assert!(matches!(classify_heal_format_rebalance(None, 1), Ok(HealFormatRebalance::Missing)));
+        for status in [RebalStatus::Completed, RebalStatus::Stopped, RebalStatus::Failed] {
+            let mut meta = completed_two_pool_rebalance();
+            meta.pool_stats[0].info.status = status;
+            assert!(meta.has_terminal_topology(), "terminal status {status:?}");
+        }
+
+        let mut invalid = Vec::new();
+        for index in 0..2 {
+            let mut active = completed_two_pool_rebalance();
+            active.stopped_at = Some(OffsetDateTime::UNIX_EPOCH);
+            active.pool_stats[index].info.status = RebalStatus::Started;
+            invalid.push(active);
+            let mut stopping = completed_two_pool_rebalance();
+            stopping.pool_stats[index].info.stopping = true;
+            invalid.push(stopping);
+        }
+        let mut unknown_participant = completed_two_pool_rebalance();
+        unknown_participant.pool_stats[0].info.status = RebalStatus::None;
+        invalid.push(unknown_participant);
+        let mut no_id = completed_two_pool_rebalance();
+        no_id.id.clear();
+        invalid.push(no_id);
+        invalid.push(RebalanceMeta::default());
+        for record in [
+            RebalanceStopPropagationRecord {
+                stop_attempt_at: Some(OffsetDateTime::UNIX_EPOCH),
+                ..Default::default()
+            },
+            RebalanceStopPropagationRecord {
+                stop_failures: vec!["peer".to_string()],
+                ..Default::default()
+            },
+            RebalanceStopPropagationRecord {
+                terminal_reload_attempt_at: Some(OffsetDateTime::UNIX_EPOCH),
+                terminal_reload_failures: vec!["peer".to_string()],
+                ..Default::default()
+            },
+        ] {
+            let mut meta = completed_two_pool_rebalance();
+            meta.pool_stats[1].info.last_error = Some(encode_rebalance_stop_propagation_record(&record));
+            invalid.push(meta);
+        }
+        let mut malformed = completed_two_pool_rebalance();
+        malformed.pool_stats[0].info.last_error = Some("rebalance stop propagation incomplete: invalid".to_string());
+        invalid.push(malformed);
+        for meta in invalid {
+            let error = classify_heal_format_rebalance(Some(meta), 1).expect_err("uncertain history must block repair");
+            assert!(error.to_string().contains("not confirmed terminal"));
+            assert!(!error.to_string().contains("request rate"));
+        }
+        let mut acknowledged = completed_two_pool_rebalance();
+        acknowledged.pool_stats[0].info.last_error =
+            Some(encode_rebalance_stop_propagation_record(&RebalanceStopPropagationRecord {
+                stop_attempt_at: Some(OffsetDateTime::UNIX_EPOCH),
+                terminal_reload_attempt_at: Some(OffsetDateTime::UNIX_EPOCH),
+                ..Default::default()
+            }));
+        assert!(acknowledged.has_terminal_topology());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn replacement_format_after_historical_pool_removal() {
+        let (temp_dir, store, shutdown) = heal_store_with_pool_count(1).await;
+        let mut meta = completed_two_pool_rebalance();
+        meta.save(store.pools[0].clone())
+            .await
+            .expect("persist historical two-pool run");
+        let (before, _) = read_config_no_lock_preserve_empty_with_metadata(store.pools[0].clone(), REBAL_META_NAME)
+            .await
+            .expect("read historical run before repair");
+        let target = remove_heal_test_format(&temp_dir, &store, 0, 3).await;
+
+        // Even a worker in a removed pool must fence every current format write.
+        meta.pool_stats[1].participating = true;
+        meta.pool_stats[1].info.status = RebalStatus::Started;
+        meta.save(store.pools[0].clone())
+            .await
+            .expect("persist active historical pool");
+        let err = store
+            .heal_replacement_format(false, 0, 0, std::slice::from_ref(&target))
+            .await
+            .expect_err("removed active source must block format repair");
+        assert!(err.to_string().contains("2 pools but the deployment has 1"));
+        assert_heal_test_format_missing(&temp_dir, 0, 3).await;
+        meta.pool_stats[1] = RebalanceStats::default();
+        meta.save(store.pools[0].clone())
+            .await
+            .expect("persist terminal history again");
+
+        let (result, error) = store
+            .heal_replacement_format(false, 0, 0, std::slice::from_ref(&target))
+            .await
+            .expect("terminal historical topology must allow target format repair");
+        assert!(error.is_none(), "target repair: {error:?}");
+        assert!(result.after.drives.iter().all(|drive| !drive.uuid.is_empty()));
+        let disk = store.pools[0].disk_set[0].disks.read().await[3]
+            .clone()
+            .expect("replacement disk");
+        let repaired = load_format_erasure(&disk, true).await.expect("read repaired target format");
+        assert!(!repaired.erasure.this.is_nil());
+
+        remove_heal_test_format(&temp_dir, &store, 0, 3).await;
+        let (_, error) = store
+            .handle_heal_format(false)
+            .await
+            .expect("full format heal uses the same historical fence");
+        assert!(error.is_none(), "full format repair: {error:?}");
+        assert!(heal_test_format_path(&temp_dir, 0, 3).exists());
+        let (after, _) = read_config_no_lock_preserve_empty_with_metadata(store.pools[0].clone(), REBAL_META_NAME)
+            .await
+            .expect("historical status remains readable");
+        assert_eq!(before, after, "format repair must not rewrite historical rebalance status");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn preformat_retry_requires_historical_topology_and_a_blank_target() {
+        let (temp_dir, store, shutdown) = heal_store_with_pool_count(1).await;
+        completed_two_pool_rebalance()
+            .save(store.pools[0].clone())
+            .await
+            .expect("persist historical two-pool run");
+        let target = remove_heal_test_format(&temp_dir, &store, 0, 3).await;
+        assert!(
+            !store
+                .replacement_preformat_retry_is_safe(0, 0, std::slice::from_ref(&target))
+                .await
+                .expect("inspect target with old metadata"),
+            "missing format alone must not admit a disk containing old metadata"
+        );
+        let target_path = temp_dir.path().join("pool0-disk3");
+        for entry in std::fs::read_dir(&target_path).expect("list target fixture") {
+            let entry = entry.expect("target fixture entry");
+            if entry.file_type().expect("fixture entry type").is_dir() {
+                std::fs::remove_dir_all(entry.path()).expect("clear replacement fixture directory");
+            } else {
+                std::fs::remove_file(entry.path()).expect("clear replacement fixture file");
+            }
+        }
+        let target_disk = store.pools[0].disk_set[0].disks.read().await[3]
+            .clone()
+            .expect("replacement disk");
+        if !cfg!(target_os = "linux") {
+            assert!(target_disk.acquire_replacement_execution_lease().await.is_err());
+            assert!(
+                !store
+                    .replacement_preformat_retry_is_safe(0, 0, &[target])
+                    .await
+                    .expect("platforms without pinned mount identity must reject compatibility recovery")
+            );
+            shutdown.cancel();
+            return;
+        }
+        let _lease = target_disk
+            .acquire_replacement_execution_lease()
+            .await
+            .expect("own replacement executor");
+        assert!(
+            store
+                .replacement_preformat_retry_is_safe(0, 0, std::slice::from_ref(&target))
+                .await
+                .expect("inspect blank target")
+        );
+        assert_heal_test_format_missing(&temp_dir, 0, 3).await;
+        std::fs::create_dir(target_path.join("user-bucket")).expect("simulate residual user bucket");
+        assert!(
+            !store
+                .replacement_preformat_retry_is_safe(0, 0, std::slice::from_ref(&target))
+                .await
+                .expect("inspect nonblank target")
+        );
+        std::fs::remove_dir(target_path.join("user-bucket")).expect("remove fixture bucket");
+        delete_config(store.pools[0].clone(), REBAL_META_NAME)
+            .await
+            .expect("remove historical run");
+        assert!(
+            !store
+                .replacement_preformat_retry_is_safe(0, 0, &[target])
+                .await
+                .expect("ordinary replacement has no compatibility authority")
+        );
+        shutdown.cancel();
     }
 
     #[tokio::test]
@@ -3762,7 +4282,6 @@ mod tests {
         let mut recoverable_temp_dirs = Vec::new();
         let mut recoverable_endpoints = Vec::new();
         let mut recoverable_disks = Vec::new();
-        let mut unformatted_disk = None;
         for disk_index in 0..3 {
             let temp_dir = tempfile::tempdir().expect("temporary disk root should be created");
             let mut endpoint = Endpoint::try_from(temp_dir.path().to_str().expect("temporary path should be UTF-8"))
@@ -3779,15 +4298,11 @@ mod tests {
             )
             .await
             .expect("temporary disk should open");
-            if disk_index < 2 {
-                let mut disk_format = recoverable_format.clone();
-                disk_format.erasure.this = recoverable_format.erasure.sets[0][disk_index];
-                save_format_file(&Some(disk.clone()), &Some(disk_format))
-                    .await
-                    .expect("recoverable format should be written");
-            } else {
-                unformatted_disk = Some(disk.clone());
-            }
+            let mut disk_format = recoverable_format.clone();
+            disk_format.erasure.this = recoverable_format.erasure.sets[0][disk_index];
+            save_format_file(&Some(disk.clone()), &Some(disk_format))
+                .await
+                .expect("recoverable format should be written before pool metadata");
             recoverable_temp_dirs.push(temp_dir);
             recoverable_endpoints.push(endpoint);
             recoverable_disks.push(Some(disk));
@@ -3836,6 +4351,36 @@ mod tests {
             .expect("pool metadata should be persisted before format heal");
         *store.pool_meta_save_gate.lock().await = PoolMetaWriteState::default();
 
+        let replacement_endpoint = store.pools[1].endpoints.endpoints.as_ref()[2].clone();
+        tokio::fs::remove_file(
+            recoverable_temp_dirs[2]
+                .path()
+                .join(crate::disk::RUSTFS_META_BUCKET)
+                .join(FORMAT_CONFIG_FILE),
+        )
+        .await
+        .expect("the target format must be removed only after durable pool metadata exists");
+        let replacement_disk = new_disk(
+            &replacement_endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("the unformatted replacement disk must reopen");
+        assert!(matches!(
+            load_format_erasure(&replacement_disk, true).await,
+            Err(crate::disk::error::DiskError::UnformattedDisk)
+        ));
+        let replacement_set = &store.pools[1].disk_set[0];
+        let replacement_slot = replacement_set
+            .set_endpoints
+            .iter()
+            .position(|endpoint| endpoint == &replacement_endpoint)
+            .expect("the replacement must remain in its original set");
+        replacement_set.disks.write().await[replacement_slot] = Some(replacement_disk.clone());
+
         let (result, err) = store
             .handle_heal_format(false)
             .await
@@ -3845,7 +4390,7 @@ mod tests {
             "foreign format majority must not be downgraded to a successful heal: {err:?}"
         );
         assert_eq!(result.disk_count, 3, "the recoverable pool should still be inspected");
-        let healed = load_format_erasure(&unformatted_disk.expect("the unformatted disk handle should be retained"), true)
+        let healed = load_format_erasure(&replacement_disk, true)
             .await
             .expect("the later pool should be healed despite the first pool error");
         assert_eq!(healed.erasure.this, recoverable_format.erasure.sets[0][2]);

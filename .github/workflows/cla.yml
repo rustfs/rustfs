@@ -46,7 +46,7 @@ jobs:
     # Echoes one line; the run exists only so the concurrency group cancels the
     # in-flight run of a closed PR.
     permissions: {}
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Explain cancellation run
@@ -61,7 +61,7 @@ jobs:
       checks: write
       issues: write
       pull-requests: write
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Report CLA result for merge queue

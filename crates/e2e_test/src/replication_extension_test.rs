@@ -14,8 +14,8 @@
 
 use crate::common::{
     AdminTransport, RustFSTestEnvironment, admin_add_canned_policy_via, admin_attach_user_policy_via, admin_create_user,
-    awscurl_post_sts_form_urlencoded, init_logging, local_http_client, replication_fast_env, rustfs_binary_path, signed_request,
-    signed_request_with_client, signed_request_with_session_token,
+    awscurl_post_sts_form_urlencoded, init_logging, local_http_client, parse_assume_role_credentials, replication_fast_env,
+    rustfs_binary_path, signed_request, signed_request_with_client, signed_request_with_session_token,
 };
 use crate::fake_s3_target::{
     FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, FaultAction as FakeTargetFault, Operation as FakeTargetOperation,
@@ -385,21 +385,6 @@ pub(crate) struct ReplicationResetStatusTarget {
     pub(crate) replicated_count: i64,
     #[serde(rename = "object", default)]
     pub(crate) object: String,
-}
-
-fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&close)? + start;
-    Some(xml[start..end].to_string())
-}
-
-fn parse_assume_role_credentials(xml: &str) -> Result<(String, String, String), Box<dyn Error + Send + Sync>> {
-    let access_key = extract_xml_tag(xml, "AccessKeyId").ok_or("missing AccessKeyId in AssumeRole response")?;
-    let secret_key = extract_xml_tag(xml, "SecretAccessKey").ok_or("missing SecretAccessKey in AssumeRole response")?;
-    let session_token = extract_xml_tag(xml, "SessionToken").ok_or("missing SessionToken in AssumeRole response")?;
-    Ok((access_key, secret_key, session_token))
 }
 
 pub(crate) struct ReplicationTargetOptions<'a> {
@@ -3945,7 +3930,15 @@ async fn test_bucket_replication_version_purge_of_non_inline_object_releases_sou
         (sse_key, sse_put.version_id().ok_or("SSE PUT omitted version ID")?.to_string()),
         (large_key, large_put.version_id().ok_or("large PUT omitted version ID")?.to_string()),
     ];
-    assert_replication_converged(&source_client, &source_bucket, &target_client, &target_bucket).await?;
+    // Managed-SSE listings may omit ETags. Check the replicated version's body
+    // before deleting it rather than comparing keyless listing fingerprints.
+    for (key, version_id) in &purged {
+        let source_body = get_version_body(&source_client, &source_bucket, key, version_id).await?;
+        let expected_sha256: [u8; 32] = Sha256::digest(&source_body).into();
+        wait_for_replicated_sha256(&target_client, &target_bucket, key, expected_sha256).await?;
+        let target_body = get_version_body(&target_client, &target_bucket, key, version_id).await?;
+        assert_eq!(target_body, source_body, "replicated version body differs for {key}/{version_id}");
+    }
 
     for (key, version_id) in &purged {
         source_client
@@ -3956,10 +3949,6 @@ async fn test_bucket_replication_version_purge_of_non_inline_object_releases_sou
             .send()
             .await?;
     }
-    assert_replication_converged(&source_client, &source_bucket, &target_client, &target_bucket).await?;
-    let target_state = list_replication_state(&target_client, &target_bucket).await?;
-    assert!(target_state.is_empty(), "target retained an explicitly purged version: {target_state:?}");
-
     // The purge state is applied on the source asynchronously after the target
     // acknowledges the delete; only then does the retained version go away and
     // the bucket become deletable. A listing that is empty while DeleteBucket
@@ -3983,6 +3972,9 @@ async fn test_bucket_replication_version_purge_of_non_inline_object_releases_sou
             Err(err) => return Err(err.into()),
         }
     }
+
+    let target_state = list_replication_state(&target_client, &target_bucket).await?;
+    assert!(target_state.is_empty(), "target retained an explicitly purged version: {target_state:?}");
 
     Ok(())
 }

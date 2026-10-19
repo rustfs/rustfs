@@ -134,7 +134,7 @@ pub(crate) mod kms {
 
 pub(crate) mod protocols {
     pub(crate) mod client {
-        pub(crate) use crate::storage::storage_api::access_consumer::{ReqInfo, authorize_request};
+        pub(crate) use crate::storage::storage_api::access_consumer::{MultipartStagingOperation, ReqInfo, authorize_request};
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::contract::bucket::{BucketOperations, MakeBucketOptions};
         #[cfg(test)]
@@ -265,7 +265,9 @@ pub(crate) mod server {
         }
 
         pub(crate) use crate::storage::storage_api::ecstore_disk::DiskStore;
-        pub(crate) use crate::storage::storage_api::{Endpoint, EndpointServerPools, is_dist_erasure};
+        pub(crate) use crate::storage::storage_api::{
+            Endpoint, EndpointServerPools, PeerRestClient, get_global_notification_sys, is_dist_erasure,
+        };
 
         pub(crate) fn disk_endpoint_snapshot(disk: &DiskStore) -> Endpoint {
             crate::storage::storage_api::ecstore_disk::DiskAPI::endpoint(disk.as_ref())
@@ -460,6 +462,7 @@ pub(crate) mod workload {
 }
 
 pub(crate) mod table {
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::utils::check_valid_bucket_name_strict;
     pub(crate) use crate::storage::storage_api::ecstore_object::{WriteCommitGuard, WriteCompletion};
     pub(crate) mod contract {
         pub(crate) mod http {

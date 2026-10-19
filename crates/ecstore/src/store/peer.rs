@@ -18,6 +18,11 @@ use crate::disk::error::{DiskError, Result as DiskResult};
 use crate::disk::{DeleteOptions, Disk, RenameDataGuards, RenameDataResp};
 use crate::runtime::instance::{InstanceContext, NamespaceCommitGuard};
 use crate::runtime::sources as runtime_sources;
+use rustfs_io_metrics::{
+    PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_ADMIT, PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_LOCAL_RENAME,
+    PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_LOOKUP, PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_OVERHEAD,
+    PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_TOTAL,
+};
 use tracing::{debug, error};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -80,6 +85,13 @@ fn validate_bootstrap_volume(volume: &str) -> DiskResult<()> {
 }
 
 impl ECStore {
+    /// Resolve a quota lease against this request's captured storage instance.
+    pub async fn quota_mutation_fence_disk(&self, disk_ref: &str) -> DiskResult<DiskStore> {
+        let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
+        let _owner = admit_local_disk(&self.ctx, &disk, id, false).await?;
+        Ok(disk)
+    }
+
     pub async fn write_local_metadata_at_incarnation(
         self: &Arc<Self>,
         disk_ref: &str,
@@ -331,15 +343,38 @@ async fn rename_local_data_with_ctx(
     destination: (&str, &str),
     mut guards: RenameDataGuards,
 ) -> DiskResult<RenameDataResp> {
+    let handler_started = rustfs_io_metrics::put_stage_timer();
+    let lookup_started = rustfs_io_metrics::put_stage_timer();
     let (disk, disk_id) = local_disk_candidate(ctx, disk_ref).await?;
+    let lookup_ms = lookup_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
+    if let Some(duration_ms) = lookup_ms {
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_LOOKUP, duration_ms);
+    }
     let mutates_namespace = !is_meta_bucketname(source.0) || !is_meta_bucketname(destination.0);
+    let admit_started = rustfs_io_metrics::put_stage_timer();
     let owner = admit_local_disk(ctx, &disk, disk_id, mutates_namespace).await?;
+    let admit_ms = admit_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
+    if let Some(duration_ms) = admit_ms {
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_ADMIT, duration_ms);
+    }
     guards.namespace_owner = owner.as_ref().map(|owner| owner.clone() as Arc<dyn Send + Sync>);
+    let local_rename_started = rustfs_io_metrics::put_stage_timer();
     let result = disk
         .rename_data_borrowed_with_fence_observed(source.0, source.1, fi, destination.0, destination.1, guards)
         .await
         .result;
+    let local_rename_ms = local_rename_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
+    if let Some(duration_ms) = local_rename_ms {
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_LOCAL_RENAME, duration_ms);
+    }
     drop(owner);
+    if let Some(handler_started) = handler_started {
+        let handler_ms = handler_started.elapsed().as_secs_f64() * 1000.0;
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_TOTAL, handler_ms);
+        let child_ms = lookup_ms.unwrap_or(0.0) + admit_ms.unwrap_or(0.0) + local_rename_ms.unwrap_or(0.0);
+        let overhead_ms = (handler_ms - child_ms).max(0.0);
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_OVERHEAD, overhead_ms);
+    }
     result
 }
 
@@ -1090,15 +1125,20 @@ mod tests {
         .await
         .expect("bounded physical entry");
         drop(rename);
-        assert!(store.scanner_data_usage_publication_blocked().await);
+        assert!(
+            !store.scanner_data_usage_publication_blocked().await,
+            "a pending namespace commit is not a local publication barrier"
+        );
         assert!(ctx.namespace_commits_pending());
         assert!(!sibling.namespace_commits_pending());
-        assert!(
+        // The pending physical rename owns the namespace commit, which is
+        // ordinary namespace activity and no longer fences another scanner
+        // admission on the same token.
+        drop(
             store
-                .rename_local_data(&disk_ref, ("target-bucket", "staged"), &fi, ("target-bucket", "another"), Some(token))
+                .acquire_scanner_publication_lease_guard(token)
                 .await
-                .is_err(),
-            "real pending rename blocks another scanner publication"
+                .expect("a pending ordinary rename does not fence another scanner admission"),
         );
         assert!(store.release_scanner_publication_lease(token).await, "remove registered token");
         let gate = ctx.data_movement_operation_gate();
@@ -1255,7 +1295,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_namespace_commit_rejects_stale_scanner_target_admission() {
+    async fn completed_namespace_commit_keeps_scanner_target_admission() {
         use futures::FutureExt;
         use std::time::{Duration, Instant};
         use tokio::time::timeout;
@@ -1466,21 +1506,21 @@ mod tests {
         assert_eq!(final_state, (false, namespace_completed, movement_before, operation_epoch_before));
         assert_eq!(user_latest.data, user_new.data);
         assert_eq!(user_latest.version_id, user_new.version_id);
+        // An ordinary commit that completed after the lease was granted is
+        // namespace activity the scanner certifies per bucket; it is not a
+        // reason to withhold the scanner-owned metadata rename.
         assert!(
-            stale_validate.is_err() && target_rename.is_err(),
-            "completed namespace commit must reject both stale admissions: validate={stale_validate:?}, target={:?}, metadata_changed={metadata_changed}",
+            stale_validate.is_ok() && target_rename.is_ok(),
+            "a completed ordinary commit must keep both admissions: validate={stale_validate:?}, target={:?}, metadata_changed={metadata_changed}",
             target_rename.as_ref().map(|_| ()),
         );
-        assert_eq!(metadata_after, metadata_before, "stale target must not rewrite metadata");
-        assert_eq!(metadata_latest.data, metadata_old.data, "latest metadata body must remain the old one");
-        assert_eq!(
-            metadata_latest.version_id, metadata_old.version_id,
-            "latest metadata version must remain the old one"
-        );
+        assert!(metadata_changed, "the admitted target publishes the staged metadata");
+        assert!(latest_is_staged, "latest metadata must be the published one");
+        assert_ne!(metadata_latest.data, metadata_old.data);
     }
 
     #[tokio::test]
-    async fn renewed_namespace_lease_allows_real_metadata_publication() {
+    async fn scanner_lease_allows_real_metadata_publication_after_an_ordinary_write() {
         use futures::FutureExt;
         use std::time::Duration;
         use tokio::time::timeout;
@@ -1546,12 +1586,10 @@ mod tests {
                 .expect("latest ordinary committed object");
             assert_eq!(user_latest.version_id, user_new.version_id);
             assert_eq!(user_latest.data, user_new.data);
-            assert!(
-                store
-                    .validate_scanner_publication_lease(old_token, movement_generation)
-                    .await
-                    .is_err()
-            );
+            store
+                .validate_scanner_publication_lease(old_token, movement_generation)
+                .await
+                .expect("an ordinary write after the grant does not stale the lease");
             assert_eq!(
                 ctx.scanner_publication_lease_generations(old_token).await,
                 Some((
@@ -1559,7 +1597,7 @@ mod tests {
                     Some(namespace_generation),
                     crate::runtime::instance::ScannerPublicationLeasePurpose::Authoritative,
                 )),
-                "rejection must not refresh or discard the old lease"
+                "validation must not refresh or discard the lease"
             );
             let (fresh_token, fresh_generation) = store
                 .acquire_scanner_publication_lease(movement_generation, ttl)
@@ -1669,7 +1707,9 @@ mod tests {
     #[serial_test::serial]
     async fn target_ordinary_timeout_keeps_its_physical_namespace_owner() {
         use crate::disk::os::prepared_publication_test_hooks as hooks;
-        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("1"))], async {
+        // Allow real fixture I/O to finish under load. Expire the operation
+        // with virtual time only after its physical publication is paused.
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("60"))], async {
             let ctx = Arc::new(InstanceContext::new());
             let store = super::super::tests::build_store_with_ctx(ctx.clone());
             let root = tempfile::tempdir().expect("root");
@@ -1703,7 +1743,7 @@ mod tests {
             .await
             .expect("bounded entry");
             tokio::time::pause();
-            tokio::time::advance(std::time::Duration::from_secs(2)).await;
+            tokio::time::advance(std::time::Duration::from_secs(61)).await;
             tokio::time::resume();
             let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut rename)
                 .await

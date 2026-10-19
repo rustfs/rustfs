@@ -22,9 +22,12 @@
 # 3. Trigger docker.yml to build and push images using the uploaded binaries
 #
 # Platform scope:
-# - Pushes to main (development builds) build the Linux targets only — they
-#   feed the dev download channel and Docker dev images. Tags, the weekly
-#   schedule and manual dispatch build the full platform matrix.
+# - Development builds come from the nightly schedule and manual dispatch and
+#   cover the full platform matrix; they feed the dev download channel
+#   (artifacts/rustfs/dev on R2, the *-main-latest packages). Tags build the
+#   release matrix. Main pushes do not build: at the usual merge rate most
+#   per-merge builds were cancelled by the next merge before publishing
+#   anything, and the dev channel does not need per-merge granularity.
 #
 # Manual Parameters:
 # - publish: Publish binaries/releases for manual runs (default: false)
@@ -36,24 +39,8 @@ name: Build and Release
 on:
   push:
     tags: [ "*.*.*" ]
-    branches: [ main ]
-    paths-ignore:
-      - "**.md"
-      - "**.txt"
-      - ".github/**"
-      - "docs/**"
-      - "deploy/**"
-      - "scripts/dev_*.sh"
-      - "LICENSE*"
-      - "README*"
-      - "**/*.png"
-      - "**/*.jpg"
-      - "**/*.svg"
-      - ".gitignore"
-      - ".dockerignore"
-      - "flake.lock"
   schedule:
-    - cron: "13 1 * * 0" # Weekly on Sunday 01:13 UTC
+    - cron: "13 1 * * *" # Nightly 01:13 UTC
   workflow_dispatch:
     inputs:
       publish:
@@ -93,7 +80,7 @@ jobs:
   # Build strategy check - determine build type based on trigger
   build-check:
     name: Build Strategy Check
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
@@ -144,12 +131,6 @@ jobs:
               build_type="release"
               echo "📦 Release build detected: $tag_name"
             fi
-          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            # Main branch push - development build
-            should_build=true
-            build_type="development"
-            version="dev-${short_sha}"
-            echo "🛠️  Development build detected"
           elif [[ "${{ github.event_name }}" == "schedule" ]] || \
                [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             # Scheduled or manual build
@@ -178,7 +159,7 @@ jobs:
   prepare-platform-matrix:
     name: Prepare Platform Matrix
     needs: build-check
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
@@ -200,25 +181,14 @@ jobs:
             selected="all"
           fi
 
-          # Per-merge development builds only feed the dev download channel
-          # and the Docker dev images, which consume the Linux binaries; at
-          # the usual merge cadence most per-merge builds are cancelled by the
-          # next merge anyway. macOS and Windows stay covered by tag builds,
-          # the weekly scheduled build and manual dispatch.
-          if [[ "${selected}" == "all" \
-            && "${{ github.event_name }}" == "push" \
-            && "${{ needs.build-check.outputs.build_type }}" == "development" ]]; then
-            selected="linux-x86_64-musl,linux-aarch64-musl,linux-x86_64-gnu,linux-aarch64-gnu"
-            echo "Development (main push) build: restricting to Linux targets"
-          fi
 
           all='{"include":[
-            {"target_id":"linux-x86_64-musl","os":"sm-standard-4","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":""},
-            {"target_id":"linux-aarch64-musl","os":"sm-standard-4-arm","target":"aarch64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":""},
-            {"target_id":"linux-x86_64-gnu","os":"sm-standard-4","target":"x86_64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":"","features":"pyroscope"},
-            {"target_id":"linux-aarch64-gnu","os":"sm-standard-4-arm","target":"aarch64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":"","features":"pyroscope"},
-            {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":"","features":"pyroscope"},
-            {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":"","features":""}
+            {"target_id":"linux-x86_64-musl","os":"sm-standard-4","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":"","glibc":""},
+            {"target_id":"linux-aarch64-musl","os":"sm-standard-4-arm","target":"aarch64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":"","glibc":""},
+            {"target_id":"linux-x86_64-gnu","os":"sm-standard-4","target":"x86_64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":"","features":"pyroscope","glibc":"2.31"},
+            {"target_id":"linux-aarch64-gnu","os":"sm-standard-4-arm","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":"","features":"pyroscope","glibc":"2.31"},
+            {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":"","features":"pyroscope","glibc":""},
+            {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":"","features":"","glibc":""}
           ]}'
 
           if [[ "${selected}" == "all" ]]; then
@@ -246,7 +216,8 @@ jobs:
           echo "Selected platforms: ${selected}"
 
   build-rustfs:
-    name: Build RustFS
+    # Acceptance workflows select artifacts by this stable platform name.
+    name: Build RustFS (${{ matrix.target_id }})
     needs: [ build-check, prepare-platform-matrix ]
     if: needs.build-check.outputs.should_build == 'true' && needs.prepare-platform-matrix.result == 'success'
     runs-on: ${{ matrix.os }}
@@ -273,7 +244,7 @@ jobs:
         with:
           rust-version: stable
           target: ${{ matrix.target }}
-          cache-shared-key: build-${{ matrix.target }}
+          cache-shared-key: build-${{ matrix.target }}${{ matrix.glibc && format('-glibc-{0}', matrix.glibc) || '' }}
           # main only. A cache saved on refs/tags/X is scoped to that tag: no
           # other tag, no main run and no PR can restore it, so every release
           # cycle wrote up to 12 entries of 1-2GB (preview tag plus final tag,
@@ -410,35 +381,53 @@ jobs:
         shell: bash
         env:
           BUILD_TARGET: ${{ matrix.target }}
+          BUILD_OS: ${{ matrix.platform }}-${{ startsWith(matrix.target, 'aarch64-') && 'aarch64' || 'x86_64' }}
         run: |
           # Force rebuild by touching build.rs
           touch rustfs/build.rs
 
-          BINARY_NAMES=(rustfs)
-          if [[ "${{ matrix.platform }}" == "linux" ]]; then
-            BINARY_NAMES+=(rustfs-cli)
-          fi
           FEATURE_ARGS=()
           if [[ -n "${{ matrix.features }}" ]]; then
             FEATURE_ARGS=(--features "${{ matrix.features }}")
           fi
 
-          # Build one binary at a time so release LTO links cannot exhaust a
-          # self-hosted runner by running concurrently.
-          for binary in "${BINARY_NAMES[@]}"; do
-            PROFILE_ARGS=()
-            if [[ "$binary" == "rustfs" && "$BUILD_TARGET" == *-linux-gnu && "${{ matrix.features }}" == "pyroscope" ]]; then
-              # The in-process profiler resolves names from the final executable.
-              # Retain function symbols without enabling DWARF source information.
-              PROFILE_ARGS=(--config 'profile.release.strip="none"')
-            fi
-            if [[ "${{ matrix.cross }}" == "true" ]]; then
-              # All cross targets in the matrix are Linux; zigbuild handles them.
-              cargo zigbuild --release --target ${{ matrix.target }} "${FEATURE_ARGS[@]}" "${PROFILE_ARGS[@]}" -p rustfs --bin "$binary"
-            else
-              cargo build --release --target ${{ matrix.target }} "${FEATURE_ARGS[@]}" "${PROFILE_ARGS[@]}" -p rustfs --bin "$binary"
-            fi
-          done
+          # gnu targets pin an explicit glibc baseline (`<target>.<glibc>` for
+          # cargo-zigbuild) so release binaries link no symbols newer than it
+          # and run on older distros such as RHEL/Rocky 9 (glibc 2.34); #8062.
+          TARGET_ARG="$BUILD_TARGET"
+          if [[ -n "${{ matrix.glibc }}" ]]; then
+            TARGET_ARG="${TARGET_ARG}.${{ matrix.glibc }}"
+          fi
+
+          PROFILE_ARGS=()
+          if [[ "$BUILD_TARGET" == *-linux-gnu && "${{ matrix.features }}" == "pyroscope" ]]; then
+            # The in-process profiler resolves names from the final executable.
+            # Retain function symbols without enabling DWARF source information.
+            PROFILE_ARGS=(--config 'profile.release.strip="none"')
+          fi
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            cargo zigbuild --release --locked --target "$TARGET_ARG" "${FEATURE_ARGS[@]}" "${PROFILE_ARGS[@]}" -p rustfs --bin rustfs
+          else
+            cargo build --release --locked --target "$TARGET_ARG" "${FEATURE_ARGS[@]}" "${PROFILE_ARGS[@]}" -p rustfs --bin rustfs
+          fi
+
+          # All release targets use same-architecture runners, including GNU
+          # builds that use Zig only to select the glibc ABI floor.
+          bin="target/${{ matrix.target }}/release/rustfs"
+          if [[ -f "${bin}.exe" ]]; then
+            bin="${bin}.exe"
+          fi
+          version_output=$("$bin" --version)
+          if ! grep -Fxq "build target : ${BUILD_TARGET}" <<< "$version_output" || \
+             ! grep -Fxq "build os     : ${BUILD_OS}" <<< "$version_output" || \
+             ! grep -Fxq "rust channel : stable-${BUILD_TARGET}" <<< "$version_output"; then
+            echo "release binary reports an unexpected compile target" >&2
+            exit 1
+          fi
+          if [[ -n "${{ matrix.glibc }}" ]]; then
+            python3 scripts/release/check_glibc.py "${{ matrix.glibc }}" \
+              "target/${{ matrix.target }}/release/rustfs"
+          fi
 
       - name: Verify macOS binary has no dynamic liblzma dependency
         if: matrix.platform == 'macos'
@@ -554,9 +543,6 @@ jobs:
           fi
 
           BINARY_FILES=("$BINARY_NAME")
-          if [[ "${{ matrix.platform }}" == "linux" ]]; then
-            BINARY_FILES+=("rustfs-cli")
-          fi
 
           if [[ "$TARGET" == *-linux-gnu && "${{ matrix.features }}" == "pyroscope" ]]; then
             BINARY_FILES+=(rustfs.cpu-symbol-catalog.json rustfs.cpu-symbol-catalog.sha256)
@@ -629,7 +615,7 @@ jobs:
               LATEST_FILES="$LATEST_FILE"
             fi
           elif [[ "$BUILD_TYPE" == "development" ]]; then
-            # Development builds (only main branch triggers development builds)
+            # Development builds (nightly schedule and manual dispatch)
             # Create main-latest version filename
             # Convert from rustfs-linux-x86_64-dev-abc123 to rustfs-linux-x86_64-main-latest
             MAIN_LATEST_FILE="${PACKAGE_BASENAME}-main-latest.zip"
@@ -671,7 +657,7 @@ jobs:
           echo "🔧 Build type: ${BUILD_TYPE}"
           echo "📊 Version: ${VERSION}"
 
-      - name: Verify packaged Linux binaries
+      - name: Verify packaged Linux binary
         if: matrix.platform == 'linux'
         shell: bash
         run: |
@@ -679,7 +665,7 @@ jobs:
 
           package_file="${{ steps.package.outputs.package_file }}"
           archive_members="$(unzip -Z1 "$package_file" | sort)"
-          expected_members=$'rustfs\nrustfs-cli'
+          expected_members='rustfs'
           target="${{ matrix.target }}"
           features="${{ matrix.features }}"
           if [[ "$target" == *-linux-gnu && "$features" == "pyroscope" ]]; then
@@ -691,13 +677,14 @@ jobs:
             exit 1
           fi
 
-          # Every Linux target builds natively, so executing the binaries here
+          # musl targets build natively; the gnu legs are same-arch
+          # cargo-zigbuild builds pinned to the release glibc baseline. Either
+          # way the binaries run on their runner, so executing them here
           # proves each artifact matches its runner architecture.
-          cli_dir="$(mktemp -d)"
-          trap 'rm -rf "$cli_dir"' EXIT
-          unzip -q "$package_file" rustfs rustfs-cli -d "$cli_dir"
-          "$cli_dir/rustfs" --version
-          "$cli_dir/rustfs-cli" --help >/dev/null
+          binary_dir="$(mktemp -d)"
+          trap 'rm -rf "$binary_dir"' EXIT
+          unzip -q "$package_file" rustfs -d "$binary_dir"
+          "$binary_dir/rustfs" --version
 
       - name: Verify packaged console
         if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu'
@@ -843,7 +830,7 @@ jobs:
     name: Build Summary
     needs: [ build-check, build-rustfs ]
     if: always() && needs.build-check.outputs.should_build == 'true'
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Build completion summary
@@ -1032,7 +1019,7 @@ jobs:
     name: Update Latest Version
     needs: [ build-check, publish-release ]
     if: needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Update latest.json
