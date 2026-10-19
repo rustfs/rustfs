@@ -563,13 +563,20 @@ impl SetDisks {
             }
             all_states.insert(transaction, refreshed);
         }
-        // Legacy snapshots contain no set decision. A fresh authorized removal
-        // applies only after the entire key is absent and every raw shape is safe.
-        let legacy_only = explicit_delete
+        // A fresh authorized removal may discard safe legacy residue beside
+        // certified absence receipts. Every participant must have no live metadata;
+        // the receipts remain behind the key-wide barrier until all groups settle.
+        let explicit_legacy_removal = explicit_delete
             && all_states.values().flatten().all(|copy| {
                 copy.current_digest.is_none()
-                    && matches!(copy.state, DeleteRecoveryState::Absent | DeleteRecoveryState::LegacyAmbiguous)
-                    && (copy.state != DeleteRecoveryState::LegacyAmbiguous || copy.explicit_delete_safe)
+                    && match copy.state {
+                        DeleteRecoveryState::Absent => true,
+                        DeleteRecoveryState::LegacyAmbiguous => copy.explicit_delete_safe,
+                        DeleteRecoveryState::QuorumCommitted | DeleteRecoveryState::CommitFinished => {
+                            copy.journal.as_ref().is_some_and(|journal| journal.target_digest.is_none())
+                        }
+                        DeleteRecoveryState::NewPrepared => false,
+                    }
             });
         // This is a fresh authorized delete of an absent unversioned key,
         // rather than evidence about the outcome of a historical transaction.
@@ -635,7 +642,7 @@ impl SetDisks {
                 continue;
             }
             if copies.iter().any(|state| state.state == DeleteRecoveryState::LegacyAmbiguous) {
-                if legacy_only {
+                if explicit_legacy_removal {
                     if dry_run {
                         summary.reclaimed += 1;
                         continue;
@@ -1475,6 +1482,184 @@ mod tests {
             .delete_bucket(bucket, &DeleteBucketOptions::default())
             .await
             .expect("non-force bucket deletion must succeed after proof GC");
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_committed_generation_finishes_beside_stale_write_backup() {
+        let bucket = "recover-stale-write-backup";
+        let (dirs, store, disks) = fixture(bucket).await;
+        put(&store, bucket, &vec![81; 1024 * 1024], false).await;
+        let originals: Vec<_> = dirs
+            .iter()
+            .map(|dir| snapshot(&dir.path().join(bucket).join("object")))
+            .collect();
+        let metadata: Vec<_> = originals
+            .iter()
+            .map(|files| {
+                files
+                    .get(std::path::Path::new(STORAGE_FORMAT_FILE))
+                    .expect("old generation metadata")
+                    .clone()
+            })
+            .collect();
+        let old_data_dir = rustfs_filemeta::FileMeta::load(&metadata[0])
+            .expect("decode old generation")
+            .get_data_dirs()
+            .expect("old generation data directory")
+            .into_iter()
+            .flatten()
+            .next()
+            .expect("external payload data directory");
+        put(&store, bucket, &vec![82; 1024 * 1024], false).await;
+        for (index, dir) in dirs.iter().enumerate() {
+            let root = dir.path().join(bucket).join("object");
+            if index == disks.len() - 1 {
+                tokio::fs::remove_dir_all(&root)
+                    .await
+                    .expect("replace returning member with its old generation");
+            }
+            for (relative, bytes) in &originals[index] {
+                if index != disks.len() - 1 && !relative.starts_with(old_data_dir.to_string()) {
+                    continue;
+                }
+                let path = root.join(relative);
+                tokio::fs::create_dir_all(path.parent().expect("source file parent"))
+                    .await
+                    .expect("restore old generation directory");
+                tokio::fs::write(path, bytes).await.expect("restore old generation bytes");
+            }
+            if index != disks.len() - 1 {
+                tokio::fs::write(root.join(old_data_dir.to_string()).join("xl.meta.bkp"), &metadata[index])
+                    .await
+                    .expect("retain stale write backup beside older payload");
+            }
+        }
+        let transaction = applied(&store, &disks, bucket, None, disks.len()).await;
+        for disk in &disks {
+            publish(disk, bucket, transaction).await;
+        }
+        let incarnation = store
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("recovery bucket identity");
+        let before_preview: Vec<_> = dirs
+            .iter()
+            .map(|dir| snapshot(&dir.path().join(bucket).join("object")))
+            .collect();
+        let mut preview_context = DeleteRecoveryContext::new(Some(incarnation), &|| true);
+        preview_context.explicit_delete = true;
+        preview_context.dry_run = true;
+        let preview = store.pools[0].disk_set[0]
+            .recover_delete_object(bucket, "object", preview_context)
+            .await
+            .expect("preview fresh removal beside unfinished certified receipts");
+        assert_eq!(preview.reclaimed, 1, "fresh intent covers eligible legacy residue beside QuorumCommitted");
+        assert_eq!(preview.committed, 1);
+        assert_eq!(preview.blocked, 0);
+        assert_eq!(preview.pending, 0);
+        for (index, dir) in dirs.iter().enumerate() {
+            assert_eq!(
+                snapshot(&dir.path().join(bucket).join("object")),
+                before_preview[index],
+                "dry-run member {index}"
+            );
+        }
+        let report = store.pools[0].disk_set[0]
+            .recover_delete_object(bucket, "object", DeleteRecoveryContext::new(Some(incarnation), &|| true))
+            .await
+            .expect("an unrelated backup cannot prevent the certified transaction from finishing");
+        assert_eq!(report.committed, 1, "the shared transaction finishes on all members");
+        assert_eq!(report.pending, 0, "no certified payload remains pending");
+        assert_eq!(report.blocked, 1, "the uncertified older backup remains explicit recovery work");
+        for (index, disk) in disks.iter().enumerate() {
+            let state = disk
+                .inspect_delete_transaction(bucket, "object", transaction)
+                .await
+                .expect("inspect completed certified transaction");
+            assert_eq!(state.state, DeleteRecoveryState::CommitFinished, "member {index}");
+            let root = dirs[index].path().join(bucket).join("object");
+            assert!(
+                !root.join(STORAGE_FORMAT_FILE).exists(),
+                "deleted metadata remains absent on member {index}"
+            );
+            if index != disks.len() - 1 {
+                assert_eq!(
+                    tokio::fs::read(root.join(old_data_dir.to_string()).join("xl.meta.bkp"))
+                        .await
+                        .expect("uncertified write backup survives"),
+                    metadata[index],
+                    "member {index} preserves the ambiguous older generation"
+                );
+            } else {
+                assert!(
+                    !root.join(old_data_dir.to_string()).exists(),
+                    "the certified older member reclaims its payload"
+                );
+            }
+        }
+        for (index, dir) in dirs.iter().enumerate().take(disks.len() - 1) {
+            let source = rustfs_filemeta::FileMeta::load(&metadata[index]).expect("decode backup before protection");
+            let mut protected = rustfs_filemeta::FileMeta::new();
+            for version in &source.versions {
+                let mut info = version.into_fileinfo(bucket, "object", true).expect("backup version");
+                info.metadata.insert("x-amz-object-lock-legal-hold".into(), "ON".into());
+                protected.add_version(info).expect("protect ambiguous backup");
+            }
+            tokio::fs::write(
+                dir.path()
+                    .join(bucket)
+                    .join("object")
+                    .join(old_data_dir.to_string())
+                    .join("xl.meta.bkp"),
+                protected.marshal_msg().expect("encode protected backup"),
+            )
+            .await
+            .expect("persist protected ambiguous generation");
+        }
+        let protected: Vec<_> = dirs
+            .iter()
+            .map(|dir| snapshot(&dir.path().join(bucket).join("object")))
+            .collect();
+        assert!(
+            store.delete_object(bucket, "object", ObjectOptions::default()).await.is_err(),
+            "an existing delete decision cannot authorize removing protected legacy metadata"
+        );
+        for (index, dir) in dirs.iter().enumerate() {
+            assert_eq!(
+                snapshot(&dir.path().join(bucket).join("object")),
+                protected[index],
+                "protected member {index}"
+            );
+        }
+        for (index, dir) in dirs.iter().enumerate().take(disks.len() - 1) {
+            tokio::fs::write(
+                dir.path()
+                    .join(bucket)
+                    .join("object")
+                    .join(old_data_dir.to_string())
+                    .join("xl.meta.bkp"),
+                &metadata[index],
+            )
+            .await
+            .expect("restore unprotected backup fixture");
+        }
+        store
+            .delete_object(bucket, "object", ObjectOptions::default())
+            .await
+            .expect("a fresh authorized delete reclaims safe absent-key legacy residue");
+        for disk in &disks {
+            assert!(
+                discover(disk, bucket, Some("object"))
+                    .await
+                    .expect("inspect final recovery residue")
+                    .is_empty(),
+                "the fresh delete finalizes every retained decision"
+            );
+        }
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("the fully reclaimed object no longer blocks bucket removal");
     }
 
     #[tokio::test]
