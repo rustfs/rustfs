@@ -699,12 +699,12 @@ def check_ilm_build_budget(root: Path) -> list[str]:
     if step is None:
         return [".github/workflows/ci.yml: missing ignored ILM integration step"]
 
-    budget = (
-        "CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || "
-        "github.event_name == 'workflow_dispatch') && '3' || '2' }}"
-    )
+    # Measured on main: 3 build jobs cut the workspace test build from 28 to
+    # 16-23 minutes with no link storms; the lane must not drift back to 2 or
+    # fan out further without a new measurement.
+    budget = 'CARGO_BUILD_JOBS: "3"'
     if budget not in step.group("body"):
-        return [".github/workflows/ci.yml: ILM integration must keep the measured 3/2 Cargo build budget"]
+        return [".github/workflows/ci.yml: ILM integration must keep the measured Cargo build budget (CARGO_BUILD_JOBS 3)"]
     for required in (
         "        if: needs.classify-changes.outputs.mode == 'full'",
         "cargo nextest run --profile default -j1 --run-ignored ignored-only",
@@ -5581,7 +5581,7 @@ class SelfTests(unittest.TestCase):
                 "      - name: Run ignored ILM integration tests serially\n"
                 "        if: needs.classify-changes.outputs.mode == 'full'\n"
                 "        env:\n"
-                "          CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '3' || '2' }}\n"
+                '          CARGO_BUILD_JOBS: "3"\n'
                 "        run: |\n"
                 "          cargo nextest run --profile default -j1 --run-ignored ignored-only --all --exclude e2e_test \\\n"
                 "            -E 'binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))'\n"
@@ -5596,6 +5596,8 @@ class SelfTests(unittest.TestCase):
             workflow.write_text(valid.replace("          CARGO_BUILD_JOBS:", "          BUILD_JOBS:"))
             self.assertEqual(len(check_ilm_build_budget(root)), 1)
             for old, new in (
+                ('CARGO_BUILD_JOBS: "3"', 'CARGO_BUILD_JOBS: "2"'),
+                ('CARGO_BUILD_JOBS: "3"', "CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '3' || '2' }}"),
                 ("test-and-lint:", "test-ilm-integration-serial:"),
                 ("outputs.mode == 'full'", "outputs.mode == 'docs'"),
                 ("--profile default", "--profile ci"),
