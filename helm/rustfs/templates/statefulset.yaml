@@ -57,6 +57,13 @@ spec:
   serviceName: {{ include "rustfs.fullname" $ }}-headless
   replicas: {{ $pool.replicaCount }}
   podManagementPolicy: Parallel
+  {{- if gt (int $.Values.minReadySeconds) 0 }}
+  {{- /* A replaced pod reports Ready from its own view before surviving
+         peers have re-dialed its new IP (platform DNS TTL) and re-admitted
+         its drives. Hold the rollout so the next pod is not stopped while
+         survivors still count the previous one as unavailable (#8669). */}}
+  minReadySeconds: {{ int $.Values.minReadySeconds }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "rustfs.selectorLabels" $ | nindent 6 }}
