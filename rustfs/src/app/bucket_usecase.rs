@@ -5731,10 +5731,7 @@ mod tests {
         let prepared = crate::storage::persisted_from_s3s(&req.input.server_side_encryption_configuration);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase
-            .execute_put_bucket_encryption(req, prepared)
-            .await
-            .unwrap_err();
+        let err = usecase.execute_put_bucket_encryption(req, prepared).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
