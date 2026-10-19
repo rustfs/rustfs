@@ -252,11 +252,11 @@ pub mod bucket {
     pub mod quota {
         pub use crate::bucket::quota::{
             BucketQuota, QUOTA_RESERVATION_PROTOCOL_V1, QUOTA_RESERVATION_PROTOCOL_V2, QuotaCheckResult, QuotaError,
-            QuotaOperation,
+            QuotaMigrationSkipReason, QuotaOperation, QuotaProtocolMigration,
         };
 
         pub mod checker {
-            pub use crate::bucket::quota::checker::QuotaChecker;
+            pub use crate::bucket::quota::checker::{QuotaChecker, record_reservation_protocol_migration};
         }
     }
 

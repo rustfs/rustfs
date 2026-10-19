@@ -198,7 +198,7 @@ pub(super) fn request_body_is_aws_chunked_framed(headers: &HeaderMap) -> bool {
 
 /// Map a bucket-quota checker outcome onto the S3 admission result.
 ///
-/// Hard is the only supported quota type, so a checker fault (bucket-config read, config parse, or usage lookup) must fail closed rather than admit the write: allowing it would silently bypass a configured hard quota. The no-quota happy path never reaches the error arm — `QuotaChecker::check_quota` returns `Ok(allowed)` via the zero-extra-I/O fast path when no quota is configured, so failing closed here cannot penalise buckets without a quota. A fault surfaces as a retryable `ServiceUnavailable` and is counted; the client-facing message stays generic so internal config/usage details are not leaked.
+/// Hard is the only supported quota type, so a checker fault (bucket-config read, config parse, or usage lookup) must fail closed rather than admit the write: allowing it would silently bypass a configured hard quota. The no-quota happy path never reaches the error arm — `QuotaChecker::check_quota` returns `Ok(allowed)` via the zero-extra-I/O fast path when no quota is configured, so failing closed here cannot penalise buckets without a quota. A bucket admitted by the durable reservation ledger never reaches it for an unavailable usage lookup either: the checker reports that usage as absent (`current_usage = None`) and the ledger settles admission at commit (rustfs/backlog#2904); only the snapshot protocol still fails closed on it. A fault surfaces as a retryable `ServiceUnavailable` and is counted; the client-facing message stays generic so internal config/usage details are not leaked.
 pub(crate) fn map_quota_check_outcome(bucket: &str, outcome: Result<QuotaCheckResult, QuotaError>) -> S3Result<QuotaCheckResult> {
     match outcome {
         Ok(result) if !result.allowed => Err(S3Error::with_message(
@@ -2184,14 +2184,38 @@ mod tests {
 
     #[test]
     fn quota_admission_fails_closed_on_unknown_authoritative_usage() {
+        // Only the snapshot protocol still surfaces this: the checker never
+        // returns it for a bucket the durable reservation ledger admits.
         let err = map_quota_check_outcome(
             "bucket",
             Err(QuotaError::UsageUnavailable {
                 bucket: "bucket".to_string(),
             }),
         )
-        .expect_err("unknown authoritative usage must not admit a quota-controlled write");
+        .expect_err("unknown authoritative usage must not admit a snapshot-protocol write");
         assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+    }
+
+    /// rustfs/backlog#2904: a durable-quota check whose scanner usage is
+    /// unknown admits the write at the handler and leaves the decision to the
+    /// ledger; nothing on the handler path treats the absent usage as zero.
+    #[test]
+    fn durable_quota_without_scanner_usage_admits_the_write() {
+        let unknown_usage = QuotaCheckResult {
+            allowed: true,
+            current_usage: None,
+            quota_limit: Some(2048),
+            operation_size: 512,
+            remaining: None,
+            uses_durable_reservations: true,
+        };
+        let result = map_quota_check_outcome("bucket", Ok(unknown_usage)).expect("the ledger settles admission at commit");
+        assert_eq!(result.current_usage, None);
+
+        let mut opts = ObjectOptions::default();
+        apply_quota_admission(&mut opts, &result).expect("durable admission carries no snapshot into the write");
+        assert!(opts.quota_admission.is_none());
+        ensure_object_size_within_quota(&result, 4096).expect("unknown usage cannot pre-reject an object");
     }
 }
 
