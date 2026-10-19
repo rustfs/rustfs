@@ -6063,30 +6063,47 @@ async fn scanner_usage_state_reset_cancels_during_publication_admission() {
     }
 }
 
+/// Corrupt slots without any cycle state are the rustfs/rustfs#8670 shape. The
+/// full rebuild starts from the empty baseline exactly as a missing floor
+/// does: the result is a bootstrap-pending marker, never an authoritative zero
+/// floor, so quota-bearing buckets keep failing closed until a complete
+/// publication. A valid backup still supplies the recovery floor instead.
 #[tokio::test]
 #[serial]
-async fn scanner_usage_state_reset_rejects_corruption_without_a_trusted_floor() {
+async fn scanner_usage_state_reset_rebuilds_corruption_without_a_trusted_floor_from_empty_baseline() {
     let (_temp_dir, store) = setup_scanner_cycle_store_with_usage_baseline(false).await;
     save_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), b"{corrupt".to_vec())
         .await
         .expect("corrupt primary should persist");
-    let before = read_config_with_revision(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+    let result = reset_scanner_usage_state_for_full_rebuild(CancellationToken::new(), store.clone())
         .await
-        .expect("evidence should load");
-    let err = reset_scanner_usage_state_for_full_rebuild(CancellationToken::new(), store.clone())
+        .expect("corrupt slots without a cycle state start from the empty baseline");
+    assert_eq!(result.leader_epoch, 1);
+    assert_eq!(result.next_cycle, 0);
+    assert_eq!(result.usage_state, "bootstrap-pending");
+    let primary = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
         .await
-        .expect_err("corruption must not become a zero floor");
-    assert!(err.to_string().contains("no trusted cycle or usage floor"), "{err}");
-    assert_eq!(
-        read_config_with_revision(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .expect("reset should replace the corrupt primary with a bootstrap marker");
+    let primary: DataUsageInfo = serde_json::from_slice(&primary).expect("bootstrap marker should decode");
+    assert!(data_usage_info_is_bootstrap_pending(&primary), "corruption must not become a zero floor");
+    assert!(!data_usage_info_has_persisted_baseline_identity(&primary));
+    let (cycle, leader_epoch) = decode_scanner_cycle_state(
+        &read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
             .await
-            .expect("evidence should remain"),
-        before
-    );
-    assert!(matches!(
-        read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str()).await,
-        Err(EcstoreError::ConfigNotFound)
-    ));
+            .expect("reset should fence a fresh cycle state"),
+    )
+    .expect("fenced cycle state should decode");
+    assert_eq!((cycle.next, leader_epoch), (0, 1));
+    let (floor, startup) = persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect("startup should accept the bootstrap marker");
+    assert_eq!(startup, PersistedUsageFloorStartup::BootstrapPending);
+    assert_eq!(floor.leader_epoch, 1);
+
+    let (_temp_dir, store) = setup_scanner_cycle_store_with_usage_baseline(false).await;
+    save_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), b"{corrupt".to_vec())
+        .await
+        .expect("corrupt primary should persist");
     let mut backup = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
     backup.scanner_epoch = Some(7);
     backup.scanner_cycle = Some(40);
@@ -6138,10 +6155,12 @@ async fn scanner_usage_state_reset_rejects_replaced_intent_and_newer_cleanup_slo
     assert_eq!(read_config(store, &path).await.expect("newer snapshot should remain"), bytes);
 }
 
+/// Valid JSON without a baseline identity proves no floor either. The full
+/// rebuild treats it like corruption: it starts from the empty baseline with
+/// a bootstrap-pending marker instead of promoting the untrusted values.
 #[tokio::test]
 #[serial]
-async fn scanner_usage_state_reset_rejects_decodable_untrusted_floor() {
-    let (_temp_dir, store) = setup_scanner_cycle_store_with_usage_baseline(false).await;
+async fn scanner_usage_state_reset_rebuilds_decodable_untrusted_floor_from_empty_baseline() {
     let invalid_identity = DataUsageInfo {
         usage_snapshot_complete: true,
         buckets_count: 1,
@@ -6149,6 +6168,7 @@ async fn scanner_usage_state_reset_rejects_decodable_untrusted_floor() {
         ..Default::default()
     };
     for usage in [DataUsageInfo::default(), invalid_identity] {
+        let (_temp_dir, store) = setup_scanner_cycle_store_with_usage_baseline(false).await;
         save_config(
             store.clone(),
             DATA_USAGE_OBJ_NAME_PATH.as_str(),
@@ -6156,23 +6176,22 @@ async fn scanner_usage_state_reset_rejects_decodable_untrusted_floor() {
         )
         .await
         .expect("untrusted primary should persist");
-        let before = read_config_with_revision(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        let result = reset_scanner_usage_state_for_full_rebuild(CancellationToken::new(), store.clone())
             .await
-            .expect("primary should load");
-        let err = reset_scanner_usage_state_for_full_rebuild(CancellationToken::new(), store.clone())
+            .expect("an untrusted floor without a cycle state starts from the empty baseline");
+        assert_eq!((result.leader_epoch, result.next_cycle), (1, 0));
+        assert_eq!(result.usage_state, "bootstrap-pending");
+        let primary = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
             .await
-            .expect_err("valid JSON alone cannot prove a usage floor");
-        assert!(err.to_string().contains("no trusted cycle or usage floor"), "{err}");
-        assert_eq!(
-            read_config_with_revision(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
-                .await
-                .expect("evidence should remain"),
-            before
-        );
-        assert!(matches!(
-            read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str()).await,
-            Err(EcstoreError::ConfigNotFound)
-        ));
+            .expect("reset should replace the untrusted primary with a bootstrap marker");
+        let primary: DataUsageInfo = serde_json::from_slice(&primary).expect("bootstrap marker should decode");
+        assert!(data_usage_info_is_bootstrap_pending(&primary), "valid JSON alone must not become a floor");
+        assert_eq!(primary.buckets_count, 0, "untrusted values must not be promoted");
+        let (floor, startup) = persisted_usage_floor_for_startup(store.clone(), true)
+            .await
+            .expect("startup should accept the bootstrap marker");
+        assert_eq!(startup, PersistedUsageFloorStartup::BootstrapPending);
+        assert_eq!(floor.leader_epoch, 1);
     }
 }
 
