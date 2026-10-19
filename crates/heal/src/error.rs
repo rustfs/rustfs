@@ -122,14 +122,22 @@ impl Error {
 
     /// Whether a heal operation can be retried without changing its inputs.
     pub(crate) fn is_recoverable_heal(&self) -> bool {
-        classify_heal_error(self).is_retryable()
+        match classify_heal_error(self) {
+            // Only a typed grace window replays the task. A grace window
+            // rendered into a task message or an io::Error comes from an
+            // attempt that already finished; its owner (for example a durable
+            // MRF responsibility) schedules the next attempt.
+            HealErrorClass::DanglingGrace { .. } => {
+                matches!(self, Error::DanglingDeleteDeferred { .. } | Error::Storage(_) | Error::Disk(_))
+            }
+            class => class.is_retryable(),
+        }
     }
 
     /// Retry an unproven missing object only within the per-object budget.
     /// Generic task retries retain the narrower classification above.
     pub(crate) fn is_recoverable_object_heal(&self) -> bool {
-        let class = classify_heal_error(self);
-        class.is_retryable() || class == HealErrorClass::Absent
+        self.is_recoverable_heal() || self.is_object_absent()
     }
 
     /// The locked storage read found no replica of the object or version.
@@ -879,6 +887,21 @@ mod tests {
             classify_heal_error(&Error::Disk(DiskError::other(grace))),
             C::DanglingGrace { .. }
         ));
+    }
+
+    #[test]
+    fn rendered_grace_window_is_grace_but_does_not_replay_the_task() {
+        let grace = "dangling object deletion deferred by heal grace window; retry_after_secs=5; grace_secs=10";
+        let rendered = Error::TaskExecutionFailed {
+            message: format!("Failed to recreate missing object b/o: Disk error: {grace}"),
+        };
+        assert!(rendered.is_dangling_delete_grace());
+        assert!(!rendered.is_recoverable_heal(), "the owner of a finished attempt schedules the next one");
+        assert!(!rendered.is_recoverable_object_heal());
+        let typed = Error::Disk(DiskError::other(grace));
+        assert!(typed.is_dangling_delete_grace());
+        assert!(typed.is_recoverable_heal());
+        assert!(Error::DanglingDeleteDeferred { retry_not_before: 1 }.is_recoverable_heal());
     }
 
     #[test]
