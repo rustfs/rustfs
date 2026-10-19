@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use std::{future::Future, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::time::Instant;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_REBALANCE: &str = "rebalance";
@@ -917,8 +917,24 @@ impl Operation for RebalanceStatus {
         let mut meta = RebalanceMeta::new();
         if let Err(err) = meta.load(first_pool).await {
             if err == StorageError::ConfigNotFound {
-                log_rebalance_request_rejected("status", "rebalance_not_started", &request_id, &actor, &remote_addr);
-                return Err(s3_error!(NoSuchResource, "pool rebalance is not started"));
+                debug!(
+                    event = EVENT_ADMIN_REBALANCE_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_REBALANCE,
+                    state = "not_started",
+                    action = "status",
+                    request_id = %request_id,
+                    actor = %actor,
+                    remote_addr = %remote_addr,
+                    "admin rebalance state"
+                );
+                // Preserve the idle 404 contract without triggering the custom-route error logger.
+                let (parts, body) = s3_error!(NoSuchResource, "pool rebalance is not started")
+                    .to_http_response()?
+                    .into_parts();
+                let mut response = S3Response::with_headers((parts.status, body), parts.headers);
+                response.extensions = parts.extensions;
+                return Ok(response);
             }
 
             return Err(s3_error!(InternalError, "failed to load rebalance metadata from pool 0: {}", err));
