@@ -191,7 +191,13 @@ impl FileMeta {
             self.data.update(buf);
             self.data.validate().map_err(|e| {
                 error!("data validation failed: {}", e);
-                e
+                // Validation only examines bytes already read. Classify damage
+                // as repairable corruption only for formats we understand.
+                if self.data.version_ok() && Self::decode_xl_headers(meta).is_ok() {
+                    Error::FileCorrupt
+                } else {
+                    e
+                }
             })?;
         }
 

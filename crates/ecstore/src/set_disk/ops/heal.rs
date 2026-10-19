@@ -5728,6 +5728,105 @@ mod heal_result_report_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn deep_heal_rebuilds_half_truncated_inline_metadata() {
+        use tokio::io::AsyncReadExt;
+
+        let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "heal-half-truncated-inline-metadata";
+        let object = "object.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create fixture volume");
+        }
+        let payload: Vec<u8> = (0..4095)
+            .map(|index| u8::try_from(index % 251).expect("payload byte"))
+            .collect();
+        let options = ObjectOptions {
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        set.put_object(bucket, object, &mut PutObjReader::from_vec(payload.clone()), &options)
+            .await
+            .expect("persist every inline shard before physical injection");
+        let read_options = ReadOptions {
+            read_data: true,
+            ..Default::default()
+        };
+        let mut before = Vec::new();
+        let mut metadata = Vec::new();
+        for (dir, disk) in dirs.iter().zip(&disks) {
+            before.push(
+                tokio::fs::read(dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE))
+                    .await
+                    .expect("read original physical metadata"),
+            );
+            let info = disk
+                .read_version("", bucket, object, "", &read_options)
+                .await
+                .expect("read original inline shard");
+            assert!(info.data.as_ref().is_some_and(|bytes| !bytes.is_empty()));
+            metadata.push(info);
+        }
+        let target = dirs[0].path().join(bucket).join(object).join(STORAGE_FORMAT_FILE);
+        let truncated = &before[0][..before[0].len() / 2];
+        tokio::fs::write(&target, truncated)
+            .await
+            .expect("truncate exact original metadata at half length");
+
+        let (result, error) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("heal one truncated metadata replica with three healthy sources");
+        assert!(error.is_none(), "truncated inline metadata must be repairable: {error:?}");
+        assert_eq!(result.before.drives[0].state, DriveState::Corrupt.to_string());
+        assert_eq!(result.drives_healed(), Some(1), "the damaged replica must actually be rebuilt");
+        assert!(
+            result
+                .after
+                .drives
+                .iter()
+                .all(|drive| drive.state == DriveState::Ok.to_string())
+        );
+        let repaired = disks[0]
+            .read_version("", bucket, object, "", &read_options)
+            .await
+            .expect("repaired target metadata must parse");
+        assert!(repaired.equals(&metadata[0]), "restore the original logical metadata");
+        assert_eq!(repaired.erasure.index, metadata[0].erasure.index);
+        assert_eq!(repaired.data, metadata[0].data, "restore the original encoded inline shard");
+        assert_eq!(repaired.version_id, metadata[0].version_id);
+        assert_eq!(repaired.data_dir, metadata[0].data_dir);
+        for (dir, original) in dirs.iter().zip(&before).skip(1) {
+            assert_eq!(
+                tokio::fs::read(dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE))
+                    .await
+                    .expect("read healthy metadata after heal"),
+                *original,
+                "healthy metadata must remain byte-identical"
+            );
+        }
+        let mut reader = set
+            .get_object_reader(bucket, object, None, Default::default(), &options)
+            .await
+            .expect("read reconstructed object");
+        let mut body = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("read complete reconstructed payload");
+        assert_eq!(body, payload);
+    }
+
+    #[tokio::test]
     async fn deep_heal_inline_bitrot_preserves_quorum_and_dry_run_boundaries() {
         for corrupt_shards in [2, 3] {
             let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
