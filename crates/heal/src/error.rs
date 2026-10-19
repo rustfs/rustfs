@@ -244,6 +244,9 @@ pub(crate) fn classify_storage_error(error: &EcstoreError) -> HealErrorClass {
         | EcstoreError::ObjectNotFound(_, _)
         | EcstoreError::VersionNotFound(_, _, _) => HealErrorClass::Absent,
         EcstoreError::NoHealRequired => HealErrorClass::NoHealRequired,
+        // An ambiguous legacy delete residue needs operator inspection;
+        // retrying the same heal cannot resolve it (backlog#2902).
+        EcstoreError::DeleteRecoveryLegacyAmbiguous => HealErrorClass::Permanent,
         EcstoreError::Timeout => HealErrorClass::LockContention,
         EcstoreError::DiskNotFound
         | EcstoreError::VolumeNotFound
@@ -861,6 +864,7 @@ mod tests {
             ),
             (Error::Other("remote lock rpc timed out".into()), C::LockContention),
             (Error::Storage(EcstoreError::Lock(LockError::permission_denied("policy"))), C::Permanent),
+            (Error::Storage(EcstoreError::DeleteRecoveryLegacyAmbiguous), C::Permanent),
             (Error::Disk(DiskError::FileCorrupt), C::Permanent),
             (Error::Disk(DiskError::FileAccessDenied), C::Permanent),
             (Error::Disk(DiskError::DiskFull), C::Permanent),
