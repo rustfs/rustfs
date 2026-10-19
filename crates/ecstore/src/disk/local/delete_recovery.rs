@@ -778,12 +778,7 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
                         });
                     if name == transaction.to_string()
                         && !(kind.is_dir() && known_staged)
-                        && !(journal.is_none()
-                            && kind.is_file()
-                            && (delete_recovery_part_file(&child_name)
-                                || [DELETE_DATA_DIR_MARKER_PREFIX, RESERVED_DELETE_DATA_DIR_MARKER_PREFIX]
-                                    .iter()
-                                    .any(|prefix| child_name == format!("{prefix}{transaction}"))))
+                        && !(journal.is_none() && kind.is_file() && is_metadata_less_data_dir_entry(&child_name))
                         && (kind.is_dir()
                             || ![
                                 PREPARED,
@@ -2267,6 +2262,113 @@ mod tests {
             .expect("object directory");
         fs::write(path, &bytes).await.expect("original metadata");
         (temp, disk, info, bytes)
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_inspection_keeps_foreign_data_markers_inert() {
+        for prefix in [
+            DELETE_DATA_DIR_MARKER_PREFIX,
+            RESERVED_DELETE_DATA_DIR_MARKER_PREFIX,
+            RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX,
+        ] {
+            for backup in [false, true] {
+                let (_temp, disk, _info, original) = fixture().await;
+                let root = disk.io_get_object_path("recovery", "object").expect("object path");
+                fs::remove_file(root.join(STORAGE_FORMAT_FILE))
+                    .await
+                    .expect("hide current metadata");
+                let candidate = Uuid::new_v4();
+                let owner = Uuid::new_v4();
+                let data = root.join(candidate.to_string());
+                fs::create_dir(&data).await.expect("coincident data directory");
+                fs::write(data.join("part.1"), b"retained shard").await.expect("retain data");
+                let marker = data.join(format!("{prefix}{owner}"));
+                fs::write(&marker, []).await.expect("foreign transaction marker");
+                if backup {
+                    fs::write(data.join(STORAGE_FORMAT_FILE_BACKUP), &original)
+                        .await
+                        .expect("retain ambiguous backup");
+                }
+                let before = fs::read(&marker).await.expect("marker before inspection");
+                let state = disk
+                    .inspect_delete_transaction("recovery", "object", candidate)
+                    .await
+                    .expect("foreign data marker is not corrupt transaction evidence");
+                assert_eq!(
+                    state.state,
+                    if backup {
+                        DeleteRecoveryState::LegacyAmbiguous
+                    } else {
+                        DeleteRecoveryState::Absent
+                    }
+                );
+                assert!(!state.explicit_delete_safe, "foreign ownership cannot authorize legacy removal");
+                assert_eq!(fs::read(&marker).await.expect("preserved marker"), before);
+                assert_eq!(fs::read(data.join("part.1")).await.expect("preserved shard"), b"retained shard");
+                if backup {
+                    assert_eq!(
+                        fs::read(data.join(STORAGE_FORMAT_FILE_BACKUP))
+                            .await
+                            .expect("preserved backup"),
+                        original
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_inspection_rejects_unsafe_foreign_data_entries() {
+        for shape in ["malformed", "nil", "directory", "symlink", "child", "metadata", "unknown"] {
+            let (_temp, disk, _info, _original) = fixture().await;
+            let root = disk.io_get_object_path("recovery", "object").expect("object path");
+            fs::remove_file(root.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("hide current metadata");
+            let candidate = Uuid::new_v4();
+            let data = root.join(candidate.to_string());
+            fs::create_dir(&data).await.expect("coincident data directory");
+            let marker = format!("{RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX}{}", Uuid::new_v4());
+            match shape {
+                "malformed" => fs::write(data.join(format!("{RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX}invalid")), [])
+                    .await
+                    .expect("malformed marker"),
+                "nil" => fs::write(data.join(format!("{RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX}{}", Uuid::nil())), [])
+                    .await
+                    .expect("nil marker"),
+                "directory" => fs::create_dir(data.join(&marker)).await.expect("marker directory"),
+                "symlink" => {
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(root.join(STORAGE_FORMAT_FILE), data.join(&marker)).expect("marker symlink");
+                    #[cfg(not(unix))]
+                    continue;
+                }
+                "child" => fs::create_dir(data.join(Uuid::new_v4().to_string()))
+                    .await
+                    .expect("child key directory"),
+                "metadata" => fs::write(data.join(STORAGE_FORMAT_FILE), b"child metadata")
+                    .await
+                    .expect("child metadata"),
+                _ => fs::write(data.join("unknown"), []).await.expect("unknown file"),
+            }
+            assert!(
+                matches!(
+                    disk.inspect_delete_transaction("recovery", "object", candidate).await,
+                    Err(DiskError::FileCorrupt | DiskError::InvalidPath)
+                ),
+                "{shape}"
+            );
+            assert!(
+                fs::read_dir(&data)
+                    .await
+                    .expect("unsafe evidence preserved")
+                    .next_entry()
+                    .await
+                    .expect("read evidence")
+                    .is_some(),
+                "{shape}"
+            );
+        }
     }
 
     #[tokio::test]
