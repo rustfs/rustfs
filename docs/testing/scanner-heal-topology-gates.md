@@ -73,4 +73,4 @@ cargo nextest list -p e2e_test -E 'test(scanner_heal_topology_)'
 python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run -p e2e_test -E 'test(scanner_heal_topology_)' --test-threads 1
 ```
 
-Set `RUSTFS_SCANNER_HEAL_TOPOLOGY_EVIDENCE_DIR` to keep node logs, barrier observations and the per-case evidence JSON after the run. On macOS, `hdiutil attach -nomount ram://2097152` followed by `diskutil erasevolume APFS` yields the distinct filesystems that `RUSTFS_E2E_POOL_ROOTS` requires.
+Set `RUSTFS_SCANNER_HEAL_TOPOLOGY_EVIDENCE_DIR` to keep node logs, barrier observations and the per-case evidence JSON after the run; without it the fixture keeps them under `RUSTFS_E2E_LOG_DIR`, which the distributed workflow uploads. On macOS, `hdiutil attach -nomount ram://2097152` followed by `diskutil erasevolume APFS` yields the distinct filesystems that `RUSTFS_E2E_POOL_ROOTS` requires.

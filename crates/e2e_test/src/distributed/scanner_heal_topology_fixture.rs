@@ -51,8 +51,8 @@ pub(crate) const STAGE_BEFORE_TARGET_COMMIT: &str = "before_target_commit";
 pub(crate) const STAGE_BEFORE_SOURCE_CLEANUP: &str = "before_source_cleanup";
 pub(crate) const STAGE_AFTER_RESPONSIBILITY_PERSISTED: &str = "after_responsibility_persisted";
 /// Optional directory that keeps node logs, barrier observations and the
-/// per-case evidence JSON after the test; unset keeps everything in a temp dir
-/// that is removed on drop.
+/// per-case evidence JSON after the test. `RUSTFS_E2E_LOG_DIR` is the fallback;
+/// with neither set everything lives in a temp dir that is removed on drop.
 pub(crate) const EVIDENCE_DIR_ENV: &str = "RUSTFS_SCANNER_HEAL_TOPOLOGY_EVIDENCE_DIR";
 pub(crate) const DURABILITY_EVENT: &str = "disk_local_durability_mode";
 /// The existing expand/decommission cases wait 180 s for 96 objects of
@@ -214,7 +214,10 @@ pub(crate) struct TopologyRun {
 impl TopologyRun {
     pub(crate) async fn start(label: &str) -> TestResult<Self> {
         let run_name = format!("scanner-heal-topology-{label}-{}", Uuid::new_v4().simple());
-        let (artifacts, keep_artifacts) = match std::env::var_os(EVIDENCE_DIR_ENV) {
+        // CI uploads RUSTFS_E2E_LOG_DIR; keep node logs, barrier observations
+        // and evidence there so a failed lane can be diagnosed.
+        let kept_root = std::env::var_os(EVIDENCE_DIR_ENV).or_else(|| std::env::var_os("RUSTFS_E2E_LOG_DIR"));
+        let (artifacts, keep_artifacts) = match kept_root {
             Some(directory) => (PathBuf::from(directory).join(&run_name), true),
             None => (std::env::temp_dir().join(run_name), false),
         };
