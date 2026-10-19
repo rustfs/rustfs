@@ -105,6 +105,13 @@ configured drive has no current metadata. This is a new authorized decision;
 it does not infer an old commit from missing causal evidence. Mixed or
 unrecognized historical layouts remain blocked.
 
+A certified absent-target transaction can coexist with an unrelated old backup
+in a different data directory. Automatic recovery finishes the certified
+transaction's own cleanup, preserves the ambiguous backup, and retains receipts
+until the whole key settles. A fresh unconditional DELETE can discard eligible
+legacy residue alongside those receipts under the same checks above. A foreign
+transaction marker alone never authorizes removing the backup.
+
 An isolated `xl.meta.bkp` is not enough to distinguish a committed delete from
 an interrupted rollback. Automatic recovery does not guess which outcome was
 intended. Preserve a copy of the original volume and use an authoritative

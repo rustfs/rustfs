@@ -16,8 +16,8 @@ use crate::heal::{
     outcome::HealTaskOutcome,
     progress::{HealProgress, HealStatistics},
     resume::{
-        ReplacementPhase, ReplacementRecoveryCandidate, ResumeGc, ResumeManager, ResumeState, ResumeUtils,
-        merge_replacement_recovery_candidate, replacement_retry_is_exhausted_active,
+        ReplacementPhase, ReplacementRecoveryBlock, ReplacementRecoveryCandidate, ResumeGc, ResumeManager, ResumeState,
+        ResumeUtils, merge_replacement_recovery_candidate, replacement_retry_is_exhausted_active,
     },
     storage::HealStorageAPI,
     task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType, demote_to_debug_when},
@@ -985,8 +985,9 @@ pub struct HealManager {
     /// This is rebuilt from durable state after restart and never crosses the
     /// public request boundary.
     replacement_recovery_anchors: Arc<std::sync::Mutex<HashMap<String, String>>>,
-    /// Set IDs whose durable replacement metadata is corrupt or conflicting.
-    replacement_recovery_blocked_sets: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Durable replacement generations that discovery could not verify or
+    /// resolve, keyed by generation and re-evaluated on every pass.
+    replacement_recovery_blocks: ReplacementRecoveryBlocks,
     /// Durable handoff of interrupted administrator root traversals.
     root_recovery: Arc<root_recovery::RootHealRecovery>,
     /// Serialize admin starts and forceStart replacement with shutdown.
@@ -1017,6 +1018,9 @@ enum TaskStateLookup {
     Retrying(HealTaskStatus, HealOptions),
     Completed(Arc<CompletedHealStatus>),
     Queued(HealOptions),
+    /// A durable root heal record that cannot be admitted or quarantined;
+    /// it answers status queries with the reason until an operator repairs it.
+    Unrunnable(String),
     NotFound,
 }
 
@@ -1476,28 +1480,33 @@ impl HealManager {
         remove_task_aliases_for_task(&self.task_aliases, task_id).await;
     }
 
-    fn block_replacement_recovery_set(&self, set_disk_id: &str) {
-        self.replacement_recovery_blocked_sets
-            .lock()
-            .expect("replacement recovery blocked set lock poisoned")
-            .insert(set_disk_id.to_string());
+    /// Durable replacement generations this node could not verify or
+    /// resolve, with the reason and observation times, for the admin status
+    /// surface. Entries are node-local and re-evaluated by every discovery pass.
+    pub fn replacement_recovery_blocks(&self) -> Vec<ReplacementRecoveryBlock> {
+        self.replacement_recovery_blocks.snapshot()
     }
 
-    fn replacement_recovery_set_is_blocked(&self, set_disk_id: &str) -> bool {
-        self.replacement_recovery_blocked_sets
-            .lock()
-            .expect("replacement recovery blocked set lock poisoned")
-            .contains(set_disk_id)
+    #[cfg(test)]
+    pub(super) fn replacement_recovery_generation_is_blocked(&self, task_id: &str) -> bool {
+        self.replacement_recovery_blocks.is_blocked(task_id)
     }
 
-    async fn validate_replacement_recovery_records(disk: &crate::heal::DiskStore) -> Result<()> {
-        if disk.endpoint().is_local {
-            ResumeUtils::migrate_legacy_replacement_records(disk).await?;
-        }
-        for task_id in ResumeUtils::get_replacement_intent_tasks(disk).await? {
-            ResumeManager::load_replacement_intent(disk.clone(), &task_id).await?;
-        }
-        Ok(())
+    #[cfg(test)]
+    pub(super) fn block_replacement_recovery_generation_for_test(
+        &self,
+        task_id: &str,
+        set_disk_id: &str,
+        reason: &str,
+        reserves_targets: bool,
+    ) {
+        self.replacement_recovery_blocks
+            .block(task_id, set_disk_id, reason, reserves_targets);
+    }
+
+    #[cfg(test)]
+    pub(super) fn replacement_recovery_set_has_reserving_block(&self, set_disk_id: &str) -> bool {
+        self.replacement_recovery_blocks.set_has_reserving_block(set_disk_id)
     }
 
     /// Start the bounded resume-state inspector.  Destructive GC remains
@@ -1620,7 +1629,7 @@ impl HealManager {
             retrying_heals: Arc::new(Mutex::new(HashMap::new())),
             mrf_repair_notice_targets: Arc::new(StdMutex::new(HashMap::new())),
             replacement_recovery_anchors: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            replacement_recovery_blocked_sets: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            replacement_recovery_blocks: ReplacementRecoveryBlocks::default(),
             root_recovery,
             admin_start_shutdown: Mutex::new(()),
             storage,
@@ -1964,17 +1973,17 @@ impl HealManager {
         };
         // Decode all durable responsibilities before forceStart has side effects.
         // Do not hold runtime state locks while scanning recovery records.
-        let mut quarantined_task_ids = HashSet::new();
+        let mut record_issue = None;
         let mut durable_owners = if source == HealRequestSource::Admin {
             let inventory = self.root_recovery.inventory().await?;
-            quarantined_task_ids = inventory.quarantined_task_ids;
+            record_issue = inventory.record_issue(&request.id);
             inventory.requests
         } else {
             Vec::new()
         };
-        if quarantined_task_ids.contains(&request.id) {
+        if let Some(reason) = record_issue {
             return Err(Error::Other(format!(
-                "Root heal recovery task {} is quarantined and requires operator repair",
+                "Root heal recovery task {} requires operator repair: {reason}",
                 request.id
             )));
         }
@@ -2475,10 +2484,15 @@ impl HealManager {
             terminal_completed = Some(Arc::new(completed));
         }
 
-        Ok(match terminal_completed {
-            Some(completed) => TaskStateLookup::Completed(completed),
-            None => TaskStateLookup::NotFound,
-        })
+        if let Some(completed) = terminal_completed {
+            return Ok(TaskStateLookup::Completed(completed));
+        }
+        // A durable root record that can neither run nor be quarantined still
+        // answers status queries with its reason.
+        if let Some(reason) = self.root_recovery.record_issue(canonical_task_id).await {
+            return Ok(TaskStateLookup::Unrunnable(reason));
+        }
+        Ok(TaskStateLookup::NotFound)
     }
 
     async fn publish_admin_terminal(
@@ -2540,6 +2554,7 @@ impl HealManager {
             TaskStateLookup::Retrying(status, _) => Ok(status),
             TaskStateLookup::Completed(completed) => Ok(completed.status.clone()),
             TaskStateLookup::Queued(_) => Ok(HealTaskStatus::Pending),
+            TaskStateLookup::Unrunnable(error) => Ok(HealTaskStatus::Failed { error }),
             TaskStateLookup::NotFound => Err(Error::TaskNotFound {
                 task_id: task_id.to_string(),
             }),
@@ -2560,6 +2575,9 @@ impl HealManager {
             TaskStateLookup::Retrying(status, options) => Ok(empty_task_report_with_options(status, options)),
             TaskStateLookup::Completed(completed) => Ok(completed_task_report(&completed, since)),
             TaskStateLookup::Queued(options) => Ok(empty_task_report_with_options(HealTaskStatus::Pending, options)),
+            TaskStateLookup::Unrunnable(error) => {
+                Ok(empty_task_report_with_options(HealTaskStatus::Failed { error }, HealOptions::default()))
+            }
             TaskStateLookup::NotFound => Err(Error::TaskNotFound {
                 task_id: task_id.to_string(),
             }),
@@ -2583,6 +2601,9 @@ impl HealManager {
             TaskStateLookup::Retrying(status, options) => Ok(empty_task_report_with_options(status, options)),
             TaskStateLookup::Completed(completed) => Ok(completed_task_report(&completed, since)),
             TaskStateLookup::Queued(options) => Ok(empty_task_report_with_options(HealTaskStatus::Pending, options)),
+            TaskStateLookup::Unrunnable(error) => {
+                Ok(empty_task_report_with_options(HealTaskStatus::Failed { error }, HealOptions::default()))
+            }
             TaskStateLookup::NotFound => {
                 if self.path_has_task(heal_path).await {
                     return Err(Error::InvalidClientToken);
@@ -2606,6 +2627,7 @@ impl HealManager {
             TaskStateLookup::Retrying(status, _) => Ok(status),
             TaskStateLookup::Completed(completed) => Ok(completed.status.clone()),
             TaskStateLookup::Queued(_) => Ok(HealTaskStatus::Pending),
+            TaskStateLookup::Unrunnable(error) => Ok(HealTaskStatus::Failed { error }),
             TaskStateLookup::NotFound => {
                 if self.path_has_task(heal_path).await {
                     return Err(Error::InvalidClientToken);

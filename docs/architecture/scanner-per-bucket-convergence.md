@@ -1,7 +1,7 @@
 # Scanner Per-Bucket Convergence Design
 
 **Use this when:** changing what makes a scanner cycle `Complete`, `Superseded`, or converged; adding or re-classifying a dirty-usage producer; deciding whether a background writeback may invalidate a scanner cycle; changing scanner worker concurrency or throttling; or activating scoped dirty acknowledgements.
-**Source of truth:** `classify_nsscanner_cycle`, `scanner_cycle_activity_status`, and `scoped_scan_scope_from_dirty_buckets` in `crates/scanner/src/scanner_io.rs`; `dirty_usage_snapshot_status` and `acknowledge_scoped_dirty_usage` in `crates/scanner/src/scanner_io/dirty_usage.rs`; `scanner_concurrency_limit` in `crates/scanner/src/scanner_io/guards.rs`; the per-disk worker loop in `crates/scanner/src/scanner_io/io_cache.rs`; `DynamicSleeper` in `crates/scanner/src/sleeper.rs`; `ScannerNodeActivity` in `crates/scanner/src/scanner/activity.rs`; `persist_replication_state_if_current` in `crates/ecstore/src/bucket/replication/replication_resyncer.rs`; the publication fences in [scanner-usage-publication.md](scanner-usage-publication.md).
+**Source of truth:** `classify_nsscanner_cycle`, `scanner_cycle_activity_status`, and `scoped_scan_scope_from_dirty_buckets` in `crates/scanner/src/scanner_io.rs`; `dirty_usage_snapshot_status` and `acknowledge_scoped_dirty_usage` in `crates/scanner/src/scanner_io/dirty_usage.rs`; `scanner_concurrency_limit` in `crates/scanner/src/scanner_io/guards.rs`; the per-disk worker loop and `carry_partial_bucket_values` in `crates/scanner/src/scanner_io/io_cache.rs`; `DynamicSleeper` in `crates/scanner/src/sleeper.rs`; `ScannerNodeActivity` in `crates/scanner/src/scanner/activity.rs`; `persist_replication_state_if_current` in `crates/ecstore/src/bucket/replication/replication_resyncer.rs`; the publication fences in [scanner-usage-publication.md](scanner-usage-publication.md).
 
 ## Decision
 
@@ -19,9 +19,9 @@ collection, because the problems and the known-good answers are the same.
    turn the cycle into `Superseded`.
 2. **The cluster activity probe stays, as a guardrail only.** It vetoes a
    publication when the heap it describes is not the heap that was walked:
-   topology, peer identity, protocol version, data movement, or a pending PUT
-   tail changed. Namespace and dirty-usage generation movement alone never
-   vetoes; it only shades buckets.
+   topology, peer identity, protocol version, or data movement changed.
+   Namespace and dirty-usage generation movement, and a pending ordinary PUT
+   commit, never veto; they only shade buckets.
 3. **Replication status writebacks are status-class barrier hits.** They
    shade a bucket for a scoped rescan but are not namespace activity. They
    never uncertify a walk and never block cycle completion. The scanner's own
@@ -63,8 +63,8 @@ the other:
 A third class sits beside these two and is easy to mistake for the first:
 
 - **Guardrail false positives**: the cycle is invalidated not by writes but
-  by the proof machinery itself. An in-flight PUT classified as data
-  movement, a journal lock timeout reported as an unavailable activity
+  by the proof machinery itself. An in-flight PUT counted as a publication
+  barrier, a journal lock timeout reported as an unavailable activity
   baseline, or one unreachable peer in a large cluster defers the whole
   cycle, and the dirty map is never cleared. Per-bucket certification does
   nothing for this class because the walk never reaches certification. The
@@ -152,6 +152,17 @@ compare-and-remove semantics of `acknowledge_scoped_dirty_usage`:
   never move it;
 - generation moved by a `Namespace` hit: stays grey with the newer
   generation and counts as pending;
+- walk stopped early (`Partial`): stays grey with its generation, like a
+  failed walk, and counts as pending; the value published for it is the
+  last certified one, never the partial walk's running total;
+- a sweep that spans two cycles resumes only under the same coverage
+  identity (`scanner_activity_coverage_digest` with the bucket's own dirty
+  generation, through `prepare_bucket_checkpoint_with_coverage`). A peer's
+  namespace and dirty generations stay in that identity while its dirty
+  buckets are acknowledged per cycle: a write there between the two halves
+  of a sweep restarts the sweep instead of being acknowledged unwalked. The
+  local node's generations are left out, because its buckets are certified
+  one by one; a completed sweep is stored under the reuse identity;
 - a peer reported the bucket dirty without a scoped entry the coordinator can
   verify: stays grey. This is the mixed-version and partial-peer fallback,
   and it is per bucket, not per cycle.
@@ -176,7 +187,20 @@ equality test to:
 
 - guardrail vetoed: `Superseded`;
 - otherwise: `Complete`, carrying `pending_dirty_buckets` as the count of
-  buckets left grey by `Namespace` hits.
+  buckets left grey by `Namespace` hits or by a walk that stopped early.
+
+A bucket walk that stops early without exhausting the cycle budget (a sweep
+resumed under a newer plan, unresolved objects) is `Partial`. The set scan
+stands in for it with the bucket's last certified value from the previous
+complete set cache (`carry_partial_bucket_values` in
+`crates/scanner/src/scanner_io/io_cache.rs`): usage is a sum, so the
+certified buckets plus that value are a valid snapshot. The cycle then
+completes with the bucket pending (`ScannerBucketScanStatus::PartialCarried`),
+and the next scoped cycle walks it because the pending buckets of the
+authoritative baseline join the dirty buckets in
+`scoped_scan_scope_from_dirty_buckets`. Only a bucket with no certified
+value on a set (its first walk, a changed incarnation, a hard failure) keeps
+that set, and with it the cycle, `Incomplete`.
 
 `usage_snapshot_converged` becomes `pending_dirty_buckets == 0`. A `Complete`
 cycle with pending buckets publishes an authoritative snapshot: certified
@@ -206,13 +230,23 @@ walk. Field roles:
 | Field | Role |
 |---|---|
 | `instance_id`, `protocol_version`, `topology_digest` | veto: a peer restarted, changed version, or the topology changed |
-| `data_movement_active`, `movement_generation`, `publication_blocked` | veto: rebalance, decommission, or a pending PUT tail can make the walk describe a different generation |
+| `data_movement_active`, `movement_generation` | veto: rebalance or decommission can make the walk describe a different generation |
+| `publication_blocked` (a pending ordinary PUT commit) | shade signal only, and part of no plan identity: the write barrier records the bucket after the ACK and certification handles it |
 | `maintenance_generation` | veto: no cycle today records whether it published maintenance results, and the field is already part of the structural digest; it becomes a shade signal only once that distinction exists |
 | `namespace_generation`, `dirty_usage_generation`, `dirty_usage_pending` | shade signal: consumed per bucket; never a veto on their own |
 
-`scanner_activity_structural_digest` already separates the structural part
-of the snapshot from the generations. The guardrail is the structural digest
-plus the movement fields.
+The activity snapshot feeds two plan identities with different jobs. The
+coverage identity (bucket list and creation times, `topology_digest`,
+`protocol_version`, `data_movement_active`, `movement_generation`) decides
+whether a resumed bucket checkpoint still describes the same traversal; only
+it may mark a resumed sweep as mixed coverage. The reuse identity adds
+`instance_id` and `maintenance_generation` and decides whether a completed
+cache or a scoped baseline may be reused: a peer restart can lose dirty hints
+inside the journal's coalescing window and a maintenance change needs a fresh
+discovery walk, so both force a full walk, but neither changes what a
+full-walk checkpoint has already covered. `publication_blocked` belongs to
+neither identity. The guardrail compares the reuse identity plus the movement
+fields.
 
 The guardrail is bounded in three ways:
 
@@ -280,6 +314,15 @@ the speed factor. On a single-disk deployment this is one walker, one bucket,
 one object at a time, at roughly one third duty cycle under the default
 speed. Walker count is therefore a property of topology, not of the work.
 
+Two later controls bound that walk per disk rather than per object.
+rustfs/rustfs#8389 added the local-disk foreground-priority admission gate,
+which orders scanner I/O behind foreground requests. rustfs/backlog#2905 added
+a per-disk token-bucket budget (operations and bytes per second, defaults by
+detected media) that `DynamicSleeper` charges before each directory listing
+and metadata read; it is a hard ceiling layered on admission and never lets
+the scanner exceed what admission allows. The operator view is in
+`docs/operations/scanner-runtime-controls.md`.
+
 A collector's pacer sets collector work from the mutator's rate under a
 resource ceiling. The scanner adopts the same shape:
 
@@ -326,9 +369,11 @@ not tuning advice.
 
 ## What stays fail-closed
 
-- Quota authority is unchanged: an uncertified bucket keeps its last certified
-  value as the floor, as the usage floor does today. Live writes do not
-  advance it.
+- An uncertified bucket keeps its last certified value as its reported value.
+  Live writes do not advance it. Hard quota admission is owned by the
+  reservation ledger
+  ([scanner-usage-authority-decision.md](scanner-usage-authority-decision.md)),
+  so this value is reporting input, not an admission authority.
 - The storage publication epoch, leadership claim, CAS revision, publication
   lease, and tier registry fences are untouched. This design narrows what a
   generation movement means; it removes no fence.
@@ -434,7 +479,8 @@ condition before merging.
 
 - `usage_freshness` in the admin scanner status reports
   `dirty_pending_buckets` (`Namespace` class only; after certification the
-  dirty map holds exactly the pending set), the attributed guardrail veto
+  dirty map holds the shaded pending buckets, and the published pending list
+  also names buckets whose walk stopped early), the attributed guardrail veto
   (`guardrail_veto_total`, `last_guardrail_veto_unix_secs`,
   `last_guardrail_veto_reason` as `<field>@<host>`), plus the pacer target,
   achieved rate, and whether a ceiling is binding. The console marks usage

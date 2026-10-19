@@ -740,7 +740,14 @@ async fn scan_and_persist_local_bucket(
                 scan_mode,
             )
             .await
-            .ok(),
+            .map_err(|err| {
+                RemoteScannerServerError::retry_bucket(format!(
+                    "remote namespace scanner checkpoint identity unavailable during admission: {err}"
+                ))
+            })?,
+            // One digest travels on the wire: a remote sweep resumes under
+            // the reuse plan it was requested with.
+            checkpoint_plan_digest: None,
         },
     );
     match scan_state {
@@ -909,8 +916,11 @@ async fn scan_and_persist_local_bucket(
             scan_mode,
         )
         .await
-        .ok()
-            != Some(expected)
+        .map_err(|err| {
+            RemoteScannerServerError::retry_bucket(format!(
+                "remote namespace scanner checkpoint identity unavailable after scanning: {err}"
+            ))
+        })? != Some(expected)
     {
         return Err(RemoteScannerServerError::retry_bucket(
             "remote scanner checkpoint identity changed during scanning",

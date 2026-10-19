@@ -248,6 +248,7 @@ Collect at least two runs on the same RustFS commit and the same workload. Keep 
 | Duration budget (when one cycle is too long) | Bound wall-clock time per cycle. | `scanner.cycle_max_duration="1800"`. |
 | Object budget | Bound objects processed per cycle. | `scanner.cycle_max_objects="1000000"`. |
 | Directory budget | Bound directories entered per cycle. | `scanner.cycle_max_directories="100000"`. |
+| Disk I/O budget (single slow disk) | Cap scanner metadata I/O per local disk regardless of idle time; compare foreground p99 and scan completion against the media default. | `scanner.disk_io_budget_iops="50"` and `scanner.disk_io_budget_bytes_per_sec="8388608"`; `off` removes the cap for an A/B leg. |
 
 ## Deployment Matrix
 

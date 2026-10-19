@@ -13,21 +13,14 @@
 // limitations under the License.
 /// Unclean-shutdown recovery: durable replacement-intent discovery and healing-marker rewrite.
 use super::*;
+use crate::heal::DiskStore;
+use crate::heal::resume::{
+    ReplacementRecoveryBlock, abandoned_targets_are_owned_by_another_generation, replacement_generation_reserves_targets,
+};
+use std::collections::BTreeMap;
 
 pub(super) fn durable_replacement_reserves_targets(state: &ResumeState) -> bool {
-    state.replacement_generation.as_deref() == Some(state.task_id.as_str())
-        && !state.replacement_targets.is_empty()
-        && (matches!(
-            state.replacement_phase,
-            ReplacementPhase::Intent
-                | ReplacementPhase::OwnershipPending
-                | ReplacementPhase::HandoffPending
-                | ReplacementPhase::Rebuilding
-                | ReplacementPhase::Verified
-                | ReplacementPhase::CleanupPending
-        ) || (state.replacement_phase == ReplacementPhase::Abandoned
-            && state.replacement_handoff.is_none()
-            && state.replacement_legacy_successor.is_none()))
+    replacement_generation_reserves_targets(state)
 }
 
 pub(super) fn durable_replacement_recovery_is_due(state: &ResumeState, task_id: &str) -> bool {
@@ -67,16 +60,80 @@ pub(super) fn replacement_targets_belong_to_local_node(
     !replacement_targets.is_empty() && replacement_targets.iter().all(|target| local_endpoints.contains(target))
 }
 
-pub(super) fn unblock_replacement_recovery_sets_after_validation(
-    blocked_sets: &mut HashSet<String>,
-    retry_succeeded: HashSet<String>,
-    retry_failed: &HashSet<String>,
-) {
-    for set_disk_id in retry_succeeded {
-        if !retry_failed.contains(&set_disk_id) {
-            blocked_sets.remove(&set_disk_id);
+/// Node-local registry of blocked replacement generations, shared by startup
+/// discovery and the periodic scanner. Entries are keyed by generation, carry
+/// the reason and observation times, and are re-evaluated on every discovery
+/// pass; a block never widens to the generation's set.
+#[derive(Clone, Default)]
+pub(super) struct ReplacementRecoveryBlocks {
+    entries: Arc<std::sync::Mutex<BTreeMap<String, ReplacementRecoveryBlock>>>,
+}
+
+impl ReplacementRecoveryBlocks {
+    fn entries(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, ReplacementRecoveryBlock>> {
+        self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Record or refresh a block. The first observation time is kept; the
+    /// reason and reservation flag follow the latest pass.
+    pub(super) fn block(&self, task_id: &str, set_disk_id: &str, reason: impl Into<String>, reserves_targets: bool) {
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let reason = reason.into();
+        let mut entries = self.entries();
+        match entries.get_mut(task_id) {
+            Some(entry) => {
+                entry.set_disk_id = set_disk_id.to_string();
+                entry.reason = reason;
+                entry.reserves_targets = reserves_targets;
+                entry.last_observed = now;
+            }
+            None => {
+                entries.insert(
+                    task_id.to_string(),
+                    ReplacementRecoveryBlock {
+                        task_id: task_id.to_string(),
+                        set_disk_id: set_disk_id.to_string(),
+                        reason,
+                        reserves_targets,
+                        blocked_since: now,
+                        last_observed: now,
+                    },
+                );
+            }
         }
     }
+
+    /// Clear a block after the generation merged and resolved cleanly.
+    pub(super) fn unblock(&self, task_id: &str) -> bool {
+        self.entries().remove(task_id).is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_blocked(&self, task_id: &str) -> bool {
+        self.entries().contains_key(task_id)
+    }
+
+    /// Fresh admission for a set waits while one of its blocked generations
+    /// still reserves target slots; a retired or released block does not.
+    pub(super) fn set_has_reserving_block(&self, set_disk_id: &str) -> bool {
+        self.entries()
+            .values()
+            .any(|entry| entry.set_disk_id == set_disk_id && entry.reserves_targets)
+    }
+
+    pub(super) fn snapshot(&self) -> Vec<ReplacementRecoveryBlock> {
+        self.entries().values().cloned().collect()
+    }
+}
+
+/// Whether a durable generation still reserves its target slots against this
+/// node's disks. An orphaned `Abandoned` record releases them once every slot's
+/// healing marker names another generation of the same set.
+pub(super) async fn replacement_reserves_targets_on(state: &ResumeState, disks: &[DiskStore]) -> bool {
+    durable_replacement_reserves_targets(state) && !abandoned_targets_are_owned_by_another_generation(state, disks).await
 }
 
 impl HealManager {
@@ -91,7 +148,10 @@ impl HealManager {
         let mut replacement_intents = HashMap::<String, (String, Vec<String>, Vec<String>, String)>::new();
         let mut replacement_recovery_candidates = HashMap::<String, ReplacementRecoveryCandidate>::new();
         let mut conflicted_replacement_tasks = HashSet::new();
+        // Sets whose records could not be inventoried in this pass. The skip is
+        // pass-local: the next discovery pass reads them again.
         let mut conflicted_replacement_sets = HashSet::new();
+        let blocks = self.replacement_recovery_blocks.clone();
 
         {
             let local_disks = {
@@ -165,7 +225,7 @@ impl HealManager {
                 };
                 if let Err(error) = migration {
                     if let Some(set_disk_id) = &disk_set_disk_id {
-                        self.block_replacement_recovery_set(set_disk_id);
+                        conflicted_replacement_sets.insert(set_disk_id.clone());
                     }
                     warn!(
                         target: "rustfs::heal::manager",
@@ -183,7 +243,7 @@ impl HealManager {
                 match self.storage.replacement_intent_disks(set_disk_id).await {
                     Ok(disks) => recovery_disks.extend(disks),
                     Err(error) => {
-                        self.block_replacement_recovery_set(set_disk_id);
+                        conflicted_replacement_sets.insert(set_disk_id.clone());
                         warn!(
                             target: "rustfs::heal::manager",
                             event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
@@ -206,7 +266,7 @@ impl HealManager {
                     Ok(task_ids) => task_ids,
                     Err(error) => {
                         if let Some(set_disk_id) = &disk_set_disk_id {
-                            self.block_replacement_recovery_set(set_disk_id);
+                            conflicted_replacement_sets.insert(set_disk_id.clone());
                         }
                         warn!(
                             target: "rustfs::heal::manager",
@@ -224,9 +284,13 @@ impl HealManager {
                     let manager = match ResumeManager::load_replacement_intent(disk.clone(), &task_id).await {
                         Ok(manager) => manager,
                         Err(error) => {
-                            if let Some(set_disk_id) = &disk_set_disk_id {
-                                self.block_replacement_recovery_set(set_disk_id);
-                            }
+                            conflicted_replacement_tasks.insert(task_id.clone());
+                            blocks.block(
+                                &task_id,
+                                disk_set_disk_id.as_deref().unwrap_or_default(),
+                                format!("durable intent could not be loaded: {error}"),
+                                true,
+                            );
                             warn!(
                                 target: "rustfs::heal::manager",
                                 event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
@@ -241,18 +305,19 @@ impl HealManager {
                         }
                     };
                     let state = manager.get_state().await;
+                    let reserves_targets = replacement_reserves_targets_on(&state, &local_disks).await;
                     if disk_set_disk_id
                         .as_deref()
                         .is_some_and(|disk_set| disk_set != state.set_disk_id)
                     {
                         let disk_set = disk_set_disk_id.as_deref().unwrap_or_default();
                         conflicted_replacement_tasks.insert(task_id.clone());
-                        conflicted_replacement_sets.insert(state.set_disk_id.clone());
-                        conflicted_replacement_sets.insert(disk_set.to_string());
-                        self.block_replacement_recovery_set(&state.set_disk_id);
-                        if !disk_set.is_empty() {
-                            self.block_replacement_recovery_set(disk_set);
-                        }
+                        blocks.block(
+                            &task_id,
+                            &state.set_disk_id,
+                            format!("durable intent binds to {} but was found on a disk of {disk_set}", state.set_disk_id),
+                            reserves_targets,
+                        );
                         warn!(
                             target: "rustfs::heal::manager",
                             event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
@@ -266,7 +331,7 @@ impl HealManager {
                         );
                         continue;
                     }
-                    if durable_replacement_reserves_targets(&state) {
+                    if reserves_targets {
                         reserved_replacement_sets.insert(state.set_disk_id.clone());
                     }
                     if !replacement_targets_belong_to_local_node(&state.replacement_targets, &local_endpoints) {
@@ -283,31 +348,35 @@ impl HealManager {
                         && (state.retry_count < state.max_retries || replacement_retry_is_exhausted_active(&state));
                     let verified_replacement = state.completed
                         && matches!(state.replacement_phase, ReplacementPhase::Verified | ReplacementPhase::CleanupPending);
-                    if !active_replacement && !verified_replacement && durable_replacement_reserves_targets(&state) {
-                        self.block_replacement_recovery_set(&state.set_disk_id);
+                    if !active_replacement && !verified_replacement {
+                        if reserves_targets {
+                            // Exhausted or orphaned: the record keeps its
+                            // slots reserved until an operator repairs it, but
+                            // only this generation is held back.
+                            blocks.block(
+                                &task_id,
+                                &state.set_disk_id,
+                                state
+                                    .error_message
+                                    .clone()
+                                    .unwrap_or_else(|| "durable generation reserves its targets but cannot run".to_string()),
+                                true,
+                            );
+                        }
+                        continue;
                     }
-                    if (active_replacement || verified_replacement)
-                        && state.replacement_generation.as_deref() == Some(task_id.as_str())
-                        && !state.replacement_targets.is_empty()
+                    if state.replacement_generation.as_deref() == Some(task_id.as_str()) && !state.replacement_targets.is_empty()
                     {
                         if conflicted_replacement_tasks.contains(&task_id) {
                             continue;
                         }
                         let mut selected = replacement_recovery_candidates.remove(&task_id);
-                        let previous_set = selected.as_ref().map(|candidate| candidate.state.set_disk_id.clone());
                         let candidate =
                             match ReplacementRecoveryCandidate::new(state.clone(), endpoint.to_string(), endpoint.is_local) {
                                 Ok(candidate) => candidate,
                                 Err(error) => {
                                     conflicted_replacement_tasks.insert(task_id.clone());
-                                    conflicted_replacement_sets.insert(state.set_disk_id.clone());
-                                    if let Some(previous_set) = &previous_set {
-                                        conflicted_replacement_sets.insert(previous_set.clone());
-                                    }
-                                    self.block_replacement_recovery_set(&state.set_disk_id);
-                                    if let Some(previous_set) = &previous_set {
-                                        self.block_replacement_recovery_set(previous_set);
-                                    }
+                                    blocks.block(&task_id, &state.set_disk_id, error.to_string(), reserves_targets);
                                     warn!(
                                         target: "rustfs::heal::manager",
                                         event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
@@ -321,15 +390,9 @@ impl HealManager {
                                     continue;
                                 }
                             };
-                        let task_set = candidate.state.set_disk_id.clone();
                         if let Err(error) = merge_replacement_recovery_candidate(&mut selected, candidate) {
                             conflicted_replacement_tasks.insert(task_id.clone());
-                            conflicted_replacement_sets.insert(task_set.clone());
-                            self.block_replacement_recovery_set(&task_set);
-                            if let Some(previous_set) = &previous_set {
-                                conflicted_replacement_sets.insert(previous_set.clone());
-                                self.block_replacement_recovery_set(previous_set);
-                            }
+                            blocks.block(&task_id, &state.set_disk_id, error.to_string(), reserves_targets);
                             warn!(
                                 target: "rustfs::heal::manager",
                                 event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
@@ -350,20 +413,23 @@ impl HealManager {
             // Replay only the canonical durable copy.  Replica locations are
             // observations of one generation and must never each advance it.
             for (task_id, candidate) in replacement_recovery_candidates {
+                // Every copy merged cleanly: an earlier block for this
+                // generation no longer applies. Later failures re-block it.
+                blocks.unblock(&task_id);
+                let candidate_set = candidate.state.set_disk_id.clone();
+                let reserves_targets = replacement_reserves_targets_on(&candidate.state, &local_disks).await;
                 let Some(anchor_disk) = recovery_disks
                     .iter()
                     .find(|disk| disk.endpoint().to_string() == candidate.anchor)
                     .cloned()
                 else {
-                    conflicted_replacement_sets.insert(candidate.state.set_disk_id.clone());
-                    self.block_replacement_recovery_set(&candidate.state.set_disk_id);
+                    blocks.block(&task_id, &candidate_set, "durable anchor is unavailable", reserves_targets);
                     continue;
                 };
                 let manager = match ResumeManager::load_replacement_intent(anchor_disk, &task_id).await {
                     Ok(manager) => manager,
                     Err(error) => {
-                        conflicted_replacement_sets.insert(candidate.state.set_disk_id.clone());
-                        self.block_replacement_recovery_set(&candidate.state.set_disk_id);
+                        blocks.block(&task_id, &candidate_set, error.to_string(), reserves_targets);
                         warn!(
                             target: "rustfs::heal::manager",
                             event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
@@ -376,7 +442,7 @@ impl HealManager {
                         continue;
                     }
                 };
-                let mut state = manager.get_state().await;
+                let state = manager.get_state().await;
                 let now = SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -388,18 +454,25 @@ impl HealManager {
                 }
                 if replacement_retry_is_exhausted_active(&state) {
                     match manager.rearm_replacement_recovery_if_needed(self.storage.as_ref()).await {
-                        Ok(true) => state = manager.get_state().await,
+                        // Resolution below reloads the re-armed state.
+                        Ok(true) => {}
                         Ok(false) => {
                             // A ready target with an exhausted all-skip pass
                             // is terminal for this generation; preserve its
                             // reservation and do not enqueue a fresh task.
-                            conflicted_replacement_sets.insert(state.set_disk_id.clone());
-                            self.block_replacement_recovery_set(&state.set_disk_id);
+                            blocks.block(
+                                &task_id,
+                                &candidate_set,
+                                state
+                                    .error_message
+                                    .clone()
+                                    .unwrap_or_else(|| "replacement retry budget exhausted".to_string()),
+                                reserves_targets,
+                            );
                             continue;
                         }
                         Err(error) => {
-                            conflicted_replacement_sets.insert(state.set_disk_id.clone());
-                            self.block_replacement_recovery_set(&state.set_disk_id);
+                            blocks.block(&task_id, &candidate_set, error.to_string(), reserves_targets);
                             warn!(
                                 target: "rustfs::heal::manager",
                                 event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
@@ -417,8 +490,7 @@ impl HealManager {
                     Ok(state) => state,
                     Err(Error::ReplacementTargetNotReady(_)) => continue,
                     Err(error) => {
-                        conflicted_replacement_sets.insert(state.set_disk_id.clone());
-                        self.block_replacement_recovery_set(&state.set_disk_id);
+                        blocks.block(&task_id, &candidate_set, error.to_string(), reserves_targets);
                         warn!(
                             target: "rustfs::heal::manager",
                             event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
@@ -431,6 +503,7 @@ impl HealManager {
                         continue;
                     }
                 };
+                blocks.unblock(&state.task_id);
                 let resolved = (state.set_disk_id, state.replacement_targets, state.replacement_buckets, candidate.anchor);
                 match replacement_intents.entry(state.task_id.clone()) {
                     std::collections::hash_map::Entry::Vacant(entry) => {
@@ -439,10 +512,13 @@ impl HealManager {
                     std::collections::hash_map::Entry::Occupied(entry) => {
                         let existing = entry.get();
                         if existing.0 != resolved.0 || existing.1 != resolved.1 || existing.2 != resolved.2 {
-                            conflicted_replacement_sets.insert(existing.0.clone());
-                            conflicted_replacement_sets.insert(resolved.0.clone());
-                            self.block_replacement_recovery_set(&resolved.0);
-                            self.block_replacement_recovery_set(&existing.0);
+                            blocks.block(
+                                &state.task_id,
+                                &resolved.0,
+                                "durable copies resolve to different set, targets, or bucket plans",
+                                true,
+                            );
+                            entry.remove();
                         }
                     }
                 }
@@ -465,7 +541,7 @@ impl HealManager {
             let Ok((pool_index, set_index)) = crate::heal::utils::parse_set_disk_id(&set_disk_id) else {
                 continue;
             };
-            if self.replacement_recovery_set_is_blocked(&set_disk_id) {
+            if conflicted_replacement_sets.contains(&set_disk_id) {
                 debug!(
                     target: "rustfs::heal::manager",
                     event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
@@ -473,12 +549,17 @@ impl HealManager {
                     subsystem = LOG_SUBSYSTEM_MANAGER,
                     set_disk_id,
                     recovery_count = recoveries.len(),
-                    "Replacement recovery deferred because durable recovery validation is blocked"
+                    "Replacement recovery deferred because durable recovery inventory is incomplete"
                 );
                 continue;
             }
-            if conflicted_replacement_sets.contains(&set_disk_id) || recoveries.len() != 1 {
-                self.block_replacement_recovery_set(&set_disk_id);
+            if recoveries.len() != 1 {
+                // Two active generations resolved for one set. Neither may
+                // run until an operator reconciles them; each is blocked on
+                // its own so other sets keep recovering.
+                for (task_id, _, _, _) in &recoveries {
+                    blocks.block(task_id, &set_disk_id, "multiple active generations resolved for the same set", true);
+                }
                 debug!(
                     target: "rustfs::heal::manager",
                     event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
@@ -569,7 +650,10 @@ impl HealManager {
         };
 
         for set_disk_id in set_disk_ids {
-            if reserved_replacement_sets.contains(&set_disk_id) || self.replacement_recovery_set_is_blocked(&set_disk_id) {
+            if reserved_replacement_sets.contains(&set_disk_id)
+                || conflicted_replacement_sets.contains(&set_disk_id)
+                || blocks.set_has_reserving_block(&set_disk_id)
+            {
                 continue;
             }
             let mut req = HealRequest::new(

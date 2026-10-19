@@ -2738,12 +2738,15 @@ async fn replacement_failure_persistence_retains_both_errors() {
 }
 
 #[tokio::test]
-async fn replacement_format_failures_consume_the_durable_budget_across_new_executors() {
+async fn replacement_format_failures_keep_the_durable_budget_across_new_executors() {
+    // backlog#2902: the rebuild budget counts attempts after the target is
+    // formatted. A failed format keeps its durable reason and leaves the
+    // budget intact, whether one executor retries or a new one is admitted.
     let directory = TempDir::new().expect("survivor root");
     let disk = make_resume_disk(&directory).await;
     let mut request = directory_backed_replacement_request();
     request.heal_endpoints = vec!["replacement-a".to_string()];
-    for attempt in 1..=3 {
+    for _attempt in 1..=3 {
         let storage = Arc::new(MockStorage {
             replacement_target_identities_ready: Mutex::new(true),
             resume_disk: Mutex::new(Some(disk.clone())),
@@ -2763,7 +2766,16 @@ async fn replacement_format_failures_consume_the_durable_budget_across_new_execu
             .expect("durable failure")
             .get_state()
             .await;
-        assert_eq!(state.retry_count, attempt, "a new executor must not reset or double-charge the attempt");
+        assert_eq!(state.retry_count, 0, "a pre-format failure must not spend a rebuild attempt");
+        assert!(state.can_retry());
+        assert!(
+            state
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("format failure")),
+            "the durable reason is retained for status: {:?}",
+            state.error_message
+        );
         assert_eq!(state.replacement_phase, ReplacementPhase::Intent);
         assert_eq!(storage.replacement_format_calls.lock().unwrap().len(), 1);
         assert!(storage.bucket_heal_calls.lock().unwrap().is_empty());

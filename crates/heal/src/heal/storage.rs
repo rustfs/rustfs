@@ -1988,6 +1988,7 @@ impl HealStorageAPI for ECStoreHealStorage {
     ) -> Result<ReplacementResumeDisk> {
         let disks = self.resume_disk_inventory(set_disk_id).await?;
         let mut selected = None;
+        let mut inspected_other_tasks = HashSet::new();
         let mut observed_other_tasks = HashSet::new();
         for disk_store in &disks {
             if excluded_targets.contains(&disk_store.endpoint().to_string())
@@ -2009,7 +2010,7 @@ impl HealStorageAPI for ECStoreHealStorage {
                 // generation while another durable intent already owns this
                 // set. Inspect one copy of each other task and let the
                 // caller reconcile it through the normal recovery scanner.
-                if candidate_task_id != task_id && !observed_other_tasks.insert(candidate_task_id.clone()) {
+                if candidate_task_id != task_id && !inspected_other_tasks.insert(candidate_task_id.clone()) {
                     continue;
                 }
                 let manager =
@@ -2022,6 +2023,16 @@ impl HealStorageAPI for ECStoreHealStorage {
                     });
                 }
                 if candidate_task_id != task_id {
+                    // A retired record (committed handoff or approved legacy
+                    // migration) transferred its responsibility and no longer
+                    // owns the set (rustfs/rustfs#8664). An orphaned abandoned
+                    // record releases its slots once another generation's
+                    // markers own them.
+                    if super::resume::replacement_generation_reserves_targets(&state)
+                        && !super::resume::abandoned_targets_are_owned_by_another_generation(&state, &disks).await
+                    {
+                        observed_other_tasks.insert(candidate_task_id);
+                    }
                     continue;
                 }
                 let candidate =
