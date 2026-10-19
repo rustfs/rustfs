@@ -42,7 +42,7 @@ Durability is read back, not assumed: the fixture starts every node with `RUSTFS
 
 ## Fault windows
 
-The movement windows are file barriers compiled only with `e2e-test-hooks`; a production build carries none of them. The fixture arms a window for one object, waits for the server's `reached.*.json` observation, and only then injects. An unreached window fails the case instead of counting as a fault test.
+The movement windows are file barriers compiled only with `e2e-test-hooks`; a production build carries none of them. The four fault cases therefore require a server built with that feature and fail immediately with a prerequisite error otherwise; they are never skipped. The fixture arms a window for one object, waits for the server's `reached.*.json` observation, and only then injects. An unreached window fails the case instead of counting as a fault test.
 
 | Window | Server location | Env / arm | Injection | Evidence |
 |---|---|---|---|---|

@@ -196,6 +196,13 @@ pub(crate) fn normalize_version_id(version_id: Option<&str>) -> String {
     }
 }
 
+/// Fault cases inject at server-side barriers that exist only in a server
+/// built with `e2e-test-hooks`. Fail before starting a cluster instead of
+/// waiting for a barrier that can never be reached.
+pub(crate) fn require_test_hooks() {
+    crate::common::rustfs_binary_path_with_features(Some("e2e-test-hooks"));
+}
+
 /// One cluster run plus its barrier directories and node log capture.
 pub(crate) struct TopologyRun {
     pub dist: DistCluster,

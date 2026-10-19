@@ -33,8 +33,8 @@ use super::scanner_heal_topology_fixture::{
     assert_bucket_durability_strict, assert_every_node_serves, assert_probe_objects, assert_process_durability_strict,
     assert_seed_pool_census_unchanged, assert_single_pool_placement, cancel_decommission, capture_seed_pool_census,
     clear_decommission, expect_decommission_rejected, expected_live_state, incarnation_sidecar_census, pool_count, pools_holding,
-    put_probe_objects, rebalance_stopped, run_live_workload, seed_manifest, start_decommission_targets, stop_rebalance,
-    verify_from_every_node, verify_live_state, verify_manifest, wait_for_decommission_flag,
+    put_probe_objects, rebalance_stopped, require_test_hooks, run_live_workload, seed_manifest, start_decommission_targets,
+    stop_rebalance, verify_from_every_node, verify_live_state, verify_manifest, wait_for_decommission_flag,
 };
 use crate::common::{admin_request, init_logging};
 use http::Method;
@@ -482,6 +482,7 @@ fn record(run: &TopologyRun, case: &str, outcome: &TestResult<Value>, mut eviden
 #[tokio::test]
 async fn scanner_heal_topology_decommission_kill_before_source_cleanup_resumes_without_loss() -> TestResult {
     init_logging();
+    require_test_hooks();
     let mut run = TopologyRun::start("decom-kill").await?;
     let manifest = seed_manifest(&run).await?;
     verify_from_every_node(&run.dist, &manifest, "seeded").await?;
@@ -533,6 +534,7 @@ async fn scanner_heal_topology_decommission_kill_before_source_cleanup_resumes_w
 #[tokio::test]
 async fn scanner_heal_topology_decommission_target_commit_failure_retains_source() -> TestResult {
     init_logging();
+    require_test_hooks();
     let mut run = TopologyRun::start("decom-target-fail").await?;
     let manifest = seed_manifest(&run).await?;
     verify_from_every_node(&run.dist, &manifest, "seeded").await?;
@@ -579,6 +581,7 @@ async fn scanner_heal_topology_decommission_target_commit_failure_retains_source
 #[tokio::test]
 async fn scanner_heal_topology_decommission_kill_after_responsibility_persisted_before_ack_resumes() -> TestResult {
     init_logging();
+    require_test_hooks();
     let mut run = TopologyRun::start("decom-ack").await?;
     let manifest = seed_manifest(&run).await?;
     verify_from_every_node(&run.dist, &manifest, "seeded").await?;
@@ -654,6 +657,7 @@ async fn scanner_heal_topology_decommission_kill_after_responsibility_persisted_
 #[tokio::test]
 async fn scanner_heal_topology_rebalance_kill_before_source_cleanup_resumes_without_loss() -> TestResult {
     init_logging();
+    require_test_hooks();
     let mut run = TopologyRun::start("rebal-kill").await?;
     let manifest = seed_manifest(&run).await?;
     verify_from_every_node(&run.dist, &manifest, "seeded").await?;
