@@ -180,15 +180,28 @@ class DuckDBSmokeTest(unittest.TestCase):
         self.assertEqual(args.rest_path, "/iceberg")
         self.assertEqual(args.rest_signing_name, "s3")
         self.assertEqual(args.bucket, "rustfs-duckdb-smoke")
+        self.assertEqual(args.catalog_backing, "object")
+
+    def test_backing_mismatch_prevents_duckdb_table_setup(self) -> None:
+        with mock.patch.object(duckdb_smoke, "duckdb_path", return_value="duckdb"), mock.patch.object(
+            duckdb_smoke, "duckdb_client_version", return_value="1.5.5"
+        ), mock.patch.object(duckdb_smoke.pyiceberg_smoke, "ensure_aws_env"), mock.patch.object(
+            duckdb_smoke.pyiceberg_smoke, "discover_catalog_backing", side_effect=RuntimeError("backing mismatch")
+        ), mock.patch.object(duckdb_smoke.pyiceberg_smoke, "ensure_bucket") as bucket:
+            with self.assertRaisesRegex(RuntimeError, "backing mismatch"):
+                duckdb_smoke.run_smoke(self.args(), mock.Mock())
+        bucket.assert_not_called()
 
     def test_live_evidence_records_automated_duckdb_claim(self) -> None:
         args = self.args()
+        args.catalog_backing = "operator-recorded"
         result = duckdb_smoke.DuckDBSmokeResult(
             client_version="1.5.5",
             metadata_location="s3://rustfs-duckdb-smoke/metadata/00001.json",
             row_count=2,
             cleanup_result="dropped-tables-and-namespace",
             checks={"canonical_rest_catalog": "pass"},
+            catalog_backing="durable-strong",
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "evidence.json"
@@ -200,6 +213,7 @@ class DuckDBSmokeTest(unittest.TestCase):
         evidence = document["live_conformance_evidence"]
         self.assertEqual(evidence["client_name"], "DuckDB Iceberg")
         self.assertEqual(evidence["claim"], "automated-rest-catalog-smoke")
+        self.assertEqual(evidence["catalog_backing"], "durable-strong")
         self.assertIn("--secret-key '<redacted>'", evidence["command"])
         self.assertNotIn("--secret-key secret", evidence["command"])
         self.assertEqual(document["validation"]["status"], "accepted")

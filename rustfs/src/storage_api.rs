@@ -79,6 +79,12 @@ pub(crate) mod config_test {
 }
 
 pub(crate) mod error {
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_disk::error::Error as DiskError;
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_disk::error_reduce::{
+        OBJECT_OP_IGNORED_ERRS, reduce_read_quorum_errs, reduce_write_quorum_errs,
+    };
     pub(crate) mod contract {
         pub(crate) use super::super::storage_contracts::error::StorageErrorCode;
 
@@ -128,7 +134,7 @@ pub(crate) mod kms {
 
 pub(crate) mod protocols {
     pub(crate) mod client {
-        pub(crate) use crate::storage::storage_api::access_consumer::{ReqInfo, authorize_request};
+        pub(crate) use crate::storage::storage_api::access_consumer::{MultipartStagingOperation, ReqInfo, authorize_request};
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::contract::bucket::{BucketOperations, MakeBucketOptions};
         #[cfg(test)]
@@ -174,6 +180,8 @@ pub(crate) mod server {
     }
 
     pub(crate) mod http {
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::ecstore_disk::{DiskAPI, DiskOption, new_disk};
         pub(crate) use crate::storage::storage_api::{
             ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, tonic_boot_epoch_challenge,
             tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason, verify_tonic_rpc_signature_with_bootstrap,
@@ -452,6 +460,7 @@ pub(crate) mod workload {
 }
 
 pub(crate) mod table {
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::utils::check_valid_bucket_name_strict;
     pub(crate) use crate::storage::storage_api::ecstore_object::{WriteCommitGuard, WriteCompletion};
     pub(crate) mod contract {
         pub(crate) mod http {

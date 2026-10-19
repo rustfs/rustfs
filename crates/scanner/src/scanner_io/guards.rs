@@ -546,13 +546,11 @@ pub(super) fn reset_disk_bucket_scan_gauges(pool: &str, set: &str) {
     record_disk_bucket_scans_active(0, pool, set);
 }
 
+// Foreground pressure is handled during work by disk admission and the sleeper.
+// Dispatch limits must not freeze a momentary request count for an entire cycle.
 pub(super) fn scanner_concurrency_limit(configured: usize, available: usize) -> usize {
     if available == 0 {
         return 0;
-    }
-
-    if crate::workload_admission::foreground_workload_activity() > 0 {
-        return 1;
     }
 
     if configured == 0 {

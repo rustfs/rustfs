@@ -14,6 +14,7 @@
 
 use super::{ObjectOptions, WriteCompletion};
 use crate::error::{Error, Result};
+use rustfs_utils::path::object_name_disk_identity;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,7 +54,7 @@ impl WriteCommitGuard {
     pub(crate) fn from_guard(guard: Arc<rustfs_lock::NamespaceLockGuard>, bucket: &str, object: &str) -> Self {
         Self {
             bucket: bucket.into(),
-            object: object.into(),
+            object: object_name_disk_identity(object).as_ref().into(),
             guards: Arc::new(vec![guard]),
         }
     }
@@ -68,8 +69,10 @@ impl WriteCommitGuard {
         self.guards.iter().any(|guard| guard.is_lock_lost() || guard.is_released())
     }
 
+    /// Namespace locks key the disk identity of the name (see `new_ns_lock`),
+    /// so a guard proves every spelling that resolves to the same file.
     pub(crate) fn matches(&self, bucket: &str, object: &str) -> bool {
-        self.bucket.as_ref() == bucket && self.object.as_ref() == object
+        self.bucket.as_ref() == bucket && self.object.as_ref() == object_name_disk_identity(object).as_ref()
     }
 }
 

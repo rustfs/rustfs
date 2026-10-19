@@ -64,6 +64,8 @@ pub(crate) mod namespace {
 pub(crate) mod object {
     use super::{Debug, Error, FileInfo, GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
     use crate::storage_api_contracts::range::HTTPRangeSpec;
+    #[cfg(test)]
+    pub(crate) use rustfs_storage_api::object::DeleteObjectCondition;
     pub(crate) use rustfs_storage_api::{
         DeleteAccounting, DeletedObject, HTTPPreconditions, ObjectIO, ObjectLockDeleteOptions, ObjectLockRetentionOptions,
         ObjectOperations, ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState, ObjectToDelete,

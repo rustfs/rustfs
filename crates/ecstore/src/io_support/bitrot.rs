@@ -174,10 +174,14 @@ async fn open_reader_source(
     metrics_path: Option<&'static str>,
 ) -> disk::error::Result<Option<BoxedObjectReader>> {
     if let Some(data) = inline_data {
+        #[cfg(test)]
+        crate::set_disk::disk_call_counters::record_shard_open(path, true);
         let mut reader = Cursor::new(data);
         reader.set_position(u64::try_from(offset).map_err(|_| DiskError::FileCorrupt)?);
         Ok(Some(ShardReader::InMemory(reader)))
     } else if let Some(disk) = disk {
+        #[cfg(test)]
+        crate::set_disk::disk_call_counters::record_shard_open(path, false);
         open_disk_reader(disk, bucket, path, offset, length, use_mmap_read, metrics_path)
             .await
             .map(Some)

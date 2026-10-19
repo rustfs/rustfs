@@ -20,6 +20,7 @@ use crate::bucket::{
 use crate::error::is_err_bucket_not_found;
 use crate::runtime::sources as runtime_sources;
 use crate::set_disk::{BucketInfoQuorum, get_lock_acquire_timeout};
+use crate::storage_api_contracts::admin::DiskSetSelector;
 use crate::storage_api_contracts::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, SRBucketDeleteOp};
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use futures::stream::{self, StreamExt};
@@ -1172,7 +1173,7 @@ impl ECStore {
         let mut scoped_results = futures::future::join_all(self.bucket_sets().map(|(pool_index, set_index, set)| async move {
             let result = match quorum {
                 BucketInfoQuorum::Read => set.stat_bucket_with_quorum(bucket, quorum).await,
-                BucketInfoQuorum::Write => set.get_bucket_info(bucket, opts).await,
+                BucketInfoQuorum::Write | BucketInfoQuorum::HealCandidates => set.get_bucket_info(bucket, opts).await,
             };
             (pool_index, set_index, result)
         }))
@@ -1252,34 +1253,70 @@ impl ECStore {
     #[instrument(skip(self))]
     pub(super) async fn handle_list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         // TODO(backlog): support cached bucket listing via opts.cached
-        Ok(self.list_bucket_from_sets(opts, usize::MAX).await?.buckets)
+        Ok(self
+            .list_bucket_from_sets(opts, usize::MAX, BucketInfoQuorum::Write, None)
+            .await?
+            .buckets)
     }
 
     pub async fn list_bucket_for_scanner(&self, opts: &BucketOptions) -> Result<crate::cluster::rpc::ScannerBucketListing> {
-        self.list_bucket_from_sets(opts, SCANNER_BUCKET_LIST_SET_CONCURRENCY).await
+        self.list_bucket_from_sets(opts, SCANNER_BUCKET_LIST_SET_CONCURRENCY, BucketInfoQuorum::Write, None)
+            .await
+    }
+
+    /// Discover candidates for metadata initialization at each set's namespace
+    /// read quorum. Metadata loading still validates persisted configuration;
+    /// this listing must not be used as a complete scanner or mutation view.
+    pub async fn list_buckets_for_metadata_startup(&self) -> Result<Vec<BucketInfo>> {
+        Ok(self
+            .list_bucket_from_sets(
+                &BucketOptions {
+                    no_metadata: true,
+                    ..Default::default()
+                },
+                SCANNER_BUCKET_LIST_SET_CONCURRENCY,
+                BucketInfoQuorum::Read,
+                None,
+            )
+            .await?
+            .buckets)
+    }
+
+    /// Preserve namespace completeness for administrator traversal. A scoped
+    /// request must not depend on unrelated sets being available.
+    pub async fn list_buckets_for_admin_heal(
+        &self,
+        selector: Option<DiskSetSelector>,
+    ) -> Result<crate::cluster::rpc::ScannerBucketListing> {
+        self.list_bucket_from_sets(
+            &BucketOptions {
+                no_metadata: true,
+                ..Default::default()
+            },
+            SCANNER_BUCKET_LIST_SET_CONCURRENCY,
+            BucketInfoQuorum::HealCandidates,
+            selector,
+        )
+        .await
     }
 
     async fn list_bucket_from_sets(
         &self,
         opts: &BucketOptions,
         max_concurrency: usize,
+        quorum: BucketInfoQuorum,
+        selector: Option<DiskSetSelector>,
     ) -> Result<crate::cluster::rpc::ScannerBucketListing> {
-        let set_count = self.pools.iter().map(|pool| pool.disk_set.len()).sum();
+        let sets = self
+            .bucket_sets()
+            .filter(|(pool, set, _)| selector.is_none_or(|scope| scope.pool_idx == *pool && scope.set_idx == *set))
+            .collect::<Vec<_>>();
+        let set_count = sets.len();
         let concurrency = bucket_list_set_concurrency(set_count, max_concurrency);
-        let deleted = opts.deleted;
-        let cached = opts.cached;
-        let no_metadata = opts.no_metadata;
-        let mut set_listings = stream::iter(self.bucket_sets().map(move |(pool_index, set_index, set)| {
-            let opts = BucketOptions {
-                deleted,
-                cached,
-                no_metadata,
-            };
-            async move {
-                set.list_bucket_for_scanner(&opts)
-                    .await
-                    .map(|(buckets, complete)| (pool_index, set_index, buckets, complete))
-            }
+        let mut set_listings = stream::iter(sets.into_iter().map(move |(pool_index, set_index, set)| async move {
+            set.list_bucket_with_quorum(quorum)
+                .await
+                .map(|(buckets, complete)| (pool_index, set_index, buckets, complete))
         }))
         .buffer_unordered(concurrency);
         let mut topology_complete = set_count != 0;
@@ -2243,6 +2280,64 @@ mod tests {
                 .await
                 .expect("metadata marker should be written");
         }
+    }
+
+    #[tokio::test]
+    async fn admin_bucket_discovery_preserves_completeness_and_scope() {
+        use crate::storage_api_contracts::admin::DiskSetSelector;
+        let (temp, store) = setup_bucket_quorum_test_env(&[2, 2], None).await;
+        let empty = store
+            .list_buckets_for_admin_heal(None)
+            .await
+            .expect("empty namespace enumeration");
+        assert!(empty.buckets.is_empty());
+        assert!(empty.topology_complete);
+        for disk in 0..2 {
+            tokio::fs::create_dir(temp.path().join(format!("pool0-disk{disk}/healthy-bucket")))
+                .await
+                .expect("healthy bucket");
+        }
+        tokio::fs::create_dir(temp.path().join("pool1-disk0/partial-bucket"))
+            .await
+            .expect("single surviving bucket directory");
+        let global = store
+            .list_buckets_for_admin_heal(None)
+            .await
+            .expect("online disk enumeration");
+        assert!(global.topology_complete, "every disk answered the candidate inventory");
+        assert_eq!(
+            global.buckets.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+            ["healthy-bucket", "partial-bucket"]
+        );
+        let healthy = store
+            .list_buckets_for_admin_heal(Some(DiskSetSelector::new(0, 0)))
+            .await
+            .expect("healthy scope");
+        assert!(healthy.topology_complete);
+        assert_eq!(healthy.buckets.len(), 1);
+        assert_eq!(healthy.set_buckets.len(), 1);
+        let partial = store
+            .list_buckets_for_admin_heal(Some(DiskSetSelector::new(1, 0)))
+            .await
+            .expect("partial scope");
+        assert!(partial.topology_complete);
+        assert_eq!(partial.buckets[0].name, "partial-bucket");
+        let invalid = store
+            .list_buckets_for_admin_heal(Some(DiskSetSelector::new(0, 1)))
+            .await
+            .expect("unconfigured scope");
+        assert!(!invalid.topology_complete);
+        assert!(invalid.buckets.is_empty());
+        let offline = take_set_disks_offline(&store, &store.pools[1].disk_set[0], &[0]).await;
+        assert!(store.list_buckets_for_admin_heal(None).await.is_err(), "quorum errors must remain errors");
+        assert!(
+            store
+                .list_buckets_for_admin_heal(Some(DiskSetSelector::new(0, 0)))
+                .await
+                .expect("unrelated offline pool")
+                .topology_complete
+        );
+        restore_set_disks(&store, &store.pools[1].disk_set[0], offline).await;
     }
 
     #[test]
@@ -3562,6 +3657,79 @@ mod tests {
             .await
             .expect_err("bucket validation must fail when an expansion pool is unavailable");
         assert_eq!(info_err, StorageError::ErasureReadQuorum);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn metadata_startup_listing_uses_each_sets_read_quorum() {
+        for drives_per_pool in [vec![2], vec![3], vec![4], vec![6], vec![8], vec![4, 6]] {
+            let (_temp_dir, store) = setup_bucket_quorum_test_env(&drives_per_pool, None).await;
+            let bucket = "metadata-startup-read-quorum";
+            for pool in &store.pools {
+                pool.disk_set[0]
+                    .make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("healthy set should create the startup candidate");
+            }
+            let mut offline = Vec::new();
+            for (pool_index, &width) in drives_per_pool.iter().enumerate() {
+                let set = &store.pools[pool_index].disk_set[0];
+                let indexes = (width.div_ceil(2)..width).collect::<Vec<_>>();
+                offline.push(take_set_disks_offline(&store, set, &indexes).await);
+            }
+            let listing = store
+                .list_buckets_for_metadata_startup()
+                .await
+                .expect("startup must discover buckets at every set's read quorum");
+            assert_eq!(listing.len(), 1);
+            assert_eq!(listing[0].name, bucket);
+            if drives_per_pool.iter().any(|width| width % 2 == 0) {
+                let error = store
+                    .list_bucket_for_scanner(&BucketOptions::default())
+                    .await
+                    .expect_err("startup discovery must not weaken scanner quorum");
+                assert_eq!(error, StorageError::ErasureWriteQuorum);
+                let error = store
+                    .list_bucket(&BucketOptions {
+                        no_metadata: true,
+                        ..Default::default()
+                    })
+                    .await
+                    .expect_err("ordinary listing must retain its existing quorum");
+                assert_eq!(error, StorageError::ErasureWriteQuorum);
+            }
+            // A healthy earlier pool must not hide read-quorum loss in a later pool.
+            let last_pool = store.pools.len() - 1;
+            let set = &store.pools[last_pool].disk_set[0];
+            let extra = take_set_disks_offline(&store, set, &[0]).await;
+            let error = store
+                .list_buckets_for_metadata_startup()
+                .await
+                .expect_err("every set must retain read quorum for startup discovery");
+            assert_eq!(error, StorageError::ErasureReadQuorum);
+            restore_set_disks(&store, set, extra).await;
+            for (pool_index, disks) in offline.into_iter().enumerate() {
+                restore_set_disks(&store, &store.pools[pool_index].disk_set[0], disks).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn metadata_startup_listing_does_not_accept_single_disk_bucket_remnants() {
+        let (temp_dir, store) = setup_bucket_quorum_test_env(&[4], None).await;
+        let bucket = "incomplete-startup-bucket";
+        tokio::fs::create_dir(temp_dir.path().join("pool0-disk0").join(bucket))
+            .await
+            .expect("create one uncommitted directory remnant");
+        let set = &store.pools[0].disk_set[0];
+        let offline = take_set_disks_offline(&store, set, &[2, 3]).await;
+        let listing = store
+            .list_buckets_for_metadata_startup()
+            .await
+            .expect("two responsive disks satisfy discovery quorum");
+        assert!(listing.iter().all(|info| info.name != bucket));
+        restore_set_disks(&store, set, offline).await;
     }
 
     #[tokio::test]

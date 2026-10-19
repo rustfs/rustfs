@@ -24,6 +24,59 @@ mod canonical_outcome {
     use super::*;
     use crate::heal::outcome::{HealExecutionOutcome, HealTraversalCoverage};
 
+    #[tokio::test]
+    async fn admin_bucket_discovery_incomplete_cannot_finish_an_empty_cluster() {
+        for dry_run in [false, true] {
+            let storage = Arc::new(MockStorage {
+                listed_buckets: Mutex::new(Some(Vec::new())),
+                bucket_discovery_incomplete: true,
+                ..Default::default()
+            });
+            let mut request = HealRequest::new(
+                HealType::Cluster,
+                HealOptions {
+                    dry_run,
+                    recursive: true,
+                    ..Default::default()
+                },
+                HealPriority::Normal,
+            );
+            request.source = HealRequestSource::Admin;
+            let task = HealTask::from_request(request, storage.clone());
+            assert!(matches!(task.execute().await, Err(Error::BucketDiscoveryIncomplete)));
+            let outcome = task.get_outcome().await;
+            assert_eq!(outcome.execution, HealExecutionOutcome::Aborted(HealAbortReason::Untraversable));
+            assert_eq!(outcome.coverage, HealTraversalCoverage::Partial);
+            assert_eq!(outcome.counters.processed, 0);
+            assert_eq!(outcome.counters.failed, 0);
+            assert!(storage.bucket_heal_calls.lock().expect("bucket calls").is_empty());
+            assert!(storage.heal_object_calls.lock().expect("object calls").is_empty());
+            let wire = serde_json::to_value(&outcome).expect("outcome serializes");
+            assert_eq!(
+                crate::heal::outcome::legacy_wire_status("finished", &wire, false)
+                    .expect("legacy status")
+                    .0,
+                "stopped"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_bucket_discovery_complete_empty_cluster_finishes() {
+        let storage = Arc::new(MockStorage {
+            listed_buckets: Mutex::new(Some(Vec::new())),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::Normal);
+        request.source = HealRequestSource::Admin;
+        let task = HealTask::from_request(request, storage);
+        task.execute().await.expect("complete empty namespace is valid");
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
+        assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
+        assert_eq!(outcome.counters.processed, 0);
+    }
+
     fn bucket_task(storage: Arc<MockStorage>) -> HealTask {
         HealTask::from_request(
             HealRequest::new(
@@ -1481,8 +1534,11 @@ struct MockStorage {
     truncate_without_token: Mutex<bool>,
     include_object_dir_candidate: Mutex<bool>,
     listed_buckets: Mutex<Option<Vec<String>>>,
+    bucket_discovery_incomplete: bool,
     bucket_heal_errors: Mutex<HashMap<String, VecDeque<&'static str>>>,
     bucket_heal_calls: Mutex<Vec<String>>,
+    delete_recovery_results: Mutex<HashMap<String, Result<Option<HealResultItem>>>>,
+    delete_recovery_calls: Mutex<Vec<String>>,
     block_heal_object: Mutex<bool>,
     resume_disk: Mutex<Option<DiskStore>>,
     replacement_resume_disk: Mutex<Option<DiskStore>>,
@@ -1490,6 +1546,7 @@ struct MockStorage {
     usage_baseline_error: Mutex<bool>,
     erasure_set_scopes: Mutex<Vec<(usize, usize)>>,
     disk_walk_calls: Mutex<Vec<String>>,
+    disk_walk_items: Mutex<Option<Vec<HealListItem>>>,
 }
 
 #[test]
@@ -1980,6 +2037,16 @@ impl HealStorageAPI for MockStorage {
         Ok(*self.usage_baseline.lock().unwrap())
     }
 
+    async fn list_buckets_for_admin_heal(
+        &self,
+        _selector: Option<crate::heal::storage_api::storage::DiskSetSelector>,
+    ) -> Result<Vec<BucketInfo>> {
+        if self.bucket_discovery_incomplete {
+            return Err(Error::BucketDiscoveryIncomplete);
+        }
+        self.list_buckets().await
+    }
+
     async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
         let buckets = self
             .listed_buckets
@@ -2259,6 +2326,34 @@ impl HealStorageAPI for MockStorage {
         Ok(HealResultItem::default())
     }
 
+    async fn recover_delete_transactions(
+        &self,
+        bucket: &str,
+        _object: Option<&str>,
+        _expected: Option<Uuid>,
+        _opts: &HealOpts,
+    ) -> Result<Option<HealResultItem>> {
+        self.delete_recovery_calls
+            .lock()
+            .expect("recovery calls")
+            .push(bucket.to_owned());
+        self.delete_recovery_results
+            .lock()
+            .expect("recovery results")
+            .remove(bucket)
+            .unwrap_or(Ok(None))
+    }
+
+    async fn recover_delete_prefix_transactions(
+        &self,
+        bucket: &str,
+        _prefix: &str,
+        expected: Option<Uuid>,
+        opts: &HealOpts,
+    ) -> Result<Option<HealResultItem>> {
+        self.recover_delete_transactions(bucket, None, expected, opts).await
+    }
+
     async fn heal_format(&self, _dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
         *self.global_format_calls.lock().unwrap() += 1;
         if let Some(error) = self.format_error.lock().unwrap().take() {
@@ -2424,7 +2519,15 @@ impl HealStorageAPI for MockStorage {
         if continuation_token.is_some() {
             return Ok((Vec::new(), None, false));
         }
-        Ok((vec![heal_item(&format!("{set_disk_id}-object"))], None, false))
+        Ok((
+            self.disk_walk_items
+                .lock()
+                .expect("disk-walk items")
+                .clone()
+                .unwrap_or_else(|| vec![heal_item(&format!("{set_disk_id}-object"))]),
+            None,
+            false,
+        ))
     }
 
     async fn get_disk_for_resume(&self, _set_disk_id: &str) -> Result<DiskStore> {
@@ -4366,6 +4469,336 @@ async fn erasure_set_bucket_prepass_failure_stops_before_object_heal() {
     assert!(error.to_string().contains("injected bucket prepass failure"));
     assert_eq!(storage.bucket_heal_calls.lock().unwrap().as_slice(), ["bucket-a".to_string()]);
     assert!(storage.object_heal_opts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn erasure_set_unresolved_delete_recovery_preserves_other_buckets_and_ordinary_heal() {
+    use rustfs_madmin::heal_commands::DeleteRecoveryStatus;
+
+    for status in [
+        DeleteRecoveryStatus {
+            pending: 1,
+            ..Default::default()
+        },
+        DeleteRecoveryStatus {
+            blocked: 1,
+            ..Default::default()
+        },
+        DeleteRecoveryStatus {
+            failed: 1,
+            ..Default::default()
+        },
+    ] {
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let disk = make_resume_disk(&temp).await;
+        let storage = Arc::new(MockStorage {
+            delete_recovery_results: Mutex::new(HashMap::from([(
+                "bucket-a".to_owned(),
+                Ok(Some(HealResultItem {
+                    bucket: "bucket-a".to_owned(),
+                    delete_recovery: Some(status),
+                    ..Default::default()
+                })),
+            )])),
+            resume_disk: Mutex::new(Some(disk)),
+            list_each_bucket: true,
+            ..Default::default()
+        });
+        let buckets = vec!["bucket-a".to_owned(), "bucket-b".to_owned()];
+        let request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: buckets.clone(),
+                set_disk_id: "pool_0_set_0".to_owned(),
+            },
+            HealOptions {
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage.clone());
+
+        let error = task
+            .heal_erasure_set(buckets.clone(), "pool_0_set_0".to_owned())
+            .await
+            .expect_err("unresolved recovery must not be reported as complete");
+
+        assert!(matches!(error, Error::TransientSkip { .. }), "recovery must remain retryable: {error}");
+        assert_eq!(*storage.delete_recovery_calls.lock().expect("recovery calls"), buckets);
+        assert_eq!(*storage.bucket_heal_calls.lock().expect("bucket calls"), buckets);
+        assert_eq!(
+            storage.object_heal_opts.lock().expect("object calls").len(),
+            4,
+            "ordinary object heal must run for both buckets"
+        );
+        assert!(
+            task.get_result_items()
+                .await
+                .iter()
+                .any(|item| item.bucket == "bucket-a" && item.delete_recovery == Some(status)),
+            "the result retains the exact unresolved recovery category"
+        );
+    }
+}
+
+#[tokio::test]
+async fn erasure_set_delete_recovery_fatal_errors_stop_before_other_buckets() {
+    for error in [
+        Error::TaskCancelled,
+        Error::TaskTimeout,
+        Error::Storage(EcstoreError::PreconditionFailed),
+        Error::Storage(EcstoreError::SlowDown),
+        Error::Storage(EcstoreError::InvalidPath),
+    ] {
+        let expected = error.to_string();
+        let temp = TempDir::new().expect("temporary directory should be created");
+        let disk = make_resume_disk(&temp).await;
+        let storage = Arc::new(MockStorage {
+            delete_recovery_results: Mutex::new(HashMap::from([("bucket-a".to_owned(), Err(error))])),
+            resume_disk: Mutex::new(Some(disk)),
+            ..Default::default()
+        });
+        let buckets = vec!["bucket-a".to_owned(), "bucket-b".to_owned()];
+        let request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: buckets.clone(),
+                set_disk_id: "pool_0_set_0".to_owned(),
+            },
+            HealOptions {
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage.clone());
+
+        let actual = task
+            .heal_erasure_set(buckets, "pool_0_set_0".to_owned())
+            .await
+            .expect_err("fence and control errors must terminate the prepass");
+
+        assert_eq!(actual.to_string(), expected);
+        assert_eq!(*storage.delete_recovery_calls.lock().expect("recovery calls"), ["bucket-a"]);
+        assert_eq!(*storage.bucket_heal_calls.lock().expect("bucket calls"), ["bucket-a"]);
+        assert!(storage.object_heal_opts.lock().expect("object calls").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn bucket_and_prefix_delete_recovery_stays_unresolved_after_ordinary_heal() {
+    for prefix in [None, Some("logs/")] {
+        let status = rustfs_madmin::heal_commands::DeleteRecoveryStatus {
+            pending: 1,
+            ..Default::default()
+        };
+        let storage = Arc::new(MockStorage {
+            delete_recovery_results: Mutex::new(HashMap::from([(
+                "bucket-a".to_owned(),
+                Ok(Some(HealResultItem {
+                    bucket: "bucket-a".to_owned(),
+                    delete_recovery: Some(status),
+                    ..Default::default()
+                })),
+            )])),
+            ..Default::default()
+        });
+        let heal_type = prefix.map_or_else(
+            || HealType::Bucket {
+                bucket: "bucket-a".to_owned(),
+            },
+            |prefix| HealType::Prefix {
+                bucket: "bucket-a".to_owned(),
+                prefix: prefix.to_owned(),
+            },
+        );
+        let task = HealTask::from_request(
+            HealRequest::new(
+                heal_type,
+                HealOptions {
+                    recursive: true,
+                    timeout: None,
+                    ..Default::default()
+                },
+                HealPriority::Normal,
+            ),
+            storage.clone(),
+        );
+
+        let result = match prefix {
+            Some(prefix) => task.heal_prefix("bucket-a", prefix).await,
+            None => task.heal_bucket("bucket-a").await,
+        };
+        assert!(
+            matches!(result, Err(Error::TransientSkip { .. })),
+            "unfinished recovery must remain retryable: {result:?}"
+        );
+        assert_eq!(storage.object_heal_opts.lock().expect("object calls").len(), 2);
+        assert!(
+            task.get_result_items()
+                .await
+                .iter()
+                .any(|item| item.delete_recovery == Some(status))
+        );
+    }
+}
+
+#[tokio::test]
+async fn unresolved_delete_recovery_prevents_bucket_removal() {
+    let storage = Arc::new(MockStorage {
+        delete_recovery_results: Mutex::new(HashMap::from([(
+            "bucket-a".to_owned(),
+            Ok(Some(HealResultItem {
+                delete_recovery: Some(rustfs_madmin::heal_commands::DeleteRecoveryStatus {
+                    failed: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+        )])),
+        ..Default::default()
+    });
+    let task = HealTask::from_request(
+        HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket-a".to_owned(),
+            },
+            HealOptions {
+                remove_corrupted: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        ),
+        storage.clone(),
+    );
+
+    assert!(matches!(task.heal_bucket("bucket-a").await, Err(Error::TransientSkip { .. })));
+    assert!(
+        storage.bucket_heal_calls.lock().expect("bucket calls").is_empty(),
+        "publication directories must remain until recovery resolves"
+    );
+}
+
+#[tokio::test]
+async fn admin_erasure_set_delete_recovery_rescans_only_after_settlement() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let disk = make_resume_disk(&temp).await;
+    let incarnation = Uuid::new_v4();
+    let storage = Arc::new(MockStorage {
+        bucket_incarnation_id: Mutex::new(Some(incarnation)),
+        delete_recovery_results: Mutex::new(HashMap::from([(
+            "bucket-a".to_owned(),
+            Ok(Some(HealResultItem {
+                delete_recovery: Some(rustfs_madmin::heal_commands::DeleteRecoveryStatus {
+                    blocked: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+        )])),
+        resume_disk: Mutex::new(Some(disk.clone())),
+        disk_walk_items: Mutex::new(Some(vec![heal_item("object-a"), heal_item("object-b")])),
+        ..Default::default()
+    });
+    let buckets = vec!["bucket-a".to_owned(), "bucket-b".to_owned()];
+    let mut request = HealRequest::new(
+        HealType::ErasureSet {
+            buckets: buckets.clone(),
+            set_disk_id: "pool_0_set_0".to_owned(),
+        },
+        HealOptions {
+            timeout: None,
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+    request.source = HealRequestSource::Admin;
+    let task = HealTask::from_request(request, storage.clone());
+
+    let error = task
+        .heal_erasure_set(buckets.clone(), "pool_0_set_0".to_owned())
+        .await
+        .expect_err("administrator recovery cannot complete a set with unresolved recovery");
+    assert!(matches!(error, Error::TransientSkip { .. }), "typed unresolved recovery: {error}");
+    assert_eq!(storage.object_heal_opts.lock().expect("object calls").len(), 4);
+    let checkpoint = CheckpointManager::load_from_disk(disk.clone(), &task.id)
+        .await
+        .expect("retained administrator checkpoint")
+        .get_checkpoint()
+        .await;
+    assert_eq!(
+        checkpoint.current_bucket_index, 2,
+        "ordinary work advances independently from hidden recovery"
+    );
+    assert!(!checkpoint.admin.expect("administrator outcome").completed);
+    assert_eq!(*storage.delete_recovery_calls.lock().expect("recovery calls"), buckets);
+    storage.delete_recovery_results.lock().expect("recovery results").insert(
+        "bucket-a".to_owned(),
+        Ok(Some(HealResultItem {
+            delete_recovery: Some(rustfs_madmin::heal_commands::DeleteRecoveryStatus {
+                failed: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })),
+    );
+    let error = task
+        .heal_erasure_set(buckets.clone(), "pool_0_set_0".to_owned())
+        .await
+        .expect_err("completed ordinary buckets must still retry their hidden recovery");
+    assert!(matches!(error, Error::TransientSkip { .. }));
+    assert_eq!(
+        storage.object_heal_opts.lock().expect("object calls").len(),
+        4,
+        "retry must not replay payload healing"
+    );
+
+    *storage.bucket_incarnation_id.lock().expect("bucket identity") = Some(Uuid::new_v4());
+    let error = task
+        .heal_erasure_set(buckets.clone(), "pool_0_set_0".to_owned())
+        .await
+        .expect_err("recovery-only retries must retain the admitted bucket generation");
+    assert!(matches!(error, Error::StaleBucketIncarnation { .. }));
+    *storage.bucket_incarnation_id.lock().expect("bucket identity") = Some(incarnation);
+
+    // A background worker may restore and collect the hidden transaction
+    // before this retry, so the recovery result can now be None.
+    *storage.disk_walk_items.lock().expect("disk-walk items") =
+        Some(vec![heal_item("object-a"), heal_item("object-b"), heal_item("restored")]);
+    let error = task
+        .heal_erasure_set(buckets.clone(), "pool_0_set_0".to_owned())
+        .await
+        .expect_err("settlement must invalidate overlapping ordinary coverage");
+    assert!(matches!(error, Error::TransientSkip { .. }));
+    assert_eq!(storage.object_heal_opts.lock().expect("object calls").len(), 4);
+    task.heal_erasure_set(buckets, "pool_0_set_0".to_owned())
+        .await
+        .expect("a fresh coverage pass can complete");
+    assert_eq!(storage.object_heal_opts.lock().expect("object calls").len(), 10);
+    assert_eq!(
+        storage
+            .healed_objects
+            .lock()
+            .expect("healed objects")
+            .iter()
+            .filter(|object| object.as_str() == "restored")
+            .count(),
+        2
+    );
+    assert_eq!(
+        *storage.delete_recovery_calls.lock().expect("recovery calls"),
+        [
+            "bucket-a", "bucket-b", "bucket-a", "bucket-b", "bucket-a", "bucket-b", "bucket-a", "bucket-b"
+        ]
+    );
+    let checkpoint = CheckpointManager::load_from_disk(disk, &task.id)
+        .await
+        .expect("completed administrator receipt")
+        .get_checkpoint()
+        .await;
+    let admin = checkpoint.admin.expect("administrator outcome");
+    assert!(admin.completed);
+    assert_eq!(admin.outcome.counters.processed, 6, "the fresh coverage pass owns its counters");
 }
 
 #[tokio::test]

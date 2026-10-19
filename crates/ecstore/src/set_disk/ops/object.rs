@@ -20,6 +20,7 @@
 //! SetDisks core (io_primitives) via inherent calls.
 
 use crate::core::pools::DecommissionCapacityAdmission;
+use crate::disk::cleanup_runtime::{self, OLD_DATA_CLEANUP_RECEIPT_FILE};
 use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
 use rustfs_filemeta::metadata_keys;
 
@@ -36,9 +37,9 @@ use super::super::{
     GET_STAGE_LOCK_ACQUIRE, GET_STAGE_METADATA, GET_STAGE_OBJECT_INFO, GET_STAGE_PATH_DECISION, GET_STAGE_READER_SETUP,
     GenericError, GetCodecStreamingDecision, GetCodecStreamingFallbackReason, GetDirectMemoryDecision, GetObjectReader,
     HTTPRangeSpec, HashAlgorithm, HashMap, HashReader, HashSet, HeaderMap, HealChannelPriority, InstanceContext, Instant,
-    LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectApiError, ObjectInfo, ObjectKey,
-    ObjectLockConfigSnapshot, ObjectLockConfigState, ObjectOptions, ObjectReader, ObjectToDelete, OffsetDateTime, Ordering, Pin,
-    PutObjReader, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, ReadPathPlan, ReaderImpl, ReplicateDecision,
+    LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, LateMetadataFanout, OBJECT_OP_IGNORED_ERRS, ObjectApiError, ObjectInfo,
+    ObjectKey, ObjectLockConfigSnapshot, ObjectLockConfigState, ObjectOptions, ObjectReader, ObjectToDelete, OffsetDateTime,
+    Ordering, Pin, PutObjReader, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, ReadPathPlan, ReaderImpl, ReplicateDecision,
     ReplicationObjectBridge, Result, SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS, SLASH_SEPARATOR, SUFFIX_ACTUAL_SIZE,
     SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK, SetDisks,
     SmallWritePath, StorageError, TRANSITION_COMPLETE, UpdateMetadataOpts, Uuid, WriteLayout, adaptive_duplex_buffer_size,
@@ -64,6 +65,420 @@ use super::super::{
     take_prepared_get_object_metadata, to_object_err, try_read_inline_data_shards_direct, warn,
 };
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
+use super::delete_recovery::DeleteRecoveryContext;
+
+#[derive(Default)]
+struct DeleteCommitContext<'a> {
+    incarnation: Option<Uuid>,
+    options: Option<&'a ObjectOptions>,
+    guard: Option<Arc<super::super::ObjectLockDiagGuard>>,
+}
+
+impl<'a> DeleteCommitContext<'a> {
+    fn request(options: &'a ObjectOptions, guard: Option<&Arc<super::super::ObjectLockDiagGuard>>) -> Self {
+        Self {
+            incarnation: options.expected_bucket_incarnation_id,
+            options: Some(options),
+            guard: guard.cloned(),
+        }
+    }
+
+    fn can_commit(&self, bucket: &str, object: &str) -> bool {
+        self.options.is_none_or(|options| {
+            ensure_delete_commit_locks_held(self.guard.as_deref(), bucket, object, options).is_ok()
+                && options
+                    .scanner_publication_commit_scope
+                    .as_ref()
+                    .is_none_or(|scope| scope.can_commit())
+        })
+    }
+}
+
+const TIER_FREE_VERSION_SOURCE_LOOKUP_COUNTERFACTUAL_SKIP_ENV: &str =
+    "RUSTFS_PUT_TIER_FREE_VERSION_SOURCE_LOOKUP_COUNTERFACTUAL_SKIP";
+const TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ENV: &str = "RUSTFS_PUT_TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA";
+const TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ASSUME_HOMOGENEOUS_ENV: &str =
+    "RUSTFS_PUT_TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ASSUME_HOMOGENEOUS";
+const RENAME_TAIL_CLEANUP_PER_DISK_LIMIT_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_PER_DISK_LIMIT";
+const RENAME_TAIL_CLEANUP_PER_DISK_LANES_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_PER_DISK_LANES";
+const RENAME_TAIL_CLEANUP_LANE_ENABLE_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_LANE_ENABLE";
+const RENAME_TAIL_CLEANUP_LANE_CAPACITY_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_LANE_CAPACITY";
+const RENAME_TAIL_CLEANUP_LANE_BATCH_MAX_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_LANE_BATCH_MAX";
+const RENAME_TAIL_CLEANUP_LANE_BATCH_WINDOW_MS_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_LANE_BATCH_WINDOW_MS";
+const RENAME_TAIL_CLEANUP_LANE_ACTIVE_WINDOW_MS_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_LANE_ACTIVE_WINDOW_MS";
+const RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP";
+const DEFAULT_RENAME_TAIL_CLEANUP_PER_DISK_LANES: usize = 1024;
+const DEFAULT_RENAME_TAIL_CLEANUP_LANE_CAPACITY: usize = 1024;
+const DEFAULT_RENAME_TAIL_CLEANUP_LANE_BATCH_MAX: usize = 1;
+
+fn tier_free_version_source_lookup_counterfactual_skip_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var(TIER_FREE_VERSION_SOURCE_LOOKUP_COUNTERFACTUAL_SKIP_ENV)
+                .ok()
+                .as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+    })
+}
+
+fn rename_tail_cleanup_zero_target_tmp_delete_skip_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var(RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP_ENV)
+                .ok()
+                .as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+    })
+}
+
+fn tier_free_version_source_reuse_rename_data_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var(TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ENV).ok().as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+    })
+}
+
+fn tier_free_version_source_reuse_rename_data_assume_homogeneous_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var(TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ASSUME_HOMOGENEOUS_ENV)
+                .ok()
+                .as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+    })
+}
+
+fn rename_tail_cleanup_per_disk_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| rustfs_utils::get_env_usize(RENAME_TAIL_CLEANUP_PER_DISK_LIMIT_ENV, 0))
+}
+
+fn rename_tail_cleanup_per_disk_lanes() -> usize {
+    static LANES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LANES.get_or_init(|| {
+        rustfs_utils::get_env_usize(RENAME_TAIL_CLEANUP_PER_DISK_LANES_ENV, DEFAULT_RENAME_TAIL_CLEANUP_PER_DISK_LANES).max(1)
+    })
+}
+
+fn rename_tail_cleanup_foreground_yield() -> Duration {
+    static YIELD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *YIELD
+        .get_or_init(|| Duration::from_millis(rustfs_utils::get_env_u64("RUSTFS_PUT_RENAME_TAIL_CLEANUP_FOREGROUND_YIELD_MS", 0)))
+}
+
+fn rename_tail_cleanup_foreground_active_yield() -> Duration {
+    static YIELD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *YIELD.get_or_init(|| {
+        Duration::from_millis(rustfs_utils::get_env_u64("RUSTFS_PUT_RENAME_TAIL_CLEANUP_FOREGROUND_ACTIVE_YIELD_MS", 0))
+    })
+}
+
+fn rename_tail_cleanup_lane_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var(RENAME_TAIL_CLEANUP_LANE_ENABLE_ENV).ok().as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+    })
+}
+
+fn rename_tail_cleanup_lane_capacity() -> usize {
+    static CAPACITY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAPACITY.get_or_init(|| {
+        rustfs_utils::get_env_usize(RENAME_TAIL_CLEANUP_LANE_CAPACITY_ENV, DEFAULT_RENAME_TAIL_CLEANUP_LANE_CAPACITY).max(1)
+    })
+}
+
+fn rename_tail_cleanup_lane_batch_max() -> usize {
+    static BATCH_MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BATCH_MAX.get_or_init(|| {
+        rustfs_utils::get_env_usize(RENAME_TAIL_CLEANUP_LANE_BATCH_MAX_ENV, DEFAULT_RENAME_TAIL_CLEANUP_LANE_BATCH_MAX).max(1)
+    })
+}
+
+fn rename_tail_cleanup_lane_batch_window() -> Duration {
+    static WINDOW: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *WINDOW.get_or_init(|| Duration::from_millis(rustfs_utils::get_env_u64(RENAME_TAIL_CLEANUP_LANE_BATCH_WINDOW_MS_ENV, 0)))
+}
+
+fn rename_tail_cleanup_lane_active_window() -> Duration {
+    static WINDOW: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *WINDOW.get_or_init(|| Duration::from_millis(rustfs_utils::get_env_u64(RENAME_TAIL_CLEANUP_LANE_ACTIVE_WINDOW_MS_ENV, 0)))
+}
+
+async fn rename_tail_cleanup_per_disk_permit(disk_index: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let limit = rename_tail_cleanup_per_disk_limit();
+    if limit == 0 {
+        return None;
+    }
+    static LANES: std::sync::OnceLock<Vec<Arc<tokio::sync::Semaphore>>> = std::sync::OnceLock::new();
+    let lanes = LANES.get_or_init(|| {
+        (0..rename_tail_cleanup_per_disk_lanes())
+            .map(|_| Arc::new(tokio::sync::Semaphore::new(limit)))
+            .collect()
+    });
+    let semaphore = Arc::clone(&lanes[disk_index % lanes.len()]);
+    let wait_started = rustfs_io_metrics::put_stage_timer();
+    let permit = semaphore.clone().acquire_owned().await.ok();
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_PER_DISK_PERMIT_WAIT,
+        wait_started,
+    );
+    if let Some(semaphore_permit) = permit {
+        rustfs_io_metrics::record_put_object_stage_duration(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_PER_DISK_INFLIGHT,
+            limit.saturating_sub(semaphore.available_permits()) as f64,
+        );
+        Some(semaphore_permit)
+    } else {
+        None
+    }
+}
+
+type RenameTailCleanupLaneFuture = Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
+
+struct RenameTailCleanupLaneJob {
+    disk_index: usize,
+    future: RenameTailCleanupLaneFuture,
+    done: tokio::sync::oneshot::Sender<()>,
+}
+
+struct RenameTailCleanupLane {
+    sender: tokio::sync::mpsc::Sender<RenameTailCleanupLaneJob>,
+    queued: Arc<std::sync::atomic::AtomicUsize>,
+    oldest_enqueued_at: Arc<tokio::sync::Mutex<Option<Instant>>>,
+}
+
+struct RenameTailCleanupLaneQueue {
+    lanes: Vec<RenameTailCleanupLane>,
+}
+
+async fn run_rename_tail_cleanup_lane_job(job: RenameTailCleanupLaneJob) {
+    let service_started = rustfs_io_metrics::put_stage_timer();
+    job.future.await;
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_SERVICE_TIME,
+        service_started,
+    );
+    let _ = job.done.send(());
+}
+
+impl RenameTailCleanupLaneQueue {
+    fn new() -> Self {
+        let lanes = (0..rename_tail_cleanup_per_disk_lanes())
+            .map(|_| {
+                let (sender, mut receiver) =
+                    tokio::sync::mpsc::channel::<RenameTailCleanupLaneJob>(rename_tail_cleanup_lane_capacity());
+                let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let active_workers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let oldest_enqueued_at = Arc::new(tokio::sync::Mutex::new(None::<Instant>));
+                let worker_queued = Arc::clone(&queued);
+                let worker_active = Arc::clone(&active_workers);
+                let worker_oldest_enqueued_at = Arc::clone(&oldest_enqueued_at);
+                tokio::spawn(async move {
+                    loop {
+                        let queued_before_poll = worker_queued.load(Ordering::Relaxed);
+                        let worker_poll_started = rustfs_io_metrics::put_stage_timer();
+                        let Some(job) = receiver.recv().await else {
+                            return;
+                        };
+                        if queued_before_poll == 0 {
+                            rustfs_io_metrics::record_put_object_stage_duration_from(
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_WORKER_IDLE_WAIT,
+                                worker_poll_started,
+                            );
+                        } else {
+                            rustfs_io_metrics::record_put_object_stage_duration_from(
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_WORKER_POLL_WAIT,
+                                worker_poll_started,
+                            );
+                            rustfs_io_metrics::record_put_object_stage_duration_from(
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_WORKER_JOB_WAIT,
+                                worker_poll_started,
+                            );
+                        }
+                        let mut batch = vec![job];
+                        let batch_window = rename_tail_cleanup_lane_batch_window();
+                        let batch_max = rename_tail_cleanup_lane_batch_max();
+                        if batch_max > 1 && !batch_window.is_zero() {
+                            tokio::time::sleep(batch_window).await;
+                        }
+                        while batch.len() < batch_max {
+                            let Some(next) = receiver.try_recv().ok() else {
+                                break;
+                            };
+                            batch.push(next);
+                        }
+                        let queued_after_dequeue = worker_queued
+                            .fetch_sub(batch.len(), Ordering::Relaxed)
+                            .saturating_sub(batch.len());
+                        if queued_after_dequeue == 0 {
+                            *worker_oldest_enqueued_at.lock().await = None;
+                        }
+                        rustfs_io_metrics::record_put_object_stage_duration(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_QUEUE_DEPTH,
+                            queued_after_dequeue as f64,
+                        );
+                        rustfs_io_metrics::record_put_object_stage_duration(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_QUEUE_DEPTH_MAX_SAMPLE,
+                            queued_after_dequeue as f64,
+                        );
+                        if let Some(oldest) = *worker_oldest_enqueued_at.lock().await {
+                            let oldest_age_ms = oldest.elapsed().as_secs_f64() * 1000.0;
+                            rustfs_io_metrics::record_put_object_stage_duration(
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_OLDEST_AGE,
+                                oldest_age_ms,
+                            );
+                            rustfs_io_metrics::record_put_object_stage_duration(
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_OLDEST_AGE_MAX_SAMPLE,
+                                oldest_age_ms,
+                            );
+                        }
+                        rustfs_io_metrics::record_put_object_stage_duration(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_BATCH_SIZE,
+                            batch.len() as f64,
+                        );
+                        if batch.len() > 1 {
+                            rustfs_io_metrics::record_put_object_stage_duration(
+                                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_BURST_BATCH_SIZE,
+                                batch.len() as f64,
+                            );
+                        }
+                        let active = worker_active.fetch_add(1, Ordering::Relaxed) + 1;
+                        rustfs_io_metrics::record_put_object_stage_duration(
+                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_WORKER_ACTIVE,
+                            active as f64,
+                        );
+                        let active_window = rename_tail_cleanup_lane_active_window();
+                        if !active_window.is_zero() {
+                            let mut deferred = Vec::new();
+                            let mut ready = Vec::new();
+                            for job in batch {
+                                let active = rename_foreground_active_count(job.disk_index);
+                                if active > 0 {
+                                    rustfs_io_metrics::record_put_object_stage_duration(
+                                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_FOREGROUND_ACTIVE_HIT,
+                                        active as f64,
+                                    );
+                                    rustfs_io_metrics::record_put_object_stage_duration(
+                                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_REQUEUE,
+                                        1.0,
+                                    );
+                                    deferred.push(job);
+                                } else {
+                                    ready.push(job);
+                                }
+                            }
+                            for job in ready {
+                                run_rename_tail_cleanup_lane_job(job).await;
+                            }
+                            if !deferred.is_empty() {
+                                tokio::time::sleep(active_window).await;
+                                for job in deferred {
+                                    run_rename_tail_cleanup_lane_job(job).await;
+                                }
+                            }
+                        } else {
+                            for job in batch {
+                                run_rename_tail_cleanup_lane_job(job).await;
+                            }
+                        }
+                        worker_active.fetch_sub(1, Ordering::Relaxed);
+                    }
+                });
+                RenameTailCleanupLane {
+                    sender,
+                    queued,
+                    oldest_enqueued_at,
+                }
+            })
+            .collect();
+        Self { lanes }
+    }
+
+    async fn enqueue(
+        &self,
+        disk_index: usize,
+        future: RenameTailCleanupLaneFuture,
+    ) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        let lane = &self.lanes[disk_index % self.lanes.len()];
+        let enqueued_at = Instant::now();
+        let queue_push_started = rustfs_io_metrics::put_stage_timer();
+        {
+            let mut oldest = lane.oldest_enqueued_at.lock().await;
+            if oldest.is_none() {
+                *oldest = Some(enqueued_at);
+            }
+        }
+        let queued_after_enqueue = lane.queued.fetch_add(1, Ordering::Relaxed) + 1;
+        let (done, done_rx) = tokio::sync::oneshot::channel();
+        let job = RenameTailCleanupLaneJob {
+            disk_index,
+            future,
+            done,
+        };
+        match lane.sender.try_send(job) {
+            Ok(()) => {
+                rustfs_io_metrics::record_put_object_stage_duration(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_QUEUE_DEPTH,
+                    queued_after_enqueue as f64,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_QUEUE_DEPTH_MAX_SAMPLE,
+                    queued_after_enqueue as f64,
+                );
+                if let Some(oldest) = *lane.oldest_enqueued_at.lock().await {
+                    let oldest_age_ms = oldest.elapsed().as_secs_f64() * 1000.0;
+                    rustfs_io_metrics::record_put_object_stage_duration(
+                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_OLDEST_AGE,
+                        oldest_age_ms,
+                    );
+                    rustfs_io_metrics::record_put_object_stage_duration(
+                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_OLDEST_AGE_MAX_SAMPLE,
+                        oldest_age_ms,
+                    );
+                }
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_QUEUE_PUSH,
+                    queue_push_started,
+                );
+                Some(done_rx)
+            }
+            Err(err) => {
+                lane.queued.fetch_sub(1, Ordering::Relaxed);
+                if lane.queued.load(Ordering::Relaxed) == 0 {
+                    *lane.oldest_enqueued_at.lock().await = None;
+                }
+                let job = err.into_inner();
+                run_rename_tail_cleanup_lane_job(job).await;
+                rustfs_io_metrics::record_put_object_stage_duration(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_QUEUE_DEPTH_MAX_SAMPLE,
+                    lane.queued.load(Ordering::Relaxed) as f64,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_LANE_QUEUE_PUSH,
+                    queue_push_started,
+                );
+                None
+            }
+        }
+    }
+}
+
+fn rename_tail_cleanup_lane_queue() -> &'static RenameTailCleanupLaneQueue {
+    static QUEUE: std::sync::OnceLock<RenameTailCleanupLaneQueue> = std::sync::OnceLock::new();
+    QUEUE.get_or_init(RenameTailCleanupLaneQueue::new)
+}
 
 fn delete_marker_purge_candidate(
     file_info: &FileInfo,
@@ -330,7 +745,9 @@ use crate::object_api::{
 };
 use crate::services::notification_sys::RemoteVersionStateFleetProofToken;
 use crate::services::tier::tier::{TierConfigMgr, TierDestinationId, TierOperationLease, tier_destination_id_from_metadata};
-use crate::set_disk::core::io_primitives::{RenameRollbackReceipt, RenameTailCleanup, finish_rename_tail_heal};
+use crate::set_disk::core::io_primitives::{
+    RenameRollbackReceipt, RenameTailCleanup, finish_rename_tail_heal, rename_foreground_active_count,
+};
 #[cfg(test)]
 use crate::storage_api_contracts::namespace::NamespaceLocking;
 #[cfg(test)]
@@ -338,7 +755,7 @@ use crate::storage_api_contracts::object::HTTPPreconditions;
 use crate::store::ECStore;
 use crate::store::utils::clean_metadata;
 use crate::store::{RemoteTuplePublicationCommitGuard, RemoteTuplePublicationFence};
-use futures::FutureExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use http::HeaderValue;
 #[cfg(test)]
 use rustfs_filemeta::FileMeta;
@@ -347,6 +764,8 @@ use rustfs_filemeta::ObjectPartInfo;
 use rustfs_utils::path::decode_dir_object;
 #[cfg(test)]
 use rustfs_utils::path::encode_dir_object;
+use rustfs_utils::path::object_name_disk_identity;
+use std::borrow::Cow;
 use std::future::Future;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -500,7 +919,6 @@ async fn acquire_single_tier_delete_lease(opts: &ObjectOptions, source: &ObjectI
     Ok(Some(lease))
 }
 
-const OLD_DATA_CLEANUP_RECEIPT_FILE: &str = ".rustfs-old-data-cleanup-receipt.json";
 const SCANNER_PUBLICATION_LEASE_FENCE_MAX_BYTES: usize = 64 * 1024;
 const SCANNER_PUBLICATION_LEASE_FENCE_MAX_ENTRIES: usize = 256;
 
@@ -978,6 +1396,42 @@ mod tier_free_version_receipt_eligibility_tests {
             vec![0, 2],
             "independent fully committed groups should retain their sparse receipts"
         );
+    }
+}
+
+// Own only completed staging, before the commit owner can rename or roll back
+// shards. Borrow the request state; clone it only if cancellation needs cleanup.
+struct PutObjectStagingCleanup<'a> {
+    set: &'a SetDisks,
+    tmp_dir: &'a str,
+    reservation: &'a Option<cleanup_runtime::Reservation>,
+    runtime: Option<tokio::runtime::Handle>,
+}
+
+impl Drop for PutObjectStagingCleanup<'_> {
+    fn drop(&mut self) {
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        let set = self.set.clone();
+        let tmp_dir = self.tmp_dir.to_owned();
+        let reservation = self.reservation.clone();
+        // A request future may be dropped outside its polling runtime. Cleanup
+        // remains best-effort on runtime shutdown, like the existing PUT tail.
+        let _enter = runtime.enter();
+        cleanup_runtime::spawn(reservation, async move {
+            if let Err(err) = set.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await {
+                warn!(
+                    event = EVENT_SET_DISK_WRITE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    state = "cancelled_staging_cleanup_failed",
+                    tmp_dir = %tmp_dir,
+                    error = ?err,
+                    "Cancelled PUT staging cleanup failed"
+                );
+            }
+        });
     }
 }
 
@@ -2481,6 +2935,22 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             return Err(to_object_err(Error::MethodNotAllowed, vec![bucket, object]));
         }
 
+        let condition_terminal =
+            crate::object_api::get_object_read_condition_is_terminal(crate::object_api::GetObjectReadMetadata {
+                bucket,
+                object,
+                etag: object_info.etag.as_deref(),
+                mod_time: object_info.mod_time,
+                parts: &object_info.parts,
+                delete_marker: false,
+            });
+        if snapshot.condition_stopped && !condition_terminal {
+            return Err(Error::other("conditional metadata snapshot no longer satisfies the read condition"));
+        }
+        if condition_terminal {
+            return Ok(GetObjectReader::condition_stopped(object_info));
+        }
+
         // if object_info.size == 0 {
         //     let empty_rd: Box<dyn AsyncRead> = Box::new(Bytes::new());
 
@@ -2580,6 +3050,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
                 // Decode directly
                 let decode_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
+                #[cfg(test)]
+                crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
                 if let Some(body) = try_read_inline_data_shards_direct(&mut readers, data_shards, read_length, object_size).await
                 {
                     if let Some(decode_stage_start) = decode_stage_start {
@@ -2649,6 +3121,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
                 let decode_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
                 let mut output = Cursor::new(Vec::with_capacity(object_size));
+                #[cfg(test)]
+                crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
                 let (written, err) = erasure.decode(&mut output, readers, 0, object_size, object_size).await;
                 if let Some(e) = err {
                     return Err(to_object_err(e.into(), vec![bucket, object]));
@@ -2761,9 +3235,9 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 let object_size = usize::try_from(object_info.size)
                     .map_err(|_| to_object_err(Error::other("two-phase GET object size is invalid"), vec![bucket, object]))?;
                 let mut output = Vec::with_capacity(object_size);
-                let (fi, files, disks, late_metadata_fanout_disks) = snapshot.into_owned_with_late_metadata_fanout();
+                let (fi, files, disks, late_metadata_fanout) = snapshot.into_owned_with_late_metadata_fanout();
                 let expected_identity = super::super::read::LateMetadataIdentity::from_file_info(&fi);
-                let late_metadata_fanout_disks = late_metadata_fanout_disks.ok_or_else(|| {
+                let late_metadata_fanout = late_metadata_fanout.ok_or_else(|| {
                     to_object_err(Error::other("two-phase GET fallback context is missing"), vec![bucket, object])
                 })?;
                 let initial_result = Self::get_object_with_fileinfo(
@@ -2788,6 +3262,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 )
                 .await;
                 if prepare_late_materialized_retry(&initial_result, &mut output, object_size) {
+                    let late_metadata_fanout_disks = match late_metadata_fanout {
+                        LateMetadataFanout::CapturedDisks(disks) => disks,
+                        LateMetadataFanout::RefreshCurrentSet => self.get_disks_for_data_read().await,
+                    };
                     #[cfg(test)]
                     super::super::rename_fanout_barrier::checkpoint(
                         object,
@@ -3307,7 +3785,96 @@ pub(in crate::set_disk) fn merge_replication_metadata_lww(
     changed
 }
 
+struct CommittedPutOutcome {
+    // Namespace publication succeeded even if its writer must retain repair
+    // responsibility. Completion errors must not select rollback cleanup.
+    completion: Result<(ObjectInfo, Option<OldCurrentSize>)>,
+}
+
 impl SetDisks {
+    /// Failure cleanup stays awaited, but shares the same execution budget as
+    /// successful PUT continuations when isolation is enabled.
+    async fn delete_put_tmp_with_budget(&self, tmp_dir: &str, reservation: &Option<cleanup_runtime::Reservation>) -> Result<()> {
+        if reservation.is_none() {
+            return self.delete_all(RUSTFS_META_TMP_BUCKET, tmp_dir).await;
+        }
+        let set = self.clone();
+        let tmp_dir = tmp_dir.to_owned();
+        cleanup_runtime::spawn(reservation.clone(), async move { set.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await })
+            .await
+            .map_err(Error::other)?
+    }
+
+    async fn reclaim_missing_delete_residue(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        lock_guard: Option<&Arc<super::super::ObjectLockDiagGuard>>,
+    ) -> Result<bool> {
+        if is_meta_bucketname(bucket)
+            || opts.version_id.is_some()
+            || opts.versioned
+            || opts.version_suspended
+            || opts.http_preconditions.is_some()
+            || opts.data_movement
+            || opts.transition.expire_restored
+            || opts.replication_request
+            || opts.lifecycle_delete_all.is_some()
+            || opts.delete_prefix
+            || opts.expected_current_version_id.is_some()
+            || !metadata_sys::has_authoritative_never_versioned_state_in(&self.ctx, bucket)
+                .await
+                .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+        let lock_state = match opts.object_lock_config_snapshot.as_ref() {
+            Some(snapshot) => Some(snapshot.state().clone()),
+            None => metadata_sys::get_object_lock_config_state_in(&self.ctx, bucket).await.ok(),
+        };
+        if !matches!(lock_state, Some(ObjectLockConfigState::ConfirmedAbsent)) {
+            return Ok(false);
+        }
+        if let Some(expected) = opts.expected_bucket_incarnation_id {
+            self.validate_bucket_incarnation(bucket, expected, opts).await?;
+        }
+        ensure_delete_commit_locks_held(lock_guard.map(Arc::as_ref), bucket, object, opts)?;
+        begin_scanner_publication_delete_mutation(opts.scanner_publication_commit_scope.as_ref())?;
+        let result = self
+            .recover_delete_key(
+                bucket,
+                object,
+                DeleteRecoveryContext {
+                    explicit_delete: true,
+                    namespace_owner: Some(Arc::new((
+                        self.ctx.begin_namespace_commit(),
+                        lock_guard.cloned(),
+                        opts.object_lock_config_snapshot.clone(),
+                        opts.scanner_publication_commit_scope.clone(),
+                        opts.write_lock_context.clone(),
+                        opts.delete_mutation_owner.clone(),
+                    ))),
+                    ..DeleteRecoveryContext::new(opts.expected_bucket_incarnation_id, &|| {
+                        ensure_delete_commit_locks_held(lock_guard.map(Arc::as_ref), bucket, object, opts).is_ok()
+                            && opts
+                                .scanner_publication_commit_scope
+                                .as_ref()
+                                .is_none_or(|scope| scope.can_commit())
+                    })
+                },
+            )
+            .await;
+        ensure_delete_commit_locks_held(lock_guard.map(Arc::as_ref), bucket, object, opts)?;
+        let recovered = result.map_err(|err| to_object_err(err.into(), vec![bucket, object]))?;
+        if recovered.pending > 0 && !recovered.no_transactions_at_quorum {
+            return Err(StorageError::SlowDown);
+        }
+        if recovered.blocked > 0 {
+            return Err(StorageError::SlowDown);
+        }
+        Ok(recovered.reclaimed > 0 || recovered.committed > 0)
+    }
     pub(in crate::set_disk) async fn cleanup_rename_tail(
         &self,
         targets: Vec<RenameTailCleanup>,
@@ -3316,24 +3883,105 @@ impl SetDisks {
         committed_data_dir: Option<Uuid>,
         epoch: Option<Uuid>,
     ) {
+        if rename_tail_cleanup_lane_enabled() {
+            let bucket = bucket.to_string();
+            let object = object.to_string();
+            let mut completions = Vec::with_capacity(targets.len());
+            for target in targets {
+                let cleanup_set = self.clone();
+                let cleanup_bucket = bucket.clone();
+                let cleanup_object = object.clone();
+                let disk_index = target.disk_index;
+                let future = Box::pin(async move {
+                    cleanup_set
+                        .cleanup_rename_tail_target(target, &cleanup_bucket, &cleanup_object, committed_data_dir, epoch)
+                        .await;
+                });
+                if let Some(done) = rename_tail_cleanup_lane_queue().enqueue(disk_index, future).await {
+                    completions.push(done);
+                }
+            }
+            for done in completions {
+                let _ = done.await;
+            }
+            return;
+        }
+
         for target in targets {
-            let mut disks = vec![None; self.set_drive_count];
-            disks[target.disk_index] = Some(target.disk);
-            self.persist_old_data_cleanup_receipts(&disks, bucket, object, target.old_data_dir, committed_data_dir, epoch)
-                .await;
-            let cleanup = self
-                .commit_rename_data_dir_and_mark_capacity(
-                    &disks,
-                    bucket,
-                    object,
-                    &target.old_data_dir.to_string(),
-                    &committed_data_dir.unwrap_or_default().to_string(),
-                    1,
-                )
-                .await;
-            self.report_old_data_dir_cleanup(bucket, object, &target.old_data_dir.to_string(), &cleanup)
+            self.cleanup_rename_tail_target(target, bucket, object, committed_data_dir, epoch)
                 .await;
         }
+    }
+
+    async fn cleanup_rename_tail_target(
+        &self,
+        target: RenameTailCleanup,
+        bucket: &str,
+        object: &str,
+        committed_data_dir: Option<Uuid>,
+        epoch: Option<Uuid>,
+    ) {
+        let foreground_yield = rename_tail_cleanup_foreground_yield();
+        if !foreground_yield.is_zero() {
+            let yield_started = rustfs_io_metrics::put_stage_timer();
+            tokio::time::sleep(foreground_yield).await;
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_FOREGROUND_YIELD,
+                yield_started,
+            );
+        }
+        let active_yield = rename_tail_cleanup_foreground_active_yield();
+        if !active_yield.is_zero() {
+            let active = rename_foreground_active_count(target.disk_index);
+            if active > 0 {
+                rustfs_io_metrics::record_put_object_stage_duration(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DEFERRED_FOREGROUND_ACTIVE,
+                    active as f64,
+                );
+                let yield_started = rustfs_io_metrics::put_stage_timer();
+                tokio::time::sleep(active_yield).await;
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_FOREGROUND_YIELD,
+                    yield_started,
+                );
+            }
+        }
+        let _cleanup_per_disk_permit = rename_tail_cleanup_per_disk_permit(target.disk_index).await;
+        let mut disks = vec![None; self.set_drive_count];
+        disks[target.disk_index] = Some(target.disk);
+        let receipt_started = rustfs_io_metrics::put_stage_timer();
+        self.persist_old_data_cleanup_receipts(&disks, bucket, object, target.old_data_dir, committed_data_dir, epoch)
+            .await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_RECEIPT,
+            receipt_started,
+        );
+        let commit_capacity_started = rustfs_io_metrics::put_stage_timer();
+        let cleanup = self
+            .commit_rename_data_dir_and_mark_capacity(
+                &disks,
+                bucket,
+                object,
+                &target.old_data_dir.to_string(),
+                &committed_data_dir.unwrap_or_default().to_string(),
+                1,
+            )
+            .await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_COMMIT_CAPACITY,
+            commit_capacity_started,
+        );
+        let report_started = rustfs_io_metrics::put_stage_timer();
+        self.report_old_data_dir_cleanup(bucket, object, &target.old_data_dir.to_string(), &cleanup)
+            .await;
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_REPORT,
+            report_started,
+        );
+    }
+
+    fn needs_old_data_cleanup_receipt(old_data_dir: Uuid, committed_data_dir: Option<Uuid>, epoch: Option<Uuid>) -> bool {
+        epoch.is_some() && committed_data_dir != Some(old_data_dir)
     }
 
     pub(in crate::set_disk) async fn persist_old_data_cleanup_receipts(
@@ -3345,10 +3993,10 @@ impl SetDisks {
         committed_data_dir: Option<Uuid>,
         epoch: Option<Uuid>,
     ) {
-        let Some(epoch) = epoch else { return };
-        if committed_data_dir == Some(old_data_dir) {
+        if !Self::needs_old_data_cleanup_receipt(old_data_dir, committed_data_dir, epoch) {
             return;
         }
+        let Some(epoch) = epoch else { return };
         let receipt = OldDataCleanupReceipt::new(epoch, old_data_dir, committed_data_dir);
         let Ok(encoded) = receipt.encode() else {
             return;
@@ -3445,7 +4093,28 @@ impl SetDisks {
     }
 
     async fn validate_bucket_incarnation(&self, bucket: &str, expected: Uuid, opts: &ObjectOptions) -> Result<()> {
-        let current = metadata_sys::get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, opts).await?;
+        let mut metadata_opts = None;
+        if opts
+            .object_lock_config_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.is_unbound())
+        {
+            let store = metadata_sys::object_store_in(&self.ctx).await?;
+            if opts
+                .bucket_incarnation_fence
+                .as_ref()
+                .is_some_and(|owner| owner.matches(&store, bucket, expected))
+            {
+                // An unbound snapshot carries policy, not metadata ownership.
+                // Keep the actual lifecycle owner for this incarnation read.
+                let mut options = opts.clone();
+                options.object_lock_config_snapshot = None;
+                metadata_opts = Some(options);
+            }
+        }
+        let current =
+            metadata_sys::get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, metadata_opts.as_ref().unwrap_or(opts))
+                .await?;
         if current != expected {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
@@ -3537,6 +4206,23 @@ impl SetDisks {
             .scanner_publication_commit_scope
             .clone()
             .map(ScannerPublicationCommitScopeGuard::new);
+        // Reserve before staging. Some callers already hold external locks,
+        // so admission must not wait for another PUT to release its budget.
+        // Commit/cleanup owners retain clones across cancellation and early ACK.
+        if opts
+            .put_object_cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(StorageError::OperationCanceled);
+        }
+        let cleanup_reservation = cleanup_runtime::reserve().map_err(|err| {
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                StorageError::SlowDown
+            } else {
+                Error::other(err)
+            }
+        })?;
         let storage_class_config = self.storage_class_config_snapshot();
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
@@ -3655,8 +4341,20 @@ impl SetDisks {
                 (None, None, None)
             };
         let mut tmp_cleanup_owned = false;
+        let mut staging_cleanup = PutObjectStagingCleanup {
+            set: self,
+            tmp_dir: &tmp_dir,
+            reservation: &cleanup_reservation,
+            runtime: None,
+        };
         let rollback_receipt = RenameRollbackReceipt::default();
+        let operation_first_poll_delay_started = rustfs_io_metrics::put_stage_timer();
         let operation = async {
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_OPERATION_FIRST_POLL_DELAY,
+                operation_first_poll_delay_started,
+            );
+            let operation_body_to_commit_submit_started = rustfs_io_metrics::put_stage_timer();
             let erasure = Arc::new(erasure_from_file_info(&fi, false)?);
 
             let put_object_size = known_put_object_storage_size(data.size());
@@ -4013,6 +4711,12 @@ impl SetDisks {
 
             drop(writers); // drop writers to close all files, this is to prevent FileAccessDenied errors when renaming data
 
+            // File creation, writes and integrity sidecars must finish before
+            // cancellation can remove staging without racing pending writers.
+            if !direct_inline_commit {
+                staging_cleanup.runtime = Some(tokio::runtime::Handle::current());
+            }
+
             if parity_blocks == 0 {
                 let written_size = i64::try_from(w_size).map_err(|_| Error::other("put_object written size overflows i64"))?;
                 let logical_shard_size = usize::try_from(erasure.shard_file_size(written_size))
@@ -4108,6 +4812,8 @@ impl SetDisks {
             }
             #[cfg(any(test, feature = "test-util"))]
             pause_put_object_commit(bucket, object, PutObjectCommitPause::AfterNamespace).await;
+            let namespace_lock_acquired_to_commit_ready_started = rustfs_io_metrics::put_stage_timer();
+            let commit_ready_precondition_and_timestamp_started = rustfs_io_metrics::put_stage_timer();
 
             if opts.http_preconditions.is_some()
                 && let Some(err) = self.check_write_precondition(bucket, object, opts).await
@@ -4128,8 +4834,13 @@ impl SetDisks {
                     }
                 }
             }
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_PRECONDITION_AND_TIMESTAMP,
+                commit_ready_precondition_and_timestamp_started,
+            );
 
             if let Some(expected) = opts.expected_current_version_id.as_deref() {
+                let expected_version_lookup_started = rustfs_io_metrics::put_stage_timer();
                 let current = self
                     .get_object_info(
                         bucket,
@@ -4152,11 +4863,16 @@ impl SetDisks {
                 if current.version_id.map(|version| version.to_string()).as_deref() != Some(expected) {
                     return Err(StorageError::PreconditionFailed);
                 }
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_EXPECTED_VERSION_LOOKUP,
+                    expected_version_lookup_started,
+                );
             }
 
             if let Some(version_id) = opts.version_id.as_deref()
                 && !is_meta_bucketname(bucket)
             {
+                let explicit_version_lookup_started = rustfs_io_metrics::put_stage_timer();
                 let current = self
                     .get_object_info(
                         bucket,
@@ -4209,13 +4925,23 @@ impl SetDisks {
                     Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
                     Err(err) => return Err(err),
                 }
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_EXPLICIT_VERSION_LOOKUP,
+                    explicit_version_lookup_started,
+                );
             }
 
+            let restore_verify_started = rustfs_io_metrics::put_stage_timer();
             self.require_current_restore_operation_id(bucket, object, opts, expected_restore_operation_id, "put_object_commit")
                 .await?;
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_RESTORE_VERIFY,
+                restore_verify_started,
+            );
 
             // Fence every commit-time read before entering rename_data. Once
             // rename_data returns Ok the write is durable and must not be aborted.
+            let fence_verify_started = rustfs_io_metrics::put_stage_timer();
             if object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                 || publication_commit_guard
                     .as_ref()
@@ -4259,6 +4985,7 @@ impl SetDisks {
                 });
             }
 
+            let decommission_capacity_fence_started = rustfs_io_metrics::put_stage_timer();
             if decommission_capacity_guard.is_none()
                 && let Some(store) = opts.decommission_capacity_admission.as_ref()
             {
@@ -4268,6 +4995,10 @@ impl SetDisks {
                         .await?,
                 );
             }
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_DECOMMISSION_CAPACITY_FENCE,
+                decommission_capacity_fence_started,
+            );
 
             // The object namespace is acquired above, after the input stream
             // has been fully staged. Only then admit the local publication
@@ -4285,21 +5016,36 @@ impl SetDisks {
                     achieved: 0,
                 });
             }
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_FENCE_VERIFY,
+                fence_verify_started,
+            );
 
             let transaction_fencing_proof = object_transaction_fencing_fleet_proof();
             if object_transaction_fencing_requested() && transaction_fencing_proof.is_none() {
                 return Err(Error::other("object transaction fencing requires a live fleet capability proof"));
             }
+            let transaction_epoch_fence_read_started = rustfs_io_metrics::put_stage_timer();
             let transaction_epoch_fence = if transaction_fencing_proof.is_some() {
                 Some(read_object_transaction_epoch_fence(self, bucket, object).await?)
             } else {
                 None
             };
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_TRANSACTION_EPOCH_FENCE_READ,
+                transaction_epoch_fence_read_started,
+            );
 
+            let quota_begin_started = rustfs_io_metrics::put_stage_timer();
             let quota_context = reservation::begin(&self.ctx, bucket, object, opts, self.pool_index, self.set_index).await?;
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_QUOTA_BEGIN,
+                quota_begin_started,
+            );
             let quota_mutation_fence = quota_context.is_enforced() || opts.quota_admission.is_some();
             let mut replication_quota_size = None;
 
+            let metadata_adjust_started = rustfs_io_metrics::put_stage_timer();
             if opts.replication_request {
                 if quota_context.is_enforced() && opts.preserve_ciphertext {
                     return Err(Error::PartMissingOrCorrupt);
@@ -4363,7 +5109,12 @@ impl SetDisks {
                     }
                 }
             }
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_METADATA_ADJUST,
+                metadata_adjust_started,
+            );
 
+            let quota_reserve_started = rustfs_io_metrics::put_stage_timer();
             let (quota_old_size, quota_new_size) = if quota_context.is_enforced() {
                 let new_size = match replication_quota_size {
                     Some(size) => size,
@@ -4381,8 +5132,13 @@ impl SetDisks {
                 (0, 0)
             };
             let quota_reservation = quota_context.reserve(quota_old_size, quota_new_size).await?;
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_QUOTA_RESERVE,
+                quota_reserve_started,
+            );
             let (commit_disks, quota_fence_tokens) = if quota_mutation_fence {
-                match Self::prepare_quota_mutation_fences(&shuffle_disks, bucket, object, write_quorum).await {
+                let quota_mutation_fence_prepare_started = rustfs_io_metrics::put_stage_timer();
+                let prepared = match Self::prepare_quota_mutation_fences(&shuffle_disks, bucket, object, write_quorum).await {
                     Ok((disks, tokens)) => {
                         for (metadata, token) in parts_metadatas.iter_mut().zip(tokens.iter().copied()) {
                             if let Some(token) = token {
@@ -4399,10 +5155,16 @@ impl SetDisks {
                         quota_reservation.abort().await;
                         return Err(err);
                     }
-                }
+                };
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_QUOTA_MUTATION_FENCE_PREPARE,
+                    quota_mutation_fence_prepare_started,
+                );
+                prepared
             } else {
                 (shuffle_disks.clone(), vec![None; shuffle_disks.len()])
             };
+            let commit_context_prepare_started = rustfs_io_metrics::put_stage_timer();
             let transaction_epoch =
                 transaction_epoch_fence.map(|_| assign_object_transaction_epoch(&commit_disks, &mut parts_metadatas));
 
@@ -4427,7 +5189,8 @@ impl SetDisks {
                 || commit_object_lock_guard.is_some()
                 || commit_decommission_object_lock_guard.is_some()
                 || commit_publication_guard.is_some();
-            let commit_allows_early_ack = write_context.allows_early_ack(opts.write_completion)
+            let commit_write_completion = opts.write_completion;
+            let commit_allows_early_ack = write_context.allows_early_ack(commit_write_completion)
                 && !(opts.data_movement && opts.has_decommission_capacity_reservation())
                 && commit_owns_namespace_guard
                 && commit_scanner_publication_scope.is_none();
@@ -4452,10 +5215,29 @@ impl SetDisks {
             let commit_tier_free_version_receipt_sink = opts.tier_free_version_receipt_sink.clone();
             let commit_skip_free_version = opts.skip_free_version;
             let request_cancellation = operation_cancellation.clone();
+            let commit_cleanup_reservation = cleanup_reservation.clone();
             tmp_cleanup_owned = true;
+            // No await separates this handoff from starting the commit owner.
+            // Its rollback rules, not request Drop, now decide what to retain.
+            staging_cleanup.runtime = None;
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_READY_CONTEXT_PREPARE,
+                commit_context_prepare_started,
+            );
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_ACQUIRED_TO_COMMIT_READY,
+                namespace_lock_acquired_to_commit_ready_started,
+            );
 
-            let commit = move |cancellation: Option<CancellationToken>| async move {
+            let commit = move |commit_submit_to_closure_enter_started: Option<Instant>,
+                               cancellation: Option<CancellationToken>| async move {
                 let write_context = write_context;
+                let commit_closure_total_started = rustfs_io_metrics::put_stage_timer();
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_SUBMIT_TO_CLOSURE_ENTER,
+                    commit_submit_to_closure_enter_started,
+                );
+                let commit_closure_enter_to_first_await_started = rustfs_io_metrics::put_stage_timer();
                 let mut _object_lock_guard = commit_object_lock_guard;
                 let mut _decommission_object_lock_guard = commit_decommission_object_lock_guard;
                 let mut _publication_guard = commit_publication_guard;
@@ -4465,14 +5247,21 @@ impl SetDisks {
                 let mut _decommission_capacity_guard = commit_decommission_capacity_guard;
                 let mut quota_reservation = quota_reservation;
                 let rename_stage_start = Instant::now();
+                let commit_before_rename_started = rustfs_io_metrics::put_stage_timer();
+                let lock_held_pre_rename_prepare_started = rustfs_io_metrics::put_stage_timer();
                 let pre_rename = async {
                     #[cfg(any(test, feature = "test-util"))]
                     pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::AfterQuotaReservation).await;
+                    let quota_mark_commit_started = rustfs_io_metrics::put_stage_timer();
                     quota_reservation.mark_commit_started().await?;
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_QUOTA_MARK_COMMIT_STARTED,
+                        quota_mark_commit_started,
+                    );
                     #[cfg(any(test, feature = "test-util"))]
                     pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::BeforeQuotaRename).await;
+                    let first_fence_check_started = rustfs_io_metrics::put_stage_timer();
                     if quota_reservation.is_lock_lost()
-                        || !quota_reservation.capability_proof_matches()
                         || write_context.is_lock_lost()
                         || _artifact_put_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                         || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
@@ -4501,6 +5290,10 @@ impl SetDisks {
                             achieved: 0,
                         });
                     }
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_FIRST_FENCE_CHECK,
+                        first_fence_check_started,
+                    );
                     let restore_opts = ObjectOptions {
                         version_id: commit_version_id.clone(),
                         versioned: commit_versioned,
@@ -4508,6 +5301,7 @@ impl SetDisks {
                         no_lock: true,
                         ..Default::default()
                     };
+                    let restore_verify_started = rustfs_io_metrics::put_stage_timer();
                     commit_set
                         .require_current_restore_operation_id(
                             &commit_bucket,
@@ -4517,6 +5311,10 @@ impl SetDisks {
                             "put_object_quota_reservation",
                         )
                         .await?;
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_RESTORE_VERIFY,
+                        restore_verify_started,
+                    );
                     if let Some(proof) = transaction_fencing_proof.as_ref()
                         && !object_transaction_fencing_fleet_proof_matches(proof)
                     {
@@ -4530,10 +5328,15 @@ impl SetDisks {
                             PutObjectCommitPause::BeforeTransactionEpochVerify,
                         )
                         .await;
+                        let transaction_fence_verify_started = rustfs_io_metrics::put_stage_timer();
                         verify_object_transaction_epoch_fence(&commit_set, &commit_bucket, &commit_object, expected).await?;
+                        rustfs_io_metrics::record_put_object_stage_duration_from(
+                            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_TRANSACTION_FENCE_VERIFY,
+                            transaction_fence_verify_started,
+                        );
                     }
+                    let second_fence_check_started = rustfs_io_metrics::put_stage_timer();
                     if quota_reservation.is_lock_lost()
-                        || !quota_reservation.capability_proof_matches()
                         || write_context.is_lock_lost()
                         || _artifact_put_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                         || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
@@ -4562,11 +5365,20 @@ impl SetDisks {
                             achieved: 0,
                         });
                     }
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_SECOND_FENCE_CHECK,
+                        second_fence_check_started,
+                    );
                     Ok(())
                 };
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_ENTER_TO_FIRST_AWAIT,
+                    commit_closure_enter_to_first_await_started,
+                );
+                let pre_rename_await_total_started = rustfs_io_metrics::put_stage_timer();
                 let mut pre_rename_result = if cancellation.is_some() || request_cancellation.is_some() {
                     tokio::select! {
-                        biased;
+                            biased;
                         _ = wait_for_put_object_commit_cancellation(cancellation.as_ref(), request_cancellation.as_ref()) => {
                             Err(StorageError::OperationCanceled)
                         },
@@ -4575,6 +5387,12 @@ impl SetDisks {
                 } else {
                     pre_rename.await
                 };
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_AWAIT_TOTAL,
+                    pre_rename_await_total_started,
+                );
+                let pre_rename_post_await_to_rename_started = rustfs_io_metrics::put_stage_timer();
+                let scanner_scope_check_started = rustfs_io_metrics::put_stage_timer();
                 if pre_rename_result.is_ok()
                     && let Some(scope) = commit_scanner_publication_scope.as_ref()
                     && let Err(err) = scope.try_begin()
@@ -4589,6 +5407,10 @@ impl SetDisks {
                     let _ = scope.mark_indeterminate();
                     pre_rename_result = Err(StorageError::OperationCanceled);
                 }
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_SCANNER_SCOPE_CHECK,
+                    scanner_scope_check_started,
+                );
                 if let Err(err) = pre_rename_result {
                     SetDisks::abort_quota_reservation_after_fence(
                         quota_reservation,
@@ -4600,7 +5422,10 @@ impl SetDisks {
                         quota_mutation_fence,
                     )
                     .await;
-                    if let Err(cleanup_err) = commit_set.delete_all(RUSTFS_META_TMP_BUCKET, &commit_tmp_dir).await {
+                    if let Err(cleanup_err) = commit_set
+                        .delete_put_tmp_with_budget(&commit_tmp_dir, &commit_cleanup_reservation)
+                        .await
+                    {
                         warn!(tmp_dir = %commit_tmp_dir, error = ?cleanup_err, "failed to cleanup put_object temporary data");
                     } else if issue3031_diag_enabled() {
                         warn!(
@@ -4613,43 +5438,76 @@ impl SetDisks {
                     }
                     return Err(err);
                 }
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_PRE_RENAME_PREPARE,
+                    lock_held_pre_rename_prepare_started,
+                );
 
-                let put_tier_free_version_source =
-                    if commit_put_tier_free_version_id.is_some() && commit_tier_free_version_receipt_sink.is_some() {
-                        match commit_set
-                            .get_object_info(
-                                &commit_bucket,
-                                &commit_object,
-                                &ObjectOptions {
-                                    no_lock: true,
-                                    metadata_cache_safe: false,
-                                    versioned: commit_versioned,
-                                    version_suspended: commit_version_suspended,
-                                    ..Default::default()
-                                },
-                            )
-                            .await
-                        {
-                            Ok(source) => Some(source),
-                            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => None,
-                            Err(err) => {
-                                debug!(
-                                    event = EVENT_LIFECYCLE_TRANSITIONED_DELETE_CLEANUP_OWNER,
-                                    component = LOG_COMPONENT_ECSTORE,
-                                    subsystem = LOG_SUBSYSTEM_SET_DISK,
-                                    bucket = %commit_bucket,
-                                    object = %commit_object,
-                                    error = ?err,
-                                    "Skipped opportunistic tier free-version receipt source capture"
-                                );
-                                None
-                            }
+                let tier_free_version_source_lookup_started = rustfs_io_metrics::put_stage_timer();
+                let reuse_rename_data_source_for_tier_free_version = tier_free_version_source_reuse_rename_data_enabled()
+                    && (commit_set.tier_free_version_rename_data_source_capable()
+                        || tier_free_version_source_reuse_rename_data_assume_homogeneous_enabled());
+                let mut put_tier_free_version_source = if commit_put_tier_free_version_id.is_some()
+                    && commit_tier_free_version_receipt_sink.is_some()
+                    && !tier_free_version_source_lookup_counterfactual_skip_enabled()
+                    && !reuse_rename_data_source_for_tier_free_version
+                {
+                    #[cfg(feature = "diagnostic-read-version-caller")]
+                    crate::cluster::rpc::runtime_sources::observe_read_version_context_boundary(
+                        rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::TierFreeVersionSourceLookup,
+                    );
+                    match commit_set
+                        .get_object_info(
+                            &commit_bucket,
+                            &commit_object,
+                            &ObjectOptions {
+                                no_lock: true,
+                                metadata_cache_safe: false,
+                                versioned: commit_versioned,
+                                version_suspended: commit_version_suspended,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                    {
+                        Ok(source) => Some(source),
+                        Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => None,
+                        Err(err) => {
+                            debug!(
+                                event = EVENT_LIFECYCLE_TRANSITIONED_DELETE_CLEANUP_OWNER,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                                bucket = %commit_bucket,
+                                object = %commit_object,
+                                error = ?err,
+                                "Skipped opportunistic tier free-version receipt source capture"
+                            );
+                            None
                         }
-                    } else {
-                        None
-                    };
+                    }
+                } else {
+                    None
+                };
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_TIER_FREE_VERSION_SOURCE_LOOKUP,
+                    tier_free_version_source_lookup_started,
+                );
 
+                let assign_rename_indexes_started = rustfs_io_metrics::put_stage_timer();
                 Self::assign_rename_data_indexes(&mut parts_metadatas);
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_ASSIGN_RENAME_INDEXES,
+                    assign_rename_indexes_started,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_PRE_RENAME_POST_AWAIT_TO_RENAME,
+                    pre_rename_post_await_to_rename_started,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_BEFORE_RENAME,
+                    commit_before_rename_started,
+                );
+                let lock_held_rename_started = rustfs_io_metrics::put_stage_timer();
                 let mut rename_result = SetDisks::rename_data_owned_with_fence(
                     &commit_disks,
                     (RUSTFS_META_TMP_BUCKET, commit_tmp_dir.as_str()),
@@ -4676,6 +5534,12 @@ impl SetDisks {
                     })),
                 )
                 .await;
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_RENAME,
+                    lock_held_rename_started,
+                );
+                let commit_after_rename_to_return_started = rustfs_io_metrics::put_stage_timer();
+                let lock_held_rename_result_to_tail_handoff_started = rustfs_io_metrics::put_stage_timer();
                 if let Some(scope) = commit_scanner_publication_scope.as_ref() {
                     if rename_result.is_ok() {
                         let _ = scope.mark_committed();
@@ -4690,7 +5554,15 @@ impl SetDisks {
                 let mut rename_guard_release = None;
                 let mut needs_immediate_heal = false;
                 let mut tail_owns_tmp_cleanup = false;
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_RENAME_RESULT_TO_TAIL_HANDOFF,
+                    lock_held_rename_result_to_tail_handoff_started,
+                );
+                let lock_held_tail_handoff_started = rustfs_io_metrics::put_stage_timer();
                 if let Ok(rename_commit) = rename_result.as_mut() {
+                    commit_set.observe_tier_free_version_rename_data_source_capability(
+                        rename_commit.tail_drain.is_none() && rename_commit.old_current_source_all_successful_checked,
+                    );
                     commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, &rename_commit.capacity_disks);
                     // Install the tail watcher before any post-commit await. The
                     // latch keeps namespace guards through their prior handoff point.
@@ -4727,6 +5599,7 @@ impl SetDisks {
                         let fence_object = commit_object.clone();
                         let (guard_release_tx, guard_release_rx) = tokio::sync::oneshot::channel();
                         rename_guard_release = Some(guard_release_tx);
+                        let cleanup_reservation = commit_cleanup_reservation.clone();
                         tokio::spawn(finish_rename_tail_heal(
                             rename_tail_drain,
                             guard_release_rx,
@@ -4763,38 +5636,74 @@ impl SetDisks {
                                 decommission_object_lock_guard,
                                 decommission_capacity_guard,
                             ),
-                                  targets| async move {
+                                  targets| {
                                 drop(object_lock_guard);
                                 drop(write_context);
                                 drop(publication_guard);
-                                cleanup_set
-                                    .cleanup_rename_tail(
-                                        targets,
-                                        &cleanup_bucket,
-                                        &cleanup_object,
-                                        committed_data_dir,
-                                        transaction_epoch,
-                                    )
-                                    .await;
-                                if let Err(err) = cleanup_set.delete_all(RUSTFS_META_TMP_BUCKET, &cleanup_tmp_dir).await {
-                                    warn!(tmp_dir = %cleanup_tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
-                                } else if issue3031_diag_enabled() {
-                                    warn!(
-                                        target: "rustfs_ecstore::set_disk",
-                                        tmp_dir = %cleanup_tmp_dir,
-                                        "issue3031_put_object_tmp_cleanup_done"
+                                cleanup_runtime::run(cleanup_reservation, async move {
+                                    let zero_target_cleanup = targets.is_empty();
+                                    rustfs_io_metrics::record_put_object_stage_duration(
+                                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TARGET_COUNT,
+                                        targets.len() as f64,
                                     );
-                                }
-                                drop(decommission_object_lock_guard);
-                                drop(decommission_capacity_guard);
-                                drop(artifact_put_guard);
-                                drop(bucket_lifecycle_guard);
-                                drop(lifecycle_snapshot);
+                                    if zero_target_cleanup {
+                                        rustfs_io_metrics::record_put_object_stage_duration(
+                                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_ZERO_TARGET,
+                                            1.0,
+                                        );
+                                    }
+                                    cleanup_set
+                                        .cleanup_rename_tail(
+                                            targets,
+                                            &cleanup_bucket,
+                                            &cleanup_object,
+                                            committed_data_dir,
+                                            transaction_epoch,
+                                        )
+                                        .await;
+                                    let tmp_delete_started = rustfs_io_metrics::put_stage_timer();
+                                    if zero_target_cleanup && rename_tail_cleanup_zero_target_tmp_delete_skip_enabled() {
+                                        rustfs_io_metrics::record_put_object_stage_duration(
+                                            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TMP_DELETE_COUNTERFACTUAL_SKIP,
+                                            1.0,
+                                        );
+                                    } else if let Err(err) =
+                                        cleanup_set.delete_all(RUSTFS_META_TMP_BUCKET, &cleanup_tmp_dir).await
+                                    {
+                                        warn!(tmp_dir = %cleanup_tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
+                                    } else if issue3031_diag_enabled() {
+                                        warn!(
+                                            target: "rustfs_ecstore::set_disk",
+                                            tmp_dir = %cleanup_tmp_dir,
+                                            "issue3031_put_object_tmp_cleanup_done"
+                                        );
+                                    }
+                                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TMP_DELETE,
+                                        tmp_delete_started,
+                                    );
+                                    let guard_drop_started = rustfs_io_metrics::put_stage_timer();
+                                    drop(decommission_object_lock_guard);
+                                    drop(decommission_capacity_guard);
+                                    drop(artifact_put_guard);
+                                    drop(bucket_lifecycle_guard);
+                                    drop(lifecycle_snapshot);
+                                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                                        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_DECOMMISSION_GUARD_DROP,
+                                        guard_drop_started,
+                                    );
+                                })
                             },
-                            |request| async move { heal_set.submit_rename_tail_heal(request).await },
+                            move |request| async move {
+                                let _ = heal_set.submit_rename_tail_heal(request, commit_write_completion).await;
+                            },
                         ));
                     }
                 }
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_TAIL_HANDOFF,
+                    lock_held_tail_handoff_started,
+                );
                 if !tail_owns_tmp_cleanup {
                     drop(_decommission_capacity_guard.take());
                 }
@@ -4803,6 +5712,11 @@ impl SetDisks {
                     pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::AfterRenameHandoff).await;
                 }
                 if quota_mutation_fence && !tail_owns_tmp_cleanup {
+                    rustfs_io_metrics::record_put_object_stage_duration(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_QUOTA_FENCE_RELEASE_TRIGGERED,
+                        1.0,
+                    );
+                    let quota_fence_release_started = rustfs_io_metrics::put_stage_timer();
                     let _ = SetDisks::release_quota_mutation_fences(
                         &commit_disks,
                         &quota_fence_tokens,
@@ -4811,9 +5725,23 @@ impl SetDisks {
                         write_quorum,
                     )
                     .await;
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_QUOTA_FENCE_RELEASE,
+                        quota_fence_release_started,
+                    );
+                } else {
+                    rustfs_io_metrics::record_put_object_stage_duration(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_QUOTA_FENCE_RELEASE_SKIPPED,
+                        1.0,
+                    );
                 }
                 if rename_result.is_ok() {
+                    let quota_commit_started = rustfs_io_metrics::put_stage_timer();
                     quota_reservation.commit().await;
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_QUOTA_COMMIT,
+                        quota_commit_started,
+                    );
                 }
                 let rename_commit = match rename_result {
                     Ok(commit) => commit,
@@ -4823,7 +5751,10 @@ impl SetDisks {
                             // rollback backup for recovery; cleanup is unsafe.
                             return Err(err.into());
                         }
-                        if let Err(cleanup_err) = commit_set.delete_all(RUSTFS_META_TMP_BUCKET, &commit_tmp_dir).await {
+                        if let Err(cleanup_err) = commit_set
+                            .delete_put_tmp_with_budget(&commit_tmp_dir, &commit_cleanup_reservation)
+                            .await
+                        {
                             warn!(tmp_dir = %commit_tmp_dir, error = ?cleanup_err, "failed to cleanup put_object temporary data");
                         } else if issue3031_diag_enabled() {
                             warn!(
@@ -4841,7 +5772,17 @@ impl SetDisks {
                 let op_old_dir = rename_commit.data_dir;
                 let cleanup_disks = rename_commit.cleanup_disks;
                 let old_current_size = rename_commit.old_current_size;
+                if put_tier_free_version_source.is_none()
+                    && reuse_rename_data_source_for_tier_free_version
+                    && rename_commit.old_current_source_checked
+                {
+                    put_tier_free_version_source = rename_commit
+                        .old_current_source
+                        .as_ref()
+                        .map(|source| build_get_object_info(source, &commit_bucket, &commit_object, commit_versioned));
+                }
                 let mut fi = rename_commit.committed_file_info;
+                let lock_held_post_rename_started = rustfs_io_metrics::put_stage_timer();
                 if let (Some(source), Some(free_version_id)) =
                     (put_tier_free_version_source.as_ref(), commit_put_tier_free_version_id)
                     && transitioned_delete_publishes_free_version(source, &fi, commit_skip_free_version)
@@ -4856,7 +5797,12 @@ impl SetDisks {
                     );
                 }
 
-                if needs_immediate_heal {
+                let repair_result = if needs_immediate_heal {
+                    rustfs_io_metrics::record_put_object_stage_duration(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_HEAL_SUBMIT_TRIGGERED,
+                        1.0,
+                    );
+                    let heal_submit_started = rustfs_io_metrics::put_stage_timer();
                     let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
                         commit_bucket.clone(),
                         Some(commit_object.clone()),
@@ -4869,29 +5815,86 @@ impl SetDisks {
                         .or_else(|| commit_version_suspended.then(Uuid::nil))
                         .map(|version_id| version_id.to_string());
                     request.expected_bucket_incarnation_id = source_bucket_incarnation_id;
-                    commit_set.submit_rename_tail_heal(request).await;
-                }
+                    let result = commit_set.submit_rename_tail_heal(request, commit_write_completion).await;
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_HEAL_SUBMIT,
+                        heal_submit_started,
+                    );
+                    result
+                } else {
+                    rustfs_io_metrics::record_put_object_stage_duration(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_HEAL_SUBMIT_SKIPPED,
+                        1.0,
+                    );
+                    Ok(())
+                };
 
                 let rename_stage_elapsed = rename_stage_start.elapsed();
                 let rename_stage_ms = rename_stage_elapsed.as_millis() as u64;
 
-                if let Some(old_dir) = op_old_dir {
-                    commit_set
-                        .persist_old_data_cleanup_receipts(
-                            &cleanup_disks,
-                            &commit_bucket,
-                            &commit_object,
-                            old_dir,
-                            committed_data_dir,
-                            transaction_epoch,
-                        )
+                if let Some(old_dir) = op_old_dir
+                    && Self::needs_old_data_cleanup_receipt(old_dir, committed_data_dir, transaction_epoch)
+                {
+                    rustfs_io_metrics::record_put_object_stage_duration(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_CLEANUP_RECEIPT_TRIGGERED,
+                        1.0,
+                    );
+                    let cleanup_receipt_started = rustfs_io_metrics::put_stage_timer();
+                    if commit_cleanup_reservation.is_none() {
+                        commit_set
+                            .persist_old_data_cleanup_receipts(
+                                &cleanup_disks,
+                                &commit_bucket,
+                                &commit_object,
+                                old_dir,
+                                committed_data_dir,
+                                transaction_epoch,
+                            )
+                            .await;
+                    } else {
+                        let cleanup_set = commit_set.clone();
+                        let receipt_disks = cleanup_disks.clone();
+                        let receipt_bucket = commit_bucket.clone();
+                        let receipt_object = commit_object.clone();
+                        cleanup_runtime::run(commit_cleanup_reservation.clone(), async move {
+                            cleanup_set
+                                .persist_old_data_cleanup_receipts(
+                                    &receipt_disks,
+                                    &receipt_bucket,
+                                    &receipt_object,
+                                    old_dir,
+                                    committed_data_dir,
+                                    transaction_epoch,
+                                )
+                                .await;
+                        })
                         .await;
+                    }
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_CLEANUP_RECEIPT,
+                        cleanup_receipt_started,
+                    );
+                } else {
+                    rustfs_io_metrics::record_put_object_stage_duration(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_CLEANUP_RECEIPT_SKIPPED,
+                        1.0,
+                    );
                 }
 
+                let metadata_invalidate_started = rustfs_io_metrics::put_stage_timer();
                 commit_set
                     .invalidate_get_object_metadata_cache(&commit_bucket, &commit_object)
                     .await;
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_METADATA_INVALIDATE,
+                    metadata_invalidate_started,
+                );
 
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_POST_RENAME,
+                    lock_held_post_rename_started,
+                );
+                let lock_held_guard_release_started = rustfs_io_metrics::put_stage_timer();
                 if let Some(release) = rename_guard_release.take() {
                     let _ = release.send(true);
                 }
@@ -4900,6 +5903,10 @@ impl SetDisks {
                 drop(_object_lock_guard.take());
                 drop(_publication_guard.take());
                 drop(_bucket_lifecycle_guard.take());
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_GUARD_RELEASE,
+                    lock_held_guard_release_started,
+                );
 
                 rustfs_io_metrics::record_put_object_stage_duration("set_disk_rename", duration_millis_f64(rename_stage_elapsed));
                 if (rename_stage_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
@@ -4927,16 +5934,41 @@ impl SetDisks {
                     // here must not negate an already-committed, durable write, so we
                     // deliberately do NOT `?`-propagate it into a 503. On residue the
                     // report path emits the leak metric and enqueues a heal.
-                    let cleanup = commit_set
-                        .commit_rename_data_dir_and_mark_capacity(
-                            &cleanup_disks,
-                            &commit_bucket,
-                            &commit_object,
-                            &old_dir.to_string(),
-                            &committed_dir,
-                            write_quorum,
-                        )
+                    if commit_cleanup_reservation.is_none() {
+                        let cleanup = commit_set
+                            .commit_rename_data_dir_and_mark_capacity(
+                                &cleanup_disks,
+                                &commit_bucket,
+                                &commit_object,
+                                &old_dir.to_string(),
+                                &committed_dir,
+                                write_quorum,
+                            )
+                            .await;
+                        commit_set
+                            .report_old_data_dir_cleanup(&commit_bucket, &commit_object, &old_dir.to_string(), &cleanup)
+                            .await;
+                    } else {
+                        let cleanup_set = commit_set.clone();
+                        let cleanup_bucket = commit_bucket.clone();
+                        let cleanup_object = commit_object.clone();
+                        cleanup_runtime::run(commit_cleanup_reservation.clone(), async move {
+                            let cleanup = cleanup_set
+                                .commit_rename_data_dir_and_mark_capacity(
+                                    &cleanup_disks,
+                                    &cleanup_bucket,
+                                    &cleanup_object,
+                                    &old_dir.to_string(),
+                                    &committed_dir,
+                                    write_quorum,
+                                )
+                                .await;
+                            cleanup_set
+                                .report_old_data_dir_cleanup(&cleanup_bucket, &cleanup_object, &old_dir.to_string(), &cleanup)
+                                .await;
+                        })
                         .await;
+                    }
                     let cleanup_elapsed = cleanup_stage_start.elapsed();
                     let cleanup_ms = cleanup_elapsed.as_millis() as u64;
                     cleanup_stage_ms = Some(cleanup_ms);
@@ -4944,9 +5976,6 @@ impl SetDisks {
                         "set_disk_old_data_cleanup",
                         duration_millis_f64(cleanup_elapsed),
                     );
-                    commit_set
-                        .report_old_data_dir_cleanup(&commit_bucket, &commit_object, &old_dir.to_string(), &cleanup)
-                        .await;
                     if (cleanup_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
                         warn!(
                             event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
@@ -5008,6 +6037,7 @@ impl SetDisks {
                         event = EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY,
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        result = if repair_result.is_ok() { "success" } else { "repair_required" },
                         bucket = %commit_bucket,
                         object = %commit_object,
                         write_quorum,
@@ -5018,7 +6048,6 @@ impl SetDisks {
                         cleanup_ms = cleanup_stage_ms.unwrap_or_default(),
                         cleanup_present = cleanup_stage_ms.is_some(),
                         commit_tail_ms = total_commit_tail_ms as u64,
-                        result = "success",
                         "SetDisk put_object stage summary"
                     );
                 }
@@ -5026,7 +6055,7 @@ impl SetDisks {
                 if !tail_owns_tmp_cleanup {
                     let cleanup_set = commit_set.clone();
                     let cleanup_tmp_dir = commit_tmp_dir.clone();
-                    tokio::spawn(async move {
+                    cleanup_runtime::spawn(commit_cleanup_reservation.clone(), async move {
                         if let Err(err) = cleanup_set.delete_all(RUSTFS_META_TMP_BUCKET, &cleanup_tmp_dir).await {
                             warn!(tmp_dir = %cleanup_tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
                         } else if issue3031_diag_enabled() {
@@ -5039,15 +6068,38 @@ impl SetDisks {
                     });
                 }
 
-                Ok((
-                    ObjectInfo::from_file_info(&fi, &commit_bucket, &commit_object, commit_is_versioned),
-                    old_current_size,
-                ))
+                let completion = repair_result.map(|()| {
+                    let object_info_build_started = rustfs_io_metrics::put_stage_timer();
+                    let object_info = ObjectInfo::from_file_info(&fi, &commit_bucket, &commit_object, commit_is_versioned);
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_OBJECT_INFO_BUILD,
+                        object_info_build_started,
+                    );
+                    let post_object_info_to_return_started = rustfs_io_metrics::put_stage_timer();
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_NAMESPACE_LOCK_HELD_POST_OBJECT_INFO_TO_RETURN,
+                        post_object_info_to_return_started,
+                    );
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_AFTER_RENAME_TO_RETURN,
+                        commit_after_rename_to_return_started,
+                    );
+                    rustfs_io_metrics::record_put_object_stage_duration_from(
+                        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_CLOSURE_TOTAL,
+                        commit_closure_total_started,
+                    );
+                    (object_info, old_current_size)
+                });
+                Ok(CommittedPutOutcome { completion })
             };
 
             if let Some(handoff) = commit_cancellation_handoff_tx.take() {
                 let _ = handoff.send(());
             }
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_OPERATION_BODY_TO_COMMIT_SUBMIT,
+                operation_body_to_commit_submit_started,
+            );
             if detach_commit_owner {
                 if let Some(scope_outcome_guard) = scope_outcome_guard.as_mut() {
                     // The spawned commit closure owns the scope clone and is
@@ -5056,17 +6108,53 @@ impl SetDisks {
                 }
                 let mut cancellation = PutObjectCommitCancellation::new();
                 let child_token = cancellation.child_token();
-                let result = tokio::spawn(async move { Box::pin(commit(Some(child_token))).await })
-                    .await
-                    .map_err(|err| Error::other(format!("put_object commit task failed: {err}")))?;
+                let commit_task_wait_started = rustfs_io_metrics::put_stage_timer();
+                let commit_submit_to_closure_enter_started = rustfs_io_metrics::put_stage_timer();
+                #[cfg(feature = "diagnostic-read-version-caller")]
+                let diagnostic_context = crate::cluster::rpc::runtime_sources::ReadVersionDiagnosticContext::capture_entry(
+                    rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::PutCommitOwner,
+                );
+                let result = tokio::spawn(async move {
+                    let commit = Box::pin(commit(commit_submit_to_closure_enter_started, Some(child_token)));
+                    #[cfg(feature = "diagnostic-read-version-caller")]
+                    return crate::cluster::rpc::runtime_sources::with_read_version_diagnostic_context(
+                        diagnostic_context,
+                        rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::PutCommitOwner,
+                        commit,
+                    )
+                    .await;
+                    #[cfg(not(feature = "diagnostic-read-version-caller"))]
+                    commit.await
+                })
+                .await
+                .map_err(|err| Error::other(format!("put_object commit task failed: {err}")))?;
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_TASK_WAIT,
+                    commit_task_wait_started,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_FUTURE_TOTAL,
+                    commit_task_wait_started,
+                );
                 cancellation.disarm();
                 result
             } else {
-                Box::pin(commit(None)).await
+                let commit_task_wait_started = rustfs_io_metrics::put_stage_timer();
+                let commit_submit_to_closure_enter_started = rustfs_io_metrics::put_stage_timer();
+                let result = Box::pin(commit(commit_submit_to_closure_enter_started, None)).await;
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_TASK_WAIT,
+                    commit_task_wait_started,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_FUTURE_TOTAL,
+                    commit_task_wait_started,
+                );
+                result
             }
         };
-        let result: Result<(ObjectInfo, Option<OldCurrentSize>)> = if let Some((cancellation, mut handoff_rx)) = cancellation_wait
-        {
+        let operation_select_wait_started = rustfs_io_metrics::put_stage_timer();
+        let result: Result<CommittedPutOutcome> = if let Some((cancellation, mut handoff_rx)) = cancellation_wait {
             tokio::pin!(operation);
             tokio::select! {
                 biased;
@@ -5077,27 +6165,22 @@ impl SetDisks {
         } else {
             operation.await
         };
-
-        if issue3031_diag_enabled()
-            && let Err(err) = &result
-        {
-            let stage_hint = if err.to_string().contains("not enough disks to write") {
-                "writer_setup_or_quorum"
-            } else {
-                "unknown"
-            };
-            warn!(
-                event = EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_SET_DISK,
-                bucket = %bucket,
-                object = %object,
-                result = "error",
-                stage_hint,
-                error = %err,
-                "SetDisk put_object stage summary"
-            );
-        }
+        // Normal completion keeps the existing cleanup/error semantics below.
+        staging_cleanup.runtime = None;
+        drop(staging_cleanup);
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_COMMIT_OPERATION_SELECT_WAIT,
+            operation_select_wait_started,
+        );
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_OPERATION_AWAIT_TOTAL,
+            operation_select_wait_started,
+        );
+        let operation_result_return_started = rustfs_io_metrics::put_stage_timer();
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_OPERATION_RESULT_RETURN,
+            operation_result_return_started,
+        );
 
         if issue3031_diag_enabled() {
             warn!(
@@ -5124,7 +6207,7 @@ impl SetDisks {
             // entry is reclaimed by cleanup_stale_tmp_objects (24h expiry,
             // 5-minute background loop).
             let set_disks = self.clone();
-            tokio::spawn(async move {
+            cleanup_runtime::spawn(cleanup_reservation.clone(), async move {
                 if let Err(err) = set_disks.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await {
                     warn!(tmp_dir = %tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
                 } else if issue3031_diag_enabled() {
@@ -5139,7 +6222,7 @@ impl SetDisks {
             // Failure path (quorum loss / rollback): keep the cleanup inline so
             // a failed PUT never returns while its tmp shards are still on disk
             // (state-residue hardening tracked by backlog#864 / backlog#898).
-            if let Err(err) = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_dir).await {
+            if let Err(err) = self.delete_put_tmp_with_budget(&tmp_dir, &cleanup_reservation).await {
                 warn!(tmp_dir = %tmp_dir, error = ?err, "failed to cleanup put_object temporary data");
             } else if issue3031_diag_enabled() {
                 warn!(
@@ -5150,6 +6233,29 @@ impl SetDisks {
                     "issue3031_put_object_tmp_cleanup_done"
                 );
             }
+        }
+
+        let result = result.and_then(|committed| committed.completion);
+
+        if issue3031_diag_enabled()
+            && let Err(err) = &result
+        {
+            let stage_hint = if err.to_string().contains("not enough disks to write") {
+                "writer_setup_or_quorum"
+            } else {
+                "unknown"
+            };
+            warn!(
+                event = EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                result = "error",
+                bucket = %bucket,
+                object = %object,
+                stage_hint,
+                error = %err,
+                "SetDisk put_object stage summary"
+            );
         }
 
         result
@@ -7703,7 +8809,7 @@ impl SetDisks {
                 &delete_request,
                 false,
                 None,
-                opts.expected_bucket_incarnation_id,
+                DeleteCommitContext::request(opts, None),
             )
             .await?;
             if let Some((_, deleted_object)) = replication_delete {
@@ -7777,27 +8883,6 @@ impl SetDisks {
 
         Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
     }
-    #[tracing::instrument(skip(self, delete_marker_purge))]
-    async fn delete_object_version_with_purge(
-        &self,
-        bucket: &str,
-        object: &str,
-        fi: &FileInfo,
-        force_del_marker: bool,
-        delete_marker_purge: Option<MrfDeleteMarkerPurge>,
-        source_bucket_incarnation_id: Option<Uuid>,
-    ) -> Result<()> {
-        self.delete_object_version_with_purge_owned(
-            bucket,
-            object,
-            fi,
-            force_del_marker,
-            delete_marker_purge,
-            (source_bucket_incarnation_id, None),
-        )
-        .await
-    }
-
     async fn delete_object_version_with_purge_owned(
         &self,
         bucket: &str,
@@ -7807,18 +8892,76 @@ impl SetDisks {
         delete_marker_purge: Option<MrfDeleteMarkerPurge>,
         publication: (Option<Uuid>, Option<Arc<dyn Send + Sync>>),
     ) -> Result<()> {
-        let (source_bucket_incarnation_id, lifecycle_owner) = publication;
+        let opts = ObjectOptions {
+            expected_bucket_incarnation_id: publication.0,
+            delete_mutation_owner: publication.1,
+            ..Default::default()
+        };
+        self.delete_object_version_with_purge(
+            bucket,
+            object,
+            fi,
+            force_del_marker,
+            delete_marker_purge,
+            DeleteCommitContext::request(&opts, None),
+        )
+        .await
+    }
+
+    #[tracing::instrument(skip(self, delete_marker_purge, commit_context))]
+    async fn delete_object_version_with_purge(
+        &self,
+        bucket: &str,
+        object: &str,
+        fi: &FileInfo,
+        force_del_marker: bool,
+        delete_marker_purge: Option<MrfDeleteMarkerPurge>,
+        commit_context: DeleteCommitContext<'_>,
+    ) -> Result<()> {
+        let source_bucket_incarnation_id = commit_context.incarnation;
         let transported = delete_file_info_with_replication_transport_metadata(fi);
         let fi = &transported;
         let disks = self.disk_inventory().await;
-        let namespace_owner = (!is_meta_bucketname(bucket))
-            .then(|| Arc::new((self.ctx.begin_namespace_commit(), lifecycle_owner)) as Arc<dyn Send + Sync>);
+        let namespace_owner = (!is_meta_bucketname(bucket)).then(|| {
+            Arc::new((
+                self.ctx.begin_namespace_commit(),
+                commit_context.guard.clone(),
+                commit_context
+                    .options
+                    .and_then(|options| options.object_lock_config_snapshot.clone()),
+                commit_context
+                    .options
+                    .and_then(|options| options.bucket_incarnation_fence.clone()),
+                commit_context
+                    .options
+                    .and_then(|options| options.scanner_publication_commit_scope.clone()),
+                commit_context.options.and_then(|options| options.write_lock_context.clone()),
+                commit_context
+                    .options
+                    .and_then(|options| options.delete_mutation_owner.clone()),
+            )) as Arc<dyn Send + Sync>
+        });
         // Quorum is a property of the configured set, not of the current
         // online snapshot. A decommission/offline refresh may temporarily
         // shorten the snapshot; deriving quorum from it would turn a
         // quorum-minus-one delete into an apparent success.
         let write_quorum = self.set_drive_count / 2 + 1;
         let rollback_dir = Uuid::new_v4();
+        // Register before preparation: cancellation and response loss can
+        // leave a durable journal even when publication never returns.
+        let recovery_ticket = (!is_meta_bucketname(bucket))
+            .then(|| {
+                self.ctx
+                    .delete_recovery_hints()
+                    .register(crate::store::delete_recovery_runtime::DeleteRecoveryKey {
+                        pool: self.pool_index,
+                        set: self.set_index,
+                        bucket: bucket.to_owned(),
+                        object: object.to_owned(),
+                        incarnation: source_bucket_incarnation_id,
+                    })
+            })
+            .flatten();
 
         let mut futures = Vec::with_capacity(disks.len());
         let mut errs = Vec::with_capacity(disks.len());
@@ -7827,20 +8970,33 @@ impl SetDisks {
             let disk_namespace_owner = namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>);
             futures.push(async move {
                 if let Some(disk) = disk {
-                    match disk
-                        .delete_version_with_namespace_owner(
+                    let options = DeleteOptions {
+                        old_data_dir: Some(rollback_dir),
+                        delete_recovery_bucket_incarnation: source_bucket_incarnation_id,
+                        ..Default::default()
+                    };
+                    let result = if is_meta_bucketname(bucket) {
+                        disk.delete_version_with_namespace_owner(
                             bucket,
                             object,
                             fi.clone(),
                             force_del_marker,
-                            DeleteOptions {
-                                old_data_dir: Some(rollback_dir),
-                                ..Default::default()
-                            },
+                            options,
                             disk_namespace_owner,
                         )
                         .await
-                    {
+                    } else {
+                        disk.delete_version_recoverable_with_namespace_owner(
+                            bucket,
+                            object,
+                            fi.clone(),
+                            force_del_marker,
+                            options,
+                            disk_namespace_owner,
+                        )
+                        .await
+                    };
+                    match result {
                         Ok(r) => Ok(r),
                         Err(e) => Err(e),
                     }
@@ -7862,12 +9018,35 @@ impl SetDisks {
             }
         }
 
-        let quorum_result = resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object);
+        let mut quorum_result = resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object);
+        if !is_meta_bucketname(bucket) && errs.iter().flatten().any(super::delete_recovery::unsupported_recovery) {
+            quorum_result = Err(DiskError::UnsupportedDisk.into());
+        }
         let should_rollback = quorum_result.is_err();
+        let structured_cleanup = !is_meta_bucketname(bucket) && !should_rollback;
+        if structured_cleanup {
+            self.publish_delete_commit(
+                bucket,
+                object,
+                rollback_dir,
+                &disks,
+                write_quorum,
+                DeleteRecoveryContext {
+                    recovery_ticket,
+                    namespace_owner: namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>),
+                    ..DeleteRecoveryContext::new(source_bucket_incarnation_id, &|| commit_context.can_commit(bucket, object))
+                },
+            )
+            .await
+            .map_err(StorageError::from)?;
+        }
         #[cfg(test)]
         pause_delete_before_cleanup(bucket).await;
         let mut rollback_futures = Vec::new();
         for (index, err) in errs.iter().enumerate() {
+            if structured_cleanup {
+                break;
+            }
             // backlog#1158: when rolling back, fan the idempotent undo out to every
             // online disk (each self-decides from its staged backup: restore if the
             // rollback dir is present, no-op otherwise). This covers a disk that
@@ -7923,6 +9102,7 @@ impl SetDisks {
                             DeleteOptions {
                                 recursive: true,
                                 immediate: true,
+                                old_data_dir: Some(rollback_dir),
                                 ..Default::default()
                             },
                             disk_namespace_owner,
@@ -8011,6 +9191,41 @@ impl SetDisks {
         }
         Ok(())
     }
+}
+
+impl SetDisks {
+    /// Read current metadata without cache admission or read-side repair. The
+    /// outer batch owner already holds the sorted namespace write-lock set.
+    pub(crate) async fn conditional_delete_current_snapshot(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(ObjectInfo, crate::disk::CurrentDeleteGeneration)> {
+        let snapshot = self.get_object_fileinfo(bucket, object, opts, false, false).await?;
+        let file_info = snapshot.fi();
+        let generation = crate::disk::CurrentDeleteGeneration::from_file_info(file_info)
+            .map_err(|error| to_object_err(error.into(), vec![bucket, object]))?;
+        Ok((
+            ObjectInfo::from_file_info(file_info, bucket, object, opts.versioned || opts.version_suspended),
+            generation,
+        ))
+    }
+
+    /// Mixed-version peers must reject the operation before any group mutates.
+    pub(crate) async fn preflight_guarded_delete_versions(&self) -> Result<()> {
+        let disks = self.disks.read().await.clone();
+        guarded_delete_capability_barrier(disks.iter().flatten().map(|disk| disk.supports_guarded_delete_versions())).await
+    }
+}
+
+async fn guarded_delete_capability_barrier<F>(probes: impl IntoIterator<Item = F>) -> Result<()>
+where
+    F: std::future::Future<Output = crate::disk::error::Result<()>>,
+{
+    // Capability probes are read-only, so a failure can cancel the remaining
+    // probes. Admission still requires every probe to complete successfully.
+    futures::future::try_join_all(probes).await.map(|_| ()).map_err(Error::from)
 }
 
 #[async_trait::async_trait]
@@ -8306,16 +9521,23 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         } else {
             opts.expected_bucket_incarnation_id
         };
-        let owner: Arc<dyn Send + Sync> = Arc::new((opts.bucket_incarnation_fence, opts.object_lock_config_snapshot));
-        self.delete_object_version_with_purge_owned(
-            bucket,
-            object,
-            fi,
-            force_del_marker,
-            None,
-            (source_bucket_incarnation_id, Some(owner)),
-        )
-        .await
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        let result = self
+            .delete_object_version_with_purge(
+                bucket,
+                object,
+                fi,
+                force_del_marker,
+                None,
+                DeleteCommitContext {
+                    incarnation: source_bucket_incarnation_id,
+                    options: Some(&opts),
+                    ..Default::default()
+                },
+            )
+            .await;
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        result
     }
 
     #[tracing::instrument(skip(self, objects, opts))]
@@ -8347,6 +9569,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 );
             }
         };
+        let current_generations = opts.conditional_delete_generations.as_deref();
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
         let mut accounting = vec![None; objects.len()];
         let delete_config_snapshot = opts
@@ -8358,14 +9581,31 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             self.invalidate_get_object_metadata_cache(bucket, &object.object_name).await;
         }
 
-        let mut del_errs = (0..objects.len()).map(|_| None).collect::<Vec<_>>();
+        let mut del_errs = objects
+            .iter()
+            .map(|object| {
+                object.delete_condition.as_ref().map(|_| {
+                    StorageError::InvalidArgument(
+                        bucket.to_owned(),
+                        object.object_name.clone(),
+                        "conditional delete was not admitted by the store preflight".to_owned(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
 
         // Acquire locks in batch mode (best effort, matching previous behavior)
         let mut batch = rustfs_lock::BatchLockRequest::new(self.locker_owner.as_str()).with_all_or_nothing(false);
+        // Keyed by the same disk identity `new_ns_lock` uses, so aliases such
+        // as `a\b` and `a/b` on Windows share one lock (and one entry here).
+        let lock_names: Vec<Cow<'_, str>> = objects
+            .iter()
+            .map(|dobj| object_name_disk_identity(&dobj.object_name))
+            .collect();
         let mut unique_objects: HashSet<String> = HashSet::new();
-        for dobj in &objects {
-            if unique_objects.insert(dobj.object_name.clone()) {
-                batch = batch.add_write_lock(ObjectKey::new(bucket, dobj.object_name.clone()));
+        for lock_name in &lock_names {
+            if unique_objects.insert(lock_name.to_string()) {
+                batch = batch.add_write_lock(ObjectKey::new(bucket, lock_name.to_string()));
             }
         }
         let unique_lock_count = batch.requests.len();
@@ -8418,8 +9658,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         // Mark failures for objects that could not be locked
-        for (i, dobj) in objects.iter().enumerate() {
-            if let Some(err) = failed_map.get(&(bucket.to_string(), dobj.object_name.clone())) {
+        for (i, lock_name) in lock_names.iter().enumerate() {
+            if let Some(err) = failed_map.get(&(bucket.to_string(), lock_name.to_string())) {
                 del_errs[i] = Some(Error::other(err.to_string()));
             }
         }
@@ -8434,7 +9674,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     Err(err) => {
                         let message = err.to_string();
                         for (index, item) in del_errs.iter_mut().enumerate() {
-                            if locked_objects.contains(&objects[index].object_name) {
+                            if locked_objects.contains(lock_names[index].as_ref()) {
                                 *item = Some(Error::other(message.clone()));
                             }
                         }
@@ -8447,12 +9687,23 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let mut tier_reference_leases: Vec<(usize, String, Option<TierDestinationId>)> = Vec::new();
         let mut tier_free_version_receipt_candidates: HashMap<usize, TierFreeVersionReceiptCandidate> = HashMap::new();
         let mut delete_marker_purge_candidates = vec![None; objects.len()];
+        let mut missing_delete_retry_indices = Vec::new();
+        let mut deferred_recovery_indices = Vec::new();
 
         for (i, dobj) in objects.iter().enumerate() {
             if del_errs[i].is_some() {
                 continue;
             }
 
+            let guarded = current_generations.is_some_and(|generations| generations.contains_key(&dobj.object_name));
+            if guarded && dobj.version_id.is_some() {
+                del_errs[i] = Some(StorageError::InvalidArgument(
+                    bucket.to_owned(),
+                    dobj.object_name.clone(),
+                    "current-object generation guards cannot protect explicit-version deletes".to_owned(),
+                ));
+                continue;
+            }
             let replication_object_name = decode_dir_object(&dobj.object_name);
             let explicit_null_version = is_explicit_null_version(dobj.version_id);
             let version_id = delete_file_info_version_id(dobj.version_id);
@@ -8466,6 +9717,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 object_lock_delete: opts.object_lock_delete.clone(),
                 object_lock_config_snapshot: Some(Arc::clone(&object_lock_config)),
                 no_lock: true,
+                suppress_read_repair: guarded,
                 ..Default::default()
             };
             // A missing bucket Object Lock configuration does not prove that
@@ -8477,7 +9729,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let marker_delete = dobj.version_id.is_none() || dobj.synthetic_version_id;
             let replication_needs_source = replicate_delete
                 && (!marker_delete || delete_config_snapshot.active_delete_marker_rules_require_tags(&replication_object_name));
-            let (goi, authoritative_file_info, gerr) = if object_lock_check_required
+            let (mut goi, mut authoritative_file_info, mut gerr) = if object_lock_check_required
                 || replication_needs_source
                 || opts.tier_delete_journal_api.is_some()
                 || dobj.expected_identity.is_some()
@@ -8490,9 +9742,76 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             } else {
                 (ObjectInfo::default(), FileInfo::default(), None)
             };
+            if gerr
+                .as_ref()
+                .is_some_and(|error| is_err_object_not_found(error) || is_err_version_not_found(error))
+                && !is_meta_bucketname(bucket)
+                && !opts.data_movement
+                && !opts.replication_request
+                && opts.http_preconditions.is_none()
+                && !guarded
+            {
+                let recovery = self
+                    .recover_delete_key(
+                        bucket,
+                        &dobj.object_name,
+                        DeleteRecoveryContext {
+                            dry_run: !opts.no_lock,
+                            namespace_owner: opts.delete_mutation_owner.clone(),
+                            ..DeleteRecoveryContext::new(opts.expected_bucket_incarnation_id, &|| {
+                                ensure_delete_commit_locks_held(None, bucket, &dobj.object_name, &opts).is_ok()
+                            })
+                        },
+                    )
+                    .await;
+                match recovery {
+                    Ok(recovery) if !opts.no_lock && recovery.discovered > 0 && recovery.pending == 0 => {
+                        deferred_recovery_indices.push(i);
+                        continue;
+                    }
+                    Ok(recovery)
+                        if (recovery.pending > 0
+                            && !(recovery.no_transactions_at_quorum
+                                && dobj.version_id.is_none()
+                                && !versioned
+                                && !version_suspended))
+                            || (recovery.blocked > 0 && (dobj.version_id.is_some() || versioned || version_suspended)) =>
+                    {
+                        del_errs[i] = Some(if recovery.pending > 0 {
+                            StorageError::InsufficientWriteQuorum(bucket.to_owned(), dobj.object_name.clone())
+                        } else {
+                            StorageError::SlowDown
+                        });
+                        continue;
+                    }
+                    Ok(recovery) if recovery.rolled_back > 0 || recovery.committed > 0 => {
+                        let (fresh, info, _, error) = self
+                            .get_object_info_fileinfo_and_quorum(bucket, &dobj.object_name, &check_opts)
+                            .await;
+                        goi = fresh;
+                        authoritative_file_info = info;
+                        gerr = error;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        del_errs[i] = Some(to_object_err(error.into(), vec![bucket, &dobj.object_name]));
+                        continue;
+                    }
+                }
+            }
             let source_missing = gerr
                 .as_ref()
                 .is_some_and(|err| is_err_object_not_found(err) || is_err_version_not_found(err));
+            if source_missing
+                && dobj.version_id.is_none()
+                && dobj.expected_identity.is_none()
+                && !versioned
+                && !version_suspended
+                && opts.http_preconditions.is_none()
+                && !guarded
+            {
+                missing_delete_retry_indices.push(i);
+            }
             // A pool-local miss keeps the existing idempotent batch-delete
             // semantics. Exact-version deletes fan out to every pool, and a
             // retry may also arrive after the intended generation is gone.
@@ -8645,20 +9964,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 vr.set_delete_marker_incarnation(incarnation);
             }
 
-            let v = {
-                if vers_map.contains_key(&dobj.object_name) {
-                    let val = vers_map.get_mut(&dobj.object_name).unwrap();
-                    val.versions.push(vr.clone());
-                    val.clone()
-                } else {
-                    FileInfoVersions {
-                        name: vr.name.clone(),
-                        versions: vec![vr.clone()],
-                        ..Default::default()
-                    }
-                }
-            };
-
             if vr.deleted || removed_delete_marker {
                 del_objects[i] = DeletedObject {
                     delete_marker: true,
@@ -8712,8 +10017,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
 
             // Only add to vers_map if we hold the lock
-            if locked_objects.contains(&dobj.object_name) {
-                vers_map.insert(&dobj.object_name, v);
+            if locked_objects.contains(lock_names[i].as_ref()) {
+                vers_map
+                    .entry(&dobj.object_name)
+                    .or_insert_with(|| FileInfoVersions {
+                        name: vr.name.clone(),
+                        ..Default::default()
+                    })
+                    .versions
+                    .push(vr);
             }
         }
 
@@ -8730,10 +10042,17 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         let rollback_dir = Uuid::new_v4();
+        let namespace_owner = (!is_meta_bucketname(bucket)).then(|| {
+            Arc::new((
+                self.ctx.begin_namespace_commit(),
+                opts.delete_mutation_owner.clone(),
+                opts.object_lock_config_snapshot.clone(),
+                opts.scanner_publication_commit_scope.clone(),
+                opts.write_lock_context.clone(),
+            )) as Arc<dyn Send + Sync>
+        });
 
-        let disks = self.disks.read().await;
-
-        let disks = disks.clone();
+        let disks = self.disks.read().await.clone();
 
         if opts
             .namespace_lock_fence
@@ -8796,12 +10115,31 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             fi_vers.versions.retain(|fi| del_errs[fi.idx].is_none());
         }
         vers.retain(|fi_vers| !fi_vers.versions.is_empty());
+        let recovery_tickets: Vec<_> = vers
+            .iter()
+            .map(|group| {
+                (!is_meta_bucketname(bucket))
+                    .then(|| {
+                        self.ctx
+                            .delete_recovery_hints()
+                            .register(crate::store::delete_recovery_runtime::DeleteRecoveryKey {
+                                pool: self.pool_index,
+                                set: self.set_index,
+                                bucket: bucket.to_owned(),
+                                object: group.name.clone(),
+                                incarnation: opts.expected_bucket_incarnation_id,
+                            })
+                    })
+                    .flatten()
+            })
+            .collect();
         let mut futures = Vec::with_capacity(disks.len());
         let lock_lost_during_commit = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // let mut errors = Vec::with_capacity(disks.len());
 
         for disk in disks.iter() {
+            let disk_namespace_owner = namespace_owner.clone();
             let vers = vers.clone();
             let namespace_lock_fence = opts.namespace_lock_fence.clone();
             let lock_lost_during_commit = Arc::clone(&lock_lost_during_commit);
@@ -8811,15 +10149,66 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     return (0..vers.len()).map(|_| Some(DiskError::DiskOngoingReq)).collect();
                 }
                 if let Some(disk) = disk {
-                    disk.delete_versions(
-                        bucket,
-                        vers,
-                        DeleteOptions {
-                            old_data_dir: Some(rollback_dir),
-                            ..Default::default()
-                        },
-                    )
-                    .await
+                    let options = DeleteOptions {
+                        old_data_dir: Some(rollback_dir),
+                        delete_recovery_bucket_incarnation: opts.expected_bucket_incarnation_id,
+                        ..Default::default()
+                    };
+                    if current_generations
+                        .is_some_and(|generations| vers.iter().any(|group| generations.contains_key(&group.name)))
+                    {
+                        let mut guarded = Vec::new();
+                        let mut ordinary = Vec::new();
+                        let mut guarded_indices = Vec::new();
+                        let mut ordinary_indices = Vec::new();
+                        let count = vers.len();
+                        for (index, group) in vers.into_iter().enumerate() {
+                            if let Some(generation) = current_generations.and_then(|generations| generations.get(&group.name)) {
+                                guarded_indices.push(index);
+                                guarded.push(crate::disk::GuardedFileInfoVersions {
+                                    group,
+                                    expected_current: generation.clone(),
+                                });
+                            } else {
+                                ordinary_indices.push(index);
+                                ordinary.push(group);
+                            }
+                        }
+                        let mut results = vec![None; count];
+                        let guarded_results = disk
+                            .delete_versions_guarded_recoverable_with_namespace_owner(
+                                bucket,
+                                guarded,
+                                options.clone(),
+                                disk_namespace_owner.clone(),
+                            )
+                            .await;
+                        for (index, error) in guarded_indices.into_iter().zip(guarded_results) {
+                            results[index] = error;
+                        }
+                        if !ordinary.is_empty() {
+                            let errors = if is_meta_bucketname(bucket) {
+                                disk.delete_versions(bucket, ordinary, options).await
+                            } else {
+                                disk.delete_versions_recoverable_with_namespace_owner(
+                                    bucket,
+                                    ordinary,
+                                    options,
+                                    disk_namespace_owner,
+                                )
+                                .await
+                            };
+                            for (index, error) in ordinary_indices.into_iter().zip(errors) {
+                                results[index] = error;
+                            }
+                        }
+                        results
+                    } else if is_meta_bucketname(bucket) {
+                        disk.delete_versions(bucket, vers, options).await
+                    } else {
+                        disk.delete_versions_recoverable_with_namespace_owner(bucket, vers, options, disk_namespace_owner)
+                            .await
+                    }
                 } else {
                     let mut errs = Vec::with_capacity(vers.len());
                     for _ in 0..vers.len() {
@@ -8855,7 +10244,17 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 }
             }
 
-            let mut has_err = reduce_write_quorum_errs(&disk_err, OBJECT_OP_IGNORED_ERRS, disks.len() / 2 + 1);
+            let mut has_err = reduce_write_quorum_errs(&disk_err, OBJECT_OP_IGNORED_ERRS, self.set_drive_count / 2 + 1);
+            if disk_err
+                .iter()
+                .flatten()
+                .any(|error| matches!(error, DiskError::GuardedDeleteUnsupported))
+            {
+                has_err = Some(DiskError::GuardedDeleteUnsupported);
+            }
+            if !is_meta_bucketname(bucket) && disk_err.iter().flatten().any(super::delete_recovery::unsupported_recovery) {
+                has_err = Some(DiskError::UnsupportedDisk);
+            }
             if let Some(err) = has_err.clone() {
                 let er = err.into();
                 if (is_err_object_not_found(&er) || is_err_version_not_found(&er)) && !del_objects[obj_idx].delete_marker {
@@ -8899,10 +10298,69 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         #[cfg(test)]
         pause_delete_before_cleanup(bucket).await;
 
+        let mut published_groups = HashSet::new();
+        if !is_meta_bucketname(bucket) {
+            let groups = vers.iter().enumerate().filter_map(|(index, group)| {
+                group
+                    .versions
+                    .iter()
+                    .all(|version| del_errs[version.idx].is_none())
+                    .then_some(index)
+            });
+            // Mark all attempted groups before starting publication. A lost
+            // response can hide a persisted decision and must never roll back.
+            let groups = groups.collect::<Vec<_>>();
+            published_groups.extend(groups.iter().map(|index| vers[*index].name.clone()));
+            let publications = futures::stream::iter(groups.into_iter().map(|index: usize| {
+                let group = &vers[index];
+                let recovery_ticket = recovery_tickets[index].clone();
+                let namespace_owner = namespace_owner.clone();
+                let disks = &disks;
+                let opts = &opts;
+                async move {
+                    let can_commit = || {
+                        ensure_delete_commit_locks_held(None, bucket, &group.name, opts).is_ok()
+                            && opts
+                                .scanner_publication_commit_scope
+                                .as_ref()
+                                .is_none_or(|scope| scope.can_commit())
+                    };
+                    let result = self
+                        .publish_delete_commit(
+                            bucket,
+                            &group.name,
+                            rollback_dir,
+                            disks,
+                            self.set_drive_count / 2 + 1,
+                            DeleteRecoveryContext {
+                                recovery_ticket,
+                                namespace_owner,
+                                ..DeleteRecoveryContext::new(opts.expected_bucket_incarnation_id, &can_commit)
+                            },
+                        )
+                        .await;
+                    (index, result)
+                }
+            }))
+            .buffer_unordered(16)
+            .collect::<Vec<_>>()
+            .await;
+            for (index, result) in publications {
+                let group = &vers[index];
+                if let Err(error) = result {
+                    for version in &group.versions {
+                        del_errs[version.idx] = Some(to_object_err(error.clone().into(), vec![bucket, &group.name]));
+                    }
+                }
+            }
+        }
         let mut rollback_futures = Vec::new();
         let committed_receipt_indices =
             committed_tier_free_version_receipt_indices(&vers, &del_errs, &tier_free_version_receipt_candidates);
         for fi_vers in &vers {
+            if published_groups.contains(&fi_vers.name) {
+                continue;
+            }
             // delete_versions commits one xl.meta per object group, so rollback must use the same boundary.
             let should_rollback = fi_vers.versions.iter().any(|fi| del_errs[fi.idx].is_some());
             for (disk_idx, disk) in disks.iter().enumerate() {
@@ -8922,10 +10380,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 let bucket = bucket.to_string();
                 let object = fi_vers.name.clone();
                 let versions = fi_vers.clone();
+                let disk_namespace_owner = namespace_owner.clone();
                 rollback_futures.push(async move {
                     if should_rollback {
                         let errs = disk
-                            .delete_versions(
+                            .delete_versions_with_namespace_owner(
                                 &bucket,
                                 vec![versions],
                                 DeleteOptions {
@@ -8934,6 +10393,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                     old_data_dir: Some(rollback_dir),
                                     ..Default::default()
                                 },
+                                disk_namespace_owner,
                             )
                             .await;
                         if let Some(err) = errs.into_iter().flatten().next() {
@@ -8954,6 +10414,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 DeleteOptions {
                                     recursive: true,
                                     immediate: true,
+                                    old_data_dir: Some(rollback_dir),
                                     ..Default::default()
                                 },
                             )
@@ -8990,10 +10451,68 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             );
         }
 
+        // A new explicit DELETE authorizes removal of the exact missing key's
+        // legacy residue; it does not infer whether the interrupted delete committed.
+        for index in missing_delete_retry_indices {
+            if del_errs[index].is_none() {
+                let object = &objects[index].object_name;
+                let result = match ensure_delete_commit_locks_held(None, bucket, object, &opts) {
+                    Ok(()) => self.reclaim_missing_delete_residue(bucket, object, &opts, None).await,
+                    Err(err) => Err(err),
+                };
+                if let Err(err) = result {
+                    del_errs[index] = Some(err);
+                }
+            }
+        }
+
         // TODO(backlog): support partial object deletion for multi-part objects
 
         if dist_erasure {
             self.release_dist_delete_object_locks_batch(dist_batch_lock_ids).await;
+        }
+
+        // Cold missing-key replay uses the same batch contract after the fast
+        // batch lock is released; renewable key ownership survives settlement.
+        for index in deferred_recovery_indices {
+            let object = &objects[index];
+            let explicit_delete = object.version_id.is_none()
+                && !object.synthetic_version_id
+                && !opts.versioned
+                && !opts.version_suspended
+                && opts.http_preconditions.is_none()
+                && metadata_sys::has_authoritative_never_versioned_state_in(&self.ctx, bucket)
+                    .await
+                    .unwrap_or(false)
+                && matches!(object_lock_config.state(), ObjectLockConfigState::ConfirmedAbsent);
+            let recovery = self
+                .recover_delete_object(
+                    bucket,
+                    &object.object_name,
+                    DeleteRecoveryContext {
+                        explicit_delete,
+                        namespace_owner: Some(Arc::new((
+                            self.ctx.begin_namespace_commit(),
+                            opts.delete_mutation_owner.clone(),
+                            opts.object_lock_config_snapshot.clone(),
+                        ))),
+                        ..DeleteRecoveryContext::new(opts.expected_bucket_incarnation_id, &|| {
+                            ensure_delete_commit_locks_held(None, bucket, &object.object_name, &opts).is_ok()
+                        })
+                    },
+                )
+                .await;
+            match recovery {
+                Ok(recovery) if recovery.pending == 0 && recovery.blocked == 0 => {
+                    let (mut deleted, mut errors, mut receipts) =
+                        Box::pin(self.delete_objects_with_accounting(bucket, vec![object.clone()], opts.clone())).await;
+                    del_objects[index] = deleted.remove(0);
+                    del_errs[index] = errors.remove(0);
+                    accounting[index] = receipts.remove(0);
+                }
+                Ok(_) => del_errs[index] = Some(StorageError::SlowDown),
+                Err(error) => del_errs[index] = Some(to_object_err(error.into(), vec![bucket, &object.object_name])),
+            }
         }
 
         let purge_submissions = delete_marker_purge_candidates
@@ -9054,7 +10573,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         // Guard lock for single object delete
         let _lock_guard = if (!opts.delete_prefix || opts.delete_prefix_object) && !opts.no_lock {
-            Some(self.acquire_write_lock_diag("delete_object", bucket, object).await?)
+            Some(Arc::new(self.acquire_write_lock_diag("delete_object", bucket, object).await?))
         } else {
             None
         };
@@ -9124,7 +10643,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                             }
                         };
                         for version in plan {
-                            ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+                            ensure_delete_commit_locks_held(_lock_guard.as_deref(), bucket, object, &opts)?;
                             // The lease closes the gap between the durable
                             // reference proof and publishing either a committed
                             // v6 journal or the legacy free-version fallback.
@@ -9158,7 +10677,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 &delete_request,
                                 false,
                                 None,
-                                opts.expected_bucket_incarnation_id,
+                                DeleteCommitContext::request(&opts, _lock_guard.as_ref()),
                             )
                             .await?;
                             if let Some((_, deleted_object)) = replication_delete {
@@ -9167,7 +10686,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         }
                     } else {
                         for version in &versions.versions {
-                            ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+                            ensure_delete_commit_locks_held(_lock_guard.as_deref(), bucket, object, &opts)?;
                             let mut delete_request = FileInfo {
                                 name: object.to_string(),
                                 version_id: version.version_id,
@@ -9181,12 +10700,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 &delete_request,
                                 false,
                                 None,
-                                opts.expected_bucket_incarnation_id,
+                                DeleteCommitContext::request(&opts, _lock_guard.as_ref()),
                             )
                             .await?;
                         }
                         for version in &versions.free_versions {
-                            ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+                            ensure_delete_commit_locks_held(_lock_guard.as_deref(), bucket, object, &opts)?;
                             let mut delete_request = FileInfo {
                                 name: object.to_string(),
                                 version_id: version.version_id,
@@ -9201,7 +10720,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 &delete_request,
                                 false,
                                 None,
-                                opts.expected_bucket_incarnation_id,
+                                DeleteCommitContext::request(&opts, _lock_guard.as_ref()),
                             )
                             .await?;
                         }
@@ -9217,7 +10736,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 self.validate_bucket_incarnation(bucket, expected_incarnation_id, &opts)
                     .await?;
             }
-            ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+            ensure_delete_commit_locks_held(_lock_guard.as_deref(), bucket, object, &opts)?;
             begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
             self.delete_prefix_with_scanner_publication_lease(
                 bucket,
@@ -9268,14 +10787,73 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let mut version_found = true;
         // delete_object_version below derives its own majority quorum from the
         // disk array, so the object-derived quorum here is unused.
-        let (mut goi, authoritative_file_info, _write_quorum, gerr) =
+        let (mut goi, mut authoritative_file_info, _write_quorum, mut gerr) =
             self.get_object_info_fileinfo_and_quorum(bucket, object, &opts).await;
+        if gerr
+            .as_ref()
+            .is_some_and(|error| is_err_object_not_found(error) || is_err_version_not_found(error))
+            && !is_meta_bucketname(bucket)
+            && !opts.data_movement
+            && !opts.replication_request
+            && opts.http_preconditions.is_none()
+        {
+            if let Some(expected) = opts.expected_bucket_incarnation_id {
+                self.validate_bucket_incarnation(bucket, expected, &opts).await?;
+            }
+            let recovery = self
+                .recover_delete_key(
+                    bucket,
+                    object,
+                    DeleteRecoveryContext {
+                        namespace_owner: Some(Arc::new((
+                            self.ctx.begin_namespace_commit(),
+                            _lock_guard.clone(),
+                            opts.object_lock_config_snapshot.clone(),
+                            opts.scanner_publication_commit_scope.clone(),
+                            opts.write_lock_context.clone(),
+                            opts.delete_mutation_owner.clone(),
+                        ))),
+                        ..DeleteRecoveryContext::new(opts.expected_bucket_incarnation_id, &|| {
+                            ensure_delete_commit_locks_held(_lock_guard.as_deref(), bucket, object, &opts).is_ok()
+                        })
+                    },
+                )
+                .await?;
+            if (recovery.pending > 0
+                && !(recovery.no_transactions_at_quorum
+                    && opts.version_id.is_none()
+                    && !opts.versioned
+                    && !opts.version_suspended))
+                || (recovery.blocked > 0 && (opts.version_id.is_some() || opts.versioned || opts.version_suspended))
+            {
+                return Err(if recovery.pending > 0 {
+                    StorageError::InsufficientWriteQuorum(bucket.to_owned(), object.to_owned())
+                } else {
+                    StorageError::SlowDown
+                });
+            }
+            if recovery.rolled_back > 0 || recovery.committed > 0 {
+                (goi, authoritative_file_info, _, gerr) = self.get_object_info_fileinfo_and_quorum(bucket, object, &opts).await;
+            }
+        }
         if let Some(err) = &gerr
             && goi.name.is_empty()
         {
             if should_force_delete_marker_for_missing_version(&opts) {
                 version_found = false;
             } else {
+                if is_err_object_not_found(err) {
+                    ensure_delete_commit_locks_held(_lock_guard.as_deref(), bucket, object, &opts)?;
+                    if self
+                        .reclaim_missing_delete_residue(bucket, object, &opts, _lock_guard.as_ref())
+                        .await?
+                    {
+                        if let Some(scope) = scanner_publication_commit_scope.as_ref() {
+                            let _ = scope.mark_committed();
+                        }
+                        return Ok(ObjectInfo::default());
+                    }
+                }
                 return Err(err.clone());
             }
         }
@@ -9309,11 +10887,18 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 expire_restored: true,
                 ..Default::default()
             };
-            ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+            ensure_delete_commit_locks_held(_lock_guard.as_deref(), bucket, object, &opts)?;
             begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
-            self.delete_object_version_with_purge(bucket, object, &dfi, false, None, opts.expected_bucket_incarnation_id)
-                .await
-                .map_err(|e| to_object_err(e, vec![bucket, object]))?;
+            self.delete_object_version_with_purge(
+                bucket,
+                object,
+                &dfi,
+                false,
+                None,
+                DeleteCommitContext::request(&opts, _lock_guard.as_ref()),
+            )
+            .await
+            .map_err(|e| to_object_err(e, vec![bucket, object]))?;
             self.invalidate_get_object_metadata_cache(bucket, object).await;
             if let Some(scope) = scanner_publication_commit_scope.as_ref() {
                 let _ = scope.mark_committed();
@@ -9393,7 +10978,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 None
             };
 
-            ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+            ensure_delete_commit_locks_held(_lock_guard.as_deref(), bucket, object, &opts)?;
             begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
             let _tier_delete_lease = acquire_single_tier_delete_lease(&opts, &goi).await?;
             if opts.skip_free_version {
@@ -9405,7 +10990,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 &fi,
                 should_force_delete_marker_for_missing_version(&opts),
                 delete_marker_purge.clone(),
-                opts.expected_bucket_incarnation_id,
+                DeleteCommitContext::request(&opts, _lock_guard.as_ref()),
             )
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
@@ -9452,7 +11037,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             dfi.set_delete_marker_incarnation(incarnation);
         }
 
-        ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+        ensure_delete_commit_locks_held(_lock_guard.as_deref(), bucket, object, &opts)?;
         begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
         let _tier_delete_lease = acquire_single_tier_delete_lease(&opts, &goi).await?;
         if opts.skip_free_version {
@@ -9464,7 +11049,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             &dfi,
             opts.delete_marker,
             delete_marker_purge,
-            opts.expected_bucket_incarnation_id,
+            DeleteCommitContext::request(&opts, _lock_guard.as_ref()),
         )
         .await
         .map_err(|e| to_object_err(e, vec![bucket, object]))?;
@@ -9517,10 +11102,18 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // Use the same full xl.meta read path as GetObject metadata resolution.
         // This avoids HEAD/GetObject metadata visibility skew immediately after
         // PutObject/CompleteMultipartUpload.
-        let snapshot = self
-            .get_object_fileinfo(bucket, object, opts, true, false)
-            .await
-            .map_err(|e| to_object_err(e, vec![bucket, object]))?;
+        let read = self.get_object_fileinfo(bucket, object, opts, true, false);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let read = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::ObjectInfoRead,
+            async {
+                crate::cluster::rpc::runtime_sources::observe_read_version_context_boundary(
+                    rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::ObjectInfoRead,
+                );
+                read.await
+            },
+        );
+        let snapshot = read.await.map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
         let oi = ObjectInfo::from_file_info(snapshot.fi(), bucket, object, opts.versioned || opts.version_suspended);
 
@@ -10095,7 +11688,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         pause_transition_transaction_at(bucket, object, TransitionTransactionKillPoint::CommitFenceBeforeLocalCommit).await;
         upload_cleanup.disarm();
         if let Err(err) = self
-            .delete_object_version_with_purge(bucket, object, &fi, false, None, opts.expected_bucket_incarnation_id)
+            .delete_object_version_with_purge(bucket, object, &fi, false, None, DeleteCommitContext::request(opts, None))
             .await
         {
             warn!(
@@ -10861,6 +12454,232 @@ mod object_encryption_resolver_wiring_tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(None)
         }
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[test]
+    fn diagnostic_put_owner_preserves_parent_context_at_tier_free_version_lookup() {
+        use crate::cluster::rpc::runtime_sources::{current_read_version_entry_source, with_read_version_entry};
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use rustfs_io_metrics::internode_metrics::ReadVersionEntrySource;
+        use rustfs_io_metrics::s3_http_metrics::{S3HttpRequestGuard, current_s3_http_operation_context};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let (_dirs, disks, set) = runtime.block_on(crate::set_disk::hermetic_set_disks_isolated(4));
+        let bucket = "diagnostic-put-owner";
+        runtime.block_on(async {
+            for disk in &disks {
+                disk.make_volume(bucket).await.expect("make test bucket volume");
+            }
+            for index in 0..4 {
+                set.put_object(
+                    bucket,
+                    &format!("object-{index}"),
+                    &mut PutObjReader::from_vec(b"old body".to_vec()),
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("seed source object");
+            }
+        });
+        let recorder = DebuggingRecorder::new();
+        let snapshots = recorder.snapshotter();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        let mut request = S3HttpRequestGuard::new("PUT");
+        let put = request.in_scope(|| {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::PutObject);
+            current_s3_http_operation_context().expect("captured PutObject")
+        });
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let mut index = 0;
+                for earlier in [None, Some(ReadVersionEntrySource::ScannerConfigWrite)] {
+                    for api in [None, Some(put)] {
+                        let object = format!("object-{index}");
+                        index += 1;
+                        let write = async {
+                            let mut reader = PutObjReader::from_vec(b"new body".to_vec());
+                            let info = set
+                                .put_object(
+                                    bucket,
+                                    &object,
+                                    &mut reader,
+                                    &ObjectOptions {
+                                        tier_free_version_receipt_sink: Some(crate::object_api::TierFreeVersionReceiptSink::new()),
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                                .expect("replace source object");
+                            assert_eq!(info.size, 8);
+                        };
+                        rustfs_io_metrics::s3_http_metrics::with_isolated_s3_http_operation_context(api, async {
+                            match earlier {
+                                Some(source) => with_read_version_entry(source, write).await,
+                                None => write.await,
+                            }
+                        })
+                        .await;
+                        assert_eq!(current_read_version_entry_source(), None);
+                        assert_eq!(current_s3_http_operation_context(), None);
+                    }
+                }
+            });
+        });
+        let rows = snapshots.snapshot().into_vec();
+        for source in ["scanner_config_write", "put_commit_owner"] {
+            for boundary in ["put_commit_owner", "tier_free_version_source_lookup"] {
+                for (api, state) in [("unattributed", "absent"), ("s3:PutObject", "preserved")] {
+                    assert!(
+                        rows.iter().any(|(key, _, _, value)| {
+                            let labels = key
+                                .key()
+                                .labels()
+                                .map(|label| (label.key(), label.value()))
+                                .collect::<HashMap<_, _>>();
+                            key.key().name() == "rustfs_storage_diagnostic_context_transitions_total"
+                                && labels.get("entry_source") == Some(&source)
+                                && labels.get("boundary") == Some(&boundary)
+                                && labels.get("parent_api_operation") == Some(&api)
+                                && labels.get("child_api_operation") == Some(&api)
+                                && labels.get("api_context") == Some(&state)
+                                && matches!(value, DebugValue::Counter(count) if *count > 0)
+                        }),
+                        "actual detached owner and lookup must retain context: {source}/{boundary}/{api}"
+                    );
+                }
+            }
+        }
+        runtime.block_on(async {
+            for index in 0..4 {
+                let mut reader = set
+                    .get_object_reader(bucket, &format!("object-{index}"), None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("committed object remains readable");
+                let mut body = Vec::new();
+                tokio::io::AsyncReadExt::read_to_end(&mut reader.stream, &mut body)
+                    .await
+                    .expect("read committed body");
+                assert_eq!(body, b"new body");
+            }
+        });
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[test]
+    fn diagnostic_write_precondition_and_object_info_keep_origin_and_api() {
+        use crate::cluster::rpc::runtime_sources::{current_read_version_entry_source, with_read_version_entry};
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use rustfs_io_metrics::internode_metrics::ReadVersionEntrySource;
+        use rustfs_io_metrics::s3_http_metrics::{S3HttpRequestGuard, current_s3_http_operation_context};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let recorder = DebuggingRecorder::new();
+        let snapshots = recorder.snapshotter();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        let mut guard = S3HttpRequestGuard::new("PUT");
+        let put = guard.in_scope(|| {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::PutObject);
+            current_s3_http_operation_context().expect("captured PutObject")
+        });
+        let (_dirs, disks, set) = runtime.block_on(crate::set_disk::hermetic_set_disks_isolated(4));
+        let bucket = "diagnostic-precondition";
+        let object = "object";
+        let original = runtime.block_on(async {
+            for disk in &disks {
+                disk.make_volume(bucket).await.expect("create test bucket volume");
+            }
+            set.put_object(bucket, object, &mut PutObjReader::from_vec(b"body".to_vec()), &ObjectOptions::default())
+                .await
+                .expect("seed object")
+        });
+        let etag = original.etag.expect("seed ETag");
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                for earlier in [None, Some(ReadVersionEntrySource::ConfigWrite)] {
+                    for api in [None, Some(put)] {
+                        let read = async {
+                            assert_eq!(
+                                set.get_object_info(bucket, object, &ObjectOptions::default())
+                                    .await
+                                    .expect("read object info")
+                                    .etag,
+                                Some(etag.clone())
+                            );
+                            for (expected, condition) in [(false, etag.clone()), (true, "other-etag".to_string())] {
+                                let result = set
+                                    .check_write_precondition(
+                                        bucket,
+                                        object,
+                                        &ObjectOptions {
+                                            http_preconditions: Some(HTTPPreconditions {
+                                                if_match: Some(condition),
+                                                ..Default::default()
+                                            }),
+                                            ..Default::default()
+                                        },
+                                    )
+                                    .await;
+                                assert_eq!(result, expected.then_some(Error::PreconditionFailed));
+                                assert_eq!(current_s3_http_operation_context(), api);
+                            }
+                        };
+                        rustfs_io_metrics::s3_http_metrics::with_isolated_s3_http_operation_context(api, async {
+                            match earlier {
+                                Some(source) => with_read_version_entry(source, read).await,
+                                None => read.await,
+                            }
+                        })
+                        .await;
+                        assert_eq!(current_read_version_entry_source(), None);
+                        assert_eq!(current_s3_http_operation_context(), None);
+                    }
+                }
+            });
+        });
+        let rows = snapshots.snapshot().into_vec();
+        for (source, boundary) in [
+            ("write_precondition_read", "write_precondition_lookup"),
+            ("write_precondition_read", "object_info_read"),
+            ("write_precondition_read", "full_wait"),
+            ("object_info_read", "object_info_read"),
+            ("config_write", "write_precondition_lookup"),
+            ("config_write", "object_info_read"),
+            ("config_write", "full_wait"),
+        ] {
+            for (api, state) in [("unattributed", "absent"), ("s3:PutObject", "preserved")] {
+                assert!(
+                    rows.iter().any(|(key, _, _, value)| {
+                        let labels = key
+                            .key()
+                            .labels()
+                            .map(|label| (label.key(), label.value()))
+                            .collect::<HashMap<_, _>>();
+                        key.key().name() == "rustfs_storage_diagnostic_context_transitions_total"
+                            && labels.get("entry_source") == Some(&source)
+                            && labels.get("boundary") == Some(&boundary)
+                            && labels.get("parent_api_operation") == Some(&api)
+                            && labels.get("child_api_operation") == Some(&api)
+                            && labels.get("api_context") == Some(&state)
+                            && matches!(value, DebugValue::Counter(count) if *count > 0)
+                    }),
+                    "actual lookup must preserve origin and API: {source}/{boundary}/{api}"
+                );
+            }
+        }
+        assert_eq!(
+            runtime
+                .block_on(set.get_object_info(bucket, object, &ObjectOptions::default()))
+                .expect("object retained")
+                .etag,
+            Some(etag)
+        );
     }
 
     #[tokio::test]
@@ -12942,36 +14761,36 @@ mod get_object_downstream_close_accounting_tests {
             .enable_all()
             .build()
             .expect("current-thread runtime should build");
+        let (_temp_dirs, _disk_stores, set_disks, bucket, object, payload, options) = runtime.block_on(async {
+            let (_temp_dirs, _disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "get-downstream-close-accounting";
+            let object = "object.bin";
+            let payload = b"downstream-close-accounting-".repeat(10_000);
+            let options = ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            };
+
+            set_disks
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+            let owned_options =
+                hermetic_set_disks_support::lifecycle_owned_put_options(&set_disks, bucket, options.clone()).await;
+            let mut put_reader = PutObjReader::from_vec(payload.clone());
+            set_disks
+                .put_object(bucket, object, &mut put_reader, &owned_options)
+                .await
+                .expect("object should be written");
+
+            (_temp_dirs, _disk_stores, set_disks, bucket, object, payload, options)
+        });
         let recorder = CapturingRecorder::default();
         let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
         rustfs_io_metrics::set_get_stage_metrics_enabled(true);
 
         let (decode_failures, emit_failures, legacy_fanout, internal_fanout) = metrics::with_local_recorder(&recorder, || {
             runtime.block_on(async {
-                let (_temp_dirs, _disk_stores, set_disks) = hermetic_set_disks(4).await;
-                let bucket = "get-downstream-close-accounting";
-                let object = "object.bin";
-                let payload = b"downstream-close-accounting-".repeat(10_000);
-                let options = ObjectOptions {
-                    no_lock: true,
-                    ..Default::default()
-                };
-
-                set_disks
-                    .make_bucket(bucket, &MakeBucketOptions::default())
-                    .await
-                    .expect("bucket should be created");
-                let mut put_reader = PutObjReader::from_vec(payload.clone());
-                set_disks
-                    .put_object(
-                        bucket,
-                        object,
-                        &mut put_reader,
-                        &hermetic_set_disks_support::lifecycle_owned_put_options(&set_disks, bucket, options.clone()).await,
-                    )
-                    .await
-                    .expect("object should be written");
-
                 let range = Some(HTTPRangeSpec {
                     is_suffix_length: false,
                     start: 0,
@@ -14095,6 +15914,25 @@ mod metadata_mutation_generation_tests {
         assert_retired(&set_disks, &delete_key).await;
         drop(delete_probe);
 
+        let raw_object = "raw-delete-object";
+        let (_, raw_key) = put_and_prime(&set_disks, bucket, raw_object, b"raw DELETE body").await;
+        let raw_probe = MetadataCacheInvalidationProbe::install(bucket, raw_object);
+        set_disks
+            .delete_object_version(
+                bucket,
+                raw_object,
+                &FileInfo {
+                    name: raw_object.to_owned(),
+                    ..Default::default()
+                },
+                false,
+            )
+            .await
+            .expect("raw DELETE should succeed");
+        assert_eq!(raw_probe.count(), 2, "raw DELETE must fence the cache before and after mutation");
+        assert_retired(&set_disks, &raw_key).await;
+        drop(raw_probe);
+
         let copy_object = "copy-object";
         let (mut copy_info, copy_key) = put_and_prime(&set_disks, bucket, copy_object, b"COPY body").await;
         copy_info.metadata_only = true;
@@ -15212,6 +17050,7 @@ mod transition_commit_failure_tests {
                 cache_key.clone(),
                 Arc::new(GetObjectMetadataCacheEntry {
                     created_at: Instant::now(),
+                    capability: crate::set_disk::GetObjectMetadataCacheCapability::Full,
                     fi,
                     parts_metadata,
                     online_disks,
@@ -17555,6 +19394,44 @@ mod transition_upload_integrity_tests {
     /// their plan is `Plain`, so the tiered read stays byte-identical.
     #[tokio::test]
     #[serial_test::serial]
+    async fn transitioned_conditional_read_skips_remote_get_with_live_positive_control() {
+        struct MatchingEtag(String);
+        impl crate::object_api::GetObjectReadCondition for MatchingEtag {
+            fn is_terminal(&self, metadata: crate::object_api::GetObjectReadMetadata<'_>) -> bool {
+                !metadata.delete_marker && metadata.etag == Some(self.0.as_str())
+            }
+        }
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "transitioned-condition-body-get";
+        let object = "object.bin";
+        let payload = b"conditional remote reads need metadata only".repeat(256);
+        let original = write_source(&set, &disks, bucket, object, &payload).await;
+        let tier = format!("CONDITION{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier).await;
+        set.transition_object(bucket, object, &transition_options(&original, tier))
+            .await
+            .expect("transition object");
+        assert_eq!(backend.get_count().await, 0, "transition setup has not fetched the remote body");
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let reader = crate::object_api::with_get_object_read_condition(
+            Arc::new(MatchingEtag(original.etag.expect("source ETag"))),
+            set.get_object_reader(bucket, object, None, HeaderMap::new(), &opts),
+        )
+        .await
+        .expect("terminal transitioned metadata");
+        assert!(reader.object_info.is_remote(), "the condition was evaluated on transitioned metadata");
+        drop(reader);
+        assert_eq!(backend.get_count().await, 0, "a matching condition never calls the warm backend GET");
+        let (body, _) = read_transitioned(&set, bucket, object, None, &opts).await;
+        assert_eq!(body, payload);
+        assert_eq!(backend.get_count().await, 1, "the same backend counter observes a normal remote GET");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn transitioned_plain_object_get_is_unchanged() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "transitioned-plain-get-bucket";
@@ -19234,6 +21111,73 @@ mod put_object_tmp_cleanup_tests {
     }
 
     #[tokio::test]
+    async fn put_cleanup_admission_rejects_before_staging_with_an_external_lock() {
+        const CHILD: &str = "RUSTFS_CLEANUP_ADMISSION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = tokio::task::spawn_blocking(|| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "set_disk::ops::object::put_object_tmp_cleanup_tests::put_cleanup_admission_rejects_before_staging_with_an_external_lock",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("RUSTFS_CLEANUP_ISOLATE_ENABLE", "true")
+                    .env("RUSTFS_PUT_RENAME_TAIL_CLEANUP_MAX_PENDING", "1")
+                    .env("RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_WORKERS", "1")
+                    .env("RUSTFS_CLEANUP_CPUS", "none")
+                    .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP")
+                    .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_HOLD_WORKER")
+                    .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP")
+                    .output()
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let (dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "cleanup-admission-bucket";
+        let object = "externally-locked";
+        for disk in &disks {
+            disk.make_volume(bucket).await.unwrap();
+        }
+        let occupied = cleanup_runtime::reserve().unwrap().expect("isolation enabled in child");
+        let external_lock = set.acquire_write_lock_diag("admission_test", bucket, object).await.unwrap();
+        let mut reader = PutObjReader::from_vec(vec![7u8; TEST_OBJECT_SIZE]);
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let result = tokio::time::timeout(Duration::from_secs(20), set.put_object(bucket, object, &mut reader, &opts))
+            .await
+            .expect("admission must not wait while the caller owns locks");
+        assert!(matches!(result, Err(StorageError::SlowDown)));
+        assert!(non_trash_tmp_entries(&dirs).await.is_empty(), "rejection must not stage shards");
+        drop(external_lock);
+        drop(occupied);
+        let mut reader = PutObjReader::from_vec(vec![9u8; TEST_OBJECT_SIZE]);
+        set.put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .unwrap();
+        wait_for_tmp_workspace_to_drain(&dirs, "admitted PUT must eventually clean staging").await;
+        let mut actual = set
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .unwrap();
+        let mut body = Vec::new();
+        actual.stream.read_to_end(&mut body).await.unwrap();
+        assert_eq!(body, vec![9u8; TEST_OBJECT_SIZE]);
+    }
+
+    #[tokio::test]
     async fn put_object_success_eventually_cleans_tmp_workspace() {
         let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
 
@@ -20542,6 +22486,294 @@ mod put_object_tmp_cleanup_tests {
     }
 
     #[tokio::test]
+    async fn system_metadata_repair_error_does_not_wait_for_committed_tmp_cleanup() {
+        const CHILD: &str = "RUSTFS_METADATA_REPAIR_CLEANUP_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = tokio::task::spawn_blocking(|| {
+                std::process::Command::new(std::env::current_exe().expect("test executable must be available"))
+                    .args([
+                        "--exact",
+                        "set_disk::ops::object::put_object_tmp_cleanup_tests::system_metadata_repair_error_does_not_wait_for_committed_tmp_cleanup",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("RUSTFS_CLEANUP_ISOLATE_ENABLE", "true")
+                    .env("RUSTFS_PUT_RENAME_TAIL_CLEANUP_MAX_PENDING", "2")
+                    .env("RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_WORKERS", "1")
+                    .env("RUSTFS_CLEANUP_CPUS", "none")
+                    .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP")
+                    .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_DEFER_HOLD_WORKER")
+                    .env_remove("RUSTFS_PUT_RENAME_TAIL_CLEANUP_ZERO_TARGET_TMP_DELETE_SKIP")
+                    .output()
+                    .expect("the isolated cleanup regression child must run")
+            })
+            .await
+            .expect("cleanup regression child launcher must join");
+            assert!(
+                output.status.success(),
+                "cleanup regression failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        let (dirs, _disks, set) = hermetic_set_disks(4).await;
+        let occupied = cleanup_runtime::reserve()
+            .expect("the cleanup blocker must be admitted")
+            .expect("the child must enable cleanup isolation");
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let blocker = cleanup_runtime::spawn(Some(occupied), async move {
+            ready.send(()).expect("the fixture must observe the cleanup worker");
+            let _ = released.await;
+        });
+        tokio::time::timeout(Duration::from_secs(30), started)
+            .await
+            .expect("the cleanup blocker must acquire the execution worker")
+            .expect("the blocker readiness sender must stay alive");
+
+        let object = "pool.bin.identity-cleanup-owner";
+        let body = b"committed metadata with pending repair".to_vec();
+        let fault = rename_fault_injection::fail_rename_on(object, &[0]);
+        let response = tokio::time::timeout(
+            Duration::from_secs(30),
+            crate::config::com::save_config_with_opts(
+                Arc::clone(&set),
+                object,
+                body.clone(),
+                &ObjectOptions {
+                    max_parity: true,
+                    write_completion: WriteCompletion::TailDrainedWithOwnerRepair,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await;
+        release.send(()).expect("the cleanup blocker must stay alive until released");
+        tokio::time::timeout(Duration::from_secs(30), blocker)
+            .await
+            .expect("the released cleanup blocker must finish")
+            .expect("the cleanup blocker task must join");
+        let error = response
+            .expect("repair-required response must not wait for the committed temporary cleanup owner")
+            .expect_err("the committed minority failure must reach the metadata writer");
+        assert!(
+            matches!(error, Error::Io(ref inner) if inner.get_ref().is_some_and(|source| source.is::<crate::set_disk::SystemMetadataRepairRequired>()))
+        );
+        drop(fault);
+        wait_for_tmp_workspace_to_drain(&dirs, "the retained cleanup owner must eventually remove staged metadata").await;
+        let committed = crate::config::com::read_config(Arc::clone(&set), object)
+            .await
+            .expect("the repair-required metadata quorum must remain readable");
+        assert_eq!(committed, body);
+    }
+
+    #[tokio::test]
+    async fn rename_tail_heal_keeps_system_authority_separate_from_user_incarnation() {
+        let (_dirs, _disks, set) = hermetic_set_disks(4).await;
+        let mut heals = set.capture_test_rename_tail_heals();
+        let incarnation = Uuid::new_v4();
+        for bucket in [RUSTFS_META_BUCKET, ".minio.sys"] {
+            for expected in [None, Some(incarnation)] {
+                let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
+                    bucket.to_string(),
+                    Some("pool.bin.identity".to_string()),
+                    false,
+                    Some(HealChannelPriority::Normal),
+                    Some(0),
+                    Some(0),
+                );
+                request.expected_bucket_incarnation_id = expected;
+                let error = set
+                    .submit_rename_tail_heal(request, WriteCompletion::TailDrainedWithOwnerRepair)
+                    .await
+                    .expect_err("system repair must remain with its writer");
+                assert!(
+                    matches!(error, Error::Io(ref inner) if inner.get_ref().is_some_and(|source| source.is::<crate::set_disk::SystemMetadataRepairRequired>()))
+                );
+                assert!(
+                    heals.try_recv().is_err(),
+                    "even a supplied user incarnation cannot authorize system metadata heal"
+                );
+            }
+        }
+        let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
+            "ordinary-bucket".to_string(),
+            Some("ordinary-object".to_string()),
+            false,
+            Some(HealChannelPriority::Normal),
+            Some(0),
+            Some(0),
+        );
+        request.expected_bucket_incarnation_id = Some(incarnation);
+        set.submit_rename_tail_heal(request, WriteCompletion::Quorum)
+            .await
+            .expect("ordinary incarnation-bound fallback must remain available");
+        let admitted = heals
+            .try_recv()
+            .expect("the ordinary fallback must actually reach the channel");
+        assert_eq!(admitted.expected_bucket_incarnation_id, Some(incarnation));
+        assert_eq!(admitted.source, rustfs_heal_contracts::heal_channel::HealRequestSource::Mrf);
+        assert_eq!(admitted.object_prefix.as_deref(), Some("ordinary-object"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn system_metadata_partial_write_respects_completion_contract() {
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            for completion in [
+                WriteCompletion::Quorum,
+                WriteCompletion::TailDrained,
+                WriteCompletion::TailDrainedWithOwnerRepair,
+            ] {
+                let (dirs, disks, set) = hermetic_set_disks(4).await;
+                let object = format!("pool.bin.identity-{completion:?}");
+                let original = b"original deployment identity".to_vec();
+                let fixture_options = ObjectOptions {
+                    max_parity: true,
+                    write_completion: WriteCompletion::TailDrained,
+                    ..Default::default()
+                };
+                crate::config::com::save_config_with_opts(Arc::clone(&set), &object, original.clone(), &fixture_options)
+                    .await
+                    .expect("healthy system metadata write must succeed without a bucket incarnation");
+                let original_info = set
+                    .get_object_info(RUSTFS_META_BUCKET, &object, &ObjectOptions::default())
+                    .await
+                    .expect("original metadata must be readable before the partial overwrite");
+                let original_etag = original_info.etag.expect("original metadata must have an ETag");
+                let updated = b"updated deployment identity".to_vec();
+                let mut heals = set.capture_test_rename_tail_heals();
+                let tasks = rename_fanout_barrier::observe_tasks(&object);
+                let barrier = rename_fanout_barrier::arm(&object, 0, rename_fanout_barrier::PHASE_RENAME);
+                let fault = rename_fault_injection::fail_rename_on(&object, &[0]);
+                let writer = Arc::clone(&set);
+                let write_object = object.clone();
+                let write_body = updated.clone();
+                let write = tokio::spawn(async move {
+                    crate::config::com::save_config_with_opts(
+                        writer,
+                        &write_object,
+                        write_body,
+                        &ObjectOptions {
+                            max_parity: true,
+                            write_completion: completion,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                });
+                tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+                    .await
+                    .expect("the metadata rename tail must reach the failure barrier");
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        let mut updated_copies = 0;
+                        for disk in &disks {
+                            let info = disk
+                                .read_version("", RUSTFS_META_BUCKET, &object, "", &ReadOptions::default())
+                                .await
+                                .expect("each disk must retain either the original or updated metadata");
+                            if info.metadata.get("etag").is_some_and(|etag| etag != &original_etag) {
+                                updated_copies += 1;
+                            }
+                        }
+                        if updated_copies == 3 {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the metadata overwrite must reach quorum while the last disk is paused");
+                if completion != WriteCompletion::Quorum {
+                    assert!(
+                        !write.is_finished(),
+                        "drained completion must wait for the rename tail before acknowledging"
+                    );
+                }
+                barrier.release();
+                let result = tokio::time::timeout(Duration::from_secs(30), write)
+                    .await
+                    .expect("the metadata tail must drain")
+                    .expect("the metadata writer task must join");
+                if completion == WriteCompletion::TailDrainedWithOwnerRepair {
+                    let error = result.expect_err("the pool metadata owner must receive repair responsibility");
+                    let Error::Io(error) = error else {
+                        panic!("system metadata repair must retain its typed error");
+                    };
+                    assert!(
+                        error
+                            .get_ref()
+                            .is_some_and(|source| source.is::<crate::set_disk::SystemMetadataRepairRequired>()),
+                        "the config writer must retain the exact repair-required cause: {error}"
+                    );
+                } else {
+                    result.expect("ordinary system metadata must preserve quorum-success semantics");
+                }
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while tasks.running() != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the committed rename tail must eventually finish for every completion mode");
+                assert_eq!(tasks.running(), 0, "repair failure must be returned after all rename tasks drain");
+                assert!(heals.try_recv().is_err(), "system metadata must never enqueue an unfenced MRF heal");
+                let mut stale_copies = 0;
+                let mut committed_etags = Vec::new();
+                for disk in &disks {
+                    let info = disk
+                        .read_version("", RUSTFS_META_BUCKET, &object, "", &ReadOptions::default())
+                        .await
+                        .expect("every physical disk must retain its metadata after the partial rename");
+                    let etag = info.metadata.get("etag").expect("each metadata copy must retain an ETag");
+                    if etag == &original_etag {
+                        stale_copies += 1;
+                    } else {
+                        committed_etags.push(etag.clone());
+                    }
+                }
+                assert_eq!(stale_copies, 1, "exactly the failed rename must retain the old metadata");
+                assert_eq!(committed_etags.len(), 3, "the new metadata must retain its write quorum");
+                assert!(committed_etags.iter().all(|etag| etag == &committed_etags[0]));
+                let committed =
+                    tokio::time::timeout(Duration::from_secs(30), crate::config::com::read_config(Arc::clone(&set), &object))
+                        .await
+                        .expect("the committed metadata read must finish after the rename tail drains")
+                        .expect("a repair-required result must not roll back the committed metadata quorum");
+                assert_eq!(committed, updated, "the read must see the new bytes after cache invalidation");
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while !non_trash_tmp_entries(&dirs).await.is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("repair-required results must still schedule committed temporary-data cleanup");
+                drop(fault);
+                drop(barrier);
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    crate::config::com::save_config_with_opts(Arc::clone(&set), &object, updated.clone(), &fixture_options),
+                )
+                .await
+                .expect("the reconciliation must finish after the fault and barrier are disarmed")
+                .expect("the owning writer must be able to reconcile after the failed disk recovers");
+                for disk in &disks {
+                    let info = disk
+                        .read_version("", RUSTFS_META_BUCKET, &object, "", &ReadOptions::default())
+                        .await
+                        .expect("the reconciled metadata must exist on every disk");
+                    assert_ne!(info.metadata.get("etag"), Some(&original_etag));
+                }
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
     #[serial_test::serial(capacity_dirty_scope)]
     async fn tail_drained_put_preserves_quorum_success_without_unfenced_fallback_heal() {
         let (_dirs, disks, set) = hermetic_set_disks(4).await;
@@ -20814,6 +23046,42 @@ mod put_object_tmp_cleanup_tests {
             WriteCommitContext::from_options(&fake, bucket, object, false),
             Err(Error::InvalidArgument(..))
         ));
+    }
+
+    async fn borrowed_write_context_accepts(set: &SetDisks, bucket: &str, held: &str, target: &str) -> bool {
+        let guard = crate::object_api::WriteCommitGuard::acquire(
+            &set.new_ns_lock(bucket, held).await.expect("namespace wrapper"),
+            get_lock_acquire_timeout(),
+        )
+        .await
+        .expect("outer write lock");
+        let mut opts = ObjectOptions::default();
+        opts.add_write_commit_guard(&guard);
+        matches!(
+            WriteCommitContext::from_options(&opts, bucket, target, false),
+            Ok(WriteCommitContext::Borrowed(_))
+        )
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn borrowed_write_context_keeps_backslash_spelling_distinct_off_windows() {
+        let (_dirs, _disks, set) = hermetic_set_disks(4).await;
+        assert!(borrowed_write_context_accepts(&set, "bucket", "a/b", "a/b").await);
+        assert!(!borrowed_write_context_accepts(&set, "bucket", "a/b", "a\\b").await);
+        assert!(!borrowed_write_context_accepts(&set, "bucket", "a\\b", "a/b").await);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_borrowed_write_context_accepts_backslash_spelling_of_held_object() {
+        // The guard records the folded lock key; a self-copy through `a\b`
+        // must still prove the namespace it commits into.
+        let (_dirs, _disks, set) = hermetic_set_disks(4).await;
+        assert!(borrowed_write_context_accepts(&set, "bucket", "a/b", "a\\b").await);
+        assert!(borrowed_write_context_accepts(&set, "bucket", "a\\b", "a\\b").await);
+        assert!(borrowed_write_context_accepts(&set, "bucket", "a\\b\\", "a/b").await);
+        assert!(!borrowed_write_context_accepts(&set, "bucket", "a/b", "a/b/c").await);
     }
 
     #[tokio::test]
@@ -22161,6 +24429,387 @@ mod delete_objects_lock_gating_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(shard_integrity_rollout)]
+    async fn conditional_delete_snapshot_preserves_multipart_etag() {
+        use crate::storage_api_contracts::multipart::MultipartOperations as _;
+        let (_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "conditional-multipart-etag";
+        let object = "multipart.bin";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+        let options = ObjectOptions::default();
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &options)
+            .await
+            .expect("create multipart upload");
+        let part = set_disks
+            .put_object_part(
+                bucket,
+                object,
+                &upload.upload_id,
+                1,
+                &mut PutObjReader::from_vec(vec![11; 4097]),
+                &options,
+            )
+            .await
+            .expect("upload the final part");
+        let committed = set_disks
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &options,
+            )
+            .await
+            .expect("complete multipart object");
+        let (snapshot, generation) = set_disks
+            .conditional_delete_current_snapshot(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    metadata_cache_safe: false,
+                    suppress_read_repair: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read current multipart snapshot");
+        let etag = committed.etag.as_deref().expect("multipart ETag");
+        assert!(etag.ends_with("-1"));
+        assert_eq!(snapshot.etag, committed.etag);
+        let condition = crate::storage_api_contracts::object::DeleteObjectCondition::parse(&format!("\"{etag}\""))
+            .expect("quoted response ETag");
+        assert!(condition.matches(snapshot.etag.as_deref().expect("snapshot ETag")));
+        assert!(matches!(generation, crate::disk::CurrentDeleteGeneration::Present { etag: stored, .. } if stored == etag));
+    }
+
+    #[tokio::test]
+    async fn guarded_delete_drive_capability_barrier_waits_for_success_and_cancels_on_error() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use tokio_util::sync::CancellationToken;
+
+        struct ProbeLifetime {
+            active: Arc<AtomicUsize>,
+            dropped: Arc<AtomicUsize>,
+        }
+        impl Drop for ProbeLifetime {
+            fn drop(&mut self) {
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for unsupported in [false, true] {
+            let entered = Arc::new(AtomicUsize::new(0));
+            let active = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let all_entered = Arc::new(tokio::sync::Notify::new());
+            let completed = Arc::new(AtomicUsize::new(0));
+            let two_completed = Arc::new(tokio::sync::Notify::new());
+            let releases: Vec<_> = (0..3).map(|_| CancellationToken::new()).collect();
+            let mutation_started = Arc::new(AtomicBool::new(false));
+            let probes: Vec<_> = releases
+                .iter()
+                .enumerate()
+                .map(|(index, release)| {
+                    let entered = Arc::clone(&entered);
+                    let active = Arc::clone(&active);
+                    let dropped = Arc::clone(&dropped);
+                    let all_entered = Arc::clone(&all_entered);
+                    let completed = Arc::clone(&completed);
+                    let two_completed = Arc::clone(&two_completed);
+                    let release = release.clone();
+                    async move {
+                        active.fetch_add(1, Ordering::SeqCst);
+                        let _lifetime = ProbeLifetime { active, dropped };
+                        if entered.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
+                            all_entered.notify_one();
+                        }
+                        release.cancelled().await;
+                        if completed.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                            two_completed.notify_one();
+                        }
+                        if unsupported && index == 0 {
+                            Err(DiskError::GuardedDeleteUnsupported)
+                        } else {
+                            Ok(())
+                        }
+                    }
+                })
+                .collect();
+            let mutated = Arc::clone(&mutation_started);
+            let operation = tokio::spawn(async move {
+                guarded_delete_capability_barrier(probes).await?;
+                mutated.store(true, Ordering::SeqCst);
+                Ok::<(), StorageError>(())
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), all_entered.notified())
+                .await
+                .expect("all drive probes start concurrently");
+            assert_eq!(entered.load(Ordering::SeqCst), 3);
+            assert_eq!(active.load(Ordering::SeqCst), 3);
+            assert!(!mutation_started.load(Ordering::SeqCst));
+            releases[0].cancel();
+            if !unsupported {
+                releases[1].cancel();
+                tokio::time::timeout(std::time::Duration::from_secs(5), two_completed.notified())
+                    .await
+                    .expect("both released probes complete");
+                assert_eq!(completed.load(Ordering::SeqCst), 2);
+                assert!(!operation.is_finished(), "the last successful probe is required before admission");
+                assert!(!mutation_started.load(Ordering::SeqCst), "unknown capability prevents mutation");
+                releases[2].cancel();
+            }
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), operation)
+                .await
+                .expect("a failed probe does not wait for unreleased peers")
+                .expect("probe task joins");
+            assert_eq!(active.load(Ordering::SeqCst), 0, "no probe lifetime leaks after the barrier returns");
+            assert_eq!(dropped.load(Ordering::SeqCst), 3, "completed and canceled probes release their resources");
+            if unsupported {
+                assert_eq!(result, Err(StorageError::GuardedDeleteUnsupported));
+                assert_eq!(completed.load(Ordering::SeqCst), 1, "unfinished peers are canceled rather than drained");
+                assert!(
+                    !releases[1].is_cancelled() && !releases[2].is_cancelled(),
+                    "the error returns while other peers remain blocked"
+                );
+                assert!(!mutation_started.load(Ordering::SeqCst), "unsupported capability prevents mutation");
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(completed.load(Ordering::SeqCst), 3);
+                assert!(mutation_started.load(Ordering::SeqCst), "all successful probes admit mutation");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_batch_delete_preserves_write_quorum_with_one_faulty_local_drive() {
+        use crate::disk::{CurrentDeleteGeneration, GuardedFileInfoVersions};
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "guarded-faulty-quorum";
+        let object = "object";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create fixture volume");
+        }
+        put_plain_object(&set, bucket, object).await;
+        let disk_info = disks[0]
+            .read_version(bucket, bucket, object, "", &crate::disk::ReadOptions::default())
+            .await
+            .expect("read authoritative disk metadata");
+        let (_, generation) = set
+            .conditional_delete_current_snapshot(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    metadata_cache_safe: false,
+                    suppress_read_repair: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("capture guarded generation");
+        assert_eq!(
+            generation,
+            CurrentDeleteGeneration::from_file_info(&disk_info).expect("disk and set share a generation")
+        );
+        let metadata_path = disks[0]
+            .path()
+            .join(bucket)
+            .join(object)
+            .join(crate::disk::STORAGE_FORMAT_FILE);
+        let before = tokio::fs::read(&metadata_path)
+            .await
+            .expect("read faulty drive's original metadata");
+        disks[0].force_offline_for_test();
+        set.preflight_guarded_delete_versions()
+            .await
+            .expect("local capability is known independently of drive health");
+        let rejected_transaction = Uuid::new_v4();
+        let rejected = disks[0]
+            .delete_versions_guarded_recoverable(
+                bucket,
+                vec![GuardedFileInfoVersions {
+                    group: FileInfoVersions {
+                        name: object.to_owned(),
+                        versions: vec![FileInfo {
+                            name: object.to_owned(),
+                            version_id: disk_info.version_id,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    expected_current: generation.clone(),
+                }],
+                DeleteOptions {
+                    old_data_dir: Some(rejected_transaction),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(
+            rejected,
+            vec![Some(DiskError::FaultyDisk)],
+            "a known capability does not allow mutation on a faulty drive"
+        );
+        let (_, errors) = set
+            .delete_objects(
+                bucket,
+                vec![ObjectToDelete {
+                    object_name: object.to_owned(),
+                    ..Default::default()
+                }],
+                ObjectOptions {
+                    conditional_delete_generations: Some(Arc::new(HashMap::from([(object.to_owned(), generation)]))),
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            errors[0].is_none(),
+            "three healthy drives satisfy the configured write quorum: {errors:?}"
+        );
+        assert_eq!(tokio::fs::read(&metadata_path).await.expect("faulty drive is not mutated"), before);
+        assert!(
+            !metadata_path
+                .parent()
+                .expect("object directory")
+                .join(rejected_transaction.to_string())
+                .exists()
+        );
+        for disk in &disks[1..] {
+            assert!(
+                !disk
+                    .path()
+                    .join(bucket)
+                    .join(object)
+                    .join(crate::disk::STORAGE_FORMAT_FILE)
+                    .exists(),
+                "healthy quorum drives apply the guarded deletion"
+            );
+        }
+        assert!(
+            set.get_object_info(bucket, object, &ObjectOptions::default())
+                .await
+                .err()
+                .is_some_and(|error| is_err_object_not_found(&error)),
+            "the healthy read quorum observes the completed delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_batch_delete_rejects_unadmitted_conditions() {
+        let (_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "conditional-unadmitted";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+        put_plain_object(&set_disks, bucket, "protected").await;
+        let (_, errors) = set_disks
+            .delete_objects(
+                bucket,
+                vec![ObjectToDelete {
+                    object_name: "protected".to_owned(),
+                    delete_condition: Some(crate::storage_api_contracts::object::DeleteObjectCondition::Exists),
+                    ..Default::default()
+                }],
+                ObjectOptions {
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(&errors[0], Some(StorageError::InvalidArgument(_, _, _))));
+        set_disks
+            .get_object_info(bucket, "protected", &ObjectOptions::default())
+            .await
+            .expect("unadmitted condition must not delete");
+    }
+
+    #[tokio::test]
+    async fn conditional_batch_delete_disk_generation_rejects_overwrite_in_mixed_batch() {
+        let (_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "conditional-generation";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+        put_plain_object(&set_disks, bucket, "protected").await;
+        put_plain_object(&set_disks, bucket, "ordinary").await;
+        let (_, generation) = set_disks
+            .conditional_delete_current_snapshot(
+                bucket,
+                "protected",
+                &ObjectOptions {
+                    no_lock: true,
+                    metadata_cache_safe: false,
+                    suppress_read_repair: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("snapshot original generation");
+        let current = set_disks
+            .put_object(
+                bucket,
+                "protected",
+                &mut PutObjReader::from_vec(b"new-current".to_vec()),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("overwrite after snapshot");
+        let (_, errors) = set_disks
+            .delete_objects(
+                bucket,
+                vec![
+                    ObjectToDelete {
+                        object_name: "protected".to_owned(),
+                        ..Default::default()
+                    },
+                    ObjectToDelete {
+                        object_name: "ordinary".to_owned(),
+                        ..Default::default()
+                    },
+                ],
+                ObjectOptions {
+                    conditional_delete_generations: Some(Arc::new(HashMap::from([("protected".to_owned(), generation)]))),
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(errors[0], Some(StorageError::ConditionalDeleteConflict));
+        assert!(errors[1].is_none(), "ordinary group still succeeds: {errors:?}");
+        let after = set_disks
+            .get_object_info(bucket, "protected", &ObjectOptions::default())
+            .await
+            .expect("new data survives stale delete");
+        assert_eq!(after.data_dir, current.data_dir);
+        assert_eq!(after.etag, current.etag);
+        assert!(
+            set_disks
+                .get_object_info(bucket, "ordinary", &ObjectOptions::default())
+                .await
+                .err()
+                .is_some_and(|error| is_err_object_not_found(&error))
+        );
+    }
+
+    #[tokio::test]
     async fn delete_objects_reports_mixed_results_per_key() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "hp8-mixed-bucket";
@@ -22808,7 +25457,7 @@ mod delete_objects_lock_gating_tests {
         }
         put_plain_object(&set_disks, bucket, "obj-a").await;
 
-        let _outer_guard = set_disks
+        let outer_guard = set_disks
             .new_ns_lock(bucket, "obj-a")
             .await
             .expect("namespace lock should be created")
@@ -22821,25 +25470,122 @@ mod delete_objects_lock_gating_tests {
             ..Default::default()
         }];
 
-        let (deleted, errs) = tokio::time::timeout(
-            Duration::from_secs(1),
-            set_disks.delete_objects(
-                bucket,
-                objects,
-                ObjectOptions {
-                    no_lock: true,
-                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
-                        ObjectLockConfigState::ConfirmedAbsent,
-                    ))),
-                    ..Default::default()
-                },
-            ),
-        )
-        .await
-        .expect("no_lock batch delete path must not wait for the outer lock");
+        let lock_manager = set_disks
+            .local_lock_manager
+            .as_fast_lock_manager()
+            .expect("isolated fixture should use the local lock manager");
+        let lock_metrics = lock_manager.get_metrics().shard_metrics;
+        assert_eq!(lock_manager.current_lock_counts(), (1, 0));
+        let mut delete = Box::pin(set_disks.delete_objects(
+            bucket,
+            objects,
+            ObjectOptions {
+                no_lock: true,
+                object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                    ObjectLockConfigState::ConfirmedAbsent,
+                ))),
+                ..Default::default()
+            },
+        ));
+        // Observe lock attempts on every poll: durable disk work can take more
+        // than a second on CI without waiting for the namespace lock at all.
+        let deletion = futures::future::poll_fn(|cx| {
+            let result = std::future::Future::poll(delete.as_mut(), cx);
+            assert_eq!(
+                lock_manager.current_lock_counts(),
+                (1, 0),
+                "no_lock batch delete must preserve the outer holder without adding lock waiters"
+            );
+            let current = lock_manager.get_metrics().shard_metrics;
+            assert_eq!(
+                (current.total_acquisitions(), current.timeouts),
+                (lock_metrics.total_acquisitions(), lock_metrics.timeouts),
+                "no_lock batch delete must not acquire or time out on another namespace lock"
+            );
+            result
+        });
+        let (deleted, errs) = tokio::time::timeout(Duration::from_secs(30), deletion)
+            .await
+            .expect("no_lock batch delete disk work should complete");
 
         assert!(errs[0].is_none(), "no_lock batch delete should not fail with a lock error: {:?}", errs[0]);
         assert!(deleted[0].found, "existing object must still be deleted");
+        for disk in &disk_stores {
+            assert_eq!(
+                disk.read_version("", bucket, "obj-a", "", &crate::disk::ReadOptions::default())
+                    .await
+                    .expect_err("every drive must confirm the deleted version is absent"),
+                DiskError::FileNotFound
+            );
+        }
+        drop(outer_guard);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_delete_objects_batch_waits_on_backslash_alias_lock() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "batch-alias-lock-bucket";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+        put_plain_object(&set_disks, bucket, "a/b").await;
+
+        let outer_guard = set_disks
+            .new_ns_lock(bucket, "a/b")
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("outer write lock should be acquired");
+        let lock_manager = set_disks
+            .local_lock_manager
+            .as_fast_lock_manager()
+            .expect("isolated fixture should use the local lock manager");
+        assert_eq!(lock_manager.current_lock_counts(), (1, 0));
+
+        let objects = vec![ObjectToDelete {
+            object_name: "a\\b".to_string(),
+            ..Default::default()
+        }];
+        let mut delete = Box::pin(set_disks.delete_objects(
+            bucket,
+            objects,
+            ObjectOptions {
+                object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                    ObjectLockConfigState::ConfirmedAbsent,
+                ))),
+                ..Default::default()
+            },
+        ));
+        // `a\b` is the xl.meta of `a/b`: the batch must queue behind the outer
+        // holder instead of taking a second exclusive lock beside it.
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(300),
+            futures::future::poll_fn(|cx| {
+                let result = std::future::Future::poll(delete.as_mut(), cx);
+                // Holders only: the queued batch shows up as a waiter.
+                assert_eq!(
+                    lock_manager.current_lock_counts().0,
+                    1,
+                    "batch delete through `a\\b` must not lock beside the `a/b` holder"
+                );
+                result
+            }),
+        )
+        .await;
+        assert!(blocked.is_err(), "batch delete through `a\\b` must wait for the `a/b` holder");
+
+        drop(outer_guard);
+        let (deleted, errs) = tokio::time::timeout(Duration::from_secs(30), delete)
+            .await
+            .expect("batch delete should finish once the holder releases");
+        assert!(errs[0].is_none(), "batch delete should succeed after the holder releases: {:?}", errs[0]);
+        assert!(deleted[0].found, "`a\\b` must delete the object stored as `a/b`");
+        set_disks
+            .get_object_info(bucket, "a/b", &ObjectOptions::default())
+            .await
+            .expect_err("`a/b` must be gone after deleting `a\\b`");
     }
 }
 
@@ -23333,9 +26079,19 @@ mod marker_purge_receipt_tests {
             .acquire_write_lock_diag("marker_purge_receipt_test", bucket, object)
             .await
             .expect("own the deleted object namespace");
-        set.delete_object_version_with_purge(bucket, object, &marker, true, None, Some(incarnation))
-            .await
-            .expect("seed the real marker on every disk");
+        set.delete_object_version_with_purge(
+            bucket,
+            object,
+            &marker,
+            true,
+            None,
+            DeleteCommitContext {
+                incarnation: Some(incarnation),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed the real marker on every disk");
         let marker = disks[0]
             .read_version("", bucket, object, &version.to_string(), &ReadOptions::default())
             .await
@@ -23353,7 +26109,17 @@ mod marker_purge_receipt_tests {
         set.disks.write().await[0] = None;
         tokio::time::timeout(
             Duration::from_secs(10),
-            set.delete_object_version_with_purge(bucket, object, &request, false, Some(purge.clone()), Some(incarnation)),
+            set.delete_object_version_with_purge(
+                bucket,
+                object,
+                &request,
+                false,
+                Some(purge.clone()),
+                DeleteCommitContext {
+                    incarnation: Some(incarnation),
+                    ..Default::default()
+                },
+            ),
         )
         .await
         .expect("the receipt must not reacquire the deleted object's owner")
@@ -23537,6 +26303,88 @@ mod single_delete_namespace_owner_tests {
         }
     }
 
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn quorum_delete_cleanup_coordinator_binds_single_and_batch() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+
+        for batch in [false, true] {
+            let (_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+            let bucket = "quorum-cleanup-order";
+            let object = "object";
+            let version = Uuid::new_v4();
+            for disk in &disks {
+                disk.make_volume(bucket).await.expect("create fixture bucket");
+            }
+            seed_version(&set, bucket, object, version, &vec![0x51; 256 * 1024]).await;
+            let (observed, observations) = std::sync::mpsc::channel();
+            let mut hooks = Vec::new();
+            for disk in &disks {
+                let fi = disk
+                    .read_version("", bucket, object, &version.to_string(), &ReadOptions::default())
+                    .await
+                    .expect("read seeded version");
+                assert!(!fi.inline_data(), "fixture must reach physical data cleanup");
+                let crate::disk::Disk::Local(local) = disk.as_ref() else {
+                    panic!("local fixture required");
+                };
+                let object_dir = local.get_disk().get_object_path_for_io(bucket, object).expect("object path");
+                let data_dir = object_dir.join(fi.data_dir.expect("seeded data directory").to_string());
+                let observed = observed.clone();
+                hooks.push(hooks::install_at(hooks::Stage::Remove, &data_dir.join("part.1"), move || {
+                    let backup_present = std::fs::read_dir(&object_dir)
+                        .expect("object exists before payload unlink")
+                        .any(|entry| {
+                            entry
+                                .expect("read transaction entry")
+                                .path()
+                                .join(crate::disk::STORAGE_FORMAT_FILE_BACKUP)
+                                .exists()
+                        });
+                    observed.send(backup_present).expect("record actual cleanup order");
+                }));
+            }
+            if batch {
+                let (_, errors) = set
+                    .delete_objects(
+                        bucket,
+                        vec![ObjectToDelete {
+                            object_name: object.to_string(),
+                            version_id: Some(version),
+                            ..Default::default()
+                        }],
+                        ObjectOptions {
+                            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                                ObjectLockConfigState::ConfirmedAbsent,
+                            ))),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                assert!(errors.iter().all(Option::is_none), "batch delete must commit: {errors:?}");
+            } else {
+                set.delete_object_version(
+                    bucket,
+                    object,
+                    &FileInfo {
+                        name: object.to_string(),
+                        version_id: Some(version),
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .await
+                .expect("single delete must commit");
+            }
+            let observations = observations.try_iter().collect::<Vec<_>>();
+            assert_eq!(observations.len(), 4, "all four disks must reach cleanup: batch={batch}");
+            assert!(
+                observations.iter().all(|backup_present| !backup_present),
+                "the coordinator must bind post-quorum cleanup before any payload unlink: batch={batch}"
+            );
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn internal_metadata_mutations_do_not_reenter_pool_metadata() {
@@ -23635,6 +26483,54 @@ mod single_delete_namespace_owner_tests {
         );
     }
 
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn batch_delete_uses_one_namespace_owner_across_object_groups() {
+        let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "batch-delete-namespace";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("fixture bucket");
+        }
+        let mut objects = Vec::new();
+        for key in ["inline", "external"] {
+            let version = Uuid::new_v4();
+            let body = vec![0x41; if key == "inline" { 4096 } else { 256 * 1024 }];
+            seed_version(&set, bucket, key, version, &body).await;
+            objects.push(ObjectToDelete {
+                object_name: key.to_owned(),
+                version_id: Some(version),
+                ..Default::default()
+            });
+        }
+        let before = set.ctx.namespace_commit_generation();
+        assert!(!set.ctx.namespace_commits_pending());
+        let (_, errors, _) = set
+            .delete_objects_with_accounting(
+                bucket,
+                objects,
+                ObjectOptions {
+                    versioned: true,
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(errors.iter().all(Option::is_none), "batch groups must commit: {errors:?}");
+        for dir in &dirs {
+            for key in ["inline", "external"] {
+                assert!(!dir.path().join(bucket).join(key).exists(), "all group evidence must converge");
+            }
+        }
+        assert!(!set.ctx.namespace_commits_pending());
+        assert_eq!(
+            set.ctx.namespace_commit_generation(),
+            before + 2,
+            "all batch groups share one complete owner lifetime"
+        );
+    }
+
     #[cfg(not(windows))]
     async fn assert_single_delete_physical_owner(case: &'static str) {
         use crate::disk::os::prepared_publication_test_hooks as hooks;
@@ -23713,9 +26609,14 @@ mod single_delete_namespace_owner_tests {
             for (index, path) in metadata_paths.iter().enumerate() {
                 let tx = entered_tx.clone();
                 let (release, rx) = std::sync::mpsc::channel::<()>();
-                if last || cleanup {
-                    let source = if cleanup { &cleanup_sources[index] } else { path };
-                    destination_guards.push(hooks::observe_rename_destination(source, move |destination| {
+                if cleanup {
+                    let source = cleanup_sources[index].clone();
+                    guards.push(hooks::install_at(hooks::Stage::Remove, &source.join("part.1"), move || {
+                        let _ = tx.send((index, source));
+                        let _ = rx.recv();
+                    }));
+                } else if last {
+                    destination_guards.push(hooks::observe_rename_destination(path, move |destination| {
                         let _ = tx.send((index, destination.to_path_buf()));
                         let _ = rx.recv();
                     }));
@@ -23786,6 +26687,12 @@ mod single_delete_namespace_owner_tests {
                         if !rollback {
                             assert_eq!(Some(&bytes), original.as_ref());
                         }
+                    }
+                }
+                if cleanup {
+                    for (index, source) in cleanup_sources.iter().enumerate() {
+                        assert_eq!(std::fs::read(source.join("part.1")).expect("paused original shard"), cleanup_parts[index],
+                            "the paused physical cleanup must still own the exact original shard");
                     }
                 }
                 if rollback {
@@ -23864,11 +26771,7 @@ mod single_delete_namespace_owner_tests {
                 if cleanup {
                     assert!(!path.exists(), "metadata must remain deleted after cleanup cancellation");
                     assert!(!cleanup_sources[index].exists(), "physical cleanup must remove the shard directory");
-                    assert_eq!(
-                        std::fs::read(physical_keys[&index].join("part.1")).expect("actual trashed shard"),
-                        cleanup_parts[index],
-                        "trash must contain the exact original shard"
-                    );
+                    assert!(!physical_keys[&index].exists(), "the owned physical cleanup must remove its original shard directory");
                     continue;
                 }
                 if last {
@@ -23976,5 +26879,448 @@ mod single_delete_namespace_owner_tests {
     #[serial_test::serial(capacity_dirty_scope)]
     async fn single_delete_failed_quorum_keeps_owner_until_physical_undo() {
         assert_single_delete_physical_owner("rollback").await;
+    }
+}
+
+#[cfg(test)]
+mod cleanup_receipt_admission_tests {
+    use super::*;
+
+    #[test]
+    fn receipt_admission_skips_only_work_that_the_writer_would_skip() {
+        let old = Uuid::new_v4();
+        let current = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        assert!(!SetDisks::needs_old_data_cleanup_receipt(old, Some(current), None));
+        assert!(!SetDisks::needs_old_data_cleanup_receipt(old, Some(old), Some(epoch)));
+        assert!(SetDisks::needs_old_data_cleanup_receipt(old, Some(current), Some(epoch)));
+        assert!(SetDisks::needs_old_data_cleanup_receipt(old, None, Some(epoch)));
+    }
+}
+
+#[cfg(test)]
+mod crash_delete_retry_tests {
+    use super::*;
+    use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+    use crate::disk::STORAGE_FORMAT_FILE_BACKUP;
+    use crate::storage_api_contracts::bucket::{BucketOperations, DeleteBucketOptions, MakeBucketOptions};
+
+    async fn stage_interrupted_delete(store: &Arc<ECStore>, dirs: &[tempfile::TempDir], bucket: &str, object: &str, size: usize) {
+        let mut reader = PutObjReader::from_vec(vec![37; size]);
+        store
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write the object before simulating an interrupted delete");
+        let transaction = Uuid::new_v4();
+        for dir in dirs {
+            let root = dir.path().join(bucket).join(object);
+            let xl = root.join(STORAGE_FORMAT_FILE);
+            let bytes = tokio::fs::read(&xl).await.expect("read original object metadata");
+            let mut metadata = FileMeta::default();
+            metadata.unmarshal_msg(&bytes).expect("decode original object metadata");
+            let info = metadata.versions[0]
+                .into_fileinfo(bucket, object, false)
+                .expect("read original version");
+            let backup = root.join(transaction.to_string());
+            tokio::fs::create_dir_all(&backup)
+                .await
+                .expect("create transaction directory");
+            tokio::fs::write(backup.join(STORAGE_FORMAT_FILE_BACKUP), bytes)
+                .await
+                .expect("stage intact rollback backup");
+            if let Some(data_dir) = info.data_dir {
+                let parts = root.join(data_dir.to_string());
+                if parts.is_dir() {
+                    tokio::fs::write(
+                        parts.join(format!("{}{}", crate::disk::local::RESERVED_DELETE_DATA_DIR_MARKER_PREFIX, transaction)),
+                        [],
+                    )
+                    .await
+                    .expect("reserve external deletion before its local commit");
+                }
+            }
+            tokio::fs::remove_file(&xl)
+                .await
+                .expect("simulate crash after removing metadata");
+        }
+    }
+
+    #[tokio::test]
+    async fn crash_delete_retry_single_reclaims_inline_backup_only() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "crash-delete-single";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create authoritative bucket");
+        stage_interrupted_delete(&store, &dirs, bucket, "inline", 4096).await;
+        store
+            .delete_object(bucket, "inline", ObjectOptions::default())
+            .await
+            .expect("retry should reclaim the exact missing key");
+        for dir in &dirs {
+            assert!(
+                !dir.path().join(bucket).join("inline").exists(),
+                "inline backup residue must be removed on every disk"
+            );
+        }
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("the empty bucket must be deletable without force");
+    }
+
+    #[tokio::test]
+    async fn crash_delete_retry_batch_reclaims_inline_and_reserved_external() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "crash-delete-batch";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create authoritative bucket");
+        stage_interrupted_delete(&store, &dirs, bucket, "inline", 4096).await;
+        stage_interrupted_delete(&store, &dirs, bucket, "external", 1024 * 1024).await;
+        let objects = ["inline", "external"]
+            .into_iter()
+            .map(|name| ObjectToDelete {
+                object_name: name.to_string(),
+                ..Default::default()
+            })
+            .collect();
+        let (_, errors) = store.delete_objects(bucket, objects, ObjectOptions::default()).await;
+        assert!(
+            errors.iter().all(Option::is_none),
+            "retry must complete for both crash shapes: {errors:?}"
+        );
+        for dir in &dirs {
+            for object in ["inline", "external"] {
+                assert!(!dir.path().join(bucket).join(object).exists(), "retry must remove {object} on every disk");
+            }
+        }
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("batch retry must unblock non-force bucket deletion");
+    }
+
+    #[tokio::test]
+    async fn crash_delete_retry_preserves_conditional_and_versioned_residue() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "crash-delete-gates";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create authoritative bucket");
+        stage_interrupted_delete(&store, &dirs, bucket, "inline", 4096).await;
+        for opts in [
+            ObjectOptions {
+                http_preconditions: Some(HTTPPreconditions {
+                    if_match: Some("old-etag".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ObjectOptions {
+                version_id: Some(Uuid::new_v4().to_string()),
+                ..Default::default()
+            },
+        ] {
+            let _ = store.delete_object(bucket, "inline", opts).await;
+            for dir in &dirs {
+                assert!(
+                    dir.path().join(bucket).join("inline").exists(),
+                    "conditional/version-specific deletes must retain ambiguous backups"
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn crash_delete_retry_preserves_suspended_bucket_null_backup() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "crash-delete-suspended";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create authoritative bucket");
+        stage_interrupted_delete(&store, &dirs, bucket, "inline", 4096).await;
+        metadata_sys::update_in(&store.ctx, bucket, crate::bucket::metadata::BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Suspended</Status></VersioningConfiguration>".to_vec())
+            .await.expect("persist suspended versioning state");
+        let _ = store.delete_object(bucket, "inline", ObjectOptions::default()).await;
+        for dir in &dirs {
+            assert!(
+                dir.path().join(bucket).join("inline").exists(),
+                "authoritative suspended state must protect a null-version backup"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn crash_delete_retry_rejects_stale_bucket_incarnation_at_set_boundary() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "crash-delete-incarnation";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create authoritative bucket");
+        stage_interrupted_delete(&store, &dirs, bucket, "inline", 4096).await;
+        let error = store.pools[0].disk_set[0]
+            .delete_object(
+                bucket,
+                "inline",
+                ObjectOptions {
+                    expected_bucket_incarnation_id: Some(Uuid::new_v4()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the set must reject a stale authorized bucket identity");
+        assert!(
+            matches!(error, StorageError::BucketNotFound(_)),
+            "identity mismatch must retain its typed error: {error:?}"
+        );
+        for dir in &dirs {
+            assert!(
+                dir.path().join(bucket).join("inline").exists(),
+                "a stale request must leave every backup intact"
+            );
+        }
+    }
+    #[tokio::test]
+    #[serial_test::serial(shard_integrity_rollout)]
+    async fn batch_delete_completed_multipart_reclaims_native_part_sidecars() {
+        assert_completed_multipart_delete_reclaims_sidecars(false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(shard_integrity_rollout)]
+    async fn batch_delete_completed_multipart_reclaims_protected_part_sidecars() {
+        assert_completed_multipart_delete_reclaims_sidecars(true).await;
+    }
+
+    async fn assert_completed_multipart_delete_reclaims_sidecars(protected: bool) {
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_SHARD_INTEGRITY_WRITE, Some(if protected { "true" } else { "false" })),
+                (
+                    rustfs_config::ENV_SHARD_INTEGRITY_FLEET_CONFIRMED,
+                    Some(if protected { "true" } else { "false" }),
+                ),
+            ],
+            assert_completed_multipart_delete_reclaims_sidecars_inner(protected),
+        )
+        .await;
+    }
+
+    async fn assert_completed_multipart_delete_reclaims_sidecars_inner(protected: bool) {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "multipart-delete-cleanup";
+        let object = "completed-object";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let upload = store
+            .new_multipart_upload(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create native multipart upload");
+        let mut reader = PutObjReader::from_vec(vec![37; 6 * 1024 * 1024]);
+        let part = store
+            .put_object_part(bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("write native part");
+        store
+            .clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("complete native multipart upload");
+        for dir in &dirs {
+            let bytes = tokio::fs::read(dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("completed metadata");
+            let mut metadata = FileMeta::default();
+            metadata.unmarshal_msg(&bytes).expect("decode completed metadata");
+            let mut info = metadata.versions[0]
+                .into_fileinfo(bucket, object, true)
+                .expect("completed version");
+            info.hydrate_shard_integrity()
+                .expect("decode native completed integrity descriptor");
+            let path = dir
+                .path()
+                .join(bucket)
+                .join(object)
+                .join(info.data_dir.expect("external multipart directory").to_string());
+            assert!(path.join("part.1.meta").exists(), "real multipart completion retains its native sidecar");
+            let integrity = info.parts[0].integrity.as_ref();
+            assert_eq!(integrity.is_some(), protected, "completion must retain the selected native format");
+            if let Some(integrity) = integrity {
+                assert!(
+                    path.join(integrity.file_name()).exists(),
+                    "real protected completion retains its integrity proof"
+                );
+            }
+        }
+        let (_, errors) = store
+            .delete_objects(
+                bucket,
+                vec![ObjectToDelete {
+                    object_name: object.to_string(),
+                    ..Default::default()
+                }],
+                ObjectOptions::default(),
+            )
+            .await;
+        assert!(errors.iter().all(Option::is_none), "native batch delete must succeed: {errors:?}");
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("successful multipart delete must permit ordinary bucket removal");
+        for dir in &dirs {
+            assert!(
+                !dir.path().join(bucket).exists(),
+                "bucket and completed part sidecars must be removed on every disk"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod delete_recovery_inventory_tests {
+    use super::*;
+    use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+    use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+    use std::future::Future;
+    use std::task::Poll;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn batch_delete_completes_with_queued_disk_renewal() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let set = store.pools[0].disk_set[0].clone();
+        let disks = set.disk_inventory().await.into_iter().flatten().collect::<Vec<_>>();
+        let bucket = "batch-delete-renew";
+        let object = "existing-inline-version";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create authoritative real bucket");
+        store
+            .put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(vec![0x73; 4096]),
+                &ObjectOptions {
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed actual version");
+        let endpoint = set.set_endpoints[0].clone();
+        let ctx = crate::runtime::global::current_ctx();
+        let was_dist = ctx.is_dist_erasure().await;
+        if was_dist {
+            ctx.update_erasure_type(crate::layout::endpoints::SetupType::Erasure).await;
+        }
+        let map = ctx.local_disk_map();
+        let previous = map.read().await.get(&endpoint.to_string()).cloned();
+
+        let barrier = DeleteCleanupBarrier::install(bucket);
+        let delete_store = store.clone();
+        let mut deletion = tokio::spawn(async move {
+            delete_store
+                .delete_objects(
+                    bucket,
+                    vec![ObjectToDelete {
+                        object_name: object.to_owned(),
+                        ..Default::default()
+                    }],
+                    ObjectOptions::default(),
+                )
+                .await
+        });
+        barrier.wait_until_paused().await;
+        let extra_gate = set.disks.read().await;
+        let mut renewal = Box::pin(set.renew_disk(&endpoint));
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            futures::future::poll_fn(|cx| {
+                assert!(
+                    std::pin::pin!(tokio::task::unconstrained(renewal.as_mut()))
+                        .poll(cx)
+                        .is_pending(),
+                    "real renewal must reach inventory write"
+                );
+                if set.disks.try_read().is_err() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("queue real renewal writer");
+        let connected = map
+            .read()
+            .await
+            .get(&endpoint.to_string())
+            .cloned()
+            .flatten()
+            .expect("renewal registered new handle");
+        assert!(!Arc::ptr_eq(&connected, &disks[0]));
+        drop(extra_gate);
+        barrier.release();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(renewal.as_mut(), &mut deletion) }).await;
+        if outcome.is_err() {
+            deletion.abort();
+        }
+        drop(renewal);
+        if outcome.is_err() {
+            let _ = deletion.await;
+        }
+        {
+            let mut map = map.write().await;
+            match previous {
+                Some(old) => {
+                    map.insert(endpoint.to_string(), old);
+                }
+                None => {
+                    map.remove(&endpoint.to_string());
+                }
+            }
+        }
+        if was_dist {
+            ctx.update_erasure_type(crate::layout::endpoints::SetupType::DistErasure)
+                .await;
+        }
+        let (_, result) =
+            outcome.expect("batch DELETE and real queued disk renewal must finish without nested inventory-read deadlock");
+        let (_, errors) = result.expect("delete task must finish");
+        assert!(errors.iter().all(Option::is_none), "DELETE result must remain successful: {errors:?}");
     }
 }

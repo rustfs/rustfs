@@ -204,6 +204,8 @@ fn remove_source_replication_bookkeeping(user_defined: &mut HashMap<String, Stri
     }
 }
 
+#[cfg(test)]
+mod conditional_read_bench;
 mod copy;
 mod delete;
 mod extract;
@@ -237,7 +239,6 @@ use self::test_support::*;
 
 use std::collections::HashMap;
 use std::io;
-use std::ops::Add;
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};

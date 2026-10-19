@@ -152,7 +152,7 @@ pub struct ObjectLockConfigSnapshot {
     config_revision: Option<OffsetDateTime>,
     state: crate::bucket::metadata_sys::ObjectLockConfigState,
     lifecycle_fence: NamespaceLockFence,
-    _lifecycle_guard: Option<rustfs_lock::NamespaceLockGuard>,
+    _lifecycle_guard: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
     metadata_transaction_guard: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
 }
 
@@ -210,8 +210,33 @@ impl ObjectLockConfigSnapshot {
             config_revision: Some(config_revision),
             state,
             lifecycle_fence,
-            _lifecycle_guard: Some(lifecycle_guard),
+            _lifecycle_guard: Some(Arc::new(lifecycle_guard)),
             metadata_transaction_guard: Some(Arc::new(metadata_transaction_guard)),
+        }
+    }
+
+    pub(crate) fn for_store_bucket_under_lifecycle_owner(
+        store_id: Uuid,
+        bucket: &str,
+        bucket_incarnation_id: Uuid,
+        config_revision: OffsetDateTime,
+        state: crate::bucket::metadata_sys::ObjectLockConfigState,
+        lifecycle_guard: Arc<rustfs_lock::NamespaceLockGuard>,
+        metadata_transaction_guard: Arc<rustfs_lock::NamespaceLockGuard>,
+    ) -> Self {
+        let mut lifecycle_fence = NamespaceLockFence::new();
+        if let Some(signal) = lifecycle_guard.lock_lost_signal() {
+            lifecycle_fence.add_signal(signal);
+        }
+        Self {
+            store_id: Some(store_id),
+            bucket: Some(bucket.to_owned()),
+            bucket_incarnation_id: Some(bucket_incarnation_id),
+            config_revision: Some(config_revision),
+            state,
+            lifecycle_fence,
+            _lifecycle_guard: Some(lifecycle_guard),
+            metadata_transaction_guard: Some(metadata_transaction_guard),
         }
     }
 
@@ -912,6 +937,10 @@ pub enum WriteCompletion {
     /// Drain the rename fan-out before returning. Minority failures still heal
     /// after a successful quorum commit; this does not require every disk to succeed.
     TailDrained,
+    /// Drain the rename fan-out and return system-metadata repair to the
+    /// caller's existing deployment/transaction owner. This does not grant
+    /// write or heal authority and does not change the quorum requirement.
+    TailDrainedWithOwnerRepair,
 }
 
 /// Storage-owned write mode inherited by physical rewrites. This selects the
@@ -936,6 +965,10 @@ pub struct ObjectOptions {
     /// Lifecycle-only staged purge request checked under the object write lock.
     #[doc(hidden)]
     pub lifecycle_delete_all: Option<LifecycleDeleteAllRequest>,
+    /// Policy observed by lifecycle evaluation, checked under the metadata
+    /// transaction lock before logical deletion. Not persisted or sent over RPC.
+    #[doc(hidden)]
+    pub lifecycle_expiry_policy: Option<rustfs_lifecycle::ExpiryPolicySnapshot>,
     #[doc(hidden)]
     pub lifecycle_delete_all_journal: Option<Arc<parking_lot::Mutex<LifecycleDeleteAllJournalState>>>,
     /// Whole-operation authorization created only by consuming a validated
@@ -955,6 +988,15 @@ pub struct ObjectOptions {
     /// Ordinary ECStore PUT target bound to its bucket's immutable artifact namespace.
     #[doc(hidden)]
     pub artifact_put_target: Option<Arc<crate::bucket::artifact::ArtifactPutTarget>>,
+    /// In-process delete ownership for late filesystem completion. Never
+    /// serialized or copied into object metadata.
+    #[doc(hidden)]
+    pub delete_mutation_owner: Option<Arc<dyn Send + Sync>>,
+    /// Pool-local generations for admitted current-object conditional actions.
+    /// Ordinary actions execute in a separate phase without this transient map.
+    /// This must never be populated from client metadata.
+    #[doc(hidden)]
+    pub conditional_delete_generations: Option<Arc<HashMap<String, crate::disk::CurrentDeleteGeneration>>>,
     /// Internal read-only inspection must not enqueue metadata or payload repairs.
     pub suppress_read_repair: bool,
     /// Control-plane writers that immediately read or CAS the same namespace
@@ -1022,6 +1064,9 @@ pub struct ObjectOptions {
     /// Actual generation owner retained by storage commits and their physical tails.
     #[doc(hidden)]
     pub bucket_incarnation_fence: Option<Arc<crate::store::BucketIncarnationFenceGuard>>,
+    /// Retains the actual lifecycle guard for an owned multipart commit. A
+    /// lock-loss fence alone does not keep a cancelled caller's lock alive.
+    pub bucket_lifecycle_lock_owner: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
     pub replication_request: bool,
     /// True when the inbound request carried the
     /// `{x-rustfs-,x-minio-}source-proxy-request` header family with the
@@ -1178,8 +1223,11 @@ impl std::fmt::Debug for ObjectOptions {
             .field("http_preconditions", &self.http_preconditions.is_some())
             .field("delete_replication", &self.delete_replication.is_some())
             .field("delete_replication_config_snapshot", &self.delete_replication_config_snapshot)
+            .field("delete_mutation_owner", &self.delete_mutation_owner.is_some())
+            .field("conditional_delete_generations", &self.conditional_delete_generations.is_some())
             .field("namespace_lock_fence", &self.namespace_lock_fence.is_some())
             .field("bucket_lifecycle_lock_fence", &self.bucket_lifecycle_lock_fence.is_some())
+            .field("bucket_lifecycle_lock_owner", &self.bucket_lifecycle_lock_owner.is_some())
             .field("replication_request", &self.replication_request)
             .field("proxy_request", &self.proxy_request)
             .field("proxy_header_set", &self.proxy_header_set)

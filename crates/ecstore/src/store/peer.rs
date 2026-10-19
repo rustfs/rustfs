@@ -16,11 +16,17 @@ use super::*;
 use crate::bucket::utils::has_bad_path_component;
 use crate::disk::error::{DiskError, Result as DiskResult};
 use crate::disk::{
-    DeleteOptions, Disk, LegacyFileWrite, LegacyMetadataWrite, LegacyPartMutation, LegacyPartOperation, LegacyPathDelete,
-    LegacyPathDeleteOperation, LegacyRenameData, LegacyRenameFile, RenameDataGuards, RenameDataResp,
+    DeleteOptions, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, Disk, GuardedDeleteVersionsPayload, LegacyFileWrite,
+    LegacyMetadataWrite, LegacyPartMutation, LegacyPartOperation, LegacyPathDelete, LegacyPathDeleteOperation, LegacyRenameData,
+    LegacyRenameFile, RenameDataGuards, RenameDataResp,
 };
 use crate::runtime::instance::{InstanceContext, NamespaceCommitGuard};
 use crate::runtime::sources as runtime_sources;
+use rustfs_io_metrics::{
+    PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_ADMIT, PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_LOCAL_RENAME,
+    PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_LOOKUP, PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_OVERHEAD,
+    PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_TOTAL,
+};
 use tracing::{debug, error};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -36,6 +42,26 @@ pub struct BootstrapLocalTarget {
 }
 
 impl BootstrapLocalTarget {
+    pub async fn recover_local_delete_transaction(
+        &self,
+        disk_ref: &str,
+        volume: &str,
+        operation: DeleteRecoveryRpcOperation,
+    ) -> DiskResult<DeleteRecoveryRpcReply> {
+        validate_bootstrap_volume(volume)?;
+        recover_local_delete_transaction_with_ctx(&self.ctx, disk_ref, volume, operation, None).await
+    }
+
+    pub async fn guarded_local_delete_versions(
+        &self,
+        disk_ref: &str,
+        volume: &str,
+        payload: GuardedDeleteVersionsPayload,
+    ) -> DiskResult<Vec<Option<DiskError>>> {
+        validate_bootstrap_volume(volume)?;
+        guarded_local_delete_versions_with_ctx(&self.ctx, disk_ref, volume, payload, None).await
+    }
+
     pub async fn begin_legacy_local_file_write(
         &self,
         disk: &DiskStore,
@@ -202,6 +228,24 @@ fn validate_artifact_repair_target(target: (&str, &str), fi: &FileInfo, disk: Uu
 }
 
 impl ECStore {
+    pub async fn recover_local_delete_transaction(
+        &self,
+        disk_ref: &str,
+        volume: &str,
+        operation: DeleteRecoveryRpcOperation,
+    ) -> DiskResult<DeleteRecoveryRpcReply> {
+        recover_local_delete_transaction_with_ctx(&self.ctx, disk_ref, volume, operation, Some(self)).await
+    }
+
+    pub async fn guarded_local_delete_versions(
+        &self,
+        disk_ref: &str,
+        volume: &str,
+        payload: GuardedDeleteVersionsPayload,
+    ) -> DiskResult<Vec<Option<DiskError>>> {
+        guarded_local_delete_versions_with_ctx(&self.ctx, disk_ref, volume, payload, Some(self)).await
+    }
+
     pub async fn begin_legacy_local_file_write(
         &self,
         disk: &DiskStore,
@@ -496,6 +540,13 @@ impl ECStore {
         Ok(expected_disk)
     }
 
+    /// Resolve a quota lease against this request's captured storage instance.
+    pub async fn quota_mutation_fence_disk(&self, disk_ref: &str) -> DiskResult<DiskStore> {
+        let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
+        let _owner = admit_local_disk(&self.ctx, &disk, id, false).await?;
+        Ok(disk)
+    }
+
     pub async fn write_local_metadata_at_incarnation(
         self: &Arc<Self>,
         disk_ref: &str,
@@ -692,6 +743,104 @@ impl ECStore {
     }
 }
 
+async fn recover_local_delete_transaction_with_ctx(
+    ctx: &Arc<InstanceContext>,
+    disk_ref: &str,
+    volume: &str,
+    operation: DeleteRecoveryRpcOperation,
+    authority: Option<&ECStore>,
+) -> DiskResult<DeleteRecoveryRpcReply> {
+    match operation {
+        DeleteRecoveryRpcOperation::ApplyVersion {
+            object,
+            file_info,
+            force_del_marker,
+            mut opts,
+        } => {
+            crate::disk::validate_delete_recovery_options(&opts)?;
+            if object.starts_with('/') {
+                return Err(DiskError::InvalidPath);
+            }
+            let write = begin_legacy_local_metadata_mutation_with_ctx(ctx, disk_ref, volume, &object).await?;
+            // Classify only after this exact physical volume is admitted. The
+            // capability retains the same owner through publication and its tail.
+            if let Some(store) = authority {
+                store.reject_legacy_artifact_mutation(volume).await?;
+            }
+            opts.recoverable_delete = true;
+            write.stage_delete_version(*file_info, force_del_marker, opts).await?;
+            Ok(DeleteRecoveryRpcReply::AppliedVersion)
+        }
+        DeleteRecoveryRpcOperation::ApplyVersions { versions, mut opts } => {
+            crate::disk::validate_delete_recovery_options(&opts)?;
+            if versions.iter().any(|version| version.name.starts_with('/')) {
+                return Err(DiskError::InvalidPath);
+            }
+            let write = begin_legacy_local_delete_versions_with_ctx(ctx, disk_ref, volume).await?;
+            if let Some(store) = authority {
+                store.reject_legacy_artifact_mutation(volume).await?;
+            }
+            opts.recoverable_delete = true;
+            let errors = write.delete_versions(versions, opts).await;
+            Ok(DeleteRecoveryRpcReply::AppliedVersions(
+                errors.into_iter().map(|error| error.map(|error| error.to_u32())).collect(),
+            ))
+        }
+        DeleteRecoveryRpcOperation::Settle {
+            object,
+            transaction,
+            expected_fingerprint,
+            action,
+        } => {
+            let write = begin_legacy_local_metadata_mutation_with_ctx(ctx, disk_ref, volume, &object).await?;
+            if let Some(store) = authority {
+                store.reject_legacy_artifact_mutation(volume).await?;
+            }
+            write
+                .settle_delete_transaction(transaction, expected_fingerprint, action)
+                .await
+                .map(DeleteRecoveryRpcReply::Settled)
+        }
+        operation => {
+            let disk = local_mutation_disk(ctx, disk_ref).await?;
+            match operation {
+                DeleteRecoveryRpcOperation::Exists { object } => disk
+                    .has_delete_transaction_evidence(volume, &object)
+                    .await
+                    .map(|present| DeleteRecoveryRpcReply::Evidence { present }),
+                DeleteRecoveryRpcOperation::InspectOrphanDataDir { path } => disk
+                    .is_plain_orphan_data_dir(volume, &path)
+                    .await
+                    .map(|plain| DeleteRecoveryRpcReply::OrphanDataDir { plain }),
+                DeleteRecoveryRpcOperation::Discover { object, cursor, limit } => disk
+                    .discover_delete_transactions(volume, object.as_deref(), cursor, limit)
+                    .await
+                    .map(DeleteRecoveryRpcReply::Discovered),
+                DeleteRecoveryRpcOperation::Inspect { object, transaction } => disk
+                    .inspect_delete_transaction(volume, &object, transaction)
+                    .await
+                    .map(DeleteRecoveryRpcReply::Inspected),
+                _ => Err(DiskError::Unexpected),
+            }
+        }
+    }
+}
+
+async fn guarded_local_delete_versions_with_ctx(
+    ctx: &Arc<InstanceContext>,
+    disk_ref: &str,
+    volume: &str,
+    payload: GuardedDeleteVersionsPayload,
+    authority: Option<&ECStore>,
+) -> DiskResult<Vec<Option<DiskError>>> {
+    payload.validate()?;
+    let write = begin_legacy_local_delete_versions_with_ctx(ctx, disk_ref, volume).await?;
+    if let Some(store) = authority {
+        store.reject_legacy_artifact_mutation(volume).await?;
+    }
+    Ok(write.delete_versions_guarded(payload.versions, payload.opts).await)
+}
+
 async fn local_mutation_disk(ctx: &Arc<InstanceContext>, disk_ref: &str) -> DiskResult<DiskStore> {
     let (disk, id) = local_disk_candidate(ctx, disk_ref).await?;
     admit_local_disk(ctx, &disk, id, false).await?;
@@ -777,15 +926,38 @@ async fn rename_local_data_with_ctx(
     destination: (&str, &str),
     mut guards: RenameDataGuards,
 ) -> DiskResult<RenameDataResp> {
+    let handler_started = rustfs_io_metrics::put_stage_timer();
+    let lookup_started = rustfs_io_metrics::put_stage_timer();
     let (disk, disk_id) = local_disk_candidate(ctx, disk_ref).await?;
+    let lookup_ms = lookup_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
+    if let Some(duration_ms) = lookup_ms {
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_LOOKUP, duration_ms);
+    }
     let mutates_namespace = !is_meta_bucketname(source.0) || !is_meta_bucketname(destination.0);
+    let admit_started = rustfs_io_metrics::put_stage_timer();
     let owner = admit_local_disk(ctx, &disk, disk_id, mutates_namespace).await?;
+    let admit_ms = admit_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
+    if let Some(duration_ms) = admit_ms {
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_ADMIT, duration_ms);
+    }
     guards.namespace_owner = owner.as_ref().map(|owner| owner.clone() as Arc<dyn Send + Sync>);
+    let local_rename_started = rustfs_io_metrics::put_stage_timer();
     let result = disk
         .rename_data_borrowed_with_fence_observed(source.0, source.1, fi, destination.0, destination.1, guards)
         .await
         .result;
+    let local_rename_ms = local_rename_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
+    if let Some(duration_ms) = local_rename_ms {
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_LOCAL_RENAME, duration_ms);
+    }
     drop(owner);
+    if let Some(handler_started) = handler_started {
+        let handler_ms = handler_started.elapsed().as_secs_f64() * 1000.0;
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_TOTAL, handler_ms);
+        let child_ms = lookup_ms.unwrap_or(0.0) + admit_ms.unwrap_or(0.0) + local_rename_ms.unwrap_or(0.0);
+        let overhead_ms = (handler_ms - child_ms).max(0.0);
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_OVERHEAD, overhead_ms);
+    }
     result
 }
 
@@ -2521,7 +2693,9 @@ mod tests {
     #[serial_test::serial]
     async fn target_ordinary_timeout_keeps_its_physical_namespace_owner() {
         use crate::disk::os::prepared_publication_test_hooks as hooks;
-        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("1"))], async {
+        // Allow real fixture I/O to finish under load. Expire the operation
+        // with virtual time only after its physical publication is paused.
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("60"))], async {
             let ctx = Arc::new(InstanceContext::new());
             let store = super::super::tests::build_store_with_ctx(ctx.clone());
             let root = tempfile::tempdir().expect("root");
@@ -2555,7 +2729,7 @@ mod tests {
             .await
             .expect("bounded entry");
             tokio::time::pause();
-            tokio::time::advance(std::time::Duration::from_secs(2)).await;
+            tokio::time::advance(std::time::Duration::from_secs(61)).await;
             tokio::time::resume();
             let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut rename)
                 .await

@@ -349,6 +349,8 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::PUT, "/v3/restore-config-history-kv"),
         admin_route(Method::GET, "/v3/config"),
         admin_route(Method::PUT, "/v3/config"),
+        admin_route(Method::GET, "/v3/tls/certificate-state"),
+        admin_route(Method::POST, "/v3/tls/certificate"),
         admin_route(Method::GET, "/v3/scanner/status"),
         admin_route(Method::POST, "/v3/scanner/cycle-state/reset"),
         admin_route(Method::POST, "/v3/scanner/usage-state/reset"),

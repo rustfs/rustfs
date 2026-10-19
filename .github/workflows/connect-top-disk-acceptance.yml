@@ -68,6 +68,14 @@ jobs:
           ref: ${{ inputs.connect_sha }}
           token: ${{ secrets.PF_TESTING_GH_TOKEN }}
 
+      - name: Set up Docker Compose
+        uses: ./.github/actions/setup-docker-compose
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -138,7 +146,7 @@ jobs:
           ' <<<"$run" >/dev/null
           jobs=$(gh api --paginate --slurp "repos/rustfs/rustfs/actions/runs/${BUILD_RUN_ID}/jobs?per_page=100")
           jq -e '
-            [.[].jobs[] | select(.name | test("^Build RustFS \\(linux-x86_64-gnu, [a-z0-9-]+, x86_64-unknown-linux-gnu, false, linux, pyroscope\\)$"))] as $matches
+            [.[].jobs[] | select(.name | test("^Build RustFS \\(linux-x86_64-gnu\\)$"))] as $matches
             | ($matches | length) == 1 and $matches[0].conclusion == "success"
           ' <<<"$jobs" >/dev/null
           artifact=$(gh api "repos/rustfs/rustfs/actions/artifacts/${ARTIFACT_ID}")
@@ -183,7 +191,7 @@ jobs:
               assert outer.testzip() is None
               with zipfile.ZipFile(io.BytesIO(outer.read(package))) as inner:
                   entries = inner.infolist()
-                  expected = {'rustfs', 'rustfs-cli', 'rustfs.cpu-symbol-catalog.json', 'rustfs.cpu-symbol-catalog.sha256'}
+                  expected = {'rustfs', 'rustfs.cpu-symbol-catalog.json', 'rustfs.cpu-symbol-catalog.sha256'}
                   assert {entry.filename for entry in entries} == expected and len(entries) == len(expected)
                   assert all(regular(entry) and 0 < entry.file_size <= 1073741824 for entry in entries)
                   assert inner.testzip() is None
@@ -213,7 +221,7 @@ jobs:
           npm --prefix connect-harness/web ci
           connect-harness/web/node_modules/.bin/playwright install --with-deps chromium
           make -C connect-harness e2e-connected-dispatch-check
-          RUSTFS_BINARY="$GITHUB_WORKSPACE/binary/rustfs" \
+          TMPDIR="$GITHUB_WORKSPACE" RUSTFS_BINARY="$GITHUB_WORKSPACE/binary/rustfs" \
             RUSTFS_WORKTREE="$GITHUB_WORKSPACE/rustfs-source" \
             CONNECT_E2E_TOP_DISK_EVIDENCE="$GITHUB_WORKSPACE/top-disk-service-job-evidence.json" \
             make -C connect-harness e2e-connected E2E_SCENARIO=top-disk

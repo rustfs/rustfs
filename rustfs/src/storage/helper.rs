@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::module_switches::{is_audit_module_enabled, is_notify_module_enabled};
-use crate::shared_types::convert_ecstore_object_info;
+use crate::shared_types::{RemoteAddr, convert_ecstore_object_info};
 use crate::storage::access::{ReqInfo, request_context_from_req};
 use crate::storage::request_context::RequestContext;
 use crate::storage::sse::KmsRequestAuditScope;
@@ -33,6 +33,7 @@ use rustfs_s3_types::EventName;
 use rustfs_targets::{
     extract_params_header, extract_req_params, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
 };
+use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::headers::AMZ_REQUEST_ID;
 use s3s::{S3Request, S3Response, S3Result};
 use serde_json::Value;
@@ -150,15 +151,6 @@ impl OperationHelper {
             .filter(|value| !value.is_empty())
             .unwrap_or(path_object_key);
 
-        // Infer remote address
-        let remote_host = req
-            .headers
-            .get(rustfs_utils::http::X_FORWARDED_FOR)
-            .and_then(|v| v.to_str().ok())
-            .or_else(|| req.headers.get(rustfs_utils::http::X_REAL_IP).and_then(|v| v.to_str().ok()))
-            .unwrap_or("")
-            .to_string();
-
         let trigger = op.as_str();
 
         // Initialize audit builder
@@ -179,15 +171,30 @@ impl OperationHelper {
         let request_id = request_context.request_id.clone();
 
         let audit_builder = if audit_enabled {
-            Some(
-                AuditEntryBuilder::new("1.0", event, trigger, api_builder.clone().build())
-                    .remote_host(remote_host)
-                    .user_agent(get_request_user_agent(&req.headers))
-                    .req_host(get_request_host(&req.headers))
-                    .req_path(req.uri.path().to_string())
-                    .req_query(extract_req_params(req))
-                    .request_id(&request_id),
-            )
+            let remote_host = req
+                .extensions
+                .get::<ClientInfo>()
+                .map(|info| info.real_ip.to_string())
+                .or_else(|| {
+                    req.extensions
+                        .get::<Option<RemoteAddr>>()
+                        .and_then(|addr| addr.map(|addr| addr.0.ip().to_string()))
+                })
+                .unwrap_or_default();
+            let mut builder = AuditEntryBuilder::new("1.0", event, trigger, api_builder.clone().build())
+                .remote_host(remote_host)
+                .user_agent(get_request_user_agent(&req.headers))
+                .req_host(get_request_host(&req.headers))
+                .req_path(req.uri.path().to_string())
+                .req_query(extract_req_params(req))
+                .request_id(&request_id);
+            if let Some(cred) = req_info
+                .and_then(|info| info.cred.as_ref())
+                .filter(|cred| !cred.access_key.is_empty())
+            {
+                builder = builder.access_key(&cred.access_key);
+            }
+            Some(builder)
         } else {
             None
         };
@@ -344,10 +351,6 @@ impl OperationHelper {
             }
             if let Some(err) = error_msg {
                 final_builder = final_builder.error(err);
-            }
-
-            if let Some(cred) = runtime_sources::current_action_credentials() {
-                final_builder = final_builder.access_key(&cred.access_key);
             }
 
             // Inject OpenTelemetry trace context into audit tags for distributed tracing correlation
@@ -568,6 +571,133 @@ mod tests {
                 assert_eq!(event_args.object.name, "prefix/issue-2292.txt");
                 assert_eq!(event_args.version_id, "version-123");
                 assert_eq!(event_args.req_params.get("principalId").map(String::as_str), Some("notifyTag"));
+            },
+        );
+    }
+
+    #[test]
+    fn operation_helper_audits_the_authenticated_request_identity() {
+        with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("false")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+            ],
+            || {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+
+                for (access_key, parent_user) in [
+                    (Some("testuser"), ""),
+                    (Some("rustfsadmin"), ""),
+                    (Some("service-account"), "testuser"),
+                    (Some("sts-session"), "testuser"),
+                    (None, ""),
+                    (Some(""), ""),
+                ] {
+                    let expected_access_key = access_key.filter(|key| !key.is_empty());
+                    for outcome in [None, Some(true), Some(false)] {
+                        let input = GetObjectInput::builder()
+                            .bucket("audit-bucket".to_string())
+                            .key("object.txt".to_string())
+                            .build()
+                            .expect("get object input should build");
+                        let mut req = build_request(input, Method::GET, Uri::from_static("/audit-bucket/object.txt"));
+                        req.extensions.insert(ReqInfo {
+                            cred: access_key.map(|key| Credentials {
+                                access_key: key.to_string(),
+                                secret_key: "audit-secret-must-not-leak".to_string(),
+                                session_token: "audit-token-must-not-leak".to_string(),
+                                parent_user: parent_user.to_string(),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        });
+                        let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
+                        if let Some(success) = outcome {
+                            let result = if success {
+                                Ok(S3Response::new(GetObjectOutput::default()))
+                            } else {
+                                Err(S3Error::new(S3ErrorCode::NoSuchKey))
+                            };
+                            helper = helper.complete(&result);
+                        }
+                        let OperationHelper::Enabled(state) = &mut helper else {
+                            panic!("helper should be enabled when the audit switch is on");
+                        };
+                        let entry = state.audit_builder.take().expect("audit builder should exist").build();
+                        assert_eq!(entry.access_key.as_deref(), expected_access_key);
+                        let json = serde_json::to_value(&entry).expect("audit entry should serialize");
+                        assert_eq!(json.get("accessKey").and_then(|key| key.as_str()), expected_access_key);
+                        let rendered = serde_json::to_string(&entry).expect("audit entry should serialize");
+                        assert!(!rendered.contains("audit-secret-must-not-leak"));
+                        assert!(!rendered.contains("audit-token-must-not-leak"));
+                    }
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn operation_helper_audits_verified_client_addresses() {
+        use crate::shared_types::RemoteAddr;
+        use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
+        use std::net::SocketAddr;
+
+        with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("false")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+            ],
+            || {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+
+                let peer: SocketAddr = "192.0.2.10:54321".parse().unwrap();
+                let ipv6_peer: SocketAddr = "[2001:db8::10]:54321".parse().unwrap();
+                let proxied = ClientInfo::from_trusted_proxy(
+                    "198.51.100.20".parse().unwrap(),
+                    None,
+                    None,
+                    peer.ip(),
+                    1,
+                    ValidationMode::Strict,
+                    Vec::new(),
+                );
+                for (remote_addr, client_info, expected) in [
+                    (Some(RemoteAddr(peer)), None, "192.0.2.10"),
+                    (Some(RemoteAddr(ipv6_peer)), None, "2001:db8::10"),
+                    (Some(RemoteAddr(peer)), Some(proxied), "198.51.100.20"),
+                    (Some(RemoteAddr(peer)), Some(ClientInfo::direct(peer)), "192.0.2.10"),
+                    (None, None, ""),
+                ] {
+                    for spoofed in [false, true] {
+                        let input = GetObjectInput::builder()
+                            .bucket("audit-bucket".to_string())
+                            .key("object.txt".to_string())
+                            .build()
+                            .expect("get object input should build");
+                        let mut req = build_request(input, Method::GET, Uri::from_static("/audit-bucket/object.txt"));
+                        req.extensions.insert(remote_addr);
+                        if let Some(client_info) = client_info.as_ref() {
+                            req.extensions.insert(client_info.clone());
+                        }
+                        if spoofed {
+                            req.headers
+                                .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.99"));
+                            req.headers.insert("x-real-ip", HeaderValue::from_static("203.0.113.98"));
+                        }
+                        let result = Ok(S3Response::new(GetObjectOutput::default()));
+                        let mut helper =
+                            OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).complete(&result);
+                        let OperationHelper::Enabled(state) = &mut helper else {
+                            panic!("helper should be enabled when the audit switch is on");
+                        };
+                        let entry = state.audit_builder.take().expect("audit builder should exist").build();
+                        assert_eq!(entry.remote_host.as_deref(), Some(expected));
+                        let rendered = serde_json::to_value(&entry).expect("audit entry should serialize");
+                        assert_eq!(rendered["remotehost"], expected);
+                    }
+                }
             },
         );
     }

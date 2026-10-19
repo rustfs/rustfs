@@ -16,18 +16,21 @@ mod binding;
 mod error;
 mod mapper;
 mod model;
-pub mod oidc;
 mod provider;
 mod transaction;
 
 pub use binding::FederatedSessionBinding;
 pub use error::{FederatedSessionBindingError, FederationError, Result};
-pub use mapper::{CoreFederatedAuthorizationMapper, FederatedAuthorizationRules};
-pub(crate) use mapper::{FederatedAuthorizationRule, FederatedAuthorizationRuleRef};
-pub(crate) use model::OpaqueLogoutContinuation;
+pub(crate) use mapper::FederatedAuthorizationRule;
+#[cfg(test)]
+pub(crate) use mapper::FederatedAuthorizationRuleRef;
+#[cfg(any(test, feature = "test-util"))]
+pub use mapper::test_support::FederatedAuthorizationFixture;
+pub use mapper::{CoreFederatedAuthorizationMapper, FederatedAuthorization, FederatedAuthorizationRules};
+pub(crate) use model::{FederatedClaims, OpaqueLogoutContinuation};
 pub use model::{
-    FederatedAuthorization, FederatedClaims, FederatedLoginSession, FederatedProviderRef, FederatedSession,
-    FederatedSessionTransaction, OIDC_VIRTUAL_PARENT_CLAIM, VerifiedFederatedIdentity,
+    FederatedLoginSession, FederatedProviderRef, FederatedSession, FederatedSessionTransaction, OIDC_VIRTUAL_PARENT_CLAIM,
+    VerifiedFederatedIdentity,
 };
 pub(crate) use provider::{FederatedProviderQuery, StandardOidcAuthentication, VerifiedFederatedCodeExchange};
 pub use provider::{FederatedProviderView, FederatedRedirectPolicy};

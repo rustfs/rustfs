@@ -32,12 +32,12 @@ use crate::server::{
     ssec_transport::SsecTransportLayer,
     strip_valid_port_suffix,
     tls_material::{
-        TlsAcceptFailure, TlsAcceptorHolder, TlsHandshakeFailureKind, accept_tls_with_deadline, build_acceptor_from_loaded,
+        PreparedServerTls, TlsAcceptFailure, TlsAcceptorHolder, TlsHandshakeFailureKind, accept_tls_with_deadline,
         load_tls_material, spawn_reload_loop,
     },
 };
 #[cfg(feature = "http3")]
-use crate::server::{http3, hybrid::HybridBody, tls_material::build_http3_server_config_from_loaded};
+use crate::server::{http3, hybrid::HybridBody};
 use crate::storage_api::server::http as storage;
 use crate::storage_api::server::http::rpc::InternodeRpcService;
 #[cfg(test)]
@@ -1448,6 +1448,7 @@ pub async fn start_http_server(
     // Load TLS materials and build server acceptor in a single pass.
     // Outbound material (root CAs, mTLS identity) was already published in main.rs;
     // this load is needed for the server-side TLS acceptor and reload loop.
+    let mut tls_initial_snapshot = None;
     let tls_acceptor = if tls_path_configured {
         let snapshot = load_tls_material(tls_path).await.map_err(|e| {
             Error::other(format!(
@@ -1456,27 +1457,30 @@ pub async fn start_http_server(
             ))
         })?;
 
-        #[cfg(feature = "http3")]
-        if http3_enabled {
-            http3_server_config = build_http3_server_config_from_loaded(snapshot.server.as_ref(), std::path::Path::new(tls_path))
-                .await
-                .map_err(|e| Error::other(format!("HTTP/3 TLS configuration failed: {e}")))?;
-        }
-
-        let acceptor = build_acceptor_from_loaded(snapshot.server, std::path::Path::new(tls_path))
-            .await
-            .map_err(|e| Error::other(e.to_string()))?;
+        let prepared = PreparedServerTls::from_snapshot(&snapshot).map_err(|e| Error::other(e.to_string()))?;
 
         // Fail closed: if TLS was explicitly configured but no server certificates
         // were found, refuse to start rather than silently falling back to plain HTTP.
-        match acceptor {
+        match prepared {
             None => {
                 return Err(Error::other(format!(
                     "TLS is explicitly configured via RUSTFS_TLS_PATH/tls_path='{}' but no server certificates were found",
                     tls_path
                 )));
             }
-            Some(a) => Some(a),
+            Some(prepared) => {
+                #[cfg(feature = "http3")]
+                if http3_enabled {
+                    http3_server_config = Some(
+                        prepared
+                            .http3_config()
+                            .map_err(|e| Error::other(format!("HTTP/3 TLS configuration failed: {e}")))?,
+                    );
+                }
+                let acceptor = prepared.tcp_acceptor().map_err(|e| Error::other(e.to_string()))?;
+                tls_initial_snapshot = Some((snapshot, prepared));
+                Some(acceptor)
+            }
         }
     } else {
         None
@@ -1755,14 +1759,20 @@ pub async fn start_http_server(
     } else {
         None
     };
-    let tls_reload_task = tls_acceptor.as_ref().and_then(|holder| {
+    let tls_reload_task = if let (Some(holder), Some((initial, prepared))) = (tls_acceptor.as_ref(), tls_initial_snapshot.take())
+    {
         spawn_reload_loop(
             tls_path.to_string(),
             holder.clone(),
+            initial,
+            prepared,
             #[cfg(feature = "http3")]
             http3_server.as_ref().map(|(endpoint, _)| endpoint.clone()),
         )
-    });
+        .map_err(|e| Error::other(e.to_string()))?
+    } else {
+        None
+    };
 
     let is_console = config.console_enable;
     let server_domains_configured = !config.server_domains.is_empty();
@@ -2644,7 +2654,10 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             .unwrap_or("unknown");
         let peer_addr = req
             .extensions()
-            .get::<RemoteAddr>()
+            .get::<Option<RemoteAddr>>()
+            .copied()
+            .flatten()
+            .or_else(|| req.extensions().get::<RemoteAddr>().copied())
             .map(|addr| addr.0.to_string())
             .unwrap_or_else(|| "unknown".to_string());
         let failure_reason = storage::tonic_rpc_auth_failure_reason(&e);
@@ -2660,25 +2673,41 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             INTERNODE_TRANSPORT_BACKEND_GRPC,
             failure_reason,
         );
-        error!(
-            event = EVENT_RPC_SIGNATURE_VERIFICATION_FAILED,
-            component = LOG_COMPONENT_SERVER,
-            subsystem = LOG_SUBSYSTEM_HTTP,
-            failure_reason,
-            rpc_path,
-            rpc_service,
-            rpc_method,
-            expected_audience = %audience,
-            peer_addr = %peer_addr,
-            replay_scope_bootstrap_allowed = allow_replay_scope_bootstrap,
-            error = %e,
-            "RPC signature verification failed"
-        );
         if failure_reason == "stale_boot_epoch" {
             // The signature is valid, but the peer restarted before this request. Reject it
             // before execution and let the client retry after its authenticated epoch refresh.
+            warn!(
+                event = EVENT_RPC_SIGNATURE_VERIFICATION_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_HTTP,
+                result = "retryable_rejection",
+                failure_reason,
+                rpc_path,
+                rpc_service,
+                rpc_method,
+                expected_audience = %audience,
+                peer_addr = %peer_addr,
+                replay_scope_bootstrap_allowed = allow_replay_scope_bootstrap,
+                error = %e,
+                "RPC boot epoch changed; request rejected for retry"
+            );
             Status::unavailable("RPC boot epoch changed")
         } else {
+            error!(
+                event = EVENT_RPC_SIGNATURE_VERIFICATION_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_HTTP,
+                result = "rejected",
+                failure_reason,
+                rpc_path,
+                rpc_service,
+                rpc_method,
+                expected_audience = %audience,
+                peer_addr = %peer_addr,
+                replay_scope_bootstrap_allowed = allow_replay_scope_bootstrap,
+                error = %e,
+                "RPC signature verification failed"
+            );
             Status::unauthenticated("No valid auth token")
         }
     })?;
@@ -2805,6 +2834,163 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{Notify, mpsc};
     use tower::{Layer, Service, ServiceBuilder};
+
+    type RateLimitTestCore = tower::util::BoxCloneService<
+        HttpRequest<s3s::Body>,
+        Response<crate::server::hybrid::HybridBody<s3s::Body, Empty<Bytes>>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    >;
+    type RateLimitTestStack = tower::util::BoxCloneService<
+        HttpRequest<s3s::Body>,
+        Response<tower_http::body::UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    >;
+
+    fn rate_limited_external_stack(
+        peer: SocketAddr,
+        proxy_layer: Option<rustfs_trusted_proxies::TrustedProxyLayer>,
+        inner: RateLimitTestCore,
+    ) -> RateLimitTestStack {
+        use crate::server::rate_limit::RateLimitQuota;
+
+        let readiness = Arc::new(GlobalReadiness::new());
+        readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+        RateLimitTestStack::new(external_service_stack!(
+            inner,
+            Some(RemoteAddr(peer)),
+            proxy_layer,
+            false,
+            Some(RateLimitLayer::new(
+                Some(RateLimitQuota {
+                    requests_per_minute: 1,
+                    burst: 1
+                }),
+                None,
+                vec![]
+            )),
+            false,
+            readiness,
+            None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
+            HttpCompressionConfig::default(),
+            ServerContextSlot::new(),
+            false
+        ))
+    }
+
+    #[tokio::test]
+    async fn external_stack_limits_socket_peers_without_trusted_proxies() {
+        use crate::server::hybrid::HybridBody;
+        use tower::ServiceExt;
+
+        for peer in ["192.0.2.10:51000", "[2001:db8::10]:51000"] {
+            let peer: SocketAddr = peer.parse().expect("socket peer");
+            for version in [Version::HTTP_11, Version::HTTP_2, Version::HTTP_3] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let inner_calls = calls.clone();
+                let inner = tower::service_fn(move |request: HttpRequest<s3s::Body>| {
+                    assert_eq!(
+                        request
+                            .extensions()
+                            .get::<Option<RemoteAddr>>()
+                            .copied()
+                            .flatten()
+                            .map(|addr| addr.0),
+                        Some(peer)
+                    );
+                    inner_calls.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(
+                            HybridBody::<s3s::Body, Empty<Bytes>>::Rest {
+                                rest_body: s3s::Body::empty(),
+                            },
+                        ))
+                    }
+                });
+                let mut service = rate_limited_external_stack(peer, None, RateLimitTestCore::new(inner));
+
+                for (forwarded, expected) in [
+                    ("203.0.113.1", StatusCode::OK),
+                    ("203.0.113.2", StatusCode::TOO_MANY_REQUESTS),
+                ] {
+                    let request = HttpRequest::builder()
+                        .uri("/bucket/object")
+                        .version(version)
+                        .header("x-forwarded-for", forwarded)
+                        .header("x-real-ip", forwarded)
+                        .body(s3s::Body::empty())
+                        .expect("request");
+                    let response = service
+                        .ready()
+                        .await
+                        .expect("service ready")
+                        .call(request)
+                        .await
+                        .expect("response");
+                    assert_eq!(response.status(), expected, "peer={peer}, version={version:?}");
+                    if expected == StatusCode::TOO_MANY_REQUESTS {
+                        assert!(response.headers().contains_key(http::header::RETRY_AFTER));
+                        let body = response.into_body().collect().await.expect("body").to_bytes();
+                        assert!(String::from_utf8_lossy(&body).contains("<Code>TooManyRequests</Code>"));
+                    }
+                }
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "throttled requests must not reach the inner service");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn external_stack_limits_validated_proxy_clients_independently() {
+        use crate::server::hybrid::HybridBody;
+        use rustfs_trusted_proxies::{
+            LegacyTrustedProxyLayer, TrustedProxy, TrustedProxyConfig, TrustedProxyLayer, ValidationMode,
+        };
+        use tower::ServiceExt;
+
+        let peer: SocketAddr = "192.0.2.100:51000".parse().expect("proxy peer");
+        for version in [Version::HTTP_11, Version::HTTP_2, Version::HTTP_3] {
+            let proxy_config =
+                TrustedProxyConfig::new(vec![TrustedProxy::Single(peer.ip())], ValidationMode::HopByHop, false, 3, false, vec![]);
+            let proxy_layer = TrustedProxyLayer::legacy(LegacyTrustedProxyLayer::new(proxy_config, None, true));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let inner_calls = calls.clone();
+            let inner = tower::service_fn(move |request: HttpRequest<s3s::Body>| {
+                let info = request.extensions().get::<ClientInfo>().expect("validated client context");
+                assert!(info.is_from_trusted_proxy);
+                assert_ne!(info.real_ip, peer.ip());
+                inner_calls.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(
+                        HybridBody::<s3s::Body, Empty<Bytes>>::Rest {
+                            rest_body: s3s::Body::empty(),
+                        },
+                    ))
+                }
+            });
+            let mut service = rate_limited_external_stack(peer, Some(proxy_layer), RateLimitTestCore::new(inner));
+
+            for (client, expected) in [
+                ("203.0.113.1", StatusCode::OK),
+                ("203.0.113.2", StatusCode::OK),
+                ("203.0.113.1", StatusCode::TOO_MANY_REQUESTS),
+            ] {
+                let request = HttpRequest::builder()
+                    .uri("/bucket/object")
+                    .version(version)
+                    .header("x-forwarded-for", client)
+                    .body(s3s::Body::empty())
+                    .expect("request");
+                let response = service
+                    .ready()
+                    .await
+                    .expect("service ready")
+                    .call(request)
+                    .await
+                    .expect("response");
+                assert_eq!(response.status(), expected, "client={client}, version={version:?}");
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+    }
 
     #[test]
     fn peer_transport_close_kind_uses_io_error_sources() {
@@ -3276,6 +3462,291 @@ mod tests {
         assert!(dropped.load(Ordering::Acquire));
         assert!(sender.send(Bytes::from_static(b"payload")).is_err());
         assert_eq!(bytes_polled.load(Ordering::Relaxed), 0);
+    }
+
+    mod conditional_object_http {
+        use super::*;
+        use crate::app::storage_api::object_usecase::{StorageObjectInfo, check_preconditions};
+        use crate::server::hybrid::HybridBody;
+
+        #[derive(Clone)]
+        struct ConditionalObjectS3 {
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[derive(Debug)]
+        struct FixtureTransportError(String);
+
+        impl std::fmt::Display for FixtureTransportError {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+
+        impl std::error::Error for FixtureTransportError {}
+
+        type HttpConditionCase<'a> = (&'a str, &'a [(&'a str, &'a str)], StatusCode, bool);
+
+        impl<'a> From<Box<dyn std::error::Error + Send + Sync + 'a>> for FixtureTransportError {
+            fn from(error: Box<dyn std::error::Error + Send + Sync + 'a>) -> Self {
+                Self(error.to_string())
+            }
+        }
+
+        fn object_info() -> StorageObjectInfo {
+            StorageObjectInfo {
+                etag: Some("abc".to_owned()),
+                mod_time: Some(time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixture timestamp")),
+                user_defined: HashMap::from([("cache-control".to_owned(), "max-age=60".to_owned())]).into(),
+                ..Default::default()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl s3s::S3 for ConditionalObjectS3 {
+            async fn get_object(
+                &self,
+                req: s3s::S3Request<s3s::dto::GetObjectInput>,
+            ) -> s3s::S3Result<s3s::S3Response<s3s::dto::GetObjectOutput>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(req.input.bucket, "bucket");
+                assert_eq!(req.input.key, "object");
+                assert_eq!(req.input.if_match.is_some(), req.headers.contains_key(http::header::IF_MATCH));
+                assert_eq!(req.input.if_none_match.is_some(), req.headers.contains_key(http::header::IF_NONE_MATCH));
+                check_preconditions(&req.headers, &object_info())?;
+                Ok(s3s::S3Response::new(s3s::dto::GetObjectOutput {
+                    body: Some(s3s::dto::StreamingBlob::from_bytes(Bytes::from_static(b"payload"))),
+                    content_length: Some(7),
+                    e_tag: Some(s3s::dto::ETag::Strong("abc".to_owned())),
+                    ..Default::default()
+                }))
+            }
+
+            async fn head_object(
+                &self,
+                req: s3s::S3Request<s3s::dto::HeadObjectInput>,
+            ) -> s3s::S3Result<s3s::S3Response<s3s::dto::HeadObjectOutput>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(req.input.bucket, "bucket");
+                assert_eq!(req.input.key, "object");
+                assert_eq!(req.input.if_match.is_some(), req.headers.contains_key(http::header::IF_MATCH));
+                assert_eq!(req.input.if_none_match.is_some(), req.headers.contains_key(http::header::IF_NONE_MATCH));
+                check_preconditions(&req.headers, &object_info())?;
+                Ok(s3s::S3Response::new(s3s::dto::HeadObjectOutput {
+                    content_length: Some(7),
+                    e_tag: Some(s3s::dto::ETag::Strong("abc".to_owned())),
+                    ..Default::default()
+                }))
+            }
+        }
+
+        #[tokio::test]
+        async fn conditional_get_head_http1_http2_parse_headers_and_apply_precedence() {
+            let cases: &[HttpConditionCase<'_>] = &[
+                ("strong list", &[("if-none-match", "\"other\", \"abc\"")], StatusCode::NOT_MODIFIED, true),
+                ("weak list", &[("if-none-match", "\"other\", W/\"abc\"")], StatusCode::NOT_MODIFIED, true),
+                ("weak tag", &[("if-none-match", "W/\"abc\"")], StatusCode::NOT_MODIFIED, true),
+                ("wildcard", &[("if-none-match", "*")], StatusCode::NOT_MODIFIED, true),
+                ("strong match list", &[("if-match", "\"other\", \"abc\"")], StatusCode::OK, true),
+                ("weak match fails", &[("if-match", "W/\"abc\"")], StatusCode::PRECONDITION_FAILED, true),
+                ("wildcard match", &[("if-match", "*")], StatusCode::OK, true),
+                (
+                    "If-Match precedes matching If-None-Match",
+                    &[("if-match", "\"other\""), ("if-none-match", "\"abc\"")],
+                    StatusCode::PRECONDITION_FAILED,
+                    true,
+                ),
+                (
+                    "matching If-Match does not suppress If-None-Match",
+                    &[("if-match", "\"abc\""), ("if-none-match", "W/\"abc\"")],
+                    StatusCode::NOT_MODIFIED,
+                    true,
+                ),
+                (
+                    "If-Match suppresses If-Unmodified-Since",
+                    &[
+                        ("if-match", "\"abc\""),
+                        ("if-unmodified-since", "Tue, 14 Nov 2023 22:13:19 GMT"),
+                    ],
+                    StatusCode::OK,
+                    true,
+                ),
+                (
+                    "If-None-Match suppresses If-Modified-Since",
+                    &[
+                        ("if-none-match", "\"other\""),
+                        ("if-modified-since", "Tue, 14 Nov 2023 22:13:21 GMT"),
+                    ],
+                    StatusCode::OK,
+                    true,
+                ),
+                (
+                    "If-Unmodified-Since precedes wildcard If-None-Match",
+                    &[
+                        ("if-unmodified-since", "Tue, 14 Nov 2023 22:13:19 GMT"),
+                        ("if-none-match", "*"),
+                    ],
+                    StatusCode::PRECONDITION_FAILED,
+                    true,
+                ),
+                (
+                    "date matches at same second",
+                    &[("if-modified-since", "Tue, 14 Nov 2023 22:13:20 GMT")],
+                    StatusCode::NOT_MODIFIED,
+                    true,
+                ),
+                ("unmatched list", &[("if-none-match", "\"other\", W/\"different\"")], StatusCode::OK, true),
+                (
+                    "empty list member is allowed",
+                    &[("if-none-match", "\"other\", , \"abc\"")],
+                    StatusCode::NOT_MODIFIED,
+                    true,
+                ),
+                // s3s accepts these quoted fields; the canonical matcher must validate every member.
+                (
+                    "adjacent tags cannot validate cache",
+                    &[("if-none-match", "\"other\"\"abc\"")],
+                    StatusCode::OK,
+                    true,
+                ),
+                (
+                    "adjacent tags cannot satisfy If-Match",
+                    &[("if-match", "\"other\"\"abc\"")],
+                    StatusCode::PRECONDITION_FAILED,
+                    true,
+                ),
+                (
+                    "matching prefix with trailing garbage",
+                    &[("if-none-match", "\"abc\"garbage\"")],
+                    StatusCode::OK,
+                    true,
+                ),
+                (
+                    "matching prefix cannot satisfy If-Match",
+                    &[("if-match", "\"abc\"garbage\"")],
+                    StatusCode::PRECONDITION_FAILED,
+                    true,
+                ),
+                (
+                    "matching first tag with malformed later member",
+                    &[("if-none-match", "\"abc\", \"other\"\"different\"")],
+                    StatusCode::OK,
+                    true,
+                ),
+                (
+                    "If-Match validates malformed later member",
+                    &[("if-match", "\"abc\", \"other\"\"different\"")],
+                    StatusCode::PRECONDITION_FAILED,
+                    true,
+                ),
+                // These existing s3s parse boundaries reject the request before the handler.
+                ("malformed ETag", &[("if-none-match", "\"abc")], StatusCode::BAD_REQUEST, false),
+                ("invalid date", &[("if-modified-since", "not-a-date")], StatusCode::BAD_REQUEST, false),
+                (
+                    "obsolete date",
+                    &[("if-modified-since", "Tuesday, 14-Nov-23 22:13:20 GMT")],
+                    StatusCode::BAD_REQUEST,
+                    false,
+                ),
+                (
+                    "duplicate condition",
+                    &[("if-none-match", "\"other\""), ("if-none-match", "\"abc\"")],
+                    StatusCode::BAD_REQUEST,
+                    false,
+                ),
+            ];
+            for http2 in [false, true] {
+                for method in [Method::GET, Method::HEAD] {
+                    for (name, headers, expected_status, reaches_handler) in cases {
+                        let calls = Arc::new(AtomicUsize::new(0));
+                        let inner = S3ServiceBuilder::new(ConditionalObjectS3 {
+                            calls: Arc::clone(&calls),
+                        })
+                        .build();
+                        let service = ServiceBuilder::new()
+                            .layer(BodylessStatusFixLayer)
+                            .layer(HeadRequestBodyFixLayer)
+                            .map_response(|response: Response<s3s::Body>| {
+                                response.map(|rest_body| HybridBody::<s3s::Body, Empty<Bytes>>::Rest { rest_body })
+                            })
+                            .map_err(|error: s3s::HttpError| FixtureTransportError(error.to_string()))
+                            .service(inner);
+                        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                        let server = tokio::spawn(async move {
+                            let service = TowerToHyperService::new(service);
+                            if http2 {
+                                hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                                    .serve_connection(TokioIo::new(server_io), service)
+                                    .await
+                                    .expect("HTTP/2 server");
+                            } else {
+                                hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(TokioIo::new(server_io), service)
+                                    .await
+                                    .expect("HTTP/1 server");
+                            }
+                        });
+                        let mut request = HttpRequest::builder()
+                            .method(method.clone())
+                            .uri("http://localhost/bucket/object");
+                        for (header, value) in *headers {
+                            request = request.header(*header, *value);
+                        }
+                        let request = request.body(Empty::<Bytes>::new()).expect("conditional request");
+                        let (response, client) = if http2 {
+                            let (mut sender, connection) =
+                                hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(client_io))
+                                    .await
+                                    .expect("HTTP/2 handshake");
+                            let client = tokio::spawn(async move {
+                                connection.await.expect("HTTP/2 client");
+                            });
+                            let response = tokio::time::timeout(Duration::from_secs(5), sender.send_request(request))
+                                .await
+                                .expect("HTTP/2 response deadline")
+                                .expect("HTTP/2 response");
+                            (response, client)
+                        } else {
+                            let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+                                .await
+                                .expect("HTTP/1 handshake");
+                            let client = tokio::spawn(async move {
+                                connection.await.expect("HTTP/1 client");
+                            });
+                            let response = tokio::time::timeout(Duration::from_secs(5), sender.send_request(request))
+                                .await
+                                .expect("HTTP/1 response deadline")
+                                .expect("HTTP/1 response");
+                            (response, client)
+                        };
+                        assert_eq!(response.status(), *expected_status, "{name}: {method}, HTTP/2={http2}");
+                        assert_eq!(calls.load(Ordering::Relaxed), usize::from(*reaches_handler), "{name}: parser routing");
+                        if *expected_status == StatusCode::NOT_MODIFIED {
+                            assert_eq!(response.headers()[http::header::ETAG], "\"abc\"", "{name}");
+                            assert_eq!(response.headers()[http::header::CACHE_CONTROL], "max-age=60", "{name}");
+                            assert!(response.headers().contains_key(http::header::LAST_MODIFIED), "{name}");
+                            assert!(response.headers().contains_key(http::header::DATE), "{name}");
+                            assert!(!response.headers().contains_key(CONTENT_LENGTH), "{name}");
+                            assert!(!response.headers().contains_key(http::header::TRANSFER_ENCODING), "{name}");
+                        }
+                        let bytes = tokio::time::timeout(Duration::from_secs(5), response.into_body().collect())
+                            .await
+                            .expect("body deadline")
+                            .expect("response body")
+                            .to_bytes();
+                        if method == Method::HEAD || *expected_status == StatusCode::NOT_MODIFIED {
+                            assert!(bytes.is_empty(), "{name}: {method}, HTTP/2={http2}");
+                        } else if *expected_status == StatusCode::OK {
+                            assert_eq!(&bytes[..], b"payload", "{name}");
+                        } else if *expected_status == StatusCode::PRECONDITION_FAILED {
+                            assert!(String::from_utf8_lossy(&bytes).contains("<Code>PreconditionFailed</Code>"), "{name}");
+                        }
+                        client.abort();
+                        server.abort();
+                    }
+                }
+            }
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -3976,14 +4447,14 @@ mod tests {
         let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
         let previous_node_name = rustfs_common::get_global_local_node_name().await;
         let audience = "127.0.0.1:9000";
-        let path = "/node_service.NodeService/ReadVersion";
+        let path = "/node_service.NodeService/ReadAll";
         rustfs_common::set_global_local_node_name(audience).await;
         let challenge = uuid::Uuid::new_v4();
         let proof = storage::tonic_boot_epoch_response_headers(audience, challenge).expect("signed epoch proof");
         let epoch = storage::verify_tonic_boot_epoch_response(audience, challenge, &proof).expect("authenticated epoch");
         let stale_epoch = uuid::Uuid::from_u128(epoch.as_u128() ^ 1);
         let signed_headers = |audience: &str, epoch| {
-            let mut headers = storage::gen_tonic_signature_headers(audience, "node_service.NodeService", "ReadVersion", None)
+            let mut headers = storage::gen_tonic_signature_headers(audience, "node_service.NodeService", "ReadAll", None)
                 .expect("method-bound signature");
             let replay = storage::gen_tonic_replay_scope_headers(
                 audience,
@@ -3996,34 +4467,198 @@ mod tests {
             headers.extend(replay);
             headers
         };
-        let request = |headers: HeaderMap| {
+        let request = |headers: HeaderMap, peer: Option<SocketAddr>| {
             let mut request = Request::new(());
             request.metadata_mut().as_mut().extend(headers);
             request.extensions_mut().insert(RpcRequestTarget {
                 uri: format!("http://{audience}{path}").parse().expect("RPC URI"),
                 method: Method::POST,
             });
+            // The connection stack stores this optional wrapper, not a bare RemoteAddr.
+            request.extensions_mut().insert(peer.map(RemoteAddr));
             request
         };
-
+        let log_file = tempfile::NamedTempFile::new().expect("create RPC auth log capture");
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_ansi(false)
+            .with_max_level(Level::TRACE)
+            .with_writer(Arc::new(log_file.reopen().expect("open RPC auth log writer")))
+            .finish();
+        let peer: SocketAddr = "192.0.2.10:51000".parse().expect("test peer address");
         let stale = signed_headers(audience, stale_epoch);
-        let error = check_auth(request(stale.clone())).expect_err("a stale epoch must still reject the request");
-        assert_eq!(error.code(), tonic::Code::Unavailable);
-        assert_eq!(error.message(), "RPC boot epoch changed");
+        tracing::subscriber::with_default(subscriber, || {
+            let error = check_auth(request(stale.clone(), Some(peer))).expect_err("a stale epoch must still reject the request");
+            assert_eq!(error.code(), tonic::Code::Unavailable);
+            assert_eq!(error.message(), "RPC boot epoch changed");
+            let mut forged = stale.clone();
+            forged.insert("x-rustfs-rpc-signature-v3", HeaderValue::from_static("00"));
+            let error = check_auth(request(forged, Some(peer))).expect_err("a forged stale-epoch signature must remain terminal");
+            assert_eq!(error.code(), tonic::Code::Unauthenticated);
+            let error = check_auth(request(signed_headers("127.0.0.1:9001", stale_epoch), Some(peer)))
+                .expect_err("a stale epoch must not hide an audience mismatch");
+            assert_eq!(error.code(), tonic::Code::Unauthenticated);
 
-        let mut forged = stale;
-        forged.insert("x-rustfs-rpc-signature-v3", HeaderValue::from_static("00"));
-        let error = check_auth(request(forged)).expect_err("a forged stale-epoch signature must remain terminal");
-        assert_eq!(error.code(), tonic::Code::Unauthenticated);
-        let error = check_auth(request(signed_headers("127.0.0.1:9001", stale_epoch)))
-            .expect_err("a stale epoch must not hide an audience mismatch");
-        assert_eq!(error.code(), tonic::Code::Unauthenticated);
-
-        let current = signed_headers(audience, epoch);
-        assert!(check_auth(request(current.clone())).is_ok(), "a fresh authenticated scope must succeed");
-        let error = check_auth(request(current)).expect_err("a same-epoch nonce replay must remain terminal");
-        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+            let current = signed_headers(audience, epoch);
+            assert!(
+                check_auth(request(current.clone(), Some(peer))).is_ok(),
+                "a fresh authenticated scope must succeed"
+            );
+            let error = check_auth(request(current, Some(peer))).expect_err("a same-epoch nonce replay must remain terminal");
+            assert_eq!(error.code(), tonic::Code::Unauthenticated);
+            let error =
+                check_auth(request(stale.clone(), None)).expect_err("a missing peer address must not affect authentication");
+            assert_eq!(error.code(), tonic::Code::Unavailable);
+        });
         rustfs_common::set_global_local_node_name(&previous_node_name).await;
+
+        let logs = std::fs::read_to_string(log_file.path()).expect("read RPC auth logs");
+        let events: Vec<serde_json::Value> = logs
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSON log event"))
+            .filter(|event| event["fields"]["event"] == EVENT_RPC_SIGNATURE_VERIFICATION_FAILED)
+            .collect();
+        assert_eq!(events.len(), 5, "each authentication rejection must retain its diagnostic event");
+        let stale_events: Vec<_> = events
+            .iter()
+            .filter(|event| event["fields"]["failure_reason"] == "stale_boot_epoch")
+            .collect();
+        assert_eq!(stale_events.len(), 2);
+        for event in &stale_events {
+            assert_eq!(event["level"], "WARN");
+            assert_eq!(event["fields"]["result"], "retryable_rejection");
+            assert_eq!(event["fields"]["rpc_method"], "ReadAll");
+        }
+        assert_eq!(stale_events[0]["fields"]["peer_addr"], peer.to_string());
+        assert_eq!(stale_events[1]["fields"]["peer_addr"], "unknown");
+        for event in events
+            .iter()
+            .filter(|event| event["fields"]["failure_reason"] != "stale_boot_epoch")
+        {
+            assert_eq!(event["level"], "ERROR");
+            assert_eq!(event["fields"]["result"], "rejected");
+            assert_eq!(event["fields"]["peer_addr"], peer.to_string());
+        }
+        assert!(!logs.contains("rpc-http-test-secret"), "logs must not expose the RPC secret");
+        for header in ["x-rustfs-signature", "x-rustfs-rpc-signature-v2", "x-rustfs-rpc-signature-v3"] {
+            if let Some(signature) = stale.get(header) {
+                assert!(
+                    !logs.contains(signature.to_str().expect("ASCII signature")),
+                    "logs must not expose {header}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rpc_auth_read_all_recovers_after_stale_boot_epoch() {
+        use storage::DiskAPI;
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_INTERNODE_IDEMPOTENT_READ_RETRIES", Some("1")),
+                ("RUSTFS_INTERNODE_PREWARM", Some("false")),
+            ],
+            async {
+                let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
+                let listener = TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind ReadAll epoch recovery peer");
+                let addr = listener.local_addr().expect("ReadAll recovery address");
+                let audience = addr.to_string();
+                let previous_node_name = rustfs_common::get_global_local_node_name().await;
+                rustfs_common::set_global_local_node_name(&audience).await;
+                let challenge = uuid::Uuid::new_v4();
+                let proof = storage::tonic_boot_epoch_response_headers(&audience, challenge).expect("current epoch proof");
+                let epoch = storage::verify_tonic_boot_epoch_response(&audience, challenge, &proof).expect("current epoch");
+                let stale_epoch = uuid::Uuid::from_u128(epoch.as_u128() ^ 1);
+                let admitted = Arc::new(AtomicUsize::new(0));
+                let admitted_by_server = Arc::clone(&admitted);
+                let node = InterceptedService::new(NodeServiceServer::new(make_server()), move |request: Request<()>| {
+                    let request = check_auth(request)?;
+                    assert!(
+                        request.extensions().get::<Option<RemoteAddr>>().copied().flatten().is_some(),
+                        "production auth must receive the connection's optional peer address"
+                    );
+                    admitted_by_server.fetch_add(1, Ordering::SeqCst);
+                    Ok(request)
+                });
+                let scopes = Arc::new(Mutex::new(Vec::new()));
+                let observed_scopes = Arc::clone(&scopes);
+                let service = ServiceBuilder::new()
+                    .map_request(move |mut request: HttpRequest<hyper::body::Incoming>| {
+                        assert_eq!(request.uri().path(), "/node_service.NodeService/ReadAll");
+                        let mut scopes = observed_scopes.lock().expect("captured replay scopes");
+                        if scopes.is_empty() {
+                            assert!(
+                                !request.headers().contains_key("x-rustfs-rpc-boot-epoch"),
+                                "the fresh peer must start without a cached epoch"
+                            );
+                            // Inject a correctly signed stale scope at the transport boundary.
+                            // The retry must learn its scope from the real server response proof.
+                            let replay = storage::gen_tonic_replay_scope_headers(
+                                &audience,
+                                request.uri().path(),
+                                request.headers()["x-rustfs-timestamp"].to_str().expect("timestamp"),
+                                request.headers()["x-rustfs-content-sha256"].to_str().expect("body digest"),
+                                stale_epoch,
+                            )
+                            .expect("signed stale scope");
+                            request.headers_mut().extend(replay);
+                        }
+                        let parse_uuid = |name: &str| {
+                            uuid::Uuid::parse_str(request.headers()[name].to_str().expect("UUID header"))
+                                .expect("valid replay scope UUID")
+                        };
+                        scopes.push((parse_uuid("x-rustfs-rpc-boot-epoch"), parse_uuid("x-rustfs-rpc-replay-nonce")));
+                        request
+                    })
+                    .service(RpcRequestPathService::new(Routes::new(node).prepare()));
+                let server = tokio::spawn(async move {
+                    let (socket, peer) = listener.accept().await.expect("accept ReadAll recovery connection");
+                    let service = ServiceBuilder::new()
+                        .layer(AddExtensionLayer::new(Some(RemoteAddr(peer))))
+                        .service(service);
+                    ConnBuilder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
+                        .await
+                        .expect("serve ReadAll recovery connection");
+                });
+                let mut endpoint =
+                    Endpoint::try_from(format!("http://{addr}/missing-read-all-disk").as_str()).expect("ReadAll remote endpoint");
+                endpoint.is_local = false;
+                let disk = storage::new_disk(
+                    &endpoint,
+                    &storage::DiskOption {
+                        cleanup: false,
+                        health_check: false,
+                    },
+                )
+                .await
+                .expect("production remote disk client");
+                let result = tokio::time::timeout(Duration::from_secs(10), disk.read_all("bucket", "object")).await;
+                server.abort();
+                let _ = server.await;
+                rustfs_common::set_global_local_node_name(&previous_node_name).await;
+
+                let error = result
+                    .expect("bounded ReadAll retry must complete")
+                    .expect_err("missing disk must remain an error");
+                assert_eq!(
+                    error.to_string(),
+                    "io error io error cannot find disk",
+                    "the retry must reach the real ReadAll missing-disk handler"
+                );
+                let scopes = scopes.lock().expect("captured replay scopes");
+                assert_eq!(scopes.len(), 2, "stale epoch recovery must use one bounded retry");
+                assert_eq!(scopes[0].0, stale_epoch);
+                assert_eq!(scopes[1].0, epoch, "the retry must use the authenticated response epoch");
+                assert_ne!(scopes[0].1, scopes[1].1, "the retry must carry a fresh replay nonce");
+                assert_eq!(admitted.load(Ordering::SeqCst), 1, "the stale request must not reach the handler");
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -4153,6 +4788,51 @@ mod tests {
             error.contains("storage layer is not initialized") || error.contains("scoped dirty usage peer or process changed"),
             "signed probe must pass production path authentication and reach owner validation: {error}"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cold_delete_recovery_discovery_uses_production_body_auth() {
+        use storage::DiskAPI;
+        temp_env::async_with_vars([("RUSTFS_INTERNODE_RPC_BODY_DIGEST_STRICT", Some("false"))], async {
+            let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind recovery RPC peer");
+            let addr = listener.local_addr().expect("recovery RPC address");
+            let previous_node_name = rustfs_common::get_global_local_node_name().await;
+            rustfs_common::set_global_local_node_name(&addr.to_string()).await;
+            let node = InterceptedService::new(NodeServiceServer::new(make_server()), check_auth);
+            let service = RpcRequestPathService::new(Routes::new(node).prepare());
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.expect("accept recovery RPC connection");
+                ConnBuilder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
+                    .await
+                    .expect("serve recovery RPC connection");
+            });
+            let mut endpoint =
+                Endpoint::try_from(format!("http://{addr}/cold-recovery-disk").as_str()).expect("remote recovery endpoint");
+            endpoint.is_local = false;
+            let disk = storage::new_disk(
+                &endpoint,
+                &storage::DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+            )
+            .await
+            .expect("production remote disk client");
+            // Recovery may race a heal-control peer-state refresh, before another
+            // authenticated response has repopulated the shared peer state.
+            let result = disk.discover_delete_transactions("cold-recovery-bucket", None, None, 1).await;
+            server.abort();
+            let _ = server.await;
+            rustfs_common::set_global_local_node_name(&previous_node_name).await;
+            assert!(
+                matches!(result, Err(crate::storage_api::error::DiskError::DiskNotFound)),
+                "the cold request must pass production authentication and reach the missing-disk handler: {result:?}"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]

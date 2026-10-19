@@ -50,7 +50,7 @@ fn ensure_rebalance_entry_active(cancel: &CancellationToken) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 tokio::task_local! {
     static REBALANCE_ENTRY_RUN_FENCE_BARRIER: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 }
@@ -268,7 +268,7 @@ impl ECStore {
             self.rebalance_run_guard(rebalance_id.as_ref(), "rebalance entry")
         })
         .await?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         if let Ok((arrived, release)) = REBALANCE_ENTRY_RUN_FENCE_BARRIER.try_with(Clone::clone) {
             arrived.notify_one();
             release.notified().await;
@@ -836,7 +836,8 @@ pub mod test_util {
         _temp_dirs: Vec<tempfile::TempDir>,
         store: Arc<ECStore>,
         cancel: CancellationToken,
-        barrier: crate::data_movement::SourceCleanupDeleteBarrier,
+        entry_arrived: Arc<tokio::sync::Notify>,
+        entry_release: Arc<tokio::sync::Notify>,
         stop_probe: super::super::control::RebalanceStopWaitProbe,
         entry_task: Option<tokio::task::JoinHandle<Result<RebalanceEntryOutcome>>>,
     }
@@ -897,31 +898,36 @@ pub mod test_util {
                 cached: Some(file_meta),
                 reusable: false,
             };
-            let barrier = crate::data_movement::SourceCleanupDeleteBarrier::install(bucket, object);
+            let entry_arrived = Arc::new(tokio::sync::Notify::new());
+            let entry_release = Arc::new(tokio::sync::Notify::new());
             let entry_store = Arc::clone(&store);
             let entry_set = Arc::clone(&set);
             let entry_cancel = cancel.clone();
-            let entry_task = tokio::spawn(async move {
-                entry_store
-                    .rebalance_entry(
-                        RebalanceEntryTarget {
-                            bucket: bucket.to_string(),
-                            pool_index: 0,
-                        },
-                        entry,
-                        entry_set,
-                        Arc::new(RebalanceBucketConfigs::default()),
-                        Arc::from(rebalance_id),
-                        entry_cancel,
-                    )
-                    .await
-            });
+            let entry_task = tokio::spawn(REBALANCE_ENTRY_RUN_FENCE_BARRIER.scope(
+                (Arc::clone(&entry_arrived), Arc::clone(&entry_release)),
+                async move {
+                    entry_store
+                        .rebalance_entry(
+                            RebalanceEntryTarget {
+                                bucket: bucket.to_string(),
+                                pool_index: 0,
+                            },
+                            entry,
+                            entry_set,
+                            Arc::new(RebalanceBucketConfigs::default()),
+                            Arc::from(rebalance_id),
+                            entry_cancel,
+                        )
+                        .await
+                },
+            ));
 
             Self {
                 _temp_dirs,
                 store,
                 cancel,
-                barrier,
+                entry_arrived,
+                entry_release,
                 stop_probe: super::super::control::RebalanceStopWaitProbe::install(rebalance_id),
                 entry_task: Some(entry_task),
             }
@@ -932,7 +938,9 @@ pub mod test_util {
         }
 
         pub async fn wait_until_entry_paused(&self) {
-            self.barrier.wait_until_paused().await;
+            tokio::time::timeout(std::time::Duration::from_secs(30), self.entry_arrived.notified())
+                .await
+                .expect("the entry should acquire its run fence before pausing");
         }
 
         pub async fn wait_until_admission_cancelled(&self) {
@@ -946,7 +954,7 @@ pub mod test_util {
         }
 
         pub fn release_entry(&self) {
-            self.barrier.release();
+            self.entry_release.notify_one();
         }
 
         pub async fn assert_entry_cancelled(&mut self) {
@@ -964,7 +972,7 @@ pub mod test_util {
 
     impl Drop for PausedRebalanceEntryTestFixture {
         fn drop(&mut self) {
-            self.barrier.release();
+            self.entry_release.notify_one();
             if let Some(task) = self.entry_task.take() {
                 task.abort();
             }
@@ -1432,7 +1440,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn real_rebalance_entry_progresses_while_peer_activation_waits_for_run_fence() {
+    async fn real_rebalance_peer_activates_while_entry_retains_run_fence() {
         const REBALANCE_ID: &str = "rebalance-peer-activation-lock-order";
         let (_temp_dirs, store, peer) = crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(Some(
             active_rebalance_meta(REBALANCE_ID),
@@ -1448,7 +1456,7 @@ mod tests {
         let bucket = crate::disk::RUSTFS_META_BUCKET;
         let object = "rebalance-peer-activation-object";
         let version_id = uuid::Uuid::new_v4();
-        let payload = b"entry must drain before peer activation takes the pool fence".repeat(1024);
+        let payload = b"peer activation must not wait for this entry to drain".repeat(1024);
         let source_set = store.pools[0].get_disks_by_key(object);
         let target_set = store.pools[1].get_disks_by_key(object);
         let opts = ObjectOptions {
@@ -1508,7 +1516,12 @@ mod tests {
         );
         tokio::time::timeout(StdDuration::from_secs(30), attempted.notified())
             .await
-            .expect("peer activation must attempt the persisted rebalance write fence");
+            .expect("peer activation must attempt the persisted rebalance fence");
+        tokio::time::timeout(StdDuration::from_secs(30), activation_result)
+            .await
+            .expect("peer activation must finish while the entry remains paused")
+            .expect("peer activation result should be sent")
+            .expect("joining the same run must not require its active entry to release the run fence");
         release.notify_one();
 
         tokio::time::timeout(StdDuration::from_secs(30), async {
@@ -1523,10 +1536,6 @@ mod tests {
         })
         .await
         .expect("entry and peer activation must both make progress");
-        activation_result
-            .await
-            .expect("peer activation result should be sent")
-            .expect("peer activation must not time out behind the entry it blocks");
 
         let mut reader = target_set
             .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::disk::{decode_rename_data_request_file_info, encode_rename_data_response_payloads};
+use super::disk::{decode_rename_data_request_file_info, encode_rename_data_response_payloads, verify_quota_mutation_digest};
 use super::{LocalMutationTarget, NodeService};
 use crate::storage::storage_api::rpc_consumer::node_service::DiskError;
 use crate::storage::storage_api::{sign_tonic_rpc_response_proof, verify_tonic_canonical_body_digest};
@@ -45,17 +45,27 @@ impl NodeService {
         &self,
         request: Request<RenameDataRequest>,
     ) -> Result<Response<RenameDataResponse>, Status> {
-        let canonical = rustfs_protos::canonical_artifact_rename_data_request_body(request.get_ref())
-            .map_err(|_| Status::invalid_argument("artifact rename request is too large to authenticate"))?;
-        verify_tonic_canonical_body_digest(&request, &canonical)
-            .map_err(|_| Status::permission_denied("artifact rename requires its body-bound authentication"))?;
+        let canonical = rustfs_protos::canonical_artifact_rename_data_request_body(request.get_ref());
+        let quota_topology = if request.metadata().contains_key(rustfs_protos::QUOTA_MUTATION_TOPOLOGY_HEADER) {
+            Some(verify_quota_mutation_digest(&request, canonical)?)
+        } else {
+            let canonical =
+                canonical.map_err(|_| Status::invalid_argument("artifact rename request is too large to authenticate"))?;
+            verify_tonic_canonical_body_digest(&request, &canonical)
+                .map_err(|_| Status::permission_denied("artifact rename requires its body-bound authentication"))?;
+            None
+        };
         let incarnation = required_uuid(&request.get_ref().bucket_incarnation_id, "bucket incarnation")?;
         if !request.get_ref().scanner_publication_lease_token.is_empty() {
             return Err(Status::invalid_argument("artifact rename cannot carry a scanner publication lease"));
         }
         // Capture once: a bootstrap/unbound request cannot switch to a ready
         // instance after any await, and no global store fallback is permitted.
-        let LocalMutationTarget::Ready(store) = self.local_mutation_target() else {
+        let target = self.local_mutation_target();
+        if let Some(topology) = &quota_topology {
+            self.quota_store_for_topology(&target, topology)?;
+        }
+        let LocalMutationTarget::Ready(store) = target else {
             return Err(Status::unavailable("artifact rename requires a ready storage instance"));
         };
         let request = request.into_inner();
@@ -63,6 +73,20 @@ impl NodeService {
             Ok(decoded) => decoded,
             Err(error) => return Ok(rename_failure(error)),
         };
+        let quota_suffix = crate::storage::storage_api::ecstore_disk::QUOTA_MUTATION_FENCE_METADATA_SUFFIX;
+        let carries_quota_token = rustfs_utils::http::metadata_compat::contains_key_str(&decoded.value.metadata, quota_suffix);
+        if quota_topology.is_some() {
+            let token = rustfs_utils::http::metadata_compat::get_consistent_str(&decoded.value.metadata, quota_suffix)
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .filter(|token| !token.is_nil());
+            if token.is_none() {
+                return Err(Status::invalid_argument(
+                    "quota artifact rename requires a consistent non-nil mutation fence token",
+                ));
+            }
+        } else if carries_quota_token {
+            return Err(Status::invalid_argument("quota artifact rename requires topology-bound authentication"));
+        }
         let result = store
             .rename_local_artifact_data(
                 &request.disk,

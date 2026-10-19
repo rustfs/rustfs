@@ -44,6 +44,14 @@ Rules enforced by `DisksLayout::from_volumes`: with more than one argument every
 
 Startup order (`init_startup_storage_foundation` in `rustfs/src/startup_storage.rs`): parse endpoints, validate storage classes against every pool (`ECStore::validate_startup_storage_class`), enforce the unsupported-filesystem policy, initialize local disks, initialize lock clients, then load or create the format quorum and build the store. A storage-class error stops startup before any disk is touched.
 
+### 2.1 Windows endpoints
+
+Multi-node and multi-pool layouts need URL endpoints, so on Windows the drive path goes after the port with forward slashes: `http://node{1...4}:9000/D:/rustfs/data{1...4}`. `Endpoint::get_file_path` (`crates/ecstore/src/layout/endpoint.rs`) turns the URL path `/D:/rustfs/data1` back into `D:/rustfs/data1` for every scheme; a URL path without a drive, such as `/export1`, stays a URL path. A drive root (`D:\` or `http://node1:9000/D:/`) is accepted in both forms. UNC shares (`\\nas\share\d1`, `//nas/share/d1`, `\\?\UNC\...`) are rejected at parse time: they are not local volumes, and parsing would read the share server as the endpoint host.
+
+Endpoint parsing then requires distinct physical disks (`validate_local_physical_disk_independence` in `crates/ecstore/src/layout/endpoints.rs`). On Windows the device identity is the volume mount point from `GetVolumePathNameW` (`crates/utils/src/os/windows.rs`), so `D:/rustfs/data1` through `D:/rustfs/data4` are one disk and startup fails with `must use distinct physical disks`. Give each endpoint its own volume (a drive letter or a volume mounted into an NTFS folder). For a single-machine test only, `RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true` skips the check; it gives no protection against losing that volume.
+
+A single local path (`rustfs D:\rustfs\data`) is a single-node single-drive deployment and can never gain a pool (§7). If the machine may expand later, start with URL endpoints and at least two drives per pool.
+
 ## 3. Startup configuration
 
 | Variable | Effect | Boundary |

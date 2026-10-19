@@ -51,9 +51,10 @@ impl ErasureSetHealer {
             }
             let resolved;
             let buckets = if buckets.is_empty() {
+                let (pool_idx, set_idx) = crate::heal::utils::parse_set_disk_id(set_disk_id)?;
                 resolved = self
                     .storage
-                    .list_buckets()
+                    .list_buckets_for_admin_heal(Some(crate::heal::storage_api::storage::DiskSetSelector::new(pool_idx, set_idx)))
                     .await?
                     .into_iter()
                     .map(|bucket| bucket.name)

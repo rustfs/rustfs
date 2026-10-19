@@ -1092,31 +1092,41 @@ pub(crate) fn odm_check_source_preconditions(headers: &HeaderMap, head: &SourceH
     if (needs_etag && head.etag.is_none()) || (needs_mtime && head.last_modified.is_none()) {
         return Err(odm_source_unavailable_error("missing_source_validator"));
     }
+    let mut metadata = HashMap::new();
+    for (name, value) in [("cache-control", &head.cache_control), ("expires", &head.expires)] {
+        if let Some(value) = value {
+            metadata.insert(name.to_owned(), value.clone());
+        }
+    }
     let info = ObjectInfo {
         etag: head.etag.clone(),
         mod_time: head.last_modified.map(OffsetDateTime::from),
+        user_defined: metadata.into(),
         ..Default::default()
     };
-    // A successful source read establishes wildcard existence, but the
-    // remaining conditions must still run in their ordinary precedence.
-    if head.etag.is_none() && (if_match == Some("*") || if_none_match == Some("*")) {
-        let mut remaining = headers.clone();
-        if if_match == Some("*") {
-            remaining.remove(http::header::IF_MATCH);
-            remaining.remove(http::header::IF_UNMODIFIED_SINCE);
-        }
-        if if_none_match == Some("*") {
-            remaining.remove(http::header::IF_NONE_MATCH);
-            remaining.remove(http::header::IF_MODIFIED_SINCE);
-        }
-        check_preconditions(&remaining, &info)?;
-        return if if_none_match == Some("*") {
-            Err(S3Error::new(S3ErrorCode::NotModified))
-        } else {
-            Ok(())
-        };
-    }
     check_preconditions(headers, &info)
+}
+
+/// S3 documents write-side `If-None-Match` only as `*` (create-only).
+/// Reject unsupported ETag comparisons with 501 NotImplemented.
+/// Treating it as an ETag comparison would let a write overwrite an existing key
+/// while still satisfying a policy that requires `s3:if-none-match`.
+pub(crate) fn reject_non_wildcard_write_if_none_match(
+    if_none_match: Option<&s3s::dto::ETagCondition>,
+    headers: &HeaderMap,
+) -> S3Result<()> {
+    // POST parses conditional DTO fields from the form, so HTTP headers also need validation.
+    if matches!(if_none_match, Some(s3s::dto::ETagCondition::ETag(_)))
+        || headers.get_all(http::header::IF_NONE_MATCH).iter().any(|value| {
+            value.to_str().map_or(true, |value| {
+                let value = value.trim();
+                !value.is_empty() && value != "*"
+            })
+        })
+    {
+        return Err(S3Error::new(S3ErrorCode::NotImplemented));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1128,6 +1138,54 @@ mod tests {
         ServerSideEncryptionRule,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn reject_non_wildcard_write_if_none_match_allows_only_wildcard() {
+        let headers = HeaderMap::new();
+        assert!(reject_non_wildcard_write_if_none_match(None, &headers).is_ok());
+        assert!(reject_non_wildcard_write_if_none_match(Some(&s3s::dto::ETagCondition::Any), &headers).is_ok());
+
+        let etag = s3s::dto::ETagCondition::ETag(ETag::Strong("9b2cf535f27731c974343645a3985328".to_owned()));
+        let err =
+            reject_non_wildcard_write_if_none_match(Some(&etag), &headers).expect_err("an ETag If-None-Match must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::NotImplemented);
+        assert_eq!(err.status_code(), Some(http::StatusCode::NOT_IMPLEMENTED));
+        assert_eq!(
+            err.message(),
+            Some("A header you provided implies functionality that is not implemented.")
+        );
+    }
+
+    #[test]
+    fn reject_non_wildcard_write_if_none_match_checks_header_without_dto() {
+        for value in ["*", " * ", "", " "] {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::IF_NONE_MATCH, http::HeaderValue::from_str(value).expect("valid header"));
+            assert!(reject_non_wildcard_write_if_none_match(None, &headers).is_ok(), "{value:?}");
+        }
+        for value in ["\"different-etag\"", "W/\"weak-etag\"", "unquoted-etag"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::IF_NONE_MATCH, http::HeaderValue::from_str(value).expect("valid header"));
+            let err = reject_non_wildcard_write_if_none_match(None, &headers)
+                .expect_err("header-only ETag precondition must be rejected");
+            assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        }
+    }
+
+    #[test]
+    fn reject_non_wildcard_write_if_none_match_rejects_conflicting_sources() {
+        for value in [
+            http::HeaderValue::from_static("\"different-etag\""),
+            http::HeaderValue::from_bytes(b"\xff").expect("obs-text is a valid HTTP header"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.append(http::header::IF_NONE_MATCH, http::HeaderValue::from_static("*"));
+            headers.append(http::header::IF_NONE_MATCH, value);
+            let err = reject_non_wildcard_write_if_none_match(Some(&s3s::dto::ETagCondition::Any), &headers)
+                .expect_err("a form wildcard must not hide an unsupported raw HTTP precondition");
+            assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        }
+    }
 
     #[test]
     fn s3_response_version_id_distinguishes_absent_null_and_uuid_versions() {
@@ -1513,7 +1571,7 @@ mod tests {
 
     #[test]
     fn build_put_like_object_lock_metadata_rejects_retain_until_date_without_mode() {
-        let retain_until = Timestamp::from(OffsetDateTime::now_utc().add(time::Duration::days(1)));
+        let retain_until = Timestamp::from(OffsetDateTime::now_utc() + time::Duration::days(1));
         let err = build_put_like_object_lock_metadata(
             "test-bucket",
             &metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
@@ -1870,6 +1928,7 @@ mod tests {
             noncurrent_days: 0,
             newer_noncurrent_versions: 0,
             storage_class: String::new(),
+            expiry_policy: None,
         };
 
         assert!(build_put_object_expiration_header(&event).is_none());
@@ -1885,6 +1944,7 @@ mod tests {
             noncurrent_days: 0,
             newer_noncurrent_versions: 0,
             storage_class: String::new(),
+            expiry_policy: None,
         };
 
         // HTTP-date, not RFC 3339: the AWS SDKs parse this field with an
@@ -1902,6 +1962,7 @@ mod tests {
             noncurrent_days: 0,
             newer_noncurrent_versions: 0,
             storage_class: String::new(),
+            expiry_policy: None,
         };
 
         assert!(build_put_object_expiration_header(&event).is_none());
@@ -1913,6 +1974,7 @@ mod tests {
             noncurrent_days: 0,
             newer_noncurrent_versions: 0,
             storage_class: String::new(),
+            expiry_policy: None,
         };
 
         assert!(build_put_object_expiration_header(&event).is_none());

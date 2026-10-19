@@ -59,7 +59,7 @@
 7|crates/ecstore/src/set_disk/core/io_primitives.rs
 1|crates/ecstore/src/set_disk/mod.rs
 3|crates/ecstore/src/set_disk/ops/bitrot_self_verify.rs
-2|crates/ecstore/src/set_disk/ops/heal.rs
+1|crates/ecstore/src/set_disk/ops/heal.rs
 8|crates/ecstore/src/set_disk/ops/multipart.rs
 2|crates/ecstore/src/set_disk/ops/object.rs
 3|crates/ecstore/src/set_disk/read.rs
@@ -68,4 +68,4 @@
 10|crates/ecstore/src/store/init.rs
 3|crates/ecstore/src/store/multipart.rs
 6|crates/ecstore/src/store/object.rs
-5|crates/ecstore/src/store/rebalance/support.rs
+3|crates/ecstore/src/store/rebalance/support.rs

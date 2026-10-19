@@ -70,6 +70,7 @@ pub mod system;
 pub mod table_catalog;
 mod target_descriptor;
 pub mod tier;
+pub mod tls_certificate;
 pub mod tls_debug;
 pub mod trace;
 pub mod usage_prefix;

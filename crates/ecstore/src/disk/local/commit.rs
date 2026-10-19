@@ -24,7 +24,7 @@ use super::{
     LOG_SUBSYSTEM_DISK_LOCAL, LocalDisk, SyncMode, effective_durability, inline_metadata_rollback_dir, observe_old_current_size,
     remove_dir_all_if_exists, remove_dst_base_before_commit, remove_file_if_exists, rename_data_versions_signature,
     run_inline_preparation_before_backup, should_fail_after_metadata_commit, should_fail_before_old_metadata_backup,
-    should_fail_commit_rename, should_remove_staged_meta_before_commit, skip_access_checks,
+    should_fail_commit_rename, should_remove_staged_meta_before_commit, skip_access_checks, tmp_staging_mutation_path,
 };
 #[cfg(test)]
 use super::{run_inline_before_file_sync_admission, run_owned_file_write_before_open, run_rename_data_after_first_publication};
@@ -46,6 +46,33 @@ use std::{
 use tokio::fs;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+fn transitioned_old_current_source(
+    dst_meta_existed: bool,
+    dst_meta_unparsable: bool,
+    xlmeta: &FileMeta,
+    volume: &str,
+    path: &str,
+    version_id: Uuid,
+) -> (bool, Option<FileInfo>) {
+    if dst_meta_unparsable {
+        return (false, None);
+    }
+    if !dst_meta_existed {
+        return (true, None);
+    }
+    let Ok(old_current) = xlmeta.into_fileinfo(volume, path, "", false, false, true) else {
+        return (false, None);
+    };
+    if old_current.version_id.unwrap_or_default() != version_id {
+        return (true, None);
+    }
+    if old_current.transition_status == rustfs_filemeta::TRANSITION_COMPLETE {
+        (true, Some(old_current))
+    } else {
+        (true, None)
+    }
+}
 
 /// Hold later repair publications after admitting one baseline object. The
 /// fixture arms this on one replacement disk before rejoining the cluster.
@@ -214,7 +241,7 @@ pub(super) async fn lock_rename_commit_directories(
     publication_root: &os::PublicationRoot,
     mutation_lease: Arc<os::NamespaceMutationLease>,
 ) -> Result<os::RenameCommitGuard> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     let result = {
         let source_parent = source_parent.to_path_buf();
         let destination_parent = destination_parent.to_path_buf();
@@ -222,7 +249,7 @@ pub(super) async fn lock_rename_commit_directories(
         let publication_root = publication_root.clone();
         os::run_blocking_namespace_operation(mutation_lease, move || {
             let result = os::prepare_rename_commit_guard(&source_parent, &destination_parent, &base_dir, &publication_root);
-            #[cfg(test)]
+            #[cfg(all(test, windows))]
             if result.is_ok() {
                 run_destination_commit_directory_preparation(&destination_parent);
             }
@@ -230,7 +257,7 @@ pub(super) async fn lock_rename_commit_directories(
         })
         .await
     };
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     let result = {
         let _ = mutation_lease;
         os::prepare_rename_commit_guard(source_parent, destination_parent, base_dir, publication_root)
@@ -244,12 +271,12 @@ pub(super) async fn lock_rename_commit_directories(
     result.map_err(to_file_error).map_err(DiskError::from)
 }
 
-async fn read_rename_destination_metadata(
+async fn prepare_rename_destination_metadata(
     file_path: &Path,
     rename_commit_guard: &os::RenameCommitGuard,
     mutation_lease: Arc<os::NamespaceMutationLease>,
 ) -> Result<Option<Bytes>> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     let result = {
         let file_path = file_path.to_path_buf();
         let rename_commit_guard = rename_commit_guard.clone();
@@ -258,10 +285,10 @@ async fn read_rename_destination_metadata(
         })
         .await
     };
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     let _ = (rename_commit_guard, mutation_lease);
-    #[cfg(not(windows))]
-    let result = match super::super::fs::read_file(file_path).await {
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let result = match fs::read(file_path).await {
         Ok(data) => Ok(Some(data)),
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err),
@@ -294,10 +321,12 @@ impl LocalDisk {
     async fn prepare_rename_data_admission(
         &self,
         fi: FileInfo,
+        source: (&str, &str),
         destination: (&str, &str),
         source_volume: Option<&str>,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<PreparedRenameData> {
+        let (src_volume, src_path) = source;
         let (dst_volume, dst_path) = destination;
         let mut fi = fi;
         // A non-force DeleteBucket must not remove a directory while a local
@@ -326,6 +355,13 @@ impl LocalDisk {
             None => None,
         };
         // Quota admission -> metadata RMW -> namespace/volume publication.
+        let no_inline = fi.data.is_none() && fi.size > 0;
+        let fi_healing = fi.is_healing();
+        let staging_prefix = if fi_healing && !no_inline && src_volume == super::super::RUSTFS_META_TMP_BUCKET {
+            Some(tmp_staging_mutation_path(&self.root, src_path)?)
+        } else {
+            None
+        };
         let metadata_lease =
             os::acquire_metadata_mutation_lease(&self.get_object_path(dst_volume, dst_path)?, namespace_owner).await;
         let mutation_lease = if let Some(source_volume) = source_volume {
@@ -334,6 +370,7 @@ impl LocalDisk {
                 source_volume,
                 dst_volume,
                 &destination_object_path,
+                staging_prefix.as_deref(),
                 Some(metadata_lease),
             )
             .await
@@ -342,6 +379,7 @@ impl LocalDisk {
                 &self.root,
                 dst_volume,
                 &destination_object_path,
+                staging_prefix.as_deref(),
                 Some(metadata_lease),
             )
             .await
@@ -374,7 +412,7 @@ impl LocalDisk {
         #[cfg(not(target_os = "linux"))]
         let owner: Arc<dyn Send + Sync> = Arc::new((permit, namespace_owner));
         let prepared = self
-            .prepare_rename_data_admission(fi.clone(), destination, Some(source.0), Some(owner))
+            .prepare_rename_data_admission(fi.clone(), source, destination, Some(source.0), Some(owner))
             .await?;
         for volume in [Some(source.0), (source.0 != destination.0).then_some(destination.0)]
             .into_iter()
@@ -435,9 +473,17 @@ impl LocalDisk {
                 mutation_lease,
             }
         } else {
-            self.prepare_rename_data_admission(fi, (dst_volume, dst_path), None, state.namespace_owner.take())
-                .await?
+            self.prepare_rename_data_admission(
+                fi,
+                (src_volume, src_path),
+                (dst_volume, dst_path),
+                None,
+                state.namespace_owner.take(),
+            )
+            .await?
         };
+        let no_inline = fi.data.is_none() && fi.size > 0;
+        let fi_healing = fi.is_healing();
         // Snapshot the destination part paths before `fi` is consumed below. These
         // are the descriptors a reader may hold for the version this call is about
         // to replace (backlog#1145); readers build the identical string in
@@ -493,7 +539,7 @@ impl LocalDisk {
 
         // xl.meta path
         let src_file_path = self.io_get_object_path(src_volume, format!("{}/{}", src_path, STORAGE_FORMAT_FILE).as_str())?;
-        let dst_file_path = self.io_get_object_path(dst_volume, format!("{}/{}", dst_path, STORAGE_FORMAT_FILE).as_str())?;
+        let dst_file_path = self.io_get_object_open_path(dst_volume, format!("{}/{}", dst_path, STORAGE_FORMAT_FILE).as_str())?;
 
         // data_dir path
         let has_data_dir_path = {
@@ -525,11 +571,6 @@ impl LocalDisk {
         check_path_length(src_file_path.to_string_lossy().to_string().as_str())?;
         check_path_length(dst_file_path.to_string_lossy().to_string().as_str())?;
 
-        let no_inline = fi.data.is_none() && fi.size > 0;
-        // Captured before `fi` is consumed by add_version; gates the stale
-        // destination purge below.
-        let fi_healing = fi.is_healing();
-
         // Resolved once for the whole commit so a concurrent configuration
         // change can never leave a single rename_data half-synced. The tier is
         // keyed on the destination volume: user data staged in scratch
@@ -555,8 +596,7 @@ impl LocalDisk {
             .map_err(to_file_error)?;
         }
         // Acquire the common trees before reading destination metadata. On
-        // Windows this pins the object directory identity across metadata
-        // preparation, data publication, rollback backup, and final commit.
+        // Windows this pins the object directory identity across publication.
         let rename_commit_guard = lock_rename_commit_directories(
             src_file_parent,
             dst_file_parent,
@@ -574,9 +614,12 @@ impl LocalDisk {
             source_volume_dir: &src_volume_dir,
             data_paths: has_data_dir_path.as_ref(),
         };
-        let has_dst_buf =
-            read_rename_destination_metadata(commit.destination_metadata, &commit.directory_guard, commit.mutation_lease.clone())
-                .await?;
+        let has_dst_buf = prepare_rename_destination_metadata(
+            commit.destination_metadata,
+            &commit.directory_guard,
+            commit.mutation_lease.clone(),
+        )
+        .await?;
 
         if no_inline {
             // Non-inline: read xl.meta, parse, write, rename data dir, rename xl.meta
@@ -610,6 +653,14 @@ impl LocalDisk {
             }
 
             let version_id = fi.version_id.unwrap_or_default();
+            let (old_current_source_checked, old_current_source) = transitioned_old_current_source(
+                has_dst_buf.is_some(),
+                dst_meta_unparsable,
+                &xlmeta,
+                dst_volume,
+                dst_path,
+                version_id,
+            );
             let has_old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
             let old_version_exists = xlmeta.find_version(Some(version_id)).is_ok();
             let rollback_data_dir = has_old_data_dir.or_else(|| {
@@ -900,7 +951,9 @@ impl LocalDisk {
                 && let Some(parent) = dst_file_path.parent()
             {
                 let fsync_started = rustfs_io_metrics::put_stage_timer();
-                if let Err(err) = os::fsync_dst_dir_group_commit(parent, Some(commit.mutation_lease.clone())).await {
+                if let Err(err) =
+                    os::fsync_commit_directory(parent, &commit.directory_guard, commit.mutation_lease.clone(), None).await
+                {
                     rustfs_io_metrics::record_put_object_stage_duration_from(
                         rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DST_DIR_FSYNC,
                         fsync_started,
@@ -999,6 +1052,8 @@ impl LocalDisk {
                 cleanup_data_dir: has_old_data_dir,
                 sign: version_signature,
                 old_current_size,
+                old_current_source_checked,
+                old_current_source,
             })
         } else {
             // Inline metadata preparation is blocking. The transaction lease is
@@ -1012,6 +1067,8 @@ impl LocalDisk {
                 None
             };
             let dst_path_for_failpoint = dst_path.to_string();
+            let dst_volume_for_source = dst_volume.to_string();
+            let dst_path_for_source = dst_path.to_string();
             #[cfg(windows)]
             let source_parent = src_file_parent.to_path_buf();
             let rename_commit_guard_for_preparation = commit.directory_guard.clone();
@@ -1056,15 +1113,30 @@ impl LocalDisk {
                 };
 
                 let version_id = fi.version_id.unwrap_or_default();
+                let (old_current_source_checked, old_current_source) = transitioned_old_current_source(
+                    has_dst_buf.is_some(),
+                    dst_meta_unparsable,
+                    &xlmeta,
+                    &dst_volume_for_source,
+                    &dst_path_for_source,
+                    version_id,
+                );
                 let old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
-                let old_version_exists = xlmeta.find_version(Some(version_id)).is_ok();
-                let rollback_data_dir = old_data_dir.or_else(|| {
-                    if old_version_exists && has_dst_buf.is_some() {
-                        Some(inline_metadata_rollback_dir(version_id, &xlmeta))
-                    } else {
-                        None
-                    }
-                });
+                // Healing commits never run set-level post-return rollback; keep
+                // their intra-commit rollback backup in the staging directory so
+                // `<object>/<rollback_data_dir>/xl.meta.bkp` is never stranded.
+                let rollback_data_dir = if fi_healing {
+                    None
+                } else {
+                    let old_version_exists = xlmeta.find_version(Some(version_id)).is_ok();
+                    old_data_dir.or_else(|| {
+                        if old_version_exists && has_dst_buf.is_some() {
+                            Some(inline_metadata_rollback_dir(version_id, &xlmeta))
+                        } else {
+                            None
+                        }
+                    })
+                };
                 let mut staged_rollback_path = None;
                 if let Some(d) = old_data_dir.as_ref() {
                     let _ = xlmeta.data.remove_two(version_id, *d);
@@ -1080,7 +1152,7 @@ impl LocalDisk {
                 prepared_metadata_source.write_all(&new_buf, sync)?;
                 run_inline_preparation_before_backup(&dst_path_for_failpoint);
                 if let Some(ref old_metadata) = has_dst_buf
-                    && (rollback_data_dir.is_some() || sync || cfg!(test))
+                    && (rollback_data_dir.is_some() || fi_healing || sync || cfg!(test))
                 {
                     #[cfg(windows)]
                     let backup_path = {
@@ -1105,6 +1177,8 @@ impl LocalDisk {
                     old_data_dir,
                     version_signature,
                     old_current_size,
+                    old_current_source_checked,
+                    old_current_source,
                     staged_rollback_path,
                     has_dst_buf.is_none(),
                     prepared_metadata_source,
@@ -1124,6 +1198,8 @@ impl LocalDisk {
                 cleanup_data_dir,
                 version_signature,
                 old_current_size,
+                old_current_source_checked,
+                old_current_source,
                 mut local_rollback_path,
                 destination_was_absent,
                 prepared_metadata_source,
@@ -1256,10 +1332,11 @@ impl LocalDisk {
                     && let Some(dst_parent) = dst_file_path.parent()
                 {
                     let fsync_started = rustfs_io_metrics::put_stage_timer();
-                    if let Err(err) = os::fsync_dst_dir_group_commit_or_namespace_file_sync_limit(
+                    if let Err(err) = os::fsync_commit_directory(
                         dst_parent,
+                        &commit.directory_guard,
                         commit.mutation_lease.clone(),
-                        admission,
+                        Some(admission),
                     )
                     .await
                     {
@@ -1371,6 +1448,8 @@ impl LocalDisk {
                 cleanup_data_dir,
                 sign: version_signature,
                 old_current_size,
+                old_current_source_checked,
+                old_current_source,
             })
         }
     }

@@ -16,8 +16,8 @@ use crate::material::OutboundTlsMaterial;
 use crate::metrics::record_outbound_tls_publication;
 use crate::state::TlsGeneration;
 use rustfs_common::{
-    MtlsIdentityPem, clear_global_root_cert, get_global_mtls_identity, get_global_outbound_tls_generation, get_global_root_cert,
-    set_global_mtls_identity, set_global_outbound_tls_generation, set_global_root_cert,
+    MtlsIdentityPem, OutboundTlsSnapshot, get_global_outbound_tls_generation, get_global_outbound_tls_snapshot,
+    publish_global_outbound_tls_snapshot,
 };
 
 #[derive(Debug, Clone)]
@@ -35,21 +35,21 @@ pub struct GlobalOutboundTlsStateSummary {
 }
 
 pub async fn publish_global_outbound_tls_state(generation: TlsGeneration, material: &OutboundTlsMaterial) {
-    if !material.root_ca_pem.is_empty() {
-        set_global_root_cert(material.root_ca_pem.clone()).await;
-    } else {
-        clear_global_root_cert().await;
-    }
-    set_global_mtls_identity(material.mtls_identity.clone()).await;
-    set_global_outbound_tls_generation(generation.0);
-    record_outbound_tls_publication(generation.0, !material.root_ca_pem.is_empty(), material.mtls_identity.is_some());
+    let accepted = publish_global_outbound_tls_snapshot(OutboundTlsSnapshot {
+        generation: generation.0,
+        root_ca_pem: (!material.root_ca_pem.is_empty()).then(|| material.root_ca_pem.clone()),
+        mtls_identity: material.mtls_identity.clone(),
+    })
+    .await;
+    record_outbound_tls_publication(accepted, !material.root_ca_pem.is_empty(), material.mtls_identity.is_some());
 }
 
 pub async fn load_global_outbound_tls_state() -> GlobalPublishedOutboundTlsState {
+    let snapshot = get_global_outbound_tls_snapshot();
     GlobalPublishedOutboundTlsState {
-        generation: TlsGeneration(get_global_outbound_tls_generation()),
-        root_ca_pem: get_global_root_cert().await,
-        mtls_identity: get_global_mtls_identity().await,
+        generation: TlsGeneration(snapshot.generation),
+        root_ca_pem: snapshot.root_ca_pem.clone(),
+        mtls_identity: snapshot.mtls_identity.clone(),
     }
 }
 

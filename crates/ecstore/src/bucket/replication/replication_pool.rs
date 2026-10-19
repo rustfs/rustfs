@@ -3383,7 +3383,7 @@ async fn queue_replicate_deletes(batch: ReplicationHealResyncDeletes) -> Replica
 
 #[cfg(test)]
 mod tests {
-    use super::super::replication_filemeta_boundary::ReplicateTargetDecision;
+    use super::super::replication_filemeta_boundary::{ReplicateTargetDecision, ReplicationState, VersionPurgeStatusType};
     use super::super::replication_resync_boundary::{decode_mrf_file, encode_mrf_file, encode_resync_file};
     use super::super::replication_storage_boundary::{
         DeletedObject, FileInfo, GetObjectReader, HTTPRangeSpec, ListOperations, ObjectIO, ObjectOperations, PutObjReader,
@@ -3420,6 +3420,7 @@ mod tests {
         hold_first_read: AtomicBool,
         allow_first_read: Notify,
         read_count: AtomicUsize,
+        delete_storage_calls: AtomicUsize,
         reported_size: StdMutex<Option<i64>>,
         stream_read_bytes: Arc<AtomicUsize>,
         write_count: AtomicUsize,
@@ -3628,6 +3629,7 @@ mod tests {
             _object: &str,
             _opts: &Self::ObjectOptions,
         ) -> Result<Self::ObjectInfo, Self::Error> {
+            self.shared.delete_storage_calls.fetch_add(1, Ordering::SeqCst);
             Err(EcstoreError::NotImplemented)
         }
 
@@ -3669,6 +3671,7 @@ mod tests {
             _object: &str,
             _opts: Self::ObjectOptions,
         ) -> Result<Self::ObjectInfo, Self::Error> {
+            self.shared.delete_storage_calls.fetch_add(1, Ordering::SeqCst);
             Err(EcstoreError::NotImplemented)
         }
 
@@ -3790,6 +3793,7 @@ mod tests {
         type NamespaceLock = rustfs_lock::NamespaceLockWrapper;
 
         async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<Self::NamespaceLock, Self::Error> {
+            self.shared.delete_storage_calls.fetch_add(1, Ordering::SeqCst);
             let lock =
                 rustfs_lock::NamespaceLock::with_local_manager("load-resync-test".to_string(), self.shared.lock_manager.clone());
             Ok(rustfs_lock::NamespaceLockWrapper::new(
@@ -4166,6 +4170,7 @@ mod tests {
             hold_first_read: AtomicBool::new(false),
             allow_first_read: Notify::new(),
             read_count: AtomicUsize::new(0),
+            delete_storage_calls: AtomicUsize::new(0),
             reported_size: StdMutex::new(None),
             stream_read_bytes: Arc::new(AtomicUsize::new(0)),
             write_count: AtomicUsize::new(0),
@@ -4175,6 +4180,106 @@ mod tests {
             write_started: Notify::new(),
             allow_write: Notify::new(),
         })
+    }
+
+    #[tokio::test]
+    async fn delete_worker_empty_admission_skips_storage() {
+        let mut declined = ReplicateDecision::default();
+        declined.set(ReplicateTargetDecision::new("arn:test".to_string(), false, false));
+        for state in [
+            None,
+            Some(ReplicationState::default()),
+            Some(ReplicationState {
+                replicate_decision_str: declined.to_string(),
+                ..Default::default()
+            }),
+        ] {
+            for delete_marker in [false, true] {
+                let shared = empty_resync_shared_state();
+                let storage = Arc::new(LoadResyncNodeStore::new("empty-delete", shared.clone()));
+                let version_id = Uuid::new_v4();
+                let delete = DeletedObjectReplicationInfo {
+                    bucket: "no-replication".to_string(),
+                    delete_object: ReplicationDeletedObject {
+                        object_name: "expired-version".to_string(),
+                        version_id: (!delete_marker).then_some(version_id),
+                        delete_marker_version_id: delete_marker.then_some(version_id),
+                        delete_marker,
+                        replication_state: state.clone(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let completed = replicate_delete_with_outcome(delete, storage).await;
+                assert_eq!(
+                    shared.delete_storage_calls.load(Ordering::SeqCst),
+                    0,
+                    "empty admission must not lock, read, or write storage (marker={delete_marker}, state={state:?})"
+                );
+                assert!(completed, "an empty delete is a completed no-op");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_worker_preserves_persisted_admission_without_live_config() {
+        let arn = "arn:test";
+        for state in [
+            ReplicationState {
+                replicate_decision_str: test_replicate_decision(&[arn]).to_string(),
+                ..Default::default()
+            },
+            ReplicationState {
+                targets: HashMap::from([(arn.to_string(), ReplicationStatusType::Pending)]),
+                ..Default::default()
+            },
+            ReplicationState {
+                purge_targets: HashMap::from([(arn.to_string(), VersionPurgeStatusType::Pending)]),
+                ..Default::default()
+            },
+        ] {
+            let shared = empty_resync_shared_state();
+            let storage = Arc::new(LoadResyncNodeStore::new("pending-delete", shared.clone()));
+            let delete = DeletedObjectReplicationInfo {
+                bucket: "no-live-config".to_string(),
+                delete_object: ReplicationDeletedObject {
+                    object_name: "pending-version".to_string(),
+                    version_id: Some(Uuid::new_v4()),
+                    replication_state: Some(state),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(
+                !replicate_delete_with_outcome(delete, storage).await,
+                "the injected storage failure must retain admitted work for retry"
+            );
+            assert!(shared.delete_storage_calls.load(Ordering::SeqCst) > 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_worker_rejects_malformed_empty_admission() {
+        let shared = empty_resync_shared_state();
+        let storage = Arc::new(LoadResyncNodeStore::new("invalid-delete", shared.clone()));
+        let delete = DeletedObjectReplicationInfo {
+            bucket: "no-replication".to_string(),
+            delete_object: ReplicationDeletedObject {
+                object_name: "invalid-decision".to_string(),
+                version_id: Some(Uuid::new_v4()),
+                replication_state: Some(ReplicationState {
+                    replicate_decision_str: "invalid".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            !replicate_delete_with_outcome(delete, storage).await,
+            "malformed decisions must not be acknowledged as empty work"
+        );
+        assert_eq!(shared.delete_storage_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -5198,6 +5303,7 @@ mod tests {
                 hold_first_read: AtomicBool::new(false),
                 allow_first_read: Notify::new(),
                 read_count: AtomicUsize::new(0),
+                delete_storage_calls: AtomicUsize::new(0),
                 reported_size: StdMutex::new(None),
                 stream_read_bytes: Arc::new(AtomicUsize::new(0)),
                 write_count: AtomicUsize::new(0),

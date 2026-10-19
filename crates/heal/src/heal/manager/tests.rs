@@ -29,6 +29,7 @@ use tempfile::TempDir;
 pub(super) mod admin_overlap;
 mod root_recovery;
 use uuid::Uuid;
+mod auto_scan;
 mod running_mainline;
 
 use super::super::{DiskOption, DiskStore, Endpoint, new_disk, storage_api::status::BucketInfo};
@@ -599,6 +600,13 @@ impl HealStorageAPI for MockStorage {
 
     async fn get_bucket_info(&self, _bucket: &str) -> Result<Option<BucketInfo>> {
         Ok(None)
+    }
+
+    async fn list_buckets_for_admin_heal(
+        &self,
+        _selector: Option<crate::heal::storage_api::storage::DiskSetSelector>,
+    ) -> Result<Vec<BucketInfo>> {
+        self.list_buckets().await
     }
 
     async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
@@ -5663,7 +5671,7 @@ async fn configured_task_timeout_applies_only_when_request_timeout_is_absent() {
     process_manager_queue_once(&manager).await;
     let explicit_status = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            if let Ok(status @ HealTaskStatus::Failed { .. }) = manager.get_task_status(&explicit_id).await {
+            if let Ok(status @ HealTaskStatus::Completed) = manager.get_task_status(&explicit_id).await {
                 break status;
             }
             tokio::task::yield_now().await;
@@ -5671,7 +5679,8 @@ async fn configured_task_timeout_applies_only_when_request_timeout_is_absent() {
     })
     .await
     .expect("explicit timeout request should finish without using the zero default");
-    assert!(matches!(explicit_status, HealTaskStatus::Failed { .. }));
+    // Generation-bound admin tasks reach the successful mock heal without a namespace preflight.
+    assert_eq!(explicit_status, HealTaskStatus::Completed);
 }
 
 #[tokio::test]
@@ -5900,5 +5909,27 @@ fn test_heal_config_respects_feature_flags() {
             assert!(!config.set_bulkhead_enable);
             assert!(!config.page_parallel_enable);
         },
+    );
+}
+
+#[test]
+fn admin_bucket_discovery_retries_keep_the_existing_budget() {
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    let mut request = HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::Normal);
+    request.source = HealRequestSource::Admin;
+    let id = request.id.clone();
+    let error = Err(Error::BucketDiscoveryIncomplete);
+    for attempt in 1..=MAX_RECOVERABLE_HEAL_RETRIES {
+        let task = HealTask::from_request(request, storage.clone());
+        let (retry, delay, _) = retry_request_for_result(&task, &error).expect("discovery can recover within budget");
+        assert_eq!(retry.id, id);
+        assert_eq!(retry.retry_attempts, attempt);
+        assert!(delay > Duration::ZERO);
+        request = retry;
+    }
+    let task = HealTask::from_request(request, storage);
+    assert!(
+        retry_request_for_result(&task, &error).is_none(),
+        "persistent incompleteness must terminate"
     );
 }

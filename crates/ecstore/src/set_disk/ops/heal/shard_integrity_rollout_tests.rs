@@ -15,7 +15,9 @@
 use crate::disk::{DiskAPI as _, ReadOptions};
 use crate::object_api::{ObjectOptions, PutObjReader, ShardIntegrityWriteMode};
 use crate::set_disk::CompletePart;
-use crate::set_disk::ops::object::hermetic_set_disks_support::hermetic_set_disks_for_pool_with_default_parity_isolated;
+use crate::set_disk::ops::object::hermetic_set_disks_support::{
+    hermetic_set_disks_for_pool_with_default_parity_isolated, lifecycle_owned_put_options,
+};
 use crate::storage_api_contracts::multipart::MultipartOperations as _;
 use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
 use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
@@ -39,18 +41,19 @@ async fn remote_metadata_heal_does_not_certify_unread_tier_payload() {
     for disk in &disks {
         disk.make_volume(bucket).await.expect("fixture bucket");
     }
-    set.put_object(
+    let opts = lifecycle_owned_put_options(
+        &set,
         bucket,
-        object,
-        &mut PutObjReader::from_vec(vec![0x31; 1024 * 1024 + 17]),
-        &ObjectOptions {
+        ObjectOptions {
             no_lock: true,
             shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
             ..Default::default()
         },
     )
-    .await
-    .expect("protected source");
+    .await;
+    set.put_object(bucket, object, &mut PutObjReader::from_vec(vec![0x31; 1024 * 1024 + 17]), &opts)
+        .await
+        .expect("protected source");
     for (disk, dir) in disks.iter().zip(&dirs) {
         let mut info = disk
             .read_version("", bucket, object, "", &ReadOptions::default())
@@ -94,10 +97,15 @@ async fn rollout_requires_both_flags_for_new_puts() {
     for disk in &disks {
         disk.make_volume(bucket).await.expect("fixture bucket");
     }
-    let opts = ObjectOptions {
-        no_lock: true,
-        ..Default::default()
-    };
+    let opts = lifecycle_owned_put_options(
+        &set,
+        bucket,
+        ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        },
+    )
+    .await;
 
     for (requested, confirmed, protected) in [
         (false, false, false),
@@ -159,12 +167,17 @@ async fn legacy_shard_repair_and_explicit_version_metadata_recovery_remain_avail
     for disk in &disks {
         disk.make_volume(bucket).await.expect("fixture bucket");
     }
-    let opts = ObjectOptions {
-        no_lock: true,
-        versioned: true,
-        shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Legacy),
-        ..Default::default()
-    };
+    let opts = lifecycle_owned_put_options(
+        &set,
+        bucket,
+        ObjectOptions {
+            no_lock: true,
+            versioned: true,
+            shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Legacy),
+            ..Default::default()
+        },
+    )
+    .await;
     let expected = vec![0x67; 1024 * 1024 + 37];
     for case in ["missing-part", "bad-bitrot", "missing-version-metadata"] {
         let object = case;
@@ -272,10 +285,15 @@ async fn multipart_mode_survives_rollout_switch_changes() {
     for disk in &disks {
         disk.make_volume(bucket).await.expect("fixture bucket");
     }
-    let opts = ObjectOptions {
-        no_lock: true,
-        ..Default::default()
-    };
+    let opts = lifecycle_owned_put_options(
+        &set,
+        bucket,
+        ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        },
+    )
+    .await;
     for protected in [false, true] {
         let object = format!("upload-{protected}");
         let upload =
@@ -354,11 +372,16 @@ async fn physical_copy_inherits_source_mode_instead_of_current_switch() {
         };
         let object = format!("source-{protected}");
         let expected = vec![0x39; 1024 * 1024 + 11];
-        let seed_opts = ObjectOptions {
-            no_lock: true,
-            shard_integrity_write_mode: Some(mode),
-            ..Default::default()
-        };
+        let seed_opts = lifecycle_owned_put_options(
+            &set,
+            bucket,
+            ObjectOptions {
+                no_lock: true,
+                shard_integrity_write_mode: Some(mode),
+                ..Default::default()
+            },
+        )
+        .await;
         let mut source = set
             .put_object(bucket, &object, &mut PutObjReader::from_vec(expected.clone()), &seed_opts)
             .await
@@ -366,8 +389,8 @@ async fn physical_copy_inherits_source_mode_instead_of_current_switch() {
         source.metadata_only = false;
         source.put_object_reader = Some(PutObjReader::from_vec(expected.clone()));
         let opts = ObjectOptions {
-            no_lock: true,
-            ..Default::default()
+            shard_integrity_write_mode: None,
+            ..seed_opts.clone()
         };
         let copied = temp_env::async_with_vars(
             rollout_vars(!protected, !protected),

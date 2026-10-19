@@ -422,6 +422,21 @@ message DeletePathsResponse {
   optional Error error = 2;
 }
 
+// Protocol 1 is additive and has no fallback to generic file mutation RPCs.
+message RecoverDeleteTransactionRequest {
+  string disk = 1;
+  string volume = 2;
+  uint32 protocol_version = 3;
+  bytes operation = 4;
+}
+
+message RecoverDeleteTransactionResponse {
+  bool success = 1;
+  uint32 protocol_version = 2;
+  bytes result = 3;
+  optional Error error = 4;
+}
+
 message SnapshotLeaseRequest {
   string disk = 1;
   string volume = 2;
@@ -569,6 +584,14 @@ message DeleteVersionsRequest {
   // both; receivers prefer the *_bin form and fall back to the JSON string when it is empty.
   repeated bytes versions_bin = 5;
   bytes opts_bin = 6;
+}
+
+// Additive, fail-closed conditional batch protocol. Probe requests never mutate disk state.
+message GuardedDeleteVersionsRequest {
+  string disk = 1;
+  string volume = 2;
+  bytes payload = 3;
+  bool probe_only = 4;
 }
 
 message DeleteVersionsResponse {
@@ -1249,9 +1272,12 @@ service NodeService {
   rpc CompareAndUpdateFile(CompareAndUpdateFileRequest) returns (CompareAndUpdateFileResponse) {}; // auth-policy: body-bound
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
   rpc DeleteAtIncarnation(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
+  rpc RecoverDeleteTransaction(RecoverDeleteTransactionRequest) returns (RecoverDeleteTransactionResponse) {}; // auth-policy: body-bound
   rpc AcquireSnapshotLease(SnapshotLeaseRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
+  rpc AcquireQuotaMutationFence(SnapshotLeaseRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
   rpc RenewSnapshotLease(SnapshotLeaseRenewRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
   rpc ReleaseSnapshotLease(SnapshotLeaseReleaseRequest) returns (SnapshotLeaseMutationResponse) {}; // auth-policy: body-bound
+  rpc ReleaseQuotaMutationFence(SnapshotLeaseReleaseRequest) returns (SnapshotLeaseMutationResponse) {}; // auth-policy: body-bound
   rpc VerifyFile(VerifyFileRequest) returns (VerifyFileResponse) {}; // auth-policy: read-only
   rpc ReadParts(ReadPartsRequest) returns (ReadPartsResponse) {}; // auth-policy: read-only
   rpc CheckParts(CheckPartsRequest) returns (CheckPartsResponse) {}; // auth-policy: read-only
@@ -1272,6 +1298,7 @@ service NodeService {
   rpc ArtifactRepairWriteMetadata(ArtifactRepairWriteMetadataRequest) returns (WriteMetadataResponse) {}; // auth-policy: body-bound
   rpc SealArtifactAttemptRepairs(SealArtifactAttemptPutsRequest) returns (SealArtifactAttemptPutsResponse) {}; // auth-policy: body-bound
   rpc SealArtifactAttemptPuts(SealArtifactAttemptPutsRequest) returns (SealArtifactAttemptPutsResponse) {}; // auth-policy: body-bound
+  rpc RenameDataWithQuotaFence(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
   rpc MakeVolumes(MakeVolumesRequest) returns (MakeVolumesResponse) {}; // auth-policy: body-bound
   rpc MakeVolume(MakeVolumeRequest) returns (MakeVolumeResponse) {}; // auth-policy: body-bound
   rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse) {}; // auth-policy: read-only
@@ -1288,6 +1315,7 @@ service NodeService {
   rpc DeleteVersionAtIncarnation(DeleteVersionRequest) returns (DeleteVersionResponse) {}; // auth-policy: body-bound
   rpc DeleteRetiredMarker(DeleteVersionRequest) returns (DeleteVersionResponse) {}; // auth-policy: body-bound
   rpc DeleteVersions(DeleteVersionsRequest) returns (DeleteVersionsResponse) {}; // auth-policy: body-bound
+  rpc GuardedDeleteVersions(GuardedDeleteVersionsRequest) returns (DeleteVersionsResponse) {}; // auth-policy: body-bound
   rpc ReadMultiple(ReadMultipleRequest) returns (ReadMultipleResponse) {}; // auth-policy: read-only
   rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse) {}; // auth-policy: body-bound
   rpc DiskInfo(DiskInfoRequest) returns (DiskInfoResponse) {}; // auth-policy: read-only

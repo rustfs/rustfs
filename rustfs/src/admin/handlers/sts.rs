@@ -432,7 +432,7 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
         })?;
     let authorization = &session.authorization;
     let new_cred = &session.credentials;
-    let subject = authorization.claims.session_identity();
+    let subject = authorization.session_identity();
 
     let xml = assume_role_with_web_identity_response_xml(new_cred, &subject);
 

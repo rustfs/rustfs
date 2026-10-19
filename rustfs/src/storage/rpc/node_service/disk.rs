@@ -13,15 +13,19 @@
 // limitations under the License.
 
 use super::{LocalMutationTarget, NodeService};
+use crate::storage::storage_api::ecstore_disk::{
+    QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, is_quota_mutation_fence_path,
+};
 use crate::storage::storage_api::rpc_consumer::node_service::{
     BatchReadVersionReq, BatchReadVersionResp, ConditionalFileUpdate, DeleteOptions, DiskError, DiskInfoOptions,
-    FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts,
-    validate_batch_read_version_item_count,
+    FileInfoVersions, GuardedDeleteVersionsPayload, ReadMultipleReq, ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _,
+    UpdateMetadataOpts, validate_batch_read_version_item_count,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use crate::storage::storage_api::{
-    LegacyFileWrite, LegacyMetadataWrite, LegacyPartMutation, LegacyPartOperation, LegacyPathDelete, LegacyPathDeleteOperation,
-    LegacyRenameData, LegacyRenameFile, PartTransactionAction, RenameDataResp, SnapshotLeaseToken,
+    DELETE_RECOVERY_PROTOCOL_VERSION, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, LegacyFileWrite, LegacyMetadataWrite,
+    LegacyPartMutation, LegacyPartOperation, LegacyPathDelete, LegacyPathDeleteOperation, LegacyRenameData, LegacyRenameFile,
+    PartTransactionAction, RenameDataResp, SnapshotLeaseToken, verify_tonic_canonical_body_digest,
     verify_tonic_mutation_body_digest,
 };
 use bytes::Bytes;
@@ -69,6 +73,32 @@ fn startup_cas_rename_observation(
 }
 
 impl LocalMutationTarget {
+    async fn recover_local_delete_transaction(
+        &self,
+        disk_ref: &str,
+        volume: &str,
+        operation: DeleteRecoveryRpcOperation,
+    ) -> Result<DeleteRecoveryRpcReply, DiskError> {
+        match self {
+            Self::Ready(store) => store.recover_local_delete_transaction(disk_ref, volume, operation).await,
+            Self::Bootstrap(target) => target.recover_local_delete_transaction(disk_ref, volume, operation).await,
+            Self::Unbound => Err(DiskError::other("target disk instance is unavailable")),
+        }
+    }
+
+    async fn guarded_local_delete_versions(
+        &self,
+        disk_ref: &str,
+        volume: &str,
+        payload: GuardedDeleteVersionsPayload,
+    ) -> Result<Vec<Option<DiskError>>, DiskError> {
+        match self {
+            Self::Ready(store) => store.guarded_local_delete_versions(disk_ref, volume, payload).await,
+            Self::Bootstrap(target) => target.guarded_local_delete_versions(disk_ref, volume, payload).await,
+            Self::Unbound => Err(DiskError::other("target disk instance is unavailable")),
+        }
+    }
+
     pub(crate) async fn find_mutation_disk(&self, disk_ref: &str) -> Option<super::DiskStore> {
         match self {
             Self::Ready(store) => store.local_mutation_disk(disk_ref).await.ok(),
@@ -267,6 +297,16 @@ const MSGPACK_ENCODE_CAPACITY_HINT: usize = 512;
 const FILE_INFO_MSGPACK_ENCODE_CAPACITY_HINT: usize = 1024;
 const SNAPSHOT_LEASE_PROTOCOL_VERSION: u32 = 1;
 
+fn rejects_legacy_delete_transaction(volume: &str, opts: &DeleteOptions) -> bool {
+    !(volume == ".rustfs.sys"
+        || volume.starts_with(".rustfs.sys/")
+        || volume == ".minio.sys"
+        || volume.starts_with(".minio.sys/"))
+        && opts.old_data_dir.is_some()
+        && !opts.recoverable_delete
+        && !opts.undo_write
+}
+
 fn snapshot_lease_response(result: Result<SnapshotLeaseToken, DiskError>) -> Response<SnapshotLeaseResponse> {
     match result {
         Ok(token) => Response::new(SnapshotLeaseResponse {
@@ -422,6 +462,33 @@ fn verify_disk_mutation_digest<T>(
         .map_err(|err| Status::permission_denied(format!("{op} authentication failed: {err}")))
 }
 
+pub(super) fn verify_quota_mutation_digest<T>(
+    request: &Request<T>,
+    canonical_body: std::result::Result<Vec<u8>, std::num::TryFromIntError>,
+) -> Result<String, Status> {
+    let values = request.metadata().get_all(rustfs_protos::QUOTA_MUTATION_TOPOLOGY_HEADER);
+    let mut values = values.iter();
+    let topology = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| Status::permission_denied("quota mutation requires a valid topology header"))?;
+    if values.next().is_some() {
+        return Err(Status::permission_denied("quota mutation requires exactly one topology header"));
+    }
+    let body = canonical_body.map_err(|_| Status::invalid_argument("quota mutation request length cannot be represented"))?;
+    let body = rustfs_protos::canonical_quota_mutation_request_body(topology, &body)
+        .map_err(|_| Status::invalid_argument("quota mutation envelope length cannot be represented"))?;
+    verify_tonic_canonical_body_digest(request, &body)
+        .map_err(|_| Status::permission_denied("quota mutation requires topology-bound v2 authentication"))?;
+    Ok(topology.to_owned())
+}
+
 /// JSON compatibility string for a dual-encoded response field. Returns an empty string when
 /// msgpack-only mode and its explicit fleet confirmation guard are both enabled, or when
 /// request-local `_bin` payloads prove the caller can consume the paired response `_bin` field,
@@ -527,19 +594,71 @@ pub(super) fn encode_rename_data_response_payloads(
 }
 
 impl NodeService {
+    pub(super) fn quota_store_for_topology<'a>(
+        &self,
+        target: &'a LocalMutationTarget,
+        coordinator_topology: &str,
+    ) -> Result<&'a Arc<super::ECStore>, Status> {
+        let LocalMutationTarget::Ready(store) = target else {
+            return Err(Status::failed_precondition("quota mutation requires a ready storage instance"));
+        };
+        let mut cache = self
+            .quota_topology_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let identity = Arc::downgrade(store);
+        if !cache.as_ref().is_some_and(|entry| entry.store.ptr_eq(&identity)) {
+            // Instance endpoints are immutable once initialized. Keep one weak
+            // identity so a replacement instance cannot inherit this layout,
+            // even when its deployment or disk UUIDs are unchanged.
+            let endpoints = store
+                .instance_endpoints()
+                .ok_or_else(|| Status::failed_precondition("quota mutation target topology is unavailable"))?;
+            let fingerprint = super::heal::heal_topology_fingerprint(&endpoints)
+                .map_err(|_| Status::failed_precondition("quota mutation target topology is invalid"))?;
+            #[cfg(test)]
+            self.quota_topology_computations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *cache = Some(super::QuotaTopologyCacheEntry {
+                store: identity,
+                fingerprint,
+            });
+        }
+        if cache.as_ref().is_none_or(|entry| entry.fingerprint != coordinator_topology) {
+            return Err(Status::failed_precondition(
+                "quota mutation coordinator topology does not match the target",
+            ));
+        }
+        Ok(store)
+    }
+
     pub(super) async fn handle_acquire_snapshot_lease(
         &self,
         request: Request<SnapshotLeaseRequest>,
+        quota_fence: bool,
     ) -> Result<Response<SnapshotLeaseResponse>, Status> {
-        verify_disk_mutation_digest(
-            &request,
-            rustfs_protos::canonical_snapshot_lease_request_body(request.get_ref()),
-            "acquire_snapshot_lease",
-        )?;
+        let body = rustfs_protos::canonical_snapshot_lease_request_body(request.get_ref());
+        let quota_store = if quota_fence {
+            let topology = verify_quota_mutation_digest(&request, body)?;
+            if request.get_ref().volume != RUSTFS_META_BUCKET || !is_quota_mutation_fence_path(&request.get_ref().path) {
+                return Err(Status::invalid_argument("quota fence requires its internal mutation fence path"));
+            }
+            Some(Arc::clone(self.quota_store_for_topology(&self.local_mutation_target(), &topology)?))
+        } else {
+            verify_disk_mutation_digest(&request, body, "acquire_snapshot_lease")?;
+            None
+        };
         let request = request.into_inner();
-        let result = match self.find_disk(&request.disk).await {
-            Some(disk) => disk.acquire_snapshot_lease(&request.volume, &request.path).await,
-            None => Err(DiskError::other("cannot find disk")),
+        let disk = match quota_store {
+            Some(store) => store.quota_mutation_fence_disk(&request.disk).await,
+            None => self
+                .find_disk(&request.disk)
+                .await
+                .ok_or_else(|| DiskError::other("cannot find disk")),
+        };
+        let result = match disk {
+            Ok(disk) => disk.acquire_snapshot_lease(&request.volume, &request.path).await,
+            Err(err) => Err(err),
         };
         Ok(snapshot_lease_response(result))
     }
@@ -566,25 +685,37 @@ impl NodeService {
     pub(super) async fn handle_release_snapshot_lease(
         &self,
         request: Request<SnapshotLeaseReleaseRequest>,
+        quota_fence: bool,
     ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
-        verify_disk_mutation_digest(
-            &request,
-            rustfs_protos::canonical_snapshot_lease_release_request_body(request.get_ref()),
-            "release_snapshot_lease",
-        )?;
+        let body = rustfs_protos::canonical_snapshot_lease_release_request_body(request.get_ref());
+        let quota_store = if quota_fence {
+            let topology = verify_quota_mutation_digest(&request, body)?;
+            if request.get_ref().volume != RUSTFS_META_BUCKET || !is_quota_mutation_fence_path(&request.get_ref().path) {
+                return Err(Status::invalid_argument("quota fence requires its internal mutation fence path"));
+            }
+            Some(Arc::clone(self.quota_store_for_topology(&self.local_mutation_target(), &topology)?))
+        } else {
+            verify_disk_mutation_digest(&request, body, "release_snapshot_lease")?;
+            None
+        };
         let request = request.into_inner();
         let token = if request.token.as_ref() == SnapshotLeaseToken::revoke_all().as_bytes() {
             SnapshotLeaseToken::revoke_all()
         } else {
             SnapshotLeaseToken::from_slice(&request.token).map_err(|_| Status::invalid_argument("invalid lease token"))?
         };
-        let Some(disk) = self.find_disk(&request.disk).await else {
-            return Ok(Response::new(SnapshotLeaseMutationResponse {
-                success: false,
-                error: Some(DiskError::other("cannot find disk").into()),
-            }));
+        let disk = match quota_store {
+            Some(store) => store.quota_mutation_fence_disk(&request.disk).await,
+            None => self
+                .find_disk(&request.disk)
+                .await
+                .ok_or_else(|| DiskError::other("cannot find disk")),
         };
-        match disk.release_snapshot_lease(&request.volume, &request.path, token).await {
+        let result = match disk {
+            Ok(disk) => disk.release_snapshot_lease(&request.volume, &request.path, token).await,
+            Err(err) => Err(err),
+        };
+        match result {
             Ok(()) => Ok(Response::new(SnapshotLeaseMutationResponse {
                 success: true,
                 error: None,
@@ -830,6 +961,71 @@ impl NodeService {
         }
     }
 
+    pub(super) async fn handle_guarded_delete_versions(
+        &self,
+        request: Request<GuardedDeleteVersionsRequest>,
+    ) -> Result<Response<DeleteVersionsResponse>, Status> {
+        if request.get_ref().payload.len() > rustfs_protos::DELETE_RECOVERY_MAX_PAYLOAD_BYTES {
+            return Err(Status::resource_exhausted("guarded delete payload exceeds limit"));
+        }
+        let body = rustfs_protos::canonical_guarded_delete_versions_request_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("invalid guarded delete body length"))?;
+        verify_tonic_canonical_body_digest(&request, &body)
+            .map_err(|_| Status::permission_denied("guarded delete requires body-bound v2 authentication"))?;
+        let request = request.into_inner();
+        let target = self.local_mutation_target();
+        let disk = target
+            .find_mutation_disk(&request.disk)
+            .await
+            .ok_or_else(|| Status::not_found("cannot find disk"))?;
+        if request.probe_only {
+            if !request.payload.is_empty() || !request.volume.is_empty() {
+                return Err(Status::invalid_argument("guarded capability probe must have no mutation payload"));
+            }
+            if let Err(error) = disk.supports_guarded_delete_versions().await {
+                return Ok(Response::new(DeleteVersionsResponse {
+                    success: false,
+                    errors: Vec::new(),
+                    error: Some(error.into()),
+                    item_errors: Vec::new(),
+                }));
+            }
+            return Ok(Response::new(DeleteVersionsResponse {
+                success: true,
+                errors: Vec::new(),
+                error: None,
+                item_errors: Vec::new(),
+            }));
+        }
+        let payload: GuardedDeleteVersionsPayload = rustfs_protos::decode_delete_recovery_payload(&request.payload)
+            .map_err(|_| Status::invalid_argument("invalid guarded delete payload"))?;
+        payload
+            .validate()
+            .map_err(|_| Status::invalid_argument("invalid guarded delete options or batch"))?;
+        target.reject_legacy_artifact_mutation(&request.volume).await?;
+        let result = target
+            .guarded_local_delete_versions(&request.disk, &request.volume, payload)
+            .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                return Ok(Response::new(DeleteVersionsResponse {
+                    success: false,
+                    errors: Vec::new(),
+                    error: Some(error.into()),
+                    item_errors: Vec::new(),
+                }));
+            }
+        };
+        let (errors, item_errors) = encode_delete_versions_errors(result);
+        Ok(Response::new(DeleteVersionsResponse {
+            success: true,
+            errors,
+            error: None,
+            item_errors,
+        }))
+    }
+
     pub(super) async fn handle_delete_versions(
         &self,
         request: Request<DeleteVersionsRequest>,
@@ -872,6 +1068,14 @@ impl NodeService {
                 }
             };
 
+            if rejects_legacy_delete_transaction(&request.volume, &opts) {
+                return Ok(Response::new(DeleteVersionsResponse {
+                    success: false,
+                    errors: Vec::new(),
+                    error: Some(DiskError::UnsupportedDisk.into()),
+                    item_errors: Vec::new(),
+                }));
+            }
             let result = if versions.is_empty() {
                 disk.delete_versions(&request.volume, versions, opts).await
             } else {
@@ -959,6 +1163,13 @@ impl NodeService {
                 }));
             }
         };
+        if rejects_legacy_delete_transaction(&request.volume, &opts) {
+            return Ok(Response::new(DeleteVersionResponse {
+                success: false,
+                raw_file_info: String::new(),
+                error: Some(DiskError::UnsupportedDisk.into()),
+            }));
+        }
         if require_marker_condition && opts.expected_delete_marker.is_none() {
             return Err(Status::invalid_argument("retired marker deletion requires a marker precondition"));
         }
@@ -1604,7 +1815,10 @@ impl NodeService {
     pub(super) async fn handle_rename_data(
         &self,
         request: Request<RenameDataRequest>,
+        quota_fence: bool,
     ) -> Result<Response<RenameDataResponse>, Status> {
+        let service_return_started = rustfs_io_metrics::put_stage_timer();
+        let service_entry_started = rustfs_io_metrics::put_stage_timer();
         if !request.get_ref().scanner_publication_lease_token.is_empty() || !request.get_ref().bucket_incarnation_id.is_empty() {
             let has_body_digest = request
                 .metadata()
@@ -1612,14 +1826,40 @@ impl NodeService {
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|value| value != "UNSIGNED-PAYLOAD");
             if !has_body_digest {
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_ENTRY,
+                    service_entry_started,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_RETURN,
+                    service_return_started,
+                );
                 return Err(Status::permission_denied("scanner publication lease rename requires a body-bound digest"));
             }
         }
-        verify_disk_mutation_digest(
-            &request,
-            rustfs_protos::canonical_rename_data_request_body(request.get_ref()),
-            "rename_data",
-        )?;
+        let body = rustfs_protos::canonical_rename_data_request_body(request.get_ref());
+        let mut quota_topology = None;
+        let authenticated = if quota_fence {
+            verify_quota_mutation_digest(&request, body).map(|topology| quota_topology = Some(topology))
+        } else {
+            verify_disk_mutation_digest(&request, body, "rename_data")
+        };
+        if let Err(err) = authenticated {
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_ENTRY,
+                service_entry_started,
+            );
+            rustfs_io_metrics::record_put_object_stage_duration_from(
+                rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_RETURN,
+                service_return_started,
+            );
+            return Err(err);
+        }
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_ENTRY,
+            service_entry_started,
+        );
+        let before_handler_started = rustfs_io_metrics::put_stage_timer();
         let request = request.into_inner();
         let target = self.local_mutation_target();
         let bucket_incarnation = if request.bucket_incarnation_id.is_empty() {
@@ -1630,6 +1870,14 @@ impl NodeService {
                 .filter(|id| !id.is_nil())
                 .ok_or_else(|| Status::invalid_argument("bucket incarnation must be a non-nil UUID"))?;
             if !request.scanner_publication_lease_token.is_empty() {
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_BEFORE_HANDLER,
+                    before_handler_started,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_RETURN,
+                    service_return_started,
+                );
                 return Err(Status::invalid_argument(
                     "heal incarnation and scanner publication lease cannot be combined",
                 ));
@@ -1641,12 +1889,26 @@ impl NodeService {
         let decoded_file_info = match decode_rename_data_request_file_info(&request.file_info_bin, &request.file_info) {
             Ok(file_info) => file_info,
             Err(err) => {
-                return Ok(Response::new(RenameDataResponse {
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_BEFORE_HANDLER,
+                    before_handler_started,
+                );
+                let response_build_started = rustfs_io_metrics::put_stage_timer();
+                let response = Response::new(RenameDataResponse {
                     success: false,
                     rename_data_resp: String::new(),
                     rename_data_resp_bin: Vec::new().into(),
                     error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
-                }));
+                });
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_BUILD,
+                    response_build_started,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_RETURN,
+                    service_return_started,
+                );
+                return Ok(response);
             }
         };
         let scanner_publication_lease_token = if request.scanner_publication_lease_token.is_empty() {
@@ -1655,10 +1917,34 @@ impl NodeService {
             let token = Uuid::from_slice(&request.scanner_publication_lease_token)
                 .map_err(|_| Status::invalid_argument("scanner publication lease token must be a UUID"))?;
             if token.is_nil() {
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_BEFORE_HANDLER,
+                    before_handler_started,
+                );
+                rustfs_io_metrics::record_put_object_stage_duration_from(
+                    rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_RETURN,
+                    service_return_started,
+                );
                 return Err(Status::invalid_argument("scanner publication lease token must not be nil"));
             }
             Some(token)
         };
+        if quota_fence {
+            let token = rustfs_utils::http::metadata_compat::get_consistent_str(
+                &decoded_file_info.value.metadata,
+                QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+            )
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .filter(|token| !token.is_nil());
+            if token.is_none() {
+                return Err(Status::invalid_argument(
+                    "quota rename requires a consistent non-nil mutation fence token",
+                ));
+            }
+        }
+        if let Some(topology) = quota_topology {
+            self.quota_store_for_topology(&target, &topology)?;
+        }
         let request_decoded_from_msgpack = decoded_file_info.from_msgpack;
         // Bind ordinary mutations to the captured instance and both live volumes
         // before consulting bucket authority; commit consumes those exact locks.
@@ -1689,6 +1975,11 @@ impl NodeService {
         target.reject_legacy_artifact_mutation(&request.dst_volume).await?;
         #[cfg(feature = "e2e-test-hooks")]
         let observation = startup_cas_rename_observation(&target, &request, &decoded_file_info.value);
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_BEFORE_HANDLER,
+            before_handler_started,
+        );
+        let handler_await_started = rustfs_io_metrics::put_stage_timer();
         let result = if let Some(rename) = prepared {
             rename.commit().await
         } else {
@@ -1703,6 +1994,11 @@ impl NodeService {
                 )
                 .await
         };
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_HANDLER_AWAIT,
+            handler_await_started,
+        );
+        let after_handler_started = rustfs_io_metrics::put_stage_timer();
         #[cfg(feature = "e2e-test-hooks")]
         if let Some(mut observation) = observation {
             observation["ok"] = serde_json::json!(result.is_ok());
@@ -1710,28 +2006,47 @@ impl NodeService {
             let line = format!("RUSTFS_E2E_STARTUP_CAS {observation}\n");
             let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), line.as_bytes());
         }
-        match result {
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_AFTER_HANDLER,
+            after_handler_started,
+        );
+        let response_build_started = rustfs_io_metrics::put_stage_timer();
+        let response_encode_started = rustfs_io_metrics::put_stage_timer();
+        let response = match result {
             Ok(rename_data_resp) => match encode_rename_data_response_payloads(&rename_data_resp, request_decoded_from_msgpack) {
-                Ok((rename_data_resp, rename_data_resp_bin)) => Ok(Response::new(RenameDataResponse {
+                Ok((rename_data_resp, rename_data_resp_bin)) => Response::new(RenameDataResponse {
                     success: true,
                     rename_data_resp,
                     rename_data_resp_bin: rename_data_resp_bin.into(),
                     error: None,
-                })),
-                Err(err) => Ok(Response::new(RenameDataResponse {
+                }),
+                Err(err) => Response::new(RenameDataResponse {
                     success: false,
                     rename_data_resp: String::new(),
                     rename_data_resp_bin: Vec::new().into(),
                     error: Some(err.into()),
-                })),
+                }),
             },
-            Err(err) => Ok(Response::new(RenameDataResponse {
+            Err(err) => Response::new(RenameDataResponse {
                 success: false,
                 rename_data_resp: String::new(),
                 rename_data_resp_bin: Vec::new().into(),
                 error: Some(err.into()),
-            })),
-        }
+            }),
+        };
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_ENCODE,
+            response_encode_started,
+        );
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_BUILD,
+            response_build_started,
+        );
+        rustfs_io_metrics::record_put_object_stage_duration_from(
+            rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_RESPONSE_RETURN,
+            service_return_started,
+        );
+        Ok(response)
     }
 
     pub(super) async fn handle_list_dir(&self, request: Request<ListDirRequest>) -> Result<Response<ListDirResponse>, Status> {
@@ -1900,6 +2215,106 @@ impl NodeService {
                 success: false,
                 error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
+        }
+    }
+
+    pub(super) async fn handle_recover_delete_transaction(
+        &self,
+        request: Request<RecoverDeleteTransactionRequest>,
+    ) -> Result<Response<RecoverDeleteTransactionResponse>, Status> {
+        if request.get_ref().operation.len() > rustfs_protos::DELETE_RECOVERY_MAX_PAYLOAD_BYTES {
+            return Err(Status::resource_exhausted("delete recovery operation exceeds payload limit"));
+        }
+        let body = rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("delete recovery request length cannot be represented"))?;
+        // This additive protocol has no digestless rolling-upgrade exception.
+        verify_tonic_canonical_body_digest(&request, &body)
+            .map_err(|_| Status::permission_denied("delete recovery requires body-bound v2 authentication"))?;
+        let request = request.into_inner();
+        if request.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION {
+            return Err(Status::unimplemented("incompatible delete recovery protocol"));
+        }
+        let operation: DeleteRecoveryRpcOperation = rustfs_protos::decode_delete_recovery_payload(&request.operation)
+            .map_err(|_| Status::invalid_argument("invalid delete recovery operation"))?;
+        if request.operation.len() > operation.max_wire_payload_bytes() {
+            return Err(Status::resource_exhausted("delete recovery operation exceeds payload limit"));
+        }
+        match &operation {
+            DeleteRecoveryRpcOperation::ApplyVersions { versions, .. }
+                if versions.len() > 1000
+                    || versions
+                        .iter()
+                        .try_fold(0_usize, |count, versions| count.checked_add(versions.versions.len()))
+                        .is_none_or(|count| count > 1000) =>
+            {
+                return Err(Status::invalid_argument("recoverable batch delete exceeds 1000 object/version requests"));
+            }
+            DeleteRecoveryRpcOperation::Discover { limit, .. } if *limit == 0 || *limit > 256 => {
+                return Err(Status::invalid_argument("delete recovery page limit must be between 1 and 256"));
+            }
+            DeleteRecoveryRpcOperation::Inspect { transaction, .. } | DeleteRecoveryRpcOperation::Settle { transaction, .. }
+                if transaction.is_nil() =>
+            {
+                return Err(Status::invalid_argument("delete transaction must be a non-nil UUID"));
+            }
+            DeleteRecoveryRpcOperation::ApplyVersion { opts, .. } | DeleteRecoveryRpcOperation::ApplyVersions { opts, .. }
+                if opts.old_data_dir.is_none_or(|transaction| transaction.is_nil())
+                    || opts.undo_delete
+                    || opts.undo_write
+                    || opts.recursive
+                    || opts.immediate
+                    || opts.orphan_data_dir
+                    || opts.expected_delete_marker.is_some()
+                    || opts
+                        .delete_recovery_bucket_incarnation
+                        .is_some_and(|incarnation| incarnation.is_nil()) =>
+            {
+                return Err(Status::invalid_argument(
+                    "recoverable delete requires a non-nil transaction and valid apply options",
+                ));
+            }
+            DeleteRecoveryRpcOperation::ApplyVersion { object, .. } if object.starts_with('/') => {
+                return Err(Status::invalid_argument("recoverable delete requires a relative object key"));
+            }
+            DeleteRecoveryRpcOperation::ApplyVersions { versions, .. }
+                if versions.iter().any(|version| version.name.starts_with('/')) =>
+            {
+                return Err(Status::invalid_argument("recoverable delete requires relative object keys"));
+            }
+            _ => {}
+        }
+        let target = self.local_mutation_target();
+        if matches!(
+            operation,
+            DeleteRecoveryRpcOperation::ApplyVersion { .. }
+                | DeleteRecoveryRpcOperation::ApplyVersions { .. }
+                | DeleteRecoveryRpcOperation::Settle { .. }
+        ) {
+            target.reject_legacy_artifact_mutation(&request.volume).await?;
+        }
+        let result = target
+            .recover_local_delete_transaction(&request.disk, &request.volume, operation)
+            .await;
+        match result {
+            Ok(reply) => {
+                let result = encode_msgpack_named(&reply, "delete recovery reply")
+                    .map_err(|_| Status::internal("cannot encode delete recovery reply"))?;
+                if result.len() > rustfs_protos::DELETE_RECOVERY_MAX_PAYLOAD_BYTES {
+                    return Err(Status::resource_exhausted("delete recovery reply exceeds payload limit"));
+                }
+                Ok(Response::new(RecoverDeleteTransactionResponse {
+                    success: true,
+                    protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+                    result: result.into(),
+                    error: None,
+                }))
+            }
+            Err(error) => Ok(Response::new(RecoverDeleteTransactionResponse {
+                success: false,
+                protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+                result: Bytes::new(),
+                error: Some(error.into()),
+            })),
         }
     }
 
@@ -2356,9 +2771,10 @@ impl NodeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        compat_response_json, decode_msgpack_or_json, decode_rename_data_request_file_info,
+        DeleteOptions, compat_response_json, decode_msgpack_or_json, decode_rename_data_request_file_info,
         encode_batch_read_version_response_payloads, encode_delete_versions_errors, encode_file_info_msgpack, encode_msgpack,
         encode_msgpack_named, encode_read_multiple_response_payloads, encode_rename_data_response_payloads,
+        rejects_legacy_delete_transaction,
     };
     use crate::storage::DiskError;
     use crate::storage::rpc::node_service::make_server;
@@ -2371,11 +2787,32 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use serial_test::serial;
     use tonic::Request;
+    use uuid::Uuid;
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     struct SamplePayload {
         name: String,
         count: u32,
+    }
+
+    #[test]
+    fn legacy_delete_transaction_policy_preserves_rollback_and_internal_maintenance() {
+        let mut opts = DeleteOptions {
+            old_data_dir: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        assert!(rejects_legacy_delete_transaction("bucket", &opts));
+        assert!(!rejects_legacy_delete_transaction(".rustfs.sys", &opts));
+        assert!(!rejects_legacy_delete_transaction(".rustfs.sys/tmp", &opts));
+        assert!(!rejects_legacy_delete_transaction(".minio.sys", &opts));
+        opts.undo_write = true;
+        assert!(!rejects_legacy_delete_transaction("bucket", &opts));
+        opts.undo_write = false;
+        opts.recoverable_delete = true;
+        assert!(!rejects_legacy_delete_transaction("bucket", &opts));
+        opts.recoverable_delete = false;
+        opts.old_data_dir = None;
+        assert!(!rejects_legacy_delete_transaction("bucket", &opts));
     }
 
     #[test]
@@ -3278,7 +3715,7 @@ mod legacy_artifact_tests {
         request: Request<RenameDataRequest>,
     ) -> Result<Response<RenameDataResponse>, Status> {
         verify_legacy_rpc_request(&request, "RenameData")?;
-        service.handle_rename_data(request).await
+        service.handle_rename_data(request, false).await
     }
 
     #[tokio::test]
@@ -3799,7 +4236,9 @@ mod legacy_artifact_tests {
                 Bytes::new()
             },
             opts_bin: if msgpack {
-                encode_msgpack(opts, "DeleteOptions").expect("msgpack delete options").into()
+                encode_msgpack_named(opts, "DeleteOptions")
+                    .expect("msgpack delete options")
+                    .into()
             } else {
                 Bytes::new()
             },
@@ -4088,6 +4527,22 @@ mod legacy_artifact_tests {
                         tonic::Code::PermissionDenied
                     );
                     assert_eq!(path_delete_snapshot(&fixture.physical), before);
+                    if matches!(case, LegacyPathCase::Residual(false)) && msgpack && volume != ".rustfs.sys" {
+                        if volume == "path-ordinary" {
+                            let rejected = authenticated_path_mutation(&service, &disk_ref, &fixture, msgpack, false)
+                                .await
+                                .expect("obsolete ordinary transaction envelope")
+                                .expect_err("ordinary legacy transaction is unsupported");
+                            assert_eq!(rejected, DiskError::UnsupportedDisk);
+                            assert_eq!(
+                                path_delete_snapshot(&fixture.physical),
+                                before,
+                                "obsolete residual transaction must not change physical state"
+                            );
+                        }
+                        // Exercise ordinary deletion and managed classification with a legal residual request.
+                        fixture.options.old_data_dir = None;
+                    }
                     let result = authenticated_path_mutation(&service, &disk_ref, &fixture, msgpack, false).await;
                     if volume == "path-managed" {
                         assert_eq!(result.expect_err("managed path rejects").code(), tonic::Code::PermissionDenied);
@@ -5995,7 +6450,9 @@ mod legacy_artifact_tests {
                 serde_json::to_string(opts).expect("JSON bulk options")
             },
             opts_bin: if msgpack {
-                encode_msgpack(opts, "DeleteOptions").expect("binary bulk options").into()
+                encode_msgpack_named(opts, "DeleteOptions")
+                    .expect("binary bulk options")
+                    .into()
             } else {
                 Bytes::new()
             },
@@ -6081,6 +6538,322 @@ mod legacy_artifact_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn delete_recovery_and_guarded_receivers_reject_managed_mutations() {
+        use crate::storage::storage_api::ecstore_disk::{CurrentDeleteGeneration, DeleteRecoveryAction, GuardedFileInfoVersions};
+        let root = tempfile::tempdir().expect("managed recovery receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        let bucket = "recovery-managed";
+        let object = "outputs/74656e616e74/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222/object";
+        env.ecstore
+            .clone()
+            .make_artifact_bucket(bucket, "outputs/")
+            .await
+            .expect("real managed authority");
+        env.put_object_bytes(bucket, object, vec![0x42; 4097]).await;
+        let service = service_for(&env).await;
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = service
+            .local_mutation_target()
+            .find_mutation_disk(&disk_ref)
+            .await
+            .expect("captured target");
+        let fi = ecstore_disk::DiskAPI::read_version(
+            disk.as_ref(),
+            bucket,
+            bucket,
+            object,
+            "",
+            &ReadOptions {
+                read_data: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("real published version");
+        let group = FileInfoVersions {
+            volume: bucket.to_owned(),
+            name: object.to_owned(),
+            versions: vec![fi.clone()],
+            ..Default::default()
+        };
+        let opts = DeleteOptions {
+            old_data_dir: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        let before = path_delete_snapshot(&env.disk_paths[0].join(bucket));
+        for operation in [
+            DeleteRecoveryRpcOperation::ApplyVersion {
+                object: object.to_owned(),
+                file_info: Box::new(fi.clone()),
+                force_del_marker: false,
+                opts: opts.clone(),
+            },
+            DeleteRecoveryRpcOperation::ApplyVersions {
+                versions: vec![group.clone()],
+                opts: opts.clone(),
+            },
+            DeleteRecoveryRpcOperation::Settle {
+                object: object.to_owned(),
+                transaction: opts.old_data_dir.expect("transaction"),
+                expected_fingerprint: [0; 32],
+                action: DeleteRecoveryAction::Rollback,
+            },
+        ] {
+            let mut request = Request::new(RecoverDeleteTransactionRequest {
+                disk: disk_ref.clone(),
+                volume: bucket.to_owned(),
+                protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+                operation: rmp_serde::to_vec_named(&operation).expect("recovery operation").into(),
+            });
+            let canonical =
+                rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref()).expect("recovery body");
+            set_tonic_canonical_body_digest(&mut request, &canonical).expect("recovery digest");
+            mark_v2_authenticated(&mut request);
+            assert_eq!(
+                service
+                    .handle_recover_delete_transaction(request)
+                    .await
+                    .expect_err("managed recovery mutation")
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+            assert_eq!(path_delete_snapshot(&env.disk_paths[0].join(bucket)), before);
+        }
+        let payload = GuardedDeleteVersionsPayload {
+            versions: vec![GuardedFileInfoVersions {
+                expected_current: CurrentDeleteGeneration::from_file_info(&fi).expect("actual generation"),
+                group,
+            }],
+            opts,
+        };
+        payload.validate().expect("valid guarded mutation fixture");
+        let mut request = Request::new(GuardedDeleteVersionsRequest {
+            disk: disk_ref,
+            volume: bucket.to_owned(),
+            probe_only: false,
+            payload: rmp_serde::to_vec_named(&payload).expect("guarded operation").into(),
+        });
+        let canonical = rustfs_protos::canonical_guarded_delete_versions_request_body(request.get_ref()).expect("guarded body");
+        set_tonic_canonical_body_digest(&mut request, &canonical).expect("guarded digest");
+        mark_v2_authenticated(&mut request);
+        assert_eq!(
+            service
+                .handle_guarded_delete_versions(request)
+                .await
+                .expect_err("managed guarded mutation")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(path_delete_snapshot(&env.disk_paths[0].join(bucket)), before);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn artifact_delete_recovery_receivers_apply_and_rollback_real_ordinary_versions() {
+        use crate::storage::storage_api::ecstore_disk::{CurrentDeleteGeneration, DeleteRecoveryAction, GuardedFileInfoVersions};
+        use crate::storage::storage_api::{ObjectOptions, PutObjReader, contract::object::ObjectIO as _};
+        use std::time::Duration;
+
+        async fn recover(
+            service: &NodeService,
+            disk: &str,
+            bucket: &str,
+            operation: DeleteRecoveryRpcOperation,
+        ) -> DeleteRecoveryRpcReply {
+            let mut request = Request::new(RecoverDeleteTransactionRequest {
+                disk: disk.to_owned(),
+                volume: bucket.to_owned(),
+                protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+                operation: rmp_serde::to_vec_named(&operation).expect("named recovery operation").into(),
+            });
+            let body = rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref())
+                .expect("canonical recovery body");
+            sign_legacy_rpc_request(&mut request, &body, "RecoverDeleteTransaction");
+            verify_legacy_rpc_request(&request, "RecoverDeleteTransaction").expect("real recovery HMAC and replay scope");
+            let response = tokio::time::timeout(Duration::from_secs(30), service.handle_recover_delete_transaction(request))
+                .await
+                .expect("bounded recovery operation")
+                .expect("authenticated recovery response")
+                .into_inner();
+            assert!(response.success, "recovery operation failed: {:?}", response.error);
+            assert!(response.error.is_none());
+            assert_eq!(response.protocol_version, DELETE_RECOVERY_PROTOCOL_VERSION);
+            rustfs_protos::decode_delete_recovery_payload(&response.result).expect("typed recovery reply")
+        }
+
+        let _ = rustfs_credentials::set_global_rpc_secret("ordinary-delete-recovery-test-secret".to_owned());
+        let root = tempfile::tempdir().expect("ordinary recovery receiver root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        let bucket = "delete-recovery-ordinary";
+        env.make_bucket(bucket, true).await;
+        let incarnation = env
+            .ecstore
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("real ordinary incarnation");
+        let service = service_for(&env).await;
+        let disk_ref = env.disk_paths[0].to_string_lossy().into_owned();
+        let disk = service
+            .local_mutation_target()
+            .find_mutation_disk(&disk_ref)
+            .await
+            .expect("local receiver disk");
+        for mode in ["single", "batch", "guarded"] {
+            let object = format!("recovery/{mode}");
+            let payload = vec![0x42; 257];
+            env.ecstore
+                .put_object(
+                    bucket,
+                    &object,
+                    &mut PutObjReader::from_vec(payload),
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("real versioned ordinary PUT");
+            let fi = disk
+                .read_version(
+                    bucket,
+                    bucket,
+                    &object,
+                    "",
+                    &ReadOptions {
+                        read_data: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("real PUT generation on the receiving disk");
+            assert!(fi.inline_data(), "small real PUT must produce a complete inline rollback fixture");
+            assert!(
+                fi.data.as_ref().is_some_and(|data| !data.is_empty()),
+                "real encoded inline shard is present"
+            );
+            let physical = env.disk_paths[0].join(bucket).join(&object);
+            let before = path_delete_snapshot(&physical);
+            let transaction = Uuid::new_v4();
+            let opts = DeleteOptions {
+                old_data_dir: Some(transaction),
+                delete_recovery_bucket_incarnation: Some(incarnation),
+                ..Default::default()
+            };
+            let group = FileInfoVersions {
+                volume: bucket.to_owned(),
+                name: object.clone(),
+                versions: vec![fi.clone()],
+                ..Default::default()
+            };
+            if mode == "guarded" {
+                let payload = GuardedDeleteVersionsPayload {
+                    versions: vec![GuardedFileInfoVersions {
+                        expected_current: CurrentDeleteGeneration::from_file_info(&fi).expect("actual current generation"),
+                        group,
+                    }],
+                    opts,
+                };
+                payload.validate().expect("valid guarded ordinary request");
+                let mut request = Request::new(GuardedDeleteVersionsRequest {
+                    disk: disk_ref.clone(),
+                    volume: bucket.to_owned(),
+                    probe_only: false,
+                    payload: rmp_serde::to_vec_named(&payload).expect("named guarded request").into(),
+                });
+                let body = rustfs_protos::canonical_guarded_delete_versions_request_body(request.get_ref())
+                    .expect("canonical guarded request");
+                sign_legacy_rpc_request(&mut request, &body, "GuardedDeleteVersions");
+                verify_legacy_rpc_request(&request, "GuardedDeleteVersions").expect("real guarded HMAC and replay scope");
+                let response = tokio::time::timeout(Duration::from_secs(30), service.handle_guarded_delete_versions(request))
+                    .await
+                    .expect("bounded guarded publication")
+                    .expect("authenticated guarded response")
+                    .into_inner();
+                assert_bulk_results(&response, &[None]);
+            } else {
+                let operation = if mode == "single" {
+                    DeleteRecoveryRpcOperation::ApplyVersion {
+                        object: object.clone(),
+                        file_info: Box::new(fi.clone()),
+                        force_del_marker: false,
+                        opts,
+                    }
+                } else {
+                    DeleteRecoveryRpcOperation::ApplyVersions {
+                        versions: vec![group],
+                        opts,
+                    }
+                };
+                match recover(&service, &disk_ref, bucket, operation).await {
+                    DeleteRecoveryRpcReply::AppliedVersion if mode == "single" => {}
+                    DeleteRecoveryRpcReply::AppliedVersions(errors) if mode == "batch" => assert_eq!(errors, vec![None]),
+                    reply => panic!("unexpected apply reply: {reply:?}"),
+                }
+            }
+            let DeleteRecoveryRpcReply::Inspected(state) = recover(
+                &service,
+                &disk_ref,
+                bucket,
+                DeleteRecoveryRpcOperation::Inspect {
+                    object: object.clone(),
+                    transaction,
+                },
+            )
+            .await
+            else {
+                panic!("typed inspection reply");
+            };
+            assert_eq!(serde_json::to_value(&state.state).expect("serialized recovery state"), "NewPrepared");
+            assert_eq!(state.current_digest, state.journal.as_ref().expect("durable journal").target_digest);
+            assert!(!physical.join("xl.meta").exists(), "real selected version was removed");
+            assert_ne!(path_delete_snapshot(&physical), before, "forward operation must change physical state");
+            let DeleteRecoveryRpcReply::Settled(restored) = recover(
+                &service,
+                &disk_ref,
+                bucket,
+                DeleteRecoveryRpcOperation::Settle {
+                    object: object.clone(),
+                    transaction,
+                    expected_fingerprint: state.fingerprint,
+                    action: DeleteRecoveryAction::Rollback,
+                },
+            )
+            .await
+            else {
+                panic!("typed rollback reply");
+            };
+            assert_eq!(serde_json::to_value(&restored.state).expect("serialized recovery state"), "Absent");
+            assert_eq!(
+                path_delete_snapshot(&physical),
+                before,
+                "rollback restores exact metadata and removes journal residue"
+            );
+            let restored = disk
+                .read_version(
+                    bucket,
+                    bucket,
+                    &object,
+                    &fi.version_id.expect("real version").to_string(),
+                    &ReadOptions {
+                        read_data: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("exact restored ordinary version");
+            assert_eq!(restored.version_id, fi.version_id);
+            assert_eq!(restored.data, fi.data);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn legacy_bulk_delete_receiver_preserves_signed_group_results_and_rejects_managed() {
         let _ = rustfs_credentials::set_global_rpc_secret("legacy-bulk-receiver-test-secret".to_owned());
         let root = tempfile::tempdir().expect("bulk receiver root");
@@ -6123,9 +6896,37 @@ mod legacy_artifact_tests {
                         ..Default::default()
                     },
                 );
-                let result =
-                    authenticated_legacy_bulk(&service, signed_legacy_bulk_request(&disk_ref, volume, &input, &opts, msgpack))
-                        .await;
+                if volume == "bulk-ordinary" {
+                    let rejected = authenticated_legacy_bulk(
+                        &service,
+                        signed_legacy_bulk_request(&disk_ref, volume, &input, &opts, msgpack),
+                    )
+                    .await
+                    .expect("obsolete ordinary transaction envelope");
+                    assert!(!rejected.success);
+                    assert!(rejected.errors.is_empty() && rejected.item_errors.is_empty());
+                    assert_eq!(DiskError::from(rejected.error.expect("obsolete transaction")), DiskError::UnsupportedDisk);
+                    assert_bulk_bytes(&before).await;
+                    for group in &groups {
+                        assert!(
+                            !env.disk_paths[0]
+                                .join(volume)
+                                .join(&group.name)
+                                .join(rollback.to_string())
+                                .exists()
+                        );
+                    }
+                }
+                let current_opts = if volume == ".rustfs.sys" {
+                    opts.clone()
+                } else {
+                    DeleteOptions::default()
+                };
+                let result = authenticated_legacy_bulk(
+                    &service,
+                    signed_legacy_bulk_request(&disk_ref, volume, &input, &current_opts, msgpack),
+                )
+                .await;
                 if volume == "bulk-managed" {
                     assert_eq!(
                         result.expect_err("managed batch rejects before writes").code(),
@@ -6144,6 +6945,21 @@ mod legacy_artifact_tests {
                     continue;
                 }
                 assert_bulk_results(&result.expect("signed forward"), &[None, Some(DiskError::FileNotFound), None]);
+                if volume == "bulk-ordinary" {
+                    for (path, _) in &before {
+                        assert!(!path.exists(), "ordinary nontransactional batch removes actual metadata and parts");
+                    }
+                    for group in &groups {
+                        assert!(
+                            !env.disk_paths[0]
+                                .join(volume)
+                                .join(&group.name)
+                                .join(rollback.to_string())
+                                .exists()
+                        );
+                    }
+                    continue;
+                }
                 for (path, original) in &before {
                     if path.file_name().is_some_and(|name| name == "xl.meta") {
                         assert!(!path.exists(), "all selected versions removed");
@@ -6247,7 +7063,7 @@ mod legacy_artifact_tests {
             target.reject_legacy_artifact_mutation(&volume).await.expect("still ordinary");
             for undo in [false, true] {
                 let opts = DeleteOptions {
-                    old_data_dir: Some(Uuid::new_v4()),
+                    old_data_dir: undo.then(Uuid::new_v4),
                     undo_write: undo,
                     undo_delete: undo,
                     ..Default::default()
@@ -6302,7 +7118,7 @@ mod legacy_artifact_tests {
             for volume in ["bulk-instance", ".rustfs.sys"] {
                 let (groups, before) = prepare_legacy_bulk(&disk, volume, &format!("binding/{msgpack}")).await;
                 let opts = DeleteOptions {
-                    old_data_dir: Some(Uuid::new_v4()),
+                    old_data_dir: (volume == ".rustfs.sys").then(Uuid::new_v4),
                     ..Default::default()
                 };
                 for service in [&unbound, &wrong] {
@@ -6418,7 +7234,6 @@ mod legacy_artifact_tests {
             .base_dir(root.path())
             .build()
             .await;
-        env.make_bucket("bulk-remote", true).await;
         let ready = service_for(&env).await;
         let instance = crate::storage::storage_api::bootstrap_instance_ctx();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback listener");
@@ -6442,7 +7257,7 @@ mod legacy_artifact_tests {
             .find_mutation_disk(&endpoint.to_string())
             .await
             .expect("loopback receiving disk");
-        let (groups, before) = prepare_legacy_bulk(&local, "bulk-remote", "objects").await;
+        let (groups, before) = prepare_legacy_bulk(&local, ".rustfs.sys", "objects").await;
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = calls.clone();
         let audience = addr.to_string();
@@ -6487,14 +7302,14 @@ mod legacy_artifact_tests {
         input.insert(
             1,
             FileInfoVersions {
-                volume: "bulk-remote".to_owned(),
+                volume: ".rustfs.sys".to_owned(),
                 name: "objects/missing".to_owned(),
                 ..Default::default()
             },
         );
         let forward = remote
             .delete_versions(
-                "bulk-remote",
+                ".rustfs.sys",
                 input,
                 DeleteOptions {
                     old_data_dir: Some(rollback),
@@ -6520,7 +7335,7 @@ mod legacy_artifact_tests {
         }
         let undo = remote
             .delete_versions(
-                "bulk-remote",
+                ".rustfs.sys",
                 groups,
                 DeleteOptions {
                     old_data_dir: Some(rollback),
@@ -7070,9 +7885,43 @@ mod legacy_artifact_tests {
                         assert_eq!(before.is_none(), case == "marker");
                         let rollback = Uuid::new_v4();
                         let rollback_path = object_dir.join(rollback.to_string());
-                        let opts = DeleteOptions {
+                        let legacy_opts = DeleteOptions {
                             old_data_dir: Some(rollback),
                             ..Default::default()
+                        };
+                        if volume == "staged-delete-ordinary" {
+                            let original = path_delete_snapshot(&object_dir);
+                            let rejected = authenticated_legacy_delete(
+                                &service,
+                                signed_legacy_delete_request(
+                                    &disk_ref,
+                                    volume,
+                                    &path,
+                                    &fi,
+                                    &legacy_opts,
+                                    msgpack,
+                                    case == "marker",
+                                ),
+                            )
+                            .await
+                            .expect("obsolete ordinary staging envelope")
+                            .into_inner();
+                            assert!(!rejected.success);
+                            assert_eq!(
+                                DiskError::from(rejected.error.expect("obsolete transaction")),
+                                DiskError::UnsupportedDisk
+                            );
+                            assert_eq!(
+                                path_delete_snapshot(&object_dir),
+                                original,
+                                "obsolete transaction changes no physical bytes"
+                            );
+                            assert!(!rollback_path.exists());
+                        }
+                        let opts = if volume == ".rustfs.sys" {
+                            legacy_opts
+                        } else {
+                            DeleteOptions::default()
                         };
                         if volume == ".rustfs.sys" && case == "last" {
                             let rejected = authenticated_legacy_delete(
@@ -7098,6 +7947,57 @@ mod legacy_artifact_tests {
                             assert_eq!(DiskError::from(response.error.expect("bootstrap error")), DiskError::FileAccessDenied);
                         } else if volume == "staged-delete-managed" {
                             assert_eq!(result.expect_err("managed staging rejects").code(), tonic::Code::PermissionDenied);
+                        } else if volume == "staged-delete-ordinary" {
+                            let response = result.expect("ordinary nontransactional delete response").into_inner();
+                            assert!(response.success, "ordinary current delete succeeds: {:?}", response.error);
+                            assert!(response.error.is_none());
+                            assert_eq!(response.raw_file_info, "null");
+                            let current = disk
+                                .read_version(
+                                    volume,
+                                    volume,
+                                    &path,
+                                    &fi.version_id.expect("requested version").to_string(),
+                                    &ReadOptions::default(),
+                                )
+                                .await;
+                            if case == "marker" {
+                                let marker = current.expect("ordinary marker is durably created");
+                                assert!(marker.is_canonical_delete_marker());
+                                assert_eq!(marker.version_id, fi.version_id);
+                            } else {
+                                assert_eq!(
+                                    current.expect_err("ordinary selected version is removed"),
+                                    DiskError::FileVersionNotFound
+                                );
+                                if let Some((previous, _)) = previous {
+                                    let retained = disk
+                                        .read_version(
+                                            volume,
+                                            volume,
+                                            &path,
+                                            &previous.version_id.expect("previous version").to_string(),
+                                            &ReadOptions {
+                                                read_data: true,
+                                                ..Default::default()
+                                            },
+                                        )
+                                        .await
+                                        .expect("ordinary delete retains the other version");
+                                    assert_eq!(retained.version_id, previous.version_id);
+                                    assert_eq!(retained.data, previous.data);
+                                } else {
+                                    assert!(!metadata.exists(), "ordinary final version metadata is removed");
+                                }
+                                if let Some(data_dir) = fi.data_dir {
+                                    assert!(
+                                        !object_dir.join(data_dir.to_string()).exists(),
+                                        "ordinary final version parts are removed"
+                                    );
+                                }
+                            }
+                            assert!(!rollback_path.exists(), "current direct delete does not stage legacy rollback");
+                            continue;
                         } else {
                             let response = result.expect("signed staged delete response").into_inner();
                             assert!(
@@ -7255,10 +8155,7 @@ mod legacy_artifact_tests {
                     .reject_legacy_artifact_mutation(&volume)
                     .await
                     .expect("ordinary authority still classifies");
-                let opts = DeleteOptions {
-                    old_data_dir: Some(Uuid::new_v4()),
-                    ..Default::default()
-                };
+                let opts = DeleteOptions::default();
                 let response = authenticated_legacy_delete(
                     &service,
                     signed_legacy_delete_request(&disk_ref, &volume, path, &fi, &opts, msgpack, case == "marker"),

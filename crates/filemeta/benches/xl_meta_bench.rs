@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use rustfs_filemeta::{FileMeta, MetaCacheEntry, test_data::*};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use rustfs_filemeta::{FileInfo, FileMeta, MetaCacheEntry, ObjectPartInfo, test_data::*};
 use std::hint::black_box;
+use std::time::Duration;
+use time::OffsetDateTime;
+use uuid::Uuid;
 
 fn bench_create_real_xlmeta(c: &mut Criterion) {
     c.bench_function("create_real_xlmeta", |b| b.iter(|| black_box(create_real_xlmeta().unwrap())));
@@ -134,6 +137,73 @@ fn bench_list_page_to_fileinfo(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_delete_inline_versions(c: &mut Criterion) {
+    let mut group = c.benchmark_group("delete_inline_versions");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(2));
+    for count in [1000_u32, 2000, 10000] {
+        let mut meta = FileMeta::new();
+        let mut inline = vec![1];
+        rmp::encode::write_map_len(&mut inline, count).expect("inline map header");
+        let payload = vec![42; 9 * 1024];
+        let mut requests = Vec::new();
+        for id in 1..=count {
+            let version = Uuid::from_u128(u128::from(id));
+            let mut fi = FileInfo::new("object", 1, 0);
+            fi.version_id = Some(version);
+            fi.data_dir = Some(Uuid::from_u128(u128::from(count) + u128::from(id)));
+            fi.mod_time = Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1_700_000_000 + i64::from(id)));
+            fi.erasure.index = 1;
+            fi.size = i64::try_from(payload.len()).expect("payload length");
+            fi.parts.push(ObjectPartInfo {
+                number: 1,
+                size: payload.len(),
+                actual_size: fi.size,
+                ..Default::default()
+            });
+            fi.set_inline_data();
+            meta.add_version(fi).expect("seed version metadata");
+            rmp::encode::write_str(&mut inline, &version.to_string()).expect("inline key");
+            rmp::encode::write_bin(&mut inline, &payload).expect("inline body");
+            if id <= 1000 {
+                requests.push(FileInfo {
+                    version_id: Some(version),
+                    ..Default::default()
+                });
+            }
+        }
+        meta.data.update(&inline);
+        group.throughput(Throughput::Elements(u64::try_from(requests.len()).expect("batch size")));
+        group.bench_with_input(BenchmarkId::new("batch", count), &count, |b, _| {
+            b.iter_batched(
+                || meta.clone(),
+                |mut meta| black_box(meta.delete_versions(black_box(&requests)).expect("batch delete")),
+                BatchSize::LargeInput,
+            );
+        });
+        if count <= 2000 {
+            group.bench_with_input(BenchmarkId::new("sequential", count), &count, |b, _| {
+                b.iter_batched(
+                    || meta.clone(),
+                    |mut meta| {
+                        for request in black_box(&requests) {
+                            if let Some(dir) = meta.delete_version(request).expect("sequential delete") {
+                                meta.data
+                                    .remove(vec![request.version_id.expect("explicit version"), dir])
+                                    .expect("remove inline body");
+                            }
+                        }
+                        black_box(meta);
+                    },
+                    BatchSize::LargeInput,
+                );
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_create_real_xlmeta,
@@ -147,7 +217,8 @@ criterion_group!(
     bench_version_stats,
     bench_validate_integrity,
     bench_into_fileinfo_realistic,
-    bench_list_page_to_fileinfo
+    bench_list_page_to_fileinfo,
+    bench_delete_inline_versions
 );
 
 criterion_main!(benches);

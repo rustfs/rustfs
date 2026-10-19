@@ -15,7 +15,7 @@
 //! Self-heal rules.
 
 use super::super::model::{Rule, Severity::*};
-use super::{any, base, contains, prefix, strings};
+use super::{all, any, base, contains, field, prefix, strings};
 
 pub(super) fn rules() -> Vec<Rule> {
     vec![
@@ -33,14 +33,29 @@ pub(super) fn rules() -> Vec<Rule> {
             )
         },
         Rule {
-            anchors: strings(["all drives had write errors, unable to heal"]),
+            evidence_fields: strings([
+                "bucket",
+                "object",
+                "version_id",
+                "target_count",
+                "writer_failure_count",
+                "error",
+            ]),
+            anchors: strings(["Set disk object heal writer failures"]),
             ..base(
                 "heal-all-writes-failed",
                 P0DataRisk,
                 "heal",
-                "heal 结果无法写入任何盘",
-                contains("all drives had write errors, unable to heal"),
-                "heal 结果无法写入任何盘(全盘故障/满盘)。",
+                "所有自愈目标不可写",
+                any([
+                    contains("all drives had write errors, unable to heal"),
+                    all([
+                        contains("Set disk object heal writer failures"),
+                        field("state", "writer_unavailable"),
+                        field("result", "all_targets_unavailable"),
+                    ]),
+                ]),
+                "所有自愈目标不可写,修复无法继续;健康源盘可能仍可读。",
                 "先解决容量/盘故障 finding,再重跑 heal。",
             )
         },

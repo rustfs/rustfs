@@ -76,7 +76,11 @@ pub(crate) fn upload_source(
         Err(_) => return original_source(path, generated_bundle_uid),
     };
     let names = (0..archive.len())
-        .map(|index| archive.by_index(index).map(|entry| entry.name().to_owned()))
+        .map(|index| {
+            archive
+                .by_index(index)
+                .and_then(|entry| entry.name().map(|name| name.into_owned()))
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     if names

@@ -1037,6 +1037,22 @@ pub async fn awscurl_post_sts_form_urlencoded(
     Ok(response)
 }
 
+fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml[start..end].to_string())
+}
+
+/// Returns `(access_key, secret_key, session_token)` from an STS `AssumeRole` XML response.
+pub fn parse_assume_role_credentials(xml: &str) -> Result<(String, String, String), Box<dyn std::error::Error + Send + Sync>> {
+    let access_key = extract_xml_tag(xml, "AccessKeyId").ok_or("missing AccessKeyId in AssumeRole response")?;
+    let secret_key = extract_xml_tag(xml, "SecretAccessKey").ok_or("missing SecretAccessKey in AssumeRole response")?;
+    let session_token = extract_xml_tag(xml, "SessionToken").ok_or("missing SessionToken in AssumeRole response")?;
+    Ok((access_key, secret_key, session_token))
+}
+
 /// Helper function for POST requests
 pub async fn awscurl_post(
     url: &str,
@@ -1540,6 +1556,15 @@ impl RustFSTestClusterEnvironment {
     pub async fn start_node(&mut self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let binary_path = rustfs_binary_path();
         self.start_node_from_binary(node_idx, &binary_path).await
+    }
+
+    /// Start a process and wait only for TCP, allowing tests to bring up a
+    /// quorum one node at a time before the S3 service can become ready.
+    pub async fn start_node_process(&mut self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let binary_path = rustfs_binary_path();
+        let volumes_arg = self.build_volumes_arg();
+        self.spawn_node(node_idx, &binary_path, &volumes_arg)?;
+        self.wait_for_node_ready(&self.nodes[node_idx].address, node_idx).await
     }
 
     /// Start one stopped cluster node with a specific RustFS binary while

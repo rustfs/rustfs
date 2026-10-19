@@ -34,6 +34,19 @@ use crate::disk::error_reduce::{OBJECT_OP_IGNORED_ERRS, reduce_errs};
 use crate::error::StorageError;
 use rustfs_protos::proto_gen::node_service::Error as WireError;
 
+#[test]
+fn conditional_delete_errors_preserve_disk_storage_and_wire_identity() {
+    for disk_error in [DiskError::ConditionalDeleteConflict, DiskError::GuardedDeleteUnsupported] {
+        let storage: StorageError = disk_error.clone().into();
+        let raw_code = storage.to_u32();
+        assert_eq!(StorageError::from_u32(raw_code), Some(storage.clone()));
+        assert_eq!(storage.narrow_to_disk().expect("guard errors must narrow"), disk_error);
+        let wire: WireError = disk_error.clone().into();
+        let decoded: DiskError = wire.into();
+        assert_eq!(decoded, disk_error, "guard errors must survive peer RPC");
+    }
+}
+
 /// The variants heal / replication / quorum repair match on, and that must
 /// survive the DiskError → StorageError → DiskError loop unchanged.
 fn heal_matched_disk_variants() -> Vec<DiskError> {

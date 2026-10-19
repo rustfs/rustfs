@@ -906,3 +906,156 @@ async fn repair_physical_tail_case(metadata: bool, retirement: bool) {
     );
     shutdown.cancel();
 }
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_recovery_receiver_reclassifies_after_waiting_across_bucket_recreation() {
+    use crate::disk::{DeleteOptions, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, error::DiskError, os};
+    use crate::storage_api_contracts::bucket::DeleteBucketOptions;
+    use std::{future::Future as _, task::Poll};
+
+    run_large_stack_async_test("artifact-recovery-recreated", || async {
+        let root = tempfile::tempdir().expect("recreated recovery receiver root");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(root.path(), "artifact-recovery-recreated", &[4])).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let ordinary = bucket(&store, BUCKET, false).await;
+        let (disk, reference, _) = disk(&store).await;
+        let attempt = prefix();
+        let control = format!("{attempt}control");
+        let object = format!("{attempt}late-marker");
+        let marker = |object: &str| FileInfo {
+            volume: BUCKET.to_owned(),
+            name: object.to_owned(),
+            version_id: Some(Uuid::new_v4()),
+            deleted: true,
+            mark_deleted: true,
+            mod_time: Some(time::OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        let operation = |object: &str, fi: FileInfo| DeleteRecoveryRpcOperation::ApplyVersion {
+            object: object.to_owned(),
+            file_info: Box::new(fi),
+            // Missing keys require explicit marker creation in the recovery protocol.
+            force_del_marker: true,
+            opts: DeleteOptions {
+                old_data_dir: Some(Uuid::new_v4()),
+                ..Default::default()
+            },
+        };
+        let control_marker = marker(&control);
+        assert!(matches!(
+            tokio::time::timeout(
+                DEADLINE,
+                store.recover_local_delete_transaction(&reference, BUCKET, operation(&control, control_marker.clone()))
+            )
+            .await
+            .expect("bounded ordinary marker publication")
+            .expect("ordinary recovery really creates a marker"),
+            DeleteRecoveryRpcReply::AppliedVersion
+        ));
+        let read = disk
+            .read_version(BUCKET, BUCKET, &control, "", &ReadOptions::default())
+            .await
+            .expect("read actual ordinary control marker");
+        assert!(read.deleted);
+        assert_eq!(read.version_id, control_marker.version_id);
+        tokio::time::timeout(DEADLINE, async {
+            while ctx.namespace_commits_pending() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("control physical owner drains before measuring admission");
+
+        // This existing mutex precedes volume admission. It holds no volume
+        // READ, so a real DeleteBucket and managed recreation can pass the waiter.
+        let blocked = os::acquire_metadata_mutation_lease(&disk.path().join(BUCKET).join(&object), None).await;
+        let mut mutation =
+            Box::pin(store.recover_local_delete_transaction(&reference, BUCKET, operation(&object, marker(&object))));
+        tokio::time::timeout(
+            DEADLINE,
+            std::future::poll_fn(|cx| {
+                assert!(
+                    mutation.as_mut().poll(cx).is_pending(),
+                    "receiver must really wait for metadata admission"
+                );
+                if ctx.namespace_commits_pending() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("receiver reached its real admitted metadata wait");
+        tokio::time::timeout(
+            DEADLINE,
+            store.delete_bucket(
+                BUCKET,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("bucket deletion is not blocked by a signal-only observation")
+        .expect("delete the ordinary generation while receiver waits");
+        let managed = tokio::time::timeout(DEADLINE, store.clone().make_artifact_bucket(BUCKET, "outputs/"))
+            .await
+            .expect("bounded managed recreation")
+            .expect("commit real new managed authority");
+        assert_ne!(managed, ordinary);
+        let disks = store.pools[0].disk_set[0]
+            .disk_inventory()
+            .await
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(disks.len(), 4);
+        let census = || {
+            let mut pending = disks
+                .iter()
+                .flat_map(|disk| [disk.path().join(BUCKET), disk.path().join(".rustfs.sys/buckets").join(BUCKET)])
+                .collect::<Vec<_>>();
+            let mut entries = Vec::new();
+            while let Some(path) = pending.pop() {
+                if !path.exists() {
+                    continue;
+                }
+                if path.is_dir() {
+                    entries.push((path.clone(), None));
+                    pending.extend(
+                        std::fs::read_dir(path)
+                            .expect("census directory")
+                            .map(|entry| entry.expect("census entry").path()),
+                    );
+                } else {
+                    entries.push((path.clone(), Some(std::fs::read(path).expect("census file"))));
+                }
+            }
+            entries.sort();
+            entries
+        };
+        let before = census();
+        drop(blocked);
+        let result = tokio::time::timeout(DEADLINE, mutation)
+            .await
+            .expect("bounded resumed receiver");
+        assert_eq!(
+            result.expect_err("admitted receiver must classify the new managed generation"),
+            DiskError::FileAccessDenied
+        );
+        assert_eq!(census(), before, "every shard, version, metadata and recovery path remains unchanged");
+        assert_eq!(
+            store
+                .bucket_incarnation_id_from_disk(BUCKET)
+                .await
+                .expect("retained managed authority"),
+            managed
+        );
+        assert!(!ctx.namespace_commits_pending(), "rejected admission releases its actual owner");
+        shutdown.cancel();
+    });
+}

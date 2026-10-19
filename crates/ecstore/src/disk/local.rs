@@ -18,6 +18,7 @@ pub(in crate::disk) use self::commit::{LocalRenamePreflightRejection, PreparedRe
 
 mod artifact_lease;
 mod commit;
+pub(super) mod delete_recovery;
 #[cfg(all(unix, test))]
 #[path = "fd_cache_tests.rs"]
 mod fd_cache_tests;
@@ -40,6 +41,7 @@ mod uring_result_budget;
 pub(crate) use artifact_lease::Domain as ArtifactLeaseDomain;
 pub use artifact_lease::{ArtifactPutLease, ArtifactRepairLease};
 pub use replacement_lease::ReplacementExecutionLease;
+pub(crate) use replacement_lease::is_blank_target as is_blank_replacement_target;
 
 use crate::crash_inject::{self, CrashPoint};
 use crate::data_usage::local_snapshot::ensure_data_usage_layout;
@@ -54,12 +56,12 @@ use crate::disk::disk_store::{get_drive_walkdir_stall_timeout, get_object_disk_r
 use crate::disk::io_admission::{DiskIoPermit, spawn_blocking_with_disk_io_permit};
 use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
-    CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, ConditionalFileUpdate, DataDirDeleteStatus, DeleteOptions, DiskAPI, DiskInfo,
-    DiskInfoOptions, DiskLocation, DiskMetrics, FileInfoVersions, FileReader, FileWriter, MmapCopyStageMetrics, OldCurrentSize,
-    PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META, PART_TRANSACTION_ROLLBACK, PartTransactionAction, RUSTFS_META_BUCKET,
-    RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-    STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-    acquire_context_disk_io_permit, conv_part_err_to_int,
+    CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, ConditionalFileUpdate, CurrentDeleteGeneration, DataDirDeleteStatus,
+    DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics, FileInfoVersions, FileReader, FileWriter,
+    GuardedFileInfoVersions, MmapCopyStageMetrics, OldCurrentSize, PART_TRANSACTION_NEW_META, PART_TRANSACTION_OLD_META,
+    PART_TRANSACTION_ROLLBACK, PartTransactionAction, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET,
+    ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP,
+    SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, acquire_context_disk_io_permit, conv_part_err_to_int,
     endpoint::Endpoint,
     error::{DiskError, Error, FileAccessDeniedWithContext, Result},
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
@@ -133,8 +135,10 @@ tokio::task_local! {
 const RUSTFS_META_TMP_OLD_BUCKET: &str = ".rustfs.sys/tmp-old";
 const INLINE_METADATA_ROLLBACK_DIR_XOR: u128 = 0x7275737466735f696e6c696e655f7262;
 const DELETE_MARKER_ROLLBACK_FILE: &str = "xl.meta.delete-marker.rollback";
+pub(crate) const DELETE_QUORUM_COMMITTED_FILE: &str = "delete-quorum-committed";
 pub(crate) const DELETE_DATA_DIR_MARKER_PREFIX: &str = "delete-data.";
 pub(crate) const RESERVED_DELETE_DATA_DIR_MARKER_PREFIX: &str = "reserve-delete-data.";
+pub(crate) const RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX: &str = "recovery-delete-data.";
 /// Largest directory read the delete-residue probe issues before it must
 /// fall back to a complete read. Residue holds one or two data dirs, so an
 /// under-filled batch settles the common case without materializing large
@@ -164,6 +168,34 @@ pub(crate) fn metadata_less_part_file(entry: &str) -> bool {
         .is_some_and(|part_number| part_number.parse::<usize>().is_ok_and(|part_number| part_number > 0))
 }
 
+/// Native multipart sidecars travel with their part during delete recovery.
+/// Callers must additionally require a regular file inside a bound data dir.
+fn delete_recovery_part_file(entry: &str) -> bool {
+    metadata_less_part_file(entry)
+        || entry.strip_suffix(".meta").is_some_and(metadata_less_part_file)
+        || entry.split_once(".integrity.").is_some_and(|(part, generation)| {
+            metadata_less_part_file(part) && Uuid::parse_str(generation).is_ok_and(|id| !id.is_nil())
+        })
+}
+
+/// Classify the entire leaf before unlinking anything. UUID-shaped S3 prefixes
+/// and transaction witnesses share this namespace with erasure data dirs.
+fn orphan_data_dir_parts(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let protected = || std::io::Error::new(ErrorKind::InvalidData, "orphan data directory contains protected entries");
+    if !std::fs::symlink_metadata(path)?.file_type().is_dir() {
+        return Err(protected());
+    }
+    let mut parts = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() || !entry.file_name().to_str().is_some_and(delete_recovery_part_file) {
+            return Err(protected());
+        }
+        parts.push(entry.path());
+    }
+    Ok(parts)
+}
+
 fn delete_transaction_marker_id(entry: &str, prefix: &str) -> Option<Uuid> {
     entry
         .strip_prefix(prefix)
@@ -180,10 +212,15 @@ fn is_delete_transaction_marker(entry: &str, prefix: &str) -> bool {
 /// an `xl.meta`, an unknown file) means the directory is not plain delete residue.
 fn is_metadata_less_data_dir_entry(entry: &str) -> bool {
     !entry.ends_with(SLASH_SEPARATOR)
-        && (metadata_less_part_file(entry)
+        && (delete_recovery_part_file(entry)
             || entry == STORAGE_FORMAT_FILE_BACKUP
+            || entry == DELETE_QUORUM_COMMITTED_FILE
+            || entry == delete_recovery::PREPARED
+            || entry == delete_recovery::TARGET
+            || entry == delete_recovery::FINISHED
             || is_delete_transaction_marker(entry, DELETE_DATA_DIR_MARKER_PREFIX)
-            || is_delete_transaction_marker(entry, RESERVED_DELETE_DATA_DIR_MARKER_PREFIX))
+            || is_delete_transaction_marker(entry, RESERVED_DELETE_DATA_DIR_MARKER_PREFIX)
+            || is_delete_transaction_marker(entry, RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX))
 }
 const STARTUP_CLEANUP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT: &str = "RUSTFS_BITROT_SIZE_MISMATCH_RETRY_COUNT";
@@ -206,8 +243,10 @@ struct ListingMetadataRead {
     has_namespace_child_candidate: bool,
 }
 
-fn read_all_data_std(path: &Path) -> core::result::Result<(Vec<u8>, Option<OffsetDateTime>), ReadAllError> {
-    let mut file = std::fs::File::open(path).map_err(ReadAllError::Open)?;
+fn read_all_data_std(
+    opened: std::io::Result<std::fs::File>,
+) -> core::result::Result<(Vec<u8>, Option<OffsetDateTime>), ReadAllError> {
+    let mut file = opened.map_err(ReadAllError::Open)?;
     let metadata = file.metadata().map_err(|err| ReadAllError::Disk(to_file_error(err).into()))?;
 
     if metadata.is_dir() {
@@ -227,6 +266,10 @@ fn read_all_data_std(path: &Path) -> core::result::Result<(Vec<u8>, Option<Offse
 
 pub(crate) fn inline_metadata_rollback_dir(version_id: Uuid, meta: &FileMeta) -> Uuid {
     let used_data_dirs: HashSet<Uuid> = meta.get_data_dirs().unwrap_or_default().into_iter().flatten().collect();
+    inline_metadata_rollback_dir_with_used_dirs(version_id, &used_data_dirs)
+}
+
+fn inline_metadata_rollback_dir_with_used_dirs(version_id: Uuid, used_data_dirs: &HashSet<Uuid>) -> Uuid {
     let base = version_id.as_u128() ^ INLINE_METADATA_ROLLBACK_DIR_XOR;
     let mut salt = 0u128;
 
@@ -324,21 +367,44 @@ fn restore_part_transaction_file(current: &Path, backup: &Path, absent: &Path, r
 
 #[cfg(test)]
 async fn write_metadata_rollback_backup(object_dir: &Path, rollback_dir: Uuid, data: &[u8]) -> Result<()> {
-    write_delete_rollback_file(object_dir, rollback_dir, STORAGE_FORMAT_FILE_BACKUP, data, None).await
+    write_delete_rollback_file(
+        object_dir.parent().unwrap_or(object_dir),
+        "test-backup",
+        object_dir,
+        rollback_dir,
+        STORAGE_FORMAT_FILE_BACKUP,
+        data,
+        None,
+    )
+    .await
 }
 
 #[cfg(test)]
 async fn write_delete_rollback_file(
+    io_root: &Path,
+    volume: &str,
     object_dir: &Path,
     rollback_dir: Uuid,
-    name: &str,
+    name: &'static str,
     data: &[u8],
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Result<()> {
-    write_delete_rollback_file_with_prepared_publication(object_dir, rollback_dir, name, data, namespace_owner, None).await
+    write_delete_rollback_file_with_prepared_publication(
+        io_root,
+        volume,
+        object_dir,
+        rollback_dir,
+        name,
+        data,
+        namespace_owner,
+        None,
+    )
+    .await
 }
 
 async fn write_delete_rollback_file_with_prepared_publication(
+    io_root: &Path,
+    volume: &str,
     object_dir: &Path,
     rollback_dir: Uuid,
     name: &str,
@@ -354,16 +420,50 @@ async fn write_delete_rollback_file_with_prepared_publication(
         os::acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await
     };
     let data = data.to_vec();
-    let object_dir = object_dir.to_path_buf();
+    let sync = effective_durability(volume).syncs_commit_metadata();
+    let staging_root = io_root.join(RUSTFS_META_TMP_BUCKET);
+    let io_root = io_root.to_path_buf();
+    let name = name.to_owned();
     os::run_blocking_namespace_operation(lease, move || {
+        reject_local_disk_symlink_components(&io_root, &path).map_err(std::io::Error::from)?;
+        reject_local_disk_symlink_components(&io_root, &staging_root).map_err(std::io::Error::from)?;
         std::fs::create_dir_all(&backup_dir)?;
+        std::fs::create_dir_all(&staging_root)?;
         #[cfg(test)]
         run_owned_file_write_before_open(&path);
-        // Rollback must never consume a partially written backup. Stage outside
-        // the rollback directory so interrupted writes cannot become staged data.
-        let mut staged = tempfile::Builder::new().prefix(".delete-rollback-").tempfile_in(object_dir)?;
+        // tempfile's Windows `persist` hands both the staged and the final path
+        // straight to `MoveFileExW`, bypassing std's long-path handling, so a
+        // deep object key failed every delete at MAX_PATH (rustfs#8545).
+        let staging_root = rustfs_utils::extended_length_path(&staging_root)?;
+        let destination = rustfs_utils::extended_length_path(&path)?;
+        // Private directory staging is reclaimed by existing tmp cleanup after
+        // a crash and cannot leave a regular artifact in the user's bucket.
+        let staging_dir = tempfile::Builder::new()
+            .prefix(".delete-rollback-")
+            .tempdir_in(&staging_root)?;
+        let staged_path = staging_dir.path().join(name);
+        let mut staged_options = std::fs::OpenOptions::new();
+        staged_options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            staged_options.mode(0o600);
+        }
+        let mut staged = staged_options.open(&staged_path)?;
         std::io::Write::write_all(&mut staged, &data)?;
-        staged.persist(path).map_err(|err| err.error)?;
+        if sync {
+            staged.sync_all()?;
+        }
+        // Close the writer before publishing via std::fs::rename, which applies
+        // verbatim long-path normalization and POSIX-semantics replacement on Windows.
+        drop(staged);
+        std::fs::rename(&staged_path, &destination)?;
+        if sync {
+            os::fsync_dir_std(&backup_dir)?;
+            if let Some(parent) = backup_dir.parent() {
+                os::fsync_dir_std(parent)?;
+            }
+        }
         Ok(())
     })
     .await
@@ -425,14 +525,23 @@ async fn restore_metadata_backup_with_prepared_publication(
 }
 
 async fn restore_delete_rollback_with_namespace_owner(
+    volume: &str,
     object_dir: &Path,
     xl_path: &Path,
     rollback_dir: Uuid,
     publication_root: &os::PublicationRoot,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Result<()> {
-    restore_delete_rollback_with_prepared_publication(object_dir, xl_path, rollback_dir, publication_root, namespace_owner, None)
-        .await
+    restore_delete_rollback_with_prepared_publication(
+        volume,
+        object_dir,
+        xl_path,
+        rollback_dir,
+        publication_root,
+        namespace_owner,
+        None,
+    )
+    .await
 }
 
 // The frozen paths are shared by forward staging and its error recovery. The
@@ -443,14 +552,36 @@ struct DeleteRollbackPlan {
     staged_paths: Vec<(PathBuf, PathBuf)>,
     rollback_exists: bool,
     remove_new_metadata: bool,
+    recovery_journal: Option<super::DeleteRecoveryJournal>,
     publication: Option<Arc<os::NamespaceMutationLease>>,
     rollback_dir_owned: bool,
     rollback_marker_owned: bool,
 }
 
 impl DeleteRollbackPlan {
-    async fn read(object_dir: &Path, rollback_dir: Uuid, marker_paths: Vec<PathBuf>) -> Result<Self> {
+    async fn read(volume: &str, object_dir: &Path, rollback_dir: Uuid, marker_paths: Vec<PathBuf>) -> Result<Self> {
         let rollback_path = object_dir.join(rollback_dir.to_string());
+        match fs::symlink_metadata(rollback_path.join(DELETE_QUORUM_COMMITTED_FILE)).await {
+            Ok(_) => return Err(DiskError::FileCorrupt),
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(to_file_error(err).into()),
+        }
+        let recovery_journal = match fs::symlink_metadata(rollback_path.join(delete_recovery::PREPARED)).await {
+            Ok(metadata) if metadata.is_file() => {
+                let journal: super::DeleteRecoveryJournal = serde_json::from_slice(
+                    &fs::read(rollback_path.join(delete_recovery::PREPARED))
+                        .await
+                        .map_err(to_file_error)?,
+                )?;
+                if journal.volume != volume || journal.transaction != rollback_dir {
+                    return Err(DiskError::FileCorrupt);
+                }
+                Some(journal)
+            }
+            Ok(_) => return Err(DiskError::InvalidPath),
+            Err(err) if err.kind() == ErrorKind::NotFound => None,
+            Err(err) => return Err(to_file_error(err).into()),
+        };
         let mut staged_paths = Vec::new();
         let mut remove_new_metadata = false;
         let rollback_exists = match fs::read_dir(&rollback_path).await {
@@ -459,7 +590,21 @@ impl DeleteRollbackPlan {
                     let name = entry.file_name();
                     if name == DELETE_MARKER_ROLLBACK_FILE {
                         remove_new_metadata = true;
-                    } else if name != STORAGE_FORMAT_FILE_BACKUP {
+                    } else if name != STORAGE_FORMAT_FILE_BACKUP
+                        && name != DELETE_QUORUM_COMMITTED_FILE
+                        && name != delete_recovery::PREPARED
+                        && name != delete_recovery::TARGET
+                        && name != delete_recovery::FINISHED
+                    {
+                        if let Some(journal) = &recovery_journal {
+                            let id = name
+                                .to_str()
+                                .and_then(|name| Uuid::parse_str(name).ok())
+                                .ok_or(DiskError::FileCorrupt)?;
+                            if !journal.data_dirs.contains(&id) || !entry.file_type().await.map_err(to_file_error)?.is_dir() {
+                                return Err(DiskError::FileCorrupt);
+                            }
+                        }
                         staged_paths.push((entry.path(), object_dir.join(name)));
                     }
                 }
@@ -473,6 +618,7 @@ impl DeleteRollbackPlan {
             staged_paths,
             rollback_exists,
             remove_new_metadata,
+            recovery_journal,
             publication: None,
             rollback_dir_owned: false,
             rollback_marker_owned: false,
@@ -488,6 +634,11 @@ impl DeleteRollbackPlan {
     ) -> Result<()> {
         let rollback_path = object_dir.join(rollback_dir.to_string());
         let mut paths = self.marker_paths.clone();
+        if self.rollback_exists || self.rollback_dir_owned {
+            for name in [delete_recovery::TARGET, delete_recovery::PREPARED, delete_recovery::FINISHED] {
+                paths.push(rollback_path.join(name));
+            }
+        }
         if self.rollback_exists || self.rollback_dir_owned {
             paths.push(rollback_path.join(STORAGE_FORMAT_FILE_BACKUP));
             for (src, dst) in &self.staged_paths {
@@ -520,6 +671,7 @@ impl DeleteRollbackPlan {
     }
 
     async fn prepare_forward(
+        volume: &str,
         object_dir: &Path,
         xl_path: &Path,
         rollback_dir: Uuid,
@@ -528,7 +680,7 @@ impl DeleteRollbackPlan {
         publication: Arc<os::NamespaceMutationLease>,
     ) -> Result<Self> {
         let marker_paths = version_delete_marker_paths(object_dir, rollback_dir).await?;
-        let mut plan = Self::read(object_dir, rollback_dir, marker_paths).await?;
+        let mut plan = Self::read(volume, object_dir, rollback_dir, marker_paths).await?;
         let rollback_path = object_dir.join(rollback_dir.to_string());
         plan.rollback_dir_owned = true;
         plan.rollback_marker_owned = new_marker || plan.remove_new_metadata;
@@ -539,6 +691,8 @@ impl DeleteRollbackPlan {
                 plan.marker_paths.push(reserved);
                 plan.marker_paths
                     .push(data_path.join(format!("{DELETE_DATA_DIR_MARKER_PREFIX}{rollback_dir}")));
+                plan.marker_paths
+                    .push(data_path.join(format!("{RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX}{rollback_dir}")));
             }
         }
         for data_dir in data_dirs {
@@ -552,7 +706,10 @@ impl DeleteRollbackPlan {
         Ok(plan)
     }
 
-    async fn refresh_forward(&mut self, object_dir: &Path, rollback_dir: Uuid) -> Result<()> {
+    async fn refresh_forward(&mut self, volume: &str, object_dir: &Path, rollback_dir: Uuid) -> Result<()> {
+        self.recovery_journal = Self::read(volume, object_dir, rollback_dir, self.marker_paths.clone())
+            .await?
+            .recovery_journal;
         let rollback_path = object_dir.join(rollback_dir.to_string());
         self.rollback_exists = match fs::read_dir(&rollback_path).await {
             Ok(_) => true,
@@ -582,6 +739,7 @@ impl DeleteRollbackPlan {
 }
 
 async fn restore_delete_rollback_with_prepared_publication(
+    volume: &str,
     object_dir: &Path,
     xl_path: &Path,
     rollback_dir: Uuid,
@@ -590,17 +748,15 @@ async fn restore_delete_rollback_with_prepared_publication(
     prepared: Option<Arc<os::NamespaceMutationLease>>,
 ) -> Result<()> {
     let marker_paths = version_delete_marker_paths(object_dir, rollback_dir).await?;
-    if prepared.is_none() {
-        remove_version_delete_marker_paths(&marker_paths, namespace_owner.clone(), None).await?;
-    }
-    let mut plan = DeleteRollbackPlan::read(object_dir, rollback_dir, marker_paths).await?;
+    let mut plan = DeleteRollbackPlan::read(volume, object_dir, rollback_dir, marker_paths).await?;
     if let Some(publication) = prepared {
         plan.acquire(object_dir, xl_path, rollback_dir, publication)?;
     }
-    restore_delete_rollback_plan(object_dir, xl_path, rollback_dir, publication_root, namespace_owner, plan).await
+    restore_delete_rollback_plan(volume, object_dir, xl_path, rollback_dir, publication_root, namespace_owner, plan).await
 }
 
 async fn restore_delete_rollback_plan(
+    volume: &str,
     object_dir: &Path,
     xl_path: &Path,
     rollback_dir: Uuid,
@@ -613,48 +769,137 @@ async fn restore_delete_rollback_plan(
         staged_paths,
         rollback_exists,
         remove_new_metadata,
+        recovery_journal,
         publication: prepared,
         rollback_dir_owned,
         rollback_marker_owned,
     } = plan;
     let rollback_path = object_dir.join(rollback_dir.to_string());
-    let backup_path = rollback_path.join(STORAGE_FORMAT_FILE_BACKUP);
-    if prepared.is_some() {
-        remove_version_delete_marker_paths(&marker_paths, namespace_owner.clone(), prepared.clone()).await?;
-    }
     if !rollback_exists {
-        return Ok(());
+        return remove_version_delete_marker_paths(volume, &marker_paths, namespace_owner, prepared).await;
     }
 
     let had_staged_paths = !staged_paths.is_empty();
     for (src, dst) in staged_paths {
-        if let Some(publication) = &prepared {
-            os::rename_all_with_lease(&src, &dst, object_dir, publication_root, publication.clone()).await?;
+        if recovery_journal.is_some() {
+            let mut entries = fs::read_dir(&src).await.map_err(to_file_error)?;
+            let mut files = Vec::new();
+            while let Some(entry) = entries.next_entry().await.map_err(to_file_error)? {
+                let name = entry.file_name();
+                let name = name.to_str().ok_or(DiskError::FileCorrupt)?;
+                if !entry.file_type().await.map_err(to_file_error)?.is_file()
+                    || (!delete_recovery_part_file(name)
+                        && ![
+                            DELETE_DATA_DIR_MARKER_PREFIX,
+                            RESERVED_DELETE_DATA_DIR_MARKER_PREFIX,
+                            RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX,
+                        ]
+                        .iter()
+                        .any(|prefix| name == format!("{prefix}{rollback_dir}")))
+                {
+                    return Err(DiskError::FileCorrupt);
+                }
+                files.push((entry.path(), dst.join(name)));
+            }
+            if let Some(publication) = &prepared {
+                os::create_dir_all_with_lease(dst.clone(), publication.clone())
+                    .await
+                    .map_err(to_file_error)?;
+            } else {
+                os::create_dir_all_with_namespace_owner(&dst, namespace_owner.clone())
+                    .await
+                    .map_err(to_file_error)?;
+            }
+            for (source, destination) in files {
+                match fs::symlink_metadata(&destination).await {
+                    Ok(metadata) if metadata.is_file() => {
+                        let lease = match &prepared {
+                            Some(publication) => {
+                                os::try_acquire_namespace_mutation_lease_with_owner(&destination, publication.clone())?
+                            }
+                            None => os::acquire_namespace_mutation_lease_with_owner(&destination, namespace_owner.clone()).await,
+                        };
+                        let identical = os::run_blocking_namespace_operation(lease, move || {
+                            let source_meta = std::fs::symlink_metadata(&source)?;
+                            let destination_meta = std::fs::symlink_metadata(&destination)?;
+                            if !source_meta.is_file()
+                                || !destination_meta.is_file()
+                                || source_meta.len() != destination_meta.len()
+                            {
+                                return Ok(false);
+                            }
+                            let mut source_file = std::fs::File::open(&source)?;
+                            let mut destination_file = std::fs::File::open(&destination)?;
+                            let mut left = [0u8; 65536];
+                            let mut right = [0u8; 65536];
+                            let mut remaining = source_meta.len();
+                            while remaining > 0 {
+                                let length = usize::try_from(remaining.min(left.len() as u64)).map_err(std::io::Error::other)?;
+                                std::io::Read::read_exact(&mut source_file, &mut left[..length])?;
+                                std::io::Read::read_exact(&mut destination_file, &mut right[..length])?;
+                                if left[..length] != right[..length] {
+                                    return Ok(false);
+                                }
+                                remaining -= length as u64;
+                            }
+                            std::fs::remove_file(source)?;
+                            Ok(true)
+                        })
+                        .await
+                        .map_err(to_file_error)?;
+                        if !identical {
+                            return Err(DiskError::FileCorrupt);
+                        }
+                    }
+                    Ok(_) => return Err(DiskError::InvalidPath),
+                    Err(err) if err.kind() == ErrorKind::NotFound => {
+                        if let Some(publication) = &prepared {
+                            os::rename_all_with_lease(&source, &destination, object_dir, publication_root, publication.clone())
+                                .await?;
+                        } else {
+                            os::rename_all_with_owner(
+                                &source,
+                                &destination,
+                                object_dir,
+                                publication_root,
+                                namespace_owner.clone(),
+                            )
+                            .await?;
+                        }
+                    }
+                    Err(err) => return Err(to_file_error(err).into()),
+                }
+            }
+            if effective_durability(volume).syncs_commit_metadata() {
+                os::fsync_dir_with_owner(&dst, namespace_owner.clone())
+                    .await
+                    .map_err(to_file_error)?;
+                os::fsync_dir_with_owner(&src, namespace_owner.clone())
+                    .await
+                    .map_err(to_file_error)?;
+            }
+            if let Some(publication) = &prepared {
+                let _ = os::remove_dir_with_lease(&src, publication.clone()).await;
+            } else {
+                let _ = os::remove_dir_with_owner(&src, namespace_owner.clone()).await;
+            }
         } else {
-            os::rename_all_with_owner(&src, &dst, object_dir, publication_root, namespace_owner.clone()).await?;
+            if let Some(publication) = &prepared {
+                os::rename_all_with_lease(&src, &dst, object_dir, publication_root, publication.clone()).await?;
+            } else {
+                os::rename_all_with_owner(&src, &dst, object_dir, publication_root, namespace_owner.clone()).await?;
+            }
         }
     }
 
+    let backup_path = rollback_path.join(STORAGE_FORMAT_FILE_BACKUP);
     let restore = if let Some(publication) = &prepared {
         os::rename_all_with_lease(&backup_path, xl_path, object_dir, publication_root, publication.clone()).await
     } else {
         os::rename_all_with_owner(&backup_path, xl_path, object_dir, publication_root, namespace_owner.clone()).await
     };
     match restore {
-        Ok(()) => {
-            cleanup_delete_rollback(
-                &rollback_path,
-                false,
-                namespace_owner,
-                prepared,
-                rollback_dir_owned,
-                rollback_marker_owned,
-            )
-            .await;
-            Ok(())
-        }
-        // A missing backup only means "remove the newly-created delete marker"
-        // when the marker proves there was no old metadata to restore.
+        Ok(()) => {}
         Err(DiskError::FileNotFound) if remove_new_metadata => {
             let remove = if let Some(publication) = &prepared {
                 os::remove_file_with_lease(xl_path.to_path_buf(), publication.clone()).await
@@ -666,29 +911,48 @@ async fn restore_delete_rollback_plan(
                 Err(err) if err.kind() == ErrorKind::NotFound => {}
                 Err(err) => return Err(to_file_error(err).into()),
             }
-            cleanup_delete_rollback(&rollback_path, true, namespace_owner, prepared, rollback_dir_owned, rollback_marker_owned)
-                .await;
-            Ok(())
         }
-        Err(DiskError::FileNotFound) if had_staged_paths => Err(DiskError::FileNotFound),
+        Err(DiskError::FileNotFound) if had_staged_paths => return Err(DiskError::FileNotFound),
         Err(DiskError::FileNotFound) => match fs::metadata(xl_path).await {
-            Ok(_) => {
-                cleanup_delete_rollback(
-                    &rollback_path,
-                    false,
-                    namespace_owner,
-                    prepared,
-                    rollback_dir_owned,
-                    rollback_marker_owned,
-                )
-                .await;
-                Ok(())
-            }
-            Err(err) if err.kind() == ErrorKind::NotFound => Err(DiskError::FileNotFound),
-            Err(err) => Err(to_file_error(err).into()),
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => return Err(DiskError::FileNotFound),
+            Err(err) => return Err(to_file_error(err).into()),
         },
-        Err(err) => Err(err),
+        Err(err) => return Err(err),
     }
+    delete_recovery::restore_barrier(volume, object_dir, rollback_dir).await?;
+    // Persist both sides of the restore rename before discarding its evidence.
+    if effective_durability(volume).syncs_commit_metadata() {
+        os::fsync_dir_with_owner(object_dir, namespace_owner.clone())
+            .await
+            .map_err(to_file_error)?;
+        os::fsync_dir_with_owner(&rollback_path, namespace_owner.clone())
+            .await
+            .map_err(to_file_error)?;
+    }
+    remove_version_delete_marker_paths(volume, &marker_paths, namespace_owner.clone(), prepared.clone()).await?;
+    for name in [delete_recovery::TARGET, delete_recovery::PREPARED, delete_recovery::FINISHED] {
+        let remove = if let Some(publication) = &prepared {
+            os::remove_file_with_lease(rollback_path.join(name), publication.clone()).await
+        } else {
+            os::remove_file_with_owner(rollback_path.join(name), namespace_owner.clone()).await
+        };
+        match remove {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(to_file_error(err).into()),
+        }
+    }
+    cleanup_delete_rollback(
+        &rollback_path,
+        remove_new_metadata,
+        namespace_owner,
+        prepared,
+        rollback_dir_owned,
+        rollback_marker_owned,
+    )
+    .await;
+    Ok(())
 }
 
 async fn cleanup_delete_rollback(
@@ -733,6 +997,7 @@ async fn cleanup_delete_rollback(
 async fn version_delete_marker_paths(object_dir: &Path, rollback_dir: Uuid) -> Result<Vec<PathBuf>> {
     let reserved_name = format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{rollback_dir}");
     let committed_name = format!("{DELETE_DATA_DIR_MARKER_PREFIX}{rollback_dir}");
+    let recovery_name = format!("{RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX}{rollback_dir}");
     let mut entries = match fs::read_dir(object_dir).await {
         Ok(entries) => entries,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -745,7 +1010,7 @@ async fn version_delete_marker_paths(object_dir: &Path, rollback_dir: Uuid) -> R
         {
             continue;
         }
-        for marker_name in [&reserved_name, &committed_name] {
+        for marker_name in [&reserved_name, &committed_name, &recovery_name] {
             paths.push(entry.path().join(marker_name));
         }
     }
@@ -753,6 +1018,7 @@ async fn version_delete_marker_paths(object_dir: &Path, rollback_dir: Uuid) -> R
 }
 
 async fn remove_version_delete_marker_paths(
+    volume: &str,
     paths: &[PathBuf],
     namespace_owner: Option<Arc<dyn Send + Sync>>,
     prepared: Option<Arc<os::NamespaceMutationLease>>,
@@ -767,6 +1033,18 @@ async fn remove_version_delete_marker_paths(
             Ok(()) => {}
             Err(err) if err.kind() == ErrorKind::NotFound => {}
             Err(err) => return Err(to_file_error(err).into()),
+        }
+    }
+    if effective_durability(volume).syncs_commit_metadata() {
+        // Finish every unlink in a directory before its durability barrier.
+        // Retry still syncs directories whose markers are already absent.
+        let parents: BTreeSet<_> = paths.iter().filter_map(|path| path.parent()).collect();
+        for parent in parents {
+            match os::fsync_dir_with_owner(parent, namespace_owner.clone()).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(to_file_error(error).into()),
+            }
         }
     }
     Ok(())
@@ -806,14 +1084,16 @@ async fn restore_delete_rollback_after_error(
     };
 
     let restore = if let Some(mut plan) = prepared {
-        match plan.refresh_forward(object_dir, rollback_dir).await {
+        match plan.refresh_forward(volume, object_dir, rollback_dir).await {
             Ok(()) => {
-                restore_delete_rollback_plan(object_dir, xl_path, rollback_dir, publication_root, namespace_owner, plan).await
+                restore_delete_rollback_plan(volume, object_dir, xl_path, rollback_dir, publication_root, namespace_owner, plan)
+                    .await
             }
             Err(error) => Err(error),
         }
     } else {
-        restore_delete_rollback_with_namespace_owner(object_dir, xl_path, rollback_dir, publication_root, namespace_owner).await
+        restore_delete_rollback_with_namespace_owner(volume, object_dir, xl_path, rollback_dir, publication_root, namespace_owner)
+            .await
     };
     if let Err(restore_err) = restore {
         warn!(
@@ -6223,24 +6503,6 @@ fn mount_id_from_mountinfo_contents(mountinfo: &str, path: &Path) -> Option<u64>
 }
 
 impl LocalDisk {
-    #[cfg(target_os = "linux")]
-    fn open_mount_lease(root: &Path) -> Result<(std::fs::File, PathBuf, Option<u64>)> {
-        use rustix::fs::{Mode, OFlags, open};
-        use std::os::fd::AsRawFd as _;
-
-        let fd = open(
-            root,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(std::io::Error::from)
-        .map_err(DiskError::from)?;
-        let lease = std::fs::File::from(fd);
-        let io_root = PathBuf::from(format!("/proc/self/fd/{}/.", lease.as_raw_fd()));
-        let mount_id = mount_id_for_fd(&lease);
-        Ok((lease, io_root, mount_id))
-    }
-
     #[cfg(not(target_os = "linux"))]
     fn open_mount_lease(root: &Path) -> Result<PathBuf> {
         Ok(root.to_path_buf())
@@ -6433,6 +6695,7 @@ impl LocalDisk {
             source.map_or(destination.0, |s| s.0),
             destination.0,
             &dst,
+            None,
             Some(owner),
         )
         .await;
@@ -6995,7 +7258,8 @@ impl LocalDisk {
         // Destination namespace -> sorted, deduplicated READs -> try source.
         // The source lease owns the first lease, with no reverse edge.
         let lease =
-            os::acquire_rename_data_mutation_lease_for_volumes(&self.root, source.0, destination.0, &dst, Some(owner)).await;
+            os::acquire_rename_data_mutation_lease_for_volumes(&self.root, source.0, destination.0, &dst, None, Some(owner))
+                .await;
         let lease = if src == dst {
             lease
         } else {
@@ -7310,7 +7574,7 @@ impl LocalDisk {
         // reuses these exact locks, including when a DeleteVolume writer queues.
         let metadata = os::acquire_metadata_mutation_lease(&object_path, Some(owner)).await;
         let publication =
-            os::acquire_rename_data_mutation_lease_with_owner(&self.root, volume, &metadata_path, Some(metadata)).await;
+            os::acquire_rename_data_mutation_lease_with_owner(&self.root, volume, &metadata_path, None, Some(metadata)).await;
         if !skip_access_checks(volume) {
             let metadata = fs::symlink_metadata(volume_path).await.map_err(to_volume_error)?;
             if !metadata.is_dir() {
@@ -7500,7 +7764,11 @@ impl LocalDisk {
         let root = publication_root.path().to_path_buf();
 
         #[cfg(target_os = "linux")]
-        let (mount_lease, io_root, mount_lease_mount_id) = Self::open_mount_lease(&root)?;
+        let (mount_lease, io_root, mount_lease_mount_id) = (
+            publication_root.directory().clone(),
+            publication_root.io_path().to_path_buf(),
+            mount_id_for_fd(publication_root.directory()),
+        );
         #[cfg(not(target_os = "linux"))]
         let io_root = Self::open_mount_lease(&root)?;
 
@@ -7551,9 +7819,11 @@ impl LocalDisk {
             state = "format_path_resolved",
             "Local disk format path resolved"
         );
-        let (format_data, format_meta) = read_file_exists(&io_format_path).await.inspect_err(|err| {
-            log_startup_disk_error("read_format_json", &io_format_path, err);
-        })?;
+        let (format_data, format_meta) = read_file_exists(&io_format_path, &publication_root)
+            .await
+            .inspect_err(|err| {
+                log_startup_disk_error("read_format_json", &io_format_path, err);
+            })?;
 
         let mut id = None;
         // let mut format_legacy = false;
@@ -7586,8 +7856,9 @@ impl LocalDisk {
             Box::pin(async move {
                 match get_disk_info(root.clone()).await {
                     Ok((info, is_root_disk)) => {
-                        let physical_device_ids = match rustfs_utils::os::get_physical_device_ids(root.to_string_lossy().as_ref())
-                        {
+                        let physical_device_ids = match win32_volume_path(&root).and_then(|volume_path| {
+                            rustfs_utils::os::get_physical_device_ids(volume_path.to_string_lossy().as_ref())
+                        }) {
                             Ok(ids) => ids,
                             Err(err) => {
                                 warn!(
@@ -7701,7 +7972,13 @@ impl LocalDisk {
 
         let io_root = disk.io_root.clone();
         let publication_root = disk.publication_root.clone();
-        tokio::spawn(Self::cleanup_deleted_objects_loop(io_root, publication_root, exit_rx));
+        tokio::spawn(Self::cleanup_deleted_objects_loop(
+            io_root,
+            publication_root,
+            #[cfg(target_os = "linux")]
+            disk.mount_lease.clone(),
+            exit_rx,
+        ));
         debug!(
             event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
             component = LOG_COMPONENT_ECSTORE,
@@ -7717,30 +7994,53 @@ impl LocalDisk {
     async fn cleanup_deleted_objects_loop(
         root: PathBuf,
         publication_root: os::PublicationRoot,
+        #[cfg(target_os = "linux")] mount_lease: Arc<std::fs::File>,
         mut exit_rx: tokio::sync::broadcast::Receiver<()>,
     ) {
         let start_at = Instant::now() + DELETED_OBJECTS_CLEANUP_INTERVAL;
         let mut interval = interval_at(start_at, DELETED_OBJECTS_CLEANUP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if let Err(err) = Self::cleanup_deleted_objects(root.clone()).await {
+                    let root = root.clone();
+                    let publication_root = publication_root.clone();
+                    #[cfg(target_os = "linux")]
+                    let mount_lease = mount_lease.clone();
+                    if let Err(err) = super::cleanup_runtime::run_gc(move |budget| async move {
+                        // Queued/detached scans must keep /proc/self/fd paths
+                        // attached to the original mount after LocalDisk drops.
+                        #[cfg(target_os = "linux")]
+                        let _mount_lease = mount_lease;
+                        if let Err(err) = Self::cleanup_deleted_objects(root.clone(), &budget).await {
+                            error!(
+                                event = EVENT_DISK_LOCAL_BACKGROUND_CLEANUP,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                                task = "deleted_objects",
+                                state = "failed",
+                                error = ?err,
+                                "Disk local background cleanup failed"
+                            );
+                        }
+                        if let Err(err) = Self::cleanup_stale_tmp_objects(root.clone(), &publication_root, &budget).await {
+                            error!(
+                                event = EVENT_DISK_LOCAL_BACKGROUND_CLEANUP,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                                task = "stale_tmp_objects",
+                                state = "failed",
+                                error = ?err,
+                                "Disk local background cleanup failed"
+                            );
+                        }
+                        Ok(())
+                    }).await {
                         error!(
                             event = EVENT_DISK_LOCAL_BACKGROUND_CLEANUP,
                             component = LOG_COMPONENT_ECSTORE,
                             subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                            task = "deleted_objects",
-                            state = "failed",
-                            error = ?err,
-                            "Disk local background cleanup failed"
-                        );
-                    }
-                    if let Err(err) = Self::cleanup_stale_tmp_objects(root.clone(), &publication_root).await {
-                        error!(
-                            event = EVENT_DISK_LOCAL_BACKGROUND_CLEANUP,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                            task = "stale_tmp_objects",
+                            task = "cleanup_dispatch",
                             state = "failed",
                             error = ?err,
                             "Disk local background cleanup failed"
@@ -7831,93 +8131,146 @@ impl LocalDisk {
         }
     }
 
-    async fn cleanup_stale_tmp_objects(root: PathBuf, publication_root: &os::PublicationRoot) -> Result<()> {
-        Self::cleanup_stale_tmp_objects_with_expiry(root, publication_root, STALE_TMP_OBJECT_EXPIRY).await
+    async fn cleanup_stale_tmp_objects(
+        root: PathBuf,
+        publication_root: &os::PublicationRoot,
+        budget: &super::cleanup_runtime::GcBudget,
+    ) -> Result<()> {
+        Self::cleanup_stale_tmp_objects_with_expiry(root, publication_root, STALE_TMP_OBJECT_EXPIRY, budget).await
     }
 
     async fn cleanup_stale_tmp_objects_with_expiry(
         root: PathBuf,
         publication_root: &os::PublicationRoot,
         expiry: Duration,
+        budget: &super::cleanup_runtime::GcBudget,
     ) -> Result<()> {
         let tmp_path = Self::meta_path(&root, RUSTFS_META_TMP_BUCKET);
-        let mut entries = match fs::read_dir(&tmp_path).await {
+        let mut entries = match budget.step(async { Ok(fs::read_dir(&tmp_path).await?) }).await {
             Ok(entries) => entries,
             Err(e) => {
-                if e.kind() == ErrorKind::NotFound {
+                if matches!(&e, DiskError::Io(err) if err.kind() == ErrorKind::NotFound) {
                     return Ok(());
                 }
-                return Err(e.into());
+                return Err(e);
             }
         };
 
-        while let Some(entry) = entries.next_entry().await? {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.is_empty() || name == "." || name == ".." || name == ".trash" {
-                continue;
+        loop {
+            let more = budget
+                .step(async {
+                    let Some(entry) = entries.next_entry().await? else {
+                        return Ok(false);
+                    };
+                    Self::cleanup_stale_tmp_entry(entry, &root, publication_root, expiry).await?;
+                    Ok(true)
+                })
+                .await?;
+            if !more {
+                break;
             }
-
-            let file_type = entry.file_type().await?;
-            if !file_type.is_dir() {
-                continue;
-            }
-
-            let Some(age) = entry
-                .metadata()
-                .await?
-                .modified()
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-            else {
-                continue;
-            };
-            if age <= expiry {
-                continue;
-            }
-
-            let target_path = Self::meta_path(&root, RUSTFS_META_TMP_DELETED_BUCKET).join(Uuid::new_v4().to_string());
-            rename_all(entry.path(), target_path, Self::meta_path(&root, RUSTFS_META_BUCKET), publication_root).await?;
         }
 
         Ok(())
     }
 
-    async fn cleanup_deleted_objects(root: PathBuf) -> Result<()> {
+    async fn cleanup_stale_tmp_entry(
+        entry: fs::DirEntry,
+        root: &Path,
+        publication_root: &os::PublicationRoot,
+        expiry: Duration,
+    ) -> Result<()> {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.is_empty() || name == "." || name == ".." || name == ".trash" || !entry.file_type().await?.is_dir() {
+            return Ok(());
+        }
+        let Some(age) = entry
+            .metadata()
+            .await?
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+        else {
+            return Ok(());
+        };
+        if age <= expiry {
+            return Ok(());
+        }
+        let staging = Self::meta_path(publication_root.path(), RUSTFS_META_TMP_BUCKET).join(entry.file_name());
+        let owner = os::acquire_namespace_mutation_lease_with_owner(&staging, None).await;
+        // An active publisher may have consumed or refreshed this entry while
+        // GC waited. Recheck the actual path before moving the whole prefix.
+        let metadata = match fs::symlink_metadata(entry.path()).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_dir()
+            || metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_none_or(|age| age <= expiry)
+        {
+            return Ok(());
+        }
+        let target_path = Self::meta_path(root, RUSTFS_META_TMP_DELETED_BUCKET).join(Uuid::new_v4().to_string());
+        os::rename_all_with_owner(
+            entry.path(),
+            target_path,
+            Self::meta_path(root, RUSTFS_META_BUCKET),
+            publication_root,
+            Some(owner),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn cleanup_deleted_objects(root: PathBuf, budget: &super::cleanup_runtime::GcBudget) -> Result<()> {
         let trash = Self::meta_path(&root, RUSTFS_META_TMP_DELETED_BUCKET);
-        let mut entries = match fs::read_dir(&trash).await {
+        let mut entries = match budget.step(async { Ok(fs::read_dir(&trash).await?) }).await {
             Ok(entries) => entries,
             Err(e) => {
-                if e.kind() == ErrorKind::NotFound {
+                if matches!(&e, DiskError::Io(err) if err.kind() == ErrorKind::NotFound) {
                     return Ok(());
                 }
-                return Err(e.into());
+                return Err(e);
             }
         };
 
-        while let Some(entry) = entries.next_entry().await? {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.is_empty() || name == "." || name == ".." {
-                continue;
-            }
-
-            let file_type = entry.file_type().await?;
-
-            let path = trash.join(name);
-
-            if file_type.is_dir() {
-                if let Err(e) = tokio::fs::remove_dir_all(path).await
-                    && e.kind() != ErrorKind::NotFound
-                {
-                    return Err(e.into());
-                }
-            } else if let Err(e) = tokio::fs::remove_file(path).await
-                && e.kind() != ErrorKind::NotFound
-            {
-                return Err(e.into());
+        loop {
+            let more = budget
+                .step(async {
+                    let Some(entry) = entries.next_entry().await? else {
+                        return Ok(false);
+                    };
+                    Self::cleanup_trash_entry(entry, &trash).await?;
+                    Ok(true)
+                })
+                .await?;
+            if !more {
+                break;
             }
         }
 
         Ok(())
+    }
+
+    async fn cleanup_trash_entry(entry: fs::DirEntry, trash: &Path) -> Result<()> {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.is_empty() || name == "." || name == ".." {
+            return Ok(());
+        }
+        let path = trash.join(name);
+        let result = if entry.file_type().await?.is_dir() {
+            fs::remove_dir_all(path).await
+        } else {
+            fs::remove_file(path).await
+        };
+        match result {
+            Err(err) if err.kind() != ErrorKind::NotFound => Err(err.into()),
+            _ => Ok(()),
+        }
     }
 
     fn is_valid_volname(volname: &str) -> bool {
@@ -8044,6 +8397,19 @@ impl LocalDisk {
 
     fn io_get_object_path(&self, bucket: &str, key: &str) -> Result<PathBuf> {
         self.local_disk_object_path(self.io_root(), bucket, key)
+    }
+
+    /// Only for operations that open through PublicationRoot or a commit guard:
+    /// containment and symlink checks happen with the actual open, off the runtime.
+    fn io_get_object_open_path(&self, bucket: &str, key: &str) -> Result<PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            let (bucket_path, path) = build_local_disk_object_path(self.io_root(), bucket, key);
+            check_local_disk_object_path_components(self.io_root(), &bucket_path, &path)?;
+            Ok(path)
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.io_get_object_path(bucket, key)
     }
 
     fn io_get_bucket_path(&self, bucket: &str) -> Result<PathBuf> {
@@ -8256,7 +8622,7 @@ impl LocalDisk {
 
         let mut meta = FileMeta::new();
         if !fi.fresh {
-            let (buf, _) = read_file_exists(&p).await?;
+            let (buf, _) = read_file_exists(&p, &self.publication_root).await?;
             if !buf.is_empty() {
                 let _ = meta.unmarshal_msg(&buf).map_err(|_| {
                     meta = FileMeta::new();
@@ -8283,6 +8649,36 @@ impl LocalDisk {
         Ok(())
     }
 
+    /// Keep the common GET completion on its caller. Only a last-reader
+    /// release with pending reclamation needs an owned cleanup task. Leave
+    /// that token untouched so the slow path owns the complete transition.
+    pub(in crate::disk) async fn release_snapshot_lease_without_cleanup(
+        &self,
+        volume: &str,
+        path: &str,
+        token: SnapshotLeaseToken,
+    ) -> bool {
+        let key = SnapshotLeaseKey {
+            volume: volume.to_owned(),
+            path: path.to_owned(),
+        };
+        let mut registry = self.snapshot_leases.lock();
+        let Some(entry) = registry.entries.get_mut(&key) else {
+            return true;
+        };
+        if !entry.deleting
+            && entry.pending_delete.is_some()
+            && (entry.tokens.is_empty() || (entry.tokens.len() == 1 && entry.tokens.contains(&token)))
+        {
+            return false;
+        }
+        entry.tokens.remove(&token);
+        if entry.tokens.is_empty() && !entry.deleting {
+            registry.entries.remove(&key);
+        }
+        true
+    }
+
     async fn delete_data_dir_with_namespace_owner(
         &self,
         volume: &str,
@@ -8301,6 +8697,19 @@ impl LocalDisk {
         opts: DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         prepared: Option<PreparedPathDelete>,
+    ) -> Result<DataDirDeleteStatus> {
+        self.delete_data_dir_with_prepared_metadata(volume, path, opts, namespace_owner, prepared, None)
+            .await
+    }
+
+    async fn delete_data_dir_with_prepared_metadata(
+        &self,
+        volume: &str,
+        path: &str,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        prepared: Option<PreparedPathDelete>,
+        metadata_owner: Option<Arc<os::MetadataMutationLease>>,
     ) -> Result<DataDirDeleteStatus> {
         let key = SnapshotLeaseKey {
             volume: volume.to_string(),
@@ -8336,11 +8745,89 @@ impl LocalDisk {
         let result = if let Some(prepared) = prepared {
             self.delete_unleased_prepared(volume, path, &opts, prepared).await
         } else {
-            self.delete_unleased_with_namespace_owner(volume, path, &opts, namespace_owner)
+            self.delete_unleased_with_prepared_metadata(volume, path, &opts, namespace_owner, None, metadata_owner, None)
                 .await
         };
         claim.finish(result.is_ok());
         result.map(|()| DataDirDeleteStatus::Deleted)
+    }
+
+    pub(crate) async fn is_plain_orphan_data_dir(&self, volume: &str, path: &str) -> Result<bool> {
+        let path = self.io_get_object_path(volume, path)?;
+        let permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
+        spawn_blocking_with_disk_io_permit(permit, move || match orphan_data_dir_parts(&path) {
+            Ok(_) => Ok(true),
+            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::InvalidData) => Ok(false),
+            Err(err) => Err(to_file_error(err).into()),
+        })
+        .await
+        .map_err(DiskError::from)?
+    }
+
+    pub(crate) async fn delete_versions_with_namespace_owner(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Vec<Option<Error>> {
+        let mut errs = Vec::with_capacity(versions.len());
+        for _ in 0..versions.len() {
+            errs.push(None);
+        }
+
+        for (i, ver) in versions.iter().enumerate() {
+            if let Err(e) = self
+                .delete_versions_guarded_internal(
+                    volume,
+                    ver.name.as_str(),
+                    &ver.versions,
+                    &opts,
+                    namespace_owner.clone(),
+                    None,
+                    None,
+                )
+                .await
+            {
+                errs[i] = Some(e);
+            } else {
+                errs[i] = None;
+            }
+        }
+
+        errs
+    }
+
+    pub(crate) async fn delete_versions_guarded_with_namespace_owner(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Vec<Option<DiskError>> {
+        let payload = super::GuardedDeleteVersionsPayload { versions, opts };
+        if let Err(error) = payload.validate() {
+            return vec![Some(error); payload.versions.len()];
+        }
+        let super::GuardedDeleteVersionsPayload { versions, mut opts } = payload;
+        opts.recoverable_delete = true;
+        let mut errors = Vec::with_capacity(versions.len());
+        for version in &versions {
+            errors.push(
+                self.delete_versions_guarded_internal(
+                    volume,
+                    &version.group.name,
+                    &version.group.versions,
+                    &opts,
+                    namespace_owner.clone(),
+                    Some(&version.expected_current),
+                    None,
+                )
+                .await
+                .err(),
+            );
+        }
+        errors
     }
 
     async fn delete_version_inner(&self, volume: &str, path: &str, fi: FileInfo, mutation: DeleteVersionMutation) -> Result<()> {
@@ -8413,11 +8900,15 @@ impl LocalDisk {
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
         let xl_path = path_join(&[file_path.as_path(), Path::new(STORAGE_FORMAT_FILE)]);
-        let namespace_owner: Option<Arc<dyn Send + Sync>> = if let Some(publication) = &prepared_publication {
+        let mut namespace_owner: Option<Arc<dyn Send + Sync>> = if let Some(publication) = &prepared_publication {
             Some(publication.clone())
         } else {
             Some(os::acquire_metadata_mutation_lease(&self.get_object_path(volume, path)?, namespace_owner).await)
         };
+        if prepared_publication.is_none() && (opts.recoverable_delete || (opts.undo_write && opts.undo_delete)) {
+            let volume_guard = os::disk_volume_mutation_lock(&self.root, volume).read_owned().await;
+            namespace_owner = Some(Arc::new((namespace_owner, volume_guard)));
+        }
         // Reserve fresh trash destinations before changing metadata or data. A
         // held volume READ must never queue for another namespace behind delete.
         let prepared_trash = if let Some(publication) = &prepared_publication
@@ -8430,8 +8921,17 @@ impl LocalDisk {
             None
         };
         if opts.old_data_dir.is_some() && opts.undo_write {
+            if opts.undo_delete
+                && let Some(transaction) = opts.old_data_dir
+                && self
+                    .rollback_prepared_delete(volume, path, transaction, namespace_owner.clone(), prepared_publication.clone())
+                    .await?
+            {
+                return Ok(());
+            }
             return self
                 .undo_write(
+                    volume,
                     file_path.as_path(),
                     &fi,
                     &opts,
@@ -8454,20 +8954,13 @@ impl LocalDisk {
                 // Leave residue for the existing unprepared cleanup/retry path
                 // and preserve the original missing-file/version failure.
                 if prepared_publication.is_none() {
-                    self.finish_committed_delete_residue(volume, path, namespace_owner.clone())
+                    self.finish_internal_delete_residue(volume, path, namespace_owner.clone())
                         .await;
                 }
 
                 if fi.deleted && force_del_marker {
                     return self
-                        .write_missing_delete_marker(
-                            volume,
-                            path,
-                            fi,
-                            rollback_dir,
-                            namespace_owner.clone(),
-                            prepared_publication,
-                        )
+                        .write_missing_delete_marker(volume, path, fi, &opts, namespace_owner.clone(), prepared_publication)
                         .await;
                 }
 
@@ -8501,6 +8994,7 @@ impl LocalDisk {
         let prepared_rollback = if let (Some(rollback), Some(publication)) = (rollback_dir, &prepared_publication) {
             Some(
                 DeleteRollbackPlan::prepare_forward(
+                    volume,
                     &file_path,
                     &xl_path,
                     rollback,
@@ -8536,16 +9030,37 @@ impl LocalDisk {
             prepared_trash
         };
         let mut reserved_version_delete = false;
+        let mut recovery_target = None;
         if let Some(rollback_dir) = rollback_dir {
-            write_delete_rollback_file_with_prepared_publication(
-                file_path.as_path(),
-                rollback_dir,
-                STORAGE_FORMAT_FILE_BACKUP,
-                &buf,
-                namespace_owner.clone(),
-                prepared_publication.clone(),
-            )
-            .await?;
+            if opts.recoverable_delete {
+                recovery_target = self
+                    .prepare_delete_recovery(
+                        volume,
+                        path,
+                        Some(&buf),
+                        std::slice::from_ref(&fi),
+                        None,
+                        delete_recovery::DeletePreparationContext {
+                            transaction: rollback_dir,
+                            bucket_incarnation: opts.delete_recovery_bucket_incarnation,
+                            namespace_owner: namespace_owner.clone(),
+                            prepared_publication: prepared_publication.clone(),
+                        },
+                    )
+                    .await?;
+            } else {
+                write_delete_rollback_file_with_prepared_publication(
+                    self.io_root(),
+                    volume,
+                    file_path.as_path(),
+                    rollback_dir,
+                    STORAGE_FORMAT_FILE_BACKUP,
+                    &buf,
+                    namespace_owner.clone(),
+                    prepared_publication.clone(),
+                )
+                .await?;
+            }
         }
 
         if let Some(uuid) = old_dir {
@@ -8739,7 +9254,7 @@ impl LocalDisk {
         }
 
         let commit_result = if !meta.versions.is_empty() {
-            let buf = match meta.marshal_msg() {
+            let buf = match recovery_target.map(Ok).unwrap_or_else(|| meta.marshal_msg()) {
                 Ok(buf) => buf,
                 Err(err) => {
                     let err: DiskError = err.into();
@@ -8832,6 +9347,10 @@ impl LocalDisk {
             .await);
         }
 
+        if let Some(transaction) = rollback_dir {
+            self.delete_recovery_barrier(volume, path, transaction, "APPLIED").await?;
+        }
+
         if reserved_version_delete
             && let Some(rollback_dir) = rollback_dir
             && let Err(err) = self
@@ -8919,6 +9438,7 @@ impl LocalDisk {
 
     async fn undo_write(
         &self,
+        volume: &str,
         file_path: &Path,
         fi: &FileInfo,
         opts: &DeleteOptions,
@@ -8930,6 +9450,7 @@ impl LocalDisk {
         let xl_path = path_join(&[file_path, Path::new(STORAGE_FORMAT_FILE)]);
         if opts.undo_delete {
             restore_delete_rollback_with_prepared_publication(
+                volume,
                 file_path,
                 &xl_path,
                 old_data_dir,
@@ -9235,6 +9756,19 @@ impl LocalDisk {
         opts: &DeleteOptions,
         plan: PreparedPathDelete,
     ) -> Result<()> {
+        if opts.recursive && opts.old_data_dir.is_some() {
+            return self
+                .delete_unleased_with_prepared_metadata(
+                    volume,
+                    path,
+                    opts,
+                    Some(plan.lease.clone()),
+                    None,
+                    None,
+                    Some(plan.lease),
+                )
+                .await;
+        }
         let volume_dir = self.io_get_bucket_path(volume)?;
         let file_path = self.io_get_object_path(volume, path)?;
         let lease = plan.lease.clone();
@@ -9247,6 +9781,7 @@ impl LocalDisk {
             Some(lease),
             None,
             Some(plan),
+            None,
         )
         .await?;
         self.io_backend.invalidate_cached_fds_under(volume, path);
@@ -9264,6 +9799,37 @@ impl LocalDisk {
             .then(|| path.rsplit_once('/'))
             .flatten()
             .and_then(|(object, id)| Uuid::parse_str(id).ok().map(|id| (object, id)));
+        // Recovery receipts and orphan validation use main's exact cleanup
+        // executor. Admission has already captured the real volume owner, but
+        // no per-object namespace has been taken yet on this branch.
+        if opts.orphan_data_dir || transaction.is_some_and(|(_, id)| opts.old_data_dir == Some(id)) {
+            let object = if opts.orphan_data_dir {
+                path.rsplit_once('/')
+                    .map(|(object, _)| object)
+                    .ok_or(DiskError::InvalidPath)?
+            } else {
+                transaction.map(|(object, _)| object).ok_or(DiskError::InvalidPath)?
+            };
+            let metadata =
+                os::try_acquire_metadata_mutation_lease_with_owner(&self.get_object_path(volume, object)?, owner.clone())?;
+            let publication = if opts.orphan_data_dir {
+                None
+            } else {
+                let transaction_path = self.io_get_object_path(volume, path)?;
+                let mut publication = os::try_acquire_namespace_mutation_lease_with_owner(&transaction_path, metadata.clone())?;
+                for name in [
+                    STORAGE_FORMAT_FILE_BACKUP,
+                    DELETE_MARKER_ROLLBACK_FILE,
+                    DELETE_QUORUM_COMMITTED_FILE,
+                ] {
+                    publication = os::try_acquire_namespace_mutation_lease_with_owner(&transaction_path.join(name), publication)?;
+                }
+                Some(publication)
+            };
+            return self
+                .delete_with_prepared_metadata(volume, path, opts, Some(owner), Some(metadata), publication)
+                .await;
+        }
         let object = transaction.map_or(path, |(object, _)| object);
         let publication = self.prepare_path_delete_object(volume, object, owner)?;
         let (data_paths, scan_error) = if let Some((object, transaction)) = transaction {
@@ -9372,24 +9938,218 @@ impl LocalDisk {
         opt: DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
+        self.delete_with_prepared_metadata(volume, path, opt, namespace_owner, None, None)
+            .await
+    }
+
+    async fn delete_with_prepared_metadata(
+        &self,
+        volume: &str,
+        path: &str,
+        opt: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        metadata_owner: Option<Arc<os::MetadataMutationLease>>,
+        publication: Option<Arc<os::NamespaceMutationLease>>,
+    ) -> Result<()> {
         crate::hp_guard!("LocalDisk::delete");
+        if opt.orphan_data_dir {
+            return self
+                .delete_data_dir_with_prepared_metadata(volume, path, opt, namespace_owner, None, metadata_owner)
+                .await
+                .and_then(|status| match status {
+                    DataDirDeleteStatus::Deleted => Ok(()),
+                    DataDirDeleteStatus::Deferred => Err(DiskError::DiskOngoingReq),
+                });
+        }
+        let mut opt = opt;
+        let mut namespace_owner = namespace_owner;
         let handled_version_delete = if opt.recursive
             && opt.immediate
             && let Some((object, transaction_id)) = path.rsplit_once('/')
             && let Ok(transaction_id) = Uuid::parse_str(transaction_id)
+            && !transaction_id.is_nil()
         {
-            self.finish_version_delete(volume, object, transaction_id, namespace_owner.clone())
-                .await?
+            if opt.old_data_dir == Some(transaction_id) {
+                let object_path = self.get_object_path(volume, object)?;
+                namespace_owner = Some(match metadata_owner.as_ref() {
+                    Some(metadata) => metadata.clone(),
+                    None => os::acquire_metadata_mutation_lease(&object_path, namespace_owner).await,
+                });
+                let handled = self
+                    .finish_delete_transaction_with_prepared_publication(
+                        volume,
+                        object,
+                        transaction_id,
+                        namespace_owner.clone(),
+                        publication.clone(),
+                    )
+                    .await?;
+                // A key below the UUID prefix may be created concurrently with
+                // cleanup. Never recursively remove newly published descendants.
+                opt.recursive = false;
+                handled
+            } else {
+                self.finish_version_delete(volume, object, transaction_id, false, namespace_owner.clone())
+                    .await?
+                    .0
+            }
         } else {
             false
         };
+        let staging_cleanup = if volume == RUSTFS_META_TMP_BUCKET && opt.recursive {
+            let staging = tmp_staging_mutation_path(&self.root, path)?;
+            let lease = os::acquire_namespace_mutation_lease_with_owner(&staging, namespace_owner.take()).await;
+            namespace_owner = Some(lease.clone());
+            Some(StagingCleanupLease {
+                io_prefix: tmp_staging_mutation_path(self.io_root(), path)?,
+                lease,
+            })
+        } else {
+            None
+        };
         match self
-            .delete_unleased_with_namespace_owner(volume, path, &opt, namespace_owner)
+            .delete_unleased_with_prepared_metadata(
+                volume,
+                path,
+                &opt,
+                namespace_owner,
+                staging_cleanup.as_ref(),
+                metadata_owner,
+                publication,
+            )
             .await
         {
             Err(DiskError::FileNotFound) if handled_version_delete => Ok(()),
             result => result,
         }
+    }
+
+    // The caller owns the object metadata lease; retry recovery must not
+    // reacquire it while holding the same mutation domain.
+    async fn finish_delete_transaction_with_namespace_owner(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction_id: Uuid,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<bool> {
+        self.finish_delete_transaction_with_prepared_publication(volume, object, transaction_id, namespace_owner, None)
+            .await
+    }
+
+    async fn finish_delete_transaction_with_prepared_publication(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction_id: Uuid,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        publication: Option<Arc<os::NamespaceMutationLease>>,
+    ) -> Result<bool> {
+        let path = format!("{object}/{transaction_id}");
+        let transaction_path = self.io_get_object_path(volume, &path)?;
+        let mut transaction_cleanup = false;
+        match fs::read_dir(&transaction_path).await {
+            Ok(mut entries) => {
+                while let Some(entry) = entries.next_entry().await.map_err(to_file_error)? {
+                    let name = entry.file_name();
+                    if !entry.file_type().await.map_err(to_file_error)?.is_file()
+                        || (name != STORAGE_FORMAT_FILE_BACKUP
+                            && name != DELETE_MARKER_ROLLBACK_FILE
+                            && name != DELETE_QUORUM_COMMITTED_FILE)
+                    {
+                        return Err(DiskError::FileCorrupt);
+                    }
+                    transaction_cleanup = true;
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(to_file_error(err).into()),
+        }
+        if transaction_cleanup {
+            // The set invokes transaction cleanup only after observing write
+            // quorum. Unlike data-dir markers, this receipt proves that
+            // decision and also covers inline objects with no data directory.
+            let receipt_path = transaction_path.join(DELETE_QUORUM_COMMITTED_FILE);
+            let lease = match &publication {
+                Some(publication) => publication.clone(),
+                None => os::acquire_namespace_mutation_lease_with_owner(&receipt_path, namespace_owner.clone()).await,
+            };
+            let sync = effective_durability(volume).syncs_commit_metadata();
+            os::run_blocking_namespace_operation(lease, move || {
+                let receipt = match std::fs::OpenOptions::new().write(true).create_new(true).open(&receipt_path) {
+                    Ok(receipt) => receipt,
+                    Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                        if !std::fs::symlink_metadata(&receipt_path)?.is_file() {
+                            return Err(std::io::Error::new(ErrorKind::InvalidData, "delete receipt is not a regular file"));
+                        }
+                        std::fs::File::open(receipt_path)?
+                    }
+                    Err(err) => return Err(err),
+                };
+                if sync {
+                    receipt.sync_all()?;
+                    os::fsync_dir_std(&transaction_path)?;
+                    if let Some(parent) = transaction_path.parent() {
+                        os::fsync_dir_std(parent)?;
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map_err(to_file_error)?;
+            // Retain the receipt until both the backup and marked data are
+            // gone. Every interrupted cleanup remains recognizable.
+            for name in [STORAGE_FORMAT_FILE_BACKUP, DELETE_MARKER_ROLLBACK_FILE] {
+                let file = self.io_get_object_path(volume, &path)?.join(name);
+                let remove = match &publication {
+                    Some(publication) => os::remove_file_with_lease(file, publication.clone()).await,
+                    None => os::remove_file_with_owner(file, namespace_owner.clone()).await,
+                };
+                match remove {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                    Err(err) => return Err(to_file_error(err).into()),
+                }
+            }
+            if effective_durability(volume).syncs_commit_metadata() {
+                os::fsync_dir_with_owner(&self.io_get_object_path(volume, &path)?, namespace_owner.clone())
+                    .await
+                    .map_err(to_file_error)?;
+            }
+        }
+        let (found, physically_deleted) = self
+            .finish_version_delete_with_prepared_publication(
+                volume,
+                object,
+                transaction_id,
+                true,
+                namespace_owner.clone(),
+                publication.clone(),
+            )
+            .await?;
+        if !physically_deleted {
+            // Snapshot readers still own these parts. Keep the quorum receipt
+            // until their release finishes the physical data removal.
+            return Err(DiskError::DiskOngoingReq);
+        }
+        if transaction_cleanup {
+            let file = self.io_get_object_path(volume, &path)?.join(DELETE_QUORUM_COMMITTED_FILE);
+            let remove = match publication {
+                Some(publication) => os::remove_file_with_lease(file, publication).await,
+                None => os::remove_file_with_owner(file, namespace_owner).await,
+            };
+            match remove {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(to_file_error(err).into()),
+            }
+        }
+        Ok(found || transaction_cleanup)
+    }
+
+    #[cfg(test)]
+    async fn delete_unleased(&self, volume: &str, path: &str, opt: &DeleteOptions) -> Result<()> {
+        self.delete_unleased_with_namespace_owner(volume, path, opt, None, None).await
     }
 
     async fn delete_unleased_with_namespace_owner(
@@ -9398,6 +10158,21 @@ impl LocalDisk {
         path: &str,
         opt: &DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
+        staging_cleanup: Option<&StagingCleanupLease>,
+    ) -> Result<()> {
+        self.delete_unleased_with_prepared_metadata(volume, path, opt, namespace_owner, staging_cleanup, None, None)
+            .await
+    }
+
+    async fn delete_unleased_with_prepared_metadata(
+        &self,
+        volume: &str,
+        path: &str,
+        opt: &DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        staging_cleanup: Option<&StagingCleanupLease>,
+        metadata_owner: Option<Arc<os::MetadataMutationLease>>,
+        publication: Option<Arc<os::NamespaceMutationLease>>,
     ) -> Result<()> {
         let volume_dir = self.io_get_bucket_path(volume)?;
         if !skip_access_checks(volume)
@@ -9408,8 +10183,187 @@ impl LocalDisk {
 
         let file_path = self.io_get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
-        self.delete_file_with_namespace_owner(&volume_dir, &file_path, opt.recursive, opt.immediate, namespace_owner)
-            .await?;
+        if opt.orphan_data_dir {
+            if opt.recursive || opt.old_data_dir.is_some() || opt.recoverable_delete {
+                return Err(DiskError::FileCorrupt);
+            }
+            let (object, data_dir) = path.rsplit_once('/').ok_or(DiskError::InvalidPath)?;
+            let data_dir = Uuid::parse_str(data_dir).map_err(|_| DiskError::InvalidPath)?;
+            if data_dir.is_nil() {
+                return Err(DiskError::InvalidPath);
+            }
+            // A snapshot may postpone this mutation until after the caller's
+            // object lock is released. Recheck metadata and recovery obligations
+            // under the same metadata -> namespace order as normal publication.
+            let owner = match metadata_owner.as_ref() {
+                Some(metadata) => metadata.clone(),
+                None => os::acquire_metadata_mutation_lease(&self.get_object_path(volume, object)?, namespace_owner).await,
+            };
+            if self.has_delete_transaction_evidence(volume, object).await? {
+                return Err(DiskError::DiskOngoingReq);
+            }
+            let metadata_path = self.io_get_object_path(volume, &format!("{object}/{STORAGE_FORMAT_FILE}"))?;
+            let lease = match metadata_owner {
+                Some(_) => os::try_acquire_namespace_mutation_lease_with_owner(&file_path, owner)?,
+                None => os::acquire_namespace_mutation_lease_with_owner(&file_path, Some(owner)).await,
+            };
+            let sync = effective_durability(volume).syncs_commit_metadata();
+            let result = os::run_blocking_namespace_operation(lease, move || {
+                let bytes = std::fs::read(metadata_path)?;
+                let metadata = FileMeta::load(&bytes).map_err(|_| std::io::Error::from(ErrorKind::InvalidData))?;
+                if metadata
+                    .get_data_dirs()
+                    .map_err(|_| std::io::Error::from(ErrorKind::InvalidData))?
+                    .into_iter()
+                    .flatten()
+                    .any(|referenced| referenced == data_dir)
+                {
+                    return Err(std::io::Error::from(ErrorKind::InvalidData));
+                }
+                let parts = orphan_data_dir_parts(&file_path)?;
+                for part in parts {
+                    #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                    os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &part);
+                    // A descendant may be published after preflight. Unlinking
+                    // only the classified files and using rmdir never removes it.
+                    match std::fs::remove_file(part) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == ErrorKind::NotFound => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+                if sync {
+                    os::fsync_dir_std(&file_path)?;
+                }
+                std::fs::remove_dir(&file_path)?;
+                if sync && let Some(parent) = file_path.parent() {
+                    os::fsync_dir_std(parent)?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|err| {
+                if err.kind() == ErrorKind::InvalidData {
+                    DiskError::FileCorrupt
+                } else {
+                    to_file_error(err).into()
+                }
+            });
+            self.io_backend.invalidate_cached_fds_under(volume, path);
+            return result;
+        }
+        let mut recursive = opt.recursive;
+        if recursive
+            && let Some(transaction) = opt.old_data_dir
+            && path
+                .rsplit_once('/')
+                .is_some_and(|(_, name)| Uuid::parse_str(name).is_ok_and(|id| id != transaction || opt.recoverable_delete))
+        {
+            // Snapshot release replays these same options. Remove only this
+            // transaction's regular files; UUID-prefix child keys can appear
+            // after classification and must never be recursively removed.
+            let lease = match &publication {
+                Some(publication) => publication.clone(),
+                None => os::acquire_namespace_mutation_lease_with_owner(&file_path, namespace_owner.clone()).await,
+            };
+            let data_path = file_path.clone();
+            let sync = effective_durability(volume).syncs_commit_metadata();
+            let keep_rollback_witnesses = opt.recoverable_delete;
+            os::run_blocking_namespace_operation(lease, move || {
+                let entries = match std::fs::read_dir(&data_path) {
+                    Ok(entries) => entries,
+                    Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+                    Err(err) => return Err(err),
+                };
+                let committed = format!("{DELETE_DATA_DIR_MARKER_PREFIX}{transaction}");
+                let recovery_committed = format!("{RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}");
+                let reserved = format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}");
+                let corrupt =
+                    || std::io::Error::new(ErrorKind::InvalidData, "delete data directory contains unrecognized entries");
+                let mut parts = Vec::new();
+                let mut markers = Vec::new();
+                let mut has_committed_marker = false;
+                for entry in entries {
+                    let entry = entry?;
+                    let name = entry.file_name();
+                    let name = name.to_str().ok_or_else(corrupt)?;
+                    if !entry.file_type()?.is_file() {
+                        return Err(corrupt());
+                    }
+                    if delete_recovery_part_file(name)
+                        || (name != reserved && is_delete_transaction_marker(name, RESERVED_DELETE_DATA_DIR_MARKER_PREFIX))
+                    {
+                        // An interrupted legacy delete can reserve a still-live
+                        // data dir. Only this transaction's commit marker below
+                        // authorizes reclaiming it; remove the old reservation
+                        // with the payload before dropping that proof.
+                        parts.push(entry.path());
+                    } else if name == committed || name == recovery_committed || name == reserved {
+                        has_committed_marker |= name == committed || name == recovery_committed;
+                        markers.push(entry.path());
+                    } else if keep_rollback_witnesses
+                        && [
+                            STORAGE_FORMAT_FILE_BACKUP,
+                            DELETE_MARKER_ROLLBACK_FILE,
+                            DELETE_QUORUM_COMMITTED_FILE,
+                        ]
+                        .contains(&name)
+                    {
+                        // Explicit legacy deletion keeps rollback witnesses until
+                        // every snapshot-protected payload has disappeared.
+                    } else {
+                        return Err(corrupt());
+                    }
+                }
+                if !parts.is_empty() && !has_committed_marker {
+                    return Err(corrupt());
+                }
+                for files in [parts, markers] {
+                    for entry in files {
+                        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                        os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &entry);
+                        match std::fs::remove_file(entry) {
+                            Ok(()) => {}
+                            Err(err) if err.kind() == ErrorKind::NotFound => {}
+                            Err(err) => return Err(err),
+                        }
+                    }
+                    if sync {
+                        os::fsync_dir_std(&data_path)?;
+                    }
+                }
+                match std::fs::remove_dir(data_path) {
+                    Ok(()) => Ok(()),
+                    Err(err) if is_benign_object_rmdir_error(&err) => Ok(()),
+                    Err(err) => Err(err),
+                }
+            })
+            .await
+            .map_err(|err| {
+                if err.kind() == ErrorKind::InvalidData {
+                    DiskError::FileCorrupt
+                } else {
+                    to_file_error(err).into()
+                }
+            })?;
+            recursive = false;
+        }
+        self.delete_file_with_prepared_entry(
+            &volume_dir,
+            &file_path,
+            recursive,
+            opt.immediate,
+            namespace_owner,
+            publication.clone(),
+            None,
+            publication.map(|lease| PreparedPathDelete {
+                lease,
+                trash: None,
+                encoded_trash: None,
+            }),
+            staging_cleanup,
+        )
+        .await?;
         // A deleted shard must not remain readable through the io_uring fd cache.
         self.io_backend.invalidate_cached_fds_under(volume, path);
         Ok(())
@@ -9422,7 +10376,7 @@ impl LocalDisk {
         recursive: bool,
         immediate_purge: bool,
     ) -> Result<()> {
-        self.delete_file_with_namespace_owner(base_path, delete_path, recursive, immediate_purge, None)
+        self.delete_file_with_namespace_owner(base_path, delete_path, recursive, immediate_purge, None, None)
             .await
     }
 
@@ -9434,8 +10388,9 @@ impl LocalDisk {
         recursive: bool,
         immediate_purge: bool,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
+        staging_cleanup: Option<&'a StagingCleanupLease>,
     ) -> BoxFuture<'a, Result<()>> {
-        self.delete_file_with_prepared_publication(
+        self.delete_file_with_prepared_entry(
             base_path,
             delete_path,
             recursive,
@@ -9443,6 +10398,8 @@ impl LocalDisk {
             namespace_owner,
             None,
             None,
+            None,
+            staging_cleanup,
         )
     }
 
@@ -9465,6 +10422,7 @@ impl LocalDisk {
             prepared_publication,
             prepared_trash,
             None,
+            None,
         )
     }
 
@@ -9478,6 +10436,7 @@ impl LocalDisk {
         prepared_publication: Option<Arc<os::NamespaceMutationLease>>,
         prepared_trash: Option<(PathBuf, Arc<os::NamespaceMutationLease>)>,
         prepared_entry: Option<PreparedPathDelete>,
+        staging_cleanup: Option<&'a StagingCleanupLease>,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             // debug!("delete_file {:?}\n base_path:{:?}", &delete_path, &base_path);
@@ -9516,9 +10475,11 @@ impl LocalDisk {
                     )
                     .await?;
                 }
-            } else if delete_path.is_dir() {
+            } else if staging_cleanup.is_some_and(|staging| staging.io_prefix == *delete_path) || delete_path.is_dir() {
                 // debug!("delete_file remove_dir {:?}", &delete_path);
-                let result = if let Some(publication) = &prepared_publication {
+                let result = if let Some(staging) = staging_cleanup.filter(|staging| staging.io_prefix == *delete_path) {
+                    os::remove_dir_with_lease(delete_path, staging.lease.clone()).await
+                } else if let Some(publication) = &prepared_publication {
                     let lease = if let Some(entry) = &prepared_entry {
                         entry.lease.clone()
                     } else {
@@ -9602,7 +10563,7 @@ impl LocalDisk {
             }
             if let Some(dir_path) = delete_path.parent() {
                 let result = self
-                    .delete_file_with_prepared_publication(
+                    .delete_file_with_prepared_entry(
                         base_path,
                         &PathBuf::from(dir_path),
                         false,
@@ -9610,6 +10571,8 @@ impl LocalDisk {
                         namespace_owner.clone(),
                         prepared_publication.clone(),
                         None,
+                        None,
+                        staging_cleanup,
                     )
                     .await;
                 match result {
@@ -9688,10 +10651,11 @@ impl LocalDisk {
         //  - metadata failure -> to_file_error
         //  - parse failure    -> propagated verbatim from read_xl_meta_no_data_sync (`?`)
         let path = file_path.as_ref().to_path_buf();
+        let root = self.publication_root.clone();
         let (data, modtime) =
             spawn_blocking_with_disk_io_permit(io_permit, move || -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
                 // Read-only open, equivalent to O_RDONLY (get_readonly_options only sets read(true)).
-                let mut f = std::fs::File::open(&path).map_err(to_file_error)?;
+                let mut f = root.open_readonly(&path).map_err(to_file_error)?;
 
                 let meta = f.metadata().map_err(to_file_error)?;
 
@@ -9745,6 +10709,7 @@ impl LocalDisk {
         let metadata_path = self.io_get_object_path(bucket, path.to_string_lossy().as_ref());
         // A part's existence check, metadata read and decode share one dispatch.
         // Keep open errors unmapped for the existing missing-volume fallback.
+        let root = self.publication_root.clone();
         let result = spawn_blocking_with_disk_io_permit(io_permit, move || -> Result<_> {
             let part_error = |error: String| ObjectPartInfo {
                 number: num,
@@ -9757,7 +10722,7 @@ impl LocalDisk {
             // Invalid metadata paths remain request errors, but missing data wins
             // first, as it does in the serial reader.
             let metadata_path = metadata_path?;
-            Ok(read_all_data_std(&metadata_path)
+            Ok(read_all_data_std(root.open_readonly(&metadata_path))
                 .map(|(data, _)| ObjectPartInfo::unmarshal(&data).unwrap_or_else(|err| part_error(err.to_string()))))
         })
         .await;
@@ -9777,8 +10742,9 @@ impl LocalDisk {
         let object_dir = self.io_get_object_path(volume, object_name)?;
         let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
         let volume_dir = self.io_get_bucket_path(volume)?;
+        let root = self.publication_root.clone();
         let result = spawn_blocking_with_disk_io_permit(io_permit, move || {
-            let (bytes, _) = read_all_data_std(&metadata_path)?;
+            let (bytes, _) = read_all_data_std(root.open_readonly(&metadata_path))?;
             let file_meta = FileMeta::load(&bytes).ok();
             let data_dirs: HashSet<String> = file_meta
                 .as_ref()
@@ -9876,7 +10842,8 @@ impl LocalDisk {
         // gating the volume fallback on the open error alone is equivalent to
         // the original code, where the fallback lived solely in the open match arm.
         let path = file_path.as_ref().to_path_buf();
-        let res = spawn_blocking_with_disk_io_permit(io_permit, move || read_all_data_std(&path))
+        let root = self.publication_root.clone();
+        let res = spawn_blocking_with_disk_io_permit(io_permit, move || read_all_data_std(root.open_readonly(&path)))
             .await
             .map_err(DiskError::from)?;
 
@@ -9890,14 +10857,18 @@ impl LocalDisk {
         volume: &str,
         path: &str,
         fi: FileInfo,
-        rollback_dir: Option<Uuid>,
+        opts: &DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         prepared_publication: Option<Arc<os::NamespaceMutationLease>>,
     ) -> Result<()> {
+        let rollback_dir = opts.old_data_dir;
         let object_dir = self.io_get_object_path(volume, path)?;
         let xl_path = object_dir.join(STORAGE_FORMAT_FILE);
         let prepared_rollback = if let (Some(rollback), Some(publication)) = (rollback_dir, &prepared_publication) {
-            Some(DeleteRollbackPlan::prepare_forward(&object_dir, &xl_path, rollback, &[], true, publication.clone()).await?)
+            Some(
+                DeleteRollbackPlan::prepare_forward(volume, &object_dir, &xl_path, rollback, &[], true, publication.clone())
+                    .await?,
+            )
         } else {
             None
         };
@@ -9909,26 +10880,63 @@ impl LocalDisk {
             .as_ref()
             .map(|owner| owner.clone() as Arc<dyn Send + Sync>)
             .or(namespace_owner);
+        let mut recovery_target = None;
         if let Some(rollback_dir) = rollback_dir {
-            write_delete_rollback_file_with_prepared_publication(
-                &object_dir,
-                rollback_dir,
-                DELETE_MARKER_ROLLBACK_FILE,
-                &[],
-                namespace_owner.clone(),
-                prepared_publication.clone(),
-            )
-            .await?;
+            if opts.recoverable_delete {
+                recovery_target = self
+                    .prepare_delete_recovery(
+                        volume,
+                        path,
+                        None,
+                        std::slice::from_ref(&fi),
+                        None,
+                        delete_recovery::DeletePreparationContext {
+                            transaction: rollback_dir,
+                            bucket_incarnation: opts.delete_recovery_bucket_incarnation,
+                            namespace_owner: namespace_owner.clone(),
+                            prepared_publication: prepared_publication.clone(),
+                        },
+                    )
+                    .await?;
+            } else {
+                write_delete_rollback_file_with_prepared_publication(
+                    self.io_root(),
+                    volume,
+                    &object_dir,
+                    rollback_dir,
+                    DELETE_MARKER_ROLLBACK_FILE,
+                    &[],
+                    namespace_owner.clone(),
+                    prepared_publication.clone(),
+                )
+                .await?;
+            }
         }
-        if let Err(err) = self
-            .write_metadata_with_namespace_owner(volume, path, fi, namespace_owner.clone(), prepared_publication)
+        let committed = if let Some(target) = recovery_target {
+            async {
+                fi.validate_for_metadata_read()?;
+                self.write_all_meta_with_namespace_owner(
+                    volume,
+                    &format!("{path}/{STORAGE_FORMAT_FILE}"),
+                    &target,
+                    true,
+                    namespace_owner.clone(),
+                    prepared_publication,
+                )
+                .await
+            }
             .await
-        {
+        } else {
+            self.write_metadata_with_namespace_owner(volume, path, fi, namespace_owner.clone(), prepared_publication)
+                .await
+        };
+        if let Err(err) = committed {
             let restore = if let Some(rollback_dir) = rollback_dir {
                 if let Some(mut plan) = prepared_rollback {
-                    match plan.refresh_forward(&object_dir, rollback_dir).await {
+                    match plan.refresh_forward(volume, &object_dir, rollback_dir).await {
                         Ok(()) => {
                             restore_delete_rollback_plan(
+                                volume,
                                 &object_dir,
                                 &xl_path,
                                 rollback_dir,
@@ -9942,6 +10950,7 @@ impl LocalDisk {
                     }
                 } else {
                     restore_delete_rollback_with_namespace_owner(
+                        volume,
                         &object_dir,
                         &xl_path,
                         rollback_dir,
@@ -9969,6 +10978,9 @@ impl LocalDisk {
                 );
             }
             return Err(err);
+        }
+        if let Some(transaction) = rollback_dir {
+            self.delete_recovery_barrier(volume, path, transaction, "APPLIED").await?;
         }
         Ok(())
     }
@@ -10029,9 +11041,45 @@ impl LocalDisk {
         errors
     }
 
+    pub(in crate::disk) async fn delete_versions_guarded_with_owner(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Vec<Option<DiskError>> {
+        let mut errors = Vec::with_capacity(versions.len());
+        for version in versions {
+            let result = async {
+                let publication = self.prepare_bulk_delete_group(volume, &version.group.name, owner.clone())?;
+                self.delete_versions_guarded_internal(
+                    volume,
+                    &version.group.name,
+                    &version.group.versions,
+                    &opts,
+                    None,
+                    Some(&version.expected_current),
+                    Some(publication),
+                )
+                .await
+            }
+            .await;
+            errors.push(result.err());
+        }
+        errors
+    }
+
     #[cfg(test)]
-    async fn delete_versions_internal(&self, volume: &str, path: &str, fis: &[FileInfo], opts: &DeleteOptions) -> Result<()> {
-        self.delete_versions_internal_prepared(volume, path, fis, opts, None).await
+    async fn delete_versions_internal(
+        &self,
+        volume: &str,
+        path: &str,
+        fis: &[FileInfo],
+        opts: &DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        self.delete_versions_guarded_internal(volume, path, fis, opts, namespace_owner, None, None)
+            .await
     }
 
     async fn delete_versions_internal_prepared(
@@ -10042,13 +11090,31 @@ impl LocalDisk {
         opts: &DeleteOptions,
         prepared_publication: Option<Arc<os::NamespaceMutationLease>>,
     ) -> Result<()> {
+        self.delete_versions_guarded_internal(volume, path, fis, opts, None, None, prepared_publication)
+            .await
+    }
+
+    async fn delete_versions_guarded_internal(
+        &self,
+        volume: &str,
+        path: &str,
+        fis: &[FileInfo],
+        opts: &DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        expected_current: Option<&CurrentDeleteGeneration>,
+        prepared_publication: Option<Arc<os::NamespaceMutationLease>>,
+    ) -> Result<()> {
         let volume_dir = self.io_get_bucket_path(volume)?;
         let object_path = self.get_object_path(volume, path)?;
-        let namespace_owner: Option<Arc<dyn Send + Sync>> = if let Some(publication) = &prepared_publication {
+        let mut namespace_owner: Option<Arc<dyn Send + Sync>> = if let Some(publication) = &prepared_publication {
             Some(publication.clone())
         } else {
-            Some(os::acquire_metadata_mutation_lease(&object_path, None).await)
+            Some(os::acquire_metadata_mutation_lease(&object_path, namespace_owner).await)
         };
+        if prepared_publication.is_none() && (opts.recoverable_delete || (opts.undo_write && opts.undo_delete)) {
+            let volume_guard = os::disk_volume_mutation_lock(&self.root, volume).read_owned().await;
+            namespace_owner = Some(Arc::new((namespace_owner, volume_guard)));
+        }
         let xlpath = self.io_get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
         let object_dir = xlpath
             .parent()
@@ -10058,7 +11124,14 @@ impl LocalDisk {
             && opts.undo_write
         {
             if opts.undo_delete {
+                if self
+                    .rollback_prepared_delete(volume, path, rollback_dir, namespace_owner.clone(), prepared_publication.clone())
+                    .await?
+                {
+                    return Ok(());
+                }
                 return restore_delete_rollback_with_prepared_publication(
+                    volume,
                     object_dir,
                     &xlpath,
                     rollback_dir,
@@ -10086,8 +11159,11 @@ impl LocalDisk {
         {
             Ok(data) => data,
             Err(DiskError::FileNotFound) => {
+                if expected_current.is_some_and(|expected| *expected != CurrentDeleteGeneration::Absent) {
+                    return Err(DiskError::ConditionalDeleteConflict);
+                }
                 if prepared_publication.is_none() {
-                    self.finish_committed_delete_residue(volume, path, namespace_owner.clone())
+                    self.finish_internal_delete_residue(volume, path, namespace_owner.clone())
                         .await;
                 }
                 // `deleted` alone can be an explicit marker purge; only
@@ -10096,14 +11172,7 @@ impl LocalDisk {
                     return Err(DiskError::FileNotFound);
                 };
                 return self
-                    .write_missing_delete_marker(
-                        volume,
-                        path,
-                        delete_marker,
-                        opts.old_data_dir,
-                        namespace_owner.clone(),
-                        prepared_publication,
-                    )
+                    .write_missing_delete_marker(volume, path, delete_marker, opts, namespace_owner.clone(), prepared_publication)
                     .await;
             }
             Err(err) => return Err(err),
@@ -10116,45 +11185,39 @@ impl LocalDisk {
         let mut fm = FileMeta::default();
 
         fm.unmarshal_msg(&data)?;
-        let rollback_dir = opts.old_data_dir;
-        // Apply the original metadata operations once, in request order. Keep
-        // each outcome so filesystem errors retain precedence over later
-        // metadata errors while all required paths are known before writing.
-        let mut planned = if prepared_publication.is_some() {
-            let mut outcomes = Vec::with_capacity(fis.len());
-            for fi in fis {
-                let outcome = fm.delete_version(fi).map_err(DiskError::from);
-                if let Ok(Some(dir)) = &outcome {
-                    let _ = fm.data.remove(vec![fi.version_id.unwrap_or_default(), *dir]);
-                }
-                let fatal = outcome.as_ref().is_err_and(|error| {
-                    fi.deleted || (*error != DiskError::FileNotFound && *error != DiskError::FileVersionNotFound)
-                });
-                outcomes.push(outcome);
-                if fatal {
-                    break;
-                }
+        if let Some(expected) = expected_current {
+            let actual = match fm.into_fileinfo(volume, path, "", false, false, false) {
+                Ok(fi) => CurrentDeleteGeneration::from_file_info(&fi)?,
+                Err(rustfs_filemeta::Error::FileNotFound) => CurrentDeleteGeneration::Absent,
+                Err(error) => return Err(error.into()),
+            };
+            // Metadata mutation ownership is held from this comparison through
+            // recovery preparation and publication, so a stale request cannot
+            // stage a replacement generation for deletion.
+            if &actual != expected {
+                return Err(DiskError::ConditionalDeleteConflict);
             }
-            Some(outcomes.into_iter())
-        } else {
-            None
-        };
-        let mut data_dirs: Vec<Uuid> = planned
+        }
+        // Compact inline data once, but preserve backup syscall error priority.
+        // The metadata result is propagated only after rollback evidence exists.
+        let metadata_result = fm.delete_versions(fis);
+        let data_dirs: Vec<Uuid> = metadata_result
             .as_ref()
-            .map(|outcomes| {
-                outcomes
-                    .as_slice()
-                    .iter()
-                    .filter_map(|result| result.as_ref().ok().copied().flatten())
-                    .collect()
-            })
+            .map(|dirs| dirs.iter().copied().flatten().collect())
             .unwrap_or_default();
-        data_dirs.sort();
-        data_dirs.dedup();
+        let rollback_dir = opts.old_data_dir;
         let prepared_rollback = if let (Some(rollback), Some(publication)) = (rollback_dir, &prepared_publication) {
             Some(
-                DeleteRollbackPlan::prepare_forward(object_dir, &xlpath, rollback, &data_dirs, false, publication.clone())
-                    .await?,
+                DeleteRollbackPlan::prepare_forward(
+                    volume,
+                    object_dir,
+                    &xlpath,
+                    rollback,
+                    &data_dirs,
+                    false,
+                    publication.clone(),
+                )
+                .await?,
             )
         } else {
             None
@@ -10179,30 +11242,61 @@ impl LocalDisk {
             None
         };
         let mut reserved_version_delete = false;
+        let mut recovery_target = None;
         if let Some(rollback_dir) = rollback_dir {
-            write_delete_rollback_file_with_prepared_publication(
-                object_dir,
-                rollback_dir,
-                STORAGE_FORMAT_FILE_BACKUP,
-                &data,
-                namespace_owner.clone(),
-                prepared_publication.clone(),
-            )
-            .await?;
+            if opts.recoverable_delete {
+                recovery_target = self
+                    .prepare_delete_recovery(
+                        volume,
+                        path,
+                        Some(&data),
+                        fis,
+                        None,
+                        delete_recovery::DeletePreparationContext {
+                            transaction: rollback_dir,
+                            bucket_incarnation: opts.delete_recovery_bucket_incarnation,
+                            namespace_owner: namespace_owner.clone(),
+                            prepared_publication: prepared_publication.clone(),
+                        },
+                    )
+                    .await?;
+            } else {
+                write_delete_rollback_file_with_prepared_publication(
+                    self.io_root(),
+                    volume,
+                    object_dir,
+                    rollback_dir,
+                    STORAGE_FORMAT_FILE_BACKUP,
+                    &data,
+                    namespace_owner.clone(),
+                    prepared_publication.clone(),
+                )
+                .await?;
+            }
         }
 
-        for fi in fis.iter() {
-            let outcome = match &mut planned {
-                Some(outcomes) => outcomes.next().ok_or(DiskError::Unexpected)?,
-                None => fm.delete_version(fi).map_err(DiskError::from),
-            };
-            let data_dir = match outcome {
-                Ok(res) => res,
-                Err(err) => {
-                    if !fi.deleted && (err == DiskError::FileNotFound || err == DiskError::FileVersionNotFound) {
-                        continue;
-                    }
+        if let Err(error) = metadata_result {
+            return Err(restore_delete_rollback_after_error(
+                object_dir,
+                &xlpath,
+                rollback_dir,
+                volume,
+                path,
+                DeleteRollbackFailure {
+                    stage: "delete_versions_metadata_plan",
+                    error: error.into(),
+                    namespace_owner: namespace_owner.clone(),
+                    prepared: prepared_rollback.clone(),
+                },
+                &self.publication_root,
+            )
+            .await);
+        }
 
+        for dir in data_dirs {
+            let dir_path = match self.io_get_object_path(volume, format!("{path}/{dir}").as_str()) {
+                Ok(dir_path) => dir_path,
+                Err(err) => {
                     if reserved_version_delete && let Some(rollback_dir) = rollback_dir {
                         return Err(self
                             .abort_reserved_version_delete_with_failure(
@@ -10211,7 +11305,7 @@ impl LocalDisk {
                                 volume,
                                 path,
                                 DeleteRollbackFailure {
-                                    stage: "delete_versions_metadata_update",
+                                    stage: "delete_versions_data_path",
                                     error: err,
                                     namespace_owner: namespace_owner.clone(),
                                     prepared: prepared_rollback.clone(),
@@ -10226,7 +11320,7 @@ impl LocalDisk {
                         volume,
                         path,
                         DeleteRollbackFailure {
-                            stage: "delete_versions_metadata_update",
+                            stage: "delete_versions_data_path",
                             error: err,
                             namespace_owner: namespace_owner.clone(),
                             prepared: prepared_rollback.clone(),
@@ -10236,205 +11330,158 @@ impl LocalDisk {
                     .await);
                 }
             };
-
-            if let Some(dir) = data_dir {
-                let vid = fi.version_id.unwrap_or_default();
-                if prepared_publication.is_none() {
-                    let _ = fm.data.remove(vec![vid, dir]);
+            if let Some(rollback_dir) = rollback_dir {
+                let rollback_path = object_dir.join(rollback_dir.to_string());
+                let create = if let Some(publication) = &prepared_publication {
+                    os::create_dir_all_with_lease(rollback_path.clone(), publication.clone()).await
+                } else {
+                    fs::create_dir_all(&rollback_path).await
+                };
+                if let Err(err) = create {
+                    let err: DiskError = to_file_error(err).into();
+                    if reserved_version_delete {
+                        return Err(self
+                            .abort_reserved_version_delete_with_failure(
+                                object_dir,
+                                rollback_dir,
+                                volume,
+                                path,
+                                DeleteRollbackFailure {
+                                    stage: "delete_versions_rollback_dir",
+                                    error: err,
+                                    namespace_owner: namespace_owner.clone(),
+                                    prepared: prepared_rollback.clone(),
+                                },
+                            )
+                            .await);
+                    }
+                    return Err(restore_delete_rollback_after_error(
+                        object_dir,
+                        &xlpath,
+                        Some(rollback_dir),
+                        volume,
+                        path,
+                        DeleteRollbackFailure {
+                            stage: "delete_versions_rollback_dir",
+                            error: err,
+                            namespace_owner: namespace_owner.clone(),
+                            prepared: prepared_rollback.clone(),
+                        },
+                        &self.publication_root,
+                    )
+                    .await);
                 }
-
-                let dir_path = match self.io_get_object_path(volume, format!("{path}/{dir}").as_str()) {
-                    Ok(dir_path) => dir_path,
-                    Err(err) => {
-                        if reserved_version_delete && let Some(rollback_dir) = rollback_dir {
-                            return Err(self
-                                .abort_reserved_version_delete_with_failure(
-                                    object_dir,
-                                    rollback_dir,
-                                    volume,
-                                    path,
-                                    DeleteRollbackFailure {
-                                        stage: "delete_versions_data_path",
-                                        error: err,
-                                        namespace_owner: namespace_owner.clone(),
-                                        prepared: prepared_rollback.clone(),
-                                    },
-                                )
-                                .await);
-                        }
-                        return Err(restore_delete_rollback_after_error(
-                            object_dir,
-                            &xlpath,
-                            rollback_dir,
-                            volume,
-                            path,
-                            DeleteRollbackFailure {
-                                stage: "delete_versions_data_path",
-                                error: err,
-                                namespace_owner: namespace_owner.clone(),
-                                prepared: prepared_rollback.clone(),
-                            },
-                            &self.publication_root,
-                        )
-                        .await);
-                    }
-                };
-                if let Some(rollback_dir) = rollback_dir {
-                    let rollback_path = object_dir.join(rollback_dir.to_string());
-                    let create = if let Some(publication) = &prepared_publication {
-                        os::create_dir_all_with_lease(rollback_path.clone(), publication.clone()).await
-                    } else {
-                        fs::create_dir_all(&rollback_path).await
-                    };
-                    if let Err(err) = create {
-                        let err: DiskError = to_file_error(err).into();
-                        if reserved_version_delete {
-                            return Err(self
-                                .abort_reserved_version_delete_with_failure(
-                                    object_dir,
-                                    rollback_dir,
-                                    volume,
-                                    path,
-                                    DeleteRollbackFailure {
-                                        stage: "delete_versions_rollback_dir",
-                                        error: err,
-                                        namespace_owner: namespace_owner.clone(),
-                                        prepared: prepared_rollback.clone(),
-                                    },
-                                )
-                                .await);
-                        }
-                        return Err(restore_delete_rollback_after_error(
-                            object_dir,
-                            &xlpath,
-                            Some(rollback_dir),
-                            volume,
-                            path,
-                            DeleteRollbackFailure {
-                                stage: "delete_versions_rollback_dir",
-                                error: err,
-                                namespace_owner: namespace_owner.clone(),
-                                prepared: prepared_rollback.clone(),
-                            },
-                            &self.publication_root,
-                        )
-                        .await);
-                    }
-                    let reserved = match self
-                        .reserve_version_delete_with_prepared_publication(
-                            volume,
-                            path,
-                            dir,
-                            rollback_dir,
-                            namespace_owner.clone(),
-                            prepared_publication.clone(),
-                        )
-                        .await
-                    {
-                        Ok(reserved) => reserved,
-                        Err(err) => {
-                            return Err(self
-                                .abort_reserved_version_delete_with_failure(
-                                    object_dir,
-                                    rollback_dir,
-                                    volume,
-                                    path,
-                                    DeleteRollbackFailure {
-                                        stage: "delete_versions_reserve_data",
-                                        error: err,
-                                        namespace_owner: namespace_owner.clone(),
-                                        prepared: prepared_rollback.clone(),
-                                    },
-                                )
-                                .await);
-                        }
-                    };
-                    reserved_version_delete |= reserved;
-                    let rollback_data_path = rollback_path.join(dir.to_string());
-                    let stage = if reserved {
-                        Ok(())
-                    } else if let Some(publication) = &prepared_publication {
-                        os::rename_all_ignore_missing_source_with_lease(
-                            &dir_path,
-                            &rollback_data_path,
-                            &rollback_path,
-                            &self.publication_root,
-                            publication.clone(),
-                        )
-                        .await
-                    } else {
-                        os::rename_all_ignore_missing_source_with_owner(
-                            &dir_path,
-                            &rollback_data_path,
-                            &rollback_path,
-                            &self.publication_root,
-                            namespace_owner.clone(),
-                        )
-                        .await
-                    };
-                    if let Err(err) = stage {
-                        return Err(restore_delete_rollback_after_error(
-                            object_dir,
-                            &xlpath,
-                            Some(rollback_dir),
-                            volume,
-                            path,
-                            DeleteRollbackFailure {
-                                stage: "delete_versions_stage_data",
-                                error: err,
-                                namespace_owner: namespace_owner.clone(),
-                                prepared: prepared_rollback.clone(),
-                            },
-                            &self.publication_root,
-                        )
-                        .await);
-                    }
-                    if should_fail_after_delete_data_staged(path) {
-                        if reserved_version_delete {
-                            return Err(self
-                                .abort_reserved_version_delete_with_failure(
-                                    object_dir,
-                                    rollback_dir,
-                                    volume,
-                                    path,
-                                    DeleteRollbackFailure {
-                                        stage: "delete_versions_test_after_stage",
-                                        error: DiskError::Unexpected,
-                                        namespace_owner: namespace_owner.clone(),
-                                        prepared: prepared_rollback.clone(),
-                                    },
-                                )
-                                .await);
-                        }
-                        return Err(restore_delete_rollback_after_error(
-                            object_dir,
-                            &xlpath,
-                            Some(rollback_dir),
-                            volume,
-                            path,
-                            DeleteRollbackFailure {
-                                stage: "delete_versions_test_after_stage",
-                                error: DiskError::Unexpected,
-                                namespace_owner: namespace_owner.clone(),
-                                prepared: prepared_rollback.clone(),
-                            },
-                            &self.publication_root,
-                        )
-                        .await);
-                    }
-                } else if let Err(err) = self
-                    .move_to_trash_with_prepared_target(&dir_path, true, false, namespace_owner.clone(), data_trash.remove(&dir))
+                let reserved = match self
+                    .reserve_version_delete_with_prepared_publication(
+                        volume,
+                        path,
+                        dir,
+                        rollback_dir,
+                        namespace_owner.clone(),
+                        prepared_publication.clone(),
+                    )
                     .await
-                    && !(err == DiskError::FileNotFound || err == DiskError::VolumeNotFound)
                 {
-                    return Err(err);
+                    Ok(reserved) => reserved,
+                    Err(err) => {
+                        return Err(self
+                            .abort_reserved_version_delete_with_failure(
+                                object_dir,
+                                rollback_dir,
+                                volume,
+                                path,
+                                DeleteRollbackFailure {
+                                    stage: "delete_versions_reserve_data",
+                                    error: err,
+                                    namespace_owner: namespace_owner.clone(),
+                                    prepared: prepared_rollback.clone(),
+                                },
+                            )
+                            .await);
+                    }
                 };
-
-                // The version's data dir was staged or trashed; drop any cached
-                // io_uring descriptors under it so a deleted `part.N` cannot keep
-                // answering reads (rustfs/backlog#1175).
-                self.io_backend.invalidate_cached_fds_under(volume, &format!("{path}/{dir}"));
+                reserved_version_delete |= reserved;
+                let rollback_data_path = rollback_path.join(dir.to_string());
+                let stage = if reserved {
+                    Ok(())
+                } else if let Some(publication) = &prepared_publication {
+                    os::rename_all_ignore_missing_source_with_lease(
+                        &dir_path,
+                        &rollback_data_path,
+                        &rollback_path,
+                        &self.publication_root,
+                        publication.clone(),
+                    )
+                    .await
+                } else {
+                    os::rename_all_ignore_missing_source_with_owner(
+                        &dir_path,
+                        &rollback_data_path,
+                        &rollback_path,
+                        &self.publication_root,
+                        namespace_owner.clone(),
+                    )
+                    .await
+                };
+                if let Err(err) = stage {
+                    return Err(restore_delete_rollback_after_error(
+                        object_dir,
+                        &xlpath,
+                        Some(rollback_dir),
+                        volume,
+                        path,
+                        DeleteRollbackFailure {
+                            stage: "delete_versions_stage_data",
+                            error: err,
+                            namespace_owner: namespace_owner.clone(),
+                            prepared: prepared_rollback.clone(),
+                        },
+                        &self.publication_root,
+                    )
+                    .await);
+                }
+                if should_fail_after_delete_data_staged(path) {
+                    if reserved_version_delete {
+                        return Err(self
+                            .abort_reserved_version_delete_with_failure(
+                                object_dir,
+                                rollback_dir,
+                                volume,
+                                path,
+                                DeleteRollbackFailure {
+                                    stage: "delete_versions_test_after_stage",
+                                    error: DiskError::Unexpected,
+                                    namespace_owner: namespace_owner.clone(),
+                                    prepared: prepared_rollback.clone(),
+                                },
+                            )
+                            .await);
+                    }
+                    return Err(restore_delete_rollback_after_error(
+                        object_dir,
+                        &xlpath,
+                        Some(rollback_dir),
+                        volume,
+                        path,
+                        DeleteRollbackFailure {
+                            stage: "delete_versions_test_after_stage",
+                            error: DiskError::Unexpected,
+                            namespace_owner: namespace_owner.clone(),
+                            prepared: prepared_rollback.clone(),
+                        },
+                        &self.publication_root,
+                    )
+                    .await);
+                }
+            } else if let Err(err) = self
+                .move_to_trash_with_prepared_target(&dir_path, true, false, namespace_owner.clone(), data_trash.remove(&dir))
+                .await
+                && !(err == DiskError::FileNotFound || err == DiskError::VolumeNotFound)
+            {
+                return Err(err);
             }
+            // Removed shard descriptors must not remain readable through the cache.
+            self.io_backend.invalidate_cached_fds_under(volume, &format!("{path}/{dir}"));
         }
 
         // Remove xl.meta when no versions remain
@@ -10483,6 +11530,9 @@ impl LocalDisk {
                 )
                 .await);
             }
+            if let Some(transaction) = rollback_dir {
+                self.delete_recovery_barrier(volume, path, transaction, "APPLIED").await?;
+            }
             if reserved_version_delete
                 && let Some(rollback_dir) = rollback_dir
                 && let Err(err) = self
@@ -10518,7 +11568,7 @@ impl LocalDisk {
 
         // Update xl.meta atomically: a concurrent reader or crash mid-write must
         // never observe a truncated xl.meta for versions that were not deleted.
-        let buf = match fm.marshal_msg() {
+        let buf = match recovery_target.map(Ok).unwrap_or_else(|| fm.marshal_msg()) {
             Ok(buf) => buf,
             Err(err) => {
                 let err: DiskError = err.into();
@@ -10598,6 +11648,10 @@ impl LocalDisk {
                 &self.publication_root,
             )
             .await);
+        }
+
+        if let Some(transaction) = rollback_dir {
+            self.delete_recovery_barrier(volume, path, transaction, "APPLIED").await?;
         }
 
         if reserved_version_delete
@@ -10938,17 +11992,17 @@ impl LocalDisk {
                     }
                 }
 
+                let root = self.publication_root.clone();
                 tokio::task::spawn_blocking(move || {
                     let _owner = owner;
                     #[cfg(test)]
                     run_owned_file_write_before_open(&path);
 
-                    let mut file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(true)
-                        .open(&path)
-                        .map_err(to_file_error)?;
+                    let (mut file, parent_handle) = if sync == SyncMode::FileAndDir {
+                        root.create_truncate_with_parent(&path).map_err(to_file_error)?
+                    } else {
+                        (root.create_truncate(&path).map_err(to_file_error)?, None)
+                    };
                     std::io::Write::write_all(&mut file, buf.as_ref()).map_err(to_file_error)?;
                     if sync != SyncMode::None {
                         file.sync_data().map_err(to_file_error)?;
@@ -10957,7 +12011,7 @@ impl LocalDisk {
                         if sync == SyncMode::FileAndDir
                             && let Some(parent) = path.parent()
                         {
-                            os::fsync_dir_std(parent).map_err(to_file_error)?;
+                            os::fsync_directory_handle_std(parent, parent_handle.as_ref()).map_err(to_file_error)?;
                         }
                     }
                     Ok::<_, std::io::Error>(())
@@ -10982,7 +12036,18 @@ impl LocalDisk {
             os::make_dir_all(parent, skip_parent).await?;
         }
 
-        let f = super::fs::open_file(path.as_ref(), mode).await.map_err(to_file_error)?;
+        let f = if mode == O_CREATE | O_WRONLY | O_TRUNC {
+            let path = path.as_ref().to_path_buf();
+            let root = self.publication_root.clone();
+            File::from_std(
+                tokio::task::spawn_blocking(move || root.create_truncate(&path))
+                    .await
+                    .map_err(DiskError::from)?
+                    .map_err(to_file_error)?,
+            )
+        } else {
+            super::fs::open_file(path.as_ref(), mode).await.map_err(to_file_error)?
+        };
 
         Ok(f)
     }
@@ -11860,9 +12925,9 @@ fn file_meta_counts_toward_limit(meta: &FileMeta) -> bool {
 }
 
 // Filter std::io::ErrorKind::NotFound
-async fn read_file_exists(path: impl AsRef<Path>) -> Result<(Bytes, Option<Metadata>)> {
+async fn read_file_exists(path: impl AsRef<Path>, root: &os::PublicationRoot) -> Result<(Bytes, Option<Metadata>)> {
     let p = path.as_ref();
-    let (data, meta) = match read_file_all(&p).await {
+    let (data, meta) = match read_file_all(&p, root).await {
         Ok((data, meta)) => (data, Some(meta)),
         Err(e) => {
             if e == Error::FileNotFound {
@@ -11881,32 +12946,28 @@ async fn read_file_exists(path: impl AsRef<Path>) -> Result<(Bytes, Option<Metad
     Ok((data, meta))
 }
 
-async fn read_file_all(path: impl AsRef<Path>) -> Result<(Bytes, Metadata)> {
-    let p = path.as_ref();
-    let meta = read_file_metadata(&path).await?;
-
-    let data = fs::read(&p)
-        .await
-        .inspect_err(|err| {
-            log_startup_disk_io_error("read_file_all", p, err);
-        })
-        .map_err(to_file_error)?;
-
-    Ok((data.into(), meta))
-}
-
-async fn read_file_metadata(p: impl AsRef<Path>) -> Result<Metadata> {
-    let path = p.as_ref();
-    let meta = fs::metadata(path)
-        .await
-        .inspect_err(|err| {
-            if err.kind() != ErrorKind::NotFound {
-                log_startup_disk_io_error("read_file_metadata", path, err);
-            }
-        })
-        .map_err(to_file_error)?;
-
-    Ok(meta)
+async fn read_file_all(path: impl AsRef<Path>, root: &os::PublicationRoot) -> Result<(Bytes, Metadata)> {
+    let path = path.as_ref().to_path_buf();
+    let root = root.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = (|| {
+            let mut file = root.open_readonly(&path)?;
+            let metadata = file.metadata()?;
+            let mut data = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut data)?;
+            Ok::<_, std::io::Error>((Bytes::from(data), metadata))
+        })();
+        result
+            .inspect_err(|err| {
+                if err.kind() != ErrorKind::NotFound {
+                    log_startup_disk_io_error("read_file_all", &path, err);
+                }
+            })
+            .map_err(to_file_error)
+            .map_err(DiskError::from)
+    })
+    .await
+    .map_err(DiskError::from)?
 }
 
 fn skip_access_checks(p: impl AsRef<str>) -> bool {
@@ -11924,6 +12985,23 @@ fn skip_access_checks(p: impl AsRef<str>) -> bool {
     }
 
     false
+}
+
+struct StagingCleanupLease {
+    io_prefix: PathBuf,
+    lease: Arc<os::NamespaceMutationLease>,
+}
+
+// Use the configured root rather than per-handle /proc fd paths. A nested
+// publication and cleanup of its top-level TMP entry must share one lease.
+fn tmp_staging_mutation_path(root: &Path, key: &str) -> Result<PathBuf> {
+    let (temporary, object) = build_local_disk_object_path(root, RUSTFS_META_TMP_BUCKET, key);
+    let object = normalize_path_components(object);
+    let relative = object.strip_prefix(&temporary).map_err(|_| DiskError::InvalidPath)?;
+    Ok(relative
+        .components()
+        .next()
+        .map_or_else(|| temporary.clone(), |first| temporary.join(first.as_os_str())))
 }
 
 fn local_disk_object_path(root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
@@ -11988,13 +13066,19 @@ fn check_local_disk_valid_path(root: &Path, path: impl AsRef<Path>) -> Result<()
 
 #[cfg(target_os = "linux")]
 fn check_local_disk_valid_object_path_at(root: &Path, root_fd: &std::fs::File, bucket_path: &Path, path: &Path) -> Result<()> {
+    check_local_disk_object_path_components(root, bucket_path, path)?;
+    reject_local_disk_symlink_components_at(root, root_fd, &normalize_path_components(path))
+}
+
+#[cfg(target_os = "linux")]
+fn check_local_disk_object_path_components(root: &Path, bucket_path: &Path, path: &Path) -> Result<()> {
     let bucket_path = normalize_path_components(bucket_path);
     let path = normalize_path_components(path);
     if !bucket_path.starts_with(root) || !path.starts_with(&bucket_path) {
         return Err(DiskError::InvalidPath);
     }
 
-    reject_local_disk_symlink_components_at(root, root_fd, &path)
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -12244,11 +13328,48 @@ impl LocalDisk {
             marker_paths = version_delete_marker_paths(&self.io_get_object_path(volume, object)?, rollback_dir).await?;
             &marker_paths
         };
-        for pair in paths.chunks_exact(2) {
-            let reserved_path = &pair[0];
-            let committed_path = &pair[1];
+        self.commit_reserved_version_delete_marker_paths(
+            volume,
+            object,
+            rollback_dir,
+            namespace_owner,
+            paths,
+            prepared.and_then(|plan| plan.publication.clone()),
+        )
+        .await
+    }
+
+    async fn commit_reserved_version_delete_with_publication(
+        &self,
+        volume: &str,
+        object: &str,
+        rollback_dir: Uuid,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        publication: Option<Arc<os::NamespaceMutationLease>>,
+    ) -> Result<()> {
+        let paths = version_delete_marker_paths(&self.io_get_object_path(volume, object)?, rollback_dir).await?;
+        self.commit_reserved_version_delete_marker_paths(volume, object, rollback_dir, namespace_owner, &paths, publication)
+            .await
+    }
+
+    async fn commit_reserved_version_delete_marker_paths(
+        &self,
+        volume: &str,
+        object: &str,
+        rollback_dir: Uuid,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        paths: &[PathBuf],
+        publication: Option<Arc<os::NamespaceMutationLease>>,
+    ) -> Result<()> {
+        let recovery_owned =
+            fs::try_exists(self.io_get_object_path(volume, &format!("{object}/{rollback_dir}/{}", delete_recovery::PREPARED))?)
+                .await
+                .map_err(to_file_error)?;
+        for paths in paths.chunks_exact(3) {
+            let reserved_path = &paths[0];
+            let committed_path = &paths[if recovery_owned { 2 } else { 1 }];
             let data_path = reserved_path.parent().ok_or(DiskError::InvalidPath)?;
-            let rename = if let Some(publication) = prepared.and_then(|plan| plan.publication.clone()) {
+            let rename = if let Some(publication) = publication.clone() {
                 os::rename_with_lease(reserved_path.clone(), committed_path.clone(), publication).await
             } else {
                 os::rename_with_namespace_owner(reserved_path, committed_path, namespace_owner.clone()).await
@@ -12278,14 +13399,21 @@ impl LocalDisk {
     /// removed the object's metadata on this disk and committed, so the data
     /// it marked can no longer be read, healed or rolled back here. Finishing
     /// removes what `T`'s own cleanup pass would have removed. Reserved
-    /// markers, rollback backups without a committed marker, and object
+    /// transaction receipts also prove quorum commitment for inline objects.
+    /// Reserved markers, rollback backups without either proof, and object
     /// directories that hold `xl.meta` are left alone.
-    async fn finish_committed_delete_residue(
+    async fn finish_internal_delete_residue(
         &self,
         volume: &str,
         path: &str,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> usize {
+        // RUSTFS_COMPAT_TODO(backlog#2807): retain legacy cleanup for internal
+        // maintenance until old system-bucket records drain. User-bucket
+        // residue requires the explicit set-wide recovery decision.
+        if !crate::bucket::utils::is_meta_bucketname(volume) {
+            return 0;
+        }
         let transactions = match self.committed_delete_transactions(volume, path).await {
             Ok(transactions) => transactions,
             Err(err) => {
@@ -12295,7 +13423,7 @@ impl LocalDisk {
                     subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
                     volume,
                     path,
-                    operation = "scan_committed_delete_residue",
+                    operation = "scan_internal_delete_residue",
                     error = ?err,
                     "Disk local delete failed"
                 );
@@ -12309,17 +13437,50 @@ impl LocalDisk {
         };
         let mut finished = 0;
         for transaction in transactions {
-            // Unlike the delete's own pass, drop the rollback backup before the
-            // marked data: if this is cut short, the marker that proves the
-            // transaction is still in place for the next attempt.
-            let result = match self
-                .delete_unleased_with_namespace_owner(volume, &format!("{path}/{transaction}"), &opts, namespace_owner.clone())
-                .await
-            {
-                Ok(()) | Err(DiskError::FileNotFound) => self
-                    .finish_version_delete(volume, path, transaction, namespace_owner.clone())
-                    .await
-                    .map(|_| ()),
+            let transaction_path = format!("{path}/{transaction}");
+            let receipt = self
+                .io_get_object_path(volume, &transaction_path)
+                .map(|transaction_path| transaction_path.join(DELETE_QUORUM_COMMITTED_FILE));
+            let result = match receipt {
+                Ok(receipt) => match fs::symlink_metadata(receipt).await {
+                    Ok(metadata) if metadata.is_file() => {
+                        match self
+                            .finish_delete_transaction_with_namespace_owner(volume, path, transaction, namespace_owner.clone())
+                            .await
+                        {
+                            Ok(_) => {
+                                self.delete_unleased_with_namespace_owner(
+                                    volume,
+                                    &transaction_path,
+                                    &DeleteOptions {
+                                        recursive: false,
+                                        ..opts.clone()
+                                    },
+                                    namespace_owner.clone(),
+                                    None,
+                                )
+                                .await
+                            }
+                            Err(err) => Err(err),
+                        }
+                    }
+                    Ok(_) => Err(DiskError::FileCorrupt),
+                    Err(err) if err.kind() == ErrorKind::NotFound => {
+                        // Preserve the legacy marker-only cleanup policy without
+                        // upgrading disk-local evidence into a quorum receipt.
+                        match self
+                            .delete_unleased_with_namespace_owner(volume, &transaction_path, &opts, namespace_owner.clone(), None)
+                            .await
+                        {
+                            Ok(()) | Err(DiskError::FileNotFound) => self
+                                .finish_version_delete(volume, path, transaction, false, namespace_owner.clone())
+                                .await
+                                .map(|_| ()),
+                            Err(err) => Err(err),
+                        }
+                    }
+                    Err(err) => Err(to_file_error(err).into()),
+                },
                 Err(err) => Err(err),
             };
             match result {
@@ -12331,7 +13492,7 @@ impl LocalDisk {
                     volume,
                     path,
                     transaction = %transaction,
-                    operation = "finish_committed_delete_residue",
+                    operation = "finish_internal_delete_residue",
                     error = ?err,
                     "Disk local delete failed"
                 ),
@@ -12393,7 +13554,22 @@ impl LocalDisk {
                 Err(err) if err.kind() == ErrorKind::NotFound => continue,
                 Err(err) => return Err(to_file_error(err).into()),
             };
+            let mut has_quorum_receipt = false;
+            let mut safe_receipt_dir = true;
             while let Some(entry) = entries.next_entry().await.map_err(to_file_error)? {
+                let name = entry.file_name();
+                let file_type = entry.file_type().await.map_err(to_file_error)?;
+                if !file_type.is_file()
+                    || (name != STORAGE_FORMAT_FILE_BACKUP
+                        && name != DELETE_MARKER_ROLLBACK_FILE
+                        && name != DELETE_QUORUM_COMMITTED_FILE)
+                {
+                    safe_receipt_dir = false;
+                }
+                if entry.file_name() == DELETE_QUORUM_COMMITTED_FILE {
+                    has_quorum_receipt = file_type.is_file();
+                    continue;
+                }
                 let Some(transaction) = entry
                     .file_name()
                     .to_str()
@@ -12410,8 +13586,31 @@ impl LocalDisk {
                     Err(err) => return Err(to_file_error(err).into()),
                 }
             }
+            if has_quorum_receipt
+                && safe_receipt_dir
+                && let Some(transaction) = data_dir
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| Uuid::parse_str(name).ok())
+            {
+                transactions.insert(transaction);
+            }
         }
-        Ok(transactions)
+        let mut legacy = BTreeSet::new();
+        for transaction in transactions {
+            let rollback = object_path.join(transaction.to_string());
+            let mut recovery_owned = false;
+            for name in [delete_recovery::PREPARED, delete_recovery::TARGET, delete_recovery::FINISHED] {
+                recovery_owned |= fs::try_exists(rollback.join(name)).await.map_err(to_file_error)?;
+            }
+            if let Ok(metadata) = fs::symlink_metadata(rollback.join(DELETE_QUORUM_COMMITTED_FILE)).await {
+                recovery_owned |= metadata.len() > 0;
+            }
+            if !recovery_owned {
+                legacy.insert(transaction);
+            }
+        }
+        Ok(legacy)
     }
 
     async fn finish_version_delete(
@@ -12419,17 +13618,50 @@ impl LocalDisk {
         volume: &str,
         object: &str,
         rollback_dir: Uuid,
+        preserve_prefix_children: bool,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
-    ) -> Result<bool> {
+    ) -> Result<(bool, bool)> {
+        self.finish_version_delete_with_prepared_publication(
+            volume,
+            object,
+            rollback_dir,
+            preserve_prefix_children,
+            namespace_owner,
+            None,
+        )
+        .await
+    }
+
+    async fn finish_version_delete_with_prepared_publication(
+        &self,
+        volume: &str,
+        object: &str,
+        rollback_dir: Uuid,
+        preserve_prefix_children: bool,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        publication: Option<Arc<os::NamespaceMutationLease>>,
+    ) -> Result<(bool, bool)> {
         let object_path = self.io_get_object_path(volume, object)?;
         let mut entries = match fs::read_dir(object_path).await {
             Ok(entries) => entries,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok((false, true)),
             Err(err) => return Err(to_file_error(err).into()),
         };
-        let marker_name = format!("{DELETE_DATA_DIR_MARKER_PREFIX}{rollback_dir}");
+        let recovery_owned = preserve_prefix_children
+            && fs::try_exists(
+                self.io_get_object_path(volume, &format!("{object}/{rollback_dir}/{}", delete_recovery::PREPARED))?,
+            )
+            .await
+            .map_err(to_file_error)?;
+        let prefix = if recovery_owned {
+            RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX
+        } else {
+            DELETE_DATA_DIR_MARKER_PREFIX
+        };
+        let marker_name = format!("{prefix}{rollback_dir}");
         let mut first_err = None;
         let mut found = false;
+        let mut deferred = false;
         while let Some(entry) = entries.next_entry().await.map_err(to_file_error)? {
             let Some(data_dir) = entry.file_name().to_str().and_then(|data_dir| Uuid::parse_str(data_dir).ok()) else {
                 continue;
@@ -12440,25 +13672,39 @@ impl LocalDisk {
                 Err(err) if err.kind() == ErrorKind::NotFound => continue,
                 Err(err) => return Err(to_file_error(err).into()),
             }
-            if let Err(err) = self
-                .delete_data_dir_with_namespace_owner(
+            let prepared = match publication.as_ref() {
+                Some(publication) => Some(PreparedPathDelete {
+                    lease: os::try_acquire_namespace_mutation_lease_with_owner(
+                        &self.io_get_object_path(volume, &format!("{object}/{data_dir}"))?,
+                        publication.clone(),
+                    )?,
+                    trash: None,
+                    encoded_trash: None,
+                }),
+                None => None,
+            };
+            match self
+                .delete_data_dir_with_prepared_entry(
                     volume,
                     &format!("{object}/{data_dir}"),
                     DeleteOptions {
                         recursive: true,
+                        old_data_dir: preserve_prefix_children.then_some(rollback_dir),
                         ..Default::default()
                     },
                     namespace_owner.clone(),
+                    prepared,
                 )
                 .await
-                && first_err.is_none()
-                && err != DiskError::FileNotFound
-                && err != DiskError::VolumeNotFound
             {
-                first_err = Some(err);
+                Ok(DataDirDeleteStatus::Deferred) => deferred = true,
+                Ok(DataDirDeleteStatus::Deleted) => {}
+                Err(err) if err == DiskError::FileNotFound || err == DiskError::VolumeNotFound => {}
+                Err(err) if first_err.is_none() => first_err = Some(err),
+                Err(_) => {}
             }
         }
-        first_err.map_or(Ok(found), Err)
+        first_err.map_or(Ok((found, !deferred)), Err)
     }
 
     async fn abort_reserved_version_delete_with_failure(
@@ -12517,7 +13763,7 @@ impl LocalDisk {
                 self.delete_path_prepared(&claim.key.volume, &claim.key.path, opts, owner.clone())
                     .await
             } else {
-                self.delete_unleased_with_namespace_owner(&claim.key.volume, &claim.key.path, &opts, None)
+                self.delete_unleased_with_namespace_owner(&claim.key.volume, &claim.key.path, &opts, None, None)
                     .await
             };
             if let Err(err) = &result {
@@ -12579,6 +13825,79 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
 
 #[async_trait::async_trait]
 impl DiskAPI for LocalDisk {
+    async fn supports_guarded_delete_versions(&self) -> Result<()> {
+        Ok(())
+    }
+    async fn delete_versions_guarded_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        self.delete_versions_guarded_with_namespace_owner(volume, versions, opts, None)
+            .await
+    }
+    async fn delete_version_recoverable(
+        &self,
+        volume: &str,
+        object: &str,
+        file_info: FileInfo,
+        force_del_marker: bool,
+        mut opts: DeleteOptions,
+    ) -> Result<()> {
+        super::validate_delete_recovery_options(&opts)?;
+        if object.starts_with('/') {
+            return Err(DiskError::InvalidPath);
+        }
+        opts.recoverable_delete = true;
+        self.delete_version(volume, object, file_info, force_del_marker, opts).await
+    }
+    async fn delete_versions_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        mut opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        if let Err(err) = super::validate_delete_recovery_options(&opts) {
+            return vec![Some(err); versions.len()];
+        }
+        if versions.iter().any(|version| version.name.starts_with('/')) {
+            return vec![Some(DiskError::InvalidPath); versions.len()];
+        }
+        opts.recoverable_delete = true;
+        self.delete_versions(volume, versions, opts).await
+    }
+    async fn has_delete_transaction_evidence(&self, volume: &str, object: &str) -> Result<bool> {
+        self.delete_recovery_has_evidence(volume, object).await
+    }
+    async fn discover_delete_transactions(
+        &self,
+        volume: &str,
+        object: Option<&str>,
+        cursor: Option<super::DeleteRecoveryCursor>,
+        limit: u32,
+    ) -> Result<super::DeleteRecoveryPage> {
+        self.delete_recovery_discover(volume, object, cursor, limit).await
+    }
+    async fn inspect_delete_transaction(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+    ) -> Result<super::DeleteRecoveryInspection> {
+        self.delete_recovery_inspect(volume, object, transaction).await
+    }
+    async fn settle_delete_transaction(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+        expected_fingerprint: super::DeleteRecoveryDigest,
+        action: super::DeleteRecoveryAction,
+    ) -> Result<super::DeleteRecoveryInspection> {
+        self.delete_recovery_settle(volume, object, transaction, expected_fingerprint, action, None)
+            .await
+    }
     fn to_string(&self) -> String {
         self.root.to_string_lossy().to_string()
     }
@@ -12729,9 +14048,9 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        let p = self.io_get_object_path(volume, path)?;
+        let p = self.io_get_object_open_path(volume, path)?;
 
-        let (data, _) = read_file_all(&p).await?;
+        let (data, _) = read_file_all(&p, &self.publication_root).await?;
 
         Ok(data)
     }
@@ -13103,6 +14422,8 @@ impl DiskAPI for LocalDisk {
     // TODO(backlog): support io.writer cancellation and early termination in walk_dir
     #[tracing::instrument(level = "trace", skip_all)]
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
+        #[cfg(test)]
+        super::lifecycle_test_io::observe(&opts.bucket, None);
         self.wait_for_startup_cleanup().await;
 
         // Callers that do not pin a stall budget inherit the configured default, so
@@ -13452,8 +14773,17 @@ impl DiskAPI for LocalDisk {
             entry.deleting = true;
             opts
         };
+        // Release the reader token even under saturation. A rejected reclaim
+        // retains pending_delete (and its on-disk receipt) for a later retry.
+        // Do not wait for execution while a releasing reader may own locks.
         let claim = SnapshotLeaseDeleteClaim::new(&self.snapshot_leases, key);
-        let result = self.delete_path_prepared(volume, path, opts, owner.clone()).await;
+        let result = match super::cleanup_runtime::try_disk_execution() {
+            Ok(permit) => {
+                let _permit = permit;
+                self.delete_path_prepared(volume, path, opts, owner.clone()).await
+            }
+            Err(err) => Err(err.into()),
+        };
         claim.finish(result.is_ok());
         result
     }
@@ -13656,6 +14986,8 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
+        #[cfg(test)]
+        super::lifecycle_test_io::observe(volume, Some(path));
         crate::hp_guard!("LocalDisk::read_xl");
         let file_path = self.io_get_object_path(volume, path)?;
         let file_dir = self.io_get_bucket_path(volume)?;
@@ -13707,7 +15039,7 @@ impl DiskAPI for LocalDisk {
             };
 
             // if req.metadata_only {}
-            match read_file_all(&fpath).await {
+            match read_file_all(&fpath, &self.publication_root).await {
                 Ok((data, meta)) => {
                     found += 1;
 
@@ -13940,13 +15272,28 @@ async fn wait_for_startup_cleanup_signal(
 }
 
 #[tracing::instrument(level = "trace", skip_all)]
+/// The disk root stays non-verbatim for `/`-joined IO, but the Win32 volume
+/// APIs behind `rustfs_utils::os` only accept a path past the legacy limit in
+/// extended-length form. Shorter roots are passed unchanged so the volume
+/// identities those APIs report keep their conventional `C:\` form.
+fn win32_volume_path(path: &Path) -> std::io::Result<std::borrow::Cow<'_, Path>> {
+    // CreateDirectoryW's 248-unit limit, the lowest of the legacy path limits.
+    const LEGACY_MAX_PATH: usize = 248;
+    if path.to_string_lossy().encode_utf16().count() < LEGACY_MAX_PATH {
+        return Ok(std::borrow::Cow::Borrowed(path));
+    }
+    rustfs_utils::extended_length_path(path)
+}
+
 async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInfo, bool)> {
     let drive_path = drive_path.to_string_lossy().to_string();
     check_path_length(&drive_path)?;
 
-    let disk_info = get_info(&drive_path).inspect_err(|err| {
-        log_startup_disk_io_error("get_disk_info_stat", Path::new(&drive_path), err);
-    })?;
+    let disk_info = win32_volume_path(Path::new(&drive_path))
+        .and_then(|volume_path| get_info(&volume_path))
+        .inspect_err(|err| {
+            log_startup_disk_io_error("get_disk_info_stat", Path::new(&drive_path), err);
+        })?;
     let root_drive = if let Some(root_disk_threshold) = runtime_sources::root_disk_threshold_for_erasure_disk().await {
         if root_disk_threshold > 0 {
             disk_info.total <= root_disk_threshold
@@ -14053,7 +15400,7 @@ mod test {
         }
     }
 
-    fn test_file_info(name: &str, version_id: Uuid, data_dir: Option<Uuid>, data: Option<Bytes>) -> FileInfo {
+    pub(super) fn test_file_info(name: &str, version_id: Uuid, data_dir: Option<Uuid>, data: Option<Bytes>) -> FileInfo {
         let size = data
             .as_ref()
             .map(|data| i64::try_from(data.len()).expect("test data length should fit i64"))
@@ -14115,7 +15462,367 @@ mod test {
         assert!(!should_read_legacy_inline_part(&ec12, &config));
     }
 
-    fn test_meta(fi: FileInfo) -> Vec<u8> {
+    fn guarded_delete_group(fi: FileInfo, expected_current: CurrentDeleteGeneration) -> GuardedFileInfoVersions {
+        GuardedFileInfoVersions {
+            group: FileInfoVersions {
+                name: fi.name.clone(),
+                versions: vec![fi],
+                ..Default::default()
+            },
+            expected_current,
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_delete_queued_before_replacement_rejects_stale_generation() {
+        let dir = tempfile::tempdir().expect("create disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        ensure_test_volume(&disk, "bucket").await;
+        let object = "guarded-object";
+        let object_dir = dir.path().join("bucket").join(object);
+        fs::create_dir_all(&object_dir).await.expect("create object directory");
+        let mut original = test_file_info(object, Uuid::nil(), Some(Uuid::new_v4()), Some(Bytes::from_static(b"original")));
+        original.metadata.insert("etag".into(), "etag-a".into());
+        let expected = CurrentDeleteGeneration::from_file_info(&original).expect("capture original generation");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), test_meta(original.clone()))
+            .await
+            .expect("write original metadata");
+        let transaction = Uuid::new_v4();
+        let owner =
+            os::acquire_metadata_mutation_lease(&disk.get_object_path("bucket", object).expect("object path"), None).await;
+        let mut deletion = Box::pin(disk.delete_versions_guarded_recoverable(
+            "bucket",
+            vec![guarded_delete_group(original.clone(), expected)],
+            DeleteOptions {
+                old_data_dir: Some(transaction),
+                ..Default::default()
+            },
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), deletion.as_mut())
+                .await
+                .is_err(),
+            "guarded delete waits for metadata ownership"
+        );
+        let mut replacement = original;
+        replacement.data_dir = Some(Uuid::new_v4());
+        replacement.mod_time = replacement.mod_time.map(|time| time + time::Duration::seconds(1));
+        replacement.metadata.insert("etag".into(), "etag-b".into());
+        let newer = test_meta(replacement);
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), &newer)
+            .await
+            .expect("writer commits replacement while owning metadata");
+        drop(owner);
+        assert_eq!(deletion.await, vec![Some(DiskError::ConditionalDeleteConflict)]);
+        assert_eq!(
+            fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("replacement metadata remains"),
+            newer
+        );
+        assert!(
+            !object_dir.join(transaction.to_string()).exists(),
+            "rejected generation creates no recovery record"
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_delete_remote_only_matching_generation_accepts_missing_and_nil_data_directory() {
+        let dir = tempfile::tempdir().expect("create disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        ensure_test_volume(&disk, "bucket").await;
+        for (case, data_dir, remote_version, remote_version_id) in [
+            ("absent", None, None, None),
+            ("empty", Some(Uuid::nil()), Some(String::new()), None),
+            ("nil-version", None, None, Some(Uuid::nil())),
+        ] {
+            let object = format!("guarded-remote-only-{case}");
+            let object_dir = dir.path().join("bucket").join(&object);
+            fs::create_dir_all(&object_dir)
+                .await
+                .expect("create remote-only object directory");
+            let mut original = test_file_info(&object, Uuid::nil(), data_dir, None);
+            original.metadata.insert("etag".into(), "etag-remote".into());
+            original.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_owned();
+            original.transition_tier = "WARM".into();
+            original.transitioned_objname = "remote/object".into();
+            original.transition_version = remote_version;
+            original.transition_version_id = remote_version_id;
+            let expected = CurrentDeleteGeneration::from_file_info(&original).expect("capture legacy remote-only generation");
+            let before = test_meta(original.clone());
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), &before)
+                .await
+                .expect("write remote-only metadata");
+            let persisted = FileMeta::load(&before)
+                .expect("decode remote-only metadata")
+                .into_fileinfo("bucket", &object, "", false, false, false)
+                .expect("read remote-only generation");
+            assert_eq!(
+                CurrentDeleteGeneration::from_file_info(&persisted).expect("capture persisted remote generation"),
+                expected
+            );
+            // Observed transition state belongs to the guard; a version-removal
+            // descriptor must not request another transition commit.
+            let mut deletion = FileInfo {
+                name: original.name,
+                version_id: original.version_id,
+                mod_time: original.mod_time,
+                ..Default::default()
+            };
+            let free_version_id = Uuid::new_v4();
+            deletion.set_tier_free_version_id(&free_version_id.to_string());
+            let transaction = Uuid::new_v4();
+            assert_eq!(
+                disk.delete_versions_guarded_recoverable(
+                    "bucket",
+                    vec![guarded_delete_group(deletion, expected)],
+                    DeleteOptions {
+                        old_data_dir: Some(transaction),
+                        ..Default::default()
+                    },
+                )
+                .await,
+                vec![None],
+                "matching remote-only guard succeeds: {case}"
+            );
+            let after = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("durable tier cleanup metadata");
+            let remaining = FileMeta::load(&after).expect("decode tier cleanup metadata");
+            assert_eq!(remaining.versions.len(), 1, "only the tier cleanup owner remains: {case}");
+            let listed = remaining
+                .get_file_info_versions("bucket", &object, false)
+                .expect("list live and free versions");
+            assert!(listed.versions.is_empty(), "matching remote-only object version is removed: {case}");
+            assert_eq!(
+                listed.free_versions.len(),
+                1,
+                "deletion retains exactly one remote cleanup record: {case}"
+            );
+            let cleanup = &listed.free_versions[0];
+            assert!(
+                cleanup.deleted && cleanup.tier_free_version(),
+                "remaining metadata is a canonical tier cleanup marker: {case}"
+            );
+            assert_eq!(cleanup.version_id, Some(free_version_id));
+            assert_eq!(cleanup.transition_tier, "WARM");
+            assert_eq!(cleanup.transitioned_objname, "remote/object");
+            assert_eq!(cleanup.transition_version, None);
+            assert_eq!(cleanup.transition_version_id, None);
+            assert_eq!(cleanup.transition_version_state, rustfs_filemeta::TransitionVersionState::Unknown);
+            assert!(
+                matches!(
+                    remaining.into_fileinfo("bucket", &object, "", false, false, false),
+                    Err(rustfs_filemeta::Error::FileNotFound)
+                ),
+                "normal object reads no longer find the deleted version: {case}"
+            );
+            assert_eq!(
+                fs::read(object_dir.join(transaction.to_string()).join(STORAGE_FORMAT_FILE_BACKUP))
+                    .await
+                    .expect("recoverable metadata backup"),
+                before
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_delete_remote_tuple_changes_preserve_metadata_data_and_recovery_state() {
+        use rustfs_utils::http::metadata_compat::{SUFFIX_TRANSITION_TIER_DESTINATION_ID, insert_str};
+        let dir = tempfile::tempdir().expect("create disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        ensure_test_volume(&disk, "bucket").await;
+        for changed_field in [
+            "backend",
+            "tier",
+            "object",
+            "version",
+            "version-state",
+            "status",
+            "local-to-remote",
+        ] {
+            let object = format!("guarded-remote-{changed_field}");
+            let data_dir = Uuid::new_v4();
+            let object_dir = dir.path().join("bucket").join(&object);
+            let data_path = object_dir.join(data_dir.to_string()).join("part.1");
+            fs::create_dir_all(data_path.parent().expect("data directory"))
+                .await
+                .expect("create data directory");
+            fs::write(&data_path, b"preserved-payload")
+                .await
+                .expect("write local data that must survive");
+            let mut original = test_file_info(&object, Uuid::nil(), Some(data_dir), None);
+            original.size = 17;
+            original.parts[0].size = 17;
+            original.parts[0].actual_size = 17;
+            original.metadata.insert("etag".into(), "etag-same".into());
+            original.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_owned();
+            original.transition_tier = "WARM".into();
+            original.transitioned_objname = "remote/object-a".into();
+            original.transition_version = Some("opaque/version-a==".into());
+            original.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
+            insert_str(&mut original.metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID, "ab".repeat(32));
+            let mut current = original.clone();
+            match changed_field {
+                "backend" => insert_str(&mut current.metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID, "cd".repeat(32)),
+                "tier" => current.transition_tier = "COLD".into(),
+                "object" => current.transitioned_objname = "remote/object-b".into(),
+                "version" => current.transition_version = Some("opaque/version-b==".into()),
+                "version-state" => current.transition_version_state = rustfs_filemeta::TransitionVersionState::Unknown,
+                "status" => current.transition_status = "pending".into(),
+                "local-to-remote" => {
+                    original.transition_status.clear();
+                    original.transition_tier.clear();
+                    original.transitioned_objname.clear();
+                    original.transition_version = None;
+                    original.transition_version_state = rustfs_filemeta::TransitionVersionState::Unknown;
+                    rustfs_utils::http::metadata_compat::remove_str(
+                        &mut original.metadata,
+                        SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+                    );
+                }
+                _ => unreachable!("test controls changed fields"),
+            }
+            let expected = CurrentDeleteGeneration::from_file_info(&original).expect("capture original remote generation");
+            let actual = CurrentDeleteGeneration::from_file_info(&current).expect("capture changed remote generation");
+            assert_ne!(actual, expected, "remote identity change must alter the guard: {changed_field}");
+            assert_eq!(current.version_id, original.version_id);
+            assert_eq!(current.data_dir, original.data_dir);
+            assert_eq!(current.mod_time, original.mod_time);
+            assert_eq!(current.get_etag(), original.get_etag());
+            let current_metadata = test_meta(current);
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), &current_metadata)
+                .await
+                .expect("publish changed remote identity");
+            let transaction = Uuid::new_v4();
+            let errors = disk
+                .delete_versions_guarded_recoverable(
+                    "bucket",
+                    vec![guarded_delete_group(original, expected)],
+                    DeleteOptions {
+                        old_data_dir: Some(transaction),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert_eq!(
+                errors,
+                vec![Some(DiskError::ConditionalDeleteConflict)],
+                "stale remote tuple is rejected: {changed_field}"
+            );
+            assert_eq!(
+                fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+                    .await
+                    .expect("current metadata remains"),
+                current_metadata
+            );
+            assert_eq!(fs::read(&data_path).await.expect("payload remains"), b"preserved-payload");
+            assert!(
+                !object_dir.join(transaction.to_string()).exists(),
+                "stale remote tuple creates no recovery artifacts: {changed_field}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_delete_absence_guard_preserves_new_object() {
+        let dir = tempfile::tempdir().expect("create disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        ensure_test_volume(&disk, "bucket").await;
+        let object = "guarded-object";
+        let object_dir = dir.path().join("bucket").join(object);
+        fs::create_dir_all(&object_dir).await.expect("create object directory");
+        let mut current = test_file_info(object, Uuid::nil(), Some(Uuid::new_v4()), Some(Bytes::from_static(b"current")));
+        current.metadata.insert("etag".into(), "etag-current".into());
+        let newer = test_meta(current.clone());
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), &newer)
+            .await
+            .expect("write current metadata");
+        let transaction = Uuid::new_v4();
+        let errors = disk
+            .delete_versions_guarded_recoverable(
+                "bucket",
+                vec![guarded_delete_group(current, CurrentDeleteGeneration::Absent)],
+                DeleteOptions {
+                    old_data_dir: Some(transaction),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(errors, vec![Some(DiskError::ConditionalDeleteConflict)]);
+        assert_eq!(
+            fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("current metadata remains"),
+            newer
+        );
+        assert!(!object_dir.join(transaction.to_string()).exists());
+    }
+
+    #[tokio::test]
+    async fn guarded_delete_recovery_rollback_preserves_replacement() {
+        let dir = tempfile::tempdir().expect("create disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        ensure_test_volume(&disk, "bucket").await;
+        let object = "guarded-object";
+        let object_dir = dir.path().join("bucket").join(object);
+        fs::create_dir_all(&object_dir).await.expect("create object directory");
+        let mut original = test_file_info(object, Uuid::nil(), Some(Uuid::new_v4()), Some(Bytes::from_static(b"original")));
+        original.metadata.insert("etag".into(), "etag-a".into());
+        let expected = CurrentDeleteGeneration::from_file_info(&original).expect("capture original generation");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), test_meta(original.clone()))
+            .await
+            .expect("write original metadata");
+        let transaction = Uuid::new_v4();
+        assert_eq!(
+            disk.delete_versions_guarded_recoverable(
+                "bucket",
+                vec![guarded_delete_group(original.clone(), expected)],
+                DeleteOptions {
+                    old_data_dir: Some(transaction),
+                    ..Default::default()
+                },
+            )
+            .await,
+            vec![None]
+        );
+        let applied = disk
+            .inspect_delete_transaction("bucket", object, transaction)
+            .await
+            .expect("inspect prepared delete");
+        let mut replacement = original;
+        replacement.data_dir = Some(Uuid::new_v4());
+        replacement.mod_time = replacement.mod_time.map(|time| time + time::Duration::seconds(1));
+        replacement.metadata.insert("etag".into(), "etag-b".into());
+        let newer = test_meta(replacement);
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), &newer)
+            .await
+            .expect("commit replacement after delete preparation");
+        let error = disk
+            .settle_delete_transaction(
+                "bucket",
+                object,
+                transaction,
+                applied.fingerprint,
+                super::super::DeleteRecoveryAction::Rollback,
+            )
+            .await
+            .expect_err("stale rollback cannot overwrite replacement");
+        assert_eq!(error, DiskError::OutdatedXLMeta);
+        assert_eq!(
+            fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("replacement remains after rejected rollback"),
+            newer
+        );
+    }
+
+    pub(super) fn test_meta(fi: FileInfo) -> Vec<u8> {
         let mut meta = FileMeta::default();
         meta.add_version(fi).expect("test metadata should accept file info");
         meta.marshal_msg().expect("test metadata should encode")
@@ -14379,7 +16086,7 @@ mod test {
         assert!(!child_path.exists(), "the exact locked directory should be removed");
     }
 
-    async fn ensure_test_volume(disk: &LocalDisk, volume: &str) {
+    pub(super) async fn ensure_test_volume(disk: &LocalDisk, volume: &str) {
         match disk.make_volume(volume).await {
             Ok(()) | Err(DiskError::VolumeExists) => {}
             Err(err) => panic!("test volume should be available: {err:?}"),
@@ -15533,10 +17240,15 @@ mod test {
         disk.wait_for_startup_cleanup().await;
         assert_eq!(disk.startup_cleanup_ready.load(Ordering::Acquire), 1);
 
-        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().join("missing-root"), &publication_root, Duration::ZERO)
-            .await
-            .expect("missing tmp path should be a cleanup no-op");
-        LocalDisk::cleanup_deleted_objects(dir.path().join("missing-root"))
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(
+            dir.path().join("missing-root"),
+            &publication_root,
+            Duration::ZERO,
+            &crate::disk::cleanup_runtime::GcBudget::default(),
+        )
+        .await
+        .expect("missing tmp path should be a cleanup no-op");
+        LocalDisk::cleanup_deleted_objects(dir.path().join("missing-root"), &crate::disk::cleanup_runtime::GcBudget::default())
             .await
             .expect("missing trash path should be a cleanup no-op");
 
@@ -15549,9 +17261,14 @@ mod test {
         fs::create_dir_all(&trash_root).await.expect("trash dir should be created");
         backdate_mtime(&stale_dir, Duration::from_secs(10));
 
-        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), &publication_root, Duration::ZERO)
-            .await
-            .expect("stale tmp directory should move to trash");
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(
+            dir.path().to_path_buf(),
+            &publication_root,
+            Duration::ZERO,
+            &crate::disk::cleanup_runtime::GcBudget::default(),
+        )
+        .await
+        .expect("stale tmp directory should move to trash");
         assert!(!stale_dir.exists(), "stale tmp directory should be moved away");
         assert!(live_file.exists(), "plain tmp files should be ignored by stale dir cleanup");
 
@@ -15561,7 +17278,7 @@ mod test {
         fs::create_dir_all(trash_root.join("trash-dir"))
             .await
             .expect("trash dir should be created");
-        LocalDisk::cleanup_deleted_objects(dir.path().to_path_buf())
+        LocalDisk::cleanup_deleted_objects(dir.path().to_path_buf(), &crate::disk::cleanup_runtime::GcBudget::default())
             .await
             .expect("trash cleanup should remove files and directories");
         assert!(
@@ -20335,9 +22052,10 @@ mod test {
         fs::create_dir_all(object.join(rollback.to_string()).join(STORAGE_FORMAT_FILE_BACKUP))
             .await
             .expect("backup persist obstacle");
-        let expected = write_delete_rollback_file(&object, rollback, STORAGE_FORMAT_FILE_BACKUP, &original, None)
-            .await
-            .expect_err("actual backup syscall error");
+        let expected =
+            write_delete_rollback_file(disk.io_root(), volume, &object, rollback, STORAGE_FORMAT_FILE_BACKUP, &original, None)
+                .await
+                .expect_err("actual backup syscall error");
         let wrapper = LocalDiskWrapper::new(disk.clone(), false);
         let errors = wrapper
             .begin_legacy_file_write_with_namespace_owner(volume, None)
@@ -20646,7 +22364,7 @@ mod test {
             for volume in [volume, RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET] {
                 ensure_test_volume(&disk, volume).await;
             }
-            let (mut group, rollback, original) = if bulk {
+            let (group, rollback, original) = if bulk {
                 prepare_bulk_delete_fixture(&disk, volume, &object, case == "marker").await
             } else {
                 let (fi, rollback, original) = prepare_legacy_delete_fixture(&disk, volume, &object, case).await;
@@ -20661,14 +22379,6 @@ mod test {
                 )
             };
             let fi = group.versions[0].clone();
-            if bulk && case == "after-reserve" {
-                let mut invalid = fi.clone();
-                invalid.parts[0].number = 0;
-                invalid
-                    .validate_for_delete_operation()
-                    .expect_err("later metadata operation must fail");
-                group.versions.push(invalid);
-            }
             let object_dir = disk.io_get_object_path(volume, &object).expect("object path");
             let metadata = object_dir.join(STORAGE_FORMAT_FILE);
             let rollback_path = object_dir.join(rollback.to_string());
@@ -20824,6 +22534,22 @@ mod test {
                     .expect("missing marker intent");
                 fs::remove_file(&metadata).await.expect("missing old metadata");
             }
+            let marker_paths: Vec<_> = fi
+                .data_dir
+                .into_iter()
+                .flat_map(|data| {
+                    let data_path = object_dir.join(data.to_string());
+                    [RESERVED_DELETE_DATA_DIR_MARKER_PREFIX, DELETE_DATA_DIR_MARKER_PREFIX]
+                        .map(|prefix| data_path.join(format!("{prefix}{rollback}")))
+                })
+                .collect();
+            let marker_bytes: Vec<_> = marker_paths.iter().map(|path| std::fs::read(path).ok()).collect();
+            if case == "no-backup" {
+                assert!(
+                    marker_bytes.iter().any(Option::is_some),
+                    "missing-backup fixture retains a reservation proof"
+                );
+            }
             let opts = DeleteOptions {
                 undo_write: true,
                 undo_delete: true,
@@ -20864,8 +22590,12 @@ mod test {
                     fs::read(data_path.join("part.1")).await.expect("old shard restored"),
                     b"old-complete-shard"
                 );
-                for prefix in [RESERVED_DELETE_DATA_DIR_MARKER_PREFIX, DELETE_DATA_DIR_MARKER_PREFIX] {
-                    assert!(!data_path.join(format!("{prefix}{rollback}")).exists());
+                for (marker, before) in marker_paths.iter().zip(&marker_bytes) {
+                    if matches!(case, "no-backup" | "staged-no-backup") {
+                        assert_eq!(&std::fs::read(marker).ok(), before, "failed restore retains existing marker evidence");
+                    } else {
+                        assert!(!marker.exists(), "successful restore removes its marker");
+                    }
                 }
             }
             assert_eq!(wrapper.metrics_snapshot().api_calls.get("delete_version"), Some(&1));
@@ -23847,6 +25577,306 @@ mod test {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_tmp_parent_pruning_retains_staging_lease_in_executor() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+
+        let root = tempfile::tempdir().expect("cancelled parent pruning fixture");
+        let endpoint = Endpoint::try_from(root.path().to_str().expect("UTF-8 fixture path")).expect("endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        disk.write_all(RUSTFS_META_TMP_BUCKET, "stage/child/payload", Bytes::from_static(b"old staging bytes"))
+            .await
+            .expect("seed nested staging prefix");
+        let parent = disk
+            .io_get_object_path(RUSTFS_META_TMP_BUCKET, "stage")
+            .expect("staging parent path");
+        let staging_key = tmp_staging_mutation_path(&disk.root, "stage").expect("shared staging key");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hook = hooks::install_at(hooks::Stage::Remove, &parent, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(30));
+        });
+        let cleanup_disk = disk.clone();
+        let mut cleanup = tokio::spawn(async move {
+            cleanup_disk
+                .delete(
+                    RUSTFS_META_TMP_BUCKET,
+                    "stage/child",
+                    DeleteOptions {
+                        recursive: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                entered = entered_rx => entered.expect("physical parent rmdir pause"),
+                result = &mut cleanup => panic!("cleanup returned before parent pruning: {result:?}"),
+            }
+        })
+        .await
+        .expect("cleanup must reach its already-leased parent");
+        cleanup.abort();
+        assert!(cleanup.await.expect_err("cleanup waiter cancelled").is_cancelled());
+        let mut next_owner =
+            tokio::spawn(async move { os::acquire_namespace_mutation_lease_with_owner(&staging_key, None).await });
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut next_owner).await.is_err(),
+            "the physical rmdir must retain the staging lease after cancellation"
+        );
+        drop(release_tx);
+        let _next_owner = tokio::time::timeout(Duration::from_secs(10), next_owner)
+            .await
+            .expect("staging lease released after physical rmdir")
+            .expect("next staging owner");
+        assert!(!parent.exists(), "the empty staging parent must actually be pruned");
+        assert!(disk.io_get_bucket_path(RUSTFS_META_TMP_BUCKET).expect("TMP path").is_dir());
+    }
+
+    #[test]
+    fn tmp_staging_keys_share_top_level_prefix_and_reject_escape() {
+        let root = tempfile::tempdir().expect("staging key fixture");
+        let expected = root.path().join(RUSTFS_META_TMP_BUCKET).join("stage");
+        for path in ["stage", "stage/child", "stage/./child", "stage/child/../next"] {
+            assert_eq!(tmp_staging_mutation_path(root.path(), path).expect("contained staging key"), expected);
+        }
+        assert!(matches!(tmp_staging_mutation_path(root.path(), "../escape"), Err(DiskError::InvalidPath)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(dst_dir_fsync_group_commit)]
+    async fn inline_heal_owned_receiver_restores_metadata_when_tmp_cleanup_races_rollback() {
+        use crate::disk::{disk_store::LocalDiskWrapper, os::prepared_publication_test_hooks as hooks};
+
+        let _group_commit = os::set_dst_dir_fsync_group_commit_for_test(true);
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        for stale_gc in [false, true] {
+            let root = tempfile::tempdir().expect("owned receiver fixture directory");
+            let endpoint = Endpoint::try_from(root.path().to_str().expect("UTF-8 fixture path")).expect("endpoint");
+            let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+            let bucket = "inline-heal-owned-receiver";
+            let object = "inline-heal-owned-receiver-tmp-cleanup-rollback-object";
+            let staging = "inline-heal-owned-receiver-tmp-cleanup-stage";
+            ensure_test_volume(&disk, bucket).await;
+            ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+            let object_dir = disk.io_get_object_path(bucket, object).expect("physical object path");
+            let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
+            fs::create_dir_all(&object_dir).await.expect("object directory");
+            let version = Uuid::new_v4();
+            let mut old = test_file_info(object, version, None, Some(Bytes::from_static(b"old owned receiver payload")));
+            old.set_inline_data();
+            let old_metadata = test_meta(old);
+            fs::write(&metadata_path, &old_metadata)
+                .await
+                .expect("seed acknowledged metadata");
+            let staging_dir = disk
+                .io_get_object_path(RUSTFS_META_TMP_BUCKET, staging)
+                .expect("physical staging prefix");
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            // Group fsync hooks use canonical paths, including on Linux mount-FD IO paths.
+            let fsync_hook_path = object_dir.canonicalize().expect("canonical group fsync path");
+            let _hook = hooks::install_at(hooks::Stage::DirFsync, &fsync_hook_path, move || {
+                let _ = entered_tx.send(());
+                // Dropping the sender also releases this executor when an assertion fails.
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            });
+            os::fsync_dir_recorder::set_grouped_failure(&object_dir, io::ErrorKind::PermissionDenied);
+            let mut repaired = test_file_info(object, version, None, Some(Bytes::from_static(b"new owned receiver payload")));
+            repaired.set_inline_data();
+            repaired.set_healing();
+            let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+            let owner = ctx.begin_namespace_commit();
+            let owner_probe = Arc::downgrade(&owner);
+            let wrapper = LocalDiskWrapper::new(Arc::clone(&disk), false);
+            let mut receiver = tokio::spawn(async move {
+                wrapper
+                    .rename_data_observed_with_guards(
+                        RUSTFS_META_TMP_BUCKET,
+                        staging,
+                        &repaired,
+                        bucket,
+                        object,
+                        crate::disk::RenameDataGuards {
+                            external_guard: Some(owner),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    entered = entered_rx => entered.expect("physical fsync pause"),
+                    result = &mut receiver => match result {
+                        Ok(observation) => panic!("receiver completed before the fsync pause; error: {:?}", observation.result.err()),
+                        Err(error) => panic!("receiver task failed before the fsync pause: {error}"),
+                    },
+                }
+            })
+            .await
+            .expect("owned receiver must reach post-publication fsync");
+            assert_ne!(fs::read(&metadata_path).await.expect("published repaired metadata"), old_metadata);
+            assert_eq!(
+                fs::read(staging_dir.join(STORAGE_FORMAT_FILE_BACKUP))
+                    .await
+                    .expect("active staging rollback backup"),
+                old_metadata
+            );
+            // An incarnation-bound receiver drains even after its RPC waiter disappears.
+            receiver.abort();
+            assert!(receiver.await.err().expect("RPC waiter cancellation").is_cancelled());
+            assert!(ctx.namespace_commits_pending(), "the physical receiver must remain active");
+            let cleanup_disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("reconnected disk handle"));
+            if stale_gc {
+                std::fs::File::open(&staging_dir)
+                    .expect("staging directory")
+                    .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+                    .expect("make the active prefix eligible for stale GC");
+            }
+            let mut cleanup = tokio::spawn(async move {
+                if stale_gc {
+                    let mut entries = fs::read_dir(cleanup_disk.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?).await?;
+                    while let Some(entry) = entries.next_entry().await? {
+                        if entry.file_name() == staging {
+                            return LocalDisk::cleanup_stale_tmp_entry(
+                                entry,
+                                cleanup_disk.io_root(),
+                                &cleanup_disk.publication_root,
+                                Duration::from_secs(1),
+                            )
+                            .await;
+                        }
+                    }
+                    panic!("active staging prefix must be discoverable by GC");
+                }
+                cleanup_disk
+                    .delete(
+                        RUSTFS_META_TMP_BUCKET,
+                        staging,
+                        DeleteOptions {
+                            recursive: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), &mut cleanup).await.is_err(),
+                "request cleanup and stale GC must wait for the active receiver"
+            );
+            drop(release_tx);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while owner_probe.upgrade().is_some() || ctx.namespace_commits_pending() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("physical receiver must finish its failed-fsync rollback");
+            tokio::time::timeout(Duration::from_secs(10), cleanup)
+                .await
+                .expect("tmp cleanup must finish after physical rollback")
+                .expect("tmp cleanup task")
+                .expect("deferred tmp cleanup");
+            assert_eq!(
+                fs::read(&metadata_path).await.expect("metadata after failed-fsync rollback"),
+                old_metadata,
+                "temporary-prefix cleanup must not destroy an active receiver's rollback source"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(dst_dir_fsync_group_commit)]
+    async fn inline_heal_staged_backup_restores_metadata_after_commit_failure() {
+        let _group_commit = os::set_dst_dir_fsync_group_commit_for_test(true);
+        for mode in [DurabilityMode::None, DurabilityMode::Relaxed, DurabilityMode::Strict] {
+            let _mode = durability_mode_override::set(mode);
+            for version in [Uuid::nil(), Uuid::new_v4()] {
+                for old_inline in [true, false] {
+                    let root = tempfile::tempdir().expect("rollback fixture directory");
+                    let endpoint = Endpoint::try_from(root.path().to_str().expect("UTF-8 fixture path")).expect("endpoint");
+                    let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+                    let bucket = "inline-heal-rollback";
+                    let object = "inline-heal-staged-backup-rollback-object";
+                    ensure_test_volume(&disk, bucket).await;
+                    ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+                    let object_dir = disk.io_get_object_path(bucket, object).expect("physical object path");
+                    fs::create_dir_all(&object_dir).await.expect("object directory");
+                    let old_dir = Uuid::new_v4();
+                    let old = if old_inline {
+                        test_file_info(object, version, None, Some(Bytes::from_static(b"old inline bytes")))
+                    } else {
+                        fs::create_dir_all(object_dir.join(old_dir.to_string()))
+                            .await
+                            .expect("external directory");
+                        fs::write(object_dir.join(old_dir.to_string()).join("part.1"), b"x")
+                            .await
+                            .expect("old external shard");
+                        test_file_info(object, version, Some(old_dir), None)
+                    };
+                    let old_metadata = test_meta(old);
+                    fs::write(object_dir.join(STORAGE_FORMAT_FILE), &old_metadata)
+                        .await
+                        .expect("seed old metadata");
+                    if mode == DurabilityMode::Strict {
+                        os::fsync_dir_recorder::set_grouped_failure(&object_dir, io::ErrorKind::PermissionDenied);
+                    } else {
+                        set_rename_data_fail_after_metadata_commit(object);
+                    }
+                    let mut new = test_file_info(object, version, None, Some(Bytes::from_static(b"repaired inline bytes")));
+                    new.set_healing();
+                    let error = disk
+                        .rename_data(RUSTFS_META_TMP_BUCKET, "heal", new, bucket, object)
+                        .await
+                        .expect_err("injected post-publication failure");
+                    let expected_kind = if mode == DurabilityMode::Strict {
+                        io::ErrorKind::PermissionDenied
+                    } else {
+                        io::ErrorKind::Other
+                    };
+                    assert!(
+                        matches!(error, DiskError::Io(ref error) if error.kind() == expected_kind),
+                        "{mode:?}: {error:?}"
+                    );
+                    assert_eq!(
+                        fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+                            .await
+                            .expect("restored metadata"),
+                        old_metadata
+                    );
+                    if !old_inline {
+                        assert_eq!(
+                            fs::read(object_dir.join(old_dir.to_string()).join("part.1"))
+                                .await
+                                .expect("old shard"),
+                            b"x"
+                        );
+                    }
+                    let staging = disk.io_get_object_path(RUSTFS_META_TMP_BUCKET, "heal").expect("staging path");
+                    assert!(
+                        !staging.join(STORAGE_FORMAT_FILE_BACKUP).exists(),
+                        "rollback must consume the staging backup"
+                    );
+                    for entry in std::fs::read_dir(&object_dir).expect("object entries") {
+                        let entry = entry.expect("object entry");
+                        if entry.file_type().expect("entry type").is_dir() {
+                            assert!(
+                                !entry.path().join(STORAGE_FORMAT_FILE_BACKUP).exists(),
+                                "heal must not publish a live rollback backup"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn windows_and_unix_rename_data_inline_post_commit_error_restores_old_metadata() {
         use tempfile::tempdir;
@@ -24889,7 +26919,7 @@ mod test {
             .await
             .expect("existing metadata should be written");
 
-        disk.delete_versions_internal(bucket, object, &[missing_fi, existing_fi], &DeleteOptions::default())
+        disk.delete_versions_internal(bucket, object, &[missing_fi, existing_fi], &DeleteOptions::default(), None)
             .await
             .expect("missing non-deleted version should not abort deletion");
 
@@ -25046,6 +27076,7 @@ mod test {
                 old_data_dir: Some(rollback_dir),
                 ..Default::default()
             },
+            None,
         )
         .await
         .expect("missing inline data dir should not fail batch deletion");
@@ -25058,6 +27089,117 @@ mod test {
                 .exists()
         );
         assert!(!logs.contents().contains("reliable_rename failed"));
+    }
+
+    // rustfs#8545: the rollback backup is staged through tempfile, whose Windows
+    // `persist` calls `MoveFileExW` with the raw path; past MAX_PATH every
+    // delete of such a key failed with 500 while PUT and GET still worked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn windows_and_unix_delete_backs_up_metadata_beyond_max_path() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "bucket";
+        ensure_test_volume(&disk, bucket).await;
+
+        let deep_prefix = format!("dir/{}", "a".repeat(200));
+        let version_id = Uuid::parse_str("37373737-1111-2222-3333-444444444444").expect("version id should parse");
+        let data_dir = Uuid::parse_str("38383838-1111-2222-3333-444444444444").expect("data dir should parse");
+        let rollback_dir = Uuid::parse_str("39393939-1111-2222-3333-444444444444").expect("rollback dir should parse");
+        let opts = DeleteOptions {
+            old_data_dir: Some(rollback_dir),
+            ..Default::default()
+        };
+
+        for batch in [false, true] {
+            let object = format!("{deep_prefix}/{}", if batch { "batch" } else { "single" });
+            let object_dir = dir.path().join(bucket).join(&object);
+            let backup = object_dir.join(rollback_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+            assert!(
+                backup.to_str().expect("temp dir should be utf8").encode_utf16().count() > 260,
+                "regression path must cross the traditional Windows MAX_PATH boundary: {backup:?}"
+            );
+            fs::create_dir_all(&object_dir).await.expect("object dir should be created");
+            let fi = test_file_info(&object, version_id, Some(data_dir), Some(Bytes::from_static(b"inline")));
+            let meta = test_meta(fi.clone());
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), &meta)
+                .await
+                .expect("inline metadata should be written");
+
+            if batch {
+                disk.delete_versions_internal(bucket, &object, &[fi], &opts, None)
+                    .await
+                    .expect("batch delete of a deep key should succeed");
+            } else {
+                disk.delete_version(bucket, &object, fi, false, opts.clone())
+                    .await
+                    .expect("delete of a deep key should succeed");
+            }
+
+            assert!(!object_dir.join(STORAGE_FORMAT_FILE).exists(), "{object}: metadata should be deleted");
+            assert_eq!(
+                fs::read(&backup).await.expect("rollback backup should be published"),
+                meta,
+                "{object}: backup should hold the pre-delete metadata"
+            );
+        }
+    }
+
+    /// Opens a disk at `root` and drives metadata and data reads and writes
+    /// through it: they extend the root by joining `/`-separated relative paths
+    /// as strings, so they all depend on the root staying non-verbatim.
+    async fn assert_local_disk_serves_objects_at(root: &Path) {
+        let endpoint = Endpoint::try_from(root.to_str().expect("disk root should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        assert!(
+            !disk.root.to_string_lossy().starts_with(r"\\?\"),
+            "the disk root must not be verbatim: {:?}",
+            disk.root
+        );
+        let bucket = "bucket";
+        ensure_test_volume(&disk, bucket).await;
+
+        let object = "dir/object";
+        let version_id = Uuid::parse_str("41414141-1111-2222-3333-444444444444").expect("version id should parse");
+        let data_dir = Uuid::parse_str("42424242-1111-2222-3333-444444444444").expect("data dir should parse");
+        let fi = test_file_info(object, version_id, Some(data_dir), Some(Bytes::from_static(b"inline")));
+        let meta = test_meta(fi);
+        disk.write_all(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"), Bytes::from(meta.clone()))
+            .await
+            .expect("metadata should be written below the disk root");
+        let raw = disk
+            .read_xl(bucket, object, true)
+            .await
+            .expect("metadata should be read back");
+        assert_eq!(raw.buf, meta);
+
+        let payload = Bytes::from_static(b"part payload");
+        disk.write_all(bucket, "dir/other/part.1", payload.clone())
+            .await
+            .expect("data should be written below the disk root");
+        assert_eq!(
+            disk.read_all(bucket, "dir/other/part.1")
+                .await
+                .expect("data should be read back"),
+            payload
+        );
+    }
+
+    // A disk root past MAX_PATH resolved to `\\?\C:\...`, where `/` is not a
+    // separator, so the first `/`-joined metadata read (pool.bin.identity)
+    // failed with ERROR_INVALID_NAME and startup never completed.
+    #[tokio::test]
+    async fn windows_and_unix_local_disk_root_beyond_max_path_serves_objects() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let mut root = dir.path().to_path_buf();
+        while root.to_str().expect("temp dir should be utf8").encode_utf16().count() <= 270 {
+            root.push("r".repeat(100));
+        }
+        fs::create_dir_all(&root).await.expect("long disk root should be created");
+
+        assert_local_disk_serves_objects_at(&root).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -25259,8 +27401,7 @@ mod test {
         }
     }
 
-    /// Leave the state a delete reaches once it committed on this disk but
-    /// before its cleanup pass: what a cancelled request used to strand.
+    /// A legacy disk-local mutation without a structured set decision.
     async fn write_committed_delete_residue(disk: &LocalDisk, bucket: &str, object: &str) -> CommittedDeleteResidue {
         let version_id = Uuid::new_v4();
         let data_dir = Uuid::new_v4();
@@ -25300,6 +27441,56 @@ mod test {
         residue
     }
 
+    #[tokio::test]
+    async fn delete_recovery_user_bucket_apply_preserves_ambiguous_legacy_residue() {
+        for batch in [false, true] {
+            for recoverable in [false, true] {
+                let dir = tempfile::tempdir().expect("residue fixture directory");
+                let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 endpoint")).expect("endpoint");
+                let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+                let bucket = "user-legacy-residue";
+                let object = "object";
+                ensure_test_volume(&disk, bucket).await;
+                let residue = write_committed_delete_residue(&disk, bucket, object).await;
+                let original = fs::read(residue.backup()).await.expect("legacy metadata backup");
+                let request = FileInfo {
+                    name: object.to_owned(),
+                    version_id: Some(Uuid::new_v4()),
+                    ..Default::default()
+                };
+                let opts = DeleteOptions {
+                    old_data_dir: Some(Uuid::new_v4()),
+                    recoverable_delete: recoverable,
+                    delete_recovery_bucket_incarnation: Some(Uuid::new_v4()),
+                    ..Default::default()
+                };
+                if batch {
+                    let errors = disk
+                        .delete_versions(
+                            bucket,
+                            vec![FileInfoVersions {
+                                name: object.to_owned(),
+                                versions: vec![request],
+                                ..Default::default()
+                            }],
+                            opts,
+                        )
+                        .await;
+                    assert!(matches!(errors.as_slice(), [Some(DiskError::FileNotFound)]), "{errors:?}");
+                } else {
+                    assert!(matches!(
+                        disk.delete_version(bucket, object, request, false, opts).await,
+                        Err(DiskError::FileVersionNotFound)
+                    ));
+                }
+                assert_eq!(fs::read(residue.backup()).await.expect("preserved backup"), original);
+                assert_eq!(fs::read(residue.part()).await.expect("preserved shard"), b"stale");
+                assert!(residue.marker().is_file(), "a missing local apply cannot certify historical deletion");
+                assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 0);
+            }
+        }
+    }
+
     fn residue_delete_request(object: &str) -> Vec<FileInfoVersions> {
         vec![FileInfoVersions {
             name: object.to_string(),
@@ -25311,14 +27502,334 @@ mod test {
         }]
     }
 
-    // #6898: repeating the delete of a key whose earlier delete committed but
-    // never cleaned up reclaims the residue and still reports the key missing.
+    // This is a real process interruption of LocalDisk, not a server or
+    // power-loss test. The child stops at the rollback-backup unlink.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quorum_delete_cleanup_process_crash_preserves_retry_evidence() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        use std::os::unix::process::ExitStatusExt;
+
+        const CHILD_ROOT: &str = "RUSTFS_TEST_QUORUM_CLEANUP_ROOT";
+        const CHILD_TRANSACTION: &str = "RUSTFS_TEST_QUORUM_CLEANUP_TRANSACTION";
+        const CHILD_READY: &str = "RUSTFS_TEST_QUORUM_CLEANUP_READY";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let endpoint =
+                Endpoint::try_from(Path::new(&root).to_str().expect("UTF-8 child disk path")).expect("parse child endpoint");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("open child disk");
+            let transaction =
+                Uuid::parse_str(&std::env::var(CHILD_TRANSACTION).expect("child transaction")).expect("parse child transaction");
+            let ready = std::env::var_os(CHILD_READY).expect("child readiness path");
+            let rollback_path = format!("object/{transaction}");
+            let backup = disk
+                .io_get_object_path("bucket", &rollback_path)
+                .expect("child transaction path")
+                .join(STORAGE_FORMAT_FILE_BACKUP);
+            let _hook = hooks::install_at(hooks::Stage::Remove, &backup, move || {
+                std::fs::write(ready, b"before-backup-unlink").expect("publish reached boundary");
+                loop {
+                    std::thread::park();
+                }
+            });
+            disk.delete(
+                "bucket",
+                &rollback_path,
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    old_data_dir: Some(transaction),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("child cleanup should reach its boundary");
+            panic!("child unexpectedly returned without being killed");
+        }
+
+        let dir = tempfile::tempdir().expect("create test disk");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        ensure_test_volume(&disk, "bucket").await;
+        let residue = write_committed_delete_residue(&disk, "bucket", "object").await;
+        let original_backup = fs::read(residue.backup()).await.expect("read original backup");
+        let original_part = fs::read(residue.part()).await.expect("read original part");
+
+        for attempt in 0..2 {
+            let ready = dir.path().join(format!("cleanup-ready-{attempt}"));
+            let mut child = std::process::Command::new(std::env::current_exe().expect("current test binary"))
+                .args([
+                    "--exact",
+                    "disk::local::test::quorum_delete_cleanup_process_crash_preserves_retry_evidence",
+                    "--nocapture",
+                ])
+                .env(CHILD_ROOT, dir.path())
+                .env(CHILD_TRANSACTION, residue.transaction.to_string())
+                .env(CHILD_READY, &ready)
+                .spawn()
+                .expect("spawn this test's cleanup process");
+            let reached = tokio::time::timeout(Duration::from_secs(30), async {
+                while !ready.exists() {
+                    if child.try_wait().expect("check child status").is_some() {
+                        return false;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                true
+            })
+            .await;
+            // Child is an owned process handle; no process-name matching or
+            // external PID is accepted by this test.
+            if child.try_wait().expect("check owned child").is_none() {
+                child.kill().expect("SIGKILL the owned cleanup child");
+            }
+            let status = child.wait().expect("reap cleanup child");
+            assert!(matches!(reached, Ok(true)), "child must reach the exact cleanup boundary");
+            assert_eq!(status.signal(), Some(9), "child must have been interrupted by SIGKILL");
+            println!(
+                "cleanup crash {attempt}: backup={} marker={} part={}",
+                residue.backup().exists(),
+                residue.marker().exists(),
+                residue.part().exists()
+            );
+            assert_eq!(fs::read(residue.backup()).await.expect("backup at paused unlink"), original_backup);
+            assert_eq!(fs::read(residue.part()).await.expect("payload survives each crash"), original_part);
+            assert!(residue.marker().is_file(), "transaction marker survives each crash");
+            assert!(
+                residue
+                    .object_dir
+                    .join(residue.transaction.to_string())
+                    .join(DELETE_QUORUM_COMMITTED_FILE)
+                    .is_file(),
+                "quorum receipt survives each crash"
+            );
+        }
+
+        let reopened = LocalDisk::new(&endpoint, false)
+            .await
+            .expect("reopen disk after process interruption");
+        reopened
+            .delete(
+                "bucket",
+                &format!("object/{}", residue.transaction),
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    old_data_dir: Some(residue.transaction),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("retry the already committed coordinator transaction");
+        assert_eq!(original_part, b"stale");
+        let bucket_result = reopened.delete_volume("bucket", false).await;
+        println!("non-force bucket deletion after retry: {bucket_result:?}");
+        assert!(
+            !residue.object_dir.exists(),
+            "repeated delete after two crashes must reclaim this known-successful transaction"
+        );
+        bucket_result.expect("non-force bucket deletion after retry");
+    }
+
+    // Normal post-quorum cleanup must preserve its data-dir marker until the
+    // rollback backup is gone, including across an interrupted retry.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn quorum_delete_cleanup_removes_backup_before_data_and_can_retry() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+
+        let dir = tempfile::tempdir().expect("create test disk");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        let bucket = "bucket";
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+        let data_path = residue.part();
+        let rollback_path = format!("{object}/{}", residue.transaction);
+        let opts = DeleteOptions {
+            recursive: true,
+            immediate: true,
+            old_data_dir: Some(residue.transaction),
+            ..Default::default()
+        };
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hook = hooks::install_at(hooks::Stage::Remove, &data_path, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let mut cleanup = Box::pin(disk.delete(bucket, &rollback_path, opts.clone()));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                entered = entered_rx => entered.expect("cleanup must reach data removal"),
+                result = cleanup.as_mut() => panic!("cleanup ended before data removal: {result:?}"),
+            }
+        })
+        .await
+        .expect("cleanup reaches physical payload unlink");
+
+        let backup_gone = !residue.backup().exists();
+        let marker_present = residue.marker().exists();
+        let original_part = fs::read(residue.part()).await.expect("paused data must remain readable");
+        drop(cleanup);
+
+        // The in-flight unlink retains metadata ownership after cancellation.
+        // Retry must wait for that physical operation before removing proof.
+        let mut retry = Box::pin(disk.delete(bucket, &rollback_path, opts));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), retry.as_mut())
+                .await
+                .is_err(),
+            "retry cannot bypass the parked cleanup's namespace ownership"
+        );
+        assert!(residue.marker().is_file());
+        assert!(
+            residue
+                .object_dir
+                .join(residue.transaction.to_string())
+                .join(DELETE_QUORUM_COMMITTED_FILE)
+                .is_file()
+        );
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(10), retry)
+            .await
+            .expect("retry completes after the abandoned unlink releases ownership")
+            .expect("retry cleanup");
+
+        assert!(
+            backup_gone,
+            "post-quorum cleanup must remove the backup before touching its data-dir evidence"
+        );
+        assert!(marker_present, "data removal must still have its transaction marker");
+        assert_eq!(original_part, b"stale");
+        assert!(!residue.object_dir.exists(), "interrupted cleanup and retry must leave no object residue");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn quorum_delete_cleanup_backup_error_preserves_data_and_marker() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+
+        let dir = tempfile::tempdir().expect("create test disk");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        let bucket = "bucket";
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+        let backup_bytes = fs::read(residue.backup()).await.expect("read rollback evidence");
+        let backup = residue.backup();
+        let held_backup = residue.object_dir.join("held-backup");
+        let blocked_backup = backup.clone();
+        let retained_backup = held_backup.clone();
+        // Replace only the classified backup inode with a directory so the
+        // real unlink fails, while retaining its exact bytes for retry.
+        let _hook = hooks::install_at(hooks::Stage::Remove, &backup, move || {
+            std::fs::rename(&blocked_backup, retained_backup).expect("retain rollback bytes");
+            std::fs::create_dir(blocked_backup).expect("block the actual backup unlink");
+        });
+        let rollback_path = format!("{object}/{}", residue.transaction);
+        let opts = DeleteOptions {
+            recursive: true,
+            immediate: true,
+            old_data_dir: Some(residue.transaction),
+            ..Default::default()
+        };
+        disk.delete(bucket, &rollback_path, opts.clone())
+            .await
+            .expect_err("backup removal failure must be returned");
+
+        assert!(backup.is_dir(), "the native backup unlink must have encountered the blocker");
+        assert_eq!(fs::read(&held_backup).await.expect("backup bytes must survive"), backup_bytes);
+        assert!(residue.marker().exists(), "backup failure must retain the data-dir transaction marker");
+        assert_eq!(fs::read(residue.part()).await.expect("payload must survive backup failure"), b"stale");
+
+        fs::remove_dir(&backup).await.expect("remove the one-shot unlink blocker");
+        fs::rename(&held_backup, &backup)
+            .await
+            .expect("restore the unchanged backup inode");
+        assert_eq!(fs::read(&backup).await.expect("canonical rollback backup"), backup_bytes);
+        disk.delete(bucket, &rollback_path, opts)
+            .await
+            .expect("retry cleanup after one-shot unlink failure");
+        assert!(!residue.object_dir.exists(), "successful retry must reclaim the transaction");
+    }
+
+    #[tokio::test]
+    async fn quorum_delete_cleanup_preserves_other_generations_transactions_and_children() {
+        let dir = tempfile::tempdir().expect("create test disk");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        let bucket = "bucket";
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+        let newer_data_dir = Uuid::new_v4();
+        let newer_data = residue.object_dir.join(newer_data_dir.to_string());
+        fs::create_dir_all(&newer_data).await.expect("create newer data directory");
+        fs::write(newer_data.join("part.1"), b"newer payload")
+            .await
+            .expect("write newer payload");
+        let metadata = test_meta(test_file_info(object, Uuid::new_v4(), Some(newer_data_dir), None));
+        fs::write(residue.object_dir.join(STORAGE_FORMAT_FILE), &metadata)
+            .await
+            .expect("publish newer metadata before old transaction cleanup");
+        let unrelated = Uuid::new_v4();
+        let unrelated_backup = residue
+            .object_dir
+            .join(unrelated.to_string())
+            .join(STORAGE_FORMAT_FILE_BACKUP);
+        fs::create_dir_all(unrelated_backup.parent().expect("backup parent"))
+            .await
+            .expect("create unrelated transaction");
+        fs::write(&unrelated_backup, b"corrupt unproven backup")
+            .await
+            .expect("write ambiguous backup");
+        let mismatched_marker = newer_data.join(format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{unrelated}"));
+        fs::write(&mismatched_marker, []).await.expect("write unrelated marker");
+        let child = residue.object_dir.join("child").join(STORAGE_FORMAT_FILE);
+        fs::create_dir_all(child.parent().expect("child parent"))
+            .await
+            .expect("create descendant");
+        fs::write(&child, b"child metadata").await.expect("write descendant metadata");
+
+        disk.delete(
+            bucket,
+            &format!("{object}/{}", residue.transaction),
+            DeleteOptions {
+                recursive: true,
+                immediate: true,
+                old_data_dir: Some(residue.transaction),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("clean only the successful transaction");
+
+        assert!(!residue.backup().exists() && !residue.part().exists() && !residue.marker().exists());
+        assert_eq!(
+            fs::read(residue.object_dir.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("read newer metadata"),
+            metadata
+        );
+        assert_eq!(fs::read(newer_data.join("part.1")).await.expect("read newer payload"), b"newer payload");
+        assert_eq!(
+            fs::read(&unrelated_backup).await.expect("read unproven backup"),
+            b"corrupt unproven backup"
+        );
+        assert!(mismatched_marker.exists());
+        assert_eq!(fs::read(child).await.expect("read descendant"), b"child metadata");
+    }
+
+    // Internal maintenance retains its legacy cleanup behavior while user
+    // buckets require the separate set-wide authorization boundary.
     #[tokio::test]
     async fn delete_versions_finishes_committed_delete_residue() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
-        let bucket = "bucket";
+        let bucket = RUSTFS_META_BUCKET;
         let object = "prefix/object";
         ensure_test_volume(&disk, bucket).await;
         let residue = write_committed_delete_residue(&disk, bucket, object).await;
@@ -25338,7 +27849,7 @@ mod test {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
-        let bucket = "bucket";
+        let bucket = RUSTFS_META_BUCKET;
         let object = "object";
         ensure_test_volume(&disk, bucket).await;
         let residue = write_committed_delete_residue(&disk, bucket, object).await;
@@ -25358,14 +27869,13 @@ mod test {
         assert!(!residue.object_dir.exists(), "the committed residue must be reclaimed");
     }
 
-    // The rollback backup may already be gone; the committed marker alone
-    // proves the delete.
+    // Internal maintenance can finish its legacy marker after backup cleanup.
     #[tokio::test]
     async fn delete_versions_finishes_committed_marker_without_rollback_backup() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
-        let bucket = "bucket";
+        let bucket = RUSTFS_META_BUCKET;
         let object = "object";
         ensure_test_volume(&disk, bucket).await;
         let residue = write_committed_delete_residue(&disk, bucket, object).await;
@@ -25381,15 +27891,14 @@ mod test {
         assert!(!residue.object_dir.exists(), "the committed marker alone must be enough");
     }
 
-    // Only a committed marker on this disk proves the delete. A reserved marker,
-    // a rollback backup alone, or live metadata beside the marker is left for
-    // the owning transaction, rollback, or heal.
+    // Internal maintenance preserves reserved markers, backup-only states and
+    // live metadata for the owning transaction, rollback or heal.
     #[tokio::test]
     async fn committed_delete_residue_finish_leaves_unproven_state_alone() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
-        let bucket = "bucket";
+        let bucket = RUSTFS_META_BUCKET;
         ensure_test_volume(&disk, bucket).await;
 
         // A rollback backup without a committed marker, as an inline object leaves it.
@@ -25418,7 +27927,7 @@ mod test {
 
         for object in ["backup-only", "reserved", "live"] {
             assert_eq!(
-                disk.finish_committed_delete_residue(bucket, object, None).await,
+                disk.finish_internal_delete_residue(bucket, object, None).await,
                 0,
                 "{object} carries no committed proof"
             );
@@ -25445,7 +27954,7 @@ mod test {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
-        let bucket = "bucket";
+        let bucket = RUSTFS_META_BUCKET;
         let object = "logs";
         ensure_test_volume(&disk, bucket).await;
         let residue = write_committed_delete_residue(&disk, bucket, object).await;
@@ -25457,7 +27966,7 @@ mod test {
             .await
             .expect("nested metadata should be written");
 
-        assert_eq!(disk.finish_committed_delete_residue(bucket, object, None).await, 0);
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 0);
         assert!(residue.backup().exists() && residue.marker().exists() && residue.part().exists());
         assert!(nested.exists());
     }
@@ -25473,7 +27982,7 @@ mod test {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
-        let bucket = "bucket";
+        let bucket = RUSTFS_META_BUCKET;
         let object = "object";
         ensure_test_volume(&disk, bucket).await;
         let residue = write_committed_delete_residue(&disk, bucket, object).await;
@@ -25491,7 +28000,7 @@ mod test {
             let _ = release_rx.recv();
         });
 
-        let mut finish = Box::pin(disk.finish_committed_delete_residue(bucket, object, None));
+        let mut finish = Box::pin(disk.finish_internal_delete_residue(bucket, object, None));
         tokio::time::timeout(Duration::from_secs(10), async {
             tokio::select! {
                 entered = entered_rx => entered.expect("finish should reach the marked data dir"),
@@ -25507,7 +28016,7 @@ mod test {
 
         // The abandoned rename is still parked; the next attempt recognizes the
         // residue by its marker and finishes it.
-        assert_eq!(disk.finish_committed_delete_residue(bucket, object, None).await, 1);
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 1);
         assert!(!residue.object_dir.exists(), "the retried finish must reclaim the residue");
 
         // Let the abandoned rename run into its missing source and wait until
@@ -25529,7 +28038,7 @@ mod test {
         let dir = tempfile::tempdir().expect("temp dir should be created");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
-        let bucket = "bucket";
+        let bucket = RUSTFS_META_BUCKET;
         let object = "object";
         ensure_test_volume(&disk, bucket).await;
         let committed = write_committed_delete_residue(&disk, bucket, object).await;
@@ -25548,10 +28057,618 @@ mod test {
             .await
             .expect("unproven backup should be written");
 
-        assert_eq!(disk.finish_committed_delete_residue(bucket, object, None).await, 1);
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 1);
         assert!(!committed.object_dir.join(committed.data_dir.to_string()).exists());
         assert!(unproven_backup.exists(), "a backup without its own committed marker must remain");
         assert_eq!(recorder.counter_value(METRIC_DISK_DELETE_RESIDUE_FINISHED_TOTAL, &[]), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_quorum_receipt_finishes_inline_backup_after_interrupted_cleanup() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let bucket = RUSTFS_META_BUCKET;
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let object_dir = disk.io_get_object_path(bucket, object).expect("object path");
+        let transaction = Uuid::new_v4();
+        let rollback_path = object_dir.join(transaction.to_string());
+        fs::create_dir_all(&rollback_path).await.expect("transaction directory");
+        fs::write(rollback_path.join(STORAGE_FORMAT_FILE_BACKUP), b"inline metadata")
+            .await
+            .expect("inline rollback backup");
+        // Backup alone remains ambiguous. Only the set-quorum receipt permits cleanup.
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 0);
+        fs::write(rollback_path.join(DELETE_QUORUM_COMMITTED_FILE), b"")
+            .await
+            .expect("quorum receipt");
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 1);
+        assert!(!object_dir.exists(), "inline backup and receipt must be reclaimed");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn delete_quorum_cleanup_removes_backup_before_marked_data() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let bucket = "quorum-cleanup-order";
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+        let data_path = residue.part();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hook = hooks::install_at(hooks::Stage::Remove, &data_path, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let transaction_path = format!("{object}/{}", residue.transaction);
+        let mut cleanup = Box::pin(disk.delete(
+            bucket,
+            &transaction_path,
+            DeleteOptions {
+                recursive: true,
+                immediate: true,
+                old_data_dir: Some(residue.transaction),
+                ..Default::default()
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                entered = entered_rx => entered.expect("data cleanup starts"),
+                result = cleanup.as_mut() => panic!("cleanup returned before data removal: {result:?}"),
+            }
+        })
+        .await
+        .expect("cleanup reaches data removal");
+        assert!(!residue.backup().exists(), "backup must disappear before data");
+        assert!(residue.marker().exists(), "data proof must remain during removal");
+        assert!(
+            residue
+                .object_dir
+                .join(residue.transaction.to_string())
+                .join(DELETE_QUORUM_COMMITTED_FILE)
+                .is_file()
+        );
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(10), cleanup)
+            .await
+            .expect("cleanup completes")
+            .expect("cleanup succeeds");
+        assert!(!residue.object_dir.exists(), "completed cleanup reclaims every transaction file");
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn delete_rollback_keeps_markers_until_metadata_restore() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let bucket = "rollback-marker-order";
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+        let backup = residue.backup();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let _hook = hooks::install_at(hooks::Stage::Rename, &backup, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+        let request = residue_delete_request(object);
+        let mut rollback = Box::pin(disk.delete_versions(
+            bucket,
+            request,
+            DeleteOptions {
+                undo_write: true,
+                undo_delete: true,
+                old_data_dir: Some(residue.transaction),
+                ..Default::default()
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                entered = entered_rx => entered.expect("metadata restore starts"),
+                result = rollback.as_mut() => panic!("rollback returned before restore: {result:?}"),
+            }
+        })
+        .await
+        .expect("rollback reaches metadata restore");
+        assert!(residue.marker().exists(), "rollback must retain its marker until metadata is restored");
+        assert!(residue.backup().exists(), "backup must remain before restore rename");
+        drop(release);
+        let errors = tokio::time::timeout(Duration::from_secs(10), rollback)
+            .await
+            .expect("rollback completes");
+        assert!(errors.iter().all(Option::is_none), "{errors:?}");
+        assert!(residue.object_dir.join(STORAGE_FORMAT_FILE).is_file());
+        assert!(!residue.marker().exists());
+        assert!(residue.part().exists());
+    }
+
+    #[tokio::test]
+    async fn delete_rollback_rejects_quorum_committed_transaction() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let bucket = "quorum-rollback-rejection";
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+        fs::write(
+            residue
+                .object_dir
+                .join(residue.transaction.to_string())
+                .join(DELETE_QUORUM_COMMITTED_FILE),
+            b"",
+        )
+        .await
+        .expect("quorum receipt");
+        let errors = disk
+            .delete_versions(
+                bucket,
+                residue_delete_request(object),
+                DeleteOptions {
+                    undo_write: true,
+                    undo_delete: true,
+                    old_data_dir: Some(residue.transaction),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(errors.as_slice(), [Some(DiskError::FileCorrupt)]), "{errors:?}");
+        assert!(
+            !residue.object_dir.join(STORAGE_FORMAT_FILE).exists(),
+            "a committed delete must not resurrect metadata"
+        );
+        assert!(residue.backup().exists() && residue.marker().exists());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn delete_quorum_receipt_sync_failure_preserves_rollback_backup() {
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let bucket = RUSTFS_META_BUCKET;
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+        let rollback_path = residue.object_dir.join(residue.transaction.to_string());
+        os::fsync_dir_recorder::set_failure(&rollback_path, ErrorKind::Other);
+        let result = disk
+            .delete(
+                bucket,
+                &format!("{object}/{}", residue.transaction),
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    old_data_dir: Some(residue.transaction),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(result.is_err(), "failed receipt durability must stop cleanup");
+        assert!(residue.backup().exists() && residue.part().exists() && residue.marker().exists());
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 1);
+        assert!(!residue.object_dir.exists(), "retry must complete the already-decided deletion");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_quorum_backup_removal_sync_failure_retains_receipt() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let bucket = RUSTFS_META_BUCKET;
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+        let transaction_path = residue.object_dir.join(residue.transaction.to_string());
+        let receipt = transaction_path.join(DELETE_QUORUM_COMMITTED_FILE);
+        let _hook = hooks::install_at(hooks::Stage::Remove, &residue.backup(), move || {
+            // Arm after the receipt's initial fsync to fail the ordering fence
+            // between backup unlink and eventual receipt removal.
+            os::fsync_dir_recorder::set_failure(&transaction_path, ErrorKind::Other);
+        });
+        let result = disk
+            .delete(
+                bucket,
+                &format!("{object}/{}", residue.transaction),
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    old_data_dir: Some(residue.transaction),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(result.is_err(), "backup unlink must become durable before removing commitment proof");
+        assert!(receipt.is_file() && residue.part().is_file() && residue.marker().is_file());
+        assert!(!residue.backup().exists());
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 1);
+        assert!(!residue.object_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_quorum_payload_removal_sync_failure_retains_markers_and_receipt() {
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let bucket = RUSTFS_META_BUCKET;
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+        os::fsync_dir_recorder::set_failure(&residue.object_dir.join(residue.data_dir.to_string()), ErrorKind::Other);
+        let receipt = residue
+            .object_dir
+            .join(residue.transaction.to_string())
+            .join(DELETE_QUORUM_COMMITTED_FILE);
+        let result = disk
+            .delete(
+                bucket,
+                &format!("{object}/{}", residue.transaction),
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    old_data_dir: Some(residue.transaction),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(result.is_err(), "payload unlink sync failure must stop marker cleanup");
+        assert!(receipt.is_file() && residue.marker().is_file());
+        assert!(!residue.part().exists());
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 1);
+        assert!(!residue.object_dir.exists());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn delete_generic_uuid_backup_directory_does_not_publish_quorum_receipt() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let bucket = "generic-uuid-delete";
+        ensure_test_volume(&disk, bucket).await;
+        let path = format!("object/{}", Uuid::new_v4());
+        let directory = disk.io_get_object_path(bucket, &path).expect("UUID directory");
+        fs::create_dir_all(&directory).await.expect("UUID directory");
+        fs::write(directory.join("part.1"), b"data").await.expect("part");
+        fs::write(directory.join(STORAGE_FORMAT_FILE_BACKUP), b"write transaction backup")
+            .await
+            .expect("non-delete rollback backup");
+        let receipt = directory.join(DELETE_QUORUM_COMMITTED_FILE);
+        let (receipt_tx, receipt_rx) = tokio::sync::oneshot::channel();
+        let _hook = hooks::install_at(hooks::Stage::Rename, &directory, move || {
+            let _ = receipt_tx.send(receipt.exists());
+        });
+        disk.delete(
+            bucket,
+            &path,
+            DeleteOptions {
+                recursive: true,
+                immediate: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("generic directory deletion");
+        assert!(
+            !receipt_rx.await.expect("inspect directory before deletion"),
+            "ordinary UUID data is not a transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_quorum_receipt_preserves_uuid_prefix_child() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let bucket = RUSTFS_META_BUCKET;
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let transaction = Uuid::new_v4();
+        let transaction_path = format!("{object}/{transaction}");
+        let rollback = disk.io_get_object_path(bucket, &transaction_path).expect("transaction path");
+        let child = rollback.join("child").join(STORAGE_FORMAT_FILE);
+        fs::create_dir_all(child.parent().expect("child directory"))
+            .await
+            .expect("child directory");
+        fs::write(&child, b"live child metadata").await.expect("live child");
+        fs::write(rollback.join(DELETE_QUORUM_COMMITTED_FILE), b"")
+            .await
+            .expect("receipt");
+        fs::write(rollback.join(STORAGE_FORMAT_FILE_BACKUP), b"old backup")
+            .await
+            .expect("backup");
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 0);
+        let result = disk
+            .delete(
+                bucket,
+                &transaction_path,
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    old_data_dir: Some(transaction),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(DiskError::FileCorrupt)), "{result:?}");
+        assert_eq!(fs::read(&child).await.expect("preserved child"), b"live child metadata");
+        assert!(rollback.join(STORAGE_FORMAT_FILE_BACKUP).is_file());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn delete_quorum_cleanup_preserves_child_created_after_classification() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let bucket = "receipt-prefix-race";
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+        let child = residue
+            .object_dir
+            .join(residue.transaction.to_string())
+            .join("child")
+            .join(STORAGE_FORMAT_FILE);
+        let published_child = child.clone();
+        let _hook = hooks::install_at(hooks::Stage::Remove, &residue.part(), move || {
+            std::fs::create_dir_all(published_child.parent().expect("child directory")).expect("concurrent child directory");
+            std::fs::write(&published_child, b"concurrent child").expect("concurrent child metadata");
+        });
+        let result = disk
+            .delete(
+                bucket,
+                &format!("{object}/{}", residue.transaction),
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    old_data_dir: Some(residue.transaction),
+                    ..Default::default()
+                },
+            )
+            .await;
+        result.expect("cleanup preserves a concurrent child and removes only deleted payload");
+        assert_eq!(fs::read(child).await.expect("preserved concurrent child"), b"concurrent child");
+        assert!(!residue.part().exists(), "the original deleted payload must still be reclaimed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_rollback_backup_sync_failure_precedes_metadata_mutation() {
+        for mode in [DurabilityMode::Strict, DurabilityMode::None] {
+            let _mode = durability_mode_override::set(mode);
+            let dir = tempfile::tempdir().expect("temporary directory");
+            let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+            let bucket = "backup-durability-gate";
+            let object = "object";
+            ensure_test_volume(&disk, bucket).await;
+            let root = disk.io_get_object_path(bucket, object).expect("object path");
+            let data_dir = Uuid::new_v4();
+            let data_path = root.join(data_dir.to_string());
+            fs::create_dir_all(&data_path).await.expect("data directory");
+            fs::write(data_path.join("part.1"), b"original payload")
+                .await
+                .expect("payload");
+            let original = test_meta(test_file_info(object, Uuid::nil(), Some(data_dir), None));
+            fs::write(root.join(STORAGE_FORMAT_FILE), &original)
+                .await
+                .expect("original metadata");
+            let transaction = Uuid::new_v4();
+            let rollback = root.join(transaction.to_string());
+            os::fsync_dir_recorder::set_failure(&rollback, ErrorKind::Other);
+            let errors = disk
+                .delete_versions(
+                    bucket,
+                    residue_delete_request(object),
+                    DeleteOptions {
+                        old_data_dir: Some(transaction),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            if mode == DurabilityMode::Strict {
+                assert!(errors.iter().any(Option::is_some), "backup sync failure must stop deletion");
+                assert_eq!(fs::read(root.join(STORAGE_FORMAT_FILE)).await.expect("intact metadata"), original);
+                assert_eq!(fs::read(data_path.join("part.1")).await.expect("intact payload"), b"original payload");
+            } else {
+                assert!(errors.iter().all(Option::is_none), "{errors:?}");
+                assert!(
+                    !os::fsync_dir_recorder::was_fsynced(&rollback),
+                    "none mode must skip backup directory sync"
+                );
+                assert!(
+                    os::fsync_dir_recorder::take_failure(&rollback).is_some(),
+                    "none mode must not consume a sync failure"
+                );
+                assert!(!root.join(STORAGE_FORMAT_FILE).exists(), "none mode still applies the requested delete");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_rollback_restore_sync_failure_retains_markers() {
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let bucket = "restore-durability-gate";
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+        os::fsync_dir_recorder::set_failure(&residue.object_dir, ErrorKind::Other);
+        let opts = DeleteOptions {
+            undo_write: true,
+            undo_delete: true,
+            old_data_dir: Some(residue.transaction),
+            ..Default::default()
+        };
+        let errors = disk
+            .delete_versions(bucket, residue_delete_request(object), opts.clone())
+            .await;
+        assert!(errors.iter().any(Option::is_some), "restore sync failure must remain visible");
+        let bytes = fs::read(residue.object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("restored metadata is readable");
+        assert_eq!(FileMeta::load(&bytes).expect("valid restored metadata").versions.len(), 1);
+        assert!(residue.marker().exists(), "failed durability must retain transaction evidence");
+        assert!(residue.part().exists(), "rollback must retain payload");
+        let errors = disk.delete_versions(bucket, residue_delete_request(object), opts).await;
+        assert!(errors.iter().all(Option::is_none), "retry must finish rollback: {errors:?}");
+        assert!(!residue.marker().exists());
+        assert!(residue.object_dir.join(STORAGE_FORMAT_FILE).is_file());
+    }
+
+    #[tokio::test]
+    async fn delete_quorum_receipt_survives_deferred_snapshot_cleanup() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let bucket = RUSTFS_META_BUCKET;
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+        let data_path = format!("{object}/{}", residue.data_dir);
+        let snapshot = disk
+            .acquire_snapshot_lease(bucket, &data_path)
+            .await
+            .expect("snapshot protects deleted payload");
+        let receipt = residue
+            .object_dir
+            .join(residue.transaction.to_string())
+            .join(DELETE_QUORUM_COMMITTED_FILE);
+        let result = disk
+            .delete(
+                bucket,
+                &format!("{object}/{}", residue.transaction),
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    old_data_dir: Some(residue.transaction),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(DiskError::DiskOngoingReq)), "{result:?}");
+        assert!(receipt.is_file() && residue.marker().is_file() && residue.part().is_file());
+        assert!(!residue.backup().exists(), "committed backup is no longer needed");
+        disk.release_snapshot_lease(bucket, &data_path, snapshot)
+            .await
+            .expect("snapshot release finishes physical cleanup");
+        assert!(!residue.part().exists());
+        assert!(receipt.is_file(), "receipt remains until transaction cleanup observes physical removal");
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 1);
+        assert!(!residue.object_dir.exists());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn delete_quorum_data_cleanup_preserves_concurrent_uuid_prefix_child() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let bucket = "quorum-data-prefix-race";
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+        let child = residue
+            .object_dir
+            .join(residue.data_dir.to_string())
+            .join("child")
+            .join(STORAGE_FORMAT_FILE);
+        let published = child.clone();
+        let _hook = hooks::install_at(hooks::Stage::Remove, &residue.part(), move || {
+            std::fs::create_dir_all(published.parent().expect("child directory")).expect("concurrent child directory");
+            std::fs::write(published, b"new child").expect("concurrent child metadata");
+        });
+        disk.delete(
+            bucket,
+            &format!("{object}/{}", residue.transaction),
+            DeleteOptions {
+                recursive: true,
+                immediate: true,
+                old_data_dir: Some(residue.transaction),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("safe cleanup preserves new descendants");
+        assert_eq!(fs::read(child).await.expect("preserved child"), b"new child");
+        assert!(!residue.part().exists());
+        assert!(!residue.marker().exists());
+    }
+
+    #[tokio::test]
+    async fn delete_quorum_snapshot_replay_preserves_live_uuid_prefix_child() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let bucket = RUSTFS_META_BUCKET;
+        let object = "object";
+        ensure_test_volume(&disk, bucket).await;
+        let residue = write_committed_delete_residue(&disk, bucket, object).await;
+        let data_path = format!("{object}/{}", residue.data_dir);
+        let snapshot = disk.acquire_snapshot_lease(bucket, &data_path).await.expect("snapshot lease");
+        let receipt = residue
+            .object_dir
+            .join(residue.transaction.to_string())
+            .join(DELETE_QUORUM_COMMITTED_FILE);
+        assert!(matches!(
+            disk.delete(
+                bucket,
+                &format!("{object}/{}", residue.transaction),
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    old_data_dir: Some(residue.transaction),
+                    ..Default::default()
+                }
+            )
+            .await,
+            Err(DiskError::DiskOngoingReq)
+        ));
+        let child = residue
+            .object_dir
+            .join(residue.data_dir.to_string())
+            .join("child")
+            .join(STORAGE_FORMAT_FILE);
+        fs::create_dir_all(child.parent().expect("child directory"))
+            .await
+            .expect("live child directory");
+        fs::write(&child, b"live child").await.expect("live child metadata");
+        assert!(
+            disk.release_snapshot_lease(bucket, &data_path, snapshot).await.is_err(),
+            "replay must reject mixed live contents"
+        );
+        assert_eq!(fs::read(&child).await.expect("preserved child"), b"live child");
+        assert!(
+            receipt.is_file() && residue.part().is_file(),
+            "blocked replay retains payload and commitment evidence"
+        );
+        fs::remove_file(&child).await.expect("remove test child metadata");
+        fs::remove_dir(child.parent().expect("child directory"))
+            .await
+            .expect("remove test child directory");
+        assert_eq!(disk.finish_internal_delete_residue(bucket, object, None).await, 1);
+        assert!(!residue.object_dir.exists());
     }
 
     #[tokio::test]
@@ -25809,6 +28926,220 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_windows_delete_version_long_path_crosses_max_path_boundary() {
+        use super::super::DeleteRecoveryAction;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let base_len = dir.path().as_os_str().len().saturating_add(1);
+        let pad_len = 150usize.saturating_sub(base_len).max(16);
+        let root = dir.path().join("x".repeat(pad_len));
+        fs::create_dir_all(&root).await.expect("long disk root should be created");
+        let endpoint = Endpoint::try_from(root.to_str().expect("disk root should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "test-bucket";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_DELETED_BUCKET).await;
+
+        let path_code_units = |path: &Path| -> usize {
+            #[cfg(windows)]
+            {
+                use std::os::windows::ffi::OsStrExt;
+                path.as_os_str().encode_wide().count()
+            }
+            #[cfg(not(windows))]
+            {
+                path.as_os_str().len()
+            }
+        };
+        let probe_rollback_dir = Uuid::new_v4();
+        let single_char_backup_len = path_code_units(
+            &disk
+                .get_object_path(bucket, "dir/a")
+                .expect("probe object path should resolve")
+                .join(probe_rollback_dir.to_string())
+                .join(STORAGE_FORMAT_FILE_BACKUP),
+        );
+
+        for target_backup_len in [259usize, 260, 261, 300] {
+            let key_suffix_len = target_backup_len
+                .checked_sub(single_char_backup_len)
+                .and_then(|extra| extra.checked_add(1))
+                .expect("resolved disk root must leave room for the target backup path length");
+            let object = format!("dir/{}", "a".repeat(key_suffix_len));
+            let physical_object_dir = disk
+                .get_object_path(bucket, &object)
+                .expect("physical long object path should resolve");
+            let object_dir = disk
+                .io_get_object_path(bucket, &object)
+                .expect("io long object path should resolve");
+            let rollback_dir = Uuid::new_v4();
+            let physical_backup_file_path = physical_object_dir
+                .join(rollback_dir.to_string())
+                .join(STORAGE_FORMAT_FILE_BACKUP);
+            assert_eq!(
+                path_code_units(&physical_backup_file_path),
+                target_backup_len,
+                "physical backup path must hit the exact target length: {physical_backup_file_path:?}"
+            );
+            let backup_file_path = object_dir.join(rollback_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+
+            let data_dir = Uuid::new_v4();
+            let data_path = object_dir.join(data_dir.to_string());
+            fs::create_dir_all(&data_path).await.expect("long data dir should be created");
+            fs::write(data_path.join("part.1"), b"x")
+                .await
+                .expect("part data should be written");
+            let fi = test_file_info(&object, Uuid::nil(), Some(data_dir), None);
+            let meta = test_meta(fi.clone());
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), &meta)
+                .await
+                .expect("metadata should be written");
+
+            let read_fi = disk
+                .read_version(
+                    bucket,
+                    bucket,
+                    &object,
+                    "",
+                    &ReadOptions {
+                        read_data: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("read_version should succeed on long path");
+            assert_eq!(read_fi.name, object);
+
+            disk.delete_version(
+                bucket,
+                &object,
+                fi.clone(),
+                false,
+                DeleteOptions {
+                    old_data_dir: Some(rollback_dir),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delete_version should stage rollback backup across MAX_PATH");
+            assert!(backup_file_path.is_file(), "rollback backup must exist at {backup_file_path:?}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&backup_file_path)
+                    .expect("rollback backup metadata should be readable")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600, "rollback backup must retain owner-only 0o600 permissions");
+            }
+
+            disk.undo_write_with_namespace_owner(
+                bucket,
+                &object,
+                fi.clone(),
+                DeleteOptions {
+                    undo_write: true,
+                    undo_delete: true,
+                    old_data_dir: Some(rollback_dir),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("undo_write should restore metadata and data across MAX_PATH");
+            assert_eq!(
+                fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+                    .await
+                    .expect("restored metadata should be readable"),
+                meta
+            );
+            assert!(!object_dir.join(rollback_dir.to_string()).exists());
+
+            let commit_rollback_dir = Uuid::new_v4();
+            disk.delete_version(
+                bucket,
+                &object,
+                fi.clone(),
+                false,
+                DeleteOptions {
+                    old_data_dir: Some(commit_rollback_dir),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("second delete_version should succeed across MAX_PATH");
+            disk.delete_with_namespace_owner(
+                bucket,
+                &format!("{object}/{commit_rollback_dir}"),
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    old_data_dir: Some(commit_rollback_dir),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("cleanup of committed delete transaction should succeed across MAX_PATH");
+            assert!(!object_dir.join(STORAGE_FORMAT_FILE).exists());
+            assert!(!object_dir.join(commit_rollback_dir.to_string()).exists());
+
+            let mut inline_fi = test_file_info(&object, Uuid::nil(), None, Some(Bytes::from_static(b"x")));
+            inline_fi.set_inline_data();
+            let inline_meta = test_meta(inline_fi.clone());
+            fs::create_dir_all(&object_dir)
+                .await
+                .expect("object dir should be recreated for recoverable delete");
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), &inline_meta)
+                .await
+                .expect("inline metadata should be written");
+
+            let tx = Uuid::new_v4();
+            let mut delete_req = FileInfo {
+                name: object.clone(),
+                ..Default::default()
+            };
+            delete_req.set_tier_free_version_id(&Uuid::new_v4().to_string());
+            disk.delete_version_with_namespace_owner(
+                bucket,
+                &object,
+                delete_req,
+                false,
+                DeleteOptions {
+                    old_data_dir: Some(tx),
+                    recoverable_delete: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("recoverable delete_version should prepare across MAX_PATH");
+
+            let inspected = disk
+                .delete_recovery_inspect(bucket, &object, tx)
+                .await
+                .expect("delete_recovery_inspect should succeed across MAX_PATH");
+            let published = disk
+                .delete_recovery_settle(bucket, &object, tx, inspected.fingerprint, DeleteRecoveryAction::PublishCommit, None)
+                .await
+                .expect("PublishCommit should write quorum receipt across MAX_PATH");
+            let finished = disk
+                .delete_recovery_settle(bucket, &object, tx, published.fingerprint, DeleteRecoveryAction::FinishCommit, None)
+                .await
+                .expect("FinishCommit should write finished markers across MAX_PATH");
+            disk.delete_recovery_settle(bucket, &object, tx, finished.fingerprint, DeleteRecoveryAction::FinalizeCommit, None)
+                .await
+                .expect("FinalizeCommit should remove transaction directory across MAX_PATH");
+            assert!(!object_dir.join(STORAGE_FORMAT_FILE).exists());
+            assert!(!object_dir.join(tx.to_string()).exists());
+        }
+    }
+
+    #[tokio::test]
     async fn test_rename_data_failure_before_metadata_commit_preserves_old_metadata() {
         use tempfile::tempdir;
 
@@ -26047,9 +29378,14 @@ mod test {
         // Backdate after the write above: creating stale/data refreshes the
         // scanned tmp/stale directory's mtime.
         backdate_mtime(&tmp.join("stale"), Duration::from_secs(10));
-        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), &publication_root, Duration::ZERO)
-            .await
-            .expect("operation should succeed");
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(
+            dir.path().to_path_buf(),
+            &publication_root,
+            Duration::ZERO,
+            &crate::disk::cleanup_runtime::GcBudget::default(),
+        )
+        .await
+        .expect("operation should succeed");
 
         assert!(!tmp.join("stale").exists());
         assert!(trash.exists());
@@ -26076,15 +29412,58 @@ mod test {
         fs::write(&fresh_dir, b"temporary").await.expect("operation should succeed");
         fs::write(&regular_file, b"keep").await.expect("operation should succeed");
 
-        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), &publication_root, Duration::from_secs(60))
-            .await
-            .expect("operation should succeed");
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(
+            dir.path().to_path_buf(),
+            &publication_root,
+            Duration::from_secs(60),
+            &crate::disk::cleanup_runtime::GcBudget::default(),
+        )
+        .await
+        .expect("operation should succeed");
 
         assert!(tmp.join("fresh").exists());
         assert!(regular_file.exists());
 
         let mut entries = fs::read_dir(&trash).await.expect("operation should succeed");
         assert!(entries.next_entry().await.expect("operation should succeed").is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn background_cleanup_keeps_mount_lease_after_disk_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let root = disk.io_root.clone();
+        let trash_entry = LocalDisk::meta_path(&root, RUSTFS_META_TMP_DELETED_BUCKET).join("detached-gc");
+        fs::create_dir_all(&trash_entry).await.unwrap();
+        fs::write(trash_entry.join("part.1"), b"garbage").await.unwrap();
+        let live_file = root.join("keep");
+        fs::write(&live_file, b"live").await.unwrap();
+        let (exit, exited) = tokio::sync::broadcast::channel(1);
+        tokio::time::pause();
+        let cleanup = tokio::spawn(LocalDisk::cleanup_deleted_objects_loop(
+            root.clone(),
+            disk.publication_root.clone(),
+            disk.mount_lease.clone(),
+            exited,
+        ));
+        tokio::task::yield_now().await;
+        drop(disk);
+        tokio::task::yield_now().await;
+        assert!(live_file.exists(), "the GC owner must retain the original /proc/self/fd root");
+        tokio::time::advance(DELETED_OBJECTS_CLEANUP_INTERVAL + Duration::from_secs(1)).await;
+        tokio::time::resume();
+        timeout(Duration::from_secs(20), async {
+            while trash_entry.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("detached cleanup must finish against the pinned mount");
+        assert_eq!(fs::read(&live_file).await.unwrap(), b"live");
+        exit.send(()).unwrap();
+        timeout(Duration::from_secs(20), cleanup).await.unwrap().unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -28824,6 +32203,9 @@ mod test {
             undo_delete: false,
             old_data_dir: None,
             expected_delete_marker: None,
+            delete_recovery_bucket_incarnation: None,
+            recoverable_delete: false,
+            orphan_data_dir: false,
         };
         disk.delete("test-volume", "test-file.txt", delete_opts)
             .await
@@ -29590,6 +32972,121 @@ mod test {
             os::disk_volume_mutation_lock(&disk.root, volume).try_write_owned().is_ok(),
             "timed-out preparation must not leak a READ"
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_special_cleanup_metadata_contention_with_queued_volume_write() {
+        use crate::disk::disk_store::{LegacyPathDeleteOperation, LocalDiskWrapper};
+        for orphan in [false, true] {
+            for metadata_contention in [true, false] {
+                let root = tempfile::tempdir().expect("special cleanup lock-order fixture");
+                let endpoint = Endpoint::try_from(root.path().to_str().expect("UTF-8 endpoint")).expect("local endpoint");
+                let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+                let volume = "special-cleanup-queued";
+                let object = "object";
+                for name in [volume, RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET] {
+                    ensure_test_volume(&disk, name).await;
+                }
+                let object_path = disk.get_object_path(volume, object).expect("metadata lock identity");
+                let io_object = disk.io_get_object_path(volume, object).expect("physical object path");
+                fs::create_dir_all(&io_object).await.expect("real object directory");
+                let mut fi = test_file_info(object, Uuid::new_v4(), None, Some(Bytes::from_static(b"live inline payload")));
+                fi.set_inline_data();
+                let original = test_meta(fi);
+                fs::write(io_object.join(STORAGE_FORMAT_FILE), &original)
+                    .await
+                    .expect("live metadata");
+                let id = Uuid::new_v4();
+                let path = format!("{object}/{id}");
+                let candidate = io_object.join(id.to_string());
+                fs::create_dir(&candidate).await.expect("exact cleanup candidate");
+                let proof = candidate.join(if orphan { "part.1" } else { STORAGE_FORMAT_FILE_BACKUP });
+                fs::write(&proof, b"preserved until admission")
+                    .await
+                    .expect("real cleanup proof or payload");
+                let opts = if orphan {
+                    DeleteOptions {
+                        orphan_data_dir: true,
+                        ..Default::default()
+                    }
+                } else {
+                    DeleteOptions {
+                        recursive: true,
+                        immediate: true,
+                        old_data_dir: Some(id),
+                        ..Default::default()
+                    }
+                };
+                let wrapper = LocalDiskWrapper::new(disk.clone(), false);
+                let admitted = wrapper
+                    .begin_legacy_path_delete(
+                        volume,
+                        LegacyPathDeleteOperation::Delete,
+                        None,
+                        tokio::time::Instant::now() + Duration::from_secs(30),
+                    )
+                    .await
+                    .expect("A owns the real physical volume READ");
+                let mut deletion = Box::pin(disk.delete_volume(volume, true));
+                assert!(
+                    matches!(futures::poll!(deletion.as_mut()), std::task::Poll::Pending),
+                    "W queues behind A's actual READ"
+                );
+                let contention: Arc<dyn Send + Sync> = if metadata_contention {
+                    os::acquire_metadata_mutation_lease(&object_path, None).await
+                } else {
+                    os::acquire_namespace_mutation_lease_with_owner(&candidate, None).await
+                };
+                let volume_lock = os::disk_volume_mutation_lock(&disk.root, volume);
+                let mut competing = Box::pin(async move {
+                    let read = volume_lock.read_owned().await;
+                    (contention, read)
+                });
+                assert!(
+                    matches!(futures::poll!(competing.as_mut()), std::task::Poll::Pending),
+                    "B holds the selected M or namespace key and queues READ behind W"
+                );
+                let result = timeout(Duration::from_secs(5), admitted.delete(&path, opts.clone()))
+                    .await
+                    .expect("A must try the held M or namespace instead of forming a lock cycle");
+                assert!(
+                    matches!(result, Err(DiskError::Io(error)) if error.kind() == ErrorKind::WouldBlock),
+                    "exact admitted cleanup contention result"
+                );
+                assert_eq!(fs::read(&proof).await.expect("cleanup has not started"), b"preserved until admission");
+                assert_eq!(
+                    fs::read(io_object.join(STORAGE_FORMAT_FILE))
+                        .await
+                        .expect("unchanged live metadata"),
+                    original
+                );
+                drop(deletion);
+                drop(
+                    timeout(Duration::from_secs(5), competing)
+                        .await
+                        .expect("B drains after W is cancelled"),
+                );
+                wrapper
+                    .begin_legacy_path_delete(
+                        volume,
+                        LegacyPathDeleteOperation::Delete,
+                        None,
+                        tokio::time::Instant::now() + Duration::from_secs(30),
+                    )
+                    .await
+                    .expect("uncontended retry admission")
+                    .delete(&path, opts)
+                    .await
+                    .expect("exact cleanup retry succeeds");
+                assert!(!candidate.exists(), "only the exact orphan or committed transaction is removed");
+                assert_eq!(
+                    fs::read(io_object.join(STORAGE_FORMAT_FILE))
+                        .await
+                        .expect("live version survives exact cleanup"),
+                    original
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -30609,10 +34106,12 @@ mod test {
 
     #[tokio::test]
     async fn test_read_file_exists() {
-        let test_file = "./test_read_exists.txt";
+        let directory = tempfile::tempdir().expect("test directory");
+        let root = os::PublicationRoot::new(directory.path()).expect("publication root");
+        let test_file = &directory.path().join("read_exists");
 
         // Test non-existent file
-        let (data, metadata) = read_file_exists(test_file).await.expect("operation should succeed");
+        let (data, metadata) = read_file_exists(test_file, &root).await.expect("operation should succeed");
         assert!(data.is_empty());
         assert!(metadata.is_none());
 
@@ -30620,7 +34119,7 @@ mod test {
         fs::write(test_file, b"test content").await.expect("operation should succeed");
 
         // Test existing file
-        let (data, metadata) = read_file_exists(test_file).await.expect("operation should succeed");
+        let (data, metadata) = read_file_exists(test_file, &root).await.expect("operation should succeed");
         assert_eq!(data.as_ref(), b"test content");
         assert!(metadata.is_some());
 
@@ -30630,33 +34129,19 @@ mod test {
 
     #[tokio::test]
     async fn test_read_file_all() {
-        let test_file = "./test_read_all.txt";
+        let directory = tempfile::tempdir().expect("test directory");
+        let root = os::PublicationRoot::new(directory.path()).expect("publication root");
+        let test_file = &directory.path().join("read_all");
         let test_content = b"test content for read_all";
 
         // Create test file
         fs::write(test_file, test_content).await.expect("operation should succeed");
 
         // Test reading file
-        let (data, metadata) = read_file_all(test_file).await.expect("operation should succeed");
+        let (data, metadata) = read_file_all(test_file, &root).await.expect("operation should succeed");
         assert_eq!(data.as_ref(), test_content);
         assert!(metadata.is_file());
         assert_eq!(metadata.len(), test_content.len() as u64);
-
-        // Clean up
-        let _ = fs::remove_file(test_file).await;
-    }
-
-    #[tokio::test]
-    async fn test_read_file_metadata() {
-        let test_file = "./test_metadata.txt";
-
-        // Create test file
-        fs::write(test_file, b"test").await.expect("operation should succeed");
-
-        // Test reading metadata
-        let metadata = read_file_metadata(test_file).await.expect("operation should succeed");
-        assert!(metadata.is_file());
-        assert_eq!(metadata.len(), 4); // "test" is 4 bytes
 
         // Clean up
         let _ = fs::remove_file(test_file).await;
@@ -31025,6 +34510,22 @@ mod test {
         assert!(debug.contains("endpoint"));
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_local_disk_opens_url_style_drive_endpoint() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let drive_path = dir.path().to_string_lossy().replace('\\', "/");
+        let endpoint =
+            Endpoint::try_from(format!("http://127.0.0.1:9000/{drive_path}").as_str()).expect("URL endpoint should parse");
+        assert_eq!(Path::new(&endpoint.get_file_path()), dir.path());
+
+        LocalDisk::new(&endpoint, false)
+            .await
+            .expect("a URL-style drive endpoint must open as a local disk");
+    }
+
     #[tokio::test]
     async fn std_backend_truncate_append_stream_and_full_read_restore_bytes() {
         use tempfile::tempdir;
@@ -31197,6 +34698,303 @@ mod test {
         assert!(construction_source.is::<ErasureConstructionError>());
     }
 
+    async fn write_orphan_test_parent_metadata(disk: &LocalDisk, data_dir: Uuid) {
+        let mut info = FileInfo::new("object", 1, 1);
+        info.data_dir = Some(data_dir);
+        info.mod_time = Some(OffsetDateTime::now_utc());
+        info.size = 1;
+        let mut metadata = FileMeta::default();
+        metadata.add_version(info).expect("add parent version");
+        disk.write_all("orphan", "object/xl.meta", metadata.marshal_msg().expect("encode parent metadata").into())
+            .await
+            .expect("publish parent metadata");
+    }
+
+    #[tokio::test]
+    async fn orphan_data_dir_cleanup_preserves_protected_entries() {
+        let root = tempfile::tempdir().expect("create disk root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create disk");
+        ensure_test_volume(&disk, "orphan").await;
+        write_orphan_test_parent_metadata(&disk, Uuid::new_v4()).await;
+        for protected in [
+            "xl.meta".to_owned(),
+            "unknown".to_owned(),
+            STORAGE_FORMAT_FILE_BACKUP.to_owned(),
+            DELETE_QUORUM_COMMITTED_FILE.to_owned(),
+            delete_recovery::PREPARED.to_owned(),
+            format!("{DELETE_DATA_DIR_MARKER_PREFIX}{}", Uuid::new_v4()),
+        ] {
+            let path = format!("object/{}", Uuid::new_v4());
+            disk.write_all("orphan", &format!("{path}/part.1"), Bytes::from_static(b"payload"))
+                .await
+                .expect("write payload");
+            disk.write_all("orphan", &format!("{path}/{protected}"), Bytes::from_static(b"witness"))
+                .await
+                .expect("write protected entry");
+            assert!(!disk.is_plain_orphan_data_dir("orphan", &path).await.expect("probe leaf"));
+            assert!(
+                disk.delete_data_dir(
+                    "orphan",
+                    &path,
+                    DeleteOptions {
+                        orphan_data_dir: true,
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                disk.read_all("orphan", &format!("{path}/part.1"))
+                    .await
+                    .expect("read payload"),
+                b"payload"[..]
+            );
+            assert_eq!(
+                disk.read_all("orphan", &format!("{path}/{protected}"))
+                    .await
+                    .expect("read witness"),
+                b"witness"[..]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orphan_data_dir_cleanup_rejects_symlinks() {
+        let root = tempfile::tempdir().expect("create disk root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create disk");
+        ensure_test_volume(&disk, "orphan").await;
+        write_orphan_test_parent_metadata(&disk, Uuid::new_v4()).await;
+        let path = format!("object/{}", Uuid::new_v4());
+        disk.write_all("orphan", &format!("{path}/part.1"), Bytes::from_static(b"payload"))
+            .await
+            .expect("write payload");
+        let directory = disk.io_get_object_path("orphan", &path).expect("resolve leaf");
+        std::os::unix::fs::symlink(directory.join("part.1"), directory.join("part.2")).expect("create symlink");
+        assert!(!disk.is_plain_orphan_data_dir("orphan", &path).await.expect("probe leaf"));
+        assert!(
+            disk.delete_data_dir(
+                "orphan",
+                &path,
+                DeleteOptions {
+                    orphan_data_dir: true,
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read(directory.join("part.1")).expect("read payload"), b"payload");
+        assert!(
+            std::fs::symlink_metadata(directory.join("part.2"))
+                .expect("stat symlink")
+                .is_symlink()
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn orphan_data_dir_cleanup_preserves_child_created_after_preflight() {
+        use crate::disk::os::prepared_publication_test_hooks as hooks;
+
+        let root = tempfile::tempdir().expect("create disk root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create disk");
+        ensure_test_volume(&disk, "orphan").await;
+        write_orphan_test_parent_metadata(&disk, Uuid::new_v4()).await;
+        let path = format!("object/{}", Uuid::new_v4());
+        disk.write_all("orphan", &format!("{path}/part.1"), Bytes::from_static(b"stale"))
+            .await
+            .expect("write orphan payload");
+        let directory = disk.io_get_object_path("orphan", &path).expect("resolve leaf");
+        let child = directory.join("child");
+        let published_child = child.clone();
+        let _hook = hooks::install_at(hooks::Stage::Remove, &directory.join("part.1"), move || {
+            std::fs::create_dir_all(&published_child).expect("publish concurrent child");
+            std::fs::write(published_child.join("xl.meta"), b"child metadata").expect("publish child metadata");
+            std::fs::write(published_child.join("part.1"), b"child payload").expect("publish child payload");
+        });
+        assert!(disk.is_plain_orphan_data_dir("orphan", &path).await.expect("probe leaf"));
+        assert!(
+            disk.delete_data_dir(
+                "orphan",
+                &path,
+                DeleteOptions {
+                    orphan_data_dir: true,
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read(child.join("xl.meta")).expect("read child metadata"), b"child metadata");
+        assert_eq!(std::fs::read(child.join("part.1")).expect("read child payload"), b"child payload");
+        assert!(!directory.join("part.1").exists(), "classified orphan part was removed without recursing");
+    }
+
+    #[tokio::test]
+    async fn orphan_data_dir_cleanup_rechecks_snapshot_deferred_leaf() {
+        let root = tempfile::tempdir().expect("create disk root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create disk");
+        ensure_test_volume(&disk, "orphan").await;
+        write_orphan_test_parent_metadata(&disk, Uuid::new_v4()).await;
+        let path = format!("object/{}", Uuid::new_v4());
+        disk.write_all("orphan", &format!("{path}/part.1"), Bytes::from_static(b"payload"))
+            .await
+            .expect("write orphan payload");
+        let token = disk.acquire_snapshot_lease("orphan", &path).await.expect("acquire snapshot");
+        assert_eq!(
+            disk.delete_data_dir(
+                "orphan",
+                &path,
+                DeleteOptions {
+                    orphan_data_dir: true,
+                    ..Default::default()
+                }
+            )
+            .await
+            .expect("defer cleanup"),
+            DataDirDeleteStatus::Deferred
+        );
+        disk.write_all("orphan", &format!("{path}/child/xl.meta"), Bytes::from_static(b"child metadata"))
+            .await
+            .expect("publish child while snapshot is retained");
+        assert!(disk.release_snapshot_lease("orphan", &path, token).await.is_err());
+        assert_eq!(
+            disk.read_all("orphan", &format!("{path}/part.1"))
+                .await
+                .expect("read protected part"),
+            b"payload"[..]
+        );
+        assert_eq!(
+            disk.read_all("orphan", &format!("{path}/child/xl.meta"))
+                .await
+                .expect("read child metadata"),
+            b"child metadata"[..]
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_data_dir_cleanup_preserves_referenced_payload_after_snapshot_deferral() {
+        let root = tempfile::tempdir().expect("create disk root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create disk");
+        ensure_test_volume(&disk, "orphan").await;
+        write_orphan_test_parent_metadata(&disk, Uuid::new_v4()).await;
+        let data_dir = Uuid::new_v4();
+        let path = format!("object/{data_dir}");
+        disk.write_all("orphan", &format!("{path}/part.1"), Bytes::from_static(b"restored payload"))
+            .await
+            .expect("write orphan payload");
+        let token = disk.acquire_snapshot_lease("orphan", &path).await.expect("acquire snapshot");
+        assert_eq!(
+            disk.delete_data_dir(
+                "orphan",
+                &path,
+                DeleteOptions {
+                    orphan_data_dir: true,
+                    ..Default::default()
+                }
+            )
+            .await
+            .expect("defer cleanup"),
+            DataDirDeleteStatus::Deferred
+        );
+        write_orphan_test_parent_metadata(&disk, data_dir).await;
+        assert!(disk.release_snapshot_lease("orphan", &path, token).await.is_err());
+        assert_eq!(
+            disk.read_all("orphan", &format!("{path}/part.1"))
+                .await
+                .expect("read newly referenced payload"),
+            b"restored payload"[..]
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_data_dir_cleanup_preserves_journal_created_after_snapshot_deferral() {
+        let root = tempfile::tempdir().expect("create disk root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create disk");
+        ensure_test_volume(&disk, "orphan").await;
+        write_orphan_test_parent_metadata(&disk, Uuid::new_v4()).await;
+        let path = format!("object/{}", Uuid::new_v4());
+        let part = format!("{path}/part.1");
+        disk.write_all("orphan", &part, Bytes::from_static(b"rollback payload"))
+            .await
+            .expect("write orphan payload");
+        let token = disk.acquire_snapshot_lease("orphan", &path).await.expect("acquire snapshot");
+        assert_eq!(
+            disk.delete_data_dir(
+                "orphan",
+                &path,
+                DeleteOptions {
+                    orphan_data_dir: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("defer cleanup"),
+            DataDirDeleteStatus::Deferred
+        );
+        let record = format!("object/{}/{}", Uuid::new_v4(), delete_recovery::PREPARED);
+        disk.write_all("orphan", &record, Bytes::from_static(b"malformed prepared record"))
+            .await
+            .expect("publish recovery record after cleanup was deferred");
+        assert_eq!(disk.release_snapshot_lease("orphan", &path, token).await, Err(DiskError::DiskOngoingReq));
+        assert_eq!(
+            disk.read_all("orphan", &part).await.expect("read retained rollback payload"),
+            b"rollback payload"[..]
+        );
+        assert_eq!(
+            disk.read_all("orphan", &record).await.expect("read retained recovery record"),
+            b"malformed prepared record"[..]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orphan_data_dir_cleanup_propagates_parent_directory_sync_failure() {
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let root = tempfile::tempdir().expect("create disk root");
+        let endpoint = Endpoint::try_from(root.path().to_string_lossy().as_ref()).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create disk");
+        ensure_test_volume(&disk, "orphan").await;
+        write_orphan_test_parent_metadata(&disk, Uuid::new_v4()).await;
+        let path = format!("object/{}", Uuid::new_v4());
+        disk.write_all("orphan", &format!("{path}/part.1"), Bytes::from_static(b"stale"))
+            .await
+            .expect("write orphan payload");
+        let parent = disk.io_get_object_path("orphan", "object").expect("resolve parent directory");
+        os::fsync_dir_recorder::set_failure(&parent, ErrorKind::Other);
+        assert!(
+            disk.delete_data_dir(
+                "orphan",
+                &path,
+                DeleteOptions {
+                    orphan_data_dir: true,
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err(),
+            "a failed parent sync cannot report durable reclamation"
+        );
+        assert!(
+            !disk
+                .io_get_object_path("orphan", &path)
+                .expect("resolve data directory")
+                .exists()
+        );
+        assert!(
+            os::fsync_dir_recorder::take_failure(&parent).is_none(),
+            "the rmdir must attempt parent synchronization"
+        );
+    }
+
     #[tokio::test]
     async fn snapshot_leases_defer_data_dir_cleanup_until_last_release() {
         use tempfile::tempdir;
@@ -31250,9 +35048,14 @@ mod test {
             Bytes::from_static(b"later")
         );
 
-        disk.release_snapshot_lease(volume, &data_dir, renewed)
-            .await
-            .expect("renewed lease release should succeed");
+        assert!(
+            disk.release_snapshot_lease_without_cleanup(volume, &data_dir, renewed).await,
+            "a non-final reader release must not dispatch cleanup"
+        );
+        assert!(
+            !disk.release_snapshot_lease_without_cleanup(volume, &data_dir, second).await,
+            "the final reader must retain its token for owned deferred reclamation"
+        );
         assert!(
             disk.read_all(volume, &first_part).await.is_ok(),
             "one remaining lease must keep the data directory"
@@ -31337,6 +35140,44 @@ mod test {
             disk.read_all(volume, &path_join_buf(&[&data_dir, "part.1"])).await,
             Err(DiskError::FileNotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn quota_mutation_fence_token_is_bound_to_resource_and_disk_process() {
+        let root_dir = tempfile::tempdir().expect("create quota fence disk");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("parse disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("open initial disk process");
+        let bucket = "quota-fence-volume";
+        let object = "object";
+        let fence_path = quota_mutation_fence_path(bucket, object);
+        let token = disk
+            .acquire_snapshot_lease(RUSTFS_META_BUCKET, &fence_path)
+            .await
+            .expect("acquire initial quota token");
+        drop(
+            disk.claim_quota_mutation_fence(bucket, object, token)
+                .await
+                .expect("claim matching token"),
+        );
+        assert!(disk.claim_quota_mutation_fence(bucket, "other", token).await.is_err());
+        assert!(disk.claim_quota_mutation_fence("other-bucket", object, token).await.is_err());
+        drop(disk);
+
+        let reopened = LocalDisk::new(&endpoint, false).await.expect("reopen the same disk");
+        let successor = reopened
+            .acquire_snapshot_lease(RUSTFS_META_BUCKET, &fence_path)
+            .await
+            .expect("acquire successor process token");
+        assert!(
+            reopened.claim_quota_mutation_fence(bucket, object, token).await.is_err(),
+            "a token issued before restart must not authorize a later process"
+        );
+        drop(
+            reopened
+                .claim_quota_mutation_fence(bucket, object, successor)
+                .await
+                .expect("claim successor token"),
+        );
     }
 
     #[tokio::test]

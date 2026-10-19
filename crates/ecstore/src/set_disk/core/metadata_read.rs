@@ -66,6 +66,7 @@ use tokio::task::JoinSet;
 pub(in crate::set_disk) struct MetadataReadResult {
     pub(in crate::set_disk) slots: Vec<MetadataDiskObservation>,
     pub(in crate::set_disk) diagnostics: MetadataFanoutDiagnostics,
+    pub(in crate::set_disk) condition_stopped: bool,
 }
 
 impl MetadataReadResult {
@@ -170,6 +171,23 @@ fn read_version_coalescing_delay() -> Duration {
 struct CoalescedReadVersionRequest {
     item: BatchReadVersionItem,
     tx: oneshot::Sender<disk::error::Result<FileInfo>>,
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    context: crate::cluster::rpc::runtime_sources::ReadVersionDiagnosticContext,
+}
+
+impl CoalescedReadVersionRequest {
+    fn new(item: BatchReadVersionItem, tx: oneshot::Sender<disk::error::Result<FileInfo>>) -> Self {
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let context = crate::cluster::rpc::runtime_sources::ReadVersionDiagnosticContext::capture();
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        context.observe(rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::CoalescerEnqueue);
+        Self {
+            item,
+            tx,
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            context,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -245,26 +263,49 @@ async fn read_version_via_coalescer(
     allow_coalescing: bool,
 ) -> disk::error::Result<FileInfo> {
     if !allow_coalescing || !read_version_coalescing_enabled() {
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        return crate::cluster::rpc::runtime_sources::with_read_version_request_caller_if_absent(
+            rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller::MetadataRead,
+            disk.read_version(org_bucket, bucket, object, version_id, opts),
+        )
+        .await;
+        #[cfg(not(feature = "diagnostic-read-version-caller"))]
         return disk.read_version(org_bucket, bucket, object, version_id, opts).await;
     }
     if !matches!(disk.as_ref(), Disk::Remote(_)) {
         record_read_version_coalescer_event("bypass_non_remote", 1);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        return crate::cluster::rpc::runtime_sources::with_read_version_request_caller_if_absent(
+            rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller::MetadataRead,
+            disk.read_version(org_bucket, bucket, object, version_id, opts),
+        )
+        .await;
+        #[cfg(not(feature = "diagnostic-read-version-caller"))]
         return disk.read_version(org_bucket, bucket, object, version_id, opts).await;
     }
 
-    let (tx, rx) = oneshot::channel();
     let item = BatchReadVersionItem {
         org_volume: org_bucket.to_string(),
         volume: bucket.to_string(),
         path: object.to_string(),
         version_id: version_id.to_string(),
     };
+    enqueue_coalesced_read_version(disk, item, opts).await
+}
+
+pub(super) async fn enqueue_coalesced_read_version(
+    disk: DiskStore,
+    item: BatchReadVersionItem,
+    opts: &ReadOptions,
+) -> disk::error::Result<FileInfo> {
+    let (tx, rx) = oneshot::channel();
     let lane_key = ReadVersionCoalescerKey::new(&disk, opts);
+    let request = CoalescedReadVersionRequest::new(item, tx);
     let pending = {
         let mut coalescer = read_version_coalescer().lock().await;
         let lane = coalescer.lanes.entry(lane_key).or_default();
         let schedule_delayed_flush = lane.is_empty();
-        lane.push(CoalescedReadVersionRequest { item, tx });
+        lane.push(request);
         if lane.len() >= BATCH_READ_VERSION_MAX_ITEMS {
             coalescer.lanes.remove(&lane_key)
         } else if schedule_delayed_flush {
@@ -325,20 +366,24 @@ async fn flush_read_version_coalescer_pending(
 
     let mut senders = Vec::with_capacity(pending.len());
     let mut items = Vec::with_capacity(pending.len());
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let mut contexts = Vec::with_capacity(pending.len());
     for request in pending {
         senders.push(request.tx);
         items.push(request.item);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        contexts.push(request.context);
     }
 
     let expected_items = items.iter().map(ExpectedBatchReadVersionItem::from).collect::<Vec<_>>();
     record_read_version_coalescer_event("attempted_batch", items.len());
-    let result =
-        match tokio::time::timeout(get_drive_metadata_timeout(), disk.batch_read_version(BatchReadVersionReq { items, opts }))
-            .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(DiskError::Timeout),
-        };
+    let batch = disk.batch_read_version(BatchReadVersionReq { items, opts });
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let batch = crate::cluster::rpc::runtime_sources::with_read_version_batch_contexts(contexts, batch);
+    let result = match tokio::time::timeout(get_drive_metadata_timeout(), batch).await {
+        Ok(result) => result,
+        Err(_) => Err(DiskError::Timeout),
+    };
     match result {
         Ok(responses) => {
             let map_started = batch_read_version_stage_timer();
@@ -575,6 +620,7 @@ impl MetadataFanoutDiagnostics {
 
     pub(in crate::set_disk) fn record_quorum_candidate_latency(&self, path: &'static str, read_quorum: usize) {
         if let Some(latency) = self.quorum_candidate_latency(read_quorum) {
+            rustfs_io_metrics::record_get_object_metadata_quorum_result(path, "reached");
             rustfs_io_metrics::record_get_object_quorum_reached_latency(path, latency.as_secs_f64());
         }
     }
@@ -655,6 +701,8 @@ async fn inline_body_miss_reason_from_observations<'a>(
         return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
     };
 
+    #[cfg(test)]
+    crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
     match try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, object_size).await {
         Some(body) if body.len() == object_size => None,
         _ => Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY),
@@ -1012,6 +1060,10 @@ impl SetDisks {
         let object: Arc<str> = Arc::from(object);
         let version_id: Arc<str> = Arc::from(version_id);
         let slowtail_fault = get_metadata_slowtail_fault_request(bucket.as_ref(), object.as_ref(), read_data);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let diagnostic_context = crate::cluster::rpc::runtime_sources::ReadVersionDiagnosticContext::capture_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::MetadataRead,
+        );
         let futures = disks.iter().enumerate().map(|(disk_index, disk)| {
             let disk = disk.clone();
             let task_opts = opts;
@@ -1020,21 +1072,35 @@ impl SetDisks {
             let object = object.clone();
             let version_id = version_id.clone();
             let slowtail_fault = slowtail_fault.clone();
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            #[allow(clippy::redundant_locals)]
+            let diagnostic_context = diagnostic_context;
             AbortOnDropJoinHandle(tokio::spawn(async move {
-                let response_start = observe.then(Instant::now);
-                let result = if let Some(disk) = disk {
-                    Self::record_read_version_call(&object, disk_index);
-                    if let Some(delay) = slowtail_fault.as_ref().and_then(|fault| fault.delay_for_disk(disk_index)) {
-                        Self::record_metadata_slowtail_fault(&object, disk_index);
-                        tokio::time::sleep(delay).await;
-                    }
-                    read_version_via_coalescer(disk, &org_bucket, &bucket, &object, &version_id, &task_opts, allow_coalescing)
-                        .await
-                } else {
-                    Err(DiskError::DiskNotFound)
+                let read = async move {
+                    let response_start = observe.then(Instant::now);
+                    let result = if let Some(disk) = disk {
+                        Self::record_read_version_call(&object, disk_index);
+                        if let Some(delay) = slowtail_fault.as_ref().and_then(|fault| fault.delay_for_disk(disk_index)) {
+                            Self::record_metadata_slowtail_fault(&object, disk_index);
+                            tokio::time::sleep(delay).await;
+                        }
+                        read_version_via_coalescer(disk, &org_bucket, &bucket, &object, &version_id, &task_opts, allow_coalescing)
+                            .await
+                    } else {
+                        Err(DiskError::DiskNotFound)
+                    };
+                    let elapsed = response_start.map(|start| start.elapsed());
+                    (result, elapsed)
                 };
-                let elapsed = response_start.map(|start| start.elapsed());
-                (result, elapsed)
+                #[cfg(feature = "diagnostic-read-version-caller")]
+                return crate::cluster::rpc::runtime_sources::with_read_version_diagnostic_context(
+                    diagnostic_context,
+                    rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::FullWait,
+                    read,
+                )
+                .await;
+                #[cfg(not(feature = "diagnostic-read-version-caller"))]
+                read.await
             }))
         });
 
@@ -1078,7 +1144,11 @@ impl SetDisks {
                 0,
             );
         }
-        Ok(MetadataReadResult { slots, diagnostics })
+        Ok(MetadataReadResult {
+            slots,
+            diagnostics,
+            condition_stopped: false,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1121,10 +1191,15 @@ impl SetDisks {
         let mut next_fanout_index = 0usize;
         let mut scheduled_count = 0usize;
         let mut force_full_wait = false;
+        let read_condition_active = read_data && crate::object_api::get_object_read_condition_is_active();
         let mut final_miss_reason_override = None;
         let mut non_inline_candidate_eligible = None;
         let mut single_pending_hedge_deadline = None;
         let slowtail_fault = get_metadata_slowtail_fault_request(bucket.as_ref(), object.as_ref(), read_data);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let diagnostic_context = crate::cluster::rpc::runtime_sources::ReadVersionDiagnosticContext::capture_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::MetadataRead,
+        );
         let spawn_read_version = |join_set: &mut JoinSet<(usize, disk::error::Result<FileInfo>, Duration)>,
                                   task_ids: &mut [Option<tokio::task::Id>],
                                   index: usize,
@@ -1135,27 +1210,45 @@ impl SetDisks {
             let object = object.clone();
             let version_id = version_id.clone();
             let slowtail_fault = slowtail_fault.clone();
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            #[allow(clippy::redundant_locals)]
+            let diagnostic_context = diagnostic_context;
             let task = join_set.spawn(async move {
-                let response_start = Instant::now();
-                let result = if let Some(disk) = disk {
-                    #[cfg(test)]
-                    let _fanout_task_guard = rename_fanout_barrier::task_guard(&object);
-                    Self::record_read_version_call(&object, index);
-                    #[cfg(test)]
-                    Self::read_version_fanout_barrier(&object, index).await;
-                    if let Some(delay) = slowtail_fault.as_ref().and_then(|fault| fault.delay_for_disk(index)) {
-                        Self::record_metadata_slowtail_fault(&object, index);
+                let read = async move {
+                    let response_start = Instant::now();
+                    let result = if let Some(disk) = disk {
                         #[cfg(test)]
-                        rename_fanout_barrier::checkpoint(&object, index, rename_fanout_barrier::PHASE_METADATA_SLOWTAIL_FAULT)
+                        let _fanout_task_guard = rename_fanout_barrier::task_guard(&object);
+                        Self::record_read_version_call(&object, index);
+                        #[cfg(test)]
+                        Self::read_version_fanout_barrier(&object, index).await;
+                        if let Some(delay) = slowtail_fault.as_ref().and_then(|fault| fault.delay_for_disk(index)) {
+                            Self::record_metadata_slowtail_fault(&object, index);
+                            #[cfg(test)]
+                            rename_fanout_barrier::checkpoint(
+                                &object,
+                                index,
+                                rename_fanout_barrier::PHASE_METADATA_SLOWTAIL_FAULT,
+                            )
                             .await;
-                        tokio::time::sleep(delay).await;
-                    }
-                    read_version_via_coalescer(disk, &org_bucket, &bucket, &object, &version_id, &task_opts, allow_coalescing)
-                        .await
-                } else {
-                    Err(DiskError::DiskNotFound)
+                            tokio::time::sleep(delay).await;
+                        }
+                        read_version_via_coalescer(disk, &org_bucket, &bucket, &object, &version_id, &task_opts, allow_coalescing)
+                            .await
+                    } else {
+                        Err(DiskError::DiskNotFound)
+                    };
+                    (index, result, response_start.elapsed())
                 };
-                (index, result, response_start.elapsed())
+                #[cfg(feature = "diagnostic-read-version-caller")]
+                return crate::cluster::rpc::runtime_sources::with_read_version_diagnostic_context(
+                    diagnostic_context,
+                    rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::EarlyStop,
+                    read,
+                )
+                .await;
+                #[cfg(not(feature = "diagnostic-read-version-caller"))]
+                read.await
             });
             task_ids[index] = Some(task.id());
         };
@@ -1258,12 +1351,28 @@ impl SetDisks {
                 }
             }
 
-            if !force_full_wait
+            if (!force_full_wait || read_condition_active)
                 && let Some(decision) = accumulator
                     .early_stop_decision()
                     .or_else(|| accumulator.version_early_stop_decision())
             {
-                let should_return_early = if read_data {
+                let condition_stopped = read_condition_active
+                    && decision.reason == crate::diagnostics::get::GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM
+                    && accumulator.candidate.as_ref().is_some_and(|candidate| {
+                        !candidate.deleted
+                            && crate::object_api::get_object_read_condition_is_terminal(
+                                crate::object_api::GetObjectReadMetadata::from_file_info(
+                                    bucket.as_ref(),
+                                    object.as_ref(),
+                                    candidate,
+                                ),
+                            )
+                    });
+                let should_return_early = if condition_stopped {
+                    true
+                } else if force_full_wait {
+                    false
+                } else if read_data {
                     match accumulator.candidate.as_ref() {
                         Some(_candidate) if non_inline_candidate_eligible == Some(true) => {
                             accumulator.candidate_has_read_reserve()
@@ -1332,7 +1441,11 @@ impl SetDisks {
                         cancelled_count,
                     );
                     let diagnostics = MetadataFanoutDiagnostics::new(fanout_start.elapsed(), observations);
-                    return Ok(MetadataReadResult { slots, diagnostics });
+                    return Ok(MetadataReadResult {
+                        slots,
+                        diagnostics,
+                        condition_stopped,
+                    });
                 }
             }
 
@@ -1410,7 +1523,11 @@ impl SetDisks {
         rustfs_io_metrics::record_get_object_metadata_early_stop_saved_responses(metrics_path, 0);
         rustfs_io_metrics::record_get_object_metadata_fanout_lifecycle(metrics_path, scheduled_count, scheduled_count, 0);
         let diagnostics = MetadataFanoutDiagnostics::new(fanout_start.elapsed(), observations);
-        Ok(MetadataReadResult { slots, diagnostics })
+        Ok(MetadataReadResult {
+            slots,
+            diagnostics,
+            condition_stopped: false,
+        })
     }
 
     /// Test-only seam that records one per-disk `read_version` metadata RPC for

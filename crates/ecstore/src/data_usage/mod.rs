@@ -1325,6 +1325,18 @@ fn select_admin_data_usage_snapshot(
                 && authoritative.is_complete_bucket_usage_snapshot()
                 && observed_data_usage_is_newer(&observed, &authoritative) =>
         {
+            // A bucket can span several sets. Without a current or retained
+            // generation for every live set, its observed sum is only a subset,
+            // not a replacement for the last complete bucket total. Keep the
+            // baseline's timestamp and provenance until coverage is available.
+            if authoritative_format
+                && observed
+                    .usage_snapshot_set_states
+                    .iter()
+                    .any(|state| !state.tombstone && state.scanner_cycle.is_none())
+            {
+                return (authoritative, authoritative_format);
+            }
             (merge_partial_observation_for_admin(authoritative, observed), true)
         }
         Some(observed) if observed_data_usage_is_newer(&observed, &authoritative) => (observed, true),
@@ -2466,7 +2478,13 @@ async fn apply_bucket_usage_memory_overlay_if_authoritative(data_usage_info: &mu
             }
             continue;
         }
-        if !cached.stale_snapshot_pending && persisted_update.is_some_and(|persisted| cached.usage_updated_at <= persisted) {
+        // An observed scan can finish after mutations it never enumerated. Its
+        // completion time cannot supersede unreconciled single-process counts.
+        let observed_dirty_usage = data_usage_info.usage_snapshot_converged == Some(false) && cached.dirty;
+        if !cached.stale_snapshot_pending
+            && !observed_dirty_usage
+            && persisted_update.is_some_and(|persisted| cached.usage_updated_at <= persisted)
+        {
             continue;
         }
 
@@ -2529,19 +2547,17 @@ where
     use crate::object_api::ObjectOptions;
     use http::HeaderMap;
 
-    match store
-        .get_object_reader(
-            RUSTFS_META_BUCKET,
-            key,
-            None,
-            HeaderMap::new(),
-            &ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            },
-        )
-        .await
-    {
+    let opts = ObjectOptions {
+        no_lock: true,
+        ..Default::default()
+    };
+    let read = store.get_object_reader(RUSTFS_META_BUCKET, key, None, HeaderMap::new(), &opts);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let read = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+        rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::DataUsageCacheRead,
+        read,
+    );
+    match read.await {
         // A cache object that fails to decode is treated as absent rather than
         // as an error: a corrupt cache should not stall the caller, and the
         // next scanner pass rewrites it.
@@ -3064,6 +3080,8 @@ mod tests {
         transient_failures: Mutex<usize>,
         reads: Mutex<Vec<String>>,
         terminal_error: Mutex<Option<Error>>,
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        record_context: bool,
     }
 
     impl UsageCacheReadStore {
@@ -3072,6 +3090,8 @@ mod tests {
                 transient_failures: Mutex::new(n),
                 reads: Mutex::new(Vec::new()),
                 terminal_error: Mutex::new(None),
+                #[cfg(feature = "diagnostic-read-version-caller")]
+                record_context: false,
             }
         }
 
@@ -3080,6 +3100,8 @@ mod tests {
                 transient_failures: Mutex::new(0),
                 reads: Mutex::new(Vec::new()),
                 terminal_error: Mutex::new(Some(error)),
+                #[cfg(feature = "diagnostic-read-version-caller")]
+                record_context: false,
             }
         }
 
@@ -3106,6 +3128,12 @@ mod tests {
             _h: Self::HeaderMap,
             _opts: &Self::ObjectOptions,
         ) -> Result<Self::GetObjectReader, Self::Error> {
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            if self.record_context {
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_version_request(
+                    &crate::disk::ReadOptions::default(),
+                );
+            }
             self.reads.lock().await.push(object.to_string());
             if let Some(error) = self.terminal_error.lock().await.clone() {
                 return Err(error);
@@ -3203,6 +3231,89 @@ mod tests {
             vec![prefixed_usage_key(name), name.to_string()],
             "the prefixed key is tried first, then the legacy one, and neither absence is retried"
         );
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[test]
+    fn diagnostic_usage_cache_read_preserves_api_and_earlier_entry() {
+        use crate::cluster::rpc::runtime_sources::with_read_version_entry;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use rustfs_io_metrics::internode_metrics::ReadVersionEntrySource;
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, with_s3_http_operation_context,
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("diagnostic usage cache runtime");
+        let recorder = DebuggingRecorder::new();
+        let snapshots = recorder.snapshotter();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        let mut request = S3HttpRequestGuard::new("GET");
+        let get = request.in_scope(|| {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
+            current_s3_http_operation_context().expect("dispatched GET operation")
+        });
+        request.response(200);
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let ambient = crate::cluster::rpc::runtime_sources::ReadVersionDiagnosticContext::capture();
+                for (operation, source) in [
+                    (None, None),
+                    (Some(get), None),
+                    (None, Some(ReadVersionEntrySource::ServerInfoPools)),
+                    (Some(get), Some(ReadVersionEntrySource::StoreObjectReader)),
+                ] {
+                    let store = UsageCacheReadStore {
+                        record_context: true,
+                        ..Default::default()
+                    };
+                    with_s3_http_operation_context(operation, async {
+                        let load = load_data_usage_cache(&store, "usage-cache");
+                        let cache = match source {
+                            Some(source) => with_read_version_entry(source, load).await,
+                            None => load.await,
+                        }
+                        .expect("missing diagnostic cache is harmless");
+                        assert!(cache.cache.is_empty());
+                        assert_eq!(store.read_keys().await.len(), 2, "both prefixed and legacy cache reads are observed");
+                    })
+                    .await;
+                    assert_eq!(
+                        crate::cluster::rpc::runtime_sources::ReadVersionDiagnosticContext::capture(),
+                        ambient,
+                        "cache reads must restore the caller's complete diagnostic scope"
+                    );
+                }
+                assert_eq!(current_s3_http_operation_context(), None);
+            });
+        });
+        let rows = snapshots.snapshot().into_vec();
+        for (source, operation, state) in [
+            ("data_usage_cache_read", "unattributed", "absent"),
+            ("data_usage_cache_read", "s3:GetObject", "preserved"),
+            ("server_info_pools", "unattributed", "absent"),
+            ("store_object_reader", "s3:GetObject", "preserved"),
+        ] {
+            assert!(
+                rows.iter().any(|(key, _, _, value)| {
+                    let labels = key
+                        .key()
+                        .labels()
+                        .map(|label| (label.key(), label.value()))
+                        .collect::<std::collections::HashMap<_, _>>();
+                    key.key().name() == "rustfs_storage_diagnostic_context_transitions_total"
+                        && labels.get("entry_source") == Some(&source)
+                        && labels.get("boundary") == Some(&"remote_rpc")
+                        && labels.get("parent_api_operation") == Some(&operation)
+                        && labels.get("child_api_operation") == Some(&operation)
+                        && labels.get("api_context") == Some(&state)
+                        && matches!(value, DebugValue::Counter(2))
+                }),
+                "cache reads must retain API and the earliest observed entry: {source}/{operation}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3716,6 +3827,169 @@ mod tests {
         assert!(selected.replication_info.is_empty());
         assert!(selected.tier_stats.is_none());
         assert!(selected.unknown_tier_stats.is_none());
+    }
+
+    fn usage_snapshots_with_missing_observed_set() -> (DataUsageInfo, DataUsageInfo) {
+        let baseline_time = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let mut authoritative = data_usage_info_for_test("large-bucket", 510_000, 580_000_000_000, baseline_time);
+        authoritative.scanner_epoch = Some(4);
+        authoritative.scanner_cycle = Some(10);
+        authoritative.usage_snapshot_converged = Some(true);
+
+        let mut observed = data_usage_info_for_test("large-bucket", 3_000, 3_000_000_000, baseline_time + Duration::from_secs(1));
+        observed.scanner_epoch = Some(4);
+        observed.scanner_cycle = Some(11);
+        observed.usage_snapshot_complete = false;
+        observed.usage_snapshot_partial = true;
+        observed.usage_snapshot_converged = Some(false);
+        observed.usage_snapshot_authoritative_baseline = Some(authoritative.snapshot_identity());
+        observed.usage_snapshot_set_states = vec![
+            rustfs_data_usage::DataUsageSnapshotSetState {
+                pool_index: 0,
+                set_index: 0,
+                scanner_epoch: Some(4),
+                scanner_cycle: Some(11),
+                scan_plan_digest: Some([1; 32]),
+                complete: true,
+                ..Default::default()
+            },
+            rustfs_data_usage::DataUsageSnapshotSetState {
+                pool_index: 1,
+                set_index: 0,
+                scan_plan_digest: Some([1; 32]),
+                ..Default::default()
+            },
+        ];
+        assert!(
+            observed.is_valid_partial_snapshot(),
+            "a missing set is valid diagnostic progress, not a bucket total"
+        );
+        (authoritative, observed)
+    }
+
+    #[test]
+    fn partial_admin_observation_does_not_replace_totals_with_a_missing_set() {
+        let (authoritative, observed) = usage_snapshots_with_missing_observed_set();
+        let identity = authoritative.snapshot_identity();
+
+        let (selected, _) = select_admin_data_usage_snapshot(authoritative, true, Some(observed));
+
+        assert_eq!(selected.buckets_usage["large-bucket"].objects_count, 510_000);
+        assert_eq!(selected.buckets_usage["large-bucket"].size, 580_000_000_000);
+        assert_eq!(selected.objects_total_count, 510_000);
+        assert_eq!(selected.objects_total_size, 580_000_000_000);
+        assert_eq!(
+            selected.snapshot_identity(),
+            identity,
+            "retained counts must not gain a newer timestamp or generation"
+        );
+        assert!(selected.is_complete_bucket_usage_snapshot());
+    }
+
+    #[tokio::test]
+    async fn partial_admin_observation_does_not_promote_a_legacy_baseline() {
+        let (legacy, observed) = usage_snapshots_with_missing_observed_set();
+        let (selected, current_format) = select_admin_data_usage_snapshot(legacy, false, Some(observed));
+        let (normalized, _) = normalize_loaded_data_usage(selected, current_format).await;
+
+        assert!(normalized.is_valid_partial_snapshot());
+        assert!(!normalized.is_complete_bucket_usage_snapshot());
+        assert_eq!(normalized.usage_snapshot_converged, Some(false));
+        assert_eq!(normalized.objects_total_count, 3_000);
+        assert_eq!(normalized.objects_total_size, 3_000_000_000);
+    }
+
+    #[test]
+    fn partial_admin_observation_accepts_decreases_when_every_set_is_covered() {
+        let (authoritative, mut observed) = usage_snapshots_with_missing_observed_set();
+        // A compatible retained generation is useful even when it is not a
+        // completed scan of the current cycle. A tombstone explicitly removes
+        // a set; neither case is the same as an unavailable live set.
+        for tombstone in [false, true] {
+            observed.usage_snapshot_set_states[1].tombstone = tombstone;
+            observed.usage_snapshot_set_states[1].scanner_epoch = (!tombstone).then_some(4);
+            observed.usage_snapshot_set_states[1].scanner_cycle = (!tombstone).then_some(10);
+            let (selected, _) = select_admin_data_usage_snapshot(authoritative.clone(), true, Some(observed.clone()));
+
+            assert_eq!(selected.objects_total_count, 3_000);
+            assert_eq!(selected.objects_total_size, 3_000_000_000);
+            assert!(selected.is_valid_partial_snapshot());
+            assert!(!selected.is_complete_bucket_usage_snapshot());
+            assert_eq!(selected.usage_snapshot_converged, Some(false));
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn partial_admin_observation_preserves_persisted_totals_across_cache_reload() {
+        use crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
+        use crate::config::com::save_config;
+
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        let (authoritative, observed) = usage_snapshots_with_missing_observed_set();
+        let primary_bytes = serde_json::to_vec(&authoritative).expect("encode complete usage");
+        let observed_bytes = serde_json::to_vec(&observed).expect("encode partial observation");
+        save_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), primary_bytes.clone())
+            .await
+            .expect("persist complete usage");
+        save_config(store.clone(), DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(), observed_bytes.clone())
+            .await
+            .expect("persist observation with a missing set");
+        clear_usage_memory_cache_for_test().await;
+        invalidate_data_usage_snapshot_cache().await;
+
+        for reload in [false, false, true] {
+            if reload {
+                // Recreate process-local usage state, not an OS process restart.
+                clear_usage_memory_cache_for_test().await;
+                invalidate_data_usage_snapshot_cache().await;
+            }
+            let mut displayed = load_admin_data_usage_from_backend_cached(store.clone())
+                .await
+                .expect("load admin usage through the real snapshot cache");
+            apply_bucket_usage_memory_overlay(&mut displayed).await;
+            assert_eq!(displayed.objects_total_count, 510_000);
+            assert_eq!(displayed.objects_total_size, 580_000_000_000);
+            assert_eq!(displayed.bucket_sizes["large-bucket"], 580_000_000_000);
+            assert_eq!(displayed.snapshot_identity(), authoritative.snapshot_identity());
+        }
+        let quota = load_data_usage_from_backend_cached(store.clone())
+            .await
+            .expect("load quota authority");
+        assert_eq!(quota.objects_total_size, 580_000_000_000);
+        assert_eq!(
+            read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+                .await
+                .expect("read primary"),
+            primary_bytes
+        );
+        assert_eq!(
+            read_config(store.clone(), DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str())
+                .await
+                .expect("read diagnostic observation"),
+            observed_bytes,
+            "admin reads must not rewrite either persisted snapshot"
+        );
+
+        let mut reconciled = data_usage_info_for_test("large-bucket", 2, 42, SystemTime::UNIX_EPOCH + Duration::from_secs(12));
+        reconciled.scanner_epoch = Some(4);
+        reconciled.scanner_cycle = Some(12);
+        reconciled.usage_snapshot_converged = Some(true);
+        save_config(
+            store.clone(),
+            DATA_USAGE_OBJ_NAME_PATH.as_str(),
+            serde_json::to_vec(&reconciled).expect("encode confirmed deletion"),
+        )
+        .await
+        .expect("persist a later complete scan after deletion");
+        invalidate_data_usage_snapshot_cache().await;
+        let displayed = load_admin_data_usage_from_backend_cached(store)
+            .await
+            .expect("load confirmed decrease");
+        assert_eq!((displayed.objects_total_count, displayed.objects_total_size), (2, 42));
+        assert_eq!(displayed.snapshot_identity(), reconciled.snapshot_identity());
+        clear_usage_memory_cache_for_test().await;
+        invalidate_data_usage_snapshot_cache().await;
     }
 
     #[tokio::test]
@@ -6520,6 +6794,117 @@ mod tests {
                 .map(|usage| (usage.objects_count, usage.size)),
             Some((0, 0))
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn observed_admin_snapshot_preserves_unreconciled_mutations() {
+        let bucket = "observed-mutations";
+        for partial in [false, true] {
+            for delete in [false, true] {
+                for timestamp_offset in [0, 10] {
+                    clear_usage_memory_cache_for_test().await;
+                    let mut baseline = data_usage_info_for_test(bucket, 2, 20, SystemTime::now() - Duration::from_secs(10));
+                    baseline.scanner_epoch = Some(4);
+                    baseline.scanner_cycle = Some(10);
+                    baseline.usage_snapshot_converged = Some(true);
+                    replace_bucket_usage_memory_from_info(&baseline).await;
+                    let (expected_count, expected_size) = if delete {
+                        record_bucket_object_delete_memory(bucket, 10, true).await;
+                        (1, 10)
+                    } else {
+                        record_bucket_object_write_memory(bucket, None, 10).await;
+                        (3, 30)
+                    };
+                    let mutation_time = memory_cache().read().await[bucket].usage_updated_at;
+                    let mut observed = baseline.clone();
+                    observed.last_update = Some(mutation_time + Duration::from_secs(timestamp_offset));
+                    observed.scanner_cycle = Some(11);
+                    observed.usage_snapshot_complete = !partial;
+                    observed.usage_snapshot_partial = partial;
+                    observed.usage_snapshot_converged = Some(false);
+                    observed.usage_snapshot_authoritative_baseline = Some(baseline.snapshot_identity());
+                    if partial {
+                        observed.usage_snapshot_set_states = vec![rustfs_data_usage::DataUsageSnapshotSetState {
+                            pool_index: 0,
+                            set_index: 0,
+                            scanner_cycle: Some(11),
+                            scanner_epoch: Some(4),
+                            scan_plan_digest: Some([1; 32]),
+                            complete: false,
+                            tombstone: false,
+                            segment_invalidation_proof: None,
+                        }];
+                        assert!(observed.is_valid_partial_snapshot());
+                    }
+
+                    // Observational saves invalidate the admin cache without reconciling
+                    // memory. Selecting that newer view must not erase local mutations.
+                    let (selected, current_format) = select_admin_data_usage_snapshot(baseline, true, Some(observed));
+                    assert_eq!(selected.scanner_cycle, Some(11));
+                    let (selected, _) = normalize_loaded_data_usage(selected, current_format).await;
+                    let mut distributed = selected.clone();
+                    apply_bucket_usage_memory_overlay_if_authoritative(&mut distributed, false).await;
+                    assert_eq!((distributed.objects_total_count, distributed.objects_total_size), (2, 20));
+
+                    let mut response = selected;
+                    apply_bucket_usage_memory_overlay_if_authoritative(&mut response, true).await;
+                    assert_eq!(
+                        (response.objects_total_count, response.objects_total_size),
+                        (expected_count, expected_size),
+                        "partial={partial}, delete={delete}, timestamp_offset={timestamp_offset}"
+                    );
+                    assert_eq!(response.versions_total_count, expected_count);
+                    assert_eq!(response.bucket_sizes[bucket], expected_size);
+                    assert_eq!(response.buckets_usage[bucket].objects_count, expected_count);
+                    assert_eq!(response.usage_snapshot_converged, Some(false));
+                    assert_eq!(response.usage_snapshot_partial, partial);
+                    let cache = memory_cache().read().await;
+                    assert!(cache[bucket].dirty, "an admin read cannot acknowledge mutations");
+                    assert!(!cache[bucket].stale_snapshot_pending);
+                    assert_eq!(cache[bucket].pending_scanner_position, None);
+                    drop(cache);
+
+                    // A later converged scan can legitimately correct the count downward;
+                    // the display fix must not retain dirty counts or a historical maximum.
+                    let mut converged = data_usage_info_for_test(bucket, 0, 0, mutation_time + Duration::from_secs(20));
+                    converged.scanner_epoch = Some(4);
+                    converged.scanner_cycle = Some(12);
+                    converged.usage_snapshot_converged = Some(true);
+                    replace_bucket_usage_memory_from_info(&converged).await;
+                    apply_bucket_usage_memory_overlay_if_authoritative(&mut converged, true).await;
+                    assert_eq!((converged.objects_total_count, converged.objects_total_size), (0, 0));
+                    assert!(!memory_cache().read().await[bucket].dirty);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn observed_admin_snapshot_does_not_overlay_clean_or_unknown_usage() {
+        let bucket = "observed-baseline";
+        for unknown in [false, true] {
+            clear_usage_memory_cache_for_test().await;
+            let baseline = data_usage_info_for_test(bucket, 2, 20, SystemTime::now() - Duration::from_secs(10));
+            replace_bucket_usage_memory_from_info(&baseline).await;
+            if unknown {
+                memory_cache().write().await.insert(
+                    bucket.to_string(),
+                    cached_bucket_usage_from_backend(BucketUsageInfo::default(), SystemTime::UNIX_EPOCH, false),
+                );
+                record_bucket_object_write_memory(bucket, None, 10).await;
+            }
+            let mutation_time = memory_cache().read().await[bucket].usage_updated_at;
+            let mut observed = data_usage_info_for_test(bucket, 100, 1_000, mutation_time + Duration::from_secs(10));
+            observed.usage_snapshot_converged = Some(false);
+            observed.usage_snapshot_authoritative_baseline = Some(baseline.snapshot_identity());
+            let (mut response, _) = select_admin_data_usage_snapshot(baseline, true, Some(observed));
+            apply_bucket_usage_memory_overlay_if_authoritative(&mut response, true).await;
+            assert_eq!((response.objects_total_count, response.objects_total_size), (100, 1_000));
+            assert_eq!(response.usage_snapshot_complete, !unknown);
+            assert_eq!(response.usage_snapshot_converged, Some(false));
+        }
     }
 
     #[tokio::test]

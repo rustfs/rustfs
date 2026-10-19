@@ -808,3 +808,215 @@ fn merge_keeps_allow_statements_differing_only_in_not_resource() {
         "both Allow statements must survive the merge; neither may be dropped as a duplicate"
     );
 }
+
+#[test]
+fn wildcard_deny_only_session_grants_no_storage_access() {
+    let policy = Policy::parse_config(
+        br#"{"Statement":[{"Action":["s3:GetObject"],"Effect":"Deny","Resource":"*","Sid":"1"}],"Version":"2012-10-17"}"#,
+    )
+    .expect("deny-only session policy should parse");
+    let encoded = serde_json::to_vec(&policy).expect("session policy should serialize into claims");
+    let decoded = Policy::parse_config(&encoded).expect("session policy should parse from claims");
+    for action in ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"] {
+        for bucket in ["bucket", "other-bucket"] {
+            assert!(
+                !policy_is_allowed(
+                    decoded.clone(),
+                    ArgsBuilder {
+                        action: action.into(),
+                        bucket: bucket.into(),
+                        object: "data/object".into(),
+                        ..Default::default()
+                    }
+                ),
+                "deny-only session must not grant {action} on {bucket}"
+            );
+        }
+    }
+}
+
+#[test_case("s3:GetObject", "bucket", "object" => true; "matching object action")]
+#[test_case("s3:PutObject", "bucket", "object" => false; "ungranted action")]
+#[test_case("s3:GetObject", "other-bucket", "object" => true; "other bucket")]
+fn wildcard_resource_allow_preserves_action_scope(action: &str, bucket: &str, object: &str) -> bool {
+    let policy = Policy::parse_config(
+        br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":["*"]}]}"#,
+    )
+    .expect("wildcard allow policy should parse");
+    policy_is_allowed(
+        policy,
+        ArgsBuilder {
+            action: action.into(),
+            bucket: bucket.into(),
+            object: object.into(),
+            ..Default::default()
+        },
+    )
+}
+
+#[test_case("s3:GetObject", "bucket", "object"; "object")]
+#[test_case("s3:ListBucket", "bucket", ""; "bucket")]
+#[test_case("s3:ListAllMyBuckets", "", ""; "all buckets")]
+#[test_case("kms:Decrypt", "", "mykey"; "kms key")]
+#[test_case("kms:Backup", "", ""; "kms backup")]
+#[test_case("kms:Restore", "", ""; "kms restore")]
+fn wildcard_resource_allow_deny_and_exclusion(action: &str, bucket: &str, object: &str) {
+    let other_resource = if action.starts_with("kms:") {
+        "arn:aws:kms:::key/other-key"
+    } else {
+        "arn:aws:s3:::other-bucket/*"
+    };
+    for (field, resource) in [
+        ("Resource", serde_json::json!("*")),
+        ("Resource", serde_json::json!(["*"])),
+        ("Resource", serde_json::json!([other_resource, "*"])),
+        ("NotResource", serde_json::json!("*")),
+        ("NotResource", serde_json::json!([other_resource, "*"])),
+    ] {
+        let mut json = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": action, field: resource}]
+        });
+        let allow = Policy::parse_config(&serde_json::to_vec(&json).expect("test policy should serialize"))
+            .expect("wildcard policy should parse");
+        let args = ArgsBuilder {
+            action: action.into(),
+            bucket: bucket.into(),
+            object: object.into(),
+            ..Default::default()
+        };
+        assert_eq!(policy_is_allowed(allow, args), field == "Resource", "{action} with {field}");
+
+        json["Statement"][0]["Effect"] = serde_json::json!("Deny");
+        json["Statement"]
+            .as_array_mut()
+            .expect("statements are an array")
+            .push(serde_json::json!({
+                "Effect": "Allow", "Action": action, "Resource": "*"
+            }));
+        let deny = Policy::parse_config(&serde_json::to_vec(&json).expect("test policy should serialize"))
+            .expect("wildcard deny policy should parse");
+        assert_eq!(
+            policy_is_allowed(
+                deny,
+                ArgsBuilder {
+                    action: action.into(),
+                    bucket: bucket.into(),
+                    object: object.into(),
+                    ..Default::default()
+                }
+            ),
+            field == "NotResource",
+            "explicit deny must win unless {field} excludes the resource for {action}"
+        );
+    }
+}
+
+#[test_case(Some("allowed/data/") => true; "matching prefix")]
+#[test_case(Some("other/data/") => false; "outside allowed prefix")]
+#[test_case(None => false; "missing prefix")]
+fn wildcard_resource_preserves_conditions(prefix: Option<&str>) -> bool {
+    let policy = Policy::parse_config(
+        br#"{"Version":"2012-10-17","Statement":[{
+            "Effect":"Allow","Action":"s3:ListBucket","Resource":"*",
+            "Condition":{"StringLike":{"s3:prefix":"allowed/*"}}
+        }]}"#,
+    )
+    .expect("conditional wildcard policy should parse");
+    let mut args = ArgsBuilder {
+        action: "s3:ListBucket".into(),
+        bucket: "bucket".into(),
+        ..Default::default()
+    };
+    if let Some(prefix) = prefix {
+        args.conditions.insert("prefix".into(), vec![prefix.into()]);
+    }
+    policy_is_allowed(policy, args)
+}
+
+// Conditional write enforcement (`s3:if-none-match` / `s3:if-match`). Condition values
+// carry request headers under their lowercase header name; a missing header leaves
+// the key absent, which `Null: true` matches and `StringEquals` never satisfies.
+
+fn header_conditions(headers: &[(&str, &str)]) -> HashMap<String, Vec<String>> {
+    headers
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), vec![(*value).to_string()]))
+        .collect()
+}
+
+fn is_allowed_put_object(policy: &Policy, conditions: &HashMap<String, Vec<String>>) -> bool {
+    let claims: HashMap<String, Value> = HashMap::new();
+    let groups: Option<Vec<String>> = None;
+    pollster::block_on(policy.is_allowed(&Args {
+        account: "Q3AM3UQ867SPQQA43P2F",
+        groups: &groups,
+        action: rustfs_policy::policy::action::Action::S3Action(PutObjectAction),
+        bucket: "mybucket",
+        conditions,
+        is_owner: false,
+        object: "uploads/report.csv",
+        claims: &claims,
+        deny_only: false,
+    }))
+}
+
+fn put_object_policy_with_condition(condition: &str) -> Policy {
+    let json = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["s3:PutObject"],"Resource":["arn:aws:s3:::mybucket/*"],"Condition":{condition}}}]}}"#
+    );
+    Policy::parse_config(json.as_bytes()).expect("policy with conditional write key should parse")
+}
+
+#[test_case(r#"{"StringEquals":{"s3:if-none-match":"*"}}"#, &[("if-none-match", "*")] => true ; "if_none_match_string_equals_header_present")]
+#[test_case(r#"{"StringEquals":{"s3:if-none-match":"*"}}"#, &[] => false ; "if_none_match_string_equals_header_absent")]
+#[test_case(r#"{"StringEquals":{"s3:if-none-match":"*"}}"#, &[("if-match", "\"etag\"")] => false ; "if_none_match_string_equals_other_header")]
+#[test_case(r#"{"Null":{"s3:if-none-match":"false"}}"#, &[("if-none-match", "*")] => true ; "if_none_match_not_null_header_present")]
+#[test_case(r#"{"Null":{"s3:if-none-match":"false"}}"#, &[] => false ; "if_none_match_not_null_header_absent")]
+#[test_case(r#"{"Null":{"s3:if-match":"false"}}"#, &[("if-match", "\"etag\"")] => true ; "if_match_not_null_header_present")]
+#[test_case(r#"{"Null":{"s3:if-match":"false"}}"#, &[] => false ; "if_match_not_null_header_absent")]
+#[test_case(r#"{"StringEquals":{"s3:if-match":"\"etag\""}}"#, &[("if-match", "\"etag\"")] => true ; "if_match_string_equals_matching_value")]
+#[test_case(r#"{"StringEquals":{"s3:if-match":"\"etag\""}}"#, &[("if-match", "\"other\"")] => false ; "if_match_string_equals_different_value")]
+fn conditional_write_condition_keys(condition: &str, headers: &[(&str, &str)]) -> bool {
+    let policy = put_object_policy_with_condition(condition);
+    is_allowed_put_object(&policy, &header_conditions(headers))
+}
+
+/// Mirrors the AWS deny-based enforcement example: allow PutObject, but deny it
+/// when the `If-Match` header is missing.
+#[test_case(&[("if-match", "\"etag\"")] => true ; "header_present")]
+#[test_case(&[] => false ; "header_absent")]
+fn bucket_policy_denies_put_object_without_if_match(headers: &[(&str, &str)]) -> bool {
+    let policy: BucketPolicy = serde_json::from_str(
+        r#"{
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": ["*"]},
+                    "Action": ["s3:PutObject"],
+                    "Resource": ["arn:aws:s3:::mybucket/*"]
+                },
+                {
+                    "Effect": "Deny",
+                    "Principal": {"AWS": ["*"]},
+                    "Action": ["s3:PutObject"],
+                    "Resource": ["arn:aws:s3:::mybucket/*"],
+                    "Condition": {"Null": {"s3:if-match": "true"}}
+                }
+            ]
+        }"#,
+    )
+    .expect("bucket policy with conditional write key should parse");
+    let conditions = header_conditions(headers);
+    let groups: Option<Vec<String>> = None;
+    pollster::block_on(policy.is_allowed(&BucketPolicyArgs {
+        account: "Q3AM3UQ867SPQQA43P2F",
+        groups: &groups,
+        action: rustfs_policy::policy::action::Action::S3Action(PutObjectAction),
+        bucket: "mybucket",
+        conditions: &conditions,
+        is_owner: false,
+        object: "uploads/report.csv",
+    }))
+}

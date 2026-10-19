@@ -460,6 +460,7 @@ impl HealTask {
             set: self.options.set_index,
         };
 
+        let mut unresolved_delete_recovery = false;
         for bucket in buckets.iter().filter(|_| self.source != HealRequestSource::Admin) {
             // Check control flags before starting each bucket heal
             self.check_control_flags().await?;
@@ -490,6 +491,17 @@ impl HealTask {
                     return Err(err);
                 }
             }
+            // Adopt delete proofs only after their publication bucket exists.
+            if let Some(result) = self
+                .await_with_control(
+                    self.storage
+                        .recover_delete_transactions(bucket, None, None, &bucket_heal_opts),
+                )
+                .await?
+            {
+                unresolved_delete_recovery |= result.delete_recovery.is_some_and(|status| status.has_unresolved());
+                self.record_result_item(result).await;
+            }
         }
 
         // Create erasure set healer with resume support
@@ -511,6 +523,7 @@ impl HealTask {
             heal_opts,
             self.source,
         )
+        .with_unresolved_delete_recovery(unresolved_delete_recovery)
         .with_replacement_targets(replacement_targets, is_auto_replacement.then(|| self.id.clone()))
         .with_pool_metadata_targets(if self.options.recreate_missing && !self.options.dry_run {
             self.heal_endpoints.clone()

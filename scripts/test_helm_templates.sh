@@ -180,6 +180,7 @@ scanner_config_output=$(render_chart \
   --set config.rustfs.scanner.cache_save_timeout_secs=30 \
   --set config.rustfs.scanner.max_concurrent_set_scans=2 \
   --set config.rustfs.scanner.max_concurrent_disk_scans=1 \
+  --set config.rustfs.scanner.walkers_per_disk=2 \
   --set config.rustfs.scanner.yield_every_n_objects=128 \
   --set config.rustfs.scanner.alert_excess_versions=100 \
   --set config.rustfs.scanner.alert_excess_version_size=1099511627776 \
@@ -197,6 +198,7 @@ grep -q 'RUSTFS_SCANNER_IDLE_MODE: "false"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS: "30"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS: "2"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS: "1"' <<<"$scanner_config_output"
+grep -q 'RUSTFS_SCANNER_WALKERS_PER_DISK: "2"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS: "128"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_ALERT_EXCESS_VERSIONS: "100"' <<<"$scanner_config_output"
 grep -q 'RUSTFS_SCANNER_ALERT_EXCESS_VERSION_SIZE: "1099511627776"' <<<"$scanner_config_output"
@@ -568,7 +570,7 @@ nondefault_statefulset=$(awk '
 nondefault_local_host=$(statefulset_env_value RUSTFS_LOCAL_ENDPOINT_HOST <<<"$nondefault_statefulset")
 nondefault_namespace=$(yq eval '.metadata.namespace' - <<<"$nondefault_statefulset")
 nondefault_endpoint_port=$(yq eval '.spec.template.spec.containers[0].ports[] | select(.name == "endpoint") | .containerPort' - <<<"$nondefault_statefulset")
-mtls_liveness_command=$(yq eval '.spec.template.spec.containers[0].livenessProbe.exec.command[-1]' - <<<"$nondefault_statefulset")
+mtls_liveness_port=$(yq eval '.spec.template.spec.containers[0].livenessProbe.tcpSocket.port' - <<<"$nondefault_statefulset")
 mtls_readiness_command=$(yq eval '.spec.template.spec.containers[0].readinessProbe.exec.command[-1]' - <<<"$nondefault_statefulset")
 if [[ "$nondefault_local_host" != '$(RUSTFS_CHART_POD_NAME).tenant-rustfs-headless.object-storage.svc.cluster.corp' ]]; then
   echo "Combined generated topology produced an unexpected local endpoint host: $nondefault_local_host" >&2
@@ -578,9 +580,8 @@ if [[ "$nondefault_namespace" != "object-storage" || "$nondefault_endpoint_port"
   echo "Combined generated topology must retain its namespace and custom endpoint port" >&2
   exit 1
 fi
-if ! grep -Fq 'https://127.0.0.1:9443/health' <<<"$mtls_liveness_command" ||
-   grep -Fq '/health/ready' <<<"$mtls_liveness_command"; then
-  echo "mTLS liveness must use the process health endpoint, not readiness" >&2
+if [[ "$mtls_liveness_port" != 9443 ]]; then
+  echo "mTLS liveness must check the listener independently of certificate validity" >&2
   exit 1
 fi
 if ! grep -Fq 'https://127.0.0.1:9443/health/ready' <<<"$mtls_readiness_command"; then

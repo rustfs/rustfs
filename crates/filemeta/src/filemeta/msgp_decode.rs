@@ -17,44 +17,13 @@ use rmp::Marker;
 use std::io::Read;
 
 /// Maximum accepted length for a single length-prefixed msgpack element
-/// (map key, string, binary blob, ext payload, or a whole serialized
-/// xl.meta record inside a metacache stream).
+/// (map key, string, binary blob, or ext payload) inside xl.meta.
 ///
-/// Legitimate elements are far smaller: object keys are at most a few KiB
-/// and even an xl.meta record fully populated up to the 10,000-version
-/// object cap serializes to a few MiB (metacache streams carry xl.meta
-/// without inline data), so 16 MiB leaves ample headroom. A larger value
-/// means the length prefix itself is corrupt; decoding must fail with an
-/// error instead of attempting a huge allocation that aborts the whole
-/// process (see rustfs/rustfs#2715).
+/// This is not a limit on the aggregate xl.meta carried by a metacache
+/// stream: many versions and their inline data can exceed it. Bound each
+/// individual value before allocation so corrupted prefixes return an error
+/// instead of attempting a huge allocation (see rustfs/rustfs#2715).
 pub(crate) const MAX_MSGP_ELEMENT_SIZE: usize = 16 << 20;
-
-/// Reads exactly `len` bytes into a fresh buffer, treating `len` as
-/// untrusted input: lengths above [`MAX_MSGP_ELEMENT_SIZE`] and allocation
-/// failures surface as decode errors instead of aborting the process.
-pub(crate) fn read_exact_vec<R: Read>(rd: &mut R, len: usize) -> Result<Vec<u8>> {
-    if len > MAX_MSGP_ELEMENT_SIZE {
-        return Err(Error::other(format!(
-            "corrupt msgpack element: length {len} exceeds the {MAX_MSGP_ELEMENT_SIZE} byte limit"
-        )));
-    }
-    let mut buf = Vec::new();
-    buf.try_reserve_exact(len)
-        .map_err(|e| Error::other(format!("msgpack element allocation of {len} bytes failed: {e}")))?;
-    buf.resize(len, 0);
-    rd.read_exact(&mut buf).map_err(Error::from)?;
-    Ok(buf)
-}
-
-/// Bounds a decoded collection count when it is used only as a
-/// pre-allocation hint. The decode loop still consumes exactly the decoded
-/// number of elements (a corrupt count fails with an EOF decode error once
-/// the input runs out); this merely keeps the speculative reservation from
-/// aborting the process on an absurd count.
-pub(crate) fn prealloc_hint(len: usize) -> usize {
-    const MAX_PREALLOC_ITEMS: usize = 4096;
-    len.min(MAX_PREALLOC_ITEMS)
-}
 
 /// Reader that prepends a single byte to the stream. Used when we've read the marker
 /// and need to pass it to a decoder that expects to read the marker itself.
@@ -77,7 +46,72 @@ impl<R: Read> Read for PrependByteReader<'_, R> {
     }
 }
 
+/// Reads a nil marker (`0xc0`) or a MessagePack map length using `rmp::decode::read_map_len`
+/// semantics so error variants match `read_map_len` while leaving `rd` unwrapped afterward.
+#[inline]
+pub(crate) fn read_nil_or_submap_len<R: Read>(rd: &mut R) -> Result<Option<usize>> {
+    let mut first = [0u8; 1];
+    rd.read_exact(&mut first).map_err(Error::from)?;
+    match first[0] {
+        0xc0 => Ok(None),
+        0x80..=0x8f => Ok(Some((first[0] & 0x0f) as usize)),
+        b => {
+            let mut prepend = PrependByteReader {
+                byte: Some(b),
+                inner: rd,
+            };
+            let len = rmp::decode::read_map_len(&mut prepend)?;
+            Ok(Some(len as usize))
+        }
+    }
+}
+
+/// Reads a MessagePack string key into a 16-byte stack buffer when it fits,
+/// falling back to `heap` only for longer keys.
+#[inline]
+pub(crate) fn read_small_str<'a, R: Read>(rd: &mut R, inline: &'a mut [u8; 16], heap: &'a mut Vec<u8>) -> Result<&'a str> {
+    let len = usize::try_from(rmp::decode::read_str_len(rd)?).map_err(Error::other)?;
+    let bytes = if len <= inline.len() {
+        rd.read_exact(&mut inline[..len]).map_err(Error::from)?;
+        &inline[..len]
+    } else {
+        *heap = read_exact_vec(rd, len)?;
+        heap.as_slice()
+    };
+    std::str::from_utf8(bytes).map_err(|e| Error::FromUtf8(e.to_string()))
+}
+
+/// Reads exactly `len` bytes into a fresh buffer, treating `len` as
+/// untrusted input: lengths above [`MAX_MSGP_ELEMENT_SIZE`] and allocation
+/// failures surface as decode errors instead of aborting the process.
+#[inline]
+pub(crate) fn read_exact_vec<R: Read>(rd: &mut R, len: usize) -> Result<Vec<u8>> {
+    if len > MAX_MSGP_ELEMENT_SIZE {
+        return Err(Error::other(format!(
+            "corrupt msgpack element: length {len} exceeds the {MAX_MSGP_ELEMENT_SIZE} byte limit"
+        )));
+    }
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len)
+        .map_err(|e| Error::other(format!("msgpack element allocation of {len} bytes failed: {e}")))?;
+    buf.resize(len, 0);
+    rd.read_exact(&mut buf).map_err(Error::from)?;
+    Ok(buf)
+}
+
+/// Bounds a decoded collection count when it is used only as a
+/// pre-allocation hint. The decode loop still consumes exactly the decoded
+/// number of elements (a corrupt count fails with an EOF decode error once
+/// the input runs out); this merely keeps the speculative reservation from
+/// aborting the process on an absurd count.
+#[inline]
+pub(crate) fn prealloc_hint(len: usize) -> usize {
+    const MAX_PREALLOC_ITEMS: usize = 4096;
+    len.min(MAX_PREALLOC_ITEMS)
+}
+
 /// Read MessagePack nil or array length. Returns None for nil, Some(len) for array.
+#[inline]
 pub(crate) fn read_nil_or_array_len<R: Read>(rd: &mut R) -> Result<Option<usize>> {
     let mut buf = [0u8; 1];
     rd.read_exact(&mut buf).map_err(Error::from)?;
@@ -100,6 +134,7 @@ pub(crate) fn read_nil_or_array_len<R: Read>(rd: &mut R) -> Result<Option<usize>
 }
 
 /// Read MessagePack nil or map length. Returns None for nil, Some(len) for map.
+#[inline]
 pub(crate) fn read_nil_or_map_len<R: Read>(rd: &mut R) -> Result<Option<usize>> {
     let mut buf = [0u8; 1];
     rd.read_exact(&mut buf).map_err(Error::from)?;

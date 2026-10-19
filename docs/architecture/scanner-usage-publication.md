@@ -29,10 +29,15 @@ rename work ends, including when the request caller is cancelled. Scan admission
 remains movement-only so sustained PUTs do not stop namespace walks and
 scanner-driven lifecycle discovery. The post-walk local publication check and
 remote publication leases reject pending fanouts. Begin/end namespace generations
-invalidate scans and cached plans across the fanout; after acquiring remote
-leases, the coordinator rechecks the full activity digest before publishing an
+invalidate cached plans across the fanout; after acquiring remote leases, the
+coordinator rechecks the guardrail fields of the activity snapshot (the
+structural digest and the movement fields, plus the peers' dirty-usage state
+while per-bucket certification is local only) before publishing an
 authoritative aggregate. This catches a tail that finishes between the scan's
-last probe and lease acquisition.
+last probe and lease acquisition. Local namespace and dirty-usage generation
+movement in that window is not a veto: its buckets stay in the dirty map and
+are the next cycle's work, as described in
+[scanner-per-bucket-convergence.md](scanner-per-bucket-convergence.md).
 
 This adds no namespace or movement lock. An already-verified older snapshot may
 still precede a newly started write. Sustained or stalled PUT tails can delay
@@ -121,6 +126,24 @@ reuse without this identity. Older readers can ignore the added map key, but
 older writers do not enforce its fence; readability is not a mixed-version
 publication-safety guarantee.
 
+Bucket checkpoints distinguish completed traversal from object health. A failed
+object does not stop later completed subtrees from advancing the traversal
+frontier. On resume, a sorted index of cached entries with `failed_objects > 0`
+excludes their containing subtrees from reuse; healthy covered siblings keep
+their exact cached accounting. Failure counters survive retry-cache TTL and
+capacity eviction, and any remaining entry failure keeps the bucket partial.
+Directory traversal errors and unresolved size reconciliation still stop the
+frontier because they do not have the same per-entry coverage proof.
+
+Coverage follows path-component traversal order, including punctuation in sibling
+names. Coverage receipts use digest domain 3 and bind every entry in each covered
+subtree using the same predicate as resume, while excluding the unvisited suffix.
+No unsigned nested failure can authorize subtree reuse. Current
+readers accept and migrate domain 2 and legacy epoch-bound receipts. Older
+binaries cannot validate a domain 3 receipt and safely reread the bucket rather
+than applying their unconditional covered-subtree skip. The serialized receipt
+shape, cache CAS, leader epoch and publication fences are unchanged.
+
 ## Persisted Objects
 
 The persisted objects are part of the compatibility contract. Removing one
@@ -142,7 +165,11 @@ requires a compatibility window and a dedicated cleanup entry.
 Observed snapshots are a diagnostic and availability layer. They may be served
 only when the snapshot explicitly reports that it is partial or observational,
 and only to consumers that do not make hard quota, durability, or deletion
-decisions from it. Admin usage views may expose this state with completeness
+decisions from it. The scanner routes a snapshot to the observed object by the
+explicit `usage_snapshot_observational` mark that a vetoed or unverifiable cycle
+sets, not by `usage_snapshot_converged`: a complete cycle that certified every
+bucket but the ones written during its walk publishes an unconverged
+authoritative snapshot that names those buckets as pending. Admin usage views may expose this state with completeness
 flags so operators can see progress while the authoritative publication is
 blocked. Quota enforcement must not use an observed snapshot as the current
 usage authority.
@@ -194,6 +221,73 @@ Only the owner of an object may delete or quarantine it:
 Missing, undecodable, or identity-less data is not converted to zero. It is
 reported as uninitialized, recovery-required, observed-only, or unavailable
 according to the reader's surface.
+
+## Diagnosing Incomplete Census Progress
+
+Treat bucket coverage, set-worker completion, cycle certification, and usage
+publication as separate stages. A successful save can be observational, and a
+worker finishing does not certify its namespace coverage.
+
+| Signal | Meaning and next evidence |
+| --- | --- |
+| `bucket_checkpoint_prepared` | Checkpoint admission identifies the bucket, pool/set, cycle/leader epoch, and previous cycle/epoch. `resume_position` distinguishes retained traversal position from a fresh sweep; `mixed_coverage` reports whether that retained prefix began under another plan. |
+| `bucket_sweep_incomplete` | A bucket reached the end of a sweep but needs another verification pass. `unresolved_objects` reports the complete coverage/health gate, including failed child-cache entries that can be absent from the root counter and diagnostic failure map. Inspect it with `coverage_gap`, `root_failed_objects`, `failed_objects`, `size_reconciliation_entries`, and `mixed_coverage`, using bucket, pool/set, and cycle/leader epoch. `resume_position_on_entry` identifies a sweep entered with traversal position; `resume_position` reports the returned cache position after terminal cleanup. Multiple blockers can coexist. |
+| `partial_saved_not_published` | The local or remote worker successfully saved a terminal Partial cache. Correlate its bucket, pool/set, cycle/leader epoch and `resume_position` with admission and sweep events. This confirms persistence, not complete coverage or authoritative publication. |
+| `remote_scan_partial` | The coordinator received a Partial terminal response for the named bucket and disk. Correlate the worker's bucket-sweep or checkpoint events; Partial is not a complete bucket root. |
+| `bucket_result_rejected` | A bucket result did not match the cycle's frozen tier-registry generation and was not applied. |
+| `set_cache_publish_skipped` | `completed_buckets` counts distinct bucket roots successfully applied to this set cache. Use `first_incomplete_bucket` with pool/set/cycle to locate one actual gap in this set. Inspect `unprocessed_buckets` and budget/cancellation state, then correlate that bucket's worker events. |
+| `set_scan_completed` | Set workers have finished. `coverage_complete` reports the structural coverage gate, not durable publication. This event alone does not prove a complete set snapshot. |
+| `incomplete_coverage` | The cycle did not obtain complete structural coverage. This does not identify a hot bucket or prove that ordinary writes caused the gap. |
+| `publication_proof_pending` | Publication is waiting for a retryable proof. Use cycle/stage, `pending_duration`, the preceding `publication_proof_started` kind, and the peer/purpose in the error. This event does not assert that the walk was Complete. |
+
+For a report such as 52 completed buckets out of 53, first identify whether
+the missing bucket was Partial, failed, never admitted, or rejected at merge.
+Only then inspect its worker evidence. Mixed coverage is a resumable sweep
+under a newer plan; failed objects and size reconciliation require different
+follow-up. A global dirty-generation change alone does not establish which
+bucket failed to produce a complete root.
+
+A mixed tail clears traversal positions before returning Partial. If that
+terminal cache is saved, the next fresh sweep binds both coverage plans to its
+new request, even if ordinary writes continue between cycles. A periodic
+checkpoint saved before terminal cleanup still contains traversal position;
+resuming it under a changed plan can legitimately be mixed again. Correlate
+admission, sweep completion, and terminal persistence for the same bucket and
+pool/set across consecutive cycles. Samples from different sets cannot establish
+a repeated mixed loop. Check save failures, remote interruption, and leadership
+changes if only periodic progress survives.
+
+An unknown bucket cannot be quarantined as zero in an authoritative total.
+Existing pending-bucket semantics still require complete structural coverage.
+A separately labelled subtotal would need proof for each included bucket across
+every source, with missing buckets explicitly unavailable or stale; it must not
+advance full-census authority or acknowledge their dirty work.
+
+Use a bounded DEBUG window on the capacity-scanner leader and the workers
+serving the affected bucket:
+
+```text
+RUST_LOG=warn,rustfs::scanner=debug,rustfs::scanner::io=debug,rustfs::scanner::folder=debug
+```
+
+Capture one representative cycle with its effective budget configuration,
+source commit on every node, per-set completion summaries, partial-bucket
+events, remote errors, publication kind and result, and cycle-state persistence.
+The summaries report counts and bounded bucket identifiers, not object-path
+inventories. Keep logs access-controlled and redact deployment identifiers
+before sharing them.
+
+An unlimited walk budget can also leave a retryable authoritative publication
+waiting for leadership loss or a successful proof. Observational publication
+still retains the movement fence, while authoritative publication requires the
+strict namespace proof. Do not remove those fences to clear a status. Verify
+that a deployment contains the relevant fixes by commit ancestry; a newer
+release name alone is not evidence that it includes current main.
+
+Keep usage objects, checkpoint data, and recovery material intact during
+diagnosis. Acceptance requires usable census values, appropriately advancing
+dirty acknowledgements after publication, and progress across later cycles or
+leadership changes. Worker completion timestamps alone are insufficient.
 
 ## Existing Fixes As Invariants
 

@@ -27,6 +27,7 @@ use crate::bucket::utils::check_get_obj_args;
 use crate::bucket::utils::check_list_multipart_args;
 use crate::bucket::utils::check_list_parts_args;
 use crate::bucket::utils::check_new_multipart_args;
+use crate::bucket::utils::check_new_object_args;
 use crate::bucket::utils::check_object_args;
 use crate::bucket::utils::check_put_object_args;
 use crate::bucket::utils::check_put_object_part_args;
@@ -428,6 +429,7 @@ mod bucket;
 mod bucket_fence;
 pub(crate) use bucket::await_bucket_namespace_operation;
 pub use bucket_fence::BucketIncarnationFenceGuard;
+pub(crate) mod delete_recovery_runtime;
 mod heal;
 pub(crate) use heal::{BucketHealScope, bucket_heal_scope, bucket_heal_scope_for_object};
 pub use heal::{HealObjectAbsenceProof, HealObjectStorageResult};
@@ -438,7 +440,7 @@ pub(crate) mod init_format;
 pub(crate) mod list_objects;
 mod multipart;
 mod object;
-#[cfg(feature = "test-util")]
+#[cfg(any(test, feature = "test-util"))]
 pub use object::DeleteAfterObjectLockSnapshotBarrier;
 pub(crate) use object::{
     DecommissionFixedReadAnchor, ObjectLockDiagGuard, RemoteTuplePublicationCommitGuard, RemoteTuplePublicationFence,
@@ -1363,7 +1365,13 @@ impl crate::storage_api_contracts::object::ObjectIO for ECStore {
         h: HeaderMap,
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
-        self.handle_get_object_reader(bucket, object, range, h, opts).await
+        let read = self.handle_get_object_reader(bucket, object, range, h, opts);
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let read = crate::cluster::rpc::runtime_sources::with_read_version_entry(
+            rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::StoreObjectReader,
+            read,
+        );
+        read.await
     }
     #[instrument(level = "debug", skip(self, data))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {

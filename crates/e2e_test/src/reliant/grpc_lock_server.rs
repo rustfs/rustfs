@@ -113,6 +113,13 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
     }
 
+    async fn acquire_quota_mutation_fence(
+        &self,
+        _request: Request<SnapshotLeaseRequest>,
+    ) -> Result<Response<SnapshotLeaseResponse>, Status> {
+        Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
+    }
+
     async fn renew_snapshot_lease(
         &self,
         _request: Request<SnapshotLeaseRenewRequest>,
@@ -121,6 +128,13 @@ impl NodeService for MinimalLockNodeService {
     }
 
     async fn release_snapshot_lease(
+        &self,
+        _request: Request<SnapshotLeaseReleaseRequest>,
+    ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
+        Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
+    }
+
+    async fn release_quota_mutation_fence(
         &self,
         _request: Request<SnapshotLeaseReleaseRequest>,
     ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
@@ -465,6 +479,13 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn recover_delete_transaction(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::RecoverDeleteTransactionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::RecoverDeleteTransactionResponse>, Status> {
+        Err(Status::unimplemented("delete recovery is not supported by the lock fixture"))
+    }
+
     async fn settle_part_transaction(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::SettlePartTransactionRequest>,
@@ -569,6 +590,13 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn rename_data_with_quota_fence(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::RenameDataRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::RenameDataResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn make_volumes(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::MakeVolumesRequest>,
@@ -664,6 +692,13 @@ impl NodeService for MinimalLockNodeService {
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::DeleteVersionRequest>,
     ) -> Result<Response<rustfs_protos::proto_gen::node_service::DeleteVersionResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn guarded_delete_versions(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::GuardedDeleteVersionsRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::DeleteVersionsResponse>, Status> {
         Err(Status::unimplemented("lock-only test server"))
     }
 

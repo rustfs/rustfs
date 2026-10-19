@@ -206,10 +206,10 @@ fn background_shutdown_steps(enable_scanner: bool, enable_heal: bool) -> Vec<Bac
 /// those to reach the end of their on-disk steps. Then record the shutdown as
 /// clean, so the next startup skips the unclean-restart erasure-set heal, but
 /// only if nothing was left unfinished: a detached mutation still running at
-/// the deadline can be cut short with the runtime, and the heal handoff may
-/// not have completed. Returns whether the markers were cleared.
+/// the deadline can be cut short with the runtime, and a background handoff
+/// may not have completed. Returns whether the markers were cleared.
 async fn finish_detached_mutations_and_clear_unclean_shutdown_markers<W, WaitFut, ClearFut>(
-    heal_handoff_complete: bool,
+    background_handoff_complete: bool,
     detached_mutation_timeout: std::time::Duration,
     wait_for_detached_mutations: W,
     clear_unclean_shutdown_markers: ClearFut,
@@ -233,11 +233,16 @@ where
             "Detached mutations did not finish before shutdown; retaining unclean-shutdown markers"
         );
     }
-    if !(heal_handoff_complete && detached_mutations_drained) {
+    if !(background_handoff_complete && detached_mutations_drained) {
         return false;
     }
     clear_unclean_shutdown_markers.await;
     true
+}
+
+pub(crate) struct StartupBackgroundTasks {
+    pub(crate) capacity: Option<CapacityBackgroundTasks>,
+    pub(crate) table_maintenance: Option<crate::table_catalog::PeriodicMaintenanceRuntime>,
 }
 
 pub(crate) async fn run_startup_shutdown_sequence(
@@ -245,10 +250,14 @@ pub(crate) async fn run_startup_shutdown_sequence(
     shutdown_signal: ShutdownSignal,
     listener_shutdown_handles: (Option<ShutdownHandle>, Option<ShutdownHandle>),
     optional_runtimes: OptionalRuntimeServices,
-    capacity_tasks: Option<CapacityBackgroundTasks>,
+    background_tasks: StartupBackgroundTasks,
     ctx: CancellationToken,
 ) -> std::io::Result<()> {
     let (s3_shutdown_handle, console_shutdown_handle) = listener_shutdown_handles;
+    let StartupBackgroundTasks {
+        capacity: capacity_tasks,
+        table_maintenance,
+    } = background_tasks;
     ctx.cancel();
 
     // Stop long-lived peer/disk background monitors while the runtime and tracing
@@ -463,10 +472,14 @@ pub(crate) async fn run_startup_shutdown_sequence(
         console_shutdown_handle.shutdown().await;
     }
     shutdown_optional_runtime_services(optional_runtime_shutdowns).await;
+    let maintenance_drained = match table_maintenance {
+        Some(runtime) => runtime.shutdown(SHUTDOWN_TIMEOUT).await,
+        None => true,
+    };
     // FTP, SFTP and WebDAV can start deletes too: wait for detached mutations
     // only after every front end has stopped.
     finish_detached_mutations_and_clear_unclean_shutdown_markers(
-        heal_handoff_complete,
+        heal_handoff_complete && maintenance_drained,
         DETACHED_MUTATION_SHUTDOWN_TIMEOUT,
         wait_for_detached_mutations,
         rustfs_heal::heal::clear_unclean_shutdown_markers(),

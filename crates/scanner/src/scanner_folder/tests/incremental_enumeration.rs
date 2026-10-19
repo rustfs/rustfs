@@ -91,3 +91,42 @@ fn raw_enumeration_progress_invalid_entry_discards_index_but_retains_diagnostic_
     assert!(progress.page_index().is_none());
     assert_eq!(progress.cursor().expect("diagnostic cursor").entries_seen, 3);
 }
+
+// A flat prefix of tens of thousands of keys must cost the walker a bounded
+// amount of bookkeeping per entry. The pre-incremental index re-normalized
+// the cumulative entry list on every entry (rustfs#8113: 8,000 entries took
+// about 40 s); the page writer hashes each entry once when its page commits.
+#[test]
+fn raw_enumeration_progress_record_entry_stays_linear_for_large_prefixes() {
+    const ENTRIES: usize = 20_000;
+    let committed_page_entries = ENTRIES - ENTRIES % SCANNER_RAW_ENUMERATION_PAGE_ENTRY_LIMIT;
+    let mut progress = RawEnumerationProgress::new("bucket", None);
+    RAW_PAGE_DIGEST_ENTRIES.set(0);
+    let start = Instant::now();
+    // Reverse order is the worst case for the sorted insert into the building page.
+    for i in (0..ENTRIES).rev() {
+        progress.record_entry(&format!("entry-{i:06}"));
+    }
+    let elapsed = start.elapsed();
+    assert_eq!(progress.checkpointable_entry_count(), ENTRIES);
+    assert_eq!(
+        RAW_PAGE_DIGEST_ENTRIES.get(),
+        committed_page_entries,
+        "each entry is hashed exactly once, when its page commits"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "recording {ENTRIES} entries took {elapsed:?}; per-entry bookkeeping must stay amortised constant"
+    );
+    let checkpoint = progress.page_index().expect("checkpoint with committed pages");
+    assert_eq!(
+        RAW_PAGE_DIGEST_ENTRIES.get(),
+        ENTRIES,
+        "a checkpoint hashes only the building page it commits"
+    );
+    assert_eq!(checkpoint.indexed_entries().expect("validated checkpoint").len(), ENTRIES);
+    assert_eq!(
+        progress.cursor().expect("cursor").entries_seen,
+        u64::try_from(ENTRIES).expect("entry count fits")
+    );
+}

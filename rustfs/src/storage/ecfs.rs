@@ -415,7 +415,12 @@ pub(crate) fn object_lock_retention_from_metadata(metadata: &HashMap<String, Str
             date.checked_to_offset(time::UtcOffset::UTC)
                 .filter(|date| (0..=9999).contains(&date.year()))
                 .map(Timestamp::from)
-                .ok_or_else(|| s3_error!(InternalError, "Stored retention date is outside the supported UTC range"))
+                .ok_or_else(|| {
+                    S3Error::with_message(
+                        S3ErrorCode::InternalError,
+                        "Stored retention date is outside the supported UTC range".to_string(),
+                    )
+                })
         })
         .transpose()?;
     Ok(ObjectLockRetention { mode, retain_until_date })

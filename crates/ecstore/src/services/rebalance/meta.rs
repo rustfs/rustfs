@@ -71,6 +71,31 @@ impl From<u8> for RebalStatus {
 }
 
 impl RebalanceMeta {
+    /// A historical run has no authority over the current deployment's pool
+    /// indices. Stop timestamps alone do not prove that its workers stopped.
+    pub(crate) fn has_terminal_topology(&self) -> bool {
+        !self.id.is_empty()
+            && !self.pool_stats.is_empty()
+            && self.pool_stats.iter().all(|pool| {
+                if pool.info.stopping
+                    || !matches!(pool.info.status, RebalStatus::Completed | RebalStatus::Stopped | RebalStatus::Failed)
+                        && (pool.participating || pool.info.status != RebalStatus::None)
+                {
+                    return false;
+                }
+                let Some(message) = pool.info.last_error.as_deref() else {
+                    return true;
+                };
+                if !is_rebalance_stop_propagation_error(Some(message)) {
+                    return true;
+                }
+                decode_rebalance_stop_propagation_record(message).is_some_and(|record| {
+                    !record.has_failures()
+                        && (record.stop_attempt_at.or(self.stopped_at).is_none() || record.terminal_reload_attempt_at.is_some())
+                })
+            })
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

@@ -185,6 +185,8 @@ config:
       max_concurrent_set_scans: ""
       # Cap concurrent scanner disk bucket walks per set (0 keeps disk-count-derived concurrency)
       max_concurrent_disk_scans: ""
+      # Bucket walkers per local disk (1-16; default 1 keeps one bucket walk per disk, raise on flash)
+      walkers_per_disk: ""
       # Yield to the async runtime every N scanned objects (0 disables extra yield)
       yield_every_n_objects: ""
       # Version count threshold for scanner alerts
@@ -387,6 +389,14 @@ gatewayApi:
   existingGateway:
     name: ""
     namespace: ""
+
+# Native TLS identity managed by an external certificate controller.
+# Public TLS and an mTLS backend use separate listeners or an ingress terminator.
+tls:
+  enabled: false
+  existingSecret: "" # kubernetes.io/tls: tls.crt and tls.key only
+  trustSecret: "" # Optional independent outbound trust bundle: ca.crt
+  reloadInterval: 30
 
 mtls:
   enabled: false

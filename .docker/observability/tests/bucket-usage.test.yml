@@ -1,0 +1,48 @@
+evaluation_interval: 1m
+tests:
+- name: bucket usage keeps clusters separate and deduplicates reporting nodes
+  interval: 1m
+  input_series:
+  - series: rustfs_cluster_usage_buckets_total_bytes{rustfs_cluster_id="a",job="rustfs",bucket="shared",service_instance_id="a1"}
+    values: '4096 1024'
+  - series: rustfs_cluster_usage_buckets_total_bytes{rustfs_cluster_id="a",job="rustfs",bucket="shared",service_instance_id="a2"}
+    values: '4096 1024'
+  - series: rustfs_cluster_usage_buckets_total_bytes{rustfs_cluster_id="b",job="rustfs",bucket="shared",service_instance_id="b1"}
+    values: '65536 65536'
+  - series: rustfs_cluster_usage_buckets_total_bytes{rustfs_cluster_id="a",job="rustfs",bucket="empty",service_instance_id="a1"}
+    values: '0 0'
+  - series: rustfs_cluster_usage_buckets_objects_count{rustfs_cluster_id="a",job="rustfs",bucket="shared",service_instance_id="a1"}
+    values: '3 1'
+  - series: rustfs_cluster_usage_buckets_objects_count{rustfs_cluster_id="a",job="rustfs",bucket="shared",service_instance_id="a2"}
+    values: '3 1'
+  - series: rustfs_cluster_usage_buckets_objects_count{rustfs_cluster_id="b",job="rustfs",bucket="shared",service_instance_id="b1"}
+    values: '70 70'
+  - series: rustfs_cluster_usage_buckets_objects_count{rustfs_cluster_id="a",job="rustfs",bucket="empty",service_instance_id="a1"}
+    values: '0 0'
+  promql_expr_test:
+  - expr: max by (rustfs_cluster_id, job, bucket) (rustfs_cluster_usage_buckets_total_bytes{rustfs_cluster_id="a",job=~"rustfs",bucket=~".*"})
+    eval_time: 1m
+    exp_samples:
+    - labels: '{rustfs_cluster_id="a",job="rustfs",bucket="shared"}'
+      value: 1024
+    - labels: '{rustfs_cluster_id="a",job="rustfs",bucket="empty"}'
+      value: 0
+  - expr: max by (rustfs_cluster_id, job, bucket) (rustfs_cluster_usage_buckets_objects_count{rustfs_cluster_id="a",job=~"rustfs",bucket=~".*"})
+    eval_time: 1m
+    exp_samples:
+    - labels: '{rustfs_cluster_id="a",job="rustfs",bucket="shared"}'
+      value: 1
+    - labels: '{rustfs_cluster_id="a",job="rustfs",bucket="empty"}'
+      value: 0
+  - expr: max by (rustfs_cluster_id, job, bucket) (rustfs_cluster_usage_buckets_total_bytes)
+    eval_time: 1m
+    exp_samples:
+    - labels: '{rustfs_cluster_id="a",job="rustfs",bucket="shared"}'
+      value: 1024
+    - labels: '{rustfs_cluster_id="a",job="rustfs",bucket="empty"}'
+      value: 0
+    - labels: '{rustfs_cluster_id="b",job="rustfs",bucket="shared"}'
+      value: 65536
+  - expr: rustfs_cluster_usage_buckets_total_bytes{rustfs_cluster_id="a",bucket="unknown"}
+    eval_time: 1m
+    exp_samples: []

@@ -27,6 +27,8 @@ const ALL_ADMIN: AdminActionRef = AdminActionRef::new("AllAdminActions");
 const ADD_USER_TO_GROUP: AdminActionRef = AdminActionRef::new("AddUserToGroupAdminAction");
 const ATTACH_POLICY: AdminActionRef = AdminActionRef::new("AttachPolicyAdminAction");
 const CONFIG_UPDATE: AdminActionRef = AdminActionRef::new("ConfigUpdateAdminAction");
+const TLS_CERTIFICATE_PUBLISH: AdminActionRef = AdminActionRef::new("TLSCertificatePublishAdminAction");
+const TLS_CERTIFICATE_STATUS: AdminActionRef = AdminActionRef::new("TLSCertificateStatusAdminAction");
 const CONSOLE_LOG: AdminActionRef = AdminActionRef::new("ConsoleLogAdminAction");
 const COMMIT_TABLE: AdminActionRef = AdminActionRef::new("CommitTableAction");
 const ISSUE_PLUGIN_ATTEMPT: AdminActionRef = AdminActionRef::new("IssuePluginAttemptAction");
@@ -516,6 +518,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(HttpMethod::Get, "/rustfs/admin/v3/config", CONFIG_UPDATE, RouteRiskLevel::High),
     admin(HttpMethod::Put, "/rustfs/admin/v3/config", CONFIG_UPDATE, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/tls/certificate-state",
+        TLS_CERTIFICATE_STATUS,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/tls/certificate",
+        TLS_CERTIFICATE_PUBLISH,
+        RouteRiskLevel::High,
+    ),
     admin(HttpMethod::Get, "/rustfs/admin/v3/scanner/status", SERVER_INFO, RouteRiskLevel::Sensitive),
     admin(
         HttpMethod::Post,
@@ -2408,6 +2422,14 @@ mod tests {
         ] {
             assert_not_action(HttpMethod::Post, path, KMS_CONFIGURE);
         }
+    }
+
+    #[test]
+    fn route_policy_records_dedicated_tls_actions() {
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/tls/certificate-state", TLS_CERTIFICATE_STATUS);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/tls/certificate", TLS_CERTIFICATE_PUBLISH);
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/tls/certificate", CONFIG_UPDATE);
+        assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/tls/certificate-state", TLS_CERTIFICATE_PUBLISH);
     }
 
     /// `Critical` marks the routes whose worst case is permanent loss of user
