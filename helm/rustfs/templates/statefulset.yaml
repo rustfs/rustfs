@@ -39,6 +39,10 @@
 {{- $pools := include "rustfs.pools" . | fromJsonArray }}
 {{- range $pool := $pools }}
 {{- $drivesPerNode := int $pool.drives }}
+{{- /* An empty storageclass.dataStorageSize means the data volumes are supplied
+       through extraVolumes/extraVolumeMounts (for example JBOD hostPath disks),
+       so the chart renders no data PVC templates and no data mounts. */}}
+{{- $dataPvcEnabled := not (empty $pool.storageclass.dataStorageSize) }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -57,6 +61,13 @@ spec:
   serviceName: {{ include "rustfs.fullname" $ }}-headless
   replicas: {{ $pool.replicaCount }}
   podManagementPolicy: Parallel
+  {{- if gt (int $.Values.minReadySeconds) 0 }}
+  {{- /* A replaced pod reports Ready from its own view before surviving
+         peers have re-dialed its new IP (platform DNS TTL) and re-admitted
+         its drives. Hold the rollout so the next pod is not stopped while
+         survivors still count the previous one as unavailable (#8669). */}}
+  minReadySeconds: {{ int $.Values.minReadySeconds }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "rustfs.selectorLabels" $ | nindent 6 }}
@@ -142,19 +153,23 @@ spec:
       priorityClassName: {{ $.Values.priorityClassName }}
       securityContext:
         {{- toYaml $.Values.podSecurityContext | nindent 8 }}
+      {{- if or $dataPvcEnabled $logDirEnabled }}
       initContainers:
         - name: init-step
           image: "{{ $.Values.image.initImage.repository }}:{{ $.Values.image.initImage.tag }}"
           imagePullPolicy: {{ $.Values.image.initImage.pullPolicy }}
           securityContext:
             {{- toYaml $.Values.containerSecurityContext | nindent 12 }}
+          {{- if $dataPvcEnabled }}
           env:
             - name: DRIVES_PER_NODE
               value: {{ $drivesPerNode | quote }}
+          {{- end }}
           command:
             - sh
             - -c
             - |
+              {{- if $dataPvcEnabled }}
               if [ "$DRIVES_PER_NODE" -gt 1 ]; then
                 for i in $(seq 0 $(($DRIVES_PER_NODE - 1))); do
                   mkdir -p /data/rustfs$i
@@ -162,11 +177,13 @@ spec:
               else
                 mkdir -p /data
               fi
+              {{- end }}
               {{- if $logDirEnabled }}
               mkdir -p /mnt/rustfs/logs
               chmod 755 /mnt/rustfs/logs
               {{- end }}
           volumeMounts:
+            {{- if $dataPvcEnabled }}
             {{- if gt $drivesPerNode 1 }}
             {{- range $i := until $drivesPerNode }}
             - name: data-rustfs-{{ $i }}
@@ -176,10 +193,12 @@ spec:
             - name: data
               mountPath: /data
             {{- end }}
+            {{- end }}
             {{- if $logDirEnabled }}
             - name: logs
               mountPath: /mnt/rustfs
             {{- end }}
+      {{- end }}
       containers:
         - name: {{ $.Chart.Name }}
           image: "{{ $.Values.image.rustfs.repository }}:{{ $.Values.image.rustfs.tag | default $.Chart.AppVersion }}"
@@ -232,6 +251,7 @@ spec:
               mountPath: {{ $logDir }}
               subPath: logs
             {{- end }}
+            {{- if $dataPvcEnabled }}
             {{- if gt $drivesPerNode 1 }}
             {{- range $i := until $drivesPerNode }}
             - name: data-rustfs-{{ $i }}
@@ -240,6 +260,7 @@ spec:
             {{- else }}
             - name: data
               mountPath: /data
+            {{- end }}
             {{- end }}
       {{- if or $.Values.mtls.enabled $tlsEnabled $.Values.extraVolumes }}
       volumes:
@@ -282,6 +303,7 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- end }}
+  {{- if or $logDirEnabled $dataPvcEnabled }}
   volumeClaimTemplates:
     {{- if $logDirEnabled }}
     - apiVersion: v1
@@ -302,6 +324,7 @@ spec:
           requests:
             storage: {{ $pool.storageclass.logStorageSize }}
     {{- end }}
+    {{- if $dataPvcEnabled }}
     {{- if gt $drivesPerNode 1 }}
     {{- range $i := until $drivesPerNode }}
     - apiVersion: v1
@@ -341,5 +364,7 @@ spec:
           requests:
             storage: {{ $pool.storageclass.dataStorageSize }}
     {{- end }}
+    {{- end }}
+  {{- end }}
 {{- end }}
 {{- end }}
