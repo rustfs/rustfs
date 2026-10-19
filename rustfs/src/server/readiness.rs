@@ -44,6 +44,9 @@ use tokio::sync::Mutex;
 use tower::{Layer, Service};
 use tracing::{debug, info};
 
+mod peer_readmission;
+pub(crate) use peer_readmission::observe_peer_drive_admission;
+
 /// Default upper bound for the startup runtime-readiness wait.
 ///
 /// This is the compile-time fallback used when
@@ -234,30 +237,41 @@ pub async fn publish_ready_when_runtime_ready(
     readiness: &GlobalReadiness,
     state_manager: Option<&ServiceStateManager>,
 ) -> Result<(), std::io::Error> {
+    let max_wait = startup_runtime_readiness_max_wait();
+    let startup_deadline = tokio::time::Instant::now() + max_wait;
+    let mut local_readiness = None;
     wait_for_runtime_readiness_with(
-        startup_runtime_readiness_max_wait(),
+        max_wait,
         STARTUP_RUNTIME_READINESS_POLL_INTERVAL,
         // Publish service readiness at the same per-set read and shared-lock
         // boundary reported by the node probe. Mutation paths independently
         // require write quorum and a writable pool-metadata state.
         || async { collect_node_readiness_report().await.readiness },
-        |dependency_readiness| {
-            readiness.mark_stage(rustfs_common::SystemStage::FullReady);
-            mark_get_metadata_read_version_coalescing_service_ready();
-            if let Some(state_manager) = state_manager {
-                state_manager.update(ServiceState::Ready);
-            }
-            info!(
-                target: "rustfs::server::readiness",
-                storage_ready = dependency_readiness.storage_ready,
-                iam_ready = dependency_readiness.iam_ready,
-                lock_quorum_ready = dependency_readiness.lock_quorum_ready,
-                peer_health_ready = dependency_readiness.peer_health_ready,
-                "Runtime node readiness reached; publishing ready state"
-            );
-        },
+        |dependency_readiness| local_readiness = Some(dependency_readiness),
     )
-    .await
+    .await?;
+
+    // This node's own view is ready. Hold the startup FullReady transition until
+    // the peers count this node's drives online too (rustfs#8669). The gate
+    // shares the startup budget and always ends in publication.
+    let readmission = peer_readmission::wait_for_startup_peer_readmission(startup_deadline).await;
+    peer_readmission::log_readmission_outcome(&readmission);
+
+    let dependency_readiness = local_readiness.unwrap_or_default();
+    readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+    mark_get_metadata_read_version_coalescing_service_ready();
+    if let Some(state_manager) = state_manager {
+        state_manager.update(ServiceState::Ready);
+    }
+    info!(
+        target: "rustfs::server::readiness",
+        storage_ready = dependency_readiness.storage_ready,
+        iam_ready = dependency_readiness.iam_ready,
+        lock_quorum_ready = dependency_readiness.lock_quorum_ready,
+        peer_health_ready = dependency_readiness.peer_health_ready,
+        "Runtime node readiness reached; publishing ready state"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1504,6 +1518,91 @@ mod tests {
                 .expect("restored inventory")
                 .0
         ));
+    }
+
+    /// Two-node model of rustfs#8669: `node-2` restarts while the survivor's
+    /// lock client still cannot dial it. The restarted node must keep the
+    /// startup readiness gate closed until the survivor's own readiness
+    /// predicate counts node-2's drive online, then publish.
+    #[tokio::test(start_paused = true)]
+    async fn restarted_node_stays_unready_until_survivor_counts_its_drive_online() {
+        use peer_readmission::{
+            PeerDriveView, PeerProbe, ReadmissionOutcome, UNREACHABLE_PEER_GRACE, host_drive_observations, readmission_plan,
+            wait_for_peer_readmission_with,
+        };
+        use std::sync::atomic::AtomicBool;
+
+        // Survivor side: the shared 3-drive set, one drive per node.
+        let survivor = runtime_inventory(&[(1, 3, 1)]).await;
+        // Restarted side: the same topology seen from node-2.
+        let restarted_topology = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 3,
+            endpoints: Endpoints::from(
+                (0..3)
+                    .map(|disk_idx| Endpoint {
+                        url: url::Url::parse(&format!("http://node-{disk_idx}:9000/pool-0-set-0")).expect("valid test endpoint"),
+                        is_local: disk_idx == 2,
+                        pool_idx: 0,
+                        set_idx: 0,
+                        disk_idx,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }]);
+        let plan = readmission_plan(&restarted_topology).expect("restarted node plan");
+        assert_eq!(plan.local_host, "node-2:9000");
+
+        let survivor_reaches_restarted = AtomicBool::new(false);
+        let readiness = GlobalReadiness::new();
+        readiness.mark_stage(rustfs_common::SystemStage::IamReady);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+
+        let gate = async {
+            let outcome =
+                wait_for_peer_readmission_with(&plan, deadline, Duration::from_secs(1), UNREACHABLE_PEER_GRACE, || async {
+                    let mut online_hosts = HashSet::from(["node-0:9000".to_string(), "node-1:9000".to_string()]);
+                    if survivor_reaches_restarted.load(Ordering::SeqCst) {
+                        online_hosts.insert("node-2:9000".to_string());
+                    }
+                    let drives = host_drive_observations(&survivor, &plan.local_host, &online_hosts)
+                        .await
+                        .expect("survivor inventory");
+                    assert_eq!(drives.len(), 1, "the survivor reports only the restarted host's drives");
+                    let view = PeerProbe::Answered(
+                        drives
+                            .into_iter()
+                            .map(|drive| PeerDriveView {
+                                pool_index: drive.pool_index,
+                                set_index: drive.set_index,
+                                disk_index: drive.disk_index,
+                                online: drive.online,
+                            })
+                            .collect(),
+                    );
+                    HashMap::from([("node-0:9000".to_string(), view.clone()), ("node-1:9000".to_string(), view)])
+                })
+                .await;
+            readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+            outcome
+        };
+        let survivor_recovers = async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            assert!(!readiness.is_ready(), "the survivor still counts node-2 unavailable");
+            assert!(readiness_gate_blocks_path("/bucket/object", &readiness));
+            survivor_reaches_restarted.store(true, Ordering::SeqCst);
+        };
+
+        let (outcome, ()) = tokio::join!(gate, survivor_recovers);
+        let ReadmissionOutcome::Admitted { waited } = outcome else {
+            panic!("expected re-admission, got {outcome:?}");
+        };
+        assert!(waited >= Duration::from_secs(10), "published after {waited:?}");
+        assert!(readiness.is_ready());
+        assert!(!readiness_gate_blocks_path("/bucket/object", &readiness));
     }
 
     #[tokio::test]

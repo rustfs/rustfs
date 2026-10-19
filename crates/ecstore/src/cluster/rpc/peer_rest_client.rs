@@ -48,14 +48,15 @@ use rustfs_protos::proto_gen::node_service::{
     GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest, GetSysConfigRequest, GetSysErrorsRequest,
     HealControlRequest, LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest,
     LoadRebalanceMetaRequest, LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest,
-    LocalStorageInfoRequest, Mss, PingRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest,
-    ReplacementRecoveryStatusRequest, ScannerActivityRequest, ScannerActivityResponse, ScannerDirtyUsageSnapshotRequest,
-    ScannerDirtyUsageSnapshotResponse, ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest,
-    ScannerPublicationLeaseResponse, ScannerScopedDirtyUsageAckRequest, ScannerScopedDirtyUsageAckResponse,
-    ScannerScopedDirtyUsageEntry, ServerInfoRequest, SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest,
-    StartProfilingRequest, StopRebalanceRequest, TierDailyStatsRequest, TierMutationAbortRequest, TierMutationCommitRequest,
-    TierMutationControlResponse, TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest,
-    node_service_client::NodeServiceClient, tier_mutation_control_service_client::TierMutationControlServiceClient,
+    LocalStorageInfoRequest, Mss, PeerDriveAdmissionRequest, PingRequest, ReloadPoolMetaRequest,
+    ReloadSiteReplicationConfigRequest, ReplacementRecoveryStatusRequest, ScannerActivityRequest, ScannerActivityResponse,
+    ScannerDirtyUsageSnapshotRequest, ScannerDirtyUsageSnapshotResponse, ScannerPublicationLeaseReleaseRequest,
+    ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse, ScannerScopedDirtyUsageAckRequest,
+    ScannerScopedDirtyUsageAckResponse, ScannerScopedDirtyUsageEntry, ServerInfoRequest, SignalServiceRequest,
+    SignalServiceResponse, StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest, TierDailyStatsRequest,
+    TierMutationAbortRequest, TierMutationCommitRequest, TierMutationControlResponse, TierMutationFailureClass,
+    TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
+    tier_mutation_control_service_client::TierMutationControlServiceClient,
 };
 pub use rustfs_protos::{PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS};
 use rustfs_protos::{TierMutationRpcPhase, evict_failed_connection};
@@ -89,6 +90,7 @@ pub const SERVICE_SIGNAL_RELOAD_DYNAMIC: u64 = 2;
 pub const KMS_SIGNAL_SUBSYSTEM: &str = "kms";
 const BACKGROUND_HEAL_STATUS_MAX_MESSAGE_SIZE: usize = 64 * 1024;
 const REPLACEMENT_RECOVERY_STATUS_MAX_MESSAGE_SIZE: usize = 64 * 1024;
+const PEER_DRIVE_ADMISSION_MAX_MESSAGE_SIZE: usize = 256 * 1024;
 const HEAL_CONTROL_FINGERPRINT_MAX_SIZE: usize = 256;
 const HEAL_CONTROL_PAYLOAD_MAX_SIZE: usize = 64 * 1024;
 const PEER_REST_RECOVERY_MAX_ATTEMPTS: u32 = 60;
@@ -711,6 +713,16 @@ fn scanner_publication_lease_deadline(
         .ok_or_else(|| Error::other("scanner publication lease deadline overflowed"))
 }
 
+/// A peer's readiness view of one drive served by another host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerDriveAdmissionView {
+    pub pool_index: i32,
+    pub set_index: i32,
+    pub disk_index: i32,
+    /// True when the peer counts the drive towards its own read quorum.
+    pub online: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct PeerRestClient {
     pub host: XHost,
@@ -862,6 +874,11 @@ impl PeerRestClient {
             kind = "peer_rest",
             grid_host = %grid_host
         )
+    }
+
+    /// Topology `host:port` this client talks to, as written in the endpoint list.
+    pub fn topology_member(&self) -> &str {
+        &self.topology_member
     }
 
     pub fn new(host: XHost, grid_host: String) -> Self {
@@ -1671,6 +1688,51 @@ impl PeerRestClient {
                     });
                 }
                 Ok(Some(response.recovery_status.to_vec()))
+            }
+            .await,
+        )
+        .await
+    }
+
+    /// Ask the peer how it currently sees the drives served by `host`.
+    ///
+    /// `Ok(None)` means the peer predates the RPC and cannot answer.
+    pub async fn peer_drive_admission(&self, host: &str) -> Result<Option<Vec<PeerDriveAdmissionView>>> {
+        self.finalize_result(
+            async {
+                let mut client = self
+                    .get_client()
+                    .await?
+                    .max_decoding_message_size(PEER_DRIVE_ADMISSION_MAX_MESSAGE_SIZE);
+                let response = match client
+                    .peer_drive_admission(Request::new(PeerDriveAdmissionRequest { host: host.to_string() }))
+                    .await
+                {
+                    Ok(response) => response.into_inner(),
+                    Err(status) if status.code() == tonic::Code::Unimplemented => {
+                        // RUSTFS_COMPAT_TODO(peer-drive-admission-v1): old peers cannot report how they see a restarting node, so its startup re-admission gate skips them. Remove after the minimum supported RustFS peer version implements PeerDriveAdmission.
+                        return Ok(None);
+                    }
+                    Err(status) => return Err(status.into()),
+                };
+                if !response.success {
+                    return Err(match (response.error_code, response.error_info) {
+                        (None, None) => Error::other("peer drive admission failed without an error"),
+                        (error_code, error_info) => control_plane_failure("peer_drive_admission", None, error_code, error_info),
+                    });
+                }
+                Ok(Some(
+                    response
+                        .drives
+                        .into_iter()
+                        .map(|drive| PeerDriveAdmissionView {
+                            pool_index: drive.pool_index,
+                            set_index: drive.set_index,
+                            disk_index: drive.disk_index,
+                            online: drive.online,
+                        })
+                        .collect(),
+                ))
             }
             .await,
         )

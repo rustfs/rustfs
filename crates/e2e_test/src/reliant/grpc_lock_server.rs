@@ -961,6 +961,13 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn peer_drive_admission(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::PeerDriveAdmissionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::PeerDriveAdmissionResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn get_metacache_listing(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::GetMetacacheListingRequest>,

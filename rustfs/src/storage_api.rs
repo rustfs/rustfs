@@ -265,7 +265,9 @@ pub(crate) mod server {
         }
 
         pub(crate) use crate::storage::storage_api::ecstore_disk::DiskStore;
-        pub(crate) use crate::storage::storage_api::{Endpoint, EndpointServerPools, is_dist_erasure};
+        pub(crate) use crate::storage::storage_api::{
+            Endpoint, EndpointServerPools, PeerRestClient, get_global_notification_sys, is_dist_erasure,
+        };
 
         pub(crate) fn disk_endpoint_snapshot(disk: &DiskStore) -> Endpoint {
             crate::storage::storage_api::ecstore_disk::DiskAPI::endpoint(disk.as_ref())

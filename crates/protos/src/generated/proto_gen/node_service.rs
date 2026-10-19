@@ -1506,6 +1506,41 @@ pub struct ReplacementRecoveryStatusResponse {
     #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "4")]
     pub error_code: ::core::option::Option<i32>,
 }
+/// Asks a peer how it currently sees the drives served by `host`, so a
+/// restarting node can wait for re-admission before publishing readiness.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PeerDriveAdmissionRequest {
+    /// Topology host:port of the drives' owner, as written in the endpoint list.
+    #[prost(string, tag = "1")]
+    pub host: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PeerDriveAdmission {
+    #[prost(int32, tag = "1")]
+    pub pool_index: i32,
+    #[prost(int32, tag = "2")]
+    pub set_index: i32,
+    #[prost(int32, tag = "3")]
+    pub disk_index: i32,
+    /// True only when the peer would count this drive towards its own read quorum.
+    #[prost(bool, tag = "4")]
+    pub online: bool,
+    #[prost(string, tag = "5")]
+    pub runtime_state: ::prost::alloc::string::String,
+    #[prost(bool, tag = "6")]
+    pub host_online: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PeerDriveAdmissionResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(message, repeated, tag = "2")]
+    pub drives: ::prost::alloc::vec::Vec<PeerDriveAdmission>,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "4")]
+    pub error_code: ::core::option::Option<i32>,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HealControlRequest {
     #[prost(uint32, tag = "1")]
@@ -3350,6 +3385,21 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "ReplacementRecoveryStatus"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn peer_drive_admission(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PeerDriveAdmissionRequest>,
+        ) -> std::result::Result<tonic::Response<super::PeerDriveAdmissionResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/PeerDriveAdmission");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "PeerDriveAdmission"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn get_metacache_listing(
             &mut self,
             request: impl tonic::IntoRequest<super::GetMetacacheListingRequest>,
@@ -3916,6 +3966,10 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::ReplacementRecoveryStatusRequest>,
         ) -> std::result::Result<tonic::Response<super::ReplacementRecoveryStatusResponse>, tonic::Status>;
+        async fn peer_drive_admission(
+            &self,
+            request: tonic::Request<super::PeerDriveAdmissionRequest>,
+        ) -> std::result::Result<tonic::Response<super::PeerDriveAdmissionResponse>, tonic::Status>;
         async fn get_metacache_listing(
             &self,
             request: tonic::Request<super::GetMetacacheListingRequest>,
@@ -6664,6 +6718,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ReplacementRecoveryStatusSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/PeerDriveAdmission" => {
+                    #[allow(non_camel_case_types)]
+                    struct PeerDriveAdmissionSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::PeerDriveAdmissionRequest> for PeerDriveAdmissionSvc<T> {
+                        type Response = super::PeerDriveAdmissionResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::PeerDriveAdmissionRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::peer_drive_admission(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PeerDriveAdmissionSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

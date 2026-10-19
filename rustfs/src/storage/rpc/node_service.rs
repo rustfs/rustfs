@@ -2799,6 +2799,39 @@ impl Node for NodeService {
         }
     }
 
+    async fn peer_drive_admission(
+        &self,
+        request: Request<PeerDriveAdmissionRequest>,
+    ) -> Result<Response<PeerDriveAdmissionResponse>, Status> {
+        let host = request.into_inner().host;
+        match crate::server::observe_peer_drive_admission(&host).await {
+            Ok(drives) => Ok(Response::new(PeerDriveAdmissionResponse {
+                success: true,
+                drives: drives
+                    .into_iter()
+                    .map(|drive| PeerDriveAdmission {
+                        pool_index: drive.pool_index,
+                        set_index: drive.set_index,
+                        disk_index: drive.disk_index,
+                        online: drive.online,
+                        runtime_state: drive.runtime_state,
+                        host_online: drive.host_online,
+                    })
+                    .collect(),
+                error_info: None,
+                error_code: None,
+            })),
+            Err(err) => Ok(Response::new(PeerDriveAdmissionResponse {
+                success: false,
+                drives: Vec::new(),
+                error_info: Some(err.to_string()),
+                error_code: err
+                    .not_initialized()
+                    .then_some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
+            })),
+        }
+    }
+
     async fn get_metacache_listing(
         &self,
         _request: Request<GetMetacacheListingRequest>,
