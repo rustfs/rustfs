@@ -2519,6 +2519,318 @@ mod decommission_lock_order_tests {
         );
     }
 
+    /// Seeds a two-part null version, written before versioning was enabled,
+    /// with a delete marker or a newer version above it, on pool 0
+    /// (backlog#2873). Returns the null version's body and the seeded versions.
+    async fn seed_multipart_null_version(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        incarnation: uuid::Uuid,
+        marker_on_top: bool,
+    ) -> (Vec<u8>, rustfs_filemeta::FileInfoVersions) {
+        let first_part = vec![0x4e; 5 * 1024 * 1024];
+        let second_part = vec![0x55; 1];
+        let null_opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        let upload = new_multipart_upload(store, 0, bucket, object, null_opts.clone())
+            .await
+            .expect("create the null-version upload");
+        let multipart_opts = multipart_options(store, bucket, null_opts).await;
+        let mut parts = Vec::with_capacity(2);
+        for (part_num, part_body) in [(1, first_part.as_slice()), (2, second_part.as_slice())] {
+            let mut reader = PutObjReader::from_vec(part_body.to_vec());
+            let part = store.pools[0]
+                .put_object_part(bucket, object, &upload.upload_id, part_num, &mut reader, &multipart_opts)
+                .await
+                .expect("stage a null-version part");
+            parts.push(crate::storage_api_contracts::multipart::CompletePart {
+                part_num: part.part_num,
+                etag: part.etag,
+                ..Default::default()
+            });
+        }
+        let null_info = store.pools[0]
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload.upload_id, parts, &multipart_opts)
+            .await
+            .expect("complete the null-version upload");
+        assert!(null_info.is_multipart(), "the null version must use multipart data movement");
+
+        let versioned = ObjectOptions {
+            versioned: true,
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        if marker_on_top {
+            store.pools[0]
+                .delete_object(bucket, object, versioned)
+                .await
+                .expect("seed a delete marker over the null version");
+        } else {
+            store.pools[0]
+                .put_object(
+                    bucket,
+                    object,
+                    &mut PutObjReader::from_vec(b"written after versioning was enabled".to_vec()),
+                    &versioned,
+                )
+                .await
+                .expect("seed a newer version over the null version");
+        }
+        let seeded = store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("read the seeded versions")
+            .expect("the seeded versions must exist");
+        assert_eq!(seeded.versions.len(), 2);
+        assert!(seeded.versions[0].version_id.is_some());
+        assert!(seeded.versions[1].version_id.is_none(), "the oldest version must be the null version");
+        let mut body = first_part;
+        body.extend_from_slice(&second_part);
+        (body, seeded)
+    }
+
+    /// Both versions reached pool 1 with their identities, the null version's
+    /// bytes are intact, and the source entry on pool 0 is gone.
+    async fn assert_multipart_null_version_moved(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        body: &[u8],
+        seeded: &rustfs_filemeta::FileInfoVersions,
+    ) {
+        let target = store.pools[1]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("read the target versions")
+            .expect("both versions must reach the target pool");
+        assert_eq!(target.versions.len(), 2, "{object}: both versions must move");
+        assert_eq!(target.versions[0].version_id, seeded.versions[0].version_id);
+        assert_eq!(target.versions[0].deleted, seeded.versions[0].deleted);
+        assert!(
+            target.versions[1].version_id.is_none(),
+            "{object}: the null version must keep its identity"
+        );
+        assert_eq!(target.versions[1].mod_time, seeded.versions[1].mod_time);
+        let mut reader = store.pools[1]
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: Some(uuid::Uuid::nil().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the moved null version must be readable");
+        let mut actual = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut actual)
+            .await
+            .expect("drain the moved null version");
+        assert_eq!(
+            rustfs_utils::crypto::hex_sha256(&actual, str::to_owned),
+            rustfs_utils::crypto::hex_sha256(body, str::to_owned)
+        );
+        assert!(
+            store.pools[0]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("read the source versions")
+                .is_none(),
+            "{object}: the source entry must be removed after both versions moved"
+        );
+    }
+
+    fn multipart_null_version_capacity() -> Vec<DecommissionPoolCapacityInfo> {
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let source = 16 * 1024 * 1024;
+        let target = 256 * 1024 * 1024;
+        vec![
+            DecommissionPoolCapacityInfo::for_test(0, layout, 0, source, source),
+            DecommissionPoolCapacityInfo::for_test(1, layout, target, target, 0),
+        ]
+    }
+
+    /// The legacy (V1) capacity model runs the multipart staging cleanup proof
+    /// on every attempt. That proof must look up the exact null version on the
+    /// target; resolving the latest version found the marker or newer version
+    /// moved first and failed every attempt.
+    #[test]
+    #[serial_test::serial]
+    fn legacy_decommission_moves_multipart_null_version_behind_newer_versions() {
+        run_large_stack_current_thread_async_test(
+            "legacy-multipart-null-version",
+            legacy_decommission_moves_multipart_null_version_behind_newer_versions_case,
+        );
+    }
+
+    async fn legacy_decommission_moves_multipart_null_version_behind_newer_versions_case() {
+        let (_temp_dirs, store, _other_store) =
+            crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
+        let bucket = test_bucket("legacy-mp-null");
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create the legacy multipart null-version bucket");
+        let incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("load the bucket incarnation");
+        let mut seeded = Vec::new();
+        for (object, marker_on_top) in [("behind-marker.bin", true), ("behind-newer.bin", false)] {
+            let (body, versions) = seed_multipart_null_version(&store, &bucket, object, incarnation, marker_on_top).await;
+            seeded.push((object, body, versions));
+        }
+        set_decommission_capacity_info_overrides_for_test(store.id, (0..40).map(|_| multipart_null_version_capacity()).collect());
+        let _proof_guard = crate::services::notification_sys::without_decommission_target_fence_fleet_proof_for_test();
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("activate a legacy capacity reservation");
+        let model_version = store.pool_meta.read().await.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .expect("the legacy reservation must exist")
+            .model_version;
+        assert_eq!(model_version, 1, "a proofless start must use the legacy capacity model");
+
+        for (object, body, versions) in &seeded {
+            store
+                .decommission_entry_with_retry_state_for_test(
+                    CancellationToken::new(),
+                    0,
+                    MetaCacheEntry {
+                        name: object.to_string(),
+                        ..Default::default()
+                    },
+                    bucket.clone(),
+                    store.pools[0].get_disks_by_key(object),
+                    Some(incarnation),
+                    Arc::new(AtomicUsize::new(0)),
+                )
+                .await
+                .unwrap_or_else(|err| panic!("{object}: the legacy multipart null version must move: {err:?}"));
+            assert_multipart_null_version_moved(&store, &bucket, object, body, versions).await;
+        }
+    }
+
+    /// Under the exact (V2) capacity model the staging cleanup proof runs when
+    /// a previous attempt left a pending intent. An interrupted null-version
+    /// upload must not block every later attempt.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_retries_interrupted_multipart_null_version_behind_newer_version() {
+        run_large_stack_current_thread_async_test(
+            "interrupted-multipart-null-version",
+            decommission_retries_interrupted_multipart_null_version_behind_newer_version_case,
+        );
+    }
+
+    async fn decommission_retries_interrupted_multipart_null_version_behind_newer_version_case() {
+        let (_temp_dirs, store, other_store) =
+            crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
+        let bucket = test_bucket("interrupted-mp-null");
+        let object = "interrupted-null.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create the interrupted multipart null-version bucket");
+        let incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("load the bucket incarnation");
+        let (body, seeded) = seed_multipart_null_version(&store, &bucket, object, incarnation, false).await;
+        set_decommission_capacity_info_overrides_for_test(store.id, (0..40).map(|_| multipart_null_version_capacity()).collect());
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("activate an exact capacity reservation");
+        assert_ne!(
+            store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .expect("the exact reservation must exist")
+                .model_version,
+            1,
+            "a proven fleet must use the exact capacity model"
+        );
+
+        let part_barrier = MultipartCommitBarrier::install(&bucket, object, MultipartCommitPause::PutPartAfterRename);
+        let interrupted = tokio::spawn({
+            let store = Arc::clone(&store);
+            let bucket = bucket.clone();
+            let source_set = store.pools[0].get_disks_by_key(object);
+            async move {
+                store
+                    .decommission_entry_with_retry_state_for_test(
+                        CancellationToken::new(),
+                        0,
+                        MetaCacheEntry {
+                            name: object.to_string(),
+                            ..Default::default()
+                        },
+                        bucket,
+                        source_set,
+                        Some(incarnation),
+                        Arc::new(AtomicUsize::new(0)),
+                    )
+                    .await
+            }
+        });
+        part_barrier.wait_until_paused().await;
+        interrupted.abort();
+        let _ = interrupted.await;
+        drop(part_barrier);
+
+        // Resume on a fresh node context from the durable pool metadata, as a
+        // restarted leader would.
+        let mut persisted = crate::core::pools::PoolMeta::default();
+        persisted
+            .load_no_lock_from_replicas(other_store.pools.clone())
+            .await
+            .expect("reload the interrupted reservation");
+        let pending = persisted.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .expect("the interrupted reservation must remain durable")
+            .pending_target_physical_bytes;
+        assert!(pending > 0, "the interrupted upload must leave a pending intent to clean up");
+        *other_store.pool_meta.write().await = persisted;
+        set_decommission_capacity_info_overrides_for_test(
+            other_store.id,
+            (0..80).map(|_| multipart_null_version_capacity()).collect(),
+        );
+        other_store
+            .decommission_entry_with_retry_state_for_test(
+                CancellationToken::new(),
+                0,
+                MetaCacheEntry {
+                    name: object.to_string(),
+                    ..Default::default()
+                },
+                bucket.clone(),
+                other_store.pools[0].get_disks_by_key(object),
+                Some(incarnation),
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .await
+            .expect("the retry must clean up the interrupted upload and move the null version");
+        assert_multipart_null_version_moved(&other_store, &bucket, object, &body, &seeded).await;
+    }
+
     #[test]
     #[serial_test::serial]
     fn data_movement_multipart_restart_cleans_partial_upload_before_exact_fit_retry() {

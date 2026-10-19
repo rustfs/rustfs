@@ -1568,121 +1568,219 @@ mod tests {
         assert_eq!(stats.cleanup_warnings.count, 0);
     }
 
+    /// What sits above the pre-versioning null version in the null-version
+    /// fixtures (backlog#2873).
+    #[derive(Clone, Copy, Debug)]
+    enum NullVersionTop {
+        DeleteMarker,
+        NewerVersion,
+    }
+
+    const NULL_VERSION_REBALANCE_ID: &str = "rebalance-null-version";
+
+    /// One rebalancing entry: a null version written before versioning was
+    /// enabled, with a delete marker or a newer version above it, on pool 0 of a
+    /// two-pool store with an active run.
+    struct NullVersionRebalance {
+        _temp_dirs: Vec<tempfile::TempDir>,
+        store: Arc<ECStore>,
+        bucket: &'static str,
+        object: &'static str,
+        incarnation: uuid::Uuid,
+        payload: Vec<u8>,
+        seeded: rustfs_filemeta::FileInfoVersions,
+        source_set: Arc<SetDisks>,
+    }
+
+    impl NullVersionRebalance {
+        async fn new(top: NullVersionTop) -> Self {
+            let (temp_dirs, store, _peer) =
+                crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = "rebalance-null-version";
+            let object = "pre-versioning.bin";
+            // An active run blocks the data-usage publication bucket creation needs.
+            Box::pin(store.make_bucket(bucket, &MakeBucketOptions::default()))
+                .await
+                .expect("create bucket");
+            let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
+            let rebalance_meta = active_rebalance_meta(NULL_VERSION_REBALANCE_ID);
+            rebalance_meta
+                .save(Arc::clone(&store.pools[0]))
+                .await
+                .expect("persist the active rebalance run");
+            *store.rebalance_meta.write().await = Some(rebalance_meta);
+            let payload = b"written before versioning was enabled".repeat(128);
+            let source_set = store.pools[0].get_disks_by_key(object);
+            Box::pin(source_set.put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(payload.clone()),
+                &ObjectOptions {
+                    expected_bucket_incarnation_id: Some(incarnation),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("seed null version");
+            let versioned = ObjectOptions {
+                versioned: true,
+                expected_bucket_incarnation_id: Some(incarnation),
+                ..Default::default()
+            };
+            match top {
+                NullVersionTop::DeleteMarker => {
+                    let marker = Box::pin(source_set.delete_object(bucket, object, versioned))
+                        .await
+                        .expect("seed delete marker over the null version");
+                    assert!(marker.delete_marker);
+                }
+                NullVersionTop::NewerVersion => {
+                    Box::pin(source_set.put_object(
+                        bucket,
+                        object,
+                        &mut PutObjReader::from_vec(b"written after versioning was enabled".to_vec()),
+                        &versioned,
+                    ))
+                    .await
+                    .expect("seed newer version over the null version");
+                }
+            }
+            let seeded = source_set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("read seeded versions")
+                .expect("seeded versions must exist");
+            assert_eq!(seeded.versions.len(), 2);
+            assert_eq!(seeded.versions[0].deleted, matches!(top, NullVersionTop::DeleteMarker));
+            assert!(seeded.versions[0].version_id.is_some(), "the latest version must have a real id");
+            assert!(seeded.versions[1].version_id.is_none(), "the oldest version must be the null version");
+            Self {
+                _temp_dirs: temp_dirs,
+                store,
+                bucket,
+                object,
+                incarnation,
+                payload,
+                seeded,
+                source_set,
+            }
+        }
+
+        async fn run_entry(&self) -> RebalanceEntryOutcome {
+            let entry = metacache_entry_from_source(&self.source_set, self.bucket, self.object).await;
+            Box::pin(Arc::clone(&self.store).rebalance_entry(
+                RebalanceEntryTarget {
+                    bucket: self.bucket.to_string(),
+                    pool_index: 0,
+                },
+                entry,
+                Arc::clone(&self.source_set),
+                Arc::new(RebalanceBucketConfigs {
+                    bucket_incarnation_id: Some(self.incarnation),
+                    ..Default::default()
+                }),
+                Arc::from(NULL_VERSION_REBALANCE_ID),
+                CancellationToken::new(),
+            ))
+            .await
+            .expect("rebalance entry")
+        }
+
+        async fn source_versions(&self) -> Option<rustfs_filemeta::FileInfoVersions> {
+            self.source_set
+                .load_file_info_versions_exact(self.bucket, self.object)
+                .await
+                .expect("read source versions")
+        }
+
+        /// Both versions are on the target with their identities, the null
+        /// version's content and SHA-256 are intact, and the source is gone.
+        async fn assert_moved(&self) {
+            let target = self.store.pools[1]
+                .get_disks_by_key(self.object)
+                .load_file_info_versions_exact(self.bucket, self.object)
+                .await
+                .expect("read target versions")
+                .expect("versions must reach the target pool");
+            assert_eq!(target.versions.len(), 2, "both versions must move");
+            assert_eq!(target.versions[0].version_id, self.seeded.versions[0].version_id);
+            assert_eq!(target.versions[0].deleted, self.seeded.versions[0].deleted);
+            assert!(target.versions[1].version_id.is_none(), "the null version must keep its null identity");
+            assert_eq!(target.versions[1].mod_time, self.seeded.versions[1].mod_time);
+
+            let mut reader = self.store.pools[1]
+                .get_object_reader(
+                    self.bucket,
+                    self.object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        version_id: Some(uuid::Uuid::nil().to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("the migrated null version must be readable");
+            let mut actual = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut actual)
+                .await
+                .expect("drain the migrated null version");
+            assert_eq!(
+                rustfs_utils::crypto::hex_sha256(&actual, str::to_owned),
+                rustfs_utils::crypto::hex_sha256(&self.payload, str::to_owned)
+            );
+            assert_eq!(actual, self.payload);
+            assert!(
+                self.source_versions().await.is_none(),
+                "the source entry must be removed only after both versions moved"
+            );
+        }
+    }
+
     /// A pre-versioning null version hidden behind a delete marker must reach
     /// the target pool intact before the source entry is removed (backlog#2873).
     #[tokio::test]
     #[serial_test::serial]
     async fn real_rebalance_migrates_null_version_behind_delete_marker() {
-        const REBALANCE_ID: &str = "rebalance-null-version";
-        let (_temp_dirs, store, _peer) = crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
-        let bucket = "rebalance-null-version";
-        let object = "pre-versioning.bin";
-        // An active run blocks the data-usage publication bucket creation needs.
-        Box::pin(store.make_bucket(bucket, &MakeBucketOptions::default()))
-            .await
-            .expect("create bucket");
-        let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
-        let rebalance_meta = active_rebalance_meta(REBALANCE_ID);
-        rebalance_meta
-            .save(Arc::clone(&store.pools[0]))
-            .await
-            .expect("persist the active rebalance run");
-        *store.rebalance_meta.write().await = Some(rebalance_meta);
-        let payload = b"written before versioning was enabled".repeat(128);
-        let payload_sha256 = rustfs_utils::crypto::hex_sha256(&payload, str::to_owned);
-        let source_set = store.pools[0].get_disks_by_key(object);
-        Box::pin(source_set.put_object(
-            bucket,
-            object,
-            &mut PutObjReader::from_vec(payload.clone()),
-            &ObjectOptions {
-                expected_bucket_incarnation_id: Some(incarnation),
-                ..Default::default()
-            },
-        ))
-        .await
-        .expect("seed null version");
-        let marker = Box::pin(source_set.delete_object(
-            bucket,
-            object,
-            ObjectOptions {
-                versioned: true,
-                expected_bucket_incarnation_id: Some(incarnation),
-                ..Default::default()
-            },
-        ))
-        .await
-        .expect("seed delete marker over the null version");
-        assert!(marker.delete_marker);
-        let seeded = source_set
-            .load_file_info_versions_exact(bucket, object)
-            .await
-            .expect("read seeded versions")
-            .expect("seeded versions must exist");
-        assert_eq!(seeded.versions.len(), 2);
-        assert!(seeded.versions[0].deleted, "the delete marker must be the latest version");
-        assert!(seeded.versions[1].version_id.is_none(), "the oldest version must be the null version");
+        let fixture = NullVersionRebalance::new(NullVersionTop::DeleteMarker).await;
+        assert_eq!(fixture.run_entry().await, RebalanceEntryOutcome::Completed);
+        fixture.assert_moved().await;
+    }
 
-        let entry = metacache_entry_from_source(&source_set, bucket, object).await;
-        let outcome = Box::pin(Arc::clone(&store).rebalance_entry(
-            RebalanceEntryTarget {
-                bucket: bucket.to_string(),
-                pool_index: 0,
-            },
-            entry,
-            Arc::clone(&source_set),
-            Arc::new(RebalanceBucketConfigs {
-                bucket_incarnation_id: Some(incarnation),
-                ..Default::default()
-            }),
-            Arc::from(REBALANCE_ID),
-            CancellationToken::new(),
-        ))
-        .await
-        .expect("rebalance entry");
-        assert_eq!(outcome, RebalanceEntryOutcome::Completed);
+    /// Overwriting after versioning was enabled leaves a newer version above
+    /// the null version. The old `None` read selected that newer version, the
+    /// target accepted it as an equivalent copy, and cleanup then deleted the
+    /// null version without ever reporting it as missing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_rebalance_migrates_null_version_behind_newer_version() {
+        let fixture = NullVersionRebalance::new(NullVersionTop::NewerVersion).await;
+        assert_eq!(fixture.run_entry().await, RebalanceEntryOutcome::Completed);
+        fixture.assert_moved().await;
+    }
 
-        let target = store.pools[1]
-            .get_disks_by_key(object)
-            .load_file_info_versions_exact(bucket, object)
-            .await
-            .expect("read target versions")
-            .expect("versions must reach the target pool");
-        assert_eq!(target.versions.len(), 2, "both the marker and the null version must move");
-        assert!(target.versions[0].deleted, "the delete marker must stay the latest version");
-        assert_eq!(target.versions[0].version_id, seeded.versions[0].version_id);
-        assert!(target.versions[1].version_id.is_none(), "the null version must keep its null identity");
-        assert_eq!(target.versions[1].mod_time, seeded.versions[1].mod_time);
-
-        let mut reader = store.pools[1]
-            .get_object_reader(
-                bucket,
-                object,
-                None,
-                HeaderMap::new(),
-                &ObjectOptions {
-                    version_id: Some(uuid::Uuid::nil().to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("the migrated null version must be readable");
-        let mut actual = Vec::new();
-        reader
-            .stream
-            .read_to_end(&mut actual)
-            .await
-            .expect("drain the migrated null version");
-        assert_eq!(rustfs_utils::crypto::hex_sha256(&actual, str::to_owned), payload_sha256);
-        assert_eq!(actual, payload);
-        assert!(
-            source_set
-                .load_file_info_versions_exact(bucket, object)
-                .await
-                .expect("read source versions")
-                .is_none(),
-            "the source entry must be removed only after both versions moved"
-        );
+    /// A version the mover reports as not found while it still exists must not
+    /// be deleted with the entry; cleanup is deferred and the source retained.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_rebalance_retains_source_when_null_version_read_reports_not_found() {
+        let fixture = NullVersionRebalance::new(NullVersionTop::DeleteMarker).await;
+        let object = fixture.object;
+        let fault: super::super::migration::RebalanceSourceReadFault = Arc::new(move |bucket, read| {
+            (read == object).then(|| Error::VersionNotFound(bucket.to_string(), read.to_string(), "null".to_string()))
+        });
+        let outcome = super::super::migration::REBALANCE_SOURCE_READ_FAULT
+            .scope(fault, fixture.run_entry())
+            .await;
+        let RebalanceEntryOutcome::Deferred { last_error } = outcome else {
+            panic!("cleanup must be deferred while the reported-missing version exists: {outcome:?}");
+        };
+        assert!(last_error.contains("source changed"), "{last_error}");
+        let source = fixture.source_versions().await.expect("the source entry must be retained");
+        assert_eq!(source.versions.len(), 2, "every source version must be retained");
+        assert!(source.versions[1].version_id.is_none());
     }
 
     #[tokio::test]

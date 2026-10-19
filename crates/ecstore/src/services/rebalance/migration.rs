@@ -99,6 +99,16 @@ pub(crate) trait MigrationBackend: Send + Sync {
     ) -> Result<()>;
 }
 
+/// Replaces a real source read with an injected error, for the object the
+/// closure selects.
+#[cfg(test)]
+pub(super) type RebalanceSourceReadFault = std::sync::Arc<dyn Fn(&str, &str) -> Option<Error> + Send + Sync>;
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static REBALANCE_SOURCE_READ_FAULT: RebalanceSourceReadFault;
+}
+
 pub(crate) struct RebalanceMigrationBackend<'a> {
     source: &'a SetDisks,
     store: std::sync::Arc<ECStore>,
@@ -129,6 +139,10 @@ impl MigrationBackend for RebalanceMigrationBackend<'_> {
         h: HeaderMap,
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
+        #[cfg(test)]
+        if let Ok(Some(err)) = REBALANCE_SOURCE_READ_FAULT.try_with(|fault| fault(bucket, object)) {
+            return Err(err);
+        }
         self.source.get_object_reader(bucket, object, range, h, opts).await
     }
 
