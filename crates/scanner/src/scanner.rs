@@ -18,7 +18,10 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 
-use self::heal_info::{BackgroundHealInfoReadStatus, read_background_heal_info_with_epoch, save_background_heal_info_for_epoch};
+use self::heal_info::{
+    BackgroundHealInfoReadStatus, ScannerBitrotStart, read_background_heal_info_with_epoch, record_scanner_bitrot_status,
+    resolve_background_heal_info_for_cycle, save_background_heal_info_for_epoch, scanner_bitrot_start_for_cycle,
+};
 use crate::data_usage_define::{
     BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH, DATA_USAGE_OBSERVED_OBJ_NAME_PATH,
     DATA_USAGE_RECOVERY_PATH, DataUsageCache, DataUsageCacheRevision, LEGACY_DATA_USAGE_OBJ_NAME_PATH, read_config_revision,
@@ -1462,12 +1465,7 @@ impl ScannerBitrotPolicy {
     }
 }
 
-fn get_cycle_scan_mode(
-    current_cycle: u64,
-    bitrot_start_cycle: u64,
-    bitrot_start_time: Option<DateTime<Utc>>,
-    policy: ScannerBitrotPolicy,
-) -> HealScanMode {
+fn get_cycle_scan_mode(current_cycle: u64, start: ScannerBitrotStart, policy: ScannerBitrotPolicy) -> HealScanMode {
     let Some(bitrot_cycle) = policy.cycle else {
         return HealScanMode::Normal;
     };
@@ -1480,18 +1478,23 @@ fn get_cycle_scan_mode(
         return HealScanMode::Deep;
     }
 
-    if current_cycle.saturating_sub(bitrot_start_cycle) < deep_window_cycles {
-        return HealScanMode::Deep;
-    }
-
-    let Some(bitrot_start_time) = bitrot_start_time else {
-        return HealScanMode::Deep;
+    // Only a recorded Deep window keeps the selection window open. A missing
+    // record used to be read as a window that started at cycle 0, which ran
+    // Deep for `deep_window_cycles` cycles whenever the start could not be
+    // read back (rustfs/rustfs#8015); an in-memory anchor only counts the
+    // cadence.
+    let started = match start {
+        ScannerBitrotStart::None => return HealScanMode::Normal,
+        ScannerBitrotStart::Window { cycle, started } => {
+            if current_cycle.saturating_sub(cycle) < deep_window_cycles {
+                return HealScanMode::Deep;
+            }
+            started
+        }
+        ScannerBitrotStart::Anchor(anchored) => anchored,
     };
 
-    let elapsed = Utc::now()
-        .signed_duration_since(bitrot_start_time)
-        .to_std()
-        .unwrap_or(Duration::ZERO);
+    let elapsed = Utc::now().signed_duration_since(started).to_std().unwrap_or(Duration::ZERO);
     if elapsed >= bitrot_cycle {
         HealScanMode::Deep
     } else {
@@ -1795,20 +1798,18 @@ where
         }
         BackgroundHealInfoReadStatus::Loaded | BackgroundHealInfoReadStatus::Missing => {}
     }
-    let mut background_heal_info = background_heal_read.info;
     let background_heal_epoch = background_heal_read.expected_epoch;
-    let bitrot_policy = ScannerBitrotPolicy::new(
-        configured_bitrot_cycle,
-        !storeapi.setup_is_erasure_sd().await,
-        heal_object_select_prob() as u64,
-    );
+    let deep_scan_supported = !storeapi.setup_is_erasure_sd().await;
+    let bitrot_policy = ScannerBitrotPolicy::new(configured_bitrot_cycle, deep_scan_supported, heal_object_select_prob() as u64);
+    // The persisted record wins when it carries a start; the in-memory record
+    // covers a save that was skipped or lost since this process recorded it.
+    let (mut background_heal_info, mut bitrot_start_source) = resolve_background_heal_info_for_cycle(&background_heal_read);
+    let bitrot_start = scanner_bitrot_start_for_cycle(&background_heal_info, Utc::now());
+    if matches!(bitrot_start, ScannerBitrotStart::Anchor(_)) {
+        bitrot_start_source = ScannerBitrotStartSource::Memory;
+    }
 
-    let scan_mode = get_cycle_scan_mode(
-        cycle_info.current,
-        background_heal_info.bitrot_start_cycle,
-        background_heal_info.bitrot_start_time,
-        bitrot_policy,
-    );
+    let scan_mode = get_cycle_scan_mode(cycle_info.current, bitrot_start, bitrot_policy);
     info!(
         target: "rustfs::scanner",
         event = EVENT_SCANNER_CYCLE_STATE,
@@ -1816,6 +1817,7 @@ where
         subsystem = LOG_SUBSYSTEM_RUNTIME,
         cycle = cycle_info.current,
         scan_mode = ?scan_mode,
+        bitrot_start_source = bitrot_start_source.as_str(),
         state = "started",
         "Scanner cycle started"
     );
@@ -1828,8 +1830,19 @@ where
         bitrot_policy,
     ) {
         background_heal_info = new_heal_info.clone();
+        if new_heal_info.bitrot_start_time != background_heal_read.info.bitrot_start_time {
+            // A start recorded by this cycle is only in memory until a later
+            // read returns it from storage.
+            bitrot_start_source = ScannerBitrotStartSource::Memory;
+        }
         save_background_heal_info_for_epoch(storeapi.clone(), new_heal_info, background_heal_epoch).await;
     }
+    record_scanner_bitrot_status(
+        scanner_bitrot_start_for_cycle(&background_heal_info, Utc::now()),
+        bitrot_start_source,
+        deep_scan_supported,
+        scan_mode,
+    );
 
     let cycle_start = std::time::Instant::now();
     // Baseline reads are part of the same publication proof as the eventual
@@ -4099,7 +4112,10 @@ pub use cycle_state::{
 pub(crate) use cycle_state::{
     current_scanner_leader_epoch, decode_persisted_scanner_cycle_fence, load_scanner_cycle_state_for_startup,
 };
-pub use heal_info::{BackgroundHealInfo, read_background_heal_info, save_background_heal_info};
+pub use heal_info::{
+    BackgroundHealInfo, ScannerBitrotStartSource, ScannerBitrotStatus, read_background_heal_info, save_background_heal_info,
+    scanner_bitrot_status,
+};
 pub use usage_store::store_data_usage_in_backend;
 
 #[cfg(test)]

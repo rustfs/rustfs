@@ -47,6 +47,8 @@ struct ScannerStatusResponse {
     cycle_schedule: rustfs_scanner::ScannerCycleScheduleStatus,
     runtime_config: rustfs_scanner::runtime_config::ScannerRuntimeConfigStatus,
     cycle_recovery: rustfs_scanner::ScannerCycleRecoveryStatus,
+    bitrot: rustfs_scanner::ScannerBitrotStatus,
+    disk_io_budget: Vec<rustfs_scanner::ScannerDiskIoBudgetStatus>,
     data_movement_pause: ScannerDataMovementPauseStatus,
     pause_backlog: rustfs_scanner::ScannerPauseBacklogStatus,
     catch_up_estimate: ScannerCatchUpEstimate,
@@ -220,6 +222,8 @@ fn scanner_status_response(
         cycle_schedule,
         runtime_config,
         cycle_recovery: rustfs_scanner::scanner::scanner_cycle_recovery_status(),
+        bitrot: rustfs_scanner::scanner_bitrot_status(),
+        disk_io_budget: rustfs_scanner::scanner_disk_io_budget_status(),
         data_movement_pause,
         pause_backlog,
         catch_up_estimate,
@@ -839,6 +843,15 @@ mod tests {
         assert_eq!(encoded["data_movement_pause"]["paused"], false);
         assert_eq!(encoded["catch_up_estimate"]["estimated"], false);
         assert_eq!(encoded["catch_up_estimate"]["undiscovered_ilm_items_known"], true);
+        assert!(
+            ["none", "memory", "persisted"].contains(&encoded["bitrot"]["bitrot_start_source"].as_str().unwrap_or("")),
+            "bitrot start source must name where the Deep cadence start came from: {}",
+            encoded["bitrot"]
+        );
+        assert!(encoded["bitrot"]["deep_scan_supported"].is_boolean());
+        assert!(encoded["bitrot"]["bitrot_start_cycle"].is_u64());
+        assert!(encoded["bitrot"]["bitrot_start_unix_secs"].is_u64());
+        assert!(encoded["disk_io_budget"].is_array());
     }
 
     #[test]
