@@ -2652,6 +2652,58 @@ fn decommission_reserved_target_choice(
         .map(|(pool_index, _)| pool_index)
 }
 
+/// Record whether a mutation with an adopted completion went back to the
+/// target that holds it, or had to be placed elsewhere and so leaves the
+/// adopted marker behind.
+fn log_decommission_adopted_target_choice(
+    reservation: &DecommissionCapacityReservation,
+    owner: DecommissionCapacityOwner,
+    chosen_pool_index: usize,
+) {
+    let Some(mutation_id) = owner.mutation_id else {
+        return;
+    };
+    let adopted_mutation_id = decommission_adopted_intent_mutation_id(mutation_id);
+    let adopted_target_pools = reservation
+        .targets
+        .iter()
+        .filter(|target| {
+            target
+                .temporary_mutations
+                .iter()
+                .any(|mutation| mutation.mutation_id == adopted_mutation_id)
+        })
+        .map(|target| target.pool_index)
+        .collect::<Vec<_>>();
+    if adopted_target_pools.is_empty() {
+        return;
+    }
+    if adopted_target_pools.contains(&chosen_pool_index) {
+        info!(
+            event = EVENT_DECOMMISSION_ENTRY,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_POOLS,
+            state = "adopted_target_reused",
+            pool_index = owner.source_pool_index,
+            target_pool_index = chosen_pool_index,
+            mutation_id = %mutation_id,
+            "Decommission retry returns to the target that holds its adopted completion"
+        );
+    } else {
+        warn!(
+            event = EVENT_DECOMMISSION_ENTRY,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_POOLS,
+            state = "adopted_target_bypassed",
+            pool_index = owner.source_pool_index,
+            target_pool_index = chosen_pool_index,
+            adopted_target_pools = ?adopted_target_pools,
+            mutation_id = %mutation_id,
+            "Decommission retry no longer fits the target that holds its adopted completion"
+        );
+    }
+}
+
 /// Whether a target still holds a marker of this mutation, staged or adopted.
 fn decommission_target_has_mutation_marker(target: &DecommissionCapacityTarget, mutation_id: uuid::Uuid) -> bool {
     let adopted = decommission_adopted_intent_mutation_id(mutation_id);
@@ -13797,6 +13849,7 @@ impl ECStore {
             discard_decommission_capacity_target_permit_except(self.id, owner, None);
         }
         if let Some(pool_index) = decommission_reserved_target_choice(reservation, owner.mutation_id, expected_data_bytes) {
+            log_decommission_adopted_target_choice(reservation, owner, pool_index);
             return Ok(pool_index);
         }
         if reservation.source_data_equivalent_bytes > 0 {
