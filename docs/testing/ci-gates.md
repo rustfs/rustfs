@@ -92,7 +92,7 @@ Scheduled lanes never block a PR. Their workflow-local gate fails the run, sched
 | Workflow (cadence) | Jobs | Verdict and artifacts | In freshness list | Reproduce |
 |---|---|---|---|---|
 | `ci.yml` (weekly) | full matrix, including the schedule/dispatch-only rio-v2 jobs `build-rustfs-debug-binary-rio-v2` and `e2e-tests-rio-v2` | strict aggregate; the full E2E lane runs on dispatch, merge groups, and main pushes | yes | dispatch `ci.yml` |
-| `build.yml` (weekly) | `build-rustfs` over the six-target platform matrix in `prepare-platform-matrix` (four Linux, macOS aarch64, Windows x86_64) | build/package integrity | yes | dispatch `build.yml` with an exact platform set |
+| `build.yml` (nightly) | `build-rustfs` over the six-target platform matrix in `prepare-platform-matrix` (four Linux, macOS aarch64, Windows x86_64) | build/package integrity | yes | dispatch `build.yml` with an exact platform set |
 | `e2e-replication-nightly.yml` (nightly) | `repl-nightly`, `cluster-nightly`, `protocols-nightly` | three independent gates; JUnit, membership listing, server logs | yes | `python3 scripts/e2e_binary.py build --bins`, then `python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-repl-nightly -p e2e_test`; `--features e2e-test-hooks` on both steps with `--profile e2e-nightly`; `--features ftps,webdav,sftp` on both steps with `-j 1 --profile e2e-protocols` |
 | `e2e-distributed.yml` (storage-sensitive PRs + nightly) | `distributed` | fail-closed 4-node 4-disk S3, durability, replication, movement, fault, and direct/rolling upgrade gate; JUnit, membership listing, per-node server logs | yes, with `never_ran_grace_until` | download the pinned previous release as in the workflow, export `RUSTFS_UPGRADE_SOURCE_BINARY`, run `python3 scripts/e2e_binary.py build --bins`, then `python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-distributed -p e2e_test` |
 | `e2e-s3tests.yml` (weekly) | `s3tests` (single and distributed, four shards each), `upstream-head-canary` | compatibility gate; report, JUnit, node IDs, server logs | yes | `scripts/s3-tests/run.sh` against an existing single or distributed target |
@@ -125,7 +125,7 @@ Post-merge and tag-driven; not a substitute for a PR gate.
 
 | Trigger | Workflow / job | Result |
 |---|---|---|
-| Push to `main`, weekly schedule, dispatch | `build.yml` `build-rustfs` (a development build on a main push restricts the matrix to the Linux targets) | build artifacts; no release publication |
+| Nightly schedule, dispatch | `build.yml` `build-rustfs` (development build over the full platform matrix) | build artifacts and the dev download channel; no release publication |
 | Valid release or preview tag | `build.yml` `build-rustfs`, `create-release`, `upload-release-assets`, `publish-release` | draft release, checksummed assets, publish |
 | Successful non-preview release-tag build (`workflow_run`) | `docker.yml` `build-docker`, `scan-docker-image` | multi-architecture images and vulnerability report |
 | Successful release-tag build (`workflow_run`) | `package.yml` `package` | DEB/RPM packages and checksums uploaded to the release |

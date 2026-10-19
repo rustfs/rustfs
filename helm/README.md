@@ -245,6 +245,7 @@ behavior.
 | livenessProbe.periodSeconds | int | `5` |  |
 | livenessProbe.successThreshold | int | `1` |  |
 | livenessProbe.timeoutSeconds | int | `3` |  |
+| minReadySeconds | int | `45` | Seconds a replaced pod must stay Ready before the rolling update moves to the next pod. Covers the platform DNS TTL and survivor re-admission window after a restart (see `docs/operations/rolling-restart.md`). `0` disables. |
 | mode.distributed.enabled | bool | `true` | RustFS distributed mode support, namely multiple pod multiple pvc. |
 | mode.standalone.enabled | bool | `false` | RustFS standalone mode support, namely one pod one pvc.  |
 | mode.standalone.existingClaim.dataClaim |string |`""` |Whether to use existing pvc claim for data storage. |

@@ -2,7 +2,7 @@
 
 **Use this when:** restarting or upgrading nodes of an erasure-coded multi-node cluster, bringing a cluster back after several nodes were down at once, or interpreting `503` degraded-mode responses during startup.
 
-**Source of truth:** `crates/config/src/constants/health.rs` (`DEFAULT_STARTUP_READINESS_MAX_WAIT_SECS`), `rustfs/src/server/readiness.rs` (readiness responses and `Retry-After`), the `iam_bootstrap_retry_failed` log event.
+**Source of truth:** `crates/config/src/constants/health.rs` (`DEFAULT_STARTUP_READINESS_MAX_WAIT_SECS`), `rustfs/src/server/readiness.rs` (readiness responses and `Retry-After`), `crates/config/src/constants/drive.rs` (remote-drive recovery thresholds), `helm/rustfs/values.yaml` (`minReadySeconds`), the `iam_bootstrap_retry_failed` log event.
 
 Upgrading the binary or container image does not change the on-disk data format unless an explicitly enabled feature documents a version floor. Replacing the executable and restarting does not run a migration step on startup.
 
@@ -19,7 +19,7 @@ Each row is a feature whose activation makes older binaries unable to read what 
 
 ## TL;DR
 
-- Rolling restart (no downtime): restart one node at a time and wait for the restarted node to report `200` on `/health/ready` before touching the next one. The remaining nodes keep serving traffic.
+- Rolling restart (no downtime): restart one node at a time, wait for the restarted node to report `200` on `/health/ready`, and then wait until the other nodes no longer list its drives under `details.storage.unavailableDrives` before touching the next one. The remaining nodes keep serving traffic.
 - Sequential cold start (several nodes down): nodes started before the cluster has quorum come up in degraded mode. The process stays alive, answers `503` with the blocking reason, and recovers automatically as soon as enough peers are online. Do not restart-loop them; keep starting the remaining nodes.
 
 ## Why a single node cannot serve alone
@@ -39,9 +39,21 @@ For each node, in any order, one at a time:
    curl -fsS http://<node>:9000/health/ready
    ```
 
-3. Only then move on to the next node.
+3. Wait until every other node has re-admitted it. A node's own `/health/ready` says that it can reach the cluster, not that the cluster can reach it again. On each of the other nodes, `details.storage.unavailableDrives` must no longer list the restarted node's drives. `hostOnline: false` means that node cannot dial the restarted peer yet; `runtimeState` of `offline` or `returning` means the dial works and the drive is still passing its recovery probes:
 
-While one node is down, the rest of the cluster keeps quorum and serves all traffic. Taking a second node down before the first is back can cost some erasure sets their write or even read quorum; that is the situation to avoid.
+   ```bash
+   curl -s http://<other-node>:9000/health/ready | jq '.details.storage.unavailableDrives'
+   ```
+
+4. Only then move on to the next node.
+
+While one node is down, the rest of the cluster keeps quorum and serves all traffic. Taking a second node down before the survivors have re-admitted the first can cost some erasure sets their write or even read quorum; that is the situation to avoid (rustfs/rustfs#8669).
+
+### Why re-admission lags local readiness
+
+A survivor dials a peer by its configured host name on every reconnect and keeps no address cache of its own. After the peer's connections drop, its remote drives become `suspect` on the first failed RPC and `offline` on the second (`RUSTFS_DRIVE_SUSPECT_FAILURE_THRESHOLD`, default `2`). The survivor then probes the peer every `RUSTFS_DRIVE_RETURNING_PROBE_INTERVAL_SECS` (default `2`) and needs `RUSTFS_DRIVE_RETURNING_SUCCESS_THRESHOLD` (default `3`) consecutive successes before the drive counts as `online` again, so re-admission trails the first successful dial by about four to six seconds even on a perfect network.
+
+On Kubernetes the dial itself is the slow part. A replaced pod gets a new IP, but resolvers keep answering with the previous one until the record's TTL expires: kube-dns serves 30-second TTLs, CoreDNS five seconds by default, and NodeLocal DNSCache honours either. Packets to the old IP are usually dropped rather than refused, so every dial runs into the 3-second connect timeout (`RUSTFS_INTERNODE_CONNECT_TIMEOUT_SECS`) and the 1-second budget of the readiness ping (`RUSTFS_HEALTH_LOCK_ONLINE_TIMEOUT_MS`) logs `online check timed out while dialing`. Until the stale record expires, survivors count the replaced pod as unreachable even though it already reports Ready. The Helm chart therefore sets `minReadySeconds` (default `45`) on each StatefulSet so the rolling update does not stop the next pod inside that window. Size it to your DNS TTL plus about ten seconds, or set it to `0` when an external procedure performs step 3 itself.
 
 ## Sequential cold start (multiple nodes down)
 
@@ -68,6 +80,8 @@ When the whole cluster (or several nodes) went down and nodes are brought back o
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS` | `120` (`DEFAULT_STARTUP_READINESS_MAX_WAIT_SECS`) | How long startup waits for full readiness before continuing in degraded mode with background recovery. Raising it delays the listener during genuinely slow starts; lowering it surfaces degraded mode sooner. Recovery retries continue regardless of this limit. |
+| `RUSTFS_DRIVE_RETURNING_PROBE_INTERVAL_SECS` | `2` (`DEFAULT_DRIVE_RETURNING_PROBE_INTERVAL_SECS`) | Interval between recovery probes to a remote drive that is `offline` or `returning`. |
+| `RUSTFS_DRIVE_RETURNING_SUCCESS_THRESHOLD` | `3` (`DEFAULT_DRIVE_RETURNING_SUCCESS_THRESHOLD`) | Consecutive successful probes before an `offline` remote drive is `online` again. Together with the interval this bounds how long survivors keep a restarted peer out after they can dial it. |
 
 ## What is not normal
 
