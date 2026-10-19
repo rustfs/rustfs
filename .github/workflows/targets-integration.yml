@@ -42,7 +42,7 @@ jobs:
   targets-live:
     if: github.repository == 'rustfs/rustfs'
     name: PostgreSQL, MySQL, AMQP, and NATS
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -60,7 +60,7 @@ jobs:
       - name: Setup Rust environment
         uses: ./.github/actions/setup
         with:
-          cache-shared-key: targets-live-lane
+          cache-shared-key: targets-live-lane-hosted
           cache-save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'schedule' }}
           install-build-packaging-tools: 'false'
           install-test-tools: 'false'
