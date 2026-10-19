@@ -56,6 +56,10 @@ use tokio::{
 use tracing::warn;
 use tracing::{debug, error};
 
+const EVENT_USER_UPDATE_EXISTING: &str = "iam.user.update_existing";
+const LOG_COMPONENT_IAM: &str = "iam";
+const LOG_SUBSYSTEM_USERS: &str = "users";
+
 const IAM_FORMAT_FILE: &str = "format.json";
 const IAM_FORMAT_VERSION_1: i32 = 1;
 #[cfg(not(test))]
@@ -1485,7 +1489,13 @@ where
         let cache = self.cache.snapshot();
         let users = Arc::clone(&cache.users);
         if let Some(x) = users.get(access_key) {
-            warn!(error = ?x, "IAM user already exists");
+            debug!(
+                event = EVENT_USER_UPDATE_EXISTING,
+                component = LOG_COMPONENT_IAM,
+                subsystem = LOG_SUBSYSTEM_USERS,
+                state = "existing",
+                "Updating existing IAM user"
+            );
             if x.credentials.is_temp() {
                 return Err(Error::AccessKeyAlreadyExists);
             }
@@ -2918,6 +2928,60 @@ mod tests {
             sync_failures: AtomicU64::new(0),
             sync_successes: AtomicU64::new(0),
             last_sync_duration_millis: AtomicU64::new(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_boundary_existing_user_logs_omit_credentials() {
+        use tracing::instrument::WithSubscriber;
+
+        let cache = build_test_iam_cache(FailingInitialLoadStore);
+        let identity = UserIdentity::new(Credentials {
+            access_key: "LOGACCESS-PRIVATE-TAIL".to_string(),
+            secret_key: "Qstored-secret-valueZ".to_string(),
+            status: STATUS_ENABLED.to_string(),
+            ..Default::default()
+        });
+        cache
+            .cache
+            .add_or_update_user(&identity.credentials.access_key, &identity, OffsetDateTime::now_utc());
+        let log = tempfile::NamedTempFile::new().expect("capture file");
+        let writer = log.reopen().expect("capture writer");
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.try_clone().expect("clone capture writer"))
+            .finish();
+        let result = cache
+            .add_user(
+                &identity.credentials.access_key,
+                &AddOrUpdateUserReq {
+                    secret_key: "replacement-secret".to_string(),
+                    policy: None,
+                    status: AccountStatus::Enabled,
+                },
+            )
+            .with_subscriber(subscriber)
+            .await;
+        assert!(
+            matches!(result, Err(Error::InvalidArgument)),
+            "the test store rejects persistence after the existing-user path"
+        );
+        let captured = std::fs::read_to_string(log.path()).expect("read captured logs");
+        assert!(
+            captured.contains(EVENT_USER_UPDATE_EXISTING) || captured.contains("IAM user already exists"),
+            "the existing-user diagnostic must be captured"
+        );
+        for forbidden in [
+            &identity.credentials.access_key,
+            &identity.credentials.secret_key,
+            "Q***Z|20",
+            "secret_key",
+            "session_token",
+            "credentials",
+        ] {
+            assert!(!captured.contains(forbidden), "credential material must not appear in logs: {forbidden}");
         }
     }
 

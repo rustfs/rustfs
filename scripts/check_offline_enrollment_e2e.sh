@@ -46,13 +46,17 @@ cleanup()
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
 
-export CARGO_TARGET_DIR="${task_root}/target"
+# The binaries land in the workspace target directory so CI reuses its restored
+# dependency cache. The E2E root is isolated by the feature gate and the
+# dedicated binary name, not by where the build happens; only the challenge,
+# response and key files are task-local.
+target_dir="${CARGO_TARGET_DIR:-${repo_root}/target}"
 feature=offline-enrollment-e2e-root
 cargo build --locked -p rustfs --bin rustfs-cli-e2e --features "${feature}"
 cargo build --locked -p rustfs --bin rustfs-cli --features "${feature}"
 cargo test --locked -p rustfs --test connect_offline_enrollment --features "${feature}" e2e_
 
-"${CARGO_TARGET_DIR}/debug/rustfs-cli-e2e" connect offline enroll \
+"${target_dir}/debug/rustfs-cli-e2e" connect offline enroll \
     --challenge "${challenge_fixture}" \
     --output "${task_root}/e2e-response.json" \
     --key-dir "${task_root}/e2e-key" \
@@ -60,7 +64,7 @@ cargo test --locked -p rustfs --test connect_offline_enrollment --features "${fe
 test -s "${task_root}/e2e-response.json" \
     || { echo 'offline enrollment E2E gate: dedicated CLI produced no response' >&2; exit 1; }
 
-if "${CARGO_TARGET_DIR}/debug/rustfs-cli" connect offline enroll \
+if "${target_dir}/debug/rustfs-cli" connect offline enroll \
     --challenge "${challenge_fixture}" \
     --output "${task_root}/production-response.json" \
     --key-dir "${task_root}/production-key" \

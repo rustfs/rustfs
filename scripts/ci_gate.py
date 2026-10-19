@@ -16,10 +16,9 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 ALWAYS_JOBS = ("classify-changes", "typos", "quick-checks")
 CODE_JOBS = (
-    "test-and-lint", "offline-enrollment-e2e", "test-and-lint-rio-v2",
-    "connect-short-credential-boundary", "test-and-lint-protocols",
-    "build-rustfs-debug-binary", "uring-integration", "e2e-tests",
-    "s3-implemented-tests", "s3-lifecycle-behavior-tests",
+    "test-and-lint", "connect-feature-boundaries", "test-and-lint-rio-v2",
+    "test-and-lint-protocols", "build-rustfs-debug-binary", "uring-integration",
+    "e2e-tests", "s3-implemented-tests", "s3-lifecycle-behavior-tests",
 )
 # Full alternate-feature tests remain mandatory on main, merge groups, and
 # scheduled/manual runs, without repeating four builds on every PR revision.
