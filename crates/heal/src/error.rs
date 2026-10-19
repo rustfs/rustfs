@@ -377,14 +377,6 @@ pub(crate) fn classify_error_display(message: &str) -> Option<HealErrorClass> {
         "operation canceled",
         "heal rename incomplete",
     ];
-    // Canonical `Display` of DiskError::FileNotFound/FileVersionNotFound and
-    // StorageError::ObjectNotFound/VersionNotFound, matched case-sensitively.
-    const ABSENT: [&str; 4] = [
-        "File not found",
-        "File version not found",
-        "Object not found: ",
-        "Version not found: ",
-    ];
     // Canonical `Display` of DiskError/StorageError::NoHealRequired and the
     // legacy heal-format wording.
     const NO_HEAL_REQUIRED: [&str; 2] = ["No heal required", "No healing is required"];
@@ -401,7 +393,19 @@ pub(crate) fn classify_error_display(message: &str) -> Option<HealErrorClass> {
     if TRANSIENT.iter().any(|needle| lower.contains(needle)) {
         return Some(HealErrorClass::Transient);
     }
-    if ABSENT.iter().any(|display| message.contains(display)) {
+    // Only canonical errors and their type wrappers are absence evidence.
+    // Object names in contextual task messages can contain these same words.
+    let mut display = message;
+    while let Some(inner) = ["Storage error: ", "Disk error: ", "I/O error: ", "Other error: "]
+        .iter()
+        .find_map(|prefix| display.strip_prefix(*prefix))
+    {
+        display = inner;
+    }
+    if matches!(display, "File not found" | "File version not found")
+        || display.starts_with("Object not found: ")
+        || display.starts_with("Version not found: ")
+    {
         return Some(HealErrorClass::Absent);
     }
     if NO_HEAL_REQUIRED.iter().any(|display| message.contains(display)) {
@@ -785,13 +789,15 @@ mod tests {
     #[test]
     fn classify_legacy_peer_display_not_found_is_object_level_absent() {
         // backlog#2900: a typed display that lost its type at an old peer or a
-        // format! boundary converts back once, at the boundary.
+        // type wrapper converts back once, at the boundary.
         for error in [
             Error::Other("File not found".to_string()),
             Error::Other("File version not found".to_string()),
             Error::Other("Object not found: bucket/object".to_string()),
+            Error::Other("Version not found: bucket/object/version".to_string()),
+            Error::Other("I/O error: Other error: Disk error: File version not found".to_string()),
             Error::TaskExecutionFailed {
-                message: "Failed to heal object bucket/object: Storage error: File not found".to_string(),
+                message: "Storage error: File not found".to_string(),
             },
         ] {
             assert!(error.is_recoverable_object_heal(), "{error:?}");
@@ -920,6 +926,34 @@ mod tests {
         assert_eq!(classify_error_display("file not found"), None);
         assert_eq!(classify_error_display("Disk not found"), None);
         assert_eq!(classify_error_display("operation was canceled"), None);
+    }
+
+    #[test]
+    fn classify_error_display_does_not_take_absence_from_object_context() {
+        use super::{HealErrorClass, classify_error_display, classify_heal_error};
+        for object in [
+            "File not found",
+            "File version not found",
+            "Object not found: b/o",
+            "Version not found: b/o/v",
+        ] {
+            let message = format!(
+                "Heal left one or more drives unhealthy for bucket/{object}; retry after the missing drives are restored"
+            );
+            assert_eq!(
+                classify_heal_error(&Error::TaskExecutionFailed { message }),
+                HealErrorClass::Permanent,
+                "{object}"
+            );
+        }
+        for message in [
+            "File not found.txt",
+            "File version not found.txt",
+            "Failed to heal object bucket/object: Storage error: File not found",
+            "Failed to heal object bucket/Object not found: b/o: access denied",
+        ] {
+            assert_eq!(classify_error_display(message), None, "{message}");
+        }
     }
 
     #[test]

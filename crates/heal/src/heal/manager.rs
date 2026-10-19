@@ -1086,7 +1086,13 @@ impl HealManager {
         {
             return None;
         }
-        Some(HealDispositionKey::new(bucket, object, version_id.as_deref()))
+        Some(HealDispositionKey::new(
+            bucket,
+            object,
+            version_id.as_deref(),
+            request.options.pool_index,
+            request.options.set_index,
+        ))
     }
 
     fn can_displace_queued_work(request: &HealRequest) -> bool {

@@ -18,7 +18,7 @@
 //! best-effort producer (scanner, read repair, autoheal, MRF hints) can
 //! resubmit the same object as soon as its task finished, and a task that
 //! found nothing to repair is forgotten immediately. This cache remembers the
-//! last terminal verdict per `(bucket, object, version)` so admission can
+//! last terminal verdict per `(bucket, object, version, pool, set)` so admission can
 //! answer a resubmission without queueing it again:
 //!
 //! - `Absent`: a locked quorum read classified the object as absent
@@ -76,14 +76,24 @@ pub(crate) struct HealDispositionKey {
     pub(crate) object: String,
     /// `None` is the unversioned/latest target; an empty wire string is the same thing.
     pub(crate) version_id: Option<String>,
+    pub(crate) pool_index: Option<usize>,
+    pub(crate) set_index: Option<usize>,
 }
 
 impl HealDispositionKey {
-    pub(crate) fn new(bucket: &str, object: &str, version_id: Option<&str>) -> Self {
+    pub(crate) fn new(
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        pool_index: Option<usize>,
+        set_index: Option<usize>,
+    ) -> Self {
         Self {
             bucket: bucket.to_owned(),
             object: object.to_owned(),
             version_id: version_id.filter(|version| !version.is_empty()).map(ToOwned::to_owned),
+            pool_index,
+            set_index,
         }
     }
 }
@@ -310,7 +320,7 @@ pub(crate) async fn record_task_disposition(
     if task.options.dry_run || task.expected_mrf_bucket_incarnation_id.is_some() {
         return;
     }
-    let key = HealDispositionKey::new(bucket, object, version_id.as_deref());
+    let key = HealDispositionKey::new(bucket, object, version_id.as_deref(), task.options.pool_index, task.options.set_index);
     let kind = match result {
         Ok(()) if task.object_absent() => HealDispositionKind::Absent,
         Ok(()) => {
@@ -349,7 +359,7 @@ mod tests {
     use super::*;
 
     fn key(object: &str) -> HealDispositionKey {
-        HealDispositionKey::new("bucket", object, None)
+        HealDispositionKey::new("bucket", object, None, None, None)
     }
 
     #[test]
@@ -453,7 +463,13 @@ mod tests {
 
     #[test]
     fn disposition_key_normalizes_empty_version() {
-        assert_eq!(HealDispositionKey::new("b", "o", Some("")), HealDispositionKey::new("b", "o", None));
-        assert_ne!(HealDispositionKey::new("b", "o", Some("v1")), HealDispositionKey::new("b", "o", None));
+        assert_eq!(
+            HealDispositionKey::new("b", "o", Some(""), None, None),
+            HealDispositionKey::new("b", "o", None, None, None)
+        );
+        assert_ne!(
+            HealDispositionKey::new("b", "o", Some("v1"), None, None),
+            HealDispositionKey::new("b", "o", None, None, None)
+        );
     }
 }

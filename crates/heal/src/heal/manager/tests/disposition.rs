@@ -38,7 +38,7 @@ fn object_request(object: &str, source: HealRequestSource, priority: HealPriorit
 }
 
 fn key(object: &str, version: Option<&str>) -> HealDispositionKey {
-    HealDispositionKey::new(BUCKET, object, version)
+    HealDispositionKey::new(BUCKET, object, version, None, None)
 }
 
 fn seed(manager: &HealManager, object: &str, kind: HealDispositionKind, task_id: &str) {
@@ -88,6 +88,56 @@ async fn disposition_absent_hit_drops_best_effort_object_requests_before_the_que
         .submit_heal_request_with_receipt(object_request("gone", HealRequestSource::ReadRepair, HealPriority::Low, Some("v1")))
         .await
         .expect("admission decides");
+    assert_eq!(receipt.result, HealAdmissionResult::Accepted);
+}
+
+#[tokio::test]
+async fn disposition_scoped_absence_does_not_block_other_scopes() {
+    for (pool, set, expected) in [
+        (Some(0), Some(0), HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped)),
+        (Some(1), Some(0), HealAdmissionResult::Accepted),
+        (Some(0), Some(1), HealAdmissionResult::Accepted),
+        (Some(0), None, HealAdmissionResult::Accepted),
+        (None, Some(0), HealAdmissionResult::Accepted),
+        (None, None, HealAdmissionResult::Accepted),
+    ] {
+        let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
+        let mut old_pool = object_request("moved", HealRequestSource::ReadRepair, HealPriority::Low, None);
+        old_pool.options.pool_index = Some(0);
+        old_pool.options.set_index = Some(0);
+        let absent = task_for(old_pool);
+        absent.mark_object_absent();
+        record_task_disposition(&manager.disposition_cache, &absent, &Ok(()), false).await;
+
+        let mut request = object_request("moved", HealRequestSource::ReadRepair, HealPriority::Low, None);
+        request.options.pool_index = pool;
+        request.options.set_index = set;
+        let receipt = manager
+            .submit_heal_request_with_receipt(request)
+            .await
+            .expect("scoped admission decides");
+        assert_eq!(receipt.result, expected, "pool={pool:?}, set={set:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn disposition_unhealthy_admin_object_name_does_not_cache_absence() {
+    let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
+    let object = "reports/File not found.txt";
+    let task = task_for(object_request(object, HealRequestSource::Admin, HealPriority::Normal, None));
+    let failure = Error::TaskExecutionFailed {
+        message: format!(
+            "Heal left one or more drives unhealthy for {BUCKET}/{object}; retry after the missing drives are restored"
+        ),
+    };
+    record_task_disposition(&manager.disposition_cache, &task, &Err(failure), false).await;
+    assert_eq!(cached_kind(&manager, object), Some(HealDispositionKind::Permanent));
+
+    tokio::time::advance(Duration::from_secs(61)).await;
+    let receipt = manager
+        .submit_heal_request_with_receipt(object_request(object, HealRequestSource::ReadRepair, HealPriority::Low, None))
+        .await
+        .expect("repair can retry after the failure backoff");
     assert_eq!(receipt.result, HealAdmissionResult::Accepted);
 }
 
