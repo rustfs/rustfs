@@ -32,6 +32,42 @@ You can override the inference by setting `drivesPerNode` explicitly, e.g.
 (with `--cascade=orphan` to keep pods and PVCs) and recreate it, or perform a
 full reinstall.
 
+## Bring-your-own drives (JBOD)
+
+By default every drive is a PersistentVolumeClaim sized by
+`storageclass.dataStorageSize`. To use disks that you provide yourself, such as
+JBOD `hostPath` or local volumes, set `storageclass.dataStorageSize` to an empty
+string. The chart then renders no data PVCs (no data `volumeClaimTemplates` in
+distributed mode, no data PVC in standalone mode) and no data `volumeMounts`,
+and you supply the drives through `extraVolumes` and `extraVolumeMounts`:
+
+```yaml
+replicaCount: 3
+drivesPerNode: 4
+storageclass:
+  dataStorageSize: ""
+extraVolumes:
+  - name: disk0
+    hostPath: {path: /mnt/disk0, type: Directory}
+  # ... disk1 to disk3
+extraVolumeMounts:
+  - name: disk0
+    mountPath: /data/rustfs0
+  # ... /data/rustfs1 to /data/rustfs3
+```
+
+Mount the drives at `/data/rustfs0` … `/data/rustfs<drivesPerNode-1>` when
+`drivesPerNode` is greater than 1, otherwise at `/data`, so they match the
+generated `RUSTFS_VOLUMES`. The logs PVC is unaffected; set
+`config.rustfs.obs_log_directory` to an empty string to drop it as well. Each
+entry of `pools.list` may override `storageclass.dataStorageSize`
+independently. In standalone mode, `mode.standalone.existingClaim.dataClaim`
+still mounts the named claim as `data`.
+
+Switching `storageclass.dataStorageSize` between empty and non-empty changes
+`volumeClaimTemplates`, so the same StatefulSet recreation rules as for
+`drivesPerNode` apply.
+
 ---
 
 ## Upgrade notes
