@@ -113,9 +113,8 @@ pub(crate) async fn wait(operation: &str, bucket: &str, object: &str, stage: &st
     loop {
         match fs::read(&release).await {
             Ok(body) if body == RELEASE_IO_ERROR => {
-                return Err(std::io::Error::other(format!(
-                    "injected data movement barrier failure at {stage} for {bucket}/{object}"
-                )));
+                // The reached observation already names the stage and object.
+                return Err(std::io::Error::other("injected data movement barrier failure"));
             }
             Ok(_) => return Ok(()),
             Err(err) if err.kind() == ErrorKind::NotFound => {}
