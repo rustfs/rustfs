@@ -150,8 +150,10 @@ behavior.
 | localEndpointHost.autoInject | bool or null | `null` | Automatically inject `RUSTFS_LOCAL_ENDPOINT_HOST` for chart-generated distributed topologies unless `secret.existingSecret` is set. Use `true` for a credentials-only existing Secret or `false` to preserve legacy DNS locality explicitly. |
 | commonLabels | object | `{}` | Labels to add to all deployed objects. |
 | config.rustfs.address | string | `":9000"` |  |
+| config.rustfs.api_prefix | string | `""` | Serve the S3/admin API under this path prefix (`RUSTFS_API_PREFIX`), e.g. `/tools/rustfs/api`. Rendered only when non-empty. See [Serving under a path prefix](#serving-under-a-path-prefix). |
 | config.rustfs.console_address | string | `":9001"` |  |
 | config.rustfs.console_enable | string | `"true"` |  |
+| config.rustfs.console_prefix | string | `""` | Console path prefix (`RUSTFS_CONSOLE_PREFIX`). Rendered only when non-empty. When empty and `api_prefix` is set, the console is served at `<api_prefix>/rustfs/console`. |
 | config.rustfs.domains | string | `""` | Enable virtual host mode. |
 | config.rustfs.log_level | string | `"info"` |  |
 | config.rustfs.obs_environment | string | `"development"` |  |
@@ -358,6 +360,35 @@ Both approaches support pulling from private registries seamlessly and you can a
 - The default storageclass is [`local-path`](https://github.com/rancher/local-path-provisioner),if you want to specify your own storageclass, try to set parameter `storageclass.name`.
 
 - The default size for data and logs dir is **256Mi** which must satisfy the production usage,you should specify `storageclass.dataStorageSize` and `storageclass.logStorageSize` to change the size, for example, 1Ti for data and  1Gi for logs.
+
+# Serving under a path prefix
+
+Set `config.rustfs.api_prefix` (and optionally `config.rustfs.console_prefix`)
+to share one host between several RustFS instances. The proxy must pass the
+path through unchanged: do not use `rewrite-target` or a strip-prefix
+middleware, because SigV4 signs the full path. Unprefixed paths, including the
+`/health` probes, keep working. `gatewayApi` and `contour` only route `/`, so
+use `ingress.hosts[].paths[]`:
+
+```yaml
+config:
+  rustfs:
+    api_prefix: /tools/rustfs/api
+    console_prefix: /tools/rustfs/console
+ingress:
+  hosts:
+    - host: rustfs.example.com
+      paths:
+        - {path: /tools/rustfs/api, pathType: Prefix, servicePort: console}
+        - {path: /tools/rustfs/console, pathType: Prefix, servicePort: console}
+```
+
+Route both paths to `servicePort: console` (9001): the console requests
+`<api prefix><console prefix>/version`, which port 9000 (`endpoint`) rejects.
+Port 9001 also serves the full S3/admin API. With only `api_prefix` set (the
+console then lives under it), one path rule with `servicePort: console` is enough.
+
+Details: [reverse-proxy-path-prefix.md](../docs/operations/reverse-proxy-path-prefix.md).
 
 # Server pools (capacity expansion)
 
