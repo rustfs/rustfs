@@ -2632,9 +2632,8 @@ impl BucketMetadataSys {
     }
 
     async fn get_bucket_incarnation_id_from_disk(&self, bucket: &str) -> Result<Uuid> {
-        self.find_bucket_incarnation_id_from_disk(bucket)
-            .await?
-            .ok_or_else(|| Error::other(format!("bucket incarnation metadata is not authoritative: {bucket}")))
+        let incarnation_id = self.find_bucket_incarnation_id_from_disk(bucket).await?;
+        Self::require_bucket_incarnation_id(bucket, incarnation_id)
     }
 
     async fn find_bucket_incarnation_id_from_disk(&self, bucket: &str) -> Result<Option<Uuid>> {
@@ -2654,9 +2653,14 @@ impl BucketMetadataSys {
         bucket: &str,
         transaction_guard: &rustfs_lock::NamespaceLockGuard,
     ) -> Result<Uuid> {
-        self.find_bucket_incarnation_id_under_transaction_lock(bucket, transaction_guard)
-            .await?
-            .ok_or_else(|| Error::other(format!("bucket incarnation metadata is not authoritative: {bucket}")))
+        let incarnation_id = self
+            .find_bucket_incarnation_id_under_transaction_lock(bucket, transaction_guard)
+            .await?;
+        Self::require_bucket_incarnation_id(bucket, incarnation_id)
+    }
+
+    fn require_bucket_incarnation_id(bucket: &str, incarnation_id: Option<Uuid>) -> Result<Uuid> {
+        incarnation_id.ok_or_else(|| Error::other(format!("bucket incarnation metadata is not authoritative: {bucket}")))
     }
 
     async fn find_bucket_incarnation_id_under_transaction_lock(

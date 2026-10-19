@@ -8035,7 +8035,13 @@ mod tests {
                 .expect("a confirmed absent identity is distinct from a read error"),
             None,
         );
-        assert!(set.bucket_incarnation_id_from_disk(bucket).await.is_err());
+        assert_eq!(
+            set.bucket_incarnation_id_from_disk(bucket)
+                .await
+                .expect_err("required lookup retains its missing-identity error")
+                .to_string(),
+            format!("Io error: bucket incarnation metadata is not authoritative: {bucket}"),
+        );
         let incarnation = Uuid::new_v4();
         crate::bucket::metadata::save_bucket_incarnation(Arc::clone(&store), bucket, incarnation)
             .await
