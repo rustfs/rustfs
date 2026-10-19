@@ -121,9 +121,50 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
     }
 }
 
+fn rewrite_console_asset<'a>(path: &str, data: std::borrow::Cow<'a, [u8]>, prefix: &str) -> std::borrow::Cow<'a, [u8]> {
+    let data = rewrite_console_base_path(path, data, prefix);
+    inject_runtime_config_into_html(path, data, crate::server::api_prefix())
+}
+
+// The console bundle reads NEXT_PUBLIC_SERVER_HOST at runtime through its `process.env` polyfill.
+// Without it the bundle targets the page origin and drops the API prefix.
+fn inject_runtime_config_into_html<'a>(
+    path: &str,
+    data: std::borrow::Cow<'a, [u8]>,
+    api_prefix: Option<&str>,
+) -> std::borrow::Cow<'a, [u8]> {
+    let Some(api_prefix) = api_prefix else {
+        return data;
+    };
+    if path.rsplit('.').next() != Some("html") {
+        return data;
+    }
+    let Ok(text) = std::str::from_utf8(&data) else {
+        return data;
+    };
+    match inject_runtime_config(text, api_prefix) {
+        Some(html) => std::borrow::Cow::Owned(html.into_bytes()),
+        None => data,
+    }
+}
+
+/// Inserts the runtime config as the first child of `<head>`. The prefix is validated URL-safe
+/// at startup, so it needs no JS escaping. Returns `None` when the document has no `<head>` tag.
+fn inject_runtime_config(html: &str, api_prefix: &str) -> Option<String> {
+    let head = html.match_indices("<head").find_map(|(offset, tag)| {
+        let after = offset + tag.len();
+        matches!(html.as_bytes().get(after), Some(b'>' | b'/') | Some(b' ' | b'\t' | b'\r' | b'\n'))
+            .then(|| html[after..].find('>').map(|end| after + end + 1))
+            .flatten()
+    })?;
+    let script =
+        format!("<script>globalThis.process={{env:{{NEXT_PUBLIC_SERVER_HOST:location.origin+\"{api_prefix}\"}}}}</script>");
+    Some(format!("{}{script}{}", &html[..head], &html[head..]))
+}
+
 // Next exports bake the base path into HTML, chunk loaders, and RSC text payloads.
 // Rewrite only path references, preserving external URLs such as the source repository.
-fn rewrite_console_asset<'a>(path: &str, data: std::borrow::Cow<'a, [u8]>, prefix: &str) -> std::borrow::Cow<'a, [u8]> {
+fn rewrite_console_base_path<'a>(path: &str, data: std::borrow::Cow<'a, [u8]>, prefix: &str) -> std::borrow::Cow<'a, [u8]> {
     use std::borrow::Cow;
 
     if prefix == crate::server::CONSOLE_PREFIX
@@ -1327,7 +1368,7 @@ mod tests {
 
 #[cfg(test)]
 mod console_asset_prefix_tests {
-    use super::rewrite_console_asset;
+    use super::{inject_runtime_config, inject_runtime_config_into_html, rewrite_console_asset};
     use crate::server::CONSOLE_PREFIX;
     use std::borrow::Cow;
 
@@ -1392,6 +1433,66 @@ mod console_asset_prefix_tests {
         let unchanged = rewrite_console_asset("app.js", Cow::Borrowed(input.as_bytes()), CONSOLE_PREFIX);
         assert!(matches!(unchanged, Cow::Borrowed(_)));
         assert_eq!(unchanged.as_ref(), input.as_bytes());
+    }
+
+    const RUNTIME_CONFIG_SCRIPT: &str =
+        r#"<script>globalThis.process={env:{NEXT_PUBLIC_SERVER_HOST:location.origin+"/tools/rustfs/api"}}</script>"#;
+
+    #[test]
+    fn injects_runtime_config_as_first_head_child_once() {
+        for (input, expected) in [
+            (
+                "<html><head><meta charset=\"utf-8\"/><script src=\"a.js\"></script></head><body></body></html>".to_string(),
+                format!(
+                    "<html><head>{RUNTIME_CONFIG_SCRIPT}<meta charset=\"utf-8\"/><script src=\"a.js\"></script></head><body></body></html>"
+                ),
+            ),
+            (
+                "<!DOCTYPE html><html><head lang=\"en\">\n<title>x</title></head></html>".to_string(),
+                format!("<!DOCTYPE html><html><head lang=\"en\">{RUNTIME_CONFIG_SCRIPT}\n<title>x</title></head></html>"),
+            ),
+            (
+                "<html><header>x</header><head><title>y</title></head></html>".to_string(),
+                format!("<html><header>x</header><head>{RUNTIME_CONFIG_SCRIPT}<title>y</title></head></html>"),
+            ),
+        ] {
+            let output =
+                inject_runtime_config_into_html("index.html", Cow::Borrowed(input.as_bytes()), Some("/tools/rustfs/api"));
+            assert_eq!(output.as_ref(), expected.as_bytes());
+            assert_eq!(std::str::from_utf8(&output).unwrap().matches("globalThis.process").count(), 1);
+        }
+    }
+
+    #[test]
+    fn runtime_config_requires_a_head_tag() {
+        assert_eq!(inject_runtime_config("<html><header></header></html>", "/p"), None);
+        let input = "<html><body></body></html>";
+        let output = inject_runtime_config_into_html("index.html", Cow::Borrowed(input.as_bytes()), Some("/p"));
+        assert!(matches!(output, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn runtime_config_is_absent_without_api_prefix_and_outside_html() {
+        let html = "<html><head></head></html>";
+        let output = inject_runtime_config_into_html("index.html", Cow::Borrowed(html.as_bytes()), None);
+        assert!(matches!(output, Cow::Borrowed(_)));
+        // The default-prefix, unset-API path returns the borrowed input unchanged.
+        assert!(matches!(
+            rewrite_console_asset("index.html", Cow::Borrowed(html.as_bytes()), CONSOLE_PREFIX),
+            Cow::Borrowed(_)
+        ));
+        for (path, input) in [
+            ("app.js", "<head>"),
+            ("app.css", "<head>"),
+            ("data.json", "<head>"),
+            ("logo.png", "<head>"),
+        ] {
+            let output = inject_runtime_config_into_html(path, Cow::Borrowed(input.as_bytes()), Some("/p"));
+            assert!(matches!(output, Cow::Borrowed(_)), "{path}");
+        }
+        let invalid_utf8 = b"<head>\xff".as_slice();
+        let output = inject_runtime_config_into_html("index.html", Cow::Borrowed(invalid_utf8), Some("/p"));
+        assert_eq!(output.as_ref(), invalid_utf8);
     }
 
     #[test]
