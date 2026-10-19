@@ -614,6 +614,14 @@ pub mod set_disk {
         pub fn hold_namespace_commit(store: &crate::store::ECStore) -> impl Send + Sync {
             store.ctx.begin_namespace_commit()
         }
+
+        /// Whether an ordinary namespace commit (a PUT rename fanout, including
+        /// its post-ACK tail) is still pending on this instance. Test fixtures
+        /// drain tails through this probe; the scanner's publication barrier no
+        /// longer reports them.
+        pub fn namespace_commits_pending(store: &crate::store::ECStore) -> bool {
+            store.ctx.namespace_commits_pending()
+        }
     }
 }
 

@@ -1431,7 +1431,9 @@ pub(super) fn should_clear_dirty_usage_snapshot(
 /// bucket whose generation differs from the snapshot's, including buckets
 /// dirtied after the snapshot was taken. Only a `Complete` cycle reads this,
 /// and a failed bucket never reaches `Complete`, so the failed set that
-/// `dirty_usage_buckets_excluding_failed` removes is empty here.
+/// `dirty_usage_buckets_excluding_failed` removes is empty here. The caller
+/// adds the buckets whose walk stopped early behind a certified value; they
+/// are pending whether or not the dirty map names them.
 pub(super) fn pending_dirty_usage_buckets(snapshot: &DirtyUsageBuckets) -> BTreeSet<String> {
     let dirty_buckets = dirty_usage_buckets();
     dirty_buckets

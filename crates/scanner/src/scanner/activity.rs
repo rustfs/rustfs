@@ -1054,15 +1054,25 @@ pub(crate) fn scanner_activity_snapshot_digest(snapshot: &ScannerActivitySnapsho
         hasher.update(activity.dirty_usage_generation.to_be_bytes());
         hasher.update([u8::from(activity.dirty_usage_pending)]);
         hasher.update(activity.movement_generation.to_be_bytes());
-        hasher.update([u8::from(activity.publication_blocked)]);
     }
     hasher.finalize().into()
 }
 
-/// Hash the activity inputs that make an existing scanner cache unsafe to
-/// reuse. Regular namespace writes and dirty-usage generations are omitted:
-/// their affected buckets are tracked separately and may be refreshed from a
-/// complete authoritative cache baseline.
+/// The reuse identity: hash the activity inputs that make an existing
+/// scanner result unsafe to reuse without walking again. Besides the
+/// coverage identity below it binds each peer's `instance_id` and
+/// `maintenance_generation`: a restarted node may have lost the dirty hints
+/// of its last journal window and a changed lifecycle or replication rule
+/// needs a maintenance pass, so both invalidate the authoritative baseline
+/// and the set caches and force the next cycle to walk every bucket. With
+/// the bucket list it is the plan under which set caches and the
+/// scoped-scan baseline are reused (`scanner_bucket_plan_digest`).
+///
+/// Regular namespace writes and dirty-usage generations are omitted: their
+/// buckets are tracked separately and rescanned from a complete baseline.
+/// `publication_blocked` is omitted from every identity: a movement pause
+/// vetoes the cycle it moves in (`scanner_activity_guardrail_veto`) and
+/// describes nothing about the heap.
 pub(crate) fn scanner_activity_structural_digest(snapshot: &ScannerActivitySnapshot) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(u64::try_from(snapshot.len()).unwrap_or(u64::MAX).to_be_bytes());
@@ -1078,7 +1088,41 @@ pub(crate) fn scanner_activity_structural_digest(snapshot: &ScannerActivitySnaps
         hasher.update(activity.topology_digest);
         hasher.update([u8::from(activity.data_movement_active)]);
         hasher.update(activity.movement_generation.to_be_bytes());
-        hasher.update([u8::from(activity.publication_blocked)]);
+    }
+    hasher.finalize().into()
+}
+
+/// The coverage identity: hash the activity inputs under which a bucket
+/// sweep's traversal stays one traversal, so a checkpoint resumed in a later
+/// cycle is not mixed coverage. It binds the peer set, the protocol, the
+/// topology and the data-movement state. A coordinator restart, a
+/// maintenance publication or a publication pause changes none of the
+/// namespace a sweep walks, so `instance_id`, `maintenance_generation` and
+/// `publication_blocked` are left out; hashing them made every resumed sweep
+/// restart as mixed coverage after such an event (rustfs/rustfs#8494). The
+/// local node's namespace and dirty generations are left out too: the
+/// bucket's own dirty generation joins the checkpoint plan in
+/// `scanner_bucket_cache_digest`, which is what certification compares. A
+/// remote peer's generations stay in, because its dirty buckets are still
+/// acknowledged per cycle rather than per bucket, and a write there between
+/// the two halves of a sweep would otherwise be acknowledged without having
+/// been walked.
+pub(crate) fn scanner_activity_coverage_digest(snapshot: &ScannerActivitySnapshot) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(u64::try_from(snapshot.len()).unwrap_or(u64::MAX).to_be_bytes());
+    for (host, activity) in snapshot {
+        let host_bytes = host.as_bytes();
+        hasher.update(u64::try_from(host_bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(host_bytes);
+        hasher.update(activity.protocol_version.to_be_bytes());
+        hasher.update(activity.topology_digest);
+        hasher.update([u8::from(activity.data_movement_active)]);
+        hasher.update(activity.movement_generation.to_be_bytes());
+        if host.as_str() != LOCAL_SCANNER_ACTIVITY_NODE {
+            hasher.update(activity.namespace_generation.to_be_bytes());
+            hasher.update(activity.dirty_usage_generation.to_be_bytes());
+            hasher.update([u8::from(activity.dirty_usage_pending)]);
+        }
     }
     hasher.finalize().into()
 }
@@ -1128,8 +1172,10 @@ pub(crate) const SCANNER_ACTIVITY_SHADE_FIELDS: [&str; 3] =
 
 /// Compare the guardrail fields of two activity probes and name the first
 /// field that moved. `maintenance_generation` is a veto because no cycle today
-/// distinguishes whether it published maintenance results; it is also part of
-/// `scanner_activity_structural_digest`.
+/// distinguishes whether it published maintenance results. The veto fields
+/// are compared one by one; which of them also change the reuse or the
+/// coverage identity is decided by `scanner_activity_structural_digest` and
+/// `scanner_activity_coverage_digest`, not here.
 pub(crate) fn scanner_activity_guardrail_veto(
     before: &ScannerActivitySnapshot,
     after: &ScannerActivitySnapshot,

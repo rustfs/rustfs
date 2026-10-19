@@ -114,8 +114,15 @@ The structural scan-plan digest can remain stable across ordinary bucket writes
 so a scoped scan can retain unaffected baseline buckets. It is not sufficient
 proof for reusing a completed result within the same cycle. Bucket work uses an
 execution digest combining the structural plan and the full activity snapshot,
-with the bucket's dirty generation included in its cache identity. Completed set
-caches carry the same execution digest separately from their structural plan.
+with the bucket's dirty generation included in its cache identity. A bucket
+sweep's checkpoint is keyed separately by the coverage identity
+(`scanner_activity_coverage_digest`, see
+[scanner-per-bucket-convergence.md](scanner-per-bucket-convergence.md)), so
+the reuse identity can change without restarting a sweep in progress. Completed
+set caches carry the same execution digest separately from their structural
+plan; a set cache that stands in for buckets whose walk stopped early binds
+the carried bucket names into it (`scanner_carried_execution_digest`), so it
+is never adopted in place of a full walk of the same cycle, nor the reverse.
 The persisted set-root fast path requires equal execution identities as well as
 the existing source, cycle, leader, tier, and cache-structure checks.
 
@@ -289,9 +296,10 @@ worker finishing does not certify its namespace coverage.
 | `partial_saved_not_published` | The local or remote worker successfully saved a terminal Partial cache. Correlate its bucket, pool/set, cycle/leader epoch and `resume_position` with admission and sweep events. This confirms persistence, not complete coverage or authoritative publication. |
 | `checkpoint_identity_unavailable` | A local worker could not read the persisted bucket identity. `stage=admission` preserves the existing checkpoint without preparing a legacy rebuild; `stage=post_scan` rejects the unverified candidate before persistence. Correlate bucket, pool/set, cycle/epoch and the underlying read error. Remote terminal errors distinguish the same two stages. |
 | `checkpoint_identity_changed` | A successful post-scan read no longer matches the admitted identity, including a now-absent sidecar. Rejecting the result protects against bucket replacement; this differs from an unavailable read. |
-| `remote_scan_partial` | The coordinator received a Partial terminal response for the named bucket and disk. Correlate the worker's bucket-sweep or checkpoint events; Partial is not a complete bucket root. |
+| `remote_scan_partial` | The coordinator received a Partial terminal response for the named bucket and disk. Correlate the worker's bucket-sweep or checkpoint events; Partial is not a complete bucket root, but the set may still cover the bucket with its last certified value (`partial_buckets_carried`). |
+| `partial_buckets_carried` | The set published the last certified value for `carried_buckets` buckets whose walk stopped early; `first_carried_bucket` names one. The cycle can complete with them pending and the next cycle walks them. A partial bucket without a certified value on the set is counted by `set_cache_publish_skipped` instead. |
 | `bucket_result_rejected` | A bucket result did not match the cycle's frozen tier-registry generation and was not applied. |
-| `set_cache_publish_skipped` | `completed_buckets` counts distinct bucket roots successfully applied to this set cache. Use `first_incomplete_bucket` with pool/set/cycle to locate one actual gap in this set. Inspect `unprocessed_buckets` and budget/cancellation state, then correlate that bucket's worker events. |
+| `set_cache_publish_skipped` | `completed_buckets` counts distinct bucket roots successfully applied to this set cache and `carried_buckets` the partial walks covered by a certified value. Use `first_incomplete_bucket` with pool/set/cycle to locate one actual gap in this set. Inspect `unprocessed_buckets` and budget/cancellation state, then correlate that bucket's worker events. |
 | `set_scan_completed` | Set workers have finished. `coverage_complete` reports the structural coverage gate, not durable publication. This event alone does not prove a complete set snapshot. |
 | `incomplete_coverage` | The cycle did not obtain complete structural coverage. This does not identify a hot bucket or prove that ordinary writes caused the gap. |
 | `publication_proof_pending` | Publication is waiting for a retryable proof. Use cycle/stage, `pending_duration`, the preceding `publication_proof_started` kind, and the peer/purpose in the error. This event does not assert that the walk was Complete. |
@@ -347,9 +355,10 @@ inventories. Keep logs access-controlled and redact deployment identifiers
 before sharing them.
 
 An unlimited walk budget can also leave a retryable authoritative publication
-waiting for leadership loss or a successful proof. Observational publication
-still retains the movement fence, while authoritative publication requires the
-strict namespace proof. Do not remove those fences to clear a status. Verify
+waiting for leadership loss or a successful proof. Observational and
+authoritative publication both retain the movement fence, on this node and
+through the remote publication leases. Do not remove those fences to clear a
+status. Verify
 that a deployment contains the relevant fixes by commit ancestry; a newer
 release name alone is not evidence that it includes current main.
 

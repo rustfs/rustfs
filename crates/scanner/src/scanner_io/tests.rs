@@ -23,7 +23,7 @@ use crate::scanner_folder::ScannerItem;
 use crate::storage_api::EcstoreScannerPeerDirtyUsageSnapshot;
 use crate::storage_api::owner::{
     EcstorePoolDecommissionInfo, EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats,
-    WriteCommitGuard, WriteCompletion, ecstore_hold_namespace_commit,
+    WriteCommitGuard, WriteCompletion, ecstore_hold_namespace_commit, ecstore_namespace_commits_pending,
 };
 use crate::storage_api::scan::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions, ObjectIO as _};
 use crate::{
@@ -44,7 +44,9 @@ use temp_env::with_var;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+mod checkpoint_coverage_identity;
 mod listing_window_scope;
+mod partial_bucket_carry;
 mod per_bucket_certification;
 mod scoped_entry_fallback;
 mod service_cohort;
@@ -1045,7 +1047,7 @@ async fn checkpoint_rejects_unreadable_or_changed_global_fence() {
 
 async fn wait_for_namespace_commit_tails(store: &ECStore) {
     tokio::time::timeout(Duration::from_secs(30), async {
-        while store.scanner_data_usage_publication_blocked().await {
+        while ecstore_namespace_commits_pending(store) {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
@@ -1595,7 +1597,7 @@ async fn multi_pool_scanner_cycle_publishes_combined_usage() {
 
 #[tokio::test]
 #[serial]
-async fn pending_put_commit_keeps_scanner_walk_live_without_authoritative_usage() {
+async fn pending_put_commit_keeps_scanner_walk_live_and_publishes_authority() {
     let (_temp_dir, store) = setup_two_pool_scanner_store().await;
     let bucket = format!("scanner-pending-put-{}", Uuid::new_v4().simple());
     store
@@ -1625,11 +1627,15 @@ async fn pending_put_commit_keeps_scanner_walk_live_without_authoritative_usage(
     let mut pending = Some(ecstore_hold_namespace_commit(store.as_ref()));
     let mut previous_activity_digest = None;
     let mut structural_plan_digest = None;
-    for (cycle, converged) in [(1, false), (2, true)] {
-        if converged {
+    for (cycle, commit_pending) in [(1, true), (2, false)] {
+        if !commit_pending {
             drop(pending.take());
         }
-        assert_eq!(store.scanner_data_usage_publication_blocked().await, !converged);
+        assert_eq!(ecstore_namespace_commits_pending(store.as_ref()), commit_pending);
+        assert!(
+            !store.scanner_data_usage_publication_blocked().await,
+            "an ordinary PUT commit is namespace activity, not a publication barrier"
+        );
         assert!(!store.scanner_data_movement_pause_status().await.paused);
         let activity = crate::scanner::probe_scanner_activity(store.as_ref(), false)
             .await
@@ -1657,22 +1663,20 @@ async fn pending_put_commit_keeps_scanner_walk_live_without_authoritative_usage(
         .expect("namespace scanning must finish while a PUT commit is pending")
         .expect("namespace scanning must remain available during a pending PUT commit");
         assert_eq!(result.activity_digest(), Some(activity_digest));
-        if !converged {
+        if commit_pending {
             assert_eq!(budget.progress().0, 2, "the pending commit must not suppress actual object traversal");
         }
         assert_eq!(
             result.status,
-            if converged {
-                ScannerCycleStatus::Complete
-            } else {
-                ScannerCycleStatus::Superseded
-            }
+            ScannerCycleStatus::Complete,
+            "a pending PUT commit shades its bucket; it no longer supersedes the walk"
         );
         let usage = receiver
             .recv()
             .await
             .expect("the completed walk should produce a usage candidate");
-        assert_eq!(usage.usage_snapshot_converged, Some(converged));
+        assert_eq!(usage.usage_snapshot_converged, Some(true));
+        assert!(!usage.usage_snapshot_observational);
         assert_eq!(usage.scanner_cycle, Some(cycle));
         assert_eq!(usage.objects_total_count, 2);
         assert_eq!(usage.objects_total_size, 11);
@@ -2311,6 +2315,7 @@ async fn set_snapshot_reuse_requires_execution_identity_and_fences_stale_writers
             scope: ScannerBucketScanScope::default(),
             digest: DataUsageScanPlanDigest([6; 32]),
             bucket_coverage_digest: DataUsageScanPlanDigest([6; 32]),
+            checkpoint_coverage_digest: DataUsageScanPlanDigest([6; 32]),
             requires_full_scan: false,
             execution_digest: empty_execution,
             leader_epoch: 11,
@@ -2402,6 +2407,63 @@ fn complete_segment_reuse_baseline(
         ..Default::default()
     };
     bytes::Bytes::from(serde_json::to_vec(&baseline).expect("test baseline should encode"))
+}
+
+#[test]
+fn scoped_scan_includes_the_baseline_pending_buckets() {
+    let source = DataUsageCacheSource::new(1, 2);
+    let expected_sources = HashSet::from([source]);
+    let scan_plan_digest = DataUsageScanPlanDigest([9; 32]);
+    let mut baseline: DataUsageInfo =
+        serde_json::from_slice(&complete_usage_baseline(source, scan_plan_digest, 7, 11)).expect("test baseline should decode");
+    baseline.buckets_usage.insert("stale".to_string(), Default::default());
+    baseline.buckets_count = 2;
+    baseline.usage_snapshot_converged = Some(false);
+    baseline.usage_snapshot_pending_buckets = vec!["stale".to_string(), "deleted".to_string()];
+    baseline.usage_snapshot_pending_bucket_count = 2;
+    let baseline = bytes::Bytes::from(serde_json::to_vec(&baseline).expect("test baseline should encode"));
+    let proof = ScannerCacheBaselineProof {
+        authoritative_data: Some(&baseline),
+        observed_candidate_data: None,
+        expected_sources: &expected_sources,
+        leader_epoch: 11,
+        want_cycle: 8,
+        scan_plan_digest,
+    };
+    let all_buckets = vec![bucket_info("photos"), bucket_info("stale"), bucket_info("cold")];
+
+    // A bucket the last publication left pending (a partial walk that
+    // published its last certified value) is walked with the dirty buckets.
+    let scope = scoped_scan_scope_from_dirty_buckets(
+        ScannerBucketScanScope::default(),
+        HashSet::from(["photos".to_string()]),
+        None,
+        true,
+        false,
+        &all_buckets,
+        proof,
+    );
+    assert_eq!(
+        scope.selected_buckets_for_tests(),
+        Some(&HashSet::from(["photos".to_string(), "stale".to_string()])),
+        "pending buckets join the dirty scope; a deleted bucket is dropped"
+    );
+
+    // With nothing dirty, the pending list alone scopes the walk.
+    let scope = scoped_scan_scope_from_dirty_buckets(
+        ScannerBucketScanScope::default(),
+        HashSet::new(),
+        None,
+        true,
+        false,
+        &all_buckets,
+        proof,
+    );
+    assert_eq!(
+        scope.selected_buckets_for_tests(),
+        Some(&HashSet::from(["stale".to_string()])),
+        "a pending bucket is rescanned without a dirty wake"
+    );
 }
 
 #[test]
@@ -3729,6 +3791,73 @@ fn scanner_cycle_status_requires_a_clean_complete_snapshot() {
 }
 
 #[test]
+fn carried_partial_buckets_complete_the_cycle_as_pending() {
+    for dirty_usage_status in [DirtyUsageSnapshotStatus::Current, DirtyUsageSnapshotStatus::Changed] {
+        assert_eq!(
+            classify_nsscanner_cycle(
+                true,
+                false,
+                false,
+                ScannerBucketScanStatus::PartialCarried,
+                dirty_usage_status,
+                ScannerCycleActivityStatus::Unchanged,
+            ),
+            ScannerCycleStatus::Complete,
+            "a partial walk behind a certified value is pending, not incomplete ({dirty_usage_status:?})"
+        );
+    }
+    assert_eq!(
+        classify_nsscanner_cycle(
+            true,
+            false,
+            false,
+            ScannerBucketScanStatus::PartialCarried,
+            DirtyUsageSnapshotStatus::Current,
+            ScannerCycleActivityStatus::Changed,
+        ),
+        ScannerCycleStatus::Superseded,
+        "the guardrail still vetoes a carried cycle"
+    );
+    assert_eq!(
+        classify_nsscanner_cycle(
+            true,
+            false,
+            false,
+            ScannerBucketScanStatus::PartialCarried,
+            DirtyUsageSnapshotStatus::Current,
+            ScannerCycleActivityStatus::Unverified,
+        ),
+        ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+    );
+    for (completed_all_sets, budget, cancelled, bucket_status) in [
+        (false, false, false, ScannerBucketScanStatus::PartialCarried),
+        (true, true, false, ScannerBucketScanStatus::PartialCarried),
+        (true, false, true, ScannerBucketScanStatus::PartialCarried),
+        (true, false, false, ScannerBucketScanStatus::Partial),
+    ] {
+        assert_eq!(
+            classify_nsscanner_cycle(
+                completed_all_sets,
+                budget,
+                cancelled,
+                bucket_status,
+                DirtyUsageSnapshotStatus::Current,
+                ScannerCycleActivityStatus::Unchanged,
+            ),
+            ScannerCycleStatus::Incomplete,
+            "a set that could not stand in, a budget, a cancellation, or an uncovered partial walk stays incomplete \
+             ({completed_all_sets}, {budget}, {cancelled}, {bucket_status:?})"
+        );
+    }
+    for bucket_status in [ScannerBucketScanStatus::Partial, ScannerBucketScanStatus::PartialCarried] {
+        assert!(
+            scanner_partial_progress_is_usable(true, true, bucket_status, false, false),
+            "{bucket_status:?} saved checkpoints the retry can resume"
+        );
+    }
+}
+
+#[test]
 fn checkpoint_fixture_superseded_is_distinct_from_partial_and_cancel() {
     for (budget, cancelled, bucket, expected) in [
         (false, false, ScannerBucketScanStatus::Complete, ScannerCycleStatus::Superseded),
@@ -3948,11 +4077,40 @@ fn scanner_cycle_fails_closed_when_dirty_generation_is_unverified() {
 }
 
 #[test]
+fn carried_execution_identity_differs_from_a_full_walk_and_is_order_independent() {
+    let execution = DataUsageScanPlanDigest([7; 32]);
+    assert_eq!(super::cache::scanner_carried_execution_digest(execution, &[]), execution);
+    let carried = super::cache::scanner_carried_execution_digest(execution, &["b".to_string(), "a".to_string()]);
+    assert_ne!(carried, execution, "a set that stood in for a bucket is not the full walk's execution");
+    assert_eq!(
+        carried,
+        super::cache::scanner_carried_execution_digest(execution, &["a".to_string(), "b".to_string()])
+    );
+    assert_ne!(carried, super::cache::scanner_carried_execution_digest(execution, &["a".to_string()]));
+}
+
+#[test]
 fn scanner_bucket_failure_status_preserves_the_strongest_failure() {
-    assert_eq!(scanner_bucket_scan_status(false, false, false), ScannerBucketScanStatus::Complete);
-    assert_eq!(scanner_bucket_scan_status(false, false, true), ScannerBucketScanStatus::NamespaceNotFound);
-    assert_eq!(scanner_bucket_scan_status(false, true, true), ScannerBucketScanStatus::Partial);
-    assert_eq!(scanner_bucket_scan_status(true, true, true), ScannerBucketScanStatus::Failed);
+    assert_eq!(scanner_bucket_scan_status(false, false, false, false), ScannerBucketScanStatus::Complete);
+    assert_eq!(
+        scanner_bucket_scan_status(false, false, true, false),
+        ScannerBucketScanStatus::NamespaceNotFound
+    );
+    assert_eq!(scanner_bucket_scan_status(false, true, true, false), ScannerBucketScanStatus::Partial);
+    assert_eq!(scanner_bucket_scan_status(true, true, true, false), ScannerBucketScanStatus::Failed);
+    // A partial walk covered by its last certified value may complete, but
+    // never ahead of an uncovered partial walk, a failure, or a missing
+    // namespace.
+    assert_eq!(
+        scanner_bucket_scan_status(false, false, false, true),
+        ScannerBucketScanStatus::PartialCarried
+    );
+    assert_eq!(scanner_bucket_scan_status(false, true, false, true), ScannerBucketScanStatus::Partial);
+    assert_eq!(
+        scanner_bucket_scan_status(false, false, true, true),
+        ScannerBucketScanStatus::NamespaceNotFound
+    );
+    assert_eq!(scanner_bucket_scan_status(true, false, false, true), ScannerBucketScanStatus::Failed);
 }
 
 #[test]

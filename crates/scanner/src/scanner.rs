@@ -3691,6 +3691,13 @@ where
     }
 }
 
+/// The local publication fence. Only storage data movement defers a
+/// publication: an active or terminal decommission, a rebalance, or an
+/// exhausted movement sequence. An ordinary PUT whose rename fanout is still
+/// pending is not a fence; its bucket is shaded through the dirty-usage
+/// generation and certified per bucket, so a sustained write load cannot
+/// hold the authoritative snapshot back (rustfs/rustfs#8494,
+/// rustfs/rustfs#8305).
 async fn scanner_local_publication_defer_reason<S>(storeapi: &S, observational_only: bool) -> Option<ScannerCycleDeferReason>
 where
     S: ScannerStorage,
@@ -3703,31 +3710,19 @@ where
     if !blocked {
         return None;
     }
-    // Pending namespace commits invalidate this publication attempt, but only
-    // storage movement creates durable, rate-limited catch-up debt.
-    if storeapi.scanner_data_movement_publication_blocked().await {
-        debug!(
-            target: "rustfs::scanner",
-            event = EVENT_SCANNER_PERSIST_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_RUNTIME,
-            stage = "local_barrier",
-            blocker = "data_movement",
-            "Scanner usage publication deferred"
-        );
-        Some(ScannerCycleDeferReason::DataMovement)
-    } else {
-        debug!(
-            target: "rustfs::scanner",
-            event = EVENT_SCANNER_PERSIST_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_RUNTIME,
-            stage = "local_barrier",
-            blocker = "pending_namespace_commit",
-            "Scanner usage publication deferred"
-        );
-        Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
-    }
+    // Both barriers describe storage movement. The authoritative barrier also
+    // holds terminal decommission entries an operator has not cleared, which
+    // is the same durable, rate-limited catch-up debt.
+    debug!(
+        target: "rustfs::scanner",
+        event = EVENT_SCANNER_PERSIST_STATE,
+        component = LOG_COMPONENT_SCANNER,
+        subsystem = LOG_SUBSYSTEM_RUNTIME,
+        stage = "local_barrier",
+        blocker = "data_movement",
+        "Scanner usage publication deferred"
+    );
+    Some(ScannerCycleDeferReason::DataMovement)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4137,9 +4132,9 @@ pub use activity::scanner_topology_digest;
 pub(crate) use activity::{
     LOCAL_SCANNER_ACTIVITY_NODE, ScannerActivityGuardrailVeto, ScannerActivitySnapshot, ScannerDirtyUsageAcknowledgement,
     ScannerDirtyUsageAcknowledgementKind, probe_scanner_activity, scanner_activity_allows_usage_publication,
-    scanner_activity_dirty_usage_state_for_host, scanner_activity_guardrail_veto, scanner_activity_publication_lease_targets,
-    scanner_activity_snapshot_digest, scanner_activity_structural_digest, scanner_dirty_usage_acknowledgements,
-    scanner_peer_dirty_usage_moved,
+    scanner_activity_coverage_digest, scanner_activity_dirty_usage_state_for_host, scanner_activity_guardrail_veto,
+    scanner_activity_publication_lease_targets, scanner_activity_snapshot_digest, scanner_activity_structural_digest,
+    scanner_dirty_usage_acknowledgements, scanner_peer_dirty_usage_moved,
 };
 pub(crate) use activity::{ScannerCycleOutcome, scanner_cycle_outcome_with_pending_maintenance};
 pub use backlog::{

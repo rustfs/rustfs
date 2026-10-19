@@ -18,7 +18,9 @@ use super::heal_info::{
 };
 use super::*;
 use crate::EcstoreResult;
-use crate::storage_api::owner::{WriteCommitGuard, WriteCompletion, ecstore_hold_namespace_commit};
+use crate::storage_api::owner::{
+    WriteCommitGuard, WriteCompletion, ecstore_hold_namespace_commit, ecstore_namespace_commits_pending,
+};
 use crate::storage_api::scan::{BucketOperations as _, ObjectIO as _};
 use crate::{
     DATA_USAGE_BLOOM_RECOVERY_PATH, DATA_USAGE_CACHE_KEY_FORMAT, DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT,
@@ -1501,13 +1503,18 @@ async fn run_data_scanner_cycle_publishes_activity_for_owner_lifetime() {
 
 #[tokio::test]
 #[serial]
-async fn coordinator_persists_only_an_observation_during_pending_put() {
+async fn coordinator_publishes_authority_during_pending_put() {
     for drives_per_set in [1, 4] {
-        assert_bootstrap_observation_retry(drives_per_set).await;
+        assert_bootstrap_authority_during_pending_put(drives_per_set).await;
     }
 }
 
-async fn assert_bootstrap_observation_retry(drives_per_set: usize) {
+/// A PUT whose rename fanout is still pending when the walk finishes used to
+/// turn the first cycle into an observation and keep authority bootstrap
+/// pending until a quiet retry (rustfs/rustfs#8494). The tail is ordinary
+/// namespace activity: the cycle publishes authority, discharges bootstrap,
+/// and the object the tail commits afterwards is the next cycle's work.
+async fn assert_bootstrap_authority_during_pending_put(drives_per_set: usize) {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     let temp_dir = tempfile::tempdir().expect("bootstrap directory should be created");
     let store = setup_scanner_cycle_store_at_path_with_layout(temp_dir.path(), false, 1, 1, drives_per_set).await;
@@ -1559,15 +1566,14 @@ async fn assert_bootstrap_observation_retry(drives_per_set: usize) {
         .expect("cold object should persist before scanning");
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     crate::scanner_io::record_dirty_usage_bucket(&bucket);
-    let dirty_before = crate::scanner_io::dirty_usage_buckets_for_tests();
     let baseline = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
         .await
         .expect("fixture usage baseline should be readable");
     let pending = ecstore_hold_namespace_commit(store.as_ref());
     assert_eq!(
         scanner_local_publication_defer_reason(store.as_ref(), false).await,
-        Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
-        "an ordinary namespace commit must not be classified as data movement"
+        None,
+        "an ordinary namespace commit is neither data movement nor a publication fence"
     );
     assert_eq!(
         scanner_local_publication_defer_reason(store.as_ref(), true).await,
@@ -1605,43 +1611,46 @@ async fn assert_bootstrap_observation_retry(drives_per_set: usize) {
     assert!(
         matches!(
             outcome,
-            ScannerCycleOutcome::Superseded | ScannerCycleOutcome::Partial | ScannerCycleOutcome::CompletedWithPendingMaintenance
+            ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance
         ),
-        "a pending PUT may store an observation without publishing authority: {outcome:?}"
+        "a pending PUT tail must not withhold authority from a complete walk: {outcome:?}"
     );
     finish_scanner_pause_backlog_cycle(&mut pause_backlog, &store, pause_backlog_attempt, outcome).await;
     let pause_backlog_status = scanner_pause_backlog_status(store.clone()).await;
     assert_eq!(pause_backlog_status.phase, ScannerPauseBacklogPhase::Idle);
     assert!(!pause_backlog_status.pending_full_scan);
     assert_eq!(pause_backlog_status.catch_up_attempts, 0);
-    assert_eq!(crate::scanner_io::dirty_usage_buckets_for_tests(), dirty_before);
+    assert!(
+        !crate::scanner_io::dirty_usage_buckets_for_tests().contains_key(&bucket),
+        "a certified bucket leaves the dirty map"
+    );
     assert!(
         matches!(revision, DataUsageCacheRevision::Etag(_)),
-        "the cycle-state floor should advance after its durable observation"
+        "the cycle-state floor should advance after its durable publication"
     );
-    assert_eq!(
-        read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
-            .await
-            .expect("the prior authoritative usage must remain readable"),
-        baseline,
-        "the pending candidate must not replace the authoritative baseline"
-    );
-    let observed = read_config(store.clone(), DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str())
+    let published = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
         .await
-        .expect("the pending cycle should persist its non-authoritative observation");
-    let observed: DataUsageInfo = serde_json::from_slice(&observed).expect("observed usage should decode");
-    assert_eq!(observed.usage_snapshot_converged, Some(false));
-    assert!(observed.is_complete_bucket_usage_snapshot());
-    assert_eq!(observed.objects_total_count, 2);
-    assert!(!bootstrap.record_cycle(outcome));
-    assert!(bootstrap.pending(), "an observation cannot discharge authority bootstrap");
+        .expect("the authoritative usage should be persisted");
+    assert_ne!(published, baseline, "the complete cycle replaces the bootstrap baseline");
+    let published: DataUsageInfo = serde_json::from_slice(&published).expect("published usage should decode");
+    assert_eq!(published.usage_snapshot_converged, Some(true));
+    assert!(!published.usage_snapshot_observational);
+    assert!(published.is_complete_bucket_usage_snapshot());
+    assert_eq!(published.objects_total_count, 2);
+    assert!(bootstrap.record_cycle(outcome));
+    assert!(
+        !bootstrap.pending(),
+        "a complete cycle under a pending PUT tail discharges authority bootstrap"
+    );
     crate::storage_api::ecstore_invalidate_data_usage_snapshot_cache().await;
     let displayed = crate::storage_api::scanner_io::load_admin_data_usage_from_backend_cached(store.clone())
         .await
-        .expect("admin should load the durable complete observation");
+        .expect("admin should load the durable authoritative snapshot");
     assert_eq!(displayed.objects_total_count, 2);
-    assert_eq!(displayed.usage_snapshot_converged, Some(false));
+    assert_eq!(displayed.usage_snapshot_converged, Some(true));
 
+    // The tail commits a larger body after the walk. Its bucket is shaded
+    // for the next cycle exactly as the production mutation observer does.
     let committed_body = b"committed-after-walk";
     let mut reader = PutObjReader::from_vec(committed_body.to_vec());
     {
@@ -1659,7 +1668,7 @@ async fn assert_bootstrap_observation_retry(drives_per_set: usize) {
             .await
             .expect("the pending tail must change the physical object before it drains");
     }
-    assert_eq!(crate::scanner_io::dirty_usage_buckets_for_tests(), dirty_before);
+    crate::scanner_io::record_dirty_usage_bucket(&bucket);
     drop(pending);
     let retry_budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, ScannerCycleBudgetConfig::default());
     let retry_cycle = cycle_info.next;
@@ -1698,7 +1707,10 @@ async fn assert_bootstrap_observation_retry(drives_per_set: usize) {
         outcome,
         ScannerCycleOutcome::Completed | ScannerCycleOutcome::CompletedWithPendingMaintenance
     ));
-    assert!(bootstrap.record_cycle(outcome));
+    assert!(
+        !bootstrap.record_cycle(outcome),
+        "authority bootstrap was already discharged by the first cycle"
+    );
     assert!(!bootstrap.pending());
     assert_eq!(cycle_info.next, retry_cycle + 1);
     assert!(!crate::scanner_io::dirty_usage_buckets_for_tests().contains_key(&bucket));
@@ -1725,7 +1737,7 @@ async fn assert_bootstrap_observation_retry(drives_per_set: usize) {
 
 #[tokio::test]
 #[serial]
-async fn complete_cycle_keeps_strict_publication_fence_with_observational_flag() {
+async fn complete_cycle_keeps_movement_fence_with_observational_flag() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     let pending = ecstore_hold_namespace_commit(store.as_ref());
 
@@ -1737,16 +1749,31 @@ async fn complete_cycle_keeps_strict_publication_fence_with_observational_flag()
     assert!(!complete_uses_observation, "a converged Complete snapshot is authoritative");
     assert_eq!(
         scanner_local_publication_defer_reason(store.as_ref(), complete_uses_observation).await,
-        Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
-        "a Complete cycle must remain fenced while an ordinary namespace commit is pending"
+        None,
+        "an ordinary namespace commit shades its bucket; it is not a publication fence"
     );
+    drop(pending);
+
+    // A terminal decommission entry is storage movement the operator must
+    // clear: it fences the authoritative and the observational route alike.
+    store.pool_meta.write().await.pools[0].decommission = Some(crate::storage_api::owner::EcstorePoolDecommissionInfo {
+        failed: true,
+        ..Default::default()
+    });
+    for observational_only in [false, true] {
+        assert_eq!(
+            scanner_local_publication_defer_reason(store.as_ref(), observational_only).await,
+            Some(ScannerCycleDeferReason::DataMovement),
+            "observational_only={observational_only}"
+        );
+    }
+    store.pool_meta.write().await.pools[0].decommission = None;
 
     assert!(uses_observation(ScannerCycleStatus::Superseded));
     assert!(uses_observation(ScannerCycleStatus::Deferred(
         ScannerCycleDeferReason::ActivityBaselineUnavailable
     )));
     assert!(!uses_observation(ScannerCycleStatus::Deferred(ScannerCycleDeferReason::DataMovement)));
-    drop(pending);
 }
 
 #[tokio::test]
@@ -10206,6 +10233,7 @@ fn scoped_scan_remote_dirty_coverage_invalidates_local_bucket_current() {
                 require_source: true,
                 tier_registry_generation: None,
                 checkpoint_identity: None,
+                checkpoint_plan_digest: None,
             },
         ),
         crate::scanner_io::DataUsageCacheScanState::Prepared {
@@ -10430,7 +10458,7 @@ fn scanner_activity_structural_digest_ignores_regular_bucket_writes() {
 }
 
 #[test]
-fn scanner_activity_structural_digest_fences_restart_and_maintenance() {
+fn scanner_activity_structural_digest_fences_restart_and_maintenance_but_not_publication_pauses() {
     let baseline = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
     let mut restarted = baseline.clone();
     restarted.get_mut("node-2").expect("node should exist").instance_id = "epoch-b".to_string();
@@ -10439,7 +10467,12 @@ fn scanner_activity_structural_digest_fences_restart_and_maintenance() {
         .get_mut("node-2")
         .expect("node should exist")
         .maintenance_generation = 4;
+    let mut paused = baseline.clone();
+    paused.get_mut("node-2").expect("node should exist").publication_blocked = true;
 
+    // A restarted peer may have lost its last dirty-hint window and a changed
+    // maintenance rule needs a maintenance pass, so both invalidate every
+    // reusable result (the baseline and the set caches).
     assert_ne!(
         scanner_activity_structural_digest(&baseline),
         scanner_activity_structural_digest(&restarted)
@@ -10448,8 +10481,145 @@ fn scanner_activity_structural_digest_fences_restart_and_maintenance() {
         scanner_activity_structural_digest(&baseline),
         scanner_activity_structural_digest(&maintained)
     );
+    // A publication pause describes nothing about the heap: it vetoes the
+    // cycle it moves in and is part of no identity.
+    assert_eq!(scanner_activity_structural_digest(&baseline), scanner_activity_structural_digest(&paused));
+    assert_eq!(scanner_activity_snapshot_digest(&baseline), scanner_activity_snapshot_digest(&paused));
+    assert_eq!(scanner_activity_coverage_digest(&baseline), scanner_activity_coverage_digest(&paused));
+    assert_eq!(
+        scanner_activity_guardrail_veto(&baseline, &paused).map(|veto| veto.field),
+        Some("publication_blocked")
+    );
 }
 
+#[test]
+fn scanner_activity_coverage_digest_survives_restart_and_maintenance_but_fences_the_heap() {
+    let baseline = BTreeMap::from([
+        (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("process-1", 5, 2)),
+        ("node-2".to_string(), scanner_node_activity("remote-a", 7, 3)),
+    ]);
+    type Mutation = (&'static str, Box<dyn Fn(&mut ScannerNodeActivity)>);
+
+    // A coordinator restart, a maintenance publication, a publication pause
+    // or the local node's own generations do not change the namespace a
+    // sweep traverses, so a checkpoint resumes under the same plan; each of
+    // the first three is still a guardrail veto on its own.
+    let same_coverage: Vec<Mutation> = vec![
+        ("instance_id", Box::new(|activity| activity.instance_id = "restarted".to_string())),
+        ("maintenance_generation", Box::new(|activity| activity.maintenance_generation += 1)),
+        ("publication_blocked", Box::new(|activity| activity.publication_blocked = true)),
+    ];
+    for host in [LOCAL_SCANNER_ACTIVITY_NODE, "node-2"] {
+        for (field, mutate) in &same_coverage {
+            let mut changed = baseline.clone();
+            mutate(changed.get_mut(host).expect("host should be present"));
+            assert_eq!(
+                scanner_activity_coverage_digest(&baseline),
+                scanner_activity_coverage_digest(&changed),
+                "{field} on {host} must not change the coverage identity"
+            );
+            assert_eq!(
+                scanner_activity_guardrail_veto(&baseline, &changed).map(|veto| veto.field),
+                Some(*field),
+                "{field} on {host} still vetoes the cycle it moved in"
+            );
+        }
+    }
+    let local_generations: Vec<Mutation> = vec![
+        ("namespace_generation", Box::new(|activity| activity.namespace_generation += 1)),
+        ("dirty_usage_generation", Box::new(|activity| activity.dirty_usage_generation += 1)),
+        ("dirty_usage_pending", Box::new(|activity| activity.dirty_usage_pending = true)),
+    ];
+    for (field, mutate) in &local_generations {
+        let mut changed = baseline.clone();
+        mutate(changed.get_mut(LOCAL_SCANNER_ACTIVITY_NODE).expect("local activity"));
+        assert_eq!(
+            scanner_activity_coverage_digest(&baseline),
+            scanner_activity_coverage_digest(&changed),
+            "local {field} is certified per bucket through the bucket's own dirty generation"
+        );
+        // A peer's generations stay in: its dirty buckets are acknowledged
+        // per cycle, so a write there between two halves of a sweep must
+        // restart the sweep.
+        let mut peer_changed = baseline.clone();
+        mutate(peer_changed.get_mut("node-2").expect("peer activity"));
+        assert_ne!(
+            scanner_activity_coverage_digest(&baseline),
+            scanner_activity_coverage_digest(&peer_changed),
+            "remote {field} must change the coverage identity"
+        );
+    }
+    let heap: Vec<Mutation> = vec![
+        ("protocol_version", Box::new(|activity| activity.protocol_version += 1)),
+        ("topology_digest", Box::new(|activity| activity.topology_digest = [4; 32])),
+        ("data_movement_active", Box::new(|activity| activity.data_movement_active = true)),
+        ("movement_generation", Box::new(|activity| activity.movement_generation += 1)),
+    ];
+    for host in [LOCAL_SCANNER_ACTIVITY_NODE, "node-2"] {
+        for (field, mutate) in &heap {
+            let mut changed = baseline.clone();
+            mutate(changed.get_mut(host).expect("host should be present"));
+            assert_ne!(
+                scanner_activity_coverage_digest(&baseline),
+                scanner_activity_coverage_digest(&changed),
+                "{field} on {host} must change the coverage identity"
+            );
+            assert_ne!(
+                scanner_activity_structural_digest(&baseline),
+                scanner_activity_structural_digest(&changed),
+                "{field} on {host} must change the reuse identity"
+            );
+        }
+    }
+    let mut peer_lost = baseline.clone();
+    peer_lost.remove("node-2");
+    assert_ne!(scanner_activity_coverage_digest(&baseline), scanner_activity_coverage_digest(&peer_lost));
+}
+
+#[test]
+fn bucket_checkpoint_plan_survives_a_coordinator_restart() {
+    let bucket_info = |name: &str| crate::storage_api::scanner_io::BucketInfo {
+        name: name.to_string(),
+        created: None,
+        deleted: None,
+        versioning: false,
+        object_locking: false,
+    };
+    let buckets = vec![bucket_info("alpha"), bucket_info("beta")];
+    let before = BTreeMap::from([
+        (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("process-1", 5, 2)),
+        ("node-2".to_string(), scanner_node_activity("remote-a", 7, 3)),
+    ]);
+    let mut restarted = before.clone();
+    let local = restarted
+        .get_mut(LOCAL_SCANNER_ACTIVITY_NODE)
+        .expect("local activity should exist");
+    local.instance_id = "process-2".to_string();
+    local.namespace_generation = 0;
+    local.maintenance_generation = 0;
+    local.dirty_usage_generation = 0;
+    local.dirty_usage_pending = false;
+    local.publication_blocked = true;
+
+    // The plan a bucket checkpoint was started under must be the plan the
+    // restarted coordinator requests, or every resumed sweep restarts as
+    // mixed coverage and the bucket can never certify (rustfs/rustfs#8494).
+    // The reuse plan does change: finished results are walked again.
+    let coverage_plan =
+        |snapshot| crate::scanner_io::scanner_bucket_plan_digest(&buckets, scanner_activity_coverage_digest(snapshot));
+    let reuse_plan =
+        |snapshot| crate::scanner_io::scanner_bucket_plan_digest(&buckets, scanner_activity_structural_digest(snapshot));
+    assert_eq!(coverage_plan(&before), coverage_plan(&restarted));
+    assert_ne!(reuse_plan(&before), reuse_plan(&restarted));
+
+    let mut extra_bucket = buckets.clone();
+    extra_bucket.push(bucket_info("gamma"));
+    assert_ne!(
+        coverage_plan(&before),
+        crate::scanner_io::scanner_bucket_plan_digest(&extra_bucket, scanner_activity_coverage_digest(&before)),
+        "the bucket list stays part of the plan"
+    );
+}
 #[test]
 fn scanner_dirty_usage_acknowledgements_exclude_local_and_clean_nodes() {
     let snapshot = BTreeMap::from([
