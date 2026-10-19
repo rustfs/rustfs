@@ -241,6 +241,8 @@ worker finishing does not certify its namespace coverage.
 | `bucket_checkpoint_prepared` | Checkpoint admission identifies the bucket, pool/set, cycle/leader epoch, and previous cycle/epoch. `resume_position` distinguishes retained traversal position from a fresh sweep; `mixed_coverage` reports whether that retained prefix began under another plan. |
 | `bucket_sweep_incomplete` | A bucket reached the end of a sweep but needs another verification pass. `unresolved_objects` reports the complete coverage/health gate, including failed child-cache entries that can be absent from the root counter and diagnostic failure map. Inspect it with `coverage_gap`, `root_failed_objects`, `failed_objects`, `size_reconciliation_entries`, and `mixed_coverage`, using bucket, pool/set, and cycle/leader epoch. `resume_position_on_entry` identifies a sweep entered with traversal position; `resume_position` reports the returned cache position after terminal cleanup. Multiple blockers can coexist. |
 | `partial_saved_not_published` | The local or remote worker successfully saved a terminal Partial cache. Correlate its bucket, pool/set, cycle/leader epoch and `resume_position` with admission and sweep events. This confirms persistence, not complete coverage or authoritative publication. |
+| `checkpoint_identity_unavailable` | A local worker could not read the persisted bucket identity. `stage=admission` preserves the existing checkpoint without preparing a legacy rebuild; `stage=post_scan` rejects the unverified candidate before persistence. Correlate bucket, pool/set, cycle/epoch and the underlying read error. Remote terminal errors distinguish the same two stages. |
+| `checkpoint_identity_changed` | A successful post-scan read no longer matches the admitted identity, including a now-absent sidecar. Rejecting the result protects against bucket replacement; this differs from an unavailable read. |
 | `remote_scan_partial` | The coordinator received a Partial terminal response for the named bucket and disk. Correlate the worker's bucket-sweep or checkpoint events; Partial is not a complete bucket root. |
 | `bucket_result_rejected` | A bucket result did not match the cycle's frozen tier-registry generation and was not applied. |
 | `set_cache_publish_skipped` | `completed_buckets` counts distinct bucket roots successfully applied to this set cache. Use `first_incomplete_bucket` with pool/set/cycle to locate one actual gap in this set. Inspect `unprocessed_buckets` and budget/cancellation state, then correlate that bucket's worker events. |
@@ -264,6 +266,19 @@ admission, sweep completion, and terminal persistence for the same bucket and
 pool/set across consecutive cycles. Samples from different sets cannot establish
 a repeated mixed loop. Check save failures, remote interruption, and leadership
 changes if only periodic progress survives.
+
+Identity lookup has three outcomes: a verified UUID, a confirmed absent sidecar,
+or a read failure. Only confirmed absence may use the existing full-rebuild path
+without checkpoint identity. A lock, transport, or corrupt-metadata error must
+not become absence and reset a valid frontier. A successful read that proves a
+different identity still invalidates the old result.
+
+The `.bucket-incarnation@latest` resource belongs to a read of the persisted
+identity sidecar. Scanner identity checks occur before a walk and again before
+saving its result; set inventory preflight also reads identities. A single
+remote lock-client warning can coexist with a successful quorum, so it does not
+prove that checkpoint persistence failed. Use the scanner's identity stage and
+the terminal save result to establish that connection.
 
 An unknown bucket cannot be quarantined as zero in an authoritative total.
 Existing pending-bucket semantics still require complete structural coverage.
