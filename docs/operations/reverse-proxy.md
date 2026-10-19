@@ -6,6 +6,8 @@
 
 RustFS speaks plain S3 over HTTP/1.1 and HTTP/2. Most proxy problems are not RustFS storage bugs: if the same request works directly against `:9000`, the fault is in proxy/CDN request forwarding. Use the checklist below to find which forwarding behavior broke.
 
+To serve RustFS under a URL path prefix (for example `/tools/rustfs/api`) on a shared host, see [Serving RustFS under a URL path prefix](reverse-proxy-path-prefix.md).
+
 ## Experimental HTTP/3
 
 Build with `cargo build -p rustfs --features http3` and set `RUSTFS_HTTP3_ENABLE=true` together with `RUSTFS_TLS_PATH`. HTTP/3 listens on UDP at the S3 listener's TCP address and port. Allow UDP through your firewall or proxy; clients must explicitly support HTTP/3. The console and internode RPC remain on TCP. HTTP/3 uses TLS 1.3 with `h3` ALPN, disables early data and connection migration, and follows the existing certificate reload settings.
