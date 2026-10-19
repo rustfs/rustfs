@@ -186,7 +186,7 @@ jobs:
   cloud-source:
     name: ${{ matrix.provider }} source (three-case minimum)
     if: github.repository == 'rustfs/rustfs'
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
