@@ -47,6 +47,9 @@ const ALL_POOLS: [usize; 4] = [0, 1, 2, 3];
 const TARGET_POOLS: [usize; 3] = [1, 2, 3];
 const LIVE_WRITERS: usize = 6;
 const LIVE_ROUNDS: usize = 6;
+/// Locally the decommission start reaches its durable save in about a second
+/// (POST to response ~0.8 s); 60 s separates a stalled start path from slow I/O.
+const PRE_ACK_REACH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Cancel and stop are acknowledged before every in-flight entry finishes its
 /// cleanup; terminal state and placement are polled within this budget.
 const TERMINAL_TRANSITION_TIMEOUT: Duration = Duration::from_secs(90);
@@ -389,13 +392,16 @@ async fn scanner_heal_topology_decommission_queue_cancel_resume_and_last_pool_gu
     assert_probe_objects(&run.dist, &scratch, &during, &pools(&[2, 3]), "writes issued during decommission").await?;
     let sidecars = assert_sidecars_survive_on_targets(&run, &manifest, &pools(&[2, 3]), "after retiring pools 0 and 1")?;
 
-    run.dist.restart_current_binary_gracefully().await?;
-    verify_from_every_node(&run.dist, &manifest, "after restart with retired pools").await?;
-    assert_single_pool_placement(&run.dist, &manifest, &pools(&[2, 3]), "after restart with retired pools")?;
-    let status_after_restart = decommission_status_json(&run.dist.cluster).await?;
-    for pool in [0, 1] {
-        wait_for_decommission_flag(&run.dist.cluster, pool, "complete", Duration::from_secs(10)).await?;
+    // A decommissioned pool must leave the command line; the server refuses to
+    // start while it is still listed. Pools 2 and 3 are renumbered to 0 and 1.
+    run.dist.remove_retired_pools_and_restart(&[0, 1]).await?;
+    let pools_after_restart = pool_count(&run.dist.cluster).await?;
+    if pools_after_restart != 2 {
+        return Err(format!("expected two pools after removing the retired pools, found {pools_after_restart}").into());
     }
+    verify_from_every_node(&run.dist, &manifest, "after restart without the retired pools").await?;
+    assert_single_pool_placement(&run.dist, &manifest, &pools(&[0, 1]), "after restart without the retired pools")?;
+    let status_after_restart = decommission_status_json(&run.dist.cluster).await?;
     let strict_nodes = assert_process_durability_strict(&run.node_log_paths())?;
 
     run.write_evidence(
@@ -611,7 +617,26 @@ async fn scanner_heal_topology_decommission_kill_after_responsibility_persisted_
             }
         }
     });
-    let reached = run.movement_barrier.wait_reached(Duration::from_secs(60)).await?;
+    // The start request normally reaches the durable save within about a
+    // second. If it returns first the window was never entered; if it stays in
+    // flight past the budget, the start path itself stalled before the save.
+    let requested_at = Instant::now();
+    let mut start_request = start_request;
+    let reached = tokio::select! {
+        reached = run.movement_barrier.wait_reached(PRE_ACK_REACH_TIMEOUT) => match reached {
+            Ok(reached) => reached,
+            Err(error) => {
+                return Err(format!(
+                    "the decommission start stayed in flight for {PRE_ACK_REACH_TIMEOUT:?} without reaching the durable start save: {error}"
+                )
+                .into());
+            }
+        },
+        finished = &mut start_request => {
+            return Err(format!("the decommission start returned before the pre-ACK window was reached: {:?}", finished?).into());
+        }
+    };
+    let reach_elapsed = requested_at.elapsed();
     let killed_pid = run.kill_node(SEED_POOL)?;
     let start_outcome = start_request.await?;
     if let Ok(response) = &start_outcome {
@@ -639,6 +664,7 @@ async fn scanner_heal_topology_decommission_kill_after_responsibility_persisted_
             "window": STAGE_AFTER_RESPONSIBILITY_PERSISTED,
             "nonce": run.movement_barrier.nonce(),
             "reached": reached,
+            "reach_elapsed_ms": reach_elapsed.as_millis() as u64,
             "start_request": { "outcome": "uncertain", "error": start_outcome.err() },
             "killed_pid": killed_pid,
             "restarted_pid": restarted_pid,

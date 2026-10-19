@@ -193,6 +193,16 @@ impl DistCluster {
         )))
     }
 
+    /// Stop the fleet, drop retired pools from the command line, and restart
+    /// the remaining pools, which are renumbered from zero.
+    pub async fn remove_retired_pools_and_restart(&mut self, retired: &[usize]) -> TestResult {
+        self.stop_all_gracefully().await?;
+        self.cluster.remove_single_node_pools(retired)?;
+        self.cluster.start().await?;
+        wait_for_ready(&self.cluster).await?;
+        Ok(())
+    }
+
     pub async fn append_pool_and_restart(&mut self) -> TestResult<usize> {
         self.stop_all_gracefully().await?;
         let node_idx = self.cluster.append_single_node_pool().await?;
@@ -340,8 +350,10 @@ fn configure_node_logs(cluster: &mut RustFSTestClusterEnvironment, capture_dir: 
     if let Some(directory) = capture_dir {
         std::fs::create_dir_all(directory)?;
         for node_idx in 0..cluster.nodes.len() {
-            if cluster.node_capture_log_paths[node_idx].is_none() {
-                let path = directory.join(format!("node-{node_idx}.log"));
+            // Overrides a path assigned from RUSTFS_E2E_LOG_DIR so every node of
+            // the run, including the seed node, logs into the same directory.
+            let path = directory.join(format!("node-{node_idx}.log"));
+            if cluster.node_capture_log_paths[node_idx].as_deref() != Some(path.to_string_lossy().as_ref()) {
                 cluster.set_node_capture_log_path(node_idx, path.to_string_lossy().into_owned())?;
             }
         }
@@ -1277,6 +1289,29 @@ async fn append_single_node_pool_extends_ellipses_volumes() {
     let volumes = env.rustfs_volumes_arg();
     assert_eq!(volumes.split(' ').count(), 3, "expected three pool arguments, got: {volumes}");
     assert!(volumes.contains("/drive{0...1}"), "expanded layout must keep drive ellipses: {volumes}");
+}
+
+#[tokio::test]
+async fn remove_single_node_pools_drops_retired_pools_and_renumbers() {
+    let mut env =
+        RustFSTestClusterEnvironment::with_topology(ClusterTopology::per_node_pools(2, vec![vec![0], vec![1], vec![2], vec![3]]))
+            .await
+            .expect("four-pool topology");
+    let kept: Vec<String> = env.nodes[2..].iter().map(|node| node.address.clone()).collect();
+
+    env.remove_single_node_pools(&[0, 1]).expect("remove two retired pools");
+    assert_eq!(env.nodes.len(), 2);
+    assert_eq!(env.nodes.iter().map(|node| node.address.clone()).collect::<Vec<_>>(), kept);
+    assert_eq!(env.nodes.iter().map(|node| node.pool_idx).collect::<Vec<_>>(), vec![0, 1]);
+    let volumes = env.rustfs_volumes_arg();
+    assert_eq!(volumes.split(' ').count(), 2, "expected two pool arguments, got: {volumes}");
+    assert!(
+        volumes.contains(&kept[0]) && volumes.contains(&kept[1]),
+        "retired pools must leave the command line: {volumes}"
+    );
+
+    env.remove_single_node_pools(&[0, 1])
+        .expect_err("the last remaining pool cannot be removed");
 }
 
 #[tokio::test]
