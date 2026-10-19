@@ -532,11 +532,15 @@ pub(crate) mod metadata_sys {
 pub(crate) mod quota {
     pub(crate) mod checker {
         pub(crate) type QuotaChecker = super::super::ecstore_bucket::quota::checker::QuotaChecker;
+        pub(crate) use super::super::ecstore_bucket::quota::checker::record_reservation_protocol_migration;
     }
 
     pub(crate) type BucketQuota = super::ecstore_bucket::quota::BucketQuota;
     pub(crate) type QuotaError = super::ecstore_bucket::quota::QuotaError;
     pub(crate) type QuotaOperation = super::ecstore_bucket::quota::QuotaOperation;
+    pub(crate) type QuotaProtocolMigration = super::ecstore_bucket::quota::QuotaProtocolMigration;
+    #[cfg(test)]
+    pub(crate) type QuotaMigrationSkipReason = super::ecstore_bucket::quota::QuotaMigrationSkipReason;
     pub(crate) use super::ecstore_bucket::quota::{QUOTA_RESERVATION_PROTOCOL_V1, QUOTA_RESERVATION_PROTOCOL_V2};
 }
 
