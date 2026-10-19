@@ -28,11 +28,11 @@ use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_data_usage::{BucketUsageInfo, DataUsageInfo};
 use rustfs_gateway_types::dto::Status;
+use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
 use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 use rustfs_policy::policy::BucketPolicy;
 use rustfs_policy::policy::default::DEFAULT_POLICIES;
 use rustfs_policy::policy::{Args, action::Action, action::S3Action};
-use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -96,7 +96,7 @@ fn object_lock_config_enabled(config: &ObjectLockConfiguration) -> bool {
     config
         .object_lock_enabled
         .as_ref()
-        .is_some_and(|enabled| enabled.as_str() == ObjectLockEnabled::ENABLED)
+        .is_some_and(|enabled| enabled == "Enabled")
 }
 
 fn replication_config_enabled(config: &PersistedReplicationConfiguration) -> bool {
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn accountinfo_bucket_details_marks_object_lock_enabled() {
         let enabled = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             ..Default::default()
         };
         let disabled = ObjectLockConfiguration::default();

@@ -47,7 +47,7 @@ use rustfs_config::server_config::{Config, get_global_server_config, set_global_
 use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration;
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_lock::client::LockClient;
-use s3s::region::Region;
+use rustfs_s3_types::Region;
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use tokio_util::sync::CancellationToken;
 #[cfg(test)]

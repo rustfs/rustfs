@@ -132,6 +132,7 @@ use rustfs_audit::ObjectVersion as AuditObjectVersion;
 use rustfs_concurrency::GetObjectQueueSnapshot;
 use rustfs_config::MI_B;
 use rustfs_filemeta::{NULL_VERSION_ID, RestoreStatusOps, parse_restore_obj_status};
+use rustfs_gateway_types::persistence::PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration;
 use rustfs_io_core::{BytesPool, PooledBuffer};
 use rustfs_io_metrics;
 use rustfs_lock::NamespaceLockGuard;
@@ -173,9 +174,8 @@ use s3s::dto::{
     GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, MetadataDirective, ObjectAttributes, ObjectLockLegalHold,
     ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode, ObjectPart, PutObjectInput,
     PutObjectOutput, Range, RequestCharged, RestoreObjectInput, RestoreObjectOutput, RestoreRequestType, SSECustomerAlgorithm,
-    SSECustomerKeyMD5, SSEKMSKeyId, SelectObjectContentInput, SelectObjectContentOutput, ServerSideEncryption,
-    ServerSideEncryptionConfiguration, StorageClass, StreamingBlob, TaggingDirective, TaggingHeader, Timestamp, TimestampFormat,
-    WebsiteRedirectLocation,
+    SSECustomerKeyMD5, SSEKMSKeyId, SelectObjectContentInput, SelectObjectContentOutput, ServerSideEncryption, StorageClass,
+    StreamingBlob, TaggingDirective, TaggingHeader, Timestamp, TimestampFormat, WebsiteRedirectLocation,
 };
 use s3s::header::X_AMZ_RESTORE;
 use s3s::stream::{ByteStream, DynByteStream, RemainingLength};

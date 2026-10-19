@@ -32,6 +32,7 @@ use crate::app::storage_api::bucket::metadata_sys::get_notification_config;
 use crate::server::{
     ADMIN_PREFIX, is_notify_module_enabled, refresh_notify_module_enabled, refresh_persisted_module_switches_from_store,
 };
+use crate::storage::storage_api::persisted_to_s3s;
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
@@ -339,7 +340,7 @@ impl Operation for ListTargetSubscriptions {
             else {
                 continue;
             };
-            subscriptions.extend(collect_target_subscriptions(&bucket.name, config, &target_arn)?);
+            subscriptions.extend(collect_target_subscriptions(&bucket.name, persisted_to_s3s(&config)?, &target_arn)?);
         }
         let data = serde_json::to_vec(&subscriptions)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize subscriptions: {e}")))?;

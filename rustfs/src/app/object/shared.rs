@@ -429,14 +429,16 @@ fn classify_bucket_default_sse_lookup(
 #[cfg(test)]
 mod bucket_default_sse_lookup_tests {
     use super::*;
-    use s3s::dto::{ServerSideEncryptionByDefault, ServerSideEncryptionRule};
+    use rustfs_gateway_types::persistence::{
+        PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
+    };
     use time::OffsetDateTime;
 
     fn sse_config() -> ServerSideEncryptionConfiguration {
         ServerSideEncryptionConfiguration {
             rules: vec![ServerSideEncryptionRule {
                 apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
-                    sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                    sse_algorithm: "AES256".to_owned(),
                     kms_master_key_id: None,
                 }),
                 blocked_encryption_types: None,
@@ -1111,9 +1113,8 @@ pub(crate) fn odm_check_source_preconditions(headers: &HeaderMap, head: &SourceH
 mod tests {
     use super::*;
     use http::{HeaderMap, HeaderValue};
-    use s3s::dto::{
-        ObjectLockConfiguration, ObjectLockEnabled, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
-        ServerSideEncryptionRule,
+    use rustfs_gateway_types::persistence::{
+        PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
     };
     use std::sync::Arc;
 
@@ -1386,8 +1387,8 @@ mod tests {
         ServerSideEncryptionConfiguration {
             rules: vec![ServerSideEncryptionRule {
                 apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
-                    sse_algorithm: ServerSideEncryption::from(String::from(algorithm)),
-                    kms_master_key_id: kms_key_id.map(|id| SSEKMSKeyId::from(id.to_string())),
+                    sse_algorithm: algorithm.to_owned(),
+                    kms_master_key_id: kms_key_id.map(str::to_owned),
                 }),
                 blocked_encryption_types: None,
                 bucket_key_enabled: None,
@@ -1489,8 +1490,8 @@ mod tests {
         ));
 
         let configured = metadata_sys::ObjectLockConfigState::Configured {
-            config: ObjectLockConfiguration {
-                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            config: rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+                object_lock_enabled: Some("Enabled".to_owned()),
                 rule: None,
             },
             updated_at: OffsetDateTime::now_utc(),
@@ -1519,11 +1520,11 @@ mod tests {
 
     fn bucket_default_retention_state(mode: &'static str) -> metadata_sys::ObjectLockConfigState {
         metadata_sys::ObjectLockConfigState::Configured {
-            config: s3s::dto::ObjectLockConfiguration {
-                object_lock_enabled: Some(s3s::dto::ObjectLockEnabled::from_static(s3s::dto::ObjectLockEnabled::ENABLED)),
-                rule: Some(s3s::dto::ObjectLockRule {
-                    default_retention: Some(s3s::dto::DefaultRetention {
-                        mode: Some(ObjectLockRetentionMode::from_static(mode)),
+            config: rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+                object_lock_enabled: Some("Enabled".to_owned()),
+                rule: Some(rustfs_gateway_types::persistence::PersistedObjectLockRule {
+                    default_retention: Some(rustfs_gateway_types::persistence::PersistedDefaultRetention {
+                        mode: Some(mode.to_owned()),
                         days: Some(1),
                         years: None,
                     }),

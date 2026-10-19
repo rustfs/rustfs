@@ -88,13 +88,13 @@ use rustfs_filemeta::{
     is_restored_object_on_disk,
 };
 use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration;
+use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
 use rustfs_lifecycle::{RestoreRequest, RestoreS3Location};
 use rustfs_lock::{NamespaceLockGuard, error::LockError};
 use rustfs_scanner_metrics::metrics::{
     IlmAction, Metrics, ScannerLifecycleExpiryStateUpdate, ScannerLifecycleTransitionStateUpdate, global_metrics,
 };
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::parse_bool};
-use s3s::dto::ObjectLockConfiguration;
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -4013,10 +4013,7 @@ pub(crate) async fn enqueue_immediate_expiry(api: Arc<ECStore>, oi: &ObjectInfo,
         .map(lifecycle::object_opts_from_object_info)
         .collect::<Vec<ObjectOpts>>();
     let lock_config = configs.object_lock;
-    let evaluator_lock_config = lock_config
-        .as_deref()
-        .map(object_lock_boundary::lifecycle_object_lock_config)
-        .map(Arc::new);
+    let evaluator_lock_config = lock_config.clone();
     let events = match Evaluator::new(lifecycle)
         .with_lock_retention(evaluator_lock_config)
         .eval(&object_opts)
@@ -4557,11 +4554,7 @@ async fn enqueue_expiry_for_existing_object_group(
         .iter()
         .map(lifecycle::object_opts_from_object_info)
         .collect::<Vec<ObjectOpts>>();
-    let evaluator_lock_config = context
-        .lock_config
-        .as_deref()
-        .map(object_lock_boundary::lifecycle_object_lock_config)
-        .map(Arc::new);
+    let evaluator_lock_config = context.lock_config.clone();
     let events = match Evaluator::new(context.lc.clone())
         .with_lock_retention(evaluator_lock_config)
         .eval(&object_opts)
@@ -6099,7 +6092,6 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 mod tests {
     use super::expiry_worker_count;
     use super::lifecycle_transition_publication_guard;
-    use super::object_lock_boundary;
     use super::{
         DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
         DEFAULT_TRANSITION_WORKERS_CAP, EVENT_LIFECYCLE_EVALUATION_FAILED, EVENT_LIFECYCLE_EXPIRED_DETECTED,
@@ -6195,6 +6187,10 @@ mod tests {
     use rustfs_filemeta::{FileInfo, FileMeta};
     use rustfs_gateway_types::dto::MetadataEntry;
     use rustfs_gateway_types::persistence::{
+        PersistedDefaultRetention as DefaultRetention, PersistedObjectLockConfiguration as ObjectLockConfiguration,
+        PersistedObjectLockRule as ObjectLockRule,
+    };
+    use rustfs_gateway_types::persistence::{
         PersistedLifecycleConfiguration, PersistedLifecycleExpiration, PersistedLifecycleRule,
         PersistedNoncurrentVersionExpiration, PersistedTransition,
     };
@@ -6202,7 +6198,6 @@ mod tests {
     #[cfg(feature = "test-util")]
     use rustfs_s3_client::transition_api::ReaderImpl;
     use rustfs_scanner_metrics::metrics::{IlmAction, global_metrics};
-    use s3s::dto::{DefaultRetention, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule};
     use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -10274,18 +10269,18 @@ mod tests {
 
     fn lock_enabled_without_default_retention() -> ObjectLockConfiguration {
         ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: None,
         }
     }
 
     fn lock_enabled_with_default_retention() -> ObjectLockConfiguration {
         ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: Some(ObjectLockRule {
                 default_retention: Some(DefaultRetention {
                     days: Some(30),
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                    mode: Some("COMPLIANCE".to_owned()),
                     years: None,
                 }),
             }),
@@ -12851,10 +12846,7 @@ mod tests {
 
         for (name, object, lock_config, expected) in cases {
             let object_opts = lifecycle::object_opts_from_object_info(&object);
-            let evaluator_lock_config = lock_config
-                .as_ref()
-                .map(object_lock_boundary::lifecycle_object_lock_config)
-                .map(Arc::new);
+            let evaluator_lock_config = lock_config.clone().map(Arc::new);
             let batch_event = Evaluator::new(Arc::new(lifecycle.clone()))
                 .with_lock_retention(evaluator_lock_config)
                 .eval(&[object_opts])
@@ -13919,10 +13911,7 @@ mod tests {
         let object = current_object_with_metadata(
             ReplicationStatusType::Completed,
             HashMap::from([
-                (
-                    metadata_keys::OBJECT_LOCK_MODE.to_string(),
-                    s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
-                ),
+                (metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string()),
                 (metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), retain_until),
             ]),
         );
@@ -13944,10 +13933,7 @@ mod tests {
         let mut object = current_object_with_metadata(
             ReplicationStatusType::Completed,
             HashMap::from([
-                (
-                    metadata_keys::OBJECT_LOCK_MODE.to_string(),
-                    ObjectLockRetentionMode::COMPLIANCE.to_string(),
-                ),
+                (metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string()),
                 (metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), retain_until),
             ]),
         );

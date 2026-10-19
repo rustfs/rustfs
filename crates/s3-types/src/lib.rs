@@ -29,7 +29,9 @@ mod body;
 mod compat_s3s;
 mod error;
 mod event_name;
+mod region;
 
 pub use body::Body;
 pub use error::{S3Error, S3ErrorCode, S3ErrorParts, S3Result, StdError};
 pub use event_name::{EventName, ParseEventNameError, event_schema_version};
+pub use region::{InvalidRegion, Region};

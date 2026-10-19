@@ -79,13 +79,13 @@ use rand::RngExt as _;
 use rmp_serde::Deserializer;
 use rmp_serde::Serializer;
 use rustfs_filemeta::{FileInfo, FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
+use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
 use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedReplicationConfiguration};
 use rustfs_heal_contracts::heal_channel::HealOpts;
 use rustfs_utils::crypto::{hex_sha256, is_sha256_checksum};
 use rustfs_utils::path::{
     decode_dir_object, encode_dir_object, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path,
 };
-use s3s::dto::ObjectLockConfiguration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};

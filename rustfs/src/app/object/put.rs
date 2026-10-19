@@ -2458,9 +2458,9 @@ mod tests {
         let internal = fail_put_object(PutObjectCompletion::Internal(None), error());
         assert_eq!(internal.code(), &S3ErrorCode::Custom("SlowDownRead".into()));
     }
-    use s3s::dto::{
-        DefaultRetention, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRule, ServerSideEncryptionByDefault,
-        ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
+    use rustfs_gateway_types::persistence::{
+        PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
+        PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
     };
     use std::pin::Pin;
     use std::sync::Arc;
@@ -2553,11 +2553,11 @@ mod tests {
         .unwrap();
 
         let state = metadata_sys::ObjectLockConfigState::Configured {
-            config: ObjectLockConfiguration {
-                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-                rule: Some(ObjectLockRule {
-                    default_retention: Some(DefaultRetention {
-                        mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+            config: rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+                object_lock_enabled: Some("Enabled".to_owned()),
+                rule: Some(rustfs_gateway_types::persistence::PersistedObjectLockRule {
+                    default_retention: Some(rustfs_gateway_types::persistence::PersistedDefaultRetention {
+                        mode: Some("COMPLIANCE".to_owned()),
                         days: Some(1),
                         years: None,
                     }),
@@ -3086,8 +3086,8 @@ mod tests {
             let config = ServerSideEncryptionConfiguration {
                 rules: vec![ServerSideEncryptionRule {
                     apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
-                        sse_algorithm: ServerSideEncryption::from_static(algorithm),
-                        kms_master_key_id: kms_key_id.map(|id| SSEKMSKeyId::from(id.to_string())),
+                        sse_algorithm: algorithm.to_owned(),
+                        kms_master_key_id: kms_key_id.map(|id| id.to_string()),
                     }),
                     blocked_encryption_types: None,
                     bucket_key_enabled: None,
@@ -3919,7 +3919,7 @@ mod tests {
         let config = ServerSideEncryptionConfiguration {
             rules: vec![ServerSideEncryptionRule {
                 apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
-                    sse_algorithm: ServerSideEncryption::from_static(algorithm),
+                    sse_algorithm: algorithm.to_owned(),
                     kms_master_key_id: kms_key_id.map(|id| id.to_string()),
                 }),
                 blocked_encryption_types: None,

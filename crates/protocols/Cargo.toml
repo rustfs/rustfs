@@ -149,6 +149,7 @@ rustls = { workspace = true, default-features = false, optional = true, features
 # Swift specific dependencies (optional)
 rustfs-keystone = { workspace = true, optional = true }
 rustfs-ecstore = { workspace = true, optional = true }
+rustfs-gateway-types = { workspace = true }
 rustfs-rio = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true, features = ["timeout"] }

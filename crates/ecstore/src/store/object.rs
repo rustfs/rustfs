@@ -9059,8 +9059,8 @@ mod tests {
     #[test]
     fn batch_delete_identifies_only_latest_versioned_markers() {
         let versioned = DeleteReplicationConfigSnapshot::from_configs_for_test(
-            s3s::dto::VersioningConfiguration {
-                status: Some(s3s::dto::BucketVersioningStatus::from_static(s3s::dto::BucketVersioningStatus::ENABLED)),
+            rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
+                status: Some("Enabled".to_owned()),
                 ..Default::default()
             },
             None,
@@ -9171,7 +9171,7 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_null_version_cas_distinguishes_absent_and_replacement_pools() {
-        use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
+        use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
 
         let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
         let (_first_dirs, first_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
@@ -9180,7 +9180,7 @@ mod tests {
         let bucket = RUSTFS_META_BUCKET;
         let suspended_snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
             VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED)),
+                status: Some("Suspended".to_owned()),
                 ..Default::default()
             },
             None,

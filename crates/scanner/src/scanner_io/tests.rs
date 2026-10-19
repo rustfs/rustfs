@@ -1737,7 +1737,7 @@ async fn multi_pool_scanner_cycle_zero_fills_bucket_absent_from_first_pool() {
 async fn scanner_item_object_lock_uses_cached_config() {
     let temp_dir = std::env::temp_dir();
     let cached = Arc::new(ObjectLockConfiguration {
-        object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+        object_lock_enabled: Some("Enabled".to_owned()),
         ..Default::default()
     });
     let item = ScannerItem {
@@ -1766,7 +1766,7 @@ async fn scanner_item_object_lock_uses_cached_config() {
 #[test]
 fn object_lock_config_enabled_accepts_enabled_only() {
     let enabled = ObjectLockConfiguration {
-        object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+        object_lock_enabled: Some("Enabled".to_owned()),
         ..Default::default()
     };
 

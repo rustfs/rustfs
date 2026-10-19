@@ -42,11 +42,11 @@ mod tests {
     };
     use rustfs_zip::CompressionFormat;
     use s3s::dto::{
-        CORSConfiguration, CORSRule, DefaultRetention, DeleteObjectTaggingInput, Delimiter, FilterRule, FilterRuleName,
-        GetBucketAclInput, GetObjectAclInput, GetObjectLegalHoldInput, GetObjectRetentionInput, GetObjectTaggingInput,
-        LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockConfiguration, ObjectLockEnabled,
-        ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode, ObjectLockRule,
-        PutBucketAclInput, PutObjectAclInput, PutObjectLegalHoldInput, PutObjectLockConfigurationInput, PutObjectRetentionInput,
+        DefaultRetention, DeleteObjectTaggingInput, Delimiter, FilterRule, FilterRuleName, GetBucketAclInput, GetObjectAclInput,
+        GetObjectLegalHoldInput, GetObjectRetentionInput, GetObjectTaggingInput, LambdaFunctionConfiguration,
+        NotificationConfigurationFilter, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold,
+        ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode, ObjectLockRule, PutBucketAclInput,
+        PutObjectAclInput, PutObjectLegalHoldInput, PutObjectLockConfigurationInput, PutObjectRetentionInput,
         PutObjectTaggingInput, QueueConfiguration, S3KeyFilter, Tag, Tagging, TopicConfiguration,
     };
     use s3s::{S3, S3Error, S3ErrorCode, S3Request, s3_error};
@@ -354,6 +354,12 @@ mod tests {
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
+    /// The bucket default retention path reads the persisted shape; the request
+    /// literals in these tests stay on the wire DTO and convert once here.
+    fn persisted_lock(cfg: &ObjectLockConfiguration) -> rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+        crate::storage::persisted_from_s3s(cfg).expect("the test configuration converts")
+    }
+
     #[test]
     fn test_validate_object_lock_configuration_rejects_disabled_status() {
         let cfg = ObjectLockConfiguration {
@@ -467,7 +473,7 @@ mod tests {
         };
         let mut metadata = std::collections::HashMap::new();
 
-        assert!(apply_default_lock_retention_metadata(Some(&cfg), &mut metadata));
+        assert!(apply_default_lock_retention_metadata(Some(&persisted_lock(&cfg)), &mut metadata));
         assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER), Some(&"COMPLIANCE".to_string()));
         let retain_until = metadata
             .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
@@ -501,7 +507,7 @@ mod tests {
             (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2030-01-01T00:00:00Z".to_string()),
         ]);
 
-        assert!(!apply_default_lock_retention_metadata(Some(&cfg), &mut metadata));
+        assert!(!apply_default_lock_retention_metadata(Some(&persisted_lock(&cfg)), &mut metadata));
         assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER), Some(&"GOVERNANCE".to_string()));
         assert_eq!(
             metadata.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER),
@@ -517,7 +523,7 @@ mod tests {
         };
         let mut metadata = std::collections::HashMap::new();
 
-        assert!(!apply_default_lock_retention_metadata(Some(&cfg), &mut metadata));
+        assert!(!apply_default_lock_retention_metadata(Some(&persisted_lock(&cfg)), &mut metadata));
         assert!(metadata.is_empty());
     }
 
@@ -534,7 +540,7 @@ mod tests {
             }),
         };
         let state = ObjectLockConfigState::Configured {
-            config,
+            config: persisted_lock(&config),
             updated_at: OffsetDateTime::now_utc(),
         };
         let mut metadata = std::collections::HashMap::new();
@@ -559,7 +565,7 @@ mod tests {
             }),
         };
         let state = ObjectLockConfigState::Configured {
-            config,
+            config: persisted_lock(&config),
             updated_at: OffsetDateTime::now_utc(),
         };
         let mut metadata = HashMap::new();
@@ -1154,7 +1160,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_bucket_object_lock_enabled() {
-        use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
         use time::OffsetDateTime;
 
         if !bucket_metadata_sys_initialized() {
@@ -1165,8 +1170,8 @@ mod tests {
         let test_bucket = "test-bucket-object-lock";
 
         let mut bm = BucketMetadata::new(test_bucket);
-        bm.object_lock_config = Some(ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+        bm.object_lock_config = Some(rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: None,
         });
         bm.object_lock_config_updated_at = OffsetDateTime::now_utc();
@@ -1174,7 +1179,7 @@ mod tests {
         assert!(validate_bucket_object_lock_enabled(test_bucket).await.is_ok());
 
         let mut bm = BucketMetadata::new(test_bucket);
-        bm.object_lock_config = Some(ObjectLockConfiguration {
+        bm.object_lock_config = Some(rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
             object_lock_enabled: None,
             rule: None,
         });
@@ -1858,8 +1863,8 @@ mod tests {
 
         let bucket = "test-bucket-no-match-cors";
         let mut bm = BucketMetadata::new(bucket);
-        bm.cors_config = Some(CORSConfiguration {
-            cors_rules: vec![CORSRule {
+        bm.cors_config = Some(rustfs_gateway_types::cors_tagging::PersistedCorsConfiguration {
+            cors_rules: vec![rustfs_gateway_types::cors_tagging::PersistedCorsRule {
                 allowed_headers: Some(vec!["*".to_string()]),
                 allowed_methods: vec!["GET".to_string()],
                 allowed_origins: vec!["https://allowed.example.com".to_string()],
@@ -1896,8 +1901,8 @@ mod tests {
 
         let bucket = "test-bucket-credentialed-cors";
         let mut bm = BucketMetadata::new(bucket);
-        bm.cors_config = Some(CORSConfiguration {
-            cors_rules: vec![CORSRule {
+        bm.cors_config = Some(rustfs_gateway_types::cors_tagging::PersistedCorsConfiguration {
+            cors_rules: vec![rustfs_gateway_types::cors_tagging::PersistedCorsRule {
                 allowed_headers: Some(vec!["*".to_string()]),
                 allowed_methods: vec!["GET".to_string()],
                 allowed_origins: vec!["*".to_string()],

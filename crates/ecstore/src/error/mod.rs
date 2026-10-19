@@ -1078,18 +1078,6 @@ impl From<rmp_serde::decode::Error> for Error {
     }
 }
 
-impl From<s3s::xml::SerError> for Error {
-    fn from(e: s3s::xml::SerError) -> Self {
-        Error::other(e)
-    }
-}
-
-impl From<s3s::xml::DeError> for Error {
-    fn from(e: s3s::xml::DeError) -> Self {
-        Error::other(e)
-    }
-}
-
 impl From<crate::bucket::utils::BucketConfigXmlError> for Error {
     fn from(e: crate::bucket::utils::BucketConfigXmlError) -> Self {
         Error::other(e)

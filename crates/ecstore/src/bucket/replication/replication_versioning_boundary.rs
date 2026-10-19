@@ -15,7 +15,7 @@
 use super::replication_error_boundary::Result;
 use crate::bucket::{versioning::VersioningApi as _, versioning_sys::BucketVersioningSys};
 #[cfg(test)]
-use s3s::dto::VersioningConfiguration;
+use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
 #[cfg(test)]
 use std::{collections::HashMap, sync::LazyLock, sync::Mutex};
 

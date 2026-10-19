@@ -78,12 +78,12 @@ mod tests {
     use crate::object_api::{ObjectInfo, ObjectOptions};
     use crate::storage_api_contracts::object::ObjectToDelete;
     use rustfs_gateway_types::dto::Status;
+    use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
     use rustfs_gateway_types::persistence::{
         PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
         PersistedReplicationRule, PersistedReplicationStatus,
     };
     use rustfs_scanner_metrics::metrics::IlmAction;
-    use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
     use uuid::Uuid;
 
     use super::*;
@@ -156,7 +156,7 @@ mod tests {
             for purge_enabled in [false, true] {
                 let snapshot = DeleteReplicationConfigSnapshot::from_configs_for_test(
                     VersioningConfiguration {
-                        status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                        status: Some("Enabled".to_owned()),
                         ..Default::default()
                     },
                     Some(PersistedReplicationConfiguration {

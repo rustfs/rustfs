@@ -84,6 +84,12 @@ use crate::storage::storage_api::lock_bucket_targets_metadata;
 use http::StatusCode;
 use metrics::counter;
 use rustfs_config::RUSTFS_REGION;
+use rustfs_gateway_types::cors_tagging::{PersistedCorsConfiguration, PersistedTagging};
+use rustfs_gateway_types::persistence::{
+    PersistedBucketEncryptionConfiguration, PersistedNotificationConfiguration,
+    PersistedObjectLockConfiguration as ObjectLockConfiguration, PersistedPublicAccessBlockConfiguration,
+    PersistedVersioningConfiguration,
+};
 use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedReplicationConfiguration};
 use rustfs_io_metrics::record_s3_op;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
@@ -100,26 +106,23 @@ use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::{force_delete_header, get_header};
 use rustfs_utils::obj::extract_user_defined_metadata;
 use s3s::dto::{
-    BucketLocationConstraint, BucketVersioningStatus, CommonPrefix, CreateBucketInput, CreateBucketOutput, DeleteBucketCorsInput,
-    DeleteBucketCorsOutput, DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput, DeleteBucketInput,
-    DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, DeleteBucketOutput, DeleteBucketPolicyInput,
-    DeleteBucketPolicyOutput, DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteBucketTaggingInput,
-    DeleteBucketTaggingOutput, DeleteMarkerEntry, DeletePublicAccessBlockInput, DeletePublicAccessBlockOutput, EncodingType,
-    ExpirationStatus, GetBucketCorsInput, GetBucketCorsOutput, GetBucketEncryptionInput, GetBucketEncryptionOutput,
-    GetBucketLifecycleConfigurationInput, GetBucketLocationInput, GetBucketLocationOutput,
-    GetBucketNotificationConfigurationInput, GetBucketNotificationConfigurationOutput, GetBucketPolicyInput,
-    GetBucketPolicyOutput, GetBucketPolicyStatusInput, GetBucketPolicyStatusOutput, GetBucketReplicationInput,
-    GetBucketTaggingInput, GetBucketTaggingOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
-    GetPublicAccessBlockInput, GetPublicAccessBlockOutput, HeadBucketInput, HeadBucketOutput, LifecycleRule, ListBucketsInput,
+    BucketLocationConstraint, CommonPrefix, CreateBucketInput, CreateBucketOutput, DeleteBucketCorsInput, DeleteBucketCorsOutput,
+    DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput, DeleteBucketInput, DeleteBucketLifecycleInput,
+    DeleteBucketLifecycleOutput, DeleteBucketOutput, DeleteBucketPolicyInput, DeleteBucketPolicyOutput,
+    DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteBucketTaggingInput, DeleteBucketTaggingOutput,
+    DeleteMarkerEntry, DeletePublicAccessBlockInput, DeletePublicAccessBlockOutput, EncodingType, ExpirationStatus,
+    GetBucketCorsInput, GetBucketEncryptionInput, GetBucketLifecycleConfigurationInput, GetBucketLocationInput,
+    GetBucketLocationOutput, GetBucketNotificationConfigurationInput, GetBucketPolicyInput, GetBucketPolicyOutput,
+    GetBucketPolicyStatusInput, GetBucketPolicyStatusOutput, GetBucketReplicationInput, GetBucketTaggingInput,
+    GetBucketVersioningInput, GetPublicAccessBlockInput, HeadBucketInput, HeadBucketOutput, LifecycleRule, ListBucketsInput,
     ListBucketsOutput, ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
     ListObjectsV2Input, ListObjectsV2Output, MetadataEntry, NotificationConfiguration, NotificationConfigurationFilter, Object,
-    ObjectLockConfiguration, ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, PolicyStatus, PutBucketCorsInput,
-    PutBucketCorsOutput, PutBucketEncryptionInput, PutBucketEncryptionOutput, PutBucketLifecycleConfigurationInput,
+    ObjectStorageClass, ObjectVersion, ObjectVersionStorageClass, PolicyStatus, PutBucketCorsInput, PutBucketCorsOutput,
+    PutBucketEncryptionInput, PutBucketEncryptionOutput, PutBucketLifecycleConfigurationInput,
     PutBucketLifecycleConfigurationOutput, PutBucketNotificationConfigurationInput, PutBucketNotificationConfigurationOutput,
     PutBucketPolicyInput, PutBucketPolicyOutput, PutBucketReplicationInput, PutBucketReplicationOutput, PutBucketTaggingInput,
     PutBucketTaggingOutput, PutBucketVersioningInput, PutBucketVersioningOutput, PutPublicAccessBlockInput,
-    PutPublicAccessBlockOutput, ServerSideEncryption, ServerSideEncryptionConfiguration, Tagging, Timestamp, UserMetadata,
-    VersioningConfiguration,
+    PutPublicAccessBlockOutput, ServerSideEncryption, Timestamp, UserMetadata,
 };
 use s3s::region::Region;
 use s3s::xml;
@@ -877,7 +880,7 @@ async fn restore_replication_config_after_target_cleanup_failure(
     cleanup_err
 }
 
-fn versioning_configuration_has_object_lock_incompatible_settings(config: &VersioningConfiguration) -> bool {
+fn versioning_configuration_has_object_lock_incompatible_settings(config: &PersistedVersioningConfiguration) -> bool {
     config.suspended()
         || config.exclude_folders.unwrap_or(false)
         || config
@@ -886,11 +889,11 @@ fn versioning_configuration_has_object_lock_incompatible_settings(config: &Versi
             .is_some_and(|excluded_prefixes| !excluded_prefixes.is_empty())
 }
 
-async fn validate_bucket_versioning_update(bucket: &str, config: &VersioningConfiguration) -> S3Result<()> {
+async fn validate_bucket_versioning_update(bucket: &str, config: &PersistedVersioningConfiguration) -> S3Result<()> {
     if config
         .status
         .as_ref()
-        .is_some_and(|status| !matches!(status.as_str(), BucketVersioningStatus::ENABLED | BucketVersioningStatus::SUSPENDED))
+        .is_some_and(|status| !matches!(status.as_str(), "Enabled" | "Suspended"))
     {
         return Err(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
@@ -1982,7 +1985,7 @@ impl DefaultBucketUsecase {
     pub async fn execute_get_bucket_encryption(
         &self,
         req: S3Request<GetBucketEncryptionInput>,
-    ) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
+    ) -> S3Result<Option<PersistedBucketEncryptionConfiguration>> {
         let GetBucketEncryptionInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -2012,13 +2015,11 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(GetBucketEncryptionOutput {
-            server_side_encryption_configuration,
-        }))
+        Ok(server_side_encryption_configuration)
     }
 
     #[instrument(level = "debug", skip(self))]
-    pub async fn execute_get_bucket_cors(&self, req: S3Request<GetBucketCorsInput>) -> S3Result<S3Response<GetBucketCorsOutput>> {
+    pub async fn execute_get_bucket_cors(&self, req: S3Request<GetBucketCorsInput>) -> S3Result<PersistedCorsConfiguration> {
         let GetBucketCorsInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -2051,9 +2052,7 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(GetBucketCorsOutput {
-            cors_rules: Some(cors_configuration.cors_rules),
-        }))
+        Ok(cors_configuration)
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -2087,7 +2086,7 @@ impl DefaultBucketUsecase {
     pub async fn execute_get_bucket_notification_configuration(
         &self,
         req: S3Request<GetBucketNotificationConfigurationInput>,
-    ) -> S3Result<S3Response<GetBucketNotificationConfigurationOutput>> {
+    ) -> S3Result<Option<PersistedNotificationConfiguration>> {
         let GetBucketNotificationConfigurationInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -2118,22 +2117,7 @@ impl DefaultBucketUsecase {
             }
         };
 
-        if let Some(NotificationConfiguration {
-            event_bridge_configuration,
-            lambda_function_configurations,
-            queue_configurations,
-            topic_configurations,
-        }) = has_notification_config
-        {
-            Ok(S3Response::new(GetBucketNotificationConfigurationOutput {
-                event_bridge_configuration,
-                lambda_function_configurations,
-                queue_configurations,
-                topic_configurations,
-            }))
-        } else {
-            Ok(S3Response::new(GetBucketNotificationConfigurationOutput::default()))
-        }
+        Ok(has_notification_config)
     }
 
     pub async fn execute_get_bucket_policy(
@@ -2295,10 +2279,7 @@ impl DefaultBucketUsecase {
     }
 
     #[instrument(level = "debug", skip(self))]
-    pub async fn execute_get_bucket_tagging(
-        &self,
-        req: S3Request<GetBucketTaggingInput>,
-    ) -> S3Result<S3Response<GetBucketTaggingOutput>> {
+    pub async fn execute_get_bucket_tagging(&self, req: S3Request<GetBucketTaggingInput>) -> S3Result<PersistedTagging> {
         let GetBucketTaggingInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -2310,7 +2291,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let Tagging { tag_set } = match metadata_sys::get_tagging_config(&bucket).await {
+        let tagging = match metadata_sys::get_tagging_config(&bucket).await {
             Ok((tags, _)) => tags,
             Err(err) => {
                 if err == StorageError::ConfigNotFound {
@@ -2328,14 +2309,14 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(GetBucketTaggingOutput { tag_set }))
+        Ok(tagging)
     }
 
     #[instrument(level = "debug", skip(self))]
     pub async fn execute_get_public_access_block(
         &self,
         req: S3Request<GetPublicAccessBlockInput>,
-    ) -> S3Result<S3Response<GetPublicAccessBlockOutput>> {
+    ) -> S3Result<PersistedPublicAccessBlockConfiguration> {
         let GetPublicAccessBlockInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -2360,16 +2341,14 @@ impl DefaultBucketUsecase {
             }
         };
 
-        Ok(S3Response::new(GetPublicAccessBlockOutput {
-            public_access_block_configuration: Some(config),
-        }))
+        Ok(config)
     }
 
     #[instrument(level = "debug", skip(self))]
     pub async fn execute_get_bucket_versioning(
         &self,
         req: S3Request<GetBucketVersioningInput>,
-    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+    ) -> S3Result<PersistedVersioningConfiguration> {
         let GetBucketVersioningInput { bucket, .. } = req.input;
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -2380,26 +2359,21 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let VersioningConfiguration { status, .. } = BucketVersioningSys::get(&bucket).await.map_err(ApiError::from)?;
-
-        Ok(S3Response::new(GetBucketVersioningOutput {
-            status,
-            ..Default::default()
-        }))
+        BucketVersioningSys::get(&bucket)
+            .await
+            .map_err(|err| ApiError::from(err).into())
     }
 
     pub async fn execute_put_bucket_encryption(
         &self,
         req: S3Request<PutBucketEncryptionInput>,
+        prepared: S3Result<PersistedBucketEncryptionConfiguration>,
     ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let PutBucketEncryptionInput {
-            bucket,
-            mut server_side_encryption_configuration,
-            ..
-        } = req.input;
+        let PutBucketEncryptionInput { bucket, .. } = req.input;
 
+        let mut server_side_encryption_configuration = prepared?;
         validate_bucket_encryption_configuration(&server_side_encryption_configuration)?;
 
         // When SSE-KMS is set without a specific key ID, populate the default
@@ -2605,6 +2579,7 @@ impl DefaultBucketUsecase {
     pub async fn execute_put_bucket_notification_configuration(
         &self,
         req: S3Request<PutBucketNotificationConfigurationInput>,
+        prepared: S3Result<PersistedNotificationConfiguration>,
     ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_region = req.region.clone();
@@ -2617,6 +2592,7 @@ impl DefaultBucketUsecase {
         } = req.input;
 
         validate_notification_configuration_filters(&notification_configuration)?;
+        let persisted_notification_configuration = prepared?;
 
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -2638,7 +2614,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))?;
 
-        let data = serialize_config(&notification_configuration)?;
+        let data = serialize_config(&persisted_notification_configuration)?;
         update_bucket_config_for_incarnation(&bucket, BUCKET_NOTIFICATION_CONFIG, data, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
@@ -2730,14 +2706,14 @@ impl DefaultBucketUsecase {
     }
 
     #[instrument(level = "debug", skip(self))]
-    pub async fn execute_put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
+    pub async fn execute_put_bucket_cors(
+        &self,
+        req: S3Request<PutBucketCorsInput>,
+        prepared: S3Result<PersistedCorsConfiguration>,
+    ) -> S3Result<S3Response<PutBucketCorsOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let PutBucketCorsInput {
-            bucket,
-            cors_configuration,
-            ..
-        } = req.input;
+        let PutBucketCorsInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -2748,6 +2724,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let cors_configuration = prepared?;
         let data = serialize_config(&cors_configuration)?;
         update_bucket_config_for_incarnation(&bucket, BUCKET_CORS_CONFIG, data, expected_incarnation_id)
             .await
@@ -2824,14 +2801,11 @@ impl DefaultBucketUsecase {
     pub async fn execute_put_public_access_block(
         &self,
         req: S3Request<PutPublicAccessBlockInput>,
+        prepared: S3Result<PersistedPublicAccessBlockConfiguration>,
     ) -> S3Result<S3Response<PutPublicAccessBlockOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let PutPublicAccessBlockInput {
-            bucket,
-            public_access_block_configuration,
-            ..
-        } = req.input;
+        let PutPublicAccessBlockInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -2842,6 +2816,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        let public_access_block_configuration = prepared?;
         let data = serialize_config(&public_access_block_configuration)?;
         update_bucket_config_for_incarnation(&bucket, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, data, expected_incarnation_id)
             .await
@@ -2856,10 +2831,11 @@ impl DefaultBucketUsecase {
     pub async fn execute_put_bucket_tagging(
         &self,
         req: S3Request<PutBucketTaggingInput>,
+        tagging: PersistedTagging,
     ) -> S3Result<S3Response<PutBucketTaggingOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let PutBucketTaggingInput { bucket, tagging, .. } = req.input;
+        let PutBucketTaggingInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -2895,15 +2871,13 @@ impl DefaultBucketUsecase {
     pub async fn execute_put_bucket_versioning(
         &self,
         req: S3Request<PutBucketVersioningInput>,
+        prepared: S3Result<PersistedVersioningConfiguration>,
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let PutBucketVersioningInput {
-            bucket,
-            versioning_configuration,
-            ..
-        } = req.input;
+        let PutBucketVersioningInput { bucket, .. } = req.input;
 
+        let versioning_configuration = prepared?;
         validate_bucket_versioning_update(&bucket, &versioning_configuration).await?;
 
         let data = serialize_config(&versioning_configuration)?;
@@ -3273,7 +3247,7 @@ impl DefaultBucketUsecase {
 /// algorithm it does not know, so storing one would make GetBucketEncryption
 /// advertise a scheme no object is encrypted under. s3s parses `SSEAlgorithm`
 /// as an open string, so the schema check has to happen here.
-fn validate_bucket_encryption_configuration(config: &ServerSideEncryptionConfiguration) -> S3Result<()> {
+fn validate_bucket_encryption_configuration(config: &PersistedBucketEncryptionConfiguration) -> S3Result<()> {
     if config.rules.is_empty() {
         return Err(S3Error::with_message(
             S3ErrorCode::MalformedXML,
@@ -3314,13 +3288,16 @@ mod tests {
     use http::{Extensions, HeaderMap, Method, Uri};
     use rustfs_gateway_types::dto::Status;
     use rustfs_gateway_types::persistence::{
+        PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
+        PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
+    };
+    use rustfs_gateway_types::persistence::{
         PersistedEncryptionConfiguration, PersistedReplicationDestination, PersistedReplicationRule,
     };
     use s3s::dto::{
-        BucketLifecycleConfiguration, BucketVersioningStatus, CORSConfiguration, ExcludedPrefix, FilterRule, FilterRuleName,
-        LifecycleExpiration, NoncurrentVersionTransition, PublicAccessBlockConfiguration, QueueConfiguration, S3KeyFilter,
-        ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Transition,
-        TransitionStorageClass,
+        BucketLifecycleConfiguration, CORSConfiguration, FilterRule, FilterRuleName, LifecycleExpiration,
+        NoncurrentVersionTransition, PublicAccessBlockConfiguration, QueueConfiguration, S3KeyFilter, ServerSideEncryption, Tag,
+        Tagging, Transition, TransitionStorageClass,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -3352,7 +3329,7 @@ mod tests {
     fn sse_rule(algorithm: &str, kms_key_id: Option<&str>) -> ServerSideEncryptionRule {
         ServerSideEncryptionRule {
             apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
-                sse_algorithm: ServerSideEncryption::from(algorithm.to_string()),
+                sse_algorithm: algorithm.to_string(),
                 kms_master_key_id: kms_key_id.map(|id| id.to_string()),
             }),
             blocked_encryption_types: None,
@@ -4245,8 +4222,8 @@ mod tests {
 
     #[tokio::test]
     async fn validate_bucket_versioning_update_rejects_invalid_status_before_metadata_lookup() {
-        let config = VersioningConfiguration {
-            status: Some(BucketVersioningStatus::from_static("Invalid")),
+        let config = PersistedVersioningConfiguration {
+            status: Some("Invalid".to_owned()),
             ..Default::default()
         };
 
@@ -4298,8 +4275,8 @@ mod tests {
 
     #[test]
     fn versioning_configuration_has_object_lock_incompatible_settings_rejects_suspended() {
-        let config = VersioningConfiguration {
-            status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED)),
+        let config = PersistedVersioningConfiguration {
+            status: Some("Suspended".to_owned()),
             ..Default::default()
         };
 
@@ -4308,7 +4285,7 @@ mod tests {
 
     #[test]
     fn versioning_configuration_has_object_lock_incompatible_settings_rejects_exclude_folders() {
-        let config = VersioningConfiguration {
+        let config = PersistedVersioningConfiguration {
             exclude_folders: Some(true),
             ..Default::default()
         };
@@ -4318,10 +4295,8 @@ mod tests {
 
     #[test]
     fn versioning_configuration_has_object_lock_incompatible_settings_rejects_excluded_prefixes() {
-        let config = VersioningConfiguration {
-            excluded_prefixes: Some(vec![ExcludedPrefix {
-                prefix: Some("archive/".to_string()),
-            }]),
+        let config = PersistedVersioningConfiguration {
+            excluded_prefixes: Some(vec![Some("archive/".to_string())]),
             ..Default::default()
         };
 
@@ -5653,7 +5628,10 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_put_bucket_notification_configuration(req).await.unwrap_err();
+        let err = usecase
+            .execute_put_bucket_notification_configuration(req, Ok(PersistedNotificationConfiguration::default()))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
@@ -5668,7 +5646,10 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_put_bucket_cors(req).await.unwrap_err();
+        let err = usecase
+            .execute_put_bucket_cors(req, Ok(PersistedCorsConfiguration::default()))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
@@ -5733,14 +5714,26 @@ mod tests {
         // of being refused by configuration validation first.
         let input = PutBucketEncryptionInput::builder()
             .bucket("test-bucket".to_string())
-            .server_side_encryption_configuration(sse_config(vec![sse_rule("AES256", None)]))
+            .server_side_encryption_configuration(s3s::dto::ServerSideEncryptionConfiguration {
+                rules: vec![s3s::dto::ServerSideEncryptionRule {
+                    apply_server_side_encryption_by_default: Some(s3s::dto::ServerSideEncryptionByDefault {
+                        sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                        kms_master_key_id: None,
+                    }),
+                    blocked_encryption_types: None,
+                    bucket_key_enabled: None,
+                }],
+            })
             .build()
             .unwrap();
 
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_put_bucket_encryption(req).await.unwrap_err();
+        let err = usecase
+            .execute_put_bucket_encryption(req, Ok(PersistedBucketEncryptionConfiguration::default()))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
@@ -5760,7 +5753,10 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_put_bucket_tagging(req).await.unwrap_err();
+        let err = usecase
+            .execute_put_bucket_tagging(req, PersistedTagging::default())
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
@@ -5775,7 +5771,10 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_put_public_access_block(req).await.unwrap_err();
+        let err = usecase
+            .execute_put_public_access_block(req, Ok(PersistedPublicAccessBlockConfiguration::default()))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 

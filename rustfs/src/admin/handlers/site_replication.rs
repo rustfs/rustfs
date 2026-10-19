@@ -56,6 +56,9 @@ use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::{DEFAULT_DELIMITER, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_gateway_types::dto::Status;
+use rustfs_gateway_types::persistence::{
+    PersistedObjectLockConfiguration as ObjectLockConfiguration, PersistedVersioningConfiguration as VersioningConfiguration,
+};
 use rustfs_gateway_types::persistence::{PersistedReplicationConfiguration, PersistedReplicationRule};
 use rustfs_iam::error::is_err_no_such_service_account;
 use rustfs_iam::federation::OIDC_VIRTUAL_PARENT_CLAIM;
@@ -78,7 +81,6 @@ use rustfs_policy::policy::{
     Policy,
     action::{Action, AdminAction},
 };
-use s3s::dto::{ObjectLockConfiguration, VersioningConfiguration};
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Deserialize;
 use serde::Serialize;

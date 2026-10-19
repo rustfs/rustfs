@@ -60,6 +60,7 @@ use uuid::Uuid;
 pub mod data_usage_define;
 pub mod error;
 mod lifecycle_cache;
+mod object_lock_cache;
 pub mod prefix_usage;
 pub mod raw_page_index;
 mod remote_scanner;
@@ -337,7 +338,7 @@ pub(crate) async fn get_lifecycle_config(
 
 pub(crate) async fn get_object_lock_config(
     bucket: &str,
-) -> EcstoreResult<(s3s::dto::ObjectLockConfiguration, time::OffsetDateTime)> {
+) -> EcstoreResult<(rustfs_gateway_types::persistence::PersistedObjectLockConfiguration, time::OffsetDateTime)> {
     ecstore_get_object_lock_config(bucket).await
 }
 
@@ -372,13 +373,15 @@ pub(crate) trait ScannerVersioningConfigExt {
     fn versioned(&self, prefix: &str) -> bool;
 }
 
-impl ScannerVersioningConfigExt for s3s::dto::VersioningConfiguration {
+impl ScannerVersioningConfigExt for rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
     fn prefix_enabled(&self, prefix: &str) -> bool {
-        <s3s::dto::VersioningConfiguration as EcstoreVersioningApi>::prefix_enabled(self, prefix)
+        <rustfs_gateway_types::persistence::PersistedVersioningConfiguration as EcstoreVersioningApi>::prefix_enabled(
+            self, prefix,
+        )
     }
 
     fn versioned(&self, prefix: &str) -> bool {
-        <s3s::dto::VersioningConfiguration as EcstoreVersioningApi>::versioned(self, prefix)
+        <rustfs_gateway_types::persistence::PersistedVersioningConfiguration as EcstoreVersioningApi>::versioned(self, prefix)
     }
 }
 

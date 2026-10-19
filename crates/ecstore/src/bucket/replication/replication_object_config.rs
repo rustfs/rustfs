@@ -18,7 +18,7 @@ use super::replication_filemeta_boundary::metadata_keys;
 use crate::bucket::metadata::BucketMetadata;
 use rustfs_gateway_types::dto::Status;
 use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
-use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
+use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tracing::error;
@@ -129,7 +129,7 @@ fn validate_delete_replication_config(
     if versioning
         .status
         .as_ref()
-        .is_some_and(|status| !matches!(status.as_str(), BucketVersioningStatus::ENABLED | BucketVersioningStatus::SUSPENDED))
+        .is_some_and(|status| !matches!(status.as_str(), "Enabled" | "Suspended"))
     {
         return Err(super::replication_error_boundary::Error::other(
             "bucket versioning configuration has an invalid status",
@@ -758,7 +758,7 @@ mod tests {
     #[test]
     fn delete_snapshot_rejects_unknown_status_values() {
         let invalid_versioning = VersioningConfiguration {
-            status: Some("Enabld".to_string().into()),
+            status: Some("Enabld".to_string()),
             ..Default::default()
         };
         assert!(validate_delete_replication_config(&invalid_versioning, None).is_err());
@@ -810,7 +810,7 @@ mod tests {
         let mut metadata = BucketMetadata::new("bucket");
         metadata.versioning_config_xml = b"configured".to_vec();
         metadata.versioning_config = Some(VersioningConfiguration {
-            status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+            status: Some("Enabled".to_owned()),
             ..Default::default()
         });
         metadata.replication_config_xml = b"configured".to_vec();
@@ -910,7 +910,7 @@ mod tests {
 
         let prefix_snapshot = DeleteReplicationConfigSnapshot::from_configs_for_test(
             VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                status: Some("Enabled".to_owned()),
                 ..Default::default()
             },
             Some(PersistedReplicationConfiguration {
@@ -932,7 +932,7 @@ mod tests {
         });
         let tag_snapshot = DeleteReplicationConfigSnapshot::from_configs_for_test(
             VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                status: Some("Enabled".to_owned()),
                 ..Default::default()
             },
             Some(PersistedReplicationConfiguration {
@@ -1006,7 +1006,7 @@ mod tests {
         };
         let snapshot = DeleteReplicationConfigSnapshot::from_configs_for_test(
             VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                status: Some("Enabled".to_owned()),
                 ..Default::default()
             },
             Some(replication.clone()),

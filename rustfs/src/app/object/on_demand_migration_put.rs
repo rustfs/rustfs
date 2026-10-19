@@ -299,16 +299,18 @@ mod tests {
     use super::*;
     use crate::app::storage_api::multipart_usecase::contract::multipart::MultipartOperations as _;
     use crate::app::storage_api::s3::{
-        BucketVersioningStatus, PersistedOptionalReplicationStatus, PersistedReplicationConfiguration,
-        PersistedReplicationDestination, PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag,
-        ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Status,
-        VersioningConfiguration,
+        PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
+        PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag, Status,
     };
     use crate::app::storage_api::test::bucket::utils::serialize;
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
     use crate::app::storage_api::test::{get_global_bucket_metadata_sys, set_bucket_metadata};
     use crate::on_demand_migration::{PullFailureReason, SourceSse};
     use http::Method;
+    use rustfs_gateway_types::persistence::{
+        PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
+        PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
+    };
     use rustfs_utils::http::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, contains_key_str, get_str};
     use sha2::{Digest as Sha256Digest, Sha256};
     use std::time::SystemTime;
@@ -921,7 +923,7 @@ mod tests {
         let config = ServerSideEncryptionConfiguration {
             rules: vec![ServerSideEncryptionRule {
                 apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
-                    sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                    sse_algorithm: "AES256".to_owned(),
                     kms_master_key_id: None,
                 }),
                 blocked_encryption_types: None,
@@ -1027,8 +1029,8 @@ mod tests {
         };
         let mut metadata = (*metadata).clone();
         metadata.versioning_config_xml = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
-        metadata.versioning_config = Some(VersioningConfiguration {
-            status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+        metadata.versioning_config = Some(rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
+            status: Some("Enabled".to_owned()),
             ..Default::default()
         });
         let config = PersistedReplicationConfiguration {

@@ -39,6 +39,11 @@ use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_BUCKET_METADATA_IMPORT_SIZE;
+use rustfs_gateway_types::cors_tagging::PersistedTagging as Tagging;
+use rustfs_gateway_types::persistence::{
+    PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration, PersistedNotificationConfiguration,
+    PersistedObjectLockConfiguration as ObjectLockConfiguration, PersistedVersioningConfiguration as VersioningConfiguration,
+};
 use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedReplicationConfiguration};
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::{
@@ -48,7 +53,6 @@ use rustfs_policy::policy::{
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::{
     Body, S3Request, S3Response, S3Result,
-    dto::{ObjectLockConfiguration, ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration},
     header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE},
     s3_error,
 };
@@ -166,7 +170,7 @@ async fn exported_bucket_config(bucket: &str, conf: &str) -> Result<Option<Vec<u
             let config_xml = checked_raw_xml(
                 config,
                 metadata.notification_config_xml.clone(),
-                deserialize::<s3s::dto::NotificationConfiguration>,
+                deserialize::<PersistedNotificationConfiguration>,
             )?;
             Ok(Some(config_xml))
         }
@@ -866,7 +870,7 @@ fn apply_imported_bucket_config(
 
     let store: fn(&mut BucketMetadata, Vec<u8>, OffsetDateTime) = match conf_name {
         BUCKET_NOTIFICATION_CONFIG => validated_config!(
-            deserialize::<s3s::dto::NotificationConfiguration>,
+            deserialize::<PersistedNotificationConfiguration>,
             notification_config_xml,
             notification_config_updated_at
         ),

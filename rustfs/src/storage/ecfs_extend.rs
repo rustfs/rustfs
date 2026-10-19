@@ -23,6 +23,7 @@ use crate::storage::storage_api::ecstore_bucket::metadata_sys::{self, ObjectLock
 use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::counter;
+use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
 use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::http::{
@@ -30,9 +31,8 @@ use rustfs_utils::http::{
     SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, contains_key_str, insert_str, remove_str,
 };
 use s3s::dto::{
-    Delimiter, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockConfiguration, ObjectLockEnabled,
-    ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode, QueueConfiguration,
-    TopicConfiguration,
+    Delimiter, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
+    ObjectLockRetention, ObjectLockRetentionMode, QueueConfiguration, TopicConfiguration,
 };
 use s3s::{S3Error, S3ErrorCode, S3Response, S3Result};
 use serde_urlencoded::from_bytes;
@@ -94,7 +94,7 @@ pub(crate) fn apply_lock_retention(object_lock_config: Option<&ObjectLockConfigu
 
     let Some(config) = object_lock_config else { return };
 
-    if config.object_lock_enabled.as_ref().map(|e| e.as_str()) != Some(ObjectLockEnabled::ENABLED) {
+    if config.object_lock_enabled.as_deref() != Some("Enabled") {
         return;
     }
 
@@ -477,11 +477,7 @@ pub(crate) async fn validate_bucket_object_lock_enabled(bucket: &str) -> S3Resul
 
 pub(crate) fn validate_bucket_object_lock_enabled_state(bucket: &str, state: &ObjectLockConfigState) -> S3Result<()> {
     match state {
-        ObjectLockConfigState::Configured { config, .. }
-            if config.object_lock_enabled == Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)) =>
-        {
-            Ok(())
-        }
+        ObjectLockConfigState::Configured { config, .. } if config.object_lock_enabled.as_deref() == Some("Enabled") => Ok(()),
         ObjectLockConfigState::Configured { .. } => Err(S3Error::with_message(
             S3ErrorCode::InvalidRequest,
             "Object Lock is not enabled for this bucket".to_string(),

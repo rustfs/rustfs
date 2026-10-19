@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::msgp_decode::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
-use super::object_lock::{ObjectLockApi, ObjectLockStatusExt};
+use super::object_lock::ObjectLockApi;
 use super::versioning::VersioningApi;
 use super::{quota::BucketQuota, target::BucketTargets};
 use crate::bucket::replication::invalid_replication_config_status_field;
@@ -25,13 +25,17 @@ use crate::object_api::WriteCompletion;
 use crate::runtime::sources as runtime_sources;
 use crate::store::ECStore;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
-use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedReplicationConfiguration};
-use rustfs_policy::policy::BucketPolicy;
-use s3s::dto::{
-    AccelerateConfiguration, BucketLoggingStatus, BucketVersioningStatus, CORSConfiguration, NotificationConfiguration,
-    ObjectLockConfiguration, PublicAccessBlockConfiguration, RequestPaymentConfiguration, ServerSideEncryptionConfiguration,
-    Tagging, VersioningConfiguration, WebsiteConfiguration,
+use rustfs_gateway_types::cors_tagging::{PersistedCorsConfiguration as CORSConfiguration, PersistedTagging as Tagging};
+use rustfs_gateway_types::persistence::{
+    PersistedAccelerateConfiguration as AccelerateConfiguration,
+    PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
+    PersistedBucketLoggingStatus as BucketLoggingStatus, PersistedLifecycleConfiguration,
+    PersistedNotificationConfiguration as NotificationConfiguration, PersistedObjectLockConfiguration as ObjectLockConfiguration,
+    PersistedPublicAccessBlockConfiguration as PublicAccessBlockConfiguration, PersistedReplicationConfiguration,
+    PersistedRequestPaymentConfiguration as RequestPaymentConfiguration,
+    PersistedVersioningConfiguration as VersioningConfiguration, PersistedWebsiteConfiguration as WebsiteConfiguration,
 };
+use rustfs_policy::policy::BucketPolicy;
 use serde::Serializer;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -41,23 +45,11 @@ use time::{Date, OffsetDateTime, PrimitiveDateTime, Time as CivilTime, UtcOffset
 use tracing::error;
 use uuid::Uuid;
 
-// The serving-layer DTO impls for the storage-level Object Lock traits live
-// here because this module owns the persisted `ObjectLockConfiguration`
-// during the s3s ratchet migration (rustfs/backlog#1842).
+// The persisted Object Lock configuration answers the storage-level trait
+// here because this module owns the persisted `ObjectLockConfiguration`.
 impl ObjectLockApi for ObjectLockConfiguration {
     fn enabled(&self) -> bool {
-        self.object_lock_enabled
-            .as_ref()
-            .is_some_and(|v| v.as_str() == s3s::dto::ObjectLockEnabled::ENABLED)
-    }
-}
-
-impl ObjectLockStatusExt for s3s::dto::ObjectLockLegalHoldStatus {
-    fn valid(&self) -> bool {
-        matches!(
-            self.as_str(),
-            s3s::dto::ObjectLockLegalHoldStatus::ON | s3s::dto::ObjectLockLegalHoldStatus::OFF
-        )
+        self.object_lock_enabled.as_deref() == Some("Enabled")
     }
 }
 
@@ -1029,9 +1021,11 @@ impl BucketMetadata {
                     None
                 } else {
                     let config = deserialize::<VersioningConfiguration>(&data)?;
-                    if config.status.as_ref().is_some_and(|status| {
-                        !matches!(status.as_str(), BucketVersioningStatus::ENABLED | BucketVersioningStatus::SUSPENDED)
-                    }) {
+                    if config
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| !matches!(status.as_str(), "Enabled" | "Suspended"))
+                    {
                         return Err(Error::other("bucket versioning configuration has an invalid status"));
                     }
                     Some(config)
@@ -1831,17 +1825,15 @@ mod test {
 
     #[test]
     fn object_locking_requires_lock_metadata_not_plain_versioning() {
-        use s3s::dto::ObjectLockEnabled;
-
         let mut bm = BucketMetadata::new("test-bucket");
         bm.versioning_config = Some(VersioningConfiguration {
-            status: Some(s3s::dto::BucketVersioningStatus::from_static("Enabled")),
+            status: Some("Enabled".to_owned()),
             ..Default::default()
         });
         assert!(!bm.object_locking());
 
         bm.object_lock_config = Some(ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             ..Default::default()
         });
         assert!(bm.object_locking());

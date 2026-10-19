@@ -926,7 +926,10 @@ impl DefaultObjectUsecase {
 mod tests {
     use super::*;
     use http::{HeaderValue, Method};
-    use s3s::dto::{ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule};
+    use rustfs_gateway_types::persistence::{
+        PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
+        PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
+    };
     use std::sync::Arc;
     use tokio::io::AsyncReadExt;
 
@@ -973,7 +976,7 @@ mod tests {
         let config = ServerSideEncryptionConfiguration {
             rules: vec![ServerSideEncryptionRule {
                 apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
-                    sse_algorithm: ServerSideEncryption::from(String::from("garbage")),
+                    sse_algorithm: "garbage".to_owned(),
                     kms_master_key_id: None,
                 }),
                 blocked_encryption_types: None,
@@ -995,7 +998,7 @@ mod tests {
             (ServerSideEncryption::AWS_KMS, ServerSideEncryption::AWS_KMS),
         ] {
             let sse = ServerSideEncryptionByDefault {
-                sse_algorithm: ServerSideEncryption::from_static(configured),
+                sse_algorithm: configured.to_owned(),
                 kms_master_key_id: None,
             };
             assert_eq!(bucket_default_write_sse(&sse).as_str(), expected);

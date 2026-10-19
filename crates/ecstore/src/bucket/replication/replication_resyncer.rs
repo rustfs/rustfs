@@ -6360,10 +6360,10 @@ mod tests {
     use super::super::replication_target_boundary::{BucketTarget, BucketTargets};
     use super::*;
     use rustfs_gateway_types::dto::Status;
+    use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
     use rustfs_gateway_types::persistence::{
         PersistedReplicationDestination, PersistedReplicationRule, PersistedReplicationStatus,
     };
-    use s3s::dto::{BucketVersioningStatus, ExcludedPrefix, VersioningConfiguration};
     use std::collections::HashMap;
     use time::OffsetDateTime;
     use uuid::Uuid;
@@ -8103,7 +8103,7 @@ mod tests {
         ReplicationVersioningStore::install_prefix_state_test_config(
             &bucket,
             VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                status: Some("Enabled".to_owned()),
                 ..Default::default()
             },
         );
@@ -8136,10 +8136,8 @@ mod tests {
         ReplicationVersioningStore::install_prefix_state_test_config(
             &bucket,
             VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
-                excluded_prefixes: Some(vec![ExcludedPrefix {
-                    prefix: Some("archive/".to_string()),
-                }]),
+                status: Some("Enabled".to_owned()),
+                excluded_prefixes: Some(vec![Some("archive/".to_string())]),
                 ..Default::default()
             },
         );

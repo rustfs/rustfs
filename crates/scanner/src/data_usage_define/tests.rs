@@ -3675,3 +3675,80 @@ fn test_lifecycle_cache_strict_cached_tags_contract() {
         );
     }
 }
+
+/// The Object Lock configuration inside the usage cache keeps the s3s DTO's
+/// derived MessagePack layout (rustfs/backlog#2745): every shape the old
+/// binary could write decodes, and the new writer produces the same bytes.
+#[test]
+fn object_lock_cache_matches_the_legacy_dto_bytes() {
+    use rustfs_gateway_types::persistence::{
+        PersistedDefaultRetention, PersistedObjectLockConfiguration, PersistedObjectLockRule,
+    };
+    use s3s::dto as legacy;
+
+    let legacy_cases = vec![
+        legacy::ObjectLockConfiguration {
+            object_lock_enabled: None,
+            rule: None,
+        },
+        legacy::ObjectLockConfiguration {
+            object_lock_enabled: Some(legacy::ObjectLockEnabled::from_static(legacy::ObjectLockEnabled::ENABLED)),
+            rule: None,
+        },
+        legacy::ObjectLockConfiguration {
+            object_lock_enabled: Some(legacy::ObjectLockEnabled::from("Disabled".to_owned())),
+            rule: Some(legacy::ObjectLockRule { default_retention: None }),
+        },
+        legacy::ObjectLockConfiguration {
+            object_lock_enabled: Some(legacy::ObjectLockEnabled::from_static(legacy::ObjectLockEnabled::ENABLED)),
+            rule: Some(legacy::ObjectLockRule {
+                default_retention: Some(legacy::DefaultRetention {
+                    days: Some(30),
+                    mode: Some(legacy::ObjectLockRetentionMode::from_static(legacy::ObjectLockRetentionMode::GOVERNANCE)),
+                    years: None,
+                }),
+            }),
+        },
+        legacy::ObjectLockConfiguration {
+            object_lock_enabled: Some(legacy::ObjectLockEnabled::from_static(legacy::ObjectLockEnabled::ENABLED)),
+            rule: Some(legacy::ObjectLockRule {
+                default_retention: Some(legacy::DefaultRetention {
+                    days: None,
+                    mode: Some(legacy::ObjectLockRetentionMode::from("compliance-ish".to_owned())),
+                    years: Some(2),
+                }),
+            }),
+        },
+    ];
+
+    for legacy_config in legacy_cases {
+        let persisted = PersistedObjectLockConfiguration {
+            object_lock_enabled: legacy_config
+                .object_lock_enabled
+                .as_ref()
+                .map(|value| value.as_str().to_owned()),
+            rule: legacy_config.rule.as_ref().map(|rule| PersistedObjectLockRule {
+                default_retention: rule.default_retention.as_ref().map(|retention| PersistedDefaultRetention {
+                    mode: retention.mode.as_ref().map(|value| value.as_str().to_owned()),
+                    days: retention.days,
+                    years: retention.years,
+                }),
+            }),
+        };
+        let old_bytes = rmp_serde::to_vec(&Some(Arc::new(legacy_config))).expect("encode the legacy DTO");
+        let current = Some(Arc::new(persisted.clone()));
+        let new_bytes = rmp_serde::to_vec(&crate::object_lock_cache::ObjectLockCache(&current)).expect("encode the new cache");
+        assert_eq!(new_bytes, old_bytes, "the new writer must produce the legacy bytes for {persisted:?}");
+
+        let decoded = crate::object_lock_cache::deserialize(&mut rmp_serde::Deserializer::new(old_bytes.as_slice()))
+            .expect("decode the legacy bytes");
+        assert_eq!(decoded.as_deref(), Some(&persisted));
+    }
+
+    let absent_old = rmp_serde::to_vec(&Option::<Arc<legacy::ObjectLockConfiguration>>::None).expect("encode absent");
+    let absent_new = rmp_serde::to_vec(&crate::object_lock_cache::ObjectLockCache(&None)).expect("encode absent");
+    assert_eq!(absent_new, absent_old);
+    let decoded =
+        crate::object_lock_cache::deserialize(&mut rmp_serde::Deserializer::new(absent_old.as_slice())).expect("decode absent");
+    assert!(decoded.is_none());
+}

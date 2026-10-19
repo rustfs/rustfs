@@ -66,11 +66,13 @@ use lazy_static::lazy_static;
 use rand::RngExt as _;
 use rustfs_config::server_config::Config;
 use rustfs_filemeta::{FileInfo, FileMeta};
+use rustfs_gateway_types::persistence::{
+    PersistedObjectLockConfiguration as ObjectLockConfiguration, PersistedVersioningConfiguration as VersioningConfiguration,
+};
 use rustfs_heal_contracts::heal_channel::{HealItemType, HealOpts};
 use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::path::{decode_dir_object, encode_dir_object, path_join_buf};
-use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
 use std::net::SocketAddr;
 use std::process::exit;
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -825,7 +827,7 @@ impl ECStore {
     }
 
     /// Get the global region
-    pub fn region(&self) -> Option<s3s::region::Region> {
+    pub fn region(&self) -> Option<rustfs_s3_types::Region> {
         runtime_sources::region()
     }
 
@@ -1409,11 +1411,11 @@ impl ECStore {
 
 lazy_static! {
     static ref ENABLED_OBJECT_LOCK_CONFIG: ObjectLockConfiguration = ObjectLockConfiguration {
-        object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+        object_lock_enabled: Some("Enabled".to_owned()),
         ..Default::default()
     };
     static ref ENABLED_VERSIONING_CONFIG: VersioningConfiguration = VersioningConfiguration {
-        status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+        status: Some("Enabled".to_owned()),
         ..Default::default()
     };
 }
