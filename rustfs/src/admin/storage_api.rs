@@ -99,7 +99,9 @@ mod ecstore_rpc {
 }
 
 mod ecstore_storage {
-    pub(crate) use crate::storage::storage_api::ecstore_storage::{ECStore, ScannerDataMovementPauseStatus};
+    pub(crate) use crate::storage::storage_api::ecstore_storage::{
+        ArtifactAttemptInventoryFrame, ECStore, ScannerDataMovementPauseStatus,
+    };
 }
 
 mod ecstore_tier {
@@ -113,6 +115,7 @@ pub(crate) type AdminError = ecstore_client::admin_handler_utils::AdminError;
 pub(crate) type CollectMetricsOpts = ecstore_metrics::CollectMetricsOpts;
 pub(crate) type DiskStat = ecstore_rebalance::DiskStat;
 pub(crate) type ECStore = ecstore_storage::ECStore;
+pub(crate) type ArtifactAttemptInventoryFrame = ecstore_storage::ArtifactAttemptInventoryFrame;
 pub(crate) type EndpointServerPools = ecstore_layout::EndpointServerPools;
 pub(crate) type MetricType = ecstore_metrics::MetricType;
 pub(crate) type NotificationSys = ecstore_notification::NotificationSys;

@@ -1,6 +1,9 @@
 // Copyright 2026 RustFS Team
 // SPDX-License-Identifier: Apache-2.0
 //! Controller operations; receipts are storage facts, never GC authorization.
+mod inventory;
+
+use self::inventory::Inventory;
 use super::plugin_delegation::{owner_for_resource, response};
 use crate::{
     admin::{
@@ -168,6 +171,11 @@ fn unconfirmed() -> s3s::S3Error {
 }
 
 pub fn register_plugin_artifact_routes(router: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    router.insert(
+        Method::POST,
+        &format!("{ADMIN_PREFIX}/v3/plugin-artifacts/inventory"),
+        AdminOperation(&Inventory),
+    )?;
     router.insert(
         Method::POST,
         &format!("{ADMIN_PREFIX}/v3/plugin-artifacts/buckets"),
@@ -490,7 +498,14 @@ mod tests {
     async fn plugin_artifact_routes_and_body_limit() {
         let mut router = S3Router::new(false);
         register_plugin_artifact_routes(&mut router).expect("register controls");
-        for path in ["buckets", "buckets/inspect", "seal-attempt", "seal-repairs", "retire-version"] {
+        for path in [
+            "buckets",
+            "buckets/inspect",
+            "seal-attempt",
+            "seal-repairs",
+            "retire-version",
+            "inventory",
+        ] {
             assert!(router.contains_route(Method::POST, &format!("{ADMIN_PREFIX}/v3/plugin-artifacts/{path}")));
         }
         let mut req = S3Request {

@@ -19,6 +19,7 @@
 //! each case starts four real `rustfs` processes.
 
 mod artifact_delete_test;
+mod artifact_inventory_test;
 mod artifact_put_tail_test;
 mod artifact_repair_tail_test;
 mod artifact_repair_test;

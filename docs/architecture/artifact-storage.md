@@ -501,7 +501,7 @@ python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo test -p e2e
 
 ## Controller API
 
-The admin router exposes six SigV4-authenticated POST operations:
+The admin router exposes the following SigV4-authenticated POST operations:
 
 - `/rustfs/admin/v3/plugin-artifacts/buckets`, requiring
   `admin:CreatePluginArtifactBucket` on the bucket ARN.
@@ -515,12 +515,64 @@ The admin router exposes six SigV4-authenticated POST operations:
   `admin:SealPluginArtifactWrites` on the attempt namespace.
 - `/rustfs/admin/v3/plugin-artifacts/retire-version`, requiring
   `admin:RetirePluginArtifactVersion` on the exact logical object key.
+- `/rustfs/admin/v3/plugin-artifacts/inventory`, requiring
+  `admin:InventoryPluginArtifactAttempt` on the complete attempt namespace.
 
 All require a permanent, non-root original IAM user and an installed request
 server context. Temporary credentials and service accounts are rejected. The
 initial profile requires built-in IAM; external authorization plugins cannot
 establish its explicit local Resource contract. No separate signer map is used.
 The controller grant is independent of an execution delegation's expiration.
+
+### Sealed-attempt inventory stream
+
+The inventory POST accepts `version: 1`, a non-nil UUID `invocation_id`, and
+`target` with the same complete `bucket`, `bucket_incarnation`, and canonical
+`attempt_prefix` identity as the seal requests below. Unknown fields and
+ambiguous paths are rejected. Its independent action must have an explicit
+matching Resource; seal actions, ordinary S3 listing and another attempt's
+grant do not authorize inventory. The permanent original-user, built-in IAM
+and request-context requirements above apply unchanged.
+
+A successful request starts an `application/x-ndjson` body with `Cache-Control:
+no-store`. Each newline-terminated JSON frame repeats `version: 1`, the supplied
+`invocation_id`, full `target`, and a continuous zero-based `sequence`.
+Its tagged `payload` is one of:
+
+- `{"type":"observation","disk_id":"<non-nil UUID>","key":"<complete logical key>","version_id":"<non-nil UUID>","delete_marker":false}`.
+- `{"type":"complete","members":4,"observations":12}`.
+
+The counts above are examples. Observations retain their physical disk identity;
+replicas are not additional business versions or a quorum-readability proof.
+An empty attempt has no observation frames, but still requires every configured
+member and the complete terminal. Internal endpoints and physical paths are
+never projected to this wire.
+
+The adapter uses bounded channels and caps each actual encoded line, including
+its newline, at 1 MiB. One absolute 30-second deadline covers authorization,
+request decoding, all-member inventory, backpressure and output. The existing
+16 KiB request bound and 10-second body-read bound also apply. A stalled body
+consumer cannot extend that deadline. Disconnecting the HTTP body cancels the
+coordinator future; existing physical workers retain their own owners until
+they actually exit.
+
+Complete is staged until I2 has both returned success and ended its input
+normally. Late storage failure, timeout, corruption or changed membership can
+only abort/close the body without Complete; internal errors are replaced with
+a generic stream failure. Authentication and validation errors before streaming
+use the existing AccessDenied, InvalidRequest or ServiceUnavailable responses.
+HTTP 200 and EOF alone do not establish completeness. Consumers must stage all
+observations and validate identity, sequence, counts, one final Complete and
+clean EOF before accepting the result; a transport error after Complete also
+invalidates that result. Never automatically replay a partially emitted stream.
+
+This endpoint uses the existing read-only I2 authority and closure checks. It
+creates no seal/identity record, repairs no metadata and changes no object,
+bucket or IAM configuration. It neither persists a Controller inventory nor
+grants GC, backup retention or deletion permission. Old servers without this
+route fail instead of falling back to ordinary listing.
+
+### Sealing requests
 
 All three seal operations use this request:
 

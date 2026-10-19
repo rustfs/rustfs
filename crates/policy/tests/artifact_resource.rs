@@ -256,3 +256,41 @@ fn artifact_writes_seal_requires_independent_explicit_attempt_authority() {
         "out/attempt-a/"
     ));
 }
+
+#[test]
+fn artifact_inventory_resource_requires_independent_authority() {
+    let wire = "admin:InventoryPluginArtifactAttempt";
+    let action = Action::try_from(wire).expect("A03I3A_INVENTORY_ACTION_REGISTERED");
+    assert_eq!(serde_json::to_value(action).expect("inventory wire action"), json!(wire));
+    let grant = json!({"Effect":"Allow","Action":wire,"Resource":"arn:aws:s3:::artifacts/out/attempt-a"});
+    assert!(allowed(json!([grant.clone()]), wire, "artifacts", "out/attempt-a/"));
+    for (bucket, prefix) in [("another", "out/attempt-a/"), ("artifacts", "out/attempt-b/")] {
+        assert!(!allowed(json!([grant.clone()]), wire, bucket, prefix));
+    }
+    for granted in [wire, "admin:*"] {
+        assert!(
+            !allowed(json!([{"Effect":"Allow","Action":granted}]), wire, "artifacts", "out/attempt-a/"),
+            "A03I3A_RESOURCE_REQUIRED"
+        );
+    }
+    for other in [
+        "admin:SealPluginArtifactAttempt",
+        "admin:SealPluginArtifactRepairs",
+        "admin:SealPluginArtifactWrites",
+        "s3:ListBucket",
+    ] {
+        assert!(!allowed(
+            json!([{"Effect":"Allow","Action":other,"Resource":"arn:aws:s3:::artifacts/out/attempt-a"}]),
+            wire,
+            "artifacts",
+            "out/attempt-a/"
+        ));
+        assert!(!allowed(json!([grant.clone()]), other, "artifacts", "out/attempt-a/"));
+    }
+    assert!(!allowed(
+        json!([grant, {"Effect":"Deny","Action":"admin:*"}]),
+        wire,
+        "artifacts",
+        "out/attempt-a/"
+    ));
+}

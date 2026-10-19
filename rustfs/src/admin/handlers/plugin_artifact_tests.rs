@@ -1257,3 +1257,55 @@ async fn artifact_writes_upload_part_copy_rejects_real_managed_staging_and_prese
     assert_eq!(parts.parts.len(), 1);
     assert_eq!(parts.parts[0].size, 273);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn artifact_inventory_handler_requires_request_context_and_independent_action() {
+    let fixture = Fixture::new(prefix()).await;
+    fixture.user(USER, Some(vec![fixture.attempt_arn()])).await;
+    let request = json!({"version":1,"invocation_id":Uuid::new_v4(),"target":fixture.target()});
+    assert_eq!(
+        Inventory
+            .call(fixture.request(&request, Some(USER)), Params::new())
+            .await
+            .expect_err("seal grants cannot inventory")
+            .code(),
+        &s3s::S3ErrorCode::AccessDenied
+    );
+    for slot in [None, Some(Arc::new(ServerContextSlot::default()))] {
+        let mut req = fixture.request(&request, Some(USER));
+        req.extensions.remove::<Arc<ServerContextSlot>>();
+        if let Some(slot) = slot {
+            req.extensions.insert(slot);
+        }
+        assert_eq!(
+            Inventory
+                .call(req, Params::new())
+                .await
+                .expect_err("inventory needs owning context")
+                .code(),
+            &s3s::S3ErrorCode::ServiceUnavailable
+        );
+    }
+    for mutation in ["version", "invocation_id", "unknown", "target", "nil", "prefix"] {
+        let mut invalid = request.clone();
+        match mutation {
+            "version" => invalid["version"] = json!(2),
+            "invocation_id" => invalid["invocation_id"] = json!(Uuid::nil()),
+            "unknown" => invalid["unknown"] = json!(true),
+            "target" => invalid["target"]["unknown"] = json!(true),
+            "nil" => invalid["target"]["bucket_incarnation"] = json!(Uuid::nil()),
+            _ => invalid["target"]["attempt_prefix"] = json!("outputs/../attempt/"),
+        }
+        assert_eq!(
+            Inventory
+                .call(fixture.request(&invalid, Some(USER)), Params::new())
+                .await
+                .expect_err("strict inventory identity")
+                .code(),
+            &s3s::S3ErrorCode::InvalidRequest
+        );
+    }
+    fixture.absent(&fixture.seal_path()).await;
+    fixture.absent(&fixture.repair_seal_path()).await;
+}

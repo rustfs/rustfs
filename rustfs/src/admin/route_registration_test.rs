@@ -162,6 +162,8 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::POST, "/v3/plugin-artifacts/buckets/inspect"),
         admin_route(Method::POST, "/v3/plugin-artifacts/seal-attempt"),
         admin_route(Method::POST, "/v3/plugin-artifacts/seal-repairs"),
+        admin_route(Method::POST, "/v3/plugin-artifacts/seal-writes"),
+        admin_route(Method::POST, "/v3/plugin-artifacts/inventory"),
         admin_route(Method::POST, "/v3/plugin-artifacts/retire-version"),
         route(Method::GET, HEALTH_PREFIX),
         route(Method::HEAD, HEALTH_PREFIX),
