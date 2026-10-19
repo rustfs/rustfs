@@ -1674,10 +1674,13 @@ async fn assert_bootstrap_observation_retry(drives_per_set: usize) {
     )
     .await
     .expect("the same cycle must converge after the pending PUT drains");
+    // Without a recorded Deep window both layouts run Normal (an erasure set
+    // used to open a Deep window here and revisit every bucket), so the
+    // retry reuses the cold inventory and only walks the dirty bucket.
     assert_eq!(
         retry_budget.progress().0,
-        if drives_per_set == 1 { 1 } else { 2 },
-        "Normal retries reuse cold inventory; Deep retries still visit every bucket"
+        1,
+        "Normal retries reuse cold inventory (drives_per_set={drives_per_set})"
     );
     assert!(matches!(
         outcome,
