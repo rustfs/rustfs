@@ -356,17 +356,20 @@ jobs:
             rotation_waits_for_threshold_and_stops_on_revocation -- --exact
 
       # The guard in rustfs/src/connect/registration.rs is cfg(not(debug_assertions)),
-      # the setting the release profile turns off. Handing that one flag to the
-      # rustfs lib through `cargo rustc` trips it against the cached dev-profile
-      # dependencies instead of a cold `cargo check --release` of the whole graph.
-      - name: Reject short credentials without debug assertions
-        env:
-          CARGO_BUILD_JOBS: "2"
+      # and it must be tripped by a profile that turns debug assertions off for
+      # the whole graph. Handing `-C debug-assertions=off` to the rustfs lib alone
+      # through `cargo rustc` leaves its dependencies on the dev-profile cfg, so
+      # the lib also fails on items gated on one side only (E0599 on
+      # Filenames::Embedded) and "fails solely at the compile_error" can never
+      # hold. `cargo check --release` is metadata-only and needs no
+      # link-concurrency limit; it is cold because ci-dev holds no release
+      # artifacts.
+      - name: Reject short credentials in release builds
         run: |
           log="$(mktemp)"
           set +e
-          CARGO_TERM_COLOR=never cargo rustc -p rustfs --lib \
-            --features connect-e2e-short-credentials -- -C debug-assertions=off >"$log" 2>&1
+          CARGO_TERM_COLOR=never cargo check -p rustfs --release \
+            --features connect-e2e-short-credentials >"$log" 2>&1
           status=$?
           set -e
           cat "$log"
