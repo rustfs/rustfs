@@ -1,4 +1,0 @@
-interface:
-  display_name: "Security Advisory Lessons"
-  short_description: "Apply advisory lessons in reviews."
-  default_prompt: "Use $security-advisory-lessons for a dedicated RustFS security review grounded in past advisories."

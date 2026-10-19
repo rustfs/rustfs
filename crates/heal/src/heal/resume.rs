@@ -42,10 +42,12 @@ pub use legacy_handoff::{LegacyReplacementApproval, LegacyReplacementSource};
 pub(crate) use replacement::replacement_target_identities_match;
 use replacement::replacement_targets_match_identities;
 pub use replacement::{
-    ReplacementPhase, ReplacementRecoveryRecord, ReplacementRecoveryState, ReplacementTargetIdentity, compose_key,
+    ReplacementPhase, ReplacementRecoveryBlock, ReplacementRecoveryRecord, ReplacementRecoveryState, ReplacementTargetIdentity,
+    compose_key,
 };
 pub(crate) use replacement::{
-    ReplacementRecoveryCandidate, merge_replacement_recovery_candidate, replacement_retry_is_exhausted_active,
+    ReplacementRecoveryCandidate, abandoned_targets_are_owned_by_another_generation, merge_replacement_recovery_candidate,
+    replacement_generation_is_retired, replacement_generation_reserves_targets, replacement_retry_is_exhausted_active,
     replacement_retry_is_legacy_transient_skip,
 };
 pub use utils::ResumeUtils;

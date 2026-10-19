@@ -1,4 +1,0 @@
-interface:
-  display_name: "RustFS Release Bump"
-  short_description: "Prepare RustFS release branches like PR #2957."
-  default_prompt: "Use $rustfs-release-version-bump to prepare and verify an exact RustFS release-version bump."

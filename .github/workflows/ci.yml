@@ -42,7 +42,7 @@ on:
   merge_group:
     types: [ checks_requested ]
   schedule:
-    - cron: "11 0 * * 0" # Weekly on Sunday 00:11 UTC
+    - cron: "11 0 * * *" # Nightly 00:11 UTC, after the 22:41 UTC cache-warm run
   workflow_dispatch:
 
 permissions:
@@ -62,10 +62,15 @@ env:
 
 jobs:
 
+  # Compile-free lanes, and lanes that only run a prebuilt binary, use
+  # GitHub-hosted runners: they are free for this public repository, and the
+  # self-hosted pool is reserved for the lanes that need its CPU count and
+  # disk (the workspace test build leaves a ~64GB target/, hosted runners
+  # have 14GB). Placement and billing rules: README.md in this directory.
   cancel-closed-pr-runs:
     name: Cancel Closed PR Runs
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Explain cancellation run
@@ -74,7 +79,7 @@ jobs:
   classify-changes:
     name: Select CI scope
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       mode: ${{ steps.scope.outputs.mode }}
@@ -100,16 +105,12 @@ jobs:
   typos:
     name: Typos
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
-      - name: Install typos download dependency
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends wget
       - name: Typos check with custom config file
         uses: crate-ci/typos@512fc24f32f44ab01972217aaaf3dc86ec234d53 # v1.50.2
 
@@ -117,7 +118,7 @@ jobs:
   quick-checks:
     name: Quick Checks
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout repository
@@ -179,31 +180,27 @@ jobs:
 
       - name: Run nextest tests
         env:
-          # #5394 mitigation, now under a measured experiment (backlog#1601).
+          # #5394 mitigation, settled by the backlog#1601 experiment.
           #
           # 2 was chosen when three concurrent workspace test links were believed
           # to saturate the runner's overlay I/O and wedge Cargo until the 75m
           # timeout. cgroup v2 readings from the sampler show the pod actually
-          # has 14 CPUs and 28GB (peak use 2.1GB), so 2 throttles compilation to
-          # a seventh of what is available and memory was never the constraint —
-          # the label name "sm-standard-4" had led everyone, including the
-          # original mitigation, to assume 4 cores.
+          # has 14 CPUs and 28GB (peak use 2.1GB): the label name "sm-standard-4"
+          # had led everyone, including the original mitigation, to assume 4
+          # cores, and memory was never the constraint.
           #
-          # Raised to 3 on main pushes and manual dispatches; PRs keep 2 so the
-          # merge path is untouched while the experiment runs.
-          #
-          # During baseline collection, main pushes cancelled superseded runs:
-          # only 4 of 20 Test and Lint jobs reached a terminal state. Running
-          # main validations now finish; dispatch remains an independent group
-          # for collecting additional samples on demand.
-          #
-          # Baseline over 17 samples at 2:
-          # median nextest/clippy step ratio 1.95, spread 1.85-2.06. The gate-2
-          # criterion is that ratio dropping at least 10% (below ~1.76) with no
-          # 75m timeout and no run showing three consecutive samples of
-          # rustc/collect2/rust-lld in D state. If it does not, the conclusion is
-          # "this limit is not the bottleneck" — fix it back at 2 and record the
-          # experiment, which is a result, not a failure.
+          # Measured on the same ci-dev cache, the test-profile compile took
+          # 28m21s at 2 on a pull request and 16-23 min at 3 across three
+          # successful main runs. The first pull-request run at 3 that met a
+          # busy node (run 39193827281) then hit the 75m timeout before any
+          # test started: the sampler shows cargo spinning for 70 minutes with
+          # the pod's io.pressure "full" at 86-88% and CPU pressure at zero,
+          # while node-level IO pressure was already 36% from co-tenants when
+          # the step began. The constraint is the pod's shared storage, not
+          # CPU or memory, and the limit that storage sustains on a contended
+          # node is 2. Main pushes and dispatches keep 3 (rarer, and three
+          # successes); pull requests stay at 2 until the pods get local disk
+          # for target/, which is the lever that would unlock the 14 cores.
           #
           # Must stay step-level: rust-cache hashes CARGO/CC/CFLAGS/CXX/CMAKE/RUST
           # prefixed variables from process.env into the cache key, so promoting
@@ -323,10 +320,12 @@ jobs:
           path: artifacts/ilm-integration
           retention-days: 3
 
-  # This gate builds into a fresh target directory to isolate the E2E root.
-  # Give its cold build a separate budget from workspace tests and migration proofs.
-  offline-enrollment-e2e:
-    name: Offline Enrollment E2E Root Boundary
+  # Both Connect boundaries rebuild only the rustfs crate on top of the restored
+  # ci-dev cache: the two e2e features are empty, so every dependency keeps its
+  # cached dev-profile artifact and each feature set recompiles rustfs once.
+  # The budget covers a ci-dev miss, where the first step builds the whole graph.
+  connect-feature-boundaries:
+    name: Connect Feature Boundaries
     if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
@@ -351,14 +350,58 @@ jobs:
       - name: Protect Connect test home
         run: chmod go-w "$(realpath "$HOME")"
 
+      - name: Run short credential behavior tests
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          cargo test -p rustfs --test connect_registration \
+            --features connect-e2e-short-credentials \
+            registration_enforces_build_profile_credential_lifetime -- --exact
+          cargo test -p rustfs --test connect_registration \
+            --features connect-e2e-short-credentials \
+            rotation_waits_for_threshold_and_stops_on_revocation -- --exact
+
+      # The guard in rustfs/src/connect/registration.rs is cfg(not(debug_assertions)),
+      # and it must be tripped by a profile that turns debug assertions off for
+      # the whole graph. Handing `-C debug-assertions=off` to the rustfs lib alone
+      # through `cargo rustc` leaves its dependencies on the dev-profile cfg, so
+      # the lib also fails on items gated on one side only (E0599 on
+      # Filenames::Embedded) and "fails solely at the compile_error" can never
+      # hold. `cargo check --release` is metadata-only and needs no
+      # link-concurrency limit; it is cold because ci-dev holds no release
+      # artifacts.
+      - name: Reject short credentials in release builds
+        run: |
+          log="$(mktemp)"
+          set +e
+          CARGO_TERM_COLOR=never cargo check -p rustfs --release \
+            --features connect-e2e-short-credentials >"$log" 2>&1
+          status=$?
+          set -e
+          cat "$log"
+          expected='error: connect-e2e-short-credentials is restricted to debug builds'
+          summary="error: could not compile \`rustfs\` (lib) due to 1 previous error"
+          expected_count="$(grep -Fxc "$expected" "$log" || true)"
+          summary_count="$(grep -Fc "$summary" "$log" || true)"
+          error_count="$(grep -Ec '^error(:|\[)' "$log" || true)"
+          if [ "$status" -ne 101 ] || [ "$expected_count" -ne 1 ] \
+            || [ "$summary_count" -ne 1 ] || [ "$error_count" -ne 2 ]; then
+            echo "feature gate did not fail solely at the expected compile_error" >&2
+            rm -f "$log"
+            exit 1
+          fi
+          rm -f "$log"
+
       - name: Check offline enrollment E2E root boundary
         run: ./scripts/check_offline_enrollment_e2e.sh
 
   test-and-lint-rio-v2:
     name: Test and Lint (rio-v2)
-    # Alternate feature configurations run on main, merge groups, and scheduled
-    # or manual validation; the default workspace remains the PR gate.
-    if: needs.classify-changes.outputs.mode == 'full' && github.event_name != 'pull_request'
+    # Alternate feature configurations run on the nightly schedule, merge
+    # groups and manual dispatch. The default workspace remains the PR gate and
+    # the per-push main baseline: repeating four feature builds on every merge
+    # bought nothing the nightly run does not report within a day.
+    if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["merge_group", "schedule", "workflow_dispatch"]'), github.event_name)
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
@@ -414,67 +457,10 @@ jobs:
           retention-days: 3
           if-no-files-found: error
 
-  connect-short-credential-boundary:
-    name: Connect Short Credential Boundary
-    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
-    needs: [ quick-checks, classify-changes ]
-    runs-on: sm-standard-4
-    timeout-minutes: 60
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
-        with:
-          persist-credentials: false
-
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: ci-dev
-          cache-save-if: 'false'
-          install-build-packaging-tools: 'false'
-          install-test-tools: 'false'
-
-      - name: Run short credential behavior tests
-        env:
-          CARGO_BUILD_JOBS: "2"
-        run: |
-          cargo test -p rustfs --test connect_registration \
-            --features connect-e2e-short-credentials \
-            registration_enforces_build_profile_credential_lifetime -- --exact
-          cargo test -p rustfs --test connect_registration \
-            --features connect-e2e-short-credentials \
-            rotation_waits_for_threshold_and_stops_on_revocation -- --exact
-
-      - name: Reject short credentials in release builds
-        env:
-          CARGO_BUILD_JOBS: "2"
-        run: |
-          log="$(mktemp)"
-          set +e
-          CARGO_TERM_COLOR=never cargo check -p rustfs --release \
-            --features connect-e2e-short-credentials >"$log" 2>&1
-          status=$?
-          set -e
-          cat "$log"
-          expected='error: connect-e2e-short-credentials is restricted to debug builds'
-          summary="error: could not compile \`rustfs\` (lib) due to 1 previous error"
-          expected_count="$(grep -Fxc "$expected" "$log" || true)"
-          summary_count="$(grep -Fc "$summary" "$log" || true)"
-          error_count="$(grep -Ec '^error(:|\[)' "$log" || true)"
-          if [ "$status" -ne 101 ] || [ "$expected_count" -ne 1 ] \
-            || [ "$summary_count" -ne 1 ] || [ "$error_count" -ne 2 ]; then
-            echo "release feature gate did not fail solely at the expected compile_error" >&2
-            rm -f "$log"
-            exit 1
-          fi
-          rm -f "$log"
-
   test-and-lint-protocols:
     name: "Test and Lint (${{ matrix.features.name }})"
-    if: needs.classify-changes.outputs.mode == 'full' && github.event_name != 'pull_request'
+    # Same cadence as test-and-lint-rio-v2 above.
+    if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["merge_group", "schedule", "workflow_dispatch"]'), github.event_name)
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
@@ -630,7 +616,7 @@ jobs:
   build-rustfs-debug-binary-rio-v2:
     name: Build RustFS Debug Binary (rio-v2)
     # Dormant rio-v2 variant (rustfs/backlog#1835): the feature ships in no
-    # default build, so this full-suite lane runs only on the weekly schedule
+    # default build, so this full-suite lane runs only on the nightly schedule
     # and manual dispatch. Per-PR cfg-seam coverage stays with
     # test-and-lint-rio-v2. Lifecycle and the promote-or-delete condition:
     # docs/architecture/minio-file-format-compat.md ("rio-v2 variant lifecycle").
@@ -1100,7 +1086,7 @@ jobs:
   s3-implemented-tests:
     name: S3 Implemented Tests
     needs: [ build-rustfs-debug-binary, e2e-tests ]
-    runs-on: sm-standard-4
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - name: Checkout repository
@@ -1169,12 +1155,12 @@ jobs:
     name: S3 Lifecycle Behavior Tests
     # Also gated on e2e-tests, matching s3-implemented-tests: when the e2e smoke
     # suite is already red this lane cannot tell us anything new, and it holds a
-    # sm-standard-4 for up to 30 minutes doing so. Both lanes only download the
+    # runner for up to 30 minutes doing so. Both lanes only download the
     # prebuilt debug binary (no cargo build), and s3-implemented-tests — which
     # already waits on e2e-tests — finishes later anyway, so a green PR's total
     # wall clock is unchanged.
     needs: [ build-rustfs-debug-binary, e2e-tests ]
-    runs-on: sm-standard-4
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout repository
@@ -1231,9 +1217,8 @@ jobs:
       - typos
       - quick-checks
       - test-and-lint
-      - offline-enrollment-e2e
+      - connect-feature-boundaries
       - test-and-lint-rio-v2
-      - connect-short-credential-boundary
       - test-and-lint-protocols
       - build-rustfs-debug-binary
       - uring-integration
@@ -1243,7 +1228,7 @@ jobs:
       - build-rustfs-debug-binary-rio-v2
       - e2e-tests-rio-v2
       - e2e-full
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -1259,12 +1244,11 @@ jobs:
     name: Alert on scheduled failure
     needs:
       - classify-changes
-      - connect-short-credential-boundary
+      - connect-feature-boundaries
       - required-checks
       - typos
       - quick-checks
       - test-and-lint
-      - offline-enrollment-e2e
       - test-and-lint-rio-v2
       - test-and-lint-protocols
       - build-rustfs-debug-binary

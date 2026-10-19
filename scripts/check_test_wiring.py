@@ -699,6 +699,10 @@ def check_ilm_build_budget(root: Path) -> list[str]:
     if step is None:
         return [".github/workflows/ci.yml: missing ignored ILM integration step"]
 
+    # Measured budget: 3 build jobs on main pushes and dispatches, 2 on pull
+    # requests. A pull-request run at 3 (39193827281) spent 70 minutes with the
+    # pod's io.pressure "full" at 86-88% and timed out before any test started;
+    # the shared pod storage, not CPU, bounds the PR lane.
     budget = (
         "CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || "
         "github.event_name == 'workflow_dispatch') && '3' || '2' }}"
@@ -5596,6 +5600,8 @@ class SelfTests(unittest.TestCase):
             workflow.write_text(valid.replace("          CARGO_BUILD_JOBS:", "          BUILD_JOBS:"))
             self.assertEqual(len(check_ilm_build_budget(root)), 1)
             for old, new in (
+                ("&& '3' || '2' }}", "&& '3' || '3' }}"),
+                ("&& '3' || '2' }}", "&& '2' || '2' }}"),
                 ("test-and-lint:", "test-ilm-integration-serial:"),
                 ("outputs.mode == 'full'", "outputs.mode == 'docs'"),
                 ("--profile default", "--profile ci"),

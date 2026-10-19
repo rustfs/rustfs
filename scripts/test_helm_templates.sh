@@ -503,6 +503,102 @@ if grep -q "name: data$" <<<"$generic_eight_by_two"; then
   exit 1
 fi
 
+# Issue #8665: an empty storageclass.dataStorageSize means the drives come from
+# extraVolumes/extraVolumeMounts, so no data PVC templates, no data mounts and
+# no empty `storage:` request may be rendered. The logs PVC is unaffected.
+jbod_extra_volumes='[{"name":"disk0","hostPath":{"path":"/mnt/disk0"}},{"name":"disk1","hostPath":{"path":"/mnt/disk1"}}]'
+jbod_extra_mounts='[{"name":"disk0","mountPath":"/data/rustfs0"},{"name":"disk1","mountPath":"/data/rustfs1"}]'
+jbod_statefulset=$(render_distributed_statefulset \
+  --set replicaCount=3 \
+  --set drivesPerNode=2 \
+  --set storageclass.dataStorageSize= \
+  --set-json "extraVolumes=${jbod_extra_volumes}" \
+  --set-json "extraVolumeMounts=${jbod_extra_mounts}")
+if grep -Eq 'name: data(-rustfs-[0-9]+)?$' <<<"$jbod_statefulset"; then
+  echo "Empty dataStorageSize must not render data PVC templates or data volume mounts" >&2
+  exit 1
+fi
+if grep -Eq 'storage:[[:space:]]*$' <<<"$jbod_statefulset"; then
+  echo "Empty dataStorageSize must not render an empty storage request" >&2
+  exit 1
+fi
+if grep -Eq 'DRIVES_PER_NODE|mkdir -p /data' <<<"$jbod_statefulset"; then
+  echo "Empty dataStorageSize must not initialize data directories in the init container" >&2
+  exit 1
+fi
+if ! grep -Fq 'mountPath: /data/rustfs1' <<<"$jbod_statefulset" || ! grep -Fq 'path: /mnt/disk1' <<<"$jbod_statefulset"; then
+  echo "Empty dataStorageSize must keep user-supplied extraVolumes and extraVolumeMounts" >&2
+  exit 1
+fi
+if ! grep -Eq '^[[:space:]]+name: logs$' <<<"$jbod_statefulset"; then
+  echo "Empty dataStorageSize must not affect the logs PVC" >&2
+  exit 1
+fi
+
+# With neither data nor logs PVCs there is nothing to claim or initialize.
+jbod_no_pvc_statefulset=$(render_distributed_statefulset \
+  --set replicaCount=3 \
+  --set drivesPerNode=2 \
+  --set storageclass.dataStorageSize= \
+  --set config.rustfs.obs_log_directory=)
+for absent_key in volumeClaimTemplates initContainers; do
+  if grep -Fq "${absent_key}:" <<<"$jbod_no_pvc_statefulset"; then
+    echo "StatefulSet without data or logs PVCs must not render ${absent_key}" >&2
+    exit 1
+  fi
+done
+
+# A pool may disable its data PVCs independently of the other pools.
+pools_mixed=$(helm template rustfs "$CHART_DIR" \
+  --namespace rustfs \
+  --set secret.rustfs.access_key=test-access-key \
+  --set secret.rustfs.secret_key=test-secret-key \
+  --set pools.enabled=true \
+  --set-json 'pools.list=[{},{"storageclass":{"dataStorageSize":""}}]')
+if grep -Eq 'storage:[[:space:]]*$' <<<"$pools_mixed"; then
+  echo "A pool with empty dataStorageSize must not render an empty storage request" >&2
+  exit 1
+fi
+statefulset_named() {
+  awk -v metadata_name="$1" '
+    function flush() {
+      if (doc ~ /kind: StatefulSet/ && index(doc, "\n  name: " metadata_name "\n") > 0) printf "%s", doc
+      doc = ""
+    }
+    /^---$/ { flush(); next }
+    { doc = doc "\n" $0 }
+    END { flush() }
+  '
+}
+pool0_statefulset=$(statefulset_named rustfs <<<"$pools_mixed")
+pool1_statefulset=$(statefulset_named rustfs-pool1 <<<"$pools_mixed")
+if ! grep -Eq 'name: data-rustfs-0$' <<<"$pool0_statefulset"; then
+  echo "A pool that keeps dataStorageSize must still render its data PVC templates" >&2
+  exit 1
+fi
+if [[ -z "$pool1_statefulset" ]] || grep -Eq 'name: data(-rustfs-[0-9]+)?$' <<<"$pool1_statefulset"; then
+  echo "A pool with empty dataStorageSize must not render data PVC templates or mounts" >&2
+  exit 1
+fi
+
+# Standalone mode: no data PVC and no data volume unless an existing claim is named.
+standalone_jbod=$(render_chart --set storageclass.dataStorageSize=)
+if grep -Eq 'rustfs-data$|storage:[[:space:]]*$' <<<"$standalone_jbod"; then
+  echo "Standalone mode with empty dataStorageSize must not render a data PVC" >&2
+  exit 1
+fi
+if grep -Eq '^[[:space:]]+- name: data$|mountPath: /data$' <<<"$standalone_jbod"; then
+  echo "Standalone mode with empty dataStorageSize must not mount a data volume" >&2
+  exit 1
+fi
+standalone_jbod_claim=$(render_chart \
+  --set storageclass.dataStorageSize= \
+  --set mode.standalone.existingClaim.dataClaim=existing-data)
+if ! grep -Fq 'claimName: existing-data' <<<"$standalone_jbod_claim"; then
+  echo "Standalone existingClaim.dataClaim must still mount when dataStorageSize is empty" >&2
+  exit 1
+fi
+
 # Issue #5416's exact three-node, one-drive topology must render all three
 # ordinal hosts while each StatefulSet pod receives its own explicit anchor.
 three_by_one_configmap=$(render_distributed_configmap --set replicaCount=3 --set drivesPerNode=1)

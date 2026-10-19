@@ -19,9 +19,9 @@ collection, because the problems and the known-good answers are the same.
    turn the cycle into `Superseded`.
 2. **The cluster activity probe stays, as a guardrail only.** It vetoes a
    publication when the heap it describes is not the heap that was walked:
-   topology, peer identity, protocol version, data movement, or a pending PUT
-   tail changed. Namespace and dirty-usage generation movement alone never
-   vetoes; it only shades buckets.
+   topology, peer identity, protocol version, or data movement changed.
+   Namespace and dirty-usage generation movement, and a pending ordinary PUT
+   commit, never veto; they only shade buckets.
 3. **Replication status writebacks are status-class barrier hits.** They
    shade a bucket for a scoped rescan but are not namespace activity. They
    never uncertify a walk and never block cycle completion. The scanner's own
@@ -230,13 +230,23 @@ walk. Field roles:
 | Field | Role |
 |---|---|
 | `instance_id`, `protocol_version`, `topology_digest` | veto: a peer restarted, changed version, or the topology changed |
-| `data_movement_active`, `movement_generation`, `publication_blocked` | veto: rebalance, decommission, or a pending PUT tail can make the walk describe a different generation |
+| `data_movement_active`, `movement_generation` | veto: rebalance or decommission can make the walk describe a different generation |
+| `publication_blocked` (a pending ordinary PUT commit) | shade signal only, and part of no plan identity: the write barrier records the bucket after the ACK and certification handles it |
 | `maintenance_generation` | veto: no cycle today records whether it published maintenance results, and the field is already part of the structural digest; it becomes a shade signal only once that distinction exists |
 | `namespace_generation`, `dirty_usage_generation`, `dirty_usage_pending` | shade signal: consumed per bucket; never a veto on their own |
 
-`scanner_activity_structural_digest` already separates the structural part
-of the snapshot from the generations. The guardrail is the structural digest
-plus the movement fields.
+The activity snapshot feeds two plan identities with different jobs. The
+coverage identity (bucket list and creation times, `topology_digest`,
+`protocol_version`, `data_movement_active`, `movement_generation`) decides
+whether a resumed bucket checkpoint still describes the same traversal; only
+it may mark a resumed sweep as mixed coverage. The reuse identity adds
+`instance_id` and `maintenance_generation` and decides whether a completed
+cache or a scoped baseline may be reused: a peer restart can lose dirty hints
+inside the journal's coalescing window and a maintenance change needs a fresh
+discovery walk, so both force a full walk, but neither changes what a
+full-walk checkpoint has already covered. `publication_blocked` belongs to
+neither identity. The guardrail compares the reuse identity plus the movement
+fields.
 
 The guardrail is bounded in three ways:
 
@@ -304,6 +314,15 @@ the speed factor. On a single-disk deployment this is one walker, one bucket,
 one object at a time, at roughly one third duty cycle under the default
 speed. Walker count is therefore a property of topology, not of the work.
 
+Two later controls bound that walk per disk rather than per object.
+rustfs/rustfs#8389 added the local-disk foreground-priority admission gate,
+which orders scanner I/O behind foreground requests. rustfs/backlog#2905 added
+a per-disk token-bucket budget (operations and bytes per second, defaults by
+detected media) that `DynamicSleeper` charges before each directory listing
+and metadata read; it is a hard ceiling layered on admission and never lets
+the scanner exceed what admission allows. The operator view is in
+`docs/operations/scanner-runtime-controls.md`.
+
 A collector's pacer sets collector work from the mutator's rate under a
 resource ceiling. The scanner adopts the same shape:
 
@@ -350,9 +369,11 @@ not tuning advice.
 
 ## What stays fail-closed
 
-- Quota authority is unchanged: an uncertified bucket keeps its last certified
-  value as the floor, as the usage floor does today. Live writes do not
-  advance it.
+- An uncertified bucket keeps its last certified value as its reported value.
+  Live writes do not advance it. Hard quota admission is owned by the
+  reservation ledger
+  ([scanner-usage-authority-decision.md](scanner-usage-authority-decision.md)),
+  so this value is reporting input, not an admission authority.
 - The storage publication epoch, leadership claim, CAS revision, publication
   lease, and tier registry fences are untouched. This design narrows what a
   generation movement means; it removes no fence.
