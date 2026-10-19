@@ -389,6 +389,39 @@ versions. A failed or cancelled caller may leave one or both domains closed;
 only a successful exact retry confirms completion. As with repair sealing,
 closing an attempt's writes also removes its future repair capability.
 
+## Local sealed-attempt inventory
+
+`LocalDisk::inventory_artifact_attempt` is a crate-private, single-disk physical
+candidate census. Its caller supplies the validated managed bucket, incarnation,
+attempt prefix and existing `ArtifactPutIdentity`. It opens both existing PUT
+and repair closure domains read-only, validates their closed markers, then holds
+the actual active-file drain locks in PUT-to-repair order. A durable closed
+marker alone does not prove that earlier physical owners have finished. The
+scanner never creates a seal or removes residual data.
+
+The scanner retains the initialized root descriptor and both drain owners in its
+blocking worker, including after its async waiter is cancelled. It checks fresh
+physical disk identity before scanning and before the terminal frame. It walks
+all versions directly from strict `xl.meta` decoding, preserves UUID-shaped
+namespace children beside referenced data directories, and accounts for known
+part files. Unknown residue, corrupt or unsupported metadata, missing referenced
+parts, symlinks, identity changes, deadlines and resource limits fail without a
+`Complete` frame. This does not verify every shard's content checksum.
+
+Output is one invocation with bounded entry frames and sequence numbers. The
+4096-entry traversal quantum only yields work; it is not a total entry limit.
+Depth, active handles, metadata size, pending references and frame size are
+bounded. Backpressure and cancellation cannot turn a partial stream into
+success. Consumers require both the explicit terminal frame and successful
+operation completion; ordinary EOF is insufficient. An absent attempt prefix
+inside the verified bucket yields an empty census; a missing bucket or disk root
+fails. The logical key limit applies to actual metadata objects after decoding
+one directory suffix, not to their longer physical payload-directory paths.
+
+This primitive does not expose an HTTP or RPC inventory interface, persist a
+Controller inventory, or establish all-member completeness, quorum readability,
+backup coverage or permission to collect garbage. Automatic GC remains disabled.
+
 ## Verification
 
 `crates/ecstore/src/store/init/tests/artifact_bucket_tests.rs` uses real four-disk

@@ -16,6 +16,7 @@
 use self::commit::lock_rename_commit_directories;
 pub(in crate::disk) use self::commit::{LocalRenamePreflightRejection, PreparedRenameData};
 
+pub(crate) mod artifact_inventory;
 mod artifact_lease;
 mod commit;
 pub(super) mod delete_recovery;

@@ -27,6 +27,24 @@ pub struct ArtifactLease {
 pub type ArtifactPutLease = ArtifactLease;
 pub type ArtifactRepairLease = ArtifactLease;
 
+/// Read-only census owns both already-closed physical mutation domains.
+pub(super) struct ArtifactInventoryLease {
+    _put: Arc<ArtifactLease>,
+    _repair: Arc<ArtifactLease>,
+}
+
+pub(super) async fn drain_closed(root: File, key: [u8; 32], deadline: tokio::time::Instant) -> Result<ArtifactInventoryLease> {
+    #[cfg(unix)]
+    {
+        unix::drain_closed(root, key, deadline).await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, key, deadline);
+        Err(DiskError::UnsupportedDisk)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum Domain {
     Put,
@@ -188,10 +206,14 @@ mod unix {
         }
 
         fn closed(&self) -> io::Result<Option<File>> {
+            self.closed_with_flags(OFlags::RDWR)
+        }
+
+        fn closed_with_flags(&self, access: OFlags) -> io::Result<Option<File>> {
             let mut file = match openat(
                 &self.key,
                 "closed",
-                OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                access | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
                 Mode::empty(),
             ) {
                 Ok(file) => File::from(file),
@@ -276,6 +298,100 @@ mod unix {
             .await
             .map_err(DiskError::from)?
             .map_err(DiskError::from)
+    }
+
+    fn read_error(error: io::Error) -> DiskError {
+        match error.kind() {
+            io::ErrorKind::NotFound => DiskError::other("artifact inventory requires closed PUT and repair domains"),
+            io::ErrorKind::InvalidData | io::ErrorKind::NotADirectory => DiskError::FileCorrupt,
+            io::ErrorKind::TimedOut => DiskError::Timeout,
+            _ if error.raw_os_error() == Some(Errno::LOOP.raw_os_error()) => DiskError::FileCorrupt,
+            _ => DiskError::from(error),
+        }
+    }
+
+    fn existing_directory(parent: &File, name: &str, device: u64) -> io::Result<File> {
+        let file = File::from(openat(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        let metadata = file.metadata()?;
+        if metadata.dev() != device || metadata.mode() & 0o077 != 0 {
+            return Err(invalid());
+        }
+        Ok(file)
+    }
+
+    fn existing(root: File, key: [u8; 32], domain: Domain) -> io::Result<Opened> {
+        let device = root.metadata()?.dev();
+        let seals = existing_directory(&root, domain.directory(), device)?;
+        let name = hex_simd::encode_to_string(key, hex_simd::AsciiCase::Lower);
+        let key = existing_directory(&seals, &name, device)?;
+        let lock = |name| -> io::Result<File> {
+            let file = File::from(openat(
+                &key,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                Mode::empty(),
+            )?);
+            if regular(&file, device)?.len() != 0 {
+                return Err(invalid());
+            }
+            Ok(file)
+        };
+        let admission = lock("admission.lock")?;
+        let active = lock("active.lock")?;
+        let opened = Opened {
+            root,
+            seals,
+            key,
+            admission,
+            active,
+            domain,
+        };
+        if opened.closed_with_flags(OFlags::RDONLY)?.is_none() {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+        Ok(opened)
+    }
+
+    fn retained(opened: Opened) -> Arc<ArtifactLease> {
+        Arc::new(ArtifactLease {
+            _active: opened.active,
+            _key_directory: opened.key,
+            _seal_directory: opened.seals,
+            _root: opened.root,
+        })
+    }
+
+    pub(super) async fn drain_closed(
+        root: File,
+        key: [u8; 32],
+        deadline: tokio::time::Instant,
+    ) -> Result<ArtifactInventoryLease> {
+        let (put, repair) = tokio::task::spawn_blocking(move || {
+            let put = existing(root.try_clone()?, key, Domain::Put)?;
+            let repair = existing(root, key, Domain::Repair)?;
+            Ok::<_, io::Error>((put, repair))
+        })
+        .await
+        .map_err(DiskError::from)?
+        .map_err(read_error)?;
+        // Lock order: closed PUT active exclusive -> closed repair active
+        // exclusive. No admission lock is acquired and no seal is created.
+        tokio::time::timeout_at(deadline, async {
+            lock(&put.active, FlockOperation::NonBlockingLockExclusive).await?;
+            lock(&repair.active, FlockOperation::NonBlockingLockExclusive).await
+        })
+        .await
+        .map_err(|_| DiskError::Timeout)?
+        .map_err(read_error)?;
+        Ok(ArtifactInventoryLease {
+            _put: retained(put),
+            _repair: retained(repair),
+        })
     }
 
     pub(super) async fn acquire(root: File, key: [u8; 32], domain: Domain) -> Result<Arc<ArtifactLease>> {

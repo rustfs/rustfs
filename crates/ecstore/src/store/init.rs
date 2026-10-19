@@ -871,6 +871,8 @@ impl ECStore {
 mod tests {
     #[cfg(feature = "test-util")]
     mod artifact_bucket_tests;
+    #[cfg(unix)]
+    mod artifact_inventory_tests;
     #[cfg(feature = "test-util")]
     mod artifact_put_seal_tests;
     #[cfg(all(feature = "test-util", unix))]
