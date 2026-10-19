@@ -61,6 +61,9 @@ pub(crate) const DURABILITY_EVENT: &str = "disk_local_durability_mode";
 /// profile terminates a test after 6 x 120 s, which bounds every case here.
 pub(crate) const MOVEMENT_COMPLETE_TIMEOUT: Duration = Duration::from_secs(240);
 pub(crate) const MOVEMENT_ACTIVE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A status probe that outlives this is treated as "still running": a held
+/// barrier can block the admin status request until the barrier itself times out.
+const STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const ADMIN_START_TIMEOUT: Duration = Duration::from_secs(45);
 pub(crate) const SEED_POOL: usize = 0;
 
@@ -387,34 +390,43 @@ impl FileBarrier {
             if !observations.is_empty() {
                 return Ok(observations);
             }
+            // The status request can wait on the held mover, so a slow probe is
+            // read as "still running" and never keeps this loop from noticing
+            // that the window was reached.
             match operation {
                 MovementOperation::Decommission(pool_id) => {
-                    let pool = decommission_pool_entry(&decommission_status_json(cluster).await?, pool_id)?;
-                    if ["complete", "failed", "canceled"]
-                        .iter()
-                        .any(|flag| decommission_flag(&pool, flag))
-                    {
-                        return Err(format!(
-                            "decommission of pool {pool_id} ended without entering barrier {}; the fault was not injected: {pool}",
-                            self.nonce
-                        )
-                        .into());
+                    if let Ok(status) = tokio::time::timeout(STATUS_PROBE_TIMEOUT, decommission_status_json(cluster)).await {
+                        let pool = decommission_pool_entry(&status?, pool_id)?;
+                        if ["complete", "failed", "canceled"]
+                            .iter()
+                            .any(|flag| decommission_flag(&pool, flag))
+                        {
+                            return Err(format!(
+                                "decommission of pool {pool_id} ended without entering barrier {}; the fault was not injected: {pool}",
+                                self.nonce
+                            )
+                            .into());
+                        }
                     }
                 }
                 MovementOperation::Rebalance(rebalance_id) => {
-                    let status = super::harness::rebalance_status_json(cluster).await?;
-                    let ended = super::harness::rebalance_complete(&status, rebalance_id).unwrap_or(false)
-                        || rebalance_stopped(&status, rebalance_id).unwrap_or(false)
-                        || status
-                            .get("pools")
-                            .and_then(Value::as_array)
-                            .is_some_and(|pools| pools.iter().any(|pool| pool_status_text(pool) == "failed"));
-                    if ended {
-                        return Err(format!(
-                            "rebalance {rebalance_id} ended without entering barrier {}; the fault was not injected: {status}",
-                            self.nonce
-                        )
-                        .into());
+                    if let Ok(status) =
+                        tokio::time::timeout(STATUS_PROBE_TIMEOUT, super::harness::rebalance_status_json(cluster)).await
+                    {
+                        let status = status?;
+                        let ended = super::harness::rebalance_complete(&status, rebalance_id).unwrap_or(false)
+                            || rebalance_stopped(&status, rebalance_id).unwrap_or(false)
+                            || status
+                                .get("pools")
+                                .and_then(Value::as_array)
+                                .is_some_and(|pools| pools.iter().any(|pool| pool_status_text(pool) == "failed"));
+                        if ended {
+                            return Err(format!(
+                                "rebalance {rebalance_id} ended without entering barrier {}; the fault was not injected: {status}",
+                                self.nonce
+                            )
+                            .into());
+                        }
                     }
                 }
             }
