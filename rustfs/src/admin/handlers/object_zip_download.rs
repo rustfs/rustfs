@@ -498,7 +498,7 @@ async fn authorize_object_zip_download_s3_action(
         req_info.version_id = None;
     }
 
-    authorize_request(req, Action::S3Action(action)).await
+    authorize_request(req, Action::S3Action(action)).await.map_err(Into::into)
 }
 
 fn uri_with_prefix_query(uri: &Uri, prefix: &str) -> S3Result<Uri> {

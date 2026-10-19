@@ -1247,7 +1247,7 @@ async fn authorize_table_catalog_s3_actions(
     if let Some(req_info) = req.extensions.get_mut::<ReqInfo>() {
         (req_info.bucket, req_info.object, req_info.version_id) = original;
     }
-    result
+    result.map_err(Into::into)
 }
 
 async fn table_catalog_request_principal(req: &S3Request<Body>) -> S3Result<TableCatalogRequestPrincipal> {
@@ -5467,7 +5467,7 @@ fn namespace_entry_from_create_request(
     })
 }
 
-fn iceberg_rest_error(error_type: &str, status: StatusCode, message: impl Into<String>) -> S3Error {
+fn iceberg_rest_error(error_type: &'static str, status: StatusCode, message: impl Into<String>) -> S3Error {
     let mut err = S3Error::with_message(S3ErrorCode::Custom(error_type.into()), message.into());
     err.set_status_code(status);
     err

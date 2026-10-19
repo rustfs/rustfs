@@ -326,7 +326,7 @@ fn contextualize_admin_pool_api_error(
 fn decommission_start_api_error(err: crate::storage_api::error::StorageError) -> ApiError {
     if crate::storage_api::capacity::is_pool_activation_fleet_proof_error(&err) {
         return ApiError {
-            code: S3ErrorCode::InternalError,
+            code: S3ErrorCode::InternalError.into(),
             message: POOL_ACTIVATION_FLEET_PROOF_REQUIRED.to_string(),
             source: Some(Box::new(err)),
         };
@@ -1226,14 +1226,14 @@ mod pools_handler_tests {
     #[test]
     fn test_contextualize_admin_pool_api_error_preserves_code_and_adds_pool_context() {
         let err = crate::error::ApiError {
-            code: rustfs_s3_types::S3ErrorCode::InvalidRequest,
+            code: rustfs_s3_types::S3ErrorCode::InvalidRequest.into(),
             message: "decommission already running".to_string(),
             source: None,
         };
 
         let err = contextualize_admin_pool_api_error(err, "start decommission", "pools [1, 3]");
 
-        assert_eq!(err.code, rustfs_s3_types::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code, rustfs_s3_types::S3ErrorCode::InvalidRequest.into());
         assert_eq!(
             err.message,
             "admin start decommission failed for pools [1, 3]: decommission already running"
@@ -1246,12 +1246,12 @@ mod pools_handler_tests {
 
         let err = decommission_start_api_error(err);
 
-        assert_eq!(err.code, rustfs_s3_types::S3ErrorCode::InternalError);
+        assert_eq!(err.code, rustfs_s3_types::S3ErrorCode::InternalError.into());
         assert_eq!(err.message, POOL_ACTIVATION_FLEET_PROOF_REQUIRED);
         assert!(err.source.is_some());
 
         let unrelated = decommission_start_api_error(crate::storage_api::error::StorageError::other("disk read failed"));
-        assert_eq!(unrelated.code, rustfs_s3_types::S3ErrorCode::InternalError);
+        assert_eq!(unrelated.code, rustfs_s3_types::S3ErrorCode::InternalError.into());
         assert_eq!(unrelated.message, "We encountered an internal error, please try again.");
     }
 

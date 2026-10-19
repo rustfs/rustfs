@@ -291,7 +291,7 @@ pub async fn authenticate_request(
         }
     }
 
-    result
+    result.map_err(Into::into)
 }
 
 /// Full admin gate over an `S3Request`: extract the request credentials,

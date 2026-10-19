@@ -2171,12 +2171,12 @@ mod tests {
                     .check_access(&mut req)
                     .await
                     .expect_err("router must require a signature");
-                assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+                assert_eq!(err.code(), &S3ErrorCode::AccessDenied.into());
                 let err = router
                     .call(req)
                     .await
                     .expect_err("handler must independently require authentication");
-                assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+                assert_eq!(err.code(), &S3ErrorCode::InvalidRequest.into());
                 assert!(err.to_string().contains("authentication required"));
             }
         }

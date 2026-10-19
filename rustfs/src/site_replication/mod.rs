@@ -87,7 +87,7 @@ use rustfs_madmin::{
     SRSvcAccReplicationEnvelope, SyncStatus,
 };
 use rustfs_policy::policy::Policy;
-use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};

@@ -296,7 +296,7 @@ mod tests {
             .call(request(http::Extensions::new()))
             .await
             .expect_err("empty slot must fail closed");
-        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable.into());
 
         assert!(slot.install(distinct_context(&ambient)));
         let response = router
