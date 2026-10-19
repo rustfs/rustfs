@@ -30,6 +30,7 @@ pub(super) mod admin_overlap;
 mod root_recovery;
 use uuid::Uuid;
 mod auto_scan;
+mod disposition;
 mod running_mainline;
 
 use super::super::{DiskOption, DiskStore, Endpoint, new_disk, storage_api::status::BucketInfo};
@@ -105,6 +106,7 @@ async fn process_manager_queue_once(manager: &HealManager) {
         notify: &manager.notify,
         cancel_token: &manager.cancel_token,
         workload_provider: &manager.workload_provider,
+        disposition_cache: &manager.disposition_cache,
     })
     .await;
 }
