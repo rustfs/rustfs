@@ -230,7 +230,8 @@ impl ScannerIODisk for Disk {
                 cache,
                 updates,
                 scan_mode,
-                SCANNER_SLEEPER.clone(),
+                // Every walker of this local disk shares its background I/O budget.
+                SCANNER_SLEEPER.for_disk(&self.path()),
                 prefix_scan_scope,
                 checkpoint_tx,
             ),
