@@ -22,7 +22,7 @@ use crate::admin::storage_api::object::StorageObjectOptions as ObjectOptions;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::{ADMIN_PREFIX, RemoteAddr, api_prefix};
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit},
@@ -397,7 +397,12 @@ fn format_expires_at(value: OffsetDateTime) -> S3Result<String> {
 }
 
 fn build_download_url(id: &str, token: &str) -> String {
-    format!("{ADMIN_PREFIX}{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH}/{id}.zip?token={token}")
+    build_download_url_under(api_prefix().unwrap_or(""), id, token)
+}
+
+// The browser follows this URL directly, so it must carry the external API prefix.
+fn build_download_url_under(api_prefix: &str, id: &str, token: &str) -> String {
+    format!("{api_prefix}{ADMIN_PREFIX}{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH}/{id}.zip?token={token}")
 }
 
 async fn authenticate_object_zip_download_request(req: &mut S3Request<Body>) -> S3Result<()> {
@@ -1017,6 +1022,18 @@ mod tests {
         let download_url = build_download_url(&created.id, &created.token);
         assert!(download_url.starts_with("/rustfs/admin/v3/object-zip-downloads/"));
         assert!(download_url.ends_with(&format!(".zip?token={}", created.token)));
+    }
+
+    #[test]
+    fn build_download_url_includes_api_prefix() {
+        assert_eq!(
+            build_download_url_under("", "id", "tok"),
+            "/rustfs/admin/v3/object-zip-downloads/id.zip?token=tok"
+        );
+        assert_eq!(
+            build_download_url_under("/tools/rustfs/api", "id", "tok"),
+            "/tools/rustfs/api/rustfs/admin/v3/object-zip-downloads/id.zip?token=tok"
+        );
     }
 
     #[test]
