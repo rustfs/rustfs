@@ -2,7 +2,7 @@
 
 **Use this when:** restarting or upgrading nodes of an erasure-coded multi-node cluster, bringing a cluster back after several nodes were down at once, or interpreting `503` degraded-mode responses during startup.
 
-**Source of truth:** `crates/config/src/constants/health.rs` (`DEFAULT_STARTUP_READINESS_MAX_WAIT_SECS`), `rustfs/src/server/readiness.rs` (readiness responses and `Retry-After`), `crates/config/src/constants/drive.rs` (remote-drive recovery thresholds), `helm/rustfs/values.yaml` (`minReadySeconds`), the `iam_bootstrap_retry_failed` log event.
+**Source of truth:** `crates/config/src/constants/health.rs` (`DEFAULT_STARTUP_READINESS_MAX_WAIT_SECS`), `rustfs/src/server/readiness.rs` (readiness responses and `Retry-After`), `crates/config/src/constants/drive.rs` (remote-drive recovery thresholds), `helm/rustfs/values.yaml` (`minReadySeconds`), `rustfs/src/server/readiness/peer_readmission.rs` (startup peer re-admission gate), the `iam_bootstrap_retry_failed` and `startup_peer_readmission` log events.
 
 Upgrading the binary or container image does not change the on-disk data format unless an explicitly enabled feature documents a version floor. Replacing the executable and restarting does not run a migration step on startup.
 
@@ -39,7 +39,7 @@ For each node, in any order, one at a time:
    curl -fsS http://<node>:9000/health/ready
    ```
 
-3. Wait until every other node has re-admitted it. A node's own `/health/ready` says that it can reach the cluster, not that the cluster can reach it again. On each of the other nodes, `details.storage.unavailableDrives` must no longer list the restarted node's drives. `hostOnline: false` means that node cannot dial the restarted peer yet; `runtimeState` of `offline` or `returning` means the dial works and the drive is still passing its recovery probes:
+3. Wait until every other node has re-admitted it. A distributed node holds its startup readiness until a strict majority of the peers in each of its erasure sets count its drives online (see [startup peer re-admission](#startup-peer-re-admission)), but that gate fails open, so check the remaining nodes before moving on. A node's own `/health/ready` says that it can reach the cluster, not that the cluster can reach it again. On each of the other nodes, `details.storage.unavailableDrives` must no longer list the restarted node's drives. `hostOnline: false` means that node cannot dial the restarted peer yet; `runtimeState` of `offline` or `returning` means the dial works and the drive is still passing its recovery probes:
 
    ```bash
    curl -s http://<other-node>:9000/health/ready | jq '.details.storage.unavailableDrives'
@@ -54,6 +54,20 @@ While one node is down, the rest of the cluster keeps quorum and serves all traf
 A survivor dials a peer by its configured host name on every reconnect and keeps no address cache of its own. After the peer's connections drop, its remote drives become `suspect` on the first failed RPC and `offline` on the second (`RUSTFS_DRIVE_SUSPECT_FAILURE_THRESHOLD`, default `2`). The survivor then probes the peer every `RUSTFS_DRIVE_RETURNING_PROBE_INTERVAL_SECS` (default `2`) and needs `RUSTFS_DRIVE_RETURNING_SUCCESS_THRESHOLD` (default `3`) consecutive successes before the drive counts as `online` again, so re-admission trails the first successful dial by about four to six seconds even on a perfect network.
 
 On Kubernetes the dial itself is the slow part. A replaced pod gets a new IP, but resolvers keep answering with the previous one until the record's TTL expires: kube-dns serves 30-second TTLs, CoreDNS five seconds by default, and NodeLocal DNSCache honours either. Packets to the old IP are usually dropped rather than refused, so every dial runs into the 3-second connect timeout (`RUSTFS_INTERNODE_CONNECT_TIMEOUT_SECS`) and the 1-second budget of the readiness ping (`RUSTFS_HEALTH_LOCK_ONLINE_TIMEOUT_MS`) logs `online check timed out while dialing`. Until the stale record expires, survivors count the replaced pod as unreachable even though it already reports Ready. The Helm chart therefore sets `minReadySeconds` (default `45`) on each StatefulSet so the rolling update does not stop the next pod inside that window. Size it to your DNS TTL plus about ten seconds, or set it to `0` when an external procedure performs step 3 itself.
+
+### Startup peer re-admission
+
+After a distributed node reaches local readiness, it asks the peers in every erasure set it serves how they currently see its drives. It uses the `PeerDriveAdmission` internode RPC, and each peer answers with the same predicate its own `/health/ready` uses for `unavailableDrives`. Startup readiness is published once a strict majority of each set's peers count all of this node's drives in that set as online. In a three-node set that means both peers. While the node waits, `/health/ready` stays `503` with `startup_finalization_pending` and the log shows `event="startup_peer_readmission" state="waiting"`.
+
+The wait always ends in publication:
+
+- `result="admitted"`: the peers re-admitted the node.
+- `result="gave_up" reason="deadline_elapsed"`: the startup budget `RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS` ran out. The gate shares that budget with local readiness.
+- `result="gave_up" reason="peers_unreachable"`: for 15 seconds the node could not reach enough peers to make the majority possible. A dead peer does not hold a rollout for the whole budget.
+- `result="gave_up" reason="peers_cannot_report"`: too many peers run an older release without the RPC, which is normal for the first nodes of a rolling upgrade.
+- `result="skipped"`: the gate is disabled, the deployment is not distributed, or no erasure set shares drives with a peer.
+
+The gate covers the delay inside RustFS without relying on the orchestrator. The chart's `minReadySeconds` stays useful as a second margin and for older releases. Set `RUSTFS_STARTUP_PEER_READMISSION_ENABLE=false` to return to local-only startup readiness.
 
 ## Sequential cold start (multiple nodes down)
 
@@ -80,6 +94,7 @@ When the whole cluster (or several nodes) went down and nodes are brought back o
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS` | `120` (`DEFAULT_STARTUP_READINESS_MAX_WAIT_SECS`) | How long startup waits for full readiness before continuing in degraded mode with background recovery. Raising it delays the listener during genuinely slow starts; lowering it surfaces degraded mode sooner. Recovery retries continue regardless of this limit. |
+| `RUSTFS_STARTUP_PEER_READMISSION_ENABLE` | `true` (`DEFAULT_STARTUP_PEER_READMISSION_ENABLE`) | Hold startup readiness until a strict majority of each erasure set's peers count this node's drives online. The wait is bounded by `RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS` and fails open. Set `false` to publish on this node's own view only. |
 | `RUSTFS_DRIVE_RETURNING_PROBE_INTERVAL_SECS` | `2` (`DEFAULT_DRIVE_RETURNING_PROBE_INTERVAL_SECS`) | Interval between recovery probes to a remote drive that is `offline` or `returning`. |
 | `RUSTFS_DRIVE_RETURNING_SUCCESS_THRESHOLD` | `3` (`DEFAULT_DRIVE_RETURNING_SUCCESS_THRESHOLD`) | Consecutive successful probes before an `offline` remote drive is `online` again. Together with the interval this bounds how long survivors keep a restarted peer out after they can dial it. |
 
