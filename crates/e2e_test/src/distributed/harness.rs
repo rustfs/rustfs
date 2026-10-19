@@ -77,6 +77,7 @@ pub(crate) struct DistCluster {
     pub cluster: RustFSTestClusterEnvironment,
     pool_storage_roots: Option<Vec<PathBuf>>,
     owned_pool_dirs: Vec<PathBuf>,
+    capture_log_dir: Option<PathBuf>,
 }
 
 impl DistCluster {
@@ -128,11 +129,12 @@ impl DistCluster {
         for &(key, value) in extra_env {
             cluster.set_env(key, value);
         }
-        configure_node_logs(&mut cluster)?;
+        configure_node_logs(&mut cluster, None)?;
         Ok(Self {
             cluster,
             pool_storage_roots,
             owned_pool_dirs,
+            capture_log_dir: None,
         })
     }
 
@@ -170,6 +172,14 @@ impl DistCluster {
         Ok(())
     }
 
+    /// Append every node's stdout/stderr to `directory/node-<idx>.log`, including
+    /// nodes added by later pool expansion. Call before the first start so startup
+    /// events such as the resolved durability mode are captured.
+    pub fn capture_logs_under(&mut self, directory: &Path) -> TestResult {
+        self.capture_log_dir = Some(directory.to_path_buf());
+        configure_node_logs(&mut self.cluster, Some(directory))
+    }
+
     pub fn client_with_credentials(&self, node_idx: usize, access_key: &str, secret_key: &str) -> TestResult<Client> {
         if node_idx >= self.cluster.nodes.len() {
             return Err("node_idx is invalid".into());
@@ -192,7 +202,7 @@ impl DistCluster {
             .ok_or("pool expansion requires configured isolated pool filesystems")?;
         self.owned_pool_dirs
             .push(relocate_pool_storage(&mut self.cluster, node_idx, roots)?);
-        configure_node_logs(&mut self.cluster)?;
+        configure_node_logs(&mut self.cluster, self.capture_log_dir.as_deref())?;
         self.cluster.start().await?;
         wait_for_ready(&self.cluster).await?;
         Ok(node_idx)
@@ -326,7 +336,17 @@ fn relocate_pool_storage(cluster: &mut RustFSTestClusterEnvironment, node_idx: u
     Ok(pool_run_root)
 }
 
-fn configure_node_logs(cluster: &mut RustFSTestClusterEnvironment) -> TestResult {
+fn configure_node_logs(cluster: &mut RustFSTestClusterEnvironment, capture_dir: Option<&Path>) -> TestResult {
+    if let Some(directory) = capture_dir {
+        std::fs::create_dir_all(directory)?;
+        for node_idx in 0..cluster.nodes.len() {
+            if cluster.node_capture_log_paths[node_idx].is_none() {
+                let path = directory.join(format!("node-{node_idx}.log"));
+                cluster.set_node_capture_log_path(node_idx, path.to_string_lossy().into_owned())?;
+            }
+        }
+        return Ok(());
+    }
     let Some(log_dir) = std::env::var_os("RUSTFS_E2E_LOG_DIR") else {
         return Ok(());
     };
