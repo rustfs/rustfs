@@ -180,36 +180,26 @@ jobs:
 
       - name: Run nextest tests
         env:
-          # #5394 mitigation, now under a measured experiment (backlog#1601).
+          # #5394 mitigation, settled by the backlog#1601 experiment.
           #
           # 2 was chosen when three concurrent workspace test links were believed
           # to saturate the runner's overlay I/O and wedge Cargo until the 75m
           # timeout. cgroup v2 readings from the sampler show the pod actually
-          # has 14 CPUs and 28GB (peak use 2.1GB), so 2 throttles compilation to
-          # a seventh of what is available and memory was never the constraint —
-          # the label name "sm-standard-4" had led everyone, including the
-          # original mitigation, to assume 4 cores.
+          # has 14 CPUs and 28GB (peak use 2.1GB): the label name "sm-standard-4"
+          # had led everyone, including the original mitigation, to assume 4
+          # cores, and memory was never the constraint.
           #
-          # Raised to 3 on main pushes and manual dispatches; PRs keep 2 so the
-          # merge path is untouched while the experiment runs.
-          #
-          # During baseline collection, main pushes cancelled superseded runs:
-          # only 4 of 20 Test and Lint jobs reached a terminal state. Running
-          # main validations now finish; dispatch remains an independent group
-          # for collecting additional samples on demand.
-          #
-          # Baseline over 17 samples at 2:
-          # median nextest/clippy step ratio 1.95, spread 1.85-2.06. The gate-2
-          # criterion is that ratio dropping at least 10% (below ~1.76) with no
-          # 75m timeout and no run showing three consecutive samples of
-          # rustc/collect2/rust-lld in D state. If it does not, the conclusion is
-          # "this limit is not the bottleneck" — fix it back at 2 and record the
-          # experiment, which is a result, not a failure.
+          # Measured on the same ci-dev cache, the test-profile compile took
+          # 28m21s at 2 on a pull request and 16-23 min at 3 across three
+          # successful main runs, none near the 75m timeout. 3 is now the floor
+          # on every event. The next experiment is 4-6, run the same way with
+          # the resource sampler watching for rustc/collect2/rust-lld in D state
+          # before the value is raised on pull requests.
           #
           # Must stay step-level: rust-cache hashes CARGO/CC/CFLAGS/CXX/CMAKE/RUST
           # prefixed variables from process.env into the cache key, so promoting
           # this to job level would rotate every key on this lane.
-          CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '3' || '2' }}
+          CARGO_BUILD_JOBS: "3"
         run: |
           mkdir -p artifacts/test-and-lint
           rm -f target/nextest/ci/junit.xml
@@ -296,7 +286,7 @@ jobs:
         if: needs.classify-changes.outputs.mode == 'full'
         env:
           # Match the preceding workspace build and reuse its feature graph.
-          CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '3' || '2' }}
+          CARGO_BUILD_JOBS: "3"
         run: |
           mkdir -p artifacts/ilm-integration
           set +e
@@ -324,10 +314,12 @@ jobs:
           path: artifacts/ilm-integration
           retention-days: 3
 
-  # This gate builds into a fresh target directory to isolate the E2E root.
-  # Give its cold build a separate budget from workspace tests and migration proofs.
-  offline-enrollment-e2e:
-    name: Offline Enrollment E2E Root Boundary
+  # Both Connect boundaries rebuild only the rustfs crate on top of the restored
+  # ci-dev cache: the two e2e features are empty, so every dependency keeps its
+  # cached dev-profile artifact and each feature set recompiles rustfs once.
+  # The budget covers a ci-dev miss, where the first step builds the whole graph.
+  connect-feature-boundaries:
+    name: Connect Feature Boundaries
     if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
@@ -351,6 +343,45 @@ jobs:
 
       - name: Protect Connect test home
         run: chmod go-w "$(realpath "$HOME")"
+
+      - name: Run short credential behavior tests
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          cargo test -p rustfs --test connect_registration \
+            --features connect-e2e-short-credentials \
+            registration_enforces_build_profile_credential_lifetime -- --exact
+          cargo test -p rustfs --test connect_registration \
+            --features connect-e2e-short-credentials \
+            rotation_waits_for_threshold_and_stops_on_revocation -- --exact
+
+      # The guard in rustfs/src/connect/registration.rs is cfg(not(debug_assertions)),
+      # the setting the release profile turns off. Handing that one flag to the
+      # rustfs lib through `cargo rustc` trips it against the cached dev-profile
+      # dependencies instead of a cold `cargo check --release` of the whole graph.
+      - name: Reject short credentials without debug assertions
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          log="$(mktemp)"
+          set +e
+          CARGO_TERM_COLOR=never cargo rustc -p rustfs --lib \
+            --features connect-e2e-short-credentials -- -C debug-assertions=off >"$log" 2>&1
+          status=$?
+          set -e
+          cat "$log"
+          expected='error: connect-e2e-short-credentials is restricted to debug builds'
+          summary="error: could not compile \`rustfs\` (lib) due to 1 previous error"
+          expected_count="$(grep -Fxc "$expected" "$log" || true)"
+          summary_count="$(grep -Fc "$summary" "$log" || true)"
+          error_count="$(grep -Ec '^error(:|\[)' "$log" || true)"
+          if [ "$status" -ne 101 ] || [ "$expected_count" -ne 1 ] \
+            || [ "$summary_count" -ne 1 ] || [ "$error_count" -ne 2 ]; then
+            echo "feature gate did not fail solely at the expected compile_error" >&2
+            rm -f "$log"
+            exit 1
+          fi
+          rm -f "$log"
 
       - name: Check offline enrollment E2E root boundary
         run: ./scripts/check_offline_enrollment_e2e.sh
@@ -414,64 +445,6 @@ jobs:
             artifacts/test-and-lint
           retention-days: 3
           if-no-files-found: error
-
-  connect-short-credential-boundary:
-    name: Connect Short Credential Boundary
-    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
-    needs: [ quick-checks, classify-changes ]
-    runs-on: sm-standard-4
-    timeout-minutes: 60
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
-        with:
-          persist-credentials: false
-
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          rust-version: stable
-          cache-shared-key: ci-dev
-          cache-save-if: 'false'
-          install-build-packaging-tools: 'false'
-          install-test-tools: 'false'
-
-      - name: Run short credential behavior tests
-        env:
-          CARGO_BUILD_JOBS: "2"
-        run: |
-          cargo test -p rustfs --test connect_registration \
-            --features connect-e2e-short-credentials \
-            registration_enforces_build_profile_credential_lifetime -- --exact
-          cargo test -p rustfs --test connect_registration \
-            --features connect-e2e-short-credentials \
-            rotation_waits_for_threshold_and_stops_on_revocation -- --exact
-
-      - name: Reject short credentials in release builds
-        env:
-          CARGO_BUILD_JOBS: "2"
-        run: |
-          log="$(mktemp)"
-          set +e
-          CARGO_TERM_COLOR=never cargo check -p rustfs --release \
-            --features connect-e2e-short-credentials >"$log" 2>&1
-          status=$?
-          set -e
-          cat "$log"
-          expected='error: connect-e2e-short-credentials is restricted to debug builds'
-          summary="error: could not compile \`rustfs\` (lib) due to 1 previous error"
-          expected_count="$(grep -Fxc "$expected" "$log" || true)"
-          summary_count="$(grep -Fc "$summary" "$log" || true)"
-          error_count="$(grep -Ec '^error(:|\[)' "$log" || true)"
-          if [ "$status" -ne 101 ] || [ "$expected_count" -ne 1 ] \
-            || [ "$summary_count" -ne 1 ] || [ "$error_count" -ne 2 ]; then
-            echo "release feature gate did not fail solely at the expected compile_error" >&2
-            rm -f "$log"
-            exit 1
-          fi
-          rm -f "$log"
 
   test-and-lint-protocols:
     name: "Test and Lint (${{ matrix.features.name }})"
@@ -1232,9 +1205,8 @@ jobs:
       - typos
       - quick-checks
       - test-and-lint
-      - offline-enrollment-e2e
+      - connect-feature-boundaries
       - test-and-lint-rio-v2
-      - connect-short-credential-boundary
       - test-and-lint-protocols
       - build-rustfs-debug-binary
       - uring-integration
@@ -1260,12 +1232,11 @@ jobs:
     name: Alert on scheduled failure
     needs:
       - classify-changes
-      - connect-short-credential-boundary
+      - connect-feature-boundaries
       - required-checks
       - typos
       - quick-checks
       - test-and-lint
-      - offline-enrollment-e2e
       - test-and-lint-rio-v2
       - test-and-lint-protocols
       - build-rustfs-debug-binary
