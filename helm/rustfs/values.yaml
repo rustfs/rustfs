@@ -189,6 +189,10 @@ config:
       max_concurrent_disk_scans: ""
       # Bucket walkers per local disk (1-16; default 1 keeps one bucket walk per disk, raise on flash)
       walkers_per_disk: ""
+      # Per-local-disk scanner I/O ceiling in operations per second (auto, off, or a number)
+      disk_io_budget_iops: ""
+      # Per-local-disk scanner I/O ceiling in bytes per second (auto, off, or a number)
+      disk_io_budget_bytes_per_sec: ""
       # Yield to the async runtime every N scanned objects (0 disables extra yield)
       yield_every_n_objects: ""
       # Version count threshold for scanner alerts

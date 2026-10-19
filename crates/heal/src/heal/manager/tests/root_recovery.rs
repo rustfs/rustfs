@@ -2504,14 +2504,25 @@ async fn root_recovery_legacy_oversized_quarantine_survives_larger_intent_limit(
     disk.write_all(RUSTFS_META_BUCKET, &path, bytes.into())
         .await
         .expect("alter retained prefix");
+    let inventory = manager
+        .root_recovery
+        .inventory()
+        .await
+        .expect("a changed legacy source is reported per record");
+    assert!(inventory.requests.is_empty(), "the changed source is never replayed");
+    assert!(!inventory.quarantined_task_ids.contains(&request.id));
     assert!(
-        manager.root_recovery.inventory().await.is_err(),
-        "a changed legacy source still fails closed"
+        inventory
+            .conflicted
+            .get(&request.id)
+            .is_some_and(|reason| reason.contains("quarantine source changed")),
+        "{:?}",
+        inventory.conflicted
     );
 }
 
 #[tokio::test]
-async fn root_recovery_quarantine_source_change_fails_closed() {
+async fn root_recovery_quarantine_source_change_is_fenced_per_record() {
     let (_temp, disk) = recovery_disk().await;
     let manager = recovery_manager(vec![disk.clone()]);
     let request = root_request();
@@ -2523,7 +2534,29 @@ async fn root_recovery_quarantine_source_change_fails_closed() {
     disk.write_all(RUSTFS_META_BUCKET, &path, b"changed".to_vec().into())
         .await
         .expect("change retained source");
-    assert!(manager.root_recovery.pending().await.is_err(), "marker must fence a changed source");
+    assert!(
+        manager
+            .root_recovery
+            .pending()
+            .await
+            .expect("a changed source is reported, not a failed inventory")
+            .is_empty(),
+        "marker must fence a changed source"
+    );
+    let inventory = manager.root_recovery.inventory().await.expect("per-record inventory");
+    assert!(
+        inventory
+            .conflicted
+            .get(&request.id)
+            .is_some_and(|reason| reason.contains("quarantine source changed"))
+    );
+    let mut reused = request.clone();
+    reused.force_start = true;
+    let refused = manager
+        .submit_heal_request(reused)
+        .await
+        .expect_err("a changed source keeps the task id reserved");
+    assert!(refused.to_string().contains("quarantine source changed"), "{refused}");
 }
 
 #[tokio::test]
@@ -3019,6 +3052,77 @@ async fn root_recovery_erasure_bucket_scope_marker_quarantines_conflicts() {
                 .expect("retained record")
                 .as_ref(),
             bytes.as_slice()
+        );
+    }
+}
+
+#[tokio::test]
+async fn root_recovery_conflicting_record_does_not_block_other_replays() {
+    // A record with two durable owners cannot be admitted or quarantined, but
+    // it must not postpone every other accepted responsibility.
+    let (_temp_a, disk_a) = recovery_disk().await;
+    let (_temp_b, disk_b) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk_a.clone(), disk_b.clone()]);
+    let valid = root_request();
+    manager.root_recovery.persist(&valid).await.expect("valid root record");
+    let conflicting = root_request();
+    let bytes = disk_a
+        .read_all(RUSTFS_META_BUCKET, &format!("root-heal-{}.json", valid.id))
+        .await
+        .expect("read valid record bytes")
+        .to_vec();
+    let duplicated = String::from_utf8(bytes)
+        .expect("record JSON")
+        .replace(&valid.id, &conflicting.id);
+    for disk in [&disk_a, &disk_b] {
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            &format!("root-heal-{}.json", conflicting.id),
+            duplicated.clone().into_bytes().into(),
+        )
+        .await
+        .expect("write duplicated owner");
+    }
+
+    manager
+        .replay_root_heals()
+        .await
+        .expect("one conflicting record must not fail the whole replay");
+    assert_eq!(manager.get_queue_length().await, 1, "the valid record replays");
+    assert!(
+        manager
+            .heal_queue
+            .lock()
+            .await
+            .requests()
+            .any(|request| request.id == valid.id)
+    );
+    let inventory = manager.root_recovery.inventory().await.expect("per-record inventory");
+    assert!(
+        inventory.requests.iter().all(|request| request.id != conflicting.id),
+        "a conflicting record is never replayed"
+    );
+    let mut reused = conflicting.clone();
+    reused.force_start = true;
+    let refused = manager
+        .submit_heal_request(reused)
+        .await
+        .expect_err("a conflicting task id stays reserved");
+    assert!(refused.to_string().contains("Multiple root heal recovery owners"), "{refused}");
+    assert!(
+        matches!(
+            manager.get_task_status(&conflicting.id).await,
+            Ok(HealTaskStatus::Failed { error }) if error.contains("Multiple root heal recovery owners")
+        ),
+        "the admin status interface reports why the record cannot run"
+    );
+    for disk in [&disk_a, &disk_b] {
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, &format!("root-heal-{}.json", conflicting.id))
+                .await
+                .expect("conflicting record retained")
+                .as_ref(),
+            duplicated.as_bytes()
         );
     }
 }

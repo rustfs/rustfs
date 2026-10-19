@@ -325,6 +325,12 @@ pub struct ScannerUsageFreshnessSnapshot {
     pub last_guardrail_veto_unix_secs: u64,
     #[serde(rename = "last_guardrail_veto_reason", default)]
     pub last_guardrail_veto_reason: String,
+    #[serde(rename = "disk_io_budget_wait_events", default)]
+    pub disk_io_budget_wait_events: u64,
+    #[serde(rename = "disk_io_budget_wait_millis", default)]
+    pub disk_io_budget_wait_millis: u64,
+    #[serde(rename = "last_disk_io_budget_wait_unix_secs", default)]
+    pub last_disk_io_budget_wait_unix_secs: u64,
 }
 
 impl ScannerUsageFreshnessSnapshot {
@@ -351,6 +357,15 @@ impl ScannerUsageFreshnessSnapshot {
         }
         self.deferred_total = self.deferred_total.saturating_add(other.deferred_total);
         self.guardrail_veto_total = self.guardrail_veto_total.saturating_add(other.guardrail_veto_total);
+        self.disk_io_budget_wait_events = self
+            .disk_io_budget_wait_events
+            .saturating_add(other.disk_io_budget_wait_events);
+        self.disk_io_budget_wait_millis = self
+            .disk_io_budget_wait_millis
+            .saturating_add(other.disk_io_budget_wait_millis);
+        self.last_disk_io_budget_wait_unix_secs = self
+            .last_disk_io_budget_wait_unix_secs
+            .max(other.last_disk_io_budget_wait_unix_secs);
         if other.last_guardrail_veto_unix_secs > self.last_guardrail_veto_unix_secs {
             self.last_guardrail_veto_unix_secs = other.last_guardrail_veto_unix_secs;
             self.last_guardrail_veto_reason = other.last_guardrail_veto_reason.clone();
@@ -443,6 +458,8 @@ pub struct ScannerPacingPressureSnapshot {
     pub last_cycle_pause_observed: bool,
     #[serde(rename = "last_cycle_throttle_sleep_ratio", default)]
     pub last_cycle_throttle_sleep_ratio: f64,
+    #[serde(rename = "last_cycle_disk_io_budget_wait_ratio", default)]
+    pub last_cycle_disk_io_budget_wait_ratio: f64,
     #[serde(rename = "last_cycle_yield_ratio", default)]
     pub last_cycle_yield_ratio: f64,
     #[serde(rename = "last_cycle_total_pause_ratio", default)]
@@ -458,6 +475,7 @@ impl Default for ScannerPacingPressureSnapshot {
             last_cycle_budget_limited: false,
             last_cycle_pause_observed: false,
             last_cycle_throttle_sleep_ratio: 0.0,
+            last_cycle_disk_io_budget_wait_ratio: 0.0,
             last_cycle_yield_ratio: 0.0,
             last_cycle_total_pause_ratio: 0.0,
         }
@@ -470,6 +488,8 @@ impl ScannerPacingPressureSnapshot {
             "queued_scans"
         } else if self.last_cycle_budget_limited {
             "cycle_budget"
+        } else if self.last_cycle_disk_io_budget_wait_ratio > 0.0 {
+            "disk_io_budget"
         } else if self.last_cycle_pause_observed {
             "throttle_pause"
         } else if self.current_active_scans > 0 {
@@ -492,6 +512,9 @@ impl ScannerPacingPressureSnapshot {
         self.last_cycle_throttle_sleep_ratio = self
             .last_cycle_throttle_sleep_ratio
             .max(other.last_cycle_throttle_sleep_ratio);
+        self.last_cycle_disk_io_budget_wait_ratio = self
+            .last_cycle_disk_io_budget_wait_ratio
+            .max(other.last_cycle_disk_io_budget_wait_ratio);
         self.last_cycle_yield_ratio = self.last_cycle_yield_ratio.max(other.last_cycle_yield_ratio);
         self.last_cycle_total_pause_ratio = self.last_cycle_total_pause_ratio.max(other.last_cycle_total_pause_ratio);
         self.refresh_primary_pressure();
@@ -641,6 +664,10 @@ pub struct ScannerMetrics {
     pub current_cycle_throttle_sleep_events: u64,
     #[serde(rename = "current_cycle_throttle_sleep_duration_seconds", default)]
     pub current_cycle_throttle_sleep_duration_seconds: f64,
+    #[serde(rename = "current_cycle_disk_io_budget_wait_events", default)]
+    pub current_cycle_disk_io_budget_wait_events: u64,
+    #[serde(rename = "current_cycle_disk_io_budget_wait_duration_seconds", default)]
+    pub current_cycle_disk_io_budget_wait_duration_seconds: f64,
     #[serde(rename = "current_cycle_ilm_actions", default)]
     pub current_cycle_ilm_actions: u64,
     #[serde(rename = "current_cycle_lifecycle_expiry_actions", default)]
@@ -687,6 +714,10 @@ pub struct ScannerMetrics {
     pub last_cycle_throttle_sleep_events: u64,
     #[serde(rename = "last_cycle_throttle_sleep_duration_seconds", default)]
     pub last_cycle_throttle_sleep_duration_seconds: f64,
+    #[serde(rename = "last_cycle_disk_io_budget_wait_events", default)]
+    pub last_cycle_disk_io_budget_wait_events: u64,
+    #[serde(rename = "last_cycle_disk_io_budget_wait_duration_seconds", default)]
+    pub last_cycle_disk_io_budget_wait_duration_seconds: f64,
     #[serde(rename = "last_cycle_ilm_actions", default)]
     pub last_cycle_ilm_actions: u64,
     #[serde(rename = "last_cycle_heal_objects", default)]
@@ -868,6 +899,10 @@ impl ScannerMetrics {
             .current_cycle_throttle_sleep_events
             .saturating_add(other.current_cycle_throttle_sleep_events);
         self.current_cycle_throttle_sleep_duration_seconds += other.current_cycle_throttle_sleep_duration_seconds;
+        self.current_cycle_disk_io_budget_wait_events = self
+            .current_cycle_disk_io_budget_wait_events
+            .saturating_add(other.current_cycle_disk_io_budget_wait_events);
+        self.current_cycle_disk_io_budget_wait_duration_seconds += other.current_cycle_disk_io_budget_wait_duration_seconds;
         self.current_cycle_ilm_actions = self.current_cycle_ilm_actions.saturating_add(other.current_cycle_ilm_actions);
         self.current_cycle_lifecycle_expiry_actions = self
             .current_cycle_lifecycle_expiry_actions
@@ -900,6 +935,10 @@ impl ScannerMetrics {
             .last_cycle_throttle_sleep_events
             .saturating_add(other.last_cycle_throttle_sleep_events);
         self.last_cycle_throttle_sleep_duration_seconds += other.last_cycle_throttle_sleep_duration_seconds;
+        self.last_cycle_disk_io_budget_wait_events = self
+            .last_cycle_disk_io_budget_wait_events
+            .saturating_add(other.last_cycle_disk_io_budget_wait_events);
+        self.last_cycle_disk_io_budget_wait_duration_seconds += other.last_cycle_disk_io_budget_wait_duration_seconds;
         self.last_cycle_ilm_actions = self.last_cycle_ilm_actions.saturating_add(other.last_cycle_ilm_actions);
         self.last_cycle_lifecycle_expiry_actions = self
             .last_cycle_lifecycle_expiry_actions

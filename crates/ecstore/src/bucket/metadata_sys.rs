@@ -527,6 +527,15 @@ pub(crate) async fn get_bucket_incarnation_id_in(ctx: &crate::runtime::instance:
     sys.get_bucket_incarnation_id_from_disk(bucket).await
 }
 
+pub(crate) async fn find_bucket_incarnation_id_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+) -> Result<Option<Uuid>> {
+    let sys = bucket_metadata_sys_of(ctx)?;
+    let sys = sys.read().await.clone();
+    sys.find_bucket_incarnation_id_from_disk(bucket).await
+}
+
 /// Directory loss is recoverable only for a committed, non-retired generation.
 /// The caller retains the bucket lifecycle fence through the ensuing reconstruction.
 pub(crate) async fn validate_bucket_reconstruction_in(
@@ -2652,6 +2661,11 @@ impl BucketMetadataSys {
     }
 
     async fn get_bucket_incarnation_id_from_disk(&self, bucket: &str) -> Result<Uuid> {
+        let incarnation_id = self.find_bucket_incarnation_id_from_disk(bucket).await?;
+        Self::require_bucket_incarnation_id(bucket, incarnation_id)
+    }
+
+    async fn find_bucket_incarnation_id_from_disk(&self, bucket: &str) -> Result<Option<Uuid>> {
         let transaction_lock = self
             .object_store()
             .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
@@ -2659,7 +2673,7 @@ impl BucketMetadataSys {
         let _transaction_guard = transaction_lock
             .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
             .await?;
-        self.get_bucket_incarnation_id_under_transaction_lock(bucket, &_transaction_guard)
+        self.find_bucket_incarnation_id_under_transaction_lock(bucket, &_transaction_guard)
             .await
     }
 
@@ -2668,14 +2682,26 @@ impl BucketMetadataSys {
         bucket: &str,
         transaction_guard: &rustfs_lock::NamespaceLockGuard,
     ) -> Result<Uuid> {
+        let incarnation_id = self
+            .find_bucket_incarnation_id_under_transaction_lock(bucket, transaction_guard)
+            .await?;
+        Self::require_bucket_incarnation_id(bucket, incarnation_id)
+    }
+
+    fn require_bucket_incarnation_id(bucket: &str, incarnation_id: Option<Uuid>) -> Result<Uuid> {
+        incarnation_id.ok_or_else(|| Error::other(format!("bucket incarnation metadata is not authoritative: {bucket}")))
+    }
+
+    async fn find_bucket_incarnation_id_under_transaction_lock(
+        &self,
+        bucket: &str,
+        transaction_guard: &rustfs_lock::NamespaceLockGuard,
+    ) -> Result<Option<Uuid>> {
         let incarnation_id = load_bucket_incarnation(self.object_store(), bucket).await?;
         if transaction_guard.is_lock_lost() {
             return Err(Error::other(format!("bucket incarnation metadata transaction lock was lost: {bucket}")));
         }
-        match incarnation_id {
-            Some(incarnation_id) if !incarnation_id.is_nil() => Ok(incarnation_id),
-            _ => Err(Error::other(format!("bucket incarnation metadata is not authoritative: {bucket}"))),
-        }
+        Ok(incarnation_id)
     }
 
     async fn get_metadata_authority(&self, bucket: &str) -> Result<BucketMetadataAuthority> {
