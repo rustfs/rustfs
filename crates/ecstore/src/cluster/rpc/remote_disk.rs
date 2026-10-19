@@ -2426,6 +2426,105 @@ impl RemoteDisk {
         .await
     }
 
+    /// One authenticated scan (or explicitly distinct read-only identity probe).
+    /// Partial observations are never retried after output has begun.
+    pub async fn inventory_artifact_attempt(
+        &self,
+        expected_disk: Uuid,
+        bucket: &str,
+        incarnation: Uuid,
+        prefix: &str,
+        phase: rustfs_protos::proto_gen::node_service::ArtifactInventoryPhase,
+        deadline: tokio::time::Instant,
+        output: tokio::sync::mpsc::Sender<crate::disk::ArtifactInventoryFrame>,
+    ) -> Result<()> {
+        use crate::disk::{ArtifactInventoryFrame, ArtifactInventoryVersion};
+        use rustfs_protos::{
+            artifact_inventory as protocol,
+            proto_gen::node_service::{ArtifactInventoryRequest, artifact_inventory_frame::Payload},
+        };
+        let duration = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or(Error::Timeout)?;
+        let body = ArtifactInventoryRequest {
+            protocol_version: protocol::VERSION,
+            invocation_id: Uuid::new_v4().as_bytes().to_vec().into(),
+            disk: self.endpoint.to_string(),
+            expected_disk_id: expected_disk.as_bytes().to_vec().into(),
+            bucket: bucket.to_owned(),
+            bucket_incarnation_id: incarnation.as_bytes().to_vec().into(),
+            attempt_prefix: prefix.to_owned(),
+            timeout_millis: u64::try_from(duration.as_millis().min(u128::from(protocol::MAX_TIMEOUT_MILLIS)))
+                .map_err(Error::other)?,
+            phase: phase.into(),
+        };
+        protocol::validate_request(&body).map_err(Error::other)?;
+        tokio::time::timeout_at(deadline, async {
+            let canonical = protocol::canonical_request(&body).map_err(Error::other)?;
+            let mut request = Request::new(body.clone());
+            request.set_timeout(duration);
+            crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical).map_err(Error::other)?;
+            let mut stream = self
+                .get_client()
+                .await?
+                .max_decoding_message_size(protocol::MAX_FRAME_BYTES)
+                .inventory_artifact_attempt(request)
+                .await?
+                .into_inner();
+            let mut state = protocol::StreamState::new();
+            let mut terminal = None;
+            while let Some(frame) = stream.message().await? {
+                state
+                    .accept(&body, &frame, |canonical, proof| {
+                        crate::cluster::rpc::verify_tonic_rpc_response_proof(canonical, proof).is_ok()
+                    })
+                    .map_err(Error::other)?;
+                match frame.payload {
+                    Some(Payload::Entries(entries)) => {
+                        let versions = entries
+                            .versions
+                            .into_iter()
+                            .map(|entry| {
+                                Ok(ArtifactInventoryVersion {
+                                    key: entry.key,
+                                    version_id: Uuid::from_slice(&entry.version_id).map_err(Error::other)?,
+                                    delete_marker: entry.delete_marker,
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        output
+                            .send(ArtifactInventoryFrame::Entries {
+                                sequence: frame.sequence,
+                                versions,
+                            })
+                            .await
+                            .map_err(|_| Error::other("artifact inventory consumer closed"))?;
+                    }
+                    Some(Payload::Complete(complete)) => terminal = Some(complete.entries),
+                    Some(Payload::Verified(_)) => {}
+                    None => return Err(Error::other("artifact inventory payload is absent")),
+                }
+            }
+            // A valid Complete followed by a transport failure or extra frame is
+            // still incomplete. Publish the local terminal only after clean EOF.
+            state.finish().map_err(Error::other)?;
+            if let Some(entries) = terminal {
+                output
+                    .send(ArtifactInventoryFrame::Complete {
+                        disk_id: expected_disk,
+                        incarnation,
+                        attempt_prefix: prefix.to_owned(),
+                        entries,
+                    })
+                    .await
+                    .map_err(|_| Error::other("artifact inventory consumer closed"))?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| Error::Timeout)?
+    }
+
     pub(crate) async fn seal_artifact_puts(
         &self,
         expected_disk: Uuid,

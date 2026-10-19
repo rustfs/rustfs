@@ -352,6 +352,40 @@ message ArtifactRepairWriteMetadataRequest {
 }
 
 // Receiver derives the managed prefix from authoritative bucket metadata.
+// One invocation, no cursor or persistent scan session. Verify is never an inventory completion.
+enum ArtifactInventoryPhase {
+  ARTIFACT_INVENTORY_SCAN = 0;
+  ARTIFACT_INVENTORY_VERIFY = 1;
+}
+message ArtifactInventoryRequest {
+  uint32 protocol_version = 1;
+  bytes invocation_id = 2;
+  string disk = 3;
+  bytes expected_disk_id = 4;
+  string bucket = 5;
+  bytes bucket_incarnation_id = 6;
+  string attempt_prefix = 7;
+  uint64 timeout_millis = 8;
+  ArtifactInventoryPhase phase = 9;
+}
+message ArtifactInventoryVersion {
+  string key = 1;
+  bytes version_id = 2;
+  bool delete_marker = 3;
+}
+message ArtifactInventoryEntries { repeated ArtifactInventoryVersion versions = 1; }
+message ArtifactInventoryComplete { bytes disk_id = 1; uint64 entries = 2; }
+message ArtifactInventoryVerified { bytes disk_id = 1; }
+message ArtifactInventoryFrame {
+  uint64 sequence = 1;
+  oneof payload {
+    ArtifactInventoryEntries entries = 2;
+    ArtifactInventoryComplete complete = 3;
+    ArtifactInventoryVerified verified = 4;
+  }
+  bytes response_proof = 5;
+}
+
 message SealArtifactAttemptPutsRequest {
   string disk = 1;
   string bucket = 2;
@@ -1296,6 +1330,7 @@ service NodeService {
   rpc ArtifactRenameData(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
   rpc ArtifactRepairRenameData(ArtifactRepairRenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
   rpc ArtifactRepairWriteMetadata(ArtifactRepairWriteMetadataRequest) returns (WriteMetadataResponse) {}; // auth-policy: body-bound
+  rpc InventoryArtifactAttempt(ArtifactInventoryRequest) returns (stream ArtifactInventoryFrame) {}; // auth-policy: body-bound
   rpc SealArtifactAttemptRepairs(SealArtifactAttemptPutsRequest) returns (SealArtifactAttemptPutsResponse) {}; // auth-policy: body-bound
   rpc SealArtifactAttemptPuts(SealArtifactAttemptPutsRequest) returns (SealArtifactAttemptPutsResponse) {}; // auth-policy: body-bound
   rpc RenameDataWithQuotaFence(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound

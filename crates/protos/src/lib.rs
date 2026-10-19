@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod artifact_inventory;
 pub mod compat_manifest;
 // SAFETY: `generated` is prost/tonic-generated protocol code. The allowance is
 // scoped to that module so generated internals do not relax lints elsewhere.

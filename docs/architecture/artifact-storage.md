@@ -418,7 +418,7 @@ inside the verified bucket yields an empty census; a missing bucket or disk root
 fails. The logical key limit applies to actual metadata objects after decoding
 one directory suffix, not to their longer physical payload-directory paths.
 
-This primitive does not expose an HTTP or RPC inventory interface, persist a
+The local primitive alone does not expose an HTTP or RPC inventory interface, persist a
 Controller inventory, or establish all-member completeness, quorum readability,
 backup coverage or permission to collect garbage. Automatic GC remains disabled.
 
@@ -701,3 +701,50 @@ assert that a real pending intent's bytes stay unchanged, and verify that legacy
 volumes and missing buckets gain no metadata or incarnation records. Namespace
 locking and rejection of file endpoints mislabeled as distributed are covered
 independently.
+
+
+## Authenticated all-member inventory stream
+
+`ECStore::inventory_artifact_attempt` observes one attempt under lifecycle READ,
+then the existing PUT-attempt and repair-record owners. Both immutable seal
+records must already match; inventory creates neither records nor disk closure.
+The coordinator captures every configured endpoint, exact Disk Arc and expected
+UUID once. Every member, including an empty member, must successfully contribute
+a terminal scan result. Observations retain endpoint and disk UUID; replica
+duplicates remain observations, with no unbounded global version set or quorum
+readability claim. Earlier frames are incomplete staging until global Complete
+and the operation's successful return.
+
+`InventoryArtifactAttempt` protocol version 1 uses a fresh invocation UUID and
+binds endpoint, expected physical UUID, bucket, incarnation, attempt prefix,
+time budget and explicit Scan/Verify phase into the canonical v2 request and
+every response proof. Entries, exact version UUIDs, delete-marker flags, sequence,
+terminal count and actual disk UUID are authenticated. Wire frames are limited to
+256 entries and 64 KiB of actual protobuf encoding, including response proof.
+The client enforces contiguous sequence, scope, counts and distinct phase
+terminals, and withholds scan Complete until clean EOF. Truncation, post-terminal
+frames and terminal-followed-by-transport-error are incomplete. Old peers that
+lack this RPC fail; there is no fallback to List or Walk EOF.
+
+Verify is a separate, signed `Verified` terminal; it is never a zero-entry scan
+Complete. After scans, the coordinator uses this read-only phase to freshly
+recheck each remote physical receiver and both existing drained domains while
+other members may have taken longer. Local verification retains the same pinned
+root and two-domain owners. The captured member set/Arc and expected IDs, and
+actual persisted bucket metadata/incarnation, are checked again before global
+completion. These are conservative rechecks, not an atomic snapshot across all
+disks or a backup/restore guarantee.
+
+Receiver authority uses bounded `read_config_observation` of existing metadata
+and incarnation sidecar: it bypasses cache, suppresses repair, and never migrates
+legacy identity. These reads take internal metadata-object locks, without
+reentering the coordinator's business-bucket lifecycle READ behind a queued
+writer. Each physical scan retains I1's initialized root and real drain owners
+through its last read; cancellation or slow consumers cannot release a detached
+worker's owner early. Deadline/resource/identity/closure failures omit Complete;
+invalid authentication is PermissionDenied, invalid wire input InvalidArgument,
+physical scan/closure failure (including a local scanner timeout) FailedPrecondition,
+and expiration of the outer handler deadline DeadlineExceeded.
+Client protocol, signature or membership failures are errors, regardless of
+previous partial output. No public admin route, Controller persistence, deletion,
+GC permission or saved scan session is introduced by this layer.

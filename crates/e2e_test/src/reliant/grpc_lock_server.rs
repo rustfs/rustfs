@@ -562,6 +562,15 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    type InventoryArtifactAttemptStream =
+        Pin<Box<dyn Stream<Item = Result<rustfs_protos::proto_gen::node_service::ArtifactInventoryFrame, Status>> + Send>>;
+    async fn inventory_artifact_attempt(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::ArtifactInventoryRequest>,
+    ) -> Result<Response<Self::InventoryArtifactAttemptStream>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn seal_artifact_attempt_repairs(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::SealArtifactAttemptPutsRequest>,

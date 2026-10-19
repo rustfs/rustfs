@@ -585,6 +585,7 @@ mod bucket;
 mod disk;
 mod event;
 mod health;
+mod inventory;
 mod lock;
 mod metrics;
 
@@ -1735,6 +1736,14 @@ impl Node for NodeService {
         request: Request<ArtifactRepairWriteMetadataRequest>,
     ) -> Result<Response<WriteMetadataResponse>, Status> {
         self.handle_artifact_repair_write_metadata(request).await
+    }
+
+    type InventoryArtifactAttemptStream = ResponseStream<rustfs_protos::proto_gen::node_service::ArtifactInventoryFrame>;
+    async fn inventory_artifact_attempt(
+        &self,
+        request: Request<rustfs_protos::proto_gen::node_service::ArtifactInventoryRequest>,
+    ) -> Result<Response<Self::InventoryArtifactAttemptStream>, Status> {
+        self.handle_inventory_artifact_attempt(request).await
     }
 
     async fn seal_artifact_attempt_repairs(
@@ -10495,6 +10504,18 @@ mod tests {
         assert_tampered!(cancel_decommission, CancelDecommissionRequest::default());
         assert_tampered!(clear_decommission, ClearDecommissionRequest::default());
         assert_tampered!(load_transition_tier_config, LoadTransitionTierConfigRequest::default());
+
+        let message = rustfs_protos::proto_gen::node_service::ArtifactInventoryRequest::default();
+        let mut request = Request::new(message);
+        mark_v2_authenticated(&mut request);
+        set_tonic_canonical_body_digest(&mut request, b"tampered inventory scope").expect("digest");
+        let error = service
+            .inventory_artifact_attempt(request)
+            .await
+            .err()
+            .expect("inventory body mismatch must fail");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        covered_methods.insert(normalized_rpc_method("InventoryArtifactAttempt"));
 
         let body_bound_methods: HashSet<_> = node_service_auth_policies()
             .into_iter()

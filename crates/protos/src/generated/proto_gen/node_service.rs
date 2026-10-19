@@ -465,7 +465,74 @@ pub struct ArtifactRepairWriteMetadataRequest {
     #[prost(bytes = "bytes", tag = "2")]
     pub expected_disk_id: ::prost::bytes::Bytes,
 }
-/// Receiver derives the managed prefix from authoritative bucket metadata.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ArtifactInventoryRequest {
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub invocation_id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "3")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub expected_disk_id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "5")]
+    pub bucket: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub bucket_incarnation_id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "7")]
+    pub attempt_prefix: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "8")]
+    pub timeout_millis: u64,
+    #[prost(enumeration = "ArtifactInventoryPhase", tag = "9")]
+    pub phase: i32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ArtifactInventoryVersion {
+    #[prost(string, tag = "1")]
+    pub key: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub version_id: ::prost::bytes::Bytes,
+    #[prost(bool, tag = "3")]
+    pub delete_marker: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ArtifactInventoryEntries {
+    #[prost(message, repeated, tag = "1")]
+    pub versions: ::prost::alloc::vec::Vec<ArtifactInventoryVersion>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ArtifactInventoryComplete {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub disk_id: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "2")]
+    pub entries: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ArtifactInventoryVerified {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub disk_id: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ArtifactInventoryFrame {
+    #[prost(uint64, tag = "1")]
+    pub sequence: u64,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub response_proof: ::prost::bytes::Bytes,
+    #[prost(oneof = "artifact_inventory_frame::Payload", tags = "2, 3, 4")]
+    pub payload: ::core::option::Option<artifact_inventory_frame::Payload>,
+}
+/// Nested message and enum types in `ArtifactInventoryFrame`.
+pub mod artifact_inventory_frame {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "2")]
+        Entries(super::ArtifactInventoryEntries),
+        #[prost(message, tag = "3")]
+        Complete(super::ArtifactInventoryComplete),
+        #[prost(message, tag = "4")]
+        Verified(super::ArtifactInventoryVerified),
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SealArtifactAttemptPutsRequest {
     #[prost(string, tag = "1")]
@@ -1840,6 +1907,34 @@ impl CompareAndUpdateFileOutcome {
         }
     }
 }
+/// Receiver derives the managed prefix from authoritative bucket metadata.
+/// One invocation, no cursor or persistent scan session. Verify is never an inventory completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ArtifactInventoryPhase {
+    ArtifactInventoryScan = 0,
+    ArtifactInventoryVerify = 1,
+}
+impl ArtifactInventoryPhase {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::ArtifactInventoryScan => "ARTIFACT_INVENTORY_SCAN",
+            Self::ArtifactInventoryVerify => "ARTIFACT_INVENTORY_VERIFY",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ARTIFACT_INVENTORY_SCAN" => Some(Self::ArtifactInventoryScan),
+            "ARTIFACT_INVENTORY_VERIFY" => Some(Self::ArtifactInventoryVerify),
+            _ => None,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum TierMutationPeerState {
@@ -2506,6 +2601,21 @@ pub mod node_service_client {
             req.extensions_mut()
                 .insert(GrpcMethod::new("node_service.NodeService", "ArtifactRepairWriteMetadata"));
             self.inner.unary(req, path, codec).await
+        }
+        pub async fn inventory_artifact_attempt(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ArtifactInventoryRequest>,
+        ) -> std::result::Result<tonic::Response<tonic::codec::Streaming<super::ArtifactInventoryFrame>>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/InventoryArtifactAttempt");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "InventoryArtifactAttempt"));
+            self.inner.server_streaming(req, path, codec).await
         }
         pub async fn seal_artifact_attempt_repairs(
             &mut self,
@@ -3797,6 +3907,14 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::ArtifactRepairWriteMetadataRequest>,
         ) -> std::result::Result<tonic::Response<super::WriteMetadataResponse>, tonic::Status>;
+        /// Server streaming response type for the InventoryArtifactAttempt method.
+        type InventoryArtifactAttemptStream: tonic::codegen::tokio_stream::Stream<Item = std::result::Result<super::ArtifactInventoryFrame, tonic::Status>>
+            + std::marker::Send
+            + 'static;
+        async fn inventory_artifact_attempt(
+            &self,
+            request: tonic::Request<super::ArtifactInventoryRequest>,
+        ) -> std::result::Result<tonic::Response<Self::InventoryArtifactAttemptStream>, tonic::Status>;
         async fn seal_artifact_attempt_repairs(
             &self,
             request: tonic::Request<super::SealArtifactAttemptPutsRequest>,
@@ -5151,6 +5269,35 @@ pub mod node_service_server {
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)
                             .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/InventoryArtifactAttempt" => {
+                    #[allow(non_camel_case_types)]
+                    struct InventoryArtifactAttemptSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::ServerStreamingService<super::ArtifactInventoryRequest> for InventoryArtifactAttemptSvc<T> {
+                        type Response = super::ArtifactInventoryFrame;
+                        type ResponseStream = T::InventoryArtifactAttemptStream;
+                        type Future = BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::ArtifactInventoryRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::inventory_artifact_attempt(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = InventoryArtifactAttemptSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

@@ -27,6 +27,7 @@ mod io_admission;
 #[cfg(test)]
 pub(crate) mod lifecycle_test_io;
 pub mod local;
+pub use local::artifact_inventory::{ArtifactInventoryFrame, ArtifactInventoryVersion};
 pub mod os;
 
 #[cfg(test)]

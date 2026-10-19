@@ -23,14 +23,14 @@ const MAX_REFERENCES: usize = 8192;
 const POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ArtifactInventoryVersion {
+pub struct ArtifactInventoryVersion {
     pub key: String,
     pub version_id: Uuid,
     pub delete_marker: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ArtifactInventoryFrame {
+pub enum ArtifactInventoryFrame {
     Entries {
         sequence: u64,
         versions: Vec<ArtifactInventoryVersion>,
@@ -60,10 +60,38 @@ const LIMITS: Limits = Limits {
     handles: MAX_HANDLES,
 };
 
+pub(crate) struct ArtifactInventoryVerification {
+    _drain: artifact_lease::ArtifactInventoryLease,
+}
+
 impl LocalDisk {
-    // Kept crate-private for the next disk-bound receiver; no public inventory
-    // authority or full-cluster completeness claim is exposed by this primitive.
-    #[allow(dead_code)]
+    #[cfg(all(unix, feature = "test-util"))]
+    pub fn set_inventory_worker_hook_for_test(&self, disk: Uuid, hook: Box<dyn FnOnce() + Send>) {
+        worker_hook::set(disk, hook);
+    }
+
+    /// Read-only final receiver proof, retaining the existing physical drain owners.
+    pub(crate) async fn verify_artifact_inventory_closed(
+        &self,
+        expected: Uuid,
+        identity: ArtifactPutIdentity,
+        deadline: Instant,
+    ) -> Result<ArtifactInventoryVerification> {
+        tokio::time::timeout_at(deadline, async {
+            if expected.is_nil() || self.artifact_disk_id().await? != expected {
+                return Err(DiskError::DiskNotFound);
+            }
+            let root = artifact_lease::pinned_root(self).await?;
+            let drain = artifact_lease::drain_closed(root, identity.receiver_key, deadline).await?;
+            if self.artifact_disk_id().await? != expected {
+                return Err(DiskError::DiskNotFound);
+            }
+            Ok(ArtifactInventoryVerification { _drain: drain })
+        })
+        .await
+        .map_err(|_| DiskError::Timeout)?
+    }
+
     pub(crate) async fn inventory_artifact_attempt(
         &self,
         expected_disk_id: Uuid,
@@ -122,7 +150,7 @@ impl LocalDisk {
             let worker_cancelled = cancelled.0.clone();
             let worker = tokio::task::spawn_blocking(move || {
                 let _drain = drain;
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-util"))]
                 worker_hook::run(expected_disk_id);
                 let entries =
                     unix::scan(root, &worker_bucket, &worker_prefix, &worker_output, deadline, &worker_cancelled, limits)?;
@@ -497,7 +525,7 @@ mod unix {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(unix, any(test, feature = "test-util")))]
 mod worker_hook {
     use super::*;
     type Hook = Box<dyn FnOnce() + Send>;

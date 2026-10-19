@@ -465,6 +465,72 @@ impl ECStore {
         result
     }
 
+    /// The coordinator owns lifecycle -> attempt -> repair locks. A receiver
+    /// must not reacquire their distributed READ behind a queued lifecycle WRITE.
+    /// Its authority comes from persisted managed metadata, its physical scope
+    /// from the captured disk, and closure from the existing two-domain owners.
+    pub async fn inventory_local_artifact_attempt(
+        &self,
+        disk_ref: &str,
+        expected_disk: Uuid,
+        bucket: &str,
+        incarnation: Uuid,
+        attempt_prefix: &str,
+        phase: rustfs_protos::proto_gen::node_service::ArtifactInventoryPhase,
+        deadline: tokio::time::Instant,
+        output: tokio::sync::mpsc::Sender<crate::disk::ArtifactInventoryFrame>,
+    ) -> DiskResult<()> {
+        use rustfs_protos::proto_gen::node_service::ArtifactInventoryPhase;
+        if expected_disk.is_nil()
+            || incarnation.is_nil()
+            || self.ctx.lock_manager().is_disabled()
+            || has_bad_path_component(bucket)
+            || is_meta_bucketname(bucket)
+        {
+            return Err(DiskError::FileAccessDenied);
+        }
+        let identity = self
+            .artifact_inventory_receiver_identity(bucket, incarnation, attempt_prefix)
+            .await
+            .map_err(|_| DiskError::FileAccessDenied)?;
+        let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
+        admit_local_disk(&self.ctx, &disk, id, false).await?;
+        let Disk::Local(local) = disk.as_ref() else {
+            return Err(DiskError::DiskNotFound);
+        };
+        let local = local.get_disk();
+        match phase {
+            ArtifactInventoryPhase::ArtifactInventoryScan => {
+                local
+                    .inventory_artifact_attempt(expected_disk, bucket, attempt_prefix, identity, deadline, output)
+                    .await?;
+            }
+            ArtifactInventoryPhase::ArtifactInventoryVerify => {
+                let _verified = local
+                    .verify_artifact_inventory_closed(expected_disk, identity, deadline)
+                    .await?;
+                let current = self
+                    .artifact_inventory_receiver_identity(bucket, incarnation, attempt_prefix)
+                    .await
+                    .map_err(|_| DiskError::FileAccessDenied)?;
+                if current.receiver_key != identity.receiver_key {
+                    return Err(DiskError::FileAccessDenied);
+                }
+                admit_local_disk(&self.ctx, &disk, None, false).await?;
+                return Ok(());
+            }
+        }
+        let current = self
+            .artifact_inventory_receiver_identity(bucket, incarnation, attempt_prefix)
+            .await
+            .map_err(|_| DiskError::FileAccessDenied)?;
+        if current.receiver_key != identity.receiver_key || local.artifact_disk_id().await? != expected_disk {
+            return Err(DiskError::FileAccessDenied);
+        }
+        admit_local_disk(&self.ctx, &disk, None, false).await?;
+        Ok(())
+    }
+
     pub async fn seal_local_artifact_repairs(
         &self,
         disk_ref: &str,

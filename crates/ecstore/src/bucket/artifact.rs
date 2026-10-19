@@ -15,6 +15,8 @@
 //! Persistent artifact attempt fences and exact-version repair retirement.
 //! These records do not authorize object deletion or establish GC eligibility.
 
+pub mod inventory;
+
 use super::versioning::VersioningApi as _;
 use super::{metadata::BucketMetadata, metadata_sys};
 use crate::config::com::{read_config_observation_no_lock, save_config_no_lock, with_config_object_write_lock};

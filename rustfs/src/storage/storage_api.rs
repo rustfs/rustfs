@@ -491,18 +491,18 @@ pub(crate) mod ecstore_data_usage {
 #[allow(unused_imports)]
 pub(crate) mod ecstore_disk {
     pub(crate) use rustfs_ecstore::api::disk::{
-        BUCKET_META_PREFIX, BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, ConditionalFileUpdate,
-        DELETE_RECOVERY_PROTOCOL_VERSION, DeleteOptions, DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest,
-        DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DiskAPI, DiskInfo,
-        DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, GuardedDeleteVersionsPayload,
-        GuardedFileInfoVersions, LegacyFileStream, LegacyFileWrite, LegacyMetadataWrite, LegacyPartMutation, LegacyPartOperation,
-        LegacyPathDelete, LegacyPathDeleteOperation, LegacyRenameData, LegacyRenameFile, OldCurrentSize, PartTransactionAction,
-        QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-        SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, get_object_disk_read_timeout,
-        is_quota_mutation_fence_path, validate_batch_read_version_item_count,
+        ArtifactInventoryFrame, ArtifactInventoryVersion, BUCKET_META_PREFIX, BatchReadVersionReq, BatchReadVersionResp,
+        CheckPartsResp, ConditionalFileUpdate, DELETE_RECOVERY_PROTOCOL_VERSION, DeleteOptions, DeleteRecoveryAction,
+        DeleteRecoveryCursor, DeleteRecoveryDigest, DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation,
+        DeleteRecoveryRpcReply, DiskAPI, DiskInfo, DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter,
+        GuardedDeleteVersionsPayload, GuardedFileInfoVersions, LegacyFileStream, LegacyFileWrite, LegacyMetadataWrite,
+        LegacyPartMutation, LegacyPartOperation, LegacyPathDelete, LegacyPathDeleteOperation, LegacyRenameData, LegacyRenameFile,
+        OldCurrentSize, PartTransactionAction, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, ReadMultipleReq,
+        ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+        get_object_disk_read_timeout, is_quota_mutation_fence_path, validate_batch_read_version_item_count,
     };
     #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::disk::{CurrentDeleteGeneration, DiskOption, new_disk};
+    pub(crate) use rustfs_ecstore::api::disk::{CurrentDeleteGeneration, Disk, DiskOption, new_disk};
     pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
 }
 

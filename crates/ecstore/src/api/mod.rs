@@ -467,6 +467,7 @@ pub mod disk {
     pub use crate::disk::local::{ReplacementExecutionLease, ScanGuard};
     #[cfg(all(feature = "test-util", not(windows)))]
     pub use crate::disk::os::{LocalPublicationPause, LocalPublicationStage};
+    pub use crate::disk::{ArtifactInventoryFrame, ArtifactInventoryVersion};
     pub use crate::disk::{
         BATCH_READ_VERSION_MAX_ITEMS, BUCKET_META_PREFIX, BatchReadVersionItem, BatchReadVersionReq, BatchReadVersionResp,
         CheckPartsResp, ConditionalFileUpdate, CurrentDeleteGeneration, CurrentDeleteTransition,
@@ -661,6 +662,7 @@ pub mod store_list {
 }
 
 pub mod storage {
+    pub use crate::bucket::artifact::inventory::ArtifactAttemptInventoryFrame;
     pub use crate::core::pools::{HealLifecycleExpiryContext, POOL_META_NAME};
     pub use crate::store::HealWalkVersion;
     pub use crate::store::{
