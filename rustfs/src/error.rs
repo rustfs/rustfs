@@ -294,6 +294,7 @@ impl std::error::Error for ApiError {
 pub(crate) struct ApiErrorDiagnostic {
     pub storage_code: Option<StorageErrorCode>,
     pub io_kind: Option<std::io::ErrorKind>,
+    pub io_os_error: Option<i32>,
     pub rpc_code: Option<tonic::Code>,
     pub pool_metadata: Option<PoolMetadataDiagnostic>,
     pub truncated: bool,
@@ -317,10 +318,16 @@ impl From<&PoolMetadataError> for PoolMetadataDiagnostic {
     }
 }
 
-impl ApiError {
-    pub(crate) fn diagnostic(&self) -> ApiErrorDiagnostic {
+impl ApiErrorDiagnostic {
+    pub(crate) fn from_error(error: &(dyn std::error::Error + 'static)) -> Self {
         let mut diagnostic = ApiErrorDiagnostic::default();
-        let mut current = std::error::Error::source(self);
+        // S3Error retains its payload through an inherent accessor; its
+        // std::error::Error implementation does not expose that source.
+        let mut current = if let Some(error) = error.downcast_ref::<S3Error>() {
+            error.source().map(|source| source as &(dyn std::error::Error + 'static))
+        } else {
+            std::error::Error::source(error)
+        };
         for _ in 0..16 {
             let Some(error) = current else {
                 return diagnostic;
@@ -338,14 +345,23 @@ impl ApiError {
             }
             current = if let Some(io) = error.downcast_ref::<std::io::Error>() {
                 diagnostic.io_kind = Some(io.kind());
+                diagnostic.io_os_error = io.raw_os_error();
                 // io::Error::source can skip the wrapped error itself.
                 io.get_ref().map(|source| source as &(dyn std::error::Error + 'static))
+            } else if let Some(error) = error.downcast_ref::<S3Error>() {
+                error.source().map(|source| source as &(dyn std::error::Error + 'static))
             } else {
                 error.source()
             };
         }
         diagnostic.truncated = current.is_some();
         diagnostic
+    }
+}
+
+impl ApiError {
+    pub(crate) fn diagnostic(&self) -> ApiErrorDiagnostic {
+        ApiErrorDiagnostic::from_error(self)
     }
 
     /// Access-denied error with the exact message emitted by the authorization
@@ -1001,6 +1017,35 @@ mod tests {
     }
 
     #[test]
+    fn api_error_diagnostic_survives_s3_conversion_without_changing_response() {
+        let api = ApiError::from(StorageError::Io(IoError::from_raw_os_error(30)));
+        let before = api.diagnostic();
+        assert_eq!(before.io_os_error, Some(30));
+        let mut error: S3Error = api.into();
+        error.set_request_id("server-owned-request");
+        let code = error.code().clone();
+        let status = error.status_code();
+        let message = error.message().map(str::to_owned);
+        assert_eq!(super::ApiErrorDiagnostic::from_error(&error), before);
+        assert_eq!(error.code(), &code);
+        assert_eq!(error.status_code(), status);
+        assert_eq!(error.message(), message.as_deref());
+        assert_eq!(error.request_id(), Some("server-owned-request"));
+        assert!(error.source().is_some());
+        assert!(std::error::Error::source(&error).is_none());
+
+        let error: S3Error = ApiError::from(StorageError::Io(IoError::other(StorageError::ErasureReadQuorum))).into();
+        assert_eq!(
+            super::ApiErrorDiagnostic::from_error(&error).storage_code,
+            Some(StorageErrorCode::ErasureReadQuorum)
+        );
+
+        let nested: S3Error = ApiError::from(StorageError::ErasureReadQuorum).into();
+        let api = ApiError::from(StorageError::Io(IoError::other(nested)));
+        assert_eq!(api.diagnostic().storage_code, Some(StorageErrorCode::ErasureReadQuorum));
+    }
+
+    #[test]
     fn api_error_diagnostic_bounds_cyclic_error_chains() {
         #[derive(Debug)]
         struct Cycle;
@@ -1021,6 +1066,10 @@ mod tests {
         };
         assert!(error.diagnostic().truncated);
         assert!(!format!("{:?}", error.diagnostic()).contains("secret"));
+        let error: S3Error = error.into();
+        let diagnostic = super::ApiErrorDiagnostic::from_error(&error);
+        assert!(diagnostic.truncated);
+        assert!(!format!("{diagnostic:?}").contains("secret"));
     }
 
     #[derive(Debug)]
