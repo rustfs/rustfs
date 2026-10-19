@@ -16,8 +16,8 @@
 
 use super::storage_api::admin_usecase::admin::get_server_info;
 use super::storage_api::admin_usecase::capacity::{
-    DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus, RebalStatus, get_total_usable_capacity,
-    get_total_usable_capacity_free,
+    DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolMeta, PoolStatus, RebalStatus, RebalanceMeta,
+    get_total_usable_capacity, get_total_usable_capacity_free,
 };
 use super::storage_api::admin_usecase::contract::StorageAdminApi;
 use super::storage_api::admin_usecase::contract::bucket::{BucketOperations as _, BucketOptions};
@@ -267,15 +267,15 @@ impl DefaultAdminUsecase {
         }
     }
 
-    async fn refresh_rebalance_status_snapshot(store: &ECStore) -> AdminUsecaseResult<()> {
-        store.refresh_rebalance_status_meta().await.map_err(|err| {
+    async fn rebalance_status_snapshot(store: &ECStore) -> AdminUsecaseResult<Option<RebalanceMeta>> {
+        store.rebalance_status_meta_snapshot().await.map_err(|err| {
             error!("refresh rebalance metadata for pool status failed: {:?}", err);
             ApiError::from(err)
         })
     }
 
-    async fn refresh_pool_status_snapshot(store: &ECStore) -> AdminUsecaseResult<()> {
-        store.refresh_pool_status_meta().await.map_err(|err| {
+    async fn pool_status_snapshot(store: &ECStore) -> AdminUsecaseResult<PoolMeta> {
+        store.pool_status_meta_snapshot().await.map_err(|err| {
             error!("refresh pool metadata for pool status failed: {:?}", err);
             ApiError::from(err)
         })
@@ -400,11 +400,11 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
         };
 
-        Self::refresh_pool_status_snapshot(store.as_ref()).await?;
+        let pool_meta = Self::pool_status_snapshot(store.as_ref()).await?;
 
         let mut pool_statuses = Vec::new();
         for (idx, _) in endpoints.as_ref().iter().enumerate() {
-            let state = store.status(idx).await.map_err(ApiError::from)?;
+            let state = store.status(&pool_meta, idx).await.map_err(ApiError::from)?;
             pool_statuses.push(state);
         }
 
@@ -416,10 +416,10 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
         let pool_statuses = self.execute_list_pool_statuses().await?;
-        Self::refresh_rebalance_status_snapshot(store.as_ref()).await?;
+        let rebalance_meta = Self::rebalance_status_snapshot(store.as_ref()).await?;
         let mut items = Vec::with_capacity(pool_statuses.len());
         for status in pool_statuses {
-            let rebalance_status = store.pool_rebalance_status(status.id).await;
+            let rebalance_status = ECStore::pool_rebalance_status(rebalance_meta.as_ref(), status.id);
             items.push(Self::pool_list_item_from_status(status, rebalance_status));
         }
         Ok(items)
@@ -455,10 +455,10 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
 
-        Self::refresh_pool_status_snapshot(store.as_ref()).await?;
-        let status = store.status(idx).await.map_err(ApiError::from)?;
-        Self::refresh_rebalance_status_snapshot(store.as_ref()).await?;
-        let rebalance_status = store.pool_rebalance_status(idx).await;
+        let pool_meta = Self::pool_status_snapshot(store.as_ref()).await?;
+        let status = store.status(&pool_meta, idx).await.map_err(ApiError::from)?;
+        let rebalance_meta = Self::rebalance_status_snapshot(store.as_ref()).await?;
+        let rebalance_status = ECStore::pool_rebalance_status(rebalance_meta.as_ref(), idx);
         Ok(Self::pool_list_item_from_status(status, rebalance_status))
     }
 
@@ -473,10 +473,10 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
         }
         let pool_statuses = self.execute_list_pool_statuses().await?;
-        Self::refresh_rebalance_status_snapshot(store.as_ref()).await?;
+        let rebalance_meta = Self::rebalance_status_snapshot(store.as_ref()).await?;
         let mut pools = Vec::with_capacity(pool_statuses.len());
         for status in pool_statuses {
-            let rebalance_status = store.pool_rebalance_status(status.id).await;
+            let rebalance_status = ECStore::pool_rebalance_status(rebalance_meta.as_ref(), status.id);
             pools.push(Self::decommission_pool_status_from_status(status, rebalance_status));
         }
         Ok(AdminDecommissionStatus { pools })
@@ -500,10 +500,10 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
 
-        Self::refresh_pool_status_snapshot(store.as_ref()).await?;
-        let status = store.status(idx).await.map_err(ApiError::from)?;
-        Self::refresh_rebalance_status_snapshot(store.as_ref()).await?;
-        let rebalance_status = store.pool_rebalance_status(idx).await;
+        let pool_meta = Self::pool_status_snapshot(store.as_ref()).await?;
+        let status = store.status(&pool_meta, idx).await.map_err(ApiError::from)?;
+        let rebalance_meta = Self::rebalance_status_snapshot(store.as_ref()).await?;
+        let rebalance_status = ECStore::pool_rebalance_status(rebalance_meta.as_ref(), idx);
         Ok(Self::decommission_pool_status_from_status(status, rebalance_status))
     }
 

@@ -83,12 +83,16 @@ pub(crate) enum ScannerPublicationLeasePurpose {
     Observational,
 }
 
+/// Movement read admission granted with a publication lease. Lease-scoped
+/// target operations share it rather than queueing a second read on the gate.
+pub(crate) type ScannerPublicationLeasePermit = Arc<OwnedRwLockReadGuard<()>>;
+
 pub(crate) struct ScannerPublicationLeaseEntry {
     pub(crate) expires_at: Instant,
     pub(crate) movement_generation: u64,
     pub(crate) namespace_generation: Option<u64>,
     pub(crate) purpose: ScannerPublicationLeasePurpose,
-    pub(crate) _operation_guard: OwnedRwLockReadGuard<()>,
+    pub(crate) operation_guard: ScannerPublicationLeasePermit,
 }
 
 pub(crate) struct NamespaceCommitGuard {
@@ -365,7 +369,7 @@ impl InstanceContext {
                 movement_generation,
                 namespace_generation,
                 purpose,
-                _operation_guard: operation_guard,
+                operation_guard: Arc::new(operation_guard),
             },
         );
         true
@@ -383,16 +387,35 @@ impl InstanceContext {
         &self,
         token: Uuid,
     ) -> Option<(u64, Option<u64>, ScannerPublicationLeasePurpose)> {
+        self.scanner_publication_lease_admission(token)
+            .await
+            .map(|(movement_generation, namespace_generation, purpose, _)| (movement_generation, namespace_generation, purpose))
+    }
+
+    /// Return the live lease's generations and purpose together with a share
+    /// of its movement read admission. The share keeps movement writers out
+    /// for as long as the caller holds it, even if the lease is released or
+    /// expires meanwhile, without queueing a new read behind a waiting writer.
+    pub(crate) async fn scanner_publication_lease_admission(
+        &self,
+        token: Uuid,
+    ) -> Option<(u64, Option<u64>, ScannerPublicationLeasePurpose, ScannerPublicationLeasePermit)> {
         let mut leases = self.scanner_publication_leases.lock().await;
         let now = Instant::now();
-        let (expires_at, movement_generation, namespace_generation, purpose) = leases
-            .get(&token)
-            .map(|entry| (entry.expires_at, entry.movement_generation, entry.namespace_generation, entry.purpose))?;
+        let (expires_at, movement_generation, namespace_generation, purpose, permit) = leases.get(&token).map(|entry| {
+            (
+                entry.expires_at,
+                entry.movement_generation,
+                entry.namespace_generation,
+                entry.purpose,
+                Arc::clone(&entry.operation_guard),
+            )
+        })?;
         if expires_at <= now {
             leases.remove(&token);
             return None;
         }
-        Some((movement_generation, namespace_generation, purpose))
+        Some((movement_generation, namespace_generation, purpose, permit))
     }
 
     pub(crate) async fn expire_scanner_publication_lease(&self, token: Uuid, expires_at: Instant) {

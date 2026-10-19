@@ -18,8 +18,9 @@ use super::{
     encode_rebalance_stop_propagation_record,
 };
 use crate::core::pools::{
-    PoolMeta, PoolRebalanceActivationFence, PoolRebalanceWorkerFence, acquire_pool_activation_fleet_proof,
-    acquire_pool_rebalance_activation_locks, acquire_pool_rebalance_worker_locks, pool_meta_has_active_decommission,
+    DATA_MOVEMENT_GATE_RESOURCE, GateWaitDeadline, PoolMeta, PoolRebalanceActivationFence, PoolRebalanceWorkerFence,
+    acquire_gate_until, acquire_pool_activation_fleet_proof, acquire_pool_rebalance_activation_locks,
+    acquire_pool_rebalance_worker_locks, pool_meta_has_active_decommission,
 };
 use crate::error::{Error, Result};
 use crate::object_api::ObjectOptions;
@@ -35,6 +36,8 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tracing::{debug, info};
 use uuid::Uuid;
+
+const REBALANCE_ACTIVATION_GATE_RESOURCE: &str = "rebalance activation gate";
 
 #[cfg(test)]
 static FAIL_NEXT_REBALANCE_ACTIVATION_SAVE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -383,6 +386,15 @@ fn merge_rebalance_status_refresh(current: &mut Option<RebalanceMeta>, persisted
     }
 }
 
+/// Apply a persisted status refresh (`None` when no rebalance was recorded).
+/// Returns whether the movement snapshot changed.
+fn merge_persisted_rebalance_status(current: &mut Option<RebalanceMeta>, persisted: Option<RebalanceMeta>) -> bool {
+    match persisted {
+        Some(persisted) => merge_rebalance_status_refresh(current, persisted),
+        None => clear_rebalance_status_refresh(current),
+    }
+}
+
 fn clear_rebalance_status_refresh(current: &mut Option<RebalanceMeta>) -> bool {
     if current.as_ref().is_none_or(|meta| !is_rebalance_actively_running(meta)) {
         current.take().is_some()
@@ -418,6 +430,15 @@ impl ECStore {
         expected_id: Option<&str>,
         stage: &str,
     ) -> Result<Option<tokio::sync::OwnedRwLockWriteGuard<()>>> {
+        self.rebalance_activation_write_guard_until(expected_id, stage, None).await
+    }
+
+    async fn rebalance_activation_write_guard_until(
+        &self,
+        expected_id: Option<&str>,
+        stage: &str,
+        deadline: Option<GateWaitDeadline>,
+    ) -> Result<Option<tokio::sync::OwnedRwLockWriteGuard<()>>> {
         let activation_gate = {
             let meta = self.rebalance_meta.read().await;
             if let Some(expected_id) = expected_id {
@@ -426,7 +447,7 @@ impl ECStore {
             meta.as_ref().map(|meta| Arc::clone(&meta.activation_gate))
         };
         Ok(match activation_gate {
-            Some(gate) => Some(gate.write_owned().await),
+            Some(gate) => Some(acquire_gate_until(deadline, REBALANCE_ACTIVATION_GATE_RESOURCE, gate.write_owned()).await?),
             None => None,
         })
     }
@@ -713,6 +734,12 @@ impl ECStore {
     }
 
     pub(crate) async fn load_rebalance_meta_under_start_gate(&self) -> Result<()> {
+        self.load_rebalance_meta_under_start_gate_until(None).await
+    }
+
+    /// `deadline` bounds the waits for the activation and movement writers;
+    /// on expiry the load fails before it reads or publishes anything.
+    pub(crate) async fn load_rebalance_meta_under_start_gate_until(&self, deadline: Option<GateWaitDeadline>) -> Result<()> {
         let mut meta = RebalanceMeta::new();
         debug!(
             event = EVENT_REBALANCE_STATE,
@@ -722,9 +749,11 @@ impl ECStore {
             "Loading rebalance metadata"
         );
         let pool = clone_first_arc(&self.pools, "rebalanceMeta: no pools available")?;
-        let _activation_guard = self.rebalance_activation_write_guard(None, "load rebalance metadata").await?;
+        let _activation_guard = self
+            .rebalance_activation_write_guard_until(None, "load rebalance metadata", deadline)
+            .await?;
         let movement_gate = self.ctx.data_movement_operation_gate();
-        let _movement_guard = movement_gate.write().await;
+        let _movement_guard = acquire_gate_until(deadline, DATA_MOVEMENT_GATE_RESOURCE, movement_gate.write()).await?;
         let loaded = resolve_rebalance_meta_load_result(meta.load(pool).await)?;
         if loaded {
             let movement_changed = rebalance_movement_snapshot_changed(self.rebalance_meta.read().await.as_ref(), &meta);
@@ -777,36 +806,60 @@ impl ECStore {
         Ok(())
     }
 
+    /// Rebalance metadata for an admin status read. It never waits on the
+    /// start, activation or data-movement gates, which a pending start or an
+    /// in-flight movement side effect can hold for as long as that work runs.
+    /// With all three free, the refresh publishes as before. Otherwise the
+    /// persisted metadata is merged into a private copy and nothing is
+    /// published, so no movement transition becomes visible here without the
+    /// movement writer.
     #[tracing::instrument(skip_all)]
-    pub async fn refresh_rebalance_status_meta(&self) -> Result<()> {
-        let _start_guard = self.start_gate.lock().await;
-        let pool = clone_first_arc(&self.pools, "refresh_rebalance_status_meta: no pools available")?;
-        let mut persisted = RebalanceMeta::new();
-        let _activation_guard = self
-            .rebalance_activation_write_guard(None, "refresh rebalance metadata")
-            .await?;
-        let movement_gate = self.ctx.data_movement_operation_gate();
-        let _movement_guard = movement_gate.write().await;
-        let loaded = persisted.load(pool).await;
-        match loaded {
-            Ok(()) => {
+    pub async fn rebalance_status_meta_snapshot(&self) -> Result<Option<RebalanceMeta>> {
+        // Transition order is start_gate -> activation_gate -> movement gate -> rebalance_meta.
+        if let Ok(_start_guard) = self.start_gate.try_lock() {
+            let activation_gate = self
+                .rebalance_meta
+                .read()
+                .await
+                .as_ref()
+                .map(|meta| Arc::clone(&meta.activation_gate));
+            let activation_guard = match activation_gate {
+                Some(gate) => gate.try_write_owned().ok().map(Some),
+                None => Some(None),
+            };
+            if let Some(_activation_guard) = activation_guard
+                && let Ok(_movement_guard) = self.ctx.data_movement_operation_gate().try_write_owned()
+            {
+                let persisted = self.load_rebalance_status_meta().await?;
                 let mut rebalance_meta = self.rebalance_meta.write().await;
-                if merge_rebalance_status_refresh(&mut rebalance_meta, persisted) {
+                if merge_persisted_rebalance_status(&mut rebalance_meta, persisted) {
                     self.ctx.advance_data_movement_operation_epoch();
                 }
-            }
-            Err(Error::ConfigNotFound) => {
-                let mut rebalance_meta = self.rebalance_meta.write().await;
-                if clear_rebalance_status_refresh(&mut rebalance_meta) {
-                    self.ctx.advance_data_movement_operation_epoch();
-                }
-            }
-            Err(err) => {
-                return Err(Error::other(format!("rebalance metadata refresh failed during pool status: {err}")));
+                return Ok(rebalance_meta.clone());
             }
         }
 
-        Ok(())
+        let persisted = self.load_rebalance_status_meta().await?;
+        let mut snapshot = self.rebalance_meta.read().await.clone();
+        merge_persisted_rebalance_status(&mut snapshot, persisted);
+        Ok(snapshot)
+    }
+
+    /// Persisted rebalance metadata, or `None` when no rebalance was recorded.
+    async fn load_rebalance_status_meta(&self) -> Result<Option<RebalanceMeta>> {
+        let pool = clone_first_arc(&self.pools, "refresh_rebalance_status_meta: no pools available")?;
+        let mut persisted = RebalanceMeta::new();
+        match persisted.load(pool).await {
+            Ok(()) => Ok(Some(persisted)),
+            Err(Error::ConfigNotFound) => Ok(None),
+            Err(err) => Err(Error::other(format!("rebalance metadata refresh failed during pool status: {err}"))),
+        }
+    }
+
+    /// Rebalance status of one pool in a snapshot returned by
+    /// [`ECStore::rebalance_status_meta_snapshot`].
+    pub fn pool_rebalance_status(rebalance_meta: Option<&RebalanceMeta>, pool_index: usize) -> (RebalStatus, bool) {
+        pool_rebalance_status_from_meta(rebalance_meta, pool_index)
     }
 
     #[tracing::instrument(skip_all)]
@@ -1234,11 +1287,6 @@ impl ECStore {
         false
     }
 
-    pub async fn pool_rebalance_status(&self, pool_index: usize) -> (RebalStatus, bool) {
-        let rebalance_meta = self.rebalance_meta.read().await;
-        pool_rebalance_status_from_meta(rebalance_meta.as_ref(), pool_index)
-    }
-
     pub async fn current_rebalance_id(&self) -> Option<String> {
         let rebalance_meta = self.rebalance_meta.read().await;
         rebalance_meta
@@ -1404,6 +1452,62 @@ mod tests {
     use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause, hermetic_set_disks_isolated};
 
     #[tokio::test]
+    async fn rebalance_status_snapshot_does_not_wait_for_a_pending_start_or_stuck_movement() {
+        let id = "rebalance-status-snapshot";
+        let (_temp_dirs, store) = crate::services::rebalance::test_store_with_persisted_rebalance_meta(RebalanceMeta {
+            id: id.to_string(),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Completed,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await;
+        // This node has not observed the persisted run yet.
+        *store.rebalance_meta.write().await = None;
+
+        // A start waiting on the movement writer holds the start gate, and an
+        // in-flight movement side effect holds its read admission.
+        let pending_start = store.start_gate.lock().await;
+        let stuck_side_effect = store.ctx.data_movement_operation_gate().read_owned().await;
+        let epoch = store.ctx.data_movement_operation_epoch();
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(10), store.rebalance_status_meta_snapshot())
+            .await
+            .expect("a status read must not wait for a start or in-flight data movement")
+            .expect("persisted rebalance metadata should be readable");
+        assert_eq!(snapshot.as_ref().map(|meta| meta.id.as_str()), Some(id));
+        assert_eq!(
+            ECStore::pool_rebalance_status(snapshot.as_ref(), 0),
+            (RebalStatus::Completed, false),
+            "the status read reports the persisted run"
+        );
+        assert!(
+            store.rebalance_meta.read().await.is_none(),
+            "busy gates must keep the refresh from publishing"
+        );
+        assert_eq!(store.ctx.data_movement_operation_epoch(), epoch);
+
+        drop(stuck_side_effect);
+        drop(pending_start);
+        store
+            .rebalance_status_meta_snapshot()
+            .await
+            .expect("free gates should allow the refresh to publish");
+        assert_eq!(
+            store.rebalance_meta.read().await.as_ref().map(|meta| meta.id.clone()),
+            Some(id.to_string())
+        );
+        assert!(
+            store.ctx.data_movement_operation_epoch() > epoch,
+            "a published refresh advances the epoch"
+        );
+    }
+
+    #[tokio::test]
     async fn rebalance_status_read_recovers_after_metadata_lock_timeout() {
         let id = "rebalance-status-lock-retry";
         let (_temp_dirs, store) = crate::services::rebalance::test_store_with_persisted_rebalance_meta(RebalanceMeta {
@@ -1422,7 +1526,7 @@ mod tests {
             .expect("hold metadata writer");
         let retried = Arc::new(tokio::sync::Notify::new());
         let refresh = super::super::worker::REBALANCE_METADATA_RETRY_PROBE
-            .scope(Arc::clone(&retried), store.refresh_rebalance_status_meta());
+            .scope(Arc::clone(&retried), store.rebalance_status_meta_snapshot());
         tokio::pin!(refresh);
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             tokio::select! {

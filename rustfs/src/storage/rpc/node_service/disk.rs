@@ -2228,7 +2228,7 @@ impl NodeService {
                         }));
                     };
                     match store.acquire_scanner_publication_lease_guard(token).await {
-                        Ok(guard) => Some(Arc::new(guard)),
+                        Ok(guard) => Some(guard as Arc<dyn Send + Sync>),
                         Err(err) => {
                             return Ok(Response::new(DeleteResponse {
                                 success: false,

@@ -111,6 +111,14 @@ const POOL_ACTIVATION_FLEET_PROOF_REQUIRED: &str = "pool activation requires a l
 const POOL_ACTIVATION_FLEET_PROOF_EXPIRED: &str = "pool activation fleet capability proof expired before commit";
 const DECOMMISSION_TARGET_FLEET_PROOF_EXPIRED: &str =
     "decommission target fence fleet capability proof expired before reservation commit";
+/// Bound on how long an operator decommission start waits for the gates that
+/// running data movement can hold: the start gate, the rebalance activation
+/// gate and the data-movement writer. A movement side effect keeps a read on
+/// the movement gate for as long as it runs, so a large or stalled copy would
+/// otherwise hold the start, and every reader queued behind it, indefinitely.
+const DECOMMISSION_START_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+const DECOMMISSION_START_GATE_RESOURCE: &str = "decommission start gate";
+pub(crate) const DATA_MOVEMENT_GATE_RESOURCE: &str = "data movement operation gate";
 const DECOMMISSION_STAGE_MIGRATE_OBJECT: &str = "migrate_object";
 const DECOMMISSION_STAGE_CLEANUP_PREFLIGHT: &str = "cleanup_preflight";
 const DECOMMISSION_STAGE_SOURCE_CLEANUP: &str = "source_cleanup";
@@ -3908,6 +3916,42 @@ pub(crate) async fn acquire_pool_activation_fleet_proof(
     crate::services::notification_sys::acquire_cross_pool_fence_fleet_proof()
         .map(Some)
         .ok_or_else(|| Error::other(POOL_ACTIVATION_FLEET_PROOF_REQUIRED))
+}
+
+/// One wait budget shared by every gate a single operator start acquires.
+/// Expiry is a retryable lock timeout raised before the start changes any
+/// state, so a busy gate fails the request instead of holding it open.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GateWaitDeadline {
+    at: tokio::time::Instant,
+    budget: std::time::Duration,
+}
+
+impl GateWaitDeadline {
+    pub(crate) fn after(budget: std::time::Duration) -> Self {
+        Self {
+            at: tokio::time::Instant::now() + budget,
+            budget,
+        }
+    }
+
+    pub(crate) async fn acquire<F: std::future::Future>(self, resource: &'static str, acquire: F) -> Result<F::Output> {
+        tokio::time::timeout_at(self.at, acquire)
+            .await
+            .map_err(|_| Error::Lock(rustfs_lock::LockError::timeout(resource, self.budget)))
+    }
+}
+
+/// Wait for `acquire` within `deadline`, or without bound when there is none.
+pub(crate) async fn acquire_gate_until<F: std::future::Future>(
+    deadline: Option<GateWaitDeadline>,
+    resource: &'static str,
+    acquire: F,
+) -> Result<F::Output> {
+    match deadline {
+        Some(deadline) => deadline.acquire(resource, acquire).await,
+        None => Ok(acquire.await),
+    }
 }
 
 pub fn is_pool_activation_fleet_proof_error(err: &Error) -> bool {
@@ -10143,6 +10187,19 @@ impl DecommissionPoolCapacityInfo {
     }
 }
 
+#[cfg(test)]
+static DECOMMISSION_START_GATE_WAIT_OVERRIDES: std::sync::OnceLock<std::sync::Mutex<HashMap<uuid::Uuid, std::time::Duration>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn set_decommission_start_gate_wait_for_test(store_id: uuid::Uuid, wait: std::time::Duration) {
+    DECOMMISSION_START_GATE_WAIT_OVERRIDES
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("decommission start gate wait override should not be poisoned")
+        .insert(store_id, wait);
+}
+
 #[cfg(any(test, feature = "test-util"))]
 type DecommissionCapacityInfoOverrides =
     std::sync::Mutex<HashMap<uuid::Uuid, std::collections::VecDeque<Vec<DecommissionPoolCapacityInfo>>>>;
@@ -13009,17 +13066,43 @@ impl ECStore {
         Ok(())
     }
 
-    async fn ensure_decommission_rebalance_idle_after_refresh(&self) -> Result<()> {
-        self.load_rebalance_meta().await?;
+    fn decommission_start_gate_deadline(&self) -> GateWaitDeadline {
+        #[cfg(test)]
+        if let Some(wait) = DECOMMISSION_START_GATE_WAIT_OVERRIDES
+            .get()
+            .and_then(|overrides| overrides.lock().ok()?.get(&self.id).copied())
+        {
+            return GateWaitDeadline::after(wait);
+        }
+        GateWaitDeadline::after(DECOMMISSION_START_GATE_WAIT)
+    }
+
+    /// Refresh rebalance metadata ahead of an operator decommission start,
+    /// within the same bounded gate wait the start itself uses.
+    pub async fn load_rebalance_meta_for_decommission_start(&self) -> Result<()> {
+        let deadline = self.decommission_start_gate_deadline();
+        let _start_guard = deadline
+            .acquire(DECOMMISSION_START_GATE_RESOURCE, self.start_gate.lock())
+            .await?;
+        self.load_rebalance_meta_under_start_gate_until(Some(deadline)).await
+    }
+
+    async fn ensure_decommission_rebalance_idle_after_refresh(&self, deadline: GateWaitDeadline) -> Result<()> {
+        let _start_guard = deadline
+            .acquire(DECOMMISSION_START_GATE_RESOURCE, self.start_gate.lock())
+            .await?;
+        self.ensure_decommission_rebalance_idle_after_refresh_under_start_gate(deadline)
+            .await
+    }
+
+    async fn ensure_decommission_rebalance_idle_after_refresh_under_start_gate(&self, deadline: GateWaitDeadline) -> Result<()> {
+        self.load_rebalance_meta_under_start_gate_until(Some(deadline)).await?;
         ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)
     }
 
-    async fn ensure_decommission_rebalance_idle_after_refresh_under_start_gate(&self) -> Result<()> {
-        self.load_rebalance_meta_under_start_gate().await?;
-        ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)
-    }
-
-    pub async fn status(&self, idx: usize) -> Result<PoolStatus> {
+    /// Pool status for an admin read, computed from a snapshot returned by
+    /// [`ECStore::pool_status_meta_snapshot`].
+    pub async fn status(&self, pool_meta: &PoolMeta, idx: usize) -> Result<PoolStatus> {
         let capacity_infos = self.get_decommission_all_pool_capacity_infos().await?;
         let space_info = capacity_infos
             .iter()
@@ -13027,8 +13110,7 @@ impl ECStore {
             .map(|capacity| capacity.space)
             .ok_or_else(|| invalid_decommission_pool_index_error(self.pools.len(), idx))?;
 
-        let pool_meta = self.pool_meta.read().await;
-        let active_target_reservations = active_decommission_target_reservations(&pool_meta);
+        let active_target_reservations = active_decommission_target_reservations(pool_meta);
 
         let mut pool_info = get_by_index(pool_meta.pools.as_slice(), idx, "fetch decommission status")?.clone();
         if let Some(info) = pool_info.decommission.as_mut() {
@@ -13037,25 +13119,55 @@ impl ECStore {
         Ok(apply_decommission_status_space_info(pool_info, space_info))
     }
 
+    /// Publish persisted pool metadata into memory, waiting for in-flight
+    /// data movement to drain. Startup uses it before any movement runs.
     #[tracing::instrument(skip_all)]
     pub async fn refresh_pool_status_meta(&self) -> Result<()> {
         let movement_gate = self.ctx.data_movement_operation_gate();
-        let _movement_guard = movement_gate.write().await;
-        let persisted = self.load_runtime_pool_meta("refresh pool status metadata failed").await?;
+        let movement_guard = movement_gate.write_owned().await;
+        self.publish_pool_status_refresh(movement_guard).await
+    }
 
-        let active_workers = {
-            let cancelers = self.decommission_cancelers.read().await;
-            cancelers
-                .iter()
-                .map(|canceler| canceler.as_ref().is_some_and(DecommissionCanceler::is_active))
-                .collect::<Vec<_>>()
-        };
+    /// Pool metadata for an admin status read. It never waits for data
+    /// movement: a movement side effect holds a read on the movement gate for
+    /// as long as it runs, and a queued writer would also stall every new
+    /// movement read behind it. With the gate free, the refresh publishes as
+    /// before. Otherwise the persisted snapshot is merged into a private copy
+    /// with the same monotonic rule and nothing is published, so no movement
+    /// state changes while an operation that sampled the old state is running.
+    #[tracing::instrument(skip_all)]
+    pub async fn pool_status_meta_snapshot(&self) -> Result<PoolMeta> {
+        if let Ok(movement_guard) = self.ctx.data_movement_operation_gate().try_write_owned() {
+            self.publish_pool_status_refresh(movement_guard).await?;
+            return Ok(self.pool_meta.read().await.clone());
+        }
+
+        let persisted = self.load_runtime_pool_meta("read pool status metadata failed").await?;
+        let active_workers = self.decommission_worker_activity().await;
+        let mut snapshot = self.pool_meta.read().await.clone();
+        merge_pool_status_refresh(&mut snapshot, persisted, &active_workers);
+        Ok(snapshot)
+    }
+
+    /// Load and publish under the movement writer, so no movement read sees
+    /// the transition mid-operation and no transition interleaves the load.
+    async fn publish_pool_status_refresh(&self, _movement_guard: tokio::sync::OwnedRwLockWriteGuard<()>) -> Result<()> {
+        let persisted = self.load_runtime_pool_meta("refresh pool status metadata failed").await?;
+        let active_workers = self.decommission_worker_activity().await;
 
         let mut pool_meta = self.pool_meta.write().await;
         if merge_pool_status_refresh(&mut pool_meta, persisted, &active_workers) {
             self.ctx.advance_data_movement_operation_epoch();
         }
         Ok(())
+    }
+
+    async fn decommission_worker_activity(&self) -> Vec<bool> {
+        let cancelers = self.decommission_cancelers.read().await;
+        cancelers
+            .iter()
+            .map(|canceler| canceler.as_ref().is_some_and(DecommissionCanceler::is_active))
+            .collect()
     }
 
     async fn get_decommission_pool_capacity_info(
@@ -14080,12 +14192,13 @@ impl ECStore {
         );
         validate_start_decommission_request(&indices, self.single_pool())?;
 
-        self.ensure_decommission_rebalance_idle_after_refresh().await?;
+        let deadline = self.decommission_start_gate_deadline();
+        self.ensure_decommission_rebalance_idle_after_refresh(deadline).await?;
 
         let store = require_decommission_store(runtime_sources::object_store_handle(), "start decommission")?;
         let local_indices = local_decommission_queue_prefix(&self.endpoints(), &indices)?;
         let index_cancelers = self
-            .start_decommission_with_routines(indices, &rx, local_indices.as_slice())
+            .start_decommission_inner(indices, Some((&rx, local_indices.as_slice())), deadline)
             .await?;
         drop(spawn_decommission_index_cancelers(
             store,
@@ -17148,27 +17261,22 @@ impl ECStore {
 
     #[tracing::instrument(skip(self))]
     pub async fn start_decommission(&self, indices: Vec<usize>) -> Result<()> {
-        self.start_decommission_inner(indices, None).await.map(|_| ())
+        let deadline = self.decommission_start_gate_deadline();
+        self.start_decommission_inner(indices, None, deadline).await.map(|_| ())
     }
 
-    async fn start_decommission_with_routines(
-        &self,
-        indices: Vec<usize>,
-        rx: &CancellationToken,
-        local_indices: &[usize],
-    ) -> Result<Vec<(usize, DecommissionCancelerGuard)>> {
-        self.start_decommission_inner(indices, Some((rx, local_indices))).await
-    }
-
+    /// Every gate this start waits for shares `deadline`; on expiry the start
+    /// fails with a retryable lock timeout before anything is persisted.
     async fn start_decommission_inner(
         &self,
         indices: Vec<usize>,
         reservation: Option<(&CancellationToken, &[usize])>,
+        deadline: GateWaitDeadline,
     ) -> Result<Vec<(usize, DecommissionCancelerGuard)>> {
         let indices = dedup_indices(&indices);
         validate_start_decommission_request(&indices, self.single_pool())?;
 
-        self.ensure_decommission_rebalance_idle_after_refresh().await?;
+        self.ensure_decommission_rebalance_idle_after_refresh(deadline).await?;
         #[cfg(test)]
         let endpoints = self.instance_endpoints().unwrap_or_else(|| self.endpoints());
         #[cfg(not(test))]
@@ -17210,8 +17318,10 @@ impl ECStore {
             }
         }
 
-        let _start_guard = self.start_gate.lock().await;
-        self.ensure_decommission_rebalance_idle_after_refresh_under_start_gate()
+        let _start_guard = deadline
+            .acquire(DECOMMISSION_START_GATE_RESOURCE, self.start_gate.lock())
+            .await?;
+        self.ensure_decommission_rebalance_idle_after_refresh_under_start_gate(deadline)
             .await?;
 
         let all_capacity_infos = self.get_decommission_all_pool_capacity_infos_with_owned_usage().await?;
@@ -17221,7 +17331,10 @@ impl ECStore {
         // object operations can observe the signal and release read guards.
         self.cancel_decommission_routines(&indices).await;
         let movement_gate = self.ctx.data_movement_operation_gate();
-        let _movement_guard = movement_gate.write().await;
+        // The writer waits for every in-flight movement read; bound the wait
+        // so one slow or stalled side effect fails this start instead of
+        // holding it, and every movement read queued behind it, open.
+        let _movement_guard = deadline.acquire(DATA_MOVEMENT_GATE_RESOURCE, movement_gate.write()).await?;
 
         let index_cancelers = if let Some((rx, local_indices)) = reservation {
             // Lock order matches terminal transitions: movement gate, then
@@ -19521,6 +19634,120 @@ mod tests {
         let wrapped = format!("rebalance meta save failed during start_rebalance: {POOL_ACTIVATION_FLEET_PROOF_EXPIRED}");
         assert!(is_pool_activation_fleet_proof_error(&Error::other(wrapped)));
         assert!(!is_pool_activation_fleet_proof_error(&Error::ConfigNotFound));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_status_snapshot_does_not_wait_for_a_stuck_movement_side_effect() {
+        let (_temp_dirs, store, _other_store) = Box::pin(crate::services::rebalance::test_two_pool_stores(None)).await;
+        crate::services::rebalance::promote_test_pool_meta_to_v2(&store).await;
+        let in_memory = store.pool_meta.read().await.clone();
+        let mut persisted = in_memory.clone();
+        persisted.pools[1].last_update = in_memory.pools[1].last_update + Duration::minutes(1);
+        persisted.pools[1].decommission = Some(PoolDecommissionInfo {
+            items_decommissioned: 7,
+            ..Default::default()
+        });
+        persisted
+            .save(store.pools.clone())
+            .await
+            .expect("another node's newer pool status should be persisted");
+
+        // A movement side effect that never finishes keeps its read admission.
+        let stuck_side_effect = store.ctx.data_movement_operation_gate().read_owned().await;
+        let epoch = store.ctx.data_movement_operation_epoch();
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(10), store.pool_status_meta_snapshot())
+            .await
+            .expect("a status read must not wait for in-flight data movement")
+            .expect("the persisted pool status should be readable");
+        assert_eq!(
+            snapshot.pools[1].decommission.as_ref().map(|info| info.items_decommissioned),
+            Some(7),
+            "the status read reports the persisted progress"
+        );
+        assert_eq!(
+            store.pool_meta.read().await.pools[1]
+                .decommission
+                .as_ref()
+                .map(|info| info.items_decommissioned),
+            in_memory.pools[1].decommission.as_ref().map(|info| info.items_decommissioned),
+            "a busy movement gate must keep the refresh from publishing"
+        );
+        assert_eq!(store.ctx.data_movement_operation_epoch(), epoch);
+
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, DecommissionErasureLayout { data: 1, parity: 0 }, 0, 100, 100),
+                DecommissionPoolCapacityInfo::for_test(1, DecommissionErasureLayout { data: 1, parity: 0 }, 200, 200, 0),
+            ]],
+        );
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), store.status(&snapshot, 1))
+            .await
+            .expect("pool status must not wait for in-flight data movement")
+            .expect("pool status should be computed from the snapshot");
+        assert_eq!(status.decommission.map(|info| info.items_decommissioned), Some(7));
+
+        drop(stuck_side_effect);
+        store
+            .pool_status_meta_snapshot()
+            .await
+            .expect("an idle movement gate should allow the refresh to publish");
+        assert_eq!(
+            store.pool_meta.read().await.pools[1]
+                .decommission
+                .as_ref()
+                .map(|info| info.items_decommissioned),
+            Some(7)
+        );
+        assert!(
+            store.ctx.data_movement_operation_epoch() > epoch,
+            "a published refresh advances the epoch"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_start_fails_retryably_instead_of_waiting_for_a_stuck_movement_side_effect() {
+        let (_temp_dirs, store, _other_store) = Box::pin(crate::services::rebalance::test_two_pool_stores(None)).await;
+        crate::services::rebalance::promote_test_pool_meta_to_v2(&store).await;
+        let baseline = load_pool_meta_replicas(store.pools.clone(), true)
+            .await
+            .expect("baseline pool metadata should be readable");
+        set_decommission_start_gate_wait_for_test(store.id, std::time::Duration::from_millis(500));
+
+        let stuck_side_effect = store.ctx.data_movement_operation_gate().read_owned().await;
+        let err = tokio::time::timeout(std::time::Duration::from_secs(10), store.start_decommission(vec![0]))
+            .await
+            .expect("a start must not hang behind a stuck movement side effect")
+            .expect_err("a start must fail while the movement gate stays busy");
+        assert!(
+            matches!(&err, Error::Lock(rustfs_lock::LockError::Timeout { resource, .. }) if resource == DATA_MOVEMENT_GATE_RESOURCE),
+            "a busy gate must surface as a retryable lock timeout: {err:?}"
+        );
+        assert!(
+            store
+                .pool_meta
+                .read()
+                .await
+                .pools
+                .iter()
+                .all(|pool| pool.decommission.is_none()),
+            "a timed-out start must not change in-memory pool state"
+        );
+        let after = load_pool_meta_replicas(store.pools.clone(), true)
+            .await
+            .expect("pool metadata should stay readable");
+        assert_eq!(after.canonical, baseline.canonical, "a timed-out start must not persist anything");
+
+        // A queued start writer must not keep movement reads waiting either:
+        // once the start gives up, a new movement read is admitted at once.
+        let next_side_effect =
+            tokio::time::timeout(std::time::Duration::from_secs(1), store.ctx.data_movement_operation_gate().read_owned())
+                .await
+                .expect("movement reads must not stay queued behind an abandoned start");
+        drop(next_side_effect);
+        drop(stuck_side_effect);
     }
 
     #[tokio::test]
