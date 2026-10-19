@@ -2,6 +2,9 @@
 {{- $tlsEnabled := $tls.enabled | default false -}}
 {{- $logDir := .Values.config.rustfs.obs_log_directory }}
 {{- $logDirEnabled := ne $logDir "" }}
+{{- /* With an empty storageclass.dataStorageSize and no existingClaim.dataClaim,
+       the data volume is supplied through extraVolumes/extraVolumeMounts. */}}
+{{- $dataVolumeEnabled := or .Values.mode.standalone.existingClaim.dataClaim (not (empty .Values.storageclass.dataStorageSize)) }}
 
 {{- if .Values.mode.standalone.enabled }}
 apiVersion: apps/v1
@@ -74,6 +77,7 @@ spec:
       priorityClassName: {{ .Values.priorityClassName }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if or $dataVolumeEnabled $logDirEnabled }}
       initContainers:
         - name: init-step
           image: "{{ .Values.image.initImage.repository }}:{{ .Values.image.initImage.tag }}"
@@ -84,18 +88,23 @@ spec:
             - sh
             - -c
             - |
+              {{- if $dataVolumeEnabled }}
               mkdir -p /data
+              {{- end }}
               {{- if $logDirEnabled }}
               mkdir -p /mnt/rustfs/logs
               chmod 755 /mnt/rustfs/logs
               {{- end }}
           volumeMounts:
+            {{- if $dataVolumeEnabled }}
             - name: data
               mountPath: /data
+            {{- end }}
             {{- if $logDirEnabled }}
             - name: logs
               mountPath: /mnt/rustfs
             {{- end }}
+      {{- end }}
       containers:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.rustfs.repository }}:{{ .Values.image.rustfs.tag | default .Chart.AppVersion }}"
@@ -138,8 +147,10 @@ spec:
               mountPath: {{ $logDir }}
               subPath: logs
             {{- end }}
+            {{- if $dataVolumeEnabled }}
             - name: data
               mountPath: /data
+            {{- end }}
       volumes:
       {{- with .Values.extraVolumes }}
       {{- toYaml . | nindent 8 }}
@@ -188,6 +199,7 @@ spec:
             claimName: {{ include "rustfs.fullname" $ }}-logs
             {{- end }}
       {{- end }}
+      {{- if $dataVolumeEnabled }}
         - name: data
           persistentVolumeClaim:
             {{- if .Values.mode.standalone.existingClaim.dataClaim }}
@@ -195,4 +207,5 @@ spec:
             {{- else }}
             claimName: {{ include "rustfs.fullname" $ }}-data
             {{- end }}
+      {{- end }}
 {{- end }}

@@ -125,14 +125,25 @@ fn is_service_account_owner_of(caller: &StoredCredentials, target_parent_user: &
 ///
 /// The `CreateServiceAccountAdminAction` permission gates *whether* a caller may
 /// create service accounts, not *for whom*. A non-owner is therefore confined to
-/// its own scope; only an owner may target another user — including the root
+/// its own non-root scope; only an owner may target another user — including the root
 /// credential, whose existence check is deliberately lenient. Without this a
 /// caller holding only that action could pass `target_user = <root access key>`
 /// and mint a root-parented service account that authenticates as owner via
 /// `prepare_service_account_auth`, a full-takeover privilege escalation. Mirrors
 /// `imported_service_account_parent_allowed` on the ImportIam path (GHSA-566f).
-fn add_service_account_parent_within_scope(target_user: &str, req_user: &str, req_parent_user: &str, owner: bool) -> bool {
-    owner || target_user == req_user || target_user == req_parent_user
+fn add_service_account_parent_within_scope(
+    root_access_key: &str,
+    target_user: &str,
+    req_user: &str,
+    req_parent_user: &str,
+    owner: bool,
+) -> bool {
+    let effective_parent = if target_user == req_user {
+        req_parent_user
+    } else {
+        target_user
+    };
+    owner || (effective_parent != root_access_key && (target_user == req_user || target_user == req_parent_user))
 }
 
 /// Fail-closed ownership check used by DeleteServiceAccount for a caller that
@@ -401,9 +412,8 @@ impl Operation for AddServiceAccount {
         // a root-parented (owner) service account. Evaluated on the original
         // `target_user` the caller submitted, before the derived-credential rewrite
         // to `req_parent_user` below, so the guard is bound to the parent actually
-        // requested. Its allow set is exactly `owner || is_svc_acc`. See the helper's
-        // doc comment.
-        if !add_service_account_parent_within_scope(&target_user, &req_user, &req_parent_user, owner) {
+        // requested and to the effective parent after that rewrite.
+        if !add_service_account_parent_within_scope(&sys_cred.access_key, &target_user, &req_user, &req_parent_user, owner) {
             return Err(s3_error!(AccessDenied, "service account parent is outside requester scope"));
         }
 
@@ -1470,74 +1480,86 @@ mod tests {
 
         // Attack: non-owner "alice" targets root as the parent -> DENY.
         assert!(
-            !add_service_account_parent_within_scope(root, "alice", "alice", false),
+            !add_service_account_parent_within_scope(root, root, "alice", "alice", false),
             "non-owner must not parent a service account to root"
         );
         // Non-owner targeting an unrelated user -> DENY.
         assert!(
-            !add_service_account_parent_within_scope("bob", "alice", "alice", false),
+            !add_service_account_parent_within_scope(root, "bob", "alice", "alice", false),
             "non-owner must not parent a service account to another user"
         );
         // Self-scoped creation (default target == own key) -> ALLOW.
         assert!(
-            add_service_account_parent_within_scope("alice", "alice", "alice", false),
+            add_service_account_parent_within_scope(root, "alice", "alice", "alice", false),
             "non-owner may create a service account for itself"
         );
         // Derived credential targeting its own parent -> ALLOW.
         assert!(
-            add_service_account_parent_within_scope("parent-user", "svc-key", "parent-user", false),
+            add_service_account_parent_within_scope(root, "parent-user", "svc-key", "parent-user", false),
             "derived credential may create a service account under its own parent"
         );
         // Owner may target any parent, including root (cross-user creation intact).
         assert!(
-            add_service_account_parent_within_scope(root, root, root, true),
+            add_service_account_parent_within_scope(root, root, root, root, true),
             "owner retains cross-user / root-parent creation"
         );
         assert!(
-            add_service_account_parent_within_scope("bob", root, root, true),
+            add_service_account_parent_within_scope(root, "bob", root, root, true),
             "owner may create a service account for another user"
         );
     }
 
     #[test]
-    fn ghsa_5354_scope_guard_matches_owner_or_self_scope_for_derived_credentials() {
-        // The handler evaluates `add_service_account_parent_within_scope` on the
-        // original `target_user`, before the `target_user = req_parent_user` rewrite
-        // taken inside the `is_svc_acc` branch. The guard's allow set must therefore
-        // stay exactly `owner || is_svc_acc`, where
-        // `is_svc_acc == (target_user == req_user || target_user == req_parent_user)`.
-        //
-        // The named-boundary test above only exercises the self-scoped case with
-        // `req_user == req_parent_user`. A *derived* credential has `req_user`
-        // (its own key) distinct from `req_parent_user` (its parent), which is the
-        // realistic attacker shape: a service account holding
-        // CreateServiceAccountAdminAction. Pin the equivalence across that shape so a
-        // later change to either the guard or the rewrite cannot silently let a
-        // derived non-owner credential escape its own parent's scope.
+    fn ghsa_5354_scope_guard_preserves_non_root_self_scope() {
         let root = rustfs_credentials::DEFAULT_ACCESS_KEY;
-        let cases: &[(&str, &str, &str, bool)] = &[
+        let cases: &[(&str, &str, &str, bool, bool)] = &[
             // Derived non-owner (own key != parent) aiming at root -> deny.
-            (root, "attacker-sa", "alice", false),
+            (root, "attacker-sa", "alice", false, false),
             // Derived non-owner aiming at an unrelated user -> deny.
-            ("bob", "attacker-sa", "alice", false),
+            ("bob", "attacker-sa", "alice", false, false),
             // Derived non-owner aiming at its own parent -> allow.
-            ("alice", "attacker-sa", "alice", false),
+            ("alice", "attacker-sa", "alice", false, true),
             // Derived non-owner aiming at its own key -> allow.
-            ("attacker-sa", "attacker-sa", "alice", false),
+            ("attacker-sa", "attacker-sa", "alice", false, true),
             // Top-level non-owner aiming at itself -> allow.
-            ("alice", "alice", "alice", false),
+            ("alice", "alice", "alice", false, true),
             // Owner is unrestricted, including root and a derived shape.
-            (root, "attacker-sa", "alice", true),
-            ("bob", root, root, true),
+            (root, "attacker-sa", "alice", true, true),
+            ("bob", root, root, true, true),
         ];
-        for &(target_user, req_user, req_parent_user, owner) in cases {
-            let is_svc_acc = target_user == req_user || target_user == req_parent_user;
+        for &(target_user, req_user, req_parent_user, owner, expected) in cases {
             assert_eq!(
-                add_service_account_parent_within_scope(target_user, req_user, req_parent_user, owner),
-                owner || is_svc_acc,
-                "scope guard must equal `owner || is_svc_acc` for (target={target_user}, req_user={req_user}, req_parent={req_parent_user}, owner={owner})"
+                add_service_account_parent_within_scope(root, target_user, req_user, req_parent_user, owner),
+                expected,
+                "scope guard mismatch for (target={target_user}, req_user={req_user}, req_parent={req_parent_user}, owner={owner})"
             );
         }
+    }
+
+    #[test]
+    fn credential_boundary_root_derived_non_owner_cannot_create_owner_service_account() {
+        let root = "deployment-root";
+        for target in [root, "restricted-service-account", "other-user"] {
+            assert!(
+                !add_service_account_parent_within_scope(root, target, "restricted-service-account", root, false),
+                "a root-derived non-owner must be denied even when targeting its own key: {target}"
+            );
+        }
+        assert!(add_service_account_parent_within_scope(root, root, root, root, true));
+        assert!(add_service_account_parent_within_scope(
+            root,
+            "alice",
+            "alice-service-account",
+            "alice",
+            false
+        ));
+        assert!(add_service_account_parent_within_scope(
+            root,
+            "alice-service-account",
+            "alice-service-account",
+            "alice",
+            false
+        ));
     }
 
     #[test]
