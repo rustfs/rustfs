@@ -2983,6 +2983,11 @@ fn resolve_decommission_partial_listing_entry(
     if let Some(entry) = entries.resolve(resolver) {
         return Ok(entry);
     }
+    if disk_error_count == 0
+        && let Some(prefix_dir) = decommission_prefix_directory_candidate(entries.as_ref())
+    {
+        return Ok(prefix_dir);
+    }
 
     let object = entries
         .as_ref()
@@ -3003,6 +3008,24 @@ fn resolve_decommission_partial_listing_entry(
         observed_at: OffsetDateTime::now_utc(),
         reason: "metadata_resolution_failed".to_string(),
     })
+}
+
+/// The prefix directory a partial listing sample consists of, when every
+/// candidate is one.
+///
+/// The walker emits a directory with empty metadata only when it holds no
+/// `xl.meta`, so such a sample is listing structure rather than erasure-coded
+/// data: node-local files such as the MRF journal under
+/// `.rustfs.sys/buckets/.heal/` create one on a single drive, and the
+/// recursive walk lists any object beneath it as its own entry. Below the
+/// directory quorum there is nothing to reconcile, so the callback receives the
+/// prefix exactly as a quorum-resolved one and skips it. Objects whose metadata
+/// is present but unreadable keep their metadata bytes and never match here;
+/// mixed samples stay unresolved.
+fn decommission_prefix_directory_candidate(candidates: &[Option<MetaCacheEntry>]) -> Option<MetaCacheEntry> {
+    let mut candidates = candidates.iter().flatten();
+    let first = candidates.next()?;
+    (first.is_dir() && candidates.all(MetaCacheEntry::is_dir)).then(|| first.clone())
 }
 
 fn validate_decommission_durable_ilm_copy(
@@ -24284,7 +24307,7 @@ mod pools_tests {
     };
     use crate::bucket::metadata_sys;
     use crate::data_movement;
-    use crate::disk::{STORAGE_FORMAT_FILE, endpoint::Endpoint};
+    use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE, endpoint::Endpoint};
     use crate::error::{Error, StorageError};
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::object_api::{ObjectInfo, ObjectOptions};
@@ -28782,6 +28805,122 @@ mod pools_tests {
         assert!(message.contains("1 disk error(s)"));
     }
 
+    fn decommission_listing_resolver() -> MetadataResolutionParams {
+        MetadataResolutionParams {
+            dir_quorum: 2,
+            obj_quorum: 2,
+            bucket: RUSTFS_META_BUCKET.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn node_local_prefix_directory_entry() -> MetaCacheEntry {
+        MetaCacheEntry {
+            name: "buckets/.heal/".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn single_version_object_entry(name: &str) -> MetaCacheEntry {
+        let mut meta = rustfs_filemeta::FileMeta::new();
+        meta.add_version(FileInfo {
+            volume: RUSTFS_META_BUCKET.to_string(),
+            name: name.to_string(),
+            size: 1,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        })
+        .expect("test file metadata should accept object version");
+        MetaCacheEntry {
+            name: name.to_string(),
+            metadata: meta.marshal_msg().expect("test file metadata should marshal"),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_resolve_decommission_partial_listing_entry_passes_prefix_directory_below_dir_quorum() {
+        let entry = resolve_decommission_partial_listing_entry(
+            MetaCacheEntries(vec![Some(node_local_prefix_directory_entry()), None, None]),
+            decommission_listing_resolver(),
+            RUSTFS_META_BUCKET,
+            BUCKET_META_PREFIX,
+            0,
+            1,
+            0,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("a prefix directory on one healthy drive is listing structure, not unresolved metadata");
+
+        assert_eq!(entry.name, "buckets/.heal/");
+        assert!(entry.is_dir());
+    }
+
+    #[test]
+    fn test_resolve_decommission_partial_listing_entry_keeps_prefix_directory_fail_closed_on_disk_error() {
+        let unresolved_entry = resolve_decommission_partial_listing_entry(
+            MetaCacheEntries(vec![Some(node_local_prefix_directory_entry()), None, None]),
+            decommission_listing_resolver(),
+            RUSTFS_META_BUCKET,
+            BUCKET_META_PREFIX,
+            1,
+            1,
+            0,
+            OffsetDateTime::now_utc(),
+        )
+        .expect_err("a prefix directory sampled beside a drive error must stay fail-closed");
+
+        assert_eq!(unresolved_entry.bucket, RUSTFS_META_BUCKET);
+        assert_eq!(unresolved_entry.object, "buckets/.heal/");
+        assert_eq!(unresolved_entry.candidate_count, 1);
+        assert_eq!(unresolved_entry.disk_error_count, 1);
+        assert_eq!(unresolved_entry.reason, "metadata_resolution_failed");
+    }
+
+    #[test]
+    fn test_resolve_decommission_partial_listing_entry_rejects_object_below_obj_quorum() {
+        let object = "buckets/photos/.metadata.bin";
+        let unresolved_entry = resolve_decommission_partial_listing_entry(
+            MetaCacheEntries(vec![Some(single_version_object_entry(object)), None, None]),
+            decommission_listing_resolver(),
+            RUSTFS_META_BUCKET,
+            BUCKET_META_PREFIX,
+            0,
+            1,
+            0,
+            OffsetDateTime::now_utc(),
+        )
+        .expect_err("an object sampled below the metadata quorum must stay unresolved");
+
+        assert_eq!(unresolved_entry.object, object);
+        assert_eq!(unresolved_entry.candidate_count, 1);
+        assert_eq!(unresolved_entry.disk_error_count, 0);
+        assert_eq!(unresolved_entry.reason, "metadata_resolution_failed");
+    }
+
+    #[test]
+    fn test_resolve_decommission_partial_listing_entry_rejects_mixed_prefix_and_directory_object_sample() {
+        let unresolved_entry = resolve_decommission_partial_listing_entry(
+            MetaCacheEntries(vec![
+                Some(node_local_prefix_directory_entry()),
+                Some(single_version_object_entry("buckets/.heal/")),
+                None,
+            ]),
+            decommission_listing_resolver(),
+            RUSTFS_META_BUCKET,
+            BUCKET_META_PREFIX,
+            0,
+            1,
+            0,
+            OffsetDateTime::now_utc(),
+        )
+        .expect_err("a prefix directory beside a same-name directory object must stay unresolved");
+
+        assert_eq!(unresolved_entry.object, "buckets/.heal/");
+        assert_eq!(unresolved_entry.candidate_count, 2);
+        assert_eq!(unresolved_entry.disk_error_count, 0);
+    }
+
     #[test]
     fn unresolved_entry_ledger_requires_individual_verification_before_completion() {
         let generation = OffsetDateTime::now_utc();
@@ -28944,6 +29083,100 @@ mod pools_tests {
                 .expect("reloaded decommission should exist")
                 .unresolved_entries,
             in_memory_entries
+        );
+    }
+
+    #[tokio::test]
+    async fn decommission_listing_skips_node_local_heal_journal_prefix() {
+        let (dirs, store) = metadata_sys::test_support::isolated_store_over_temp_disks().await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let generation = OffsetDateTime::now_utc();
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            pool_meta.dont_save = false;
+            pool_meta.pools[0].decommission = Some(PoolDecommissionInfo {
+                start_time: Some(generation),
+                ..Default::default()
+            });
+        }
+        store
+            .save_current_pool_meta_for_test(&[0])
+            .await
+            .expect("active decommission metadata should be persisted before listing");
+
+        // The MRF queue writes its journals with raw local-disk writes on the
+        // node that owns them, so one drive ends up with a plain directory tree
+        // that holds no xl.meta anywhere.
+        let journal_dir = dirs[0]
+            .path()
+            .join(RUSTFS_META_BUCKET)
+            .join(BUCKET_META_PREFIX)
+            .join(".heal")
+            .join("mrf");
+        tokio::fs::create_dir_all(&journal_dir)
+            .await
+            .expect("node-local journal directory should be created");
+        tokio::fs::write(journal_dir.join("journal.bin"), b"")
+            .await
+            .expect("legacy journal should be written");
+        tokio::fs::write(journal_dir.join("journal-scoped.bin"), b"scoped-journal")
+            .await
+            .expect("scoped journal should be written");
+
+        let listed = Arc::new(tokio::sync::Mutex::new(Vec::<MetaCacheEntry>::new()));
+        let listed_cb = listed.clone();
+        let callback: ListCallback = Arc::new(move |entry: MetaCacheEntry| {
+            let listed = listed_cb.clone();
+            Box::pin(async move {
+                listed.lock().await.push(entry);
+            })
+        });
+        let entry_error = Arc::new(tokio::sync::Mutex::new(None::<Error>));
+
+        store.pools[0].disk_set[0]
+            .list_objects_to_decommission(
+                store.clone(),
+                CancellationToken::new(),
+                DecomBucketInfo {
+                    name: RUSTFS_META_BUCKET.to_string(),
+                    prefix: BUCKET_META_PREFIX.to_string(),
+                },
+                callback,
+                entry_error.clone(),
+                0,
+                0,
+                generation,
+                false,
+            )
+            .await
+            .expect("a node-local journal directory must not fail the decommission listing");
+
+        assert!(entry_error.lock().await.is_none(), "{:?}", entry_error.lock().await);
+        assert!(
+            store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("decommission should remain active")
+                .unresolved_entries
+                .is_empty(),
+            "a node-local prefix must not be recorded as unresolved object metadata"
+        );
+
+        let listed = listed.lock().await;
+        let heal_entries = listed
+            .iter()
+            .filter(|entry| entry.name.starts_with("buckets/.heal/"))
+            .collect::<Vec<_>>();
+        assert!(
+            heal_entries
+                .iter()
+                .any(|entry| entry.name == "buckets/.heal/" && entry.is_dir()),
+            "the journal prefix should reach the callback as a skippable directory: {heal_entries:?}"
+        );
+        assert!(
+            heal_entries.iter().all(|entry| !entry.is_object()),
+            "raw journal files must never surface as objects: {heal_entries:?}"
         );
     }
 
