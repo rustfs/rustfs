@@ -12,16 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Instant;
 
 use rustfs_config::{
-    DEFAULT_SCANNER_IDLE_MODE, DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS, ENV_SCANNER_IDLE_MODE, ENV_SCANNER_SPEED,
-    ENV_SCANNER_YIELD_EVERY_N_OBJECTS, ScannerSpeed,
+    DEFAULT_SCANNER_IDLE_MODE, DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS, ENV_SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC,
+    ENV_SCANNER_DISK_IO_BUDGET_IOPS, ENV_SCANNER_IDLE_MODE, ENV_SCANNER_SPEED, ENV_SCANNER_YIELD_EVERY_N_OBJECTS, ScannerSpeed,
 };
 use rustfs_scanner_metrics::metrics::global_metrics;
 use tokio::time::Duration;
+
+mod io_budget;
+
+pub use io_budget::{
+    SCANNER_DISK_IO_BUDGET_MAX_WAIT, ScannerDiskIoBudget, ScannerDiskIoBudgetConfig, ScannerDiskIoBudgetLimits,
+    ScannerDiskIoBudgetStatus, ScannerDiskMedia, ScannerIoBudgetLimit, resolve_disk_io_budget, scanner_disk_io_budget_status,
+};
 
 const MIN_SLEEP: Duration = Duration::from_millis(1);
 const SCANNER_SPEED_FASTEST: u8 = 0;
@@ -74,6 +82,19 @@ fn scanner_env_config() -> (ScannerSpeed, bool) {
     (speed, idle_mode)
 }
 
+fn disk_io_budget_env_config(speed: ScannerSpeed) -> ScannerDiskIoBudgetConfig {
+    let limit = |key: &str| {
+        rustfs_utils::get_env_opt_str(key)
+            .and_then(|value| ScannerIoBudgetLimit::parse(&value))
+            .unwrap_or(ScannerIoBudgetLimit::Auto)
+    };
+    ScannerDiskIoBudgetConfig {
+        iops: limit(ENV_SCANNER_DISK_IO_BUDGET_IOPS),
+        bytes_per_sec: limit(ENV_SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC),
+        speed,
+    }
+}
+
 pub(crate) fn scanner_yield_every_n_objects() -> u64 {
     rustfs_utils::get_env_u64(ENV_SCANNER_YIELD_EVERY_N_OBJECTS, DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS)
 }
@@ -102,6 +123,7 @@ pub static SCANNER_SLEEPER: LazyLock<DynamicSleeper> = LazyLock::new(|| {
 
     let sleeper = DynamicSleeper::new(speed);
     sleeper.record_throttle_config();
+    sleeper.update_disk_io_budget(disk_io_budget_env_config(speed));
     sleeper
 });
 
@@ -111,9 +133,12 @@ pub static SCANNER_SLEEPER: LazyLock<DynamicSleeper> = LazyLock::new(|| {
 /// `elapsed_work_time * factor`, clamped to `[MIN_SLEEP, max_sleep]`.
 /// For folder-level gaps, [`sleep_folder`] uses `MIN_SLEEP * factor`,
 /// clamped only by `max_sleep`. All sleeps are gated on [`SCANNER_IDLE_MODE`];
+/// the per-disk background I/O budget bound with [`DynamicSleeper::for_disk`]
+/// is a hard ceiling that applies regardless of idle mode or preset.
 #[derive(Clone)]
 pub struct DynamicSleeper {
     inner: Arc<SleeperParams>,
+    disk_io_budget: Option<Arc<ScannerDiskIoBudget>>,
 }
 
 struct SleeperParams {
@@ -128,7 +153,50 @@ impl DynamicSleeper {
                 factor: RwLock::new(speed.sleep_factor()),
                 max_sleep: RwLock::new(speed.max_sleep()),
             }),
+            disk_io_budget: None,
         }
+    }
+
+    /// Bind this sleeper to the background I/O budget of one local disk.
+    /// Walkers that share a disk path share its buckets.
+    pub fn for_disk(&self, disk_path: &Path) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            disk_io_budget: Some(io_budget::disk_io_budget_for(disk_path)),
+        }
+    }
+
+    /// Whether byte charges can change pacing on the bound disk.
+    pub fn budgets_disk_io_bytes(&self) -> bool {
+        self.disk_io_budget.as_ref().is_some_and(|budget| budget.budgets_bytes())
+    }
+
+    /// Charge the bound disk's background I/O budget and wait it out.
+    ///
+    /// This is a hard ceiling layered on the local-disk foreground-priority
+    /// admission gate: it runs regardless of idle mode or speed preset, and
+    /// it only ever delays, so it can never admit more than the gate allows.
+    pub async fn admit_disk_io(&self, ops: u64, bytes: u64) {
+        if let Some(budget) = self.disk_io_budget.as_ref() {
+            budget.admit(ops, bytes).await;
+        }
+    }
+
+    pub(crate) fn update_disk_io_budget(&self, config: ScannerDiskIoBudgetConfig) {
+        io_budget::update_disk_io_budget_config(config);
+    }
+
+    /// Remove the per-disk budget for fixtures that walk large synthetic
+    /// namespaces through the local-disk path and test checkpoint semantics,
+    /// not pacing. nextest runs each test in its own process, so this does
+    /// not leak into other tests.
+    #[cfg(test)]
+    pub(crate) fn disable_disk_io_budget_for_tests(&self) {
+        self.update_disk_io_budget(ScannerDiskIoBudgetConfig {
+            iops: ScannerIoBudgetLimit::Unlimited,
+            bytes_per_sec: ScannerIoBudgetLimit::Unlimited,
+            speed: ScannerSpeed::Default,
+        });
     }
 
     fn should_sleep() -> bool {
@@ -141,7 +209,14 @@ impl DynamicSleeper {
         (factor, max_sleep)
     }
 
+    /// Pace one directory listing: the preset folder gap, then one
+    /// operation charged to the bound disk's background I/O budget.
     pub async fn sleep_folder(&self) {
+        self.sleep_folder_preset().await;
+        self.admit_disk_io(1, 0).await;
+    }
+
+    async fn sleep_folder_preset(&self) {
         if !Self::should_sleep() {
             return;
         }
@@ -187,10 +262,12 @@ impl DynamicSleeper {
         self.update_params(speed.sleep_factor(), speed.max_sleep());
     }
 
-    /// Reload speed and idle-mode settings from the current environment.
+    /// Reload speed, idle-mode, and disk I/O budget settings from the
+    /// current environment.
     pub fn refresh_from_env(&self) {
         let (speed, idle_mode) = scanner_env_config();
         self.update_from_runtime_config(speed.sleep_factor(), speed.max_sleep(), idle_mode, scanner_yield_every_n_objects());
+        self.update_disk_io_budget(disk_io_budget_env_config(speed));
     }
 
     pub(crate) fn update_from_runtime_config(
@@ -374,6 +451,73 @@ mod tests {
         s.sleep_folder().await;
         assert_eq!(start.elapsed(), Duration::ZERO);
 
+        SCANNER_IDLE_MODE.store(prev_mode, Ordering::Relaxed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn sleeper_without_a_disk_binding_never_charges_a_budget() {
+        let s = DynamicSleeper::new(ScannerSpeed::Fastest);
+        s.update_disk_io_budget(ScannerDiskIoBudgetConfig {
+            iops: ScannerIoBudgetLimit::Explicit(0),
+            bytes_per_sec: ScannerIoBudgetLimit::Explicit(0),
+            speed: ScannerSpeed::Fastest,
+        });
+
+        let start = tokio::time::Instant::now();
+        for _ in 0..10 {
+            s.sleep_folder().await;
+            s.admit_disk_io(1, 1 << 20).await;
+        }
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert!(!s.budgets_disk_io_bytes());
+
+        s.update_disk_io_budget(ScannerDiskIoBudgetConfig::DEFAULT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn sleeper_bound_to_a_disk_charges_folder_and_object_io_as_a_hard_ceiling() {
+        let prev_mode = SCANNER_IDLE_MODE.load(Ordering::Relaxed);
+        // Sleeps are disabled and the preset is `fastest`: only the explicit
+        // budget can pace this walk.
+        SCANNER_IDLE_MODE.store(false, Ordering::Relaxed);
+        let s = DynamicSleeper::new(ScannerSpeed::Fastest);
+        s.update_disk_io_budget(ScannerDiskIoBudgetConfig {
+            iops: ScannerIoBudgetLimit::Explicit(2),
+            bytes_per_sec: ScannerIoBudgetLimit::Explicit(1_000),
+            speed: ScannerSpeed::Fastest,
+        });
+        let disk = std::path::PathBuf::from(format!("/rustfs-scanner-sleeper-test-{}", std::process::id()));
+        let bound = s.for_disk(&disk);
+        assert!(bound.budgets_disk_io_bytes());
+
+        // Two listings fit the burst; the third owes one operation at 2/s.
+        let start = tokio::time::Instant::now();
+        bound.sleep_folder().await;
+        bound.sleep_folder().await;
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        bound.sleep_folder().await;
+        assert_eq!(start.elapsed(), Duration::from_millis(500));
+
+        // Bytes pace independently: 1500 bytes at 1000 B/s owes 500 ms on
+        // top of the operation debt already repaid.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let start = tokio::time::Instant::now();
+        bound.admit_disk_io(1, 1_500).await;
+        assert_eq!(start.elapsed(), Duration::from_millis(500));
+
+        let status = scanner_disk_io_budget_status()
+            .into_iter()
+            .find(|entry| entry.disk == disk.to_string_lossy())
+            .expect("bound disk reports a budget status");
+        assert_eq!(status.iops, Some(2));
+        assert_eq!(status.bytes_per_sec, Some(1_000));
+        assert_eq!(status.wait_events, 2);
+        assert_eq!(status.charged_ops, 4);
+        assert_eq!(status.charged_bytes, 1_500);
+
+        s.update_disk_io_budget(ScannerDiskIoBudgetConfig::DEFAULT);
         SCANNER_IDLE_MODE.store(prev_mode, Ordering::Relaxed);
     }
 

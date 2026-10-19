@@ -1978,6 +1978,19 @@ impl FolderScanner {
                     continue;
                 }
 
+                // Charge the disk's background I/O budget before the metadata
+                // read. The `xl.meta` size is only measured when bytes are
+                // budgeted, so an uncapped byte axis costs no extra stat.
+                let budgeted_bytes = if self.sleeper.budgets_disk_io_bytes() {
+                    tokio::fs::metadata(&item.path)
+                        .await
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                self.sleeper.admit_disk_io(1, budgeted_bytes).await;
+
                 let sz = match self
                     .local_disk
                     .get_size_with_tier_names(item.clone(), &self.tier_registry.names)

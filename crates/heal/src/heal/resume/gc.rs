@@ -67,6 +67,10 @@ pub(crate) struct ResumeGcReport {
     /// Records that must be handed to #1927's quarantine owner.
     pub(crate) quarantine_required: usize,
     pub(crate) generation_skipped: usize,
+    /// Retired predecessors (committed handoff) whose successor has verified
+    /// or already cleaned up behind a completion proof. They are retention
+    /// candidates for the durable owner; this pass still retains them.
+    pub(crate) retired_predecessors: usize,
     pub(crate) clock_skew: usize,
     pub(crate) read_errors: usize,
     pub(crate) retained: usize,
@@ -299,6 +303,19 @@ async fn inspect_task(
         return Ok(());
     }
 
+    if replacement && super::replacement_generation_is_retired(&parsed) {
+        let successor = parsed
+            .replacement_handoff
+            .as_ref()
+            .map(|handoff| handoff.link.successor.clone());
+        if let Some(successor) = successor
+            && super::validate_resume_task_id(&successor).is_ok()
+            && retired_successor_is_finished(options, disk, prefix, &successor, progress).await?
+        {
+            progress.report.retired_predecessors += 1;
+        }
+    }
+
     if !replacement && artifacts.checkpoint {
         let checkpoint_path = artifact_path(prefix, task_id, RESUME_CHECKPOINT_FILE)?;
         match read_bounded(disk, &checkpoint_path, options.max_bytes, progress.bytes_read).await {
@@ -338,6 +355,53 @@ async fn inspect_task(
     // supplies a common generation/CAS transition and quarantine owner.
     progress.report.retained += 1;
     Ok(())
+}
+
+/// Whether a retired predecessor's successor has verified or has left a
+/// completion proof behind. Unreadable or oversized successor records count as
+/// unfinished, so the predecessor stays retained.
+async fn retired_successor_is_finished(
+    options: InspectOptions,
+    disk: &DiskStore,
+    prefix: &str,
+    successor: &str,
+    progress: &mut InspectProgress<'_>,
+) -> Result<bool> {
+    let intent_path = artifact_path(prefix, successor, REPLACEMENT_INTENT_FILE)?;
+    match read_bounded(disk, &intent_path, options.max_bytes, progress.bytes_read).await {
+        ReadOutcome::Bytes(bytes) => {
+            return Ok(serde_json::from_slice::<ResumeState>(&bytes).is_ok_and(|state| {
+                state.task_id == successor
+                    && state.completed
+                    && matches!(
+                        state.replacement_phase,
+                        super::ReplacementPhase::Verified | super::ReplacementPhase::CleanupPending
+                    )
+            }));
+        }
+        ReadOutcome::Missing => {}
+        ReadOutcome::TooLarge => {
+            progress.report.budget_exhausted = true;
+            return Ok(false);
+        }
+        ReadOutcome::Error => {
+            progress.report.read_errors += 1;
+            return Ok(false);
+        }
+    }
+    let proof_path = artifact_path(prefix, successor, REPLACEMENT_COMPLETION_PROOF_FILE)?;
+    Ok(match read_bounded(disk, &proof_path, options.max_bytes, progress.bytes_read).await {
+        ReadOutcome::Bytes(bytes) => !bytes.is_empty(),
+        ReadOutcome::Missing => false,
+        ReadOutcome::TooLarge => {
+            progress.report.budget_exhausted = true;
+            false
+        }
+        ReadOutcome::Error => {
+            progress.report.read_errors += 1;
+            false
+        }
+    })
 }
 
 enum ReadOutcome {

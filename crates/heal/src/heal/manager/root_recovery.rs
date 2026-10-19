@@ -25,6 +25,7 @@ use crate::heal::storage_api::owner::{EcstoreConditionalFileUpdate, EcstoreDiskA
 use crate::heal::{DiskStore, RUSTFS_META_BUCKET};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
@@ -398,6 +399,22 @@ impl RootHealQuarantine {
 pub(super) struct RootHealInventory {
     pub(super) requests: Vec<HealRequest>,
     pub(super) quarantined_task_ids: HashSet<String>,
+    /// Records that can neither be admitted nor quarantined, with the reason.
+    /// They are reported, refused for admission, and retained for operator
+    /// repair; every other record keeps replaying.
+    pub(super) conflicted: BTreeMap<String, String>,
+}
+
+impl RootHealInventory {
+    /// Why a durable record cannot run, for admission refusals and status.
+    pub(super) fn record_issue(&self, task_id: &str) -> Option<String> {
+        if let Some(reason) = self.conflicted.get(task_id) {
+            return Some(reason.clone());
+        }
+        self.quarantined_task_ids
+            .contains(task_id)
+            .then(|| "durable record is quarantined".to_string())
+    }
 }
 
 impl RootHealTerminal {
@@ -907,8 +924,12 @@ impl RootHealRecovery {
         Ok(marker)
     }
 
+    /// Index quarantine markers by record. A marker that cannot be read or
+    /// decoded, or that has several owners, marks its task as conflicted
+    /// instead of failing the whole inventory; such a task is never replayed.
     async fn quarantine_marker_map(
         disks: &[DiskStore],
+        conflicted: &mut BTreeMap<String, String>,
     ) -> Result<HashMap<(RootHealRecordKind, String), (DiskStore, RootHealQuarantine)>> {
         let mut markers = HashMap::new();
         for disk in disks {
@@ -922,14 +943,24 @@ impl RootHealRecovery {
                     continue;
                 };
                 let Some(bytes) = read_bounded(disk, &entry).await? else {
-                    return Err(Error::other(format!("Root heal quarantine marker disappeared {task_id}")));
+                    conflicted.insert(task_id.to_owned(), format!("Root heal quarantine marker disappeared {task_id}"));
+                    continue;
                 };
-                let marker = decode_quarantine(task_id, record_kind, &bytes)?;
+                let marker = match decode_quarantine(task_id, record_kind, &bytes) {
+                    Ok(marker) => marker,
+                    Err(error) => {
+                        conflicted.insert(task_id.to_owned(), error.to_string());
+                        continue;
+                    }
+                };
                 let key = (record_kind, task_id.to_owned());
                 if markers.insert(key, (disk.clone(), marker)).is_some() {
-                    return Err(Error::other(format!("Multiple root heal quarantine owners for {task_id}")));
+                    conflicted.insert(task_id.to_owned(), format!("Multiple root heal quarantine owners for {task_id}"));
                 }
             }
+        }
+        for task_id in conflicted.keys() {
+            markers.retain(|(_, marked), _| marked != task_id);
         }
         Ok(markers)
     }
@@ -960,7 +991,8 @@ impl RootHealRecovery {
             }
         }
 
-        let markers = Self::quarantine_marker_map(disks).await?;
+        let mut conflicted = BTreeMap::new();
+        let markers = Self::quarantine_marker_map(disks, &mut conflicted).await?;
         for (record_kind, task_id) in markers.keys() {
             match record_kind {
                 RootHealRecordKind::Intent => {
@@ -974,18 +1006,30 @@ impl RootHealRecovery {
         let mut inventory = RootHealInventory {
             requests: Vec::new(),
             quarantined_task_ids: markers.keys().map(|(_, task_id)| task_id.clone()).collect(),
+            conflicted,
         };
+        // One record's conflict never postpones the others: it is recorded
+        // with its reason, refused for admission, and retained for repair.
         for task_id in intent_ids.union(&terminal_ids) {
+            if inventory.conflicted.contains_key(task_id) {
+                continue;
+            }
             let terminal_raw = Self::read_raw(disks, &terminal_path(task_id)?).await?;
             if terminal_raw.len() > 1 {
-                return Err(Error::other(format!("Multiple root heal terminal owners for {task_id}")));
+                inventory
+                    .conflicted
+                    .insert(task_id.clone(), format!("Multiple root heal terminal owners for {task_id}"));
+                continue;
             }
             if let Some((owner, source)) = terminal_raw.into_iter().next() {
                 if let Some(marker) = markers.get(&(RootHealRecordKind::Terminal, task_id.clone())) {
                     if EcstoreDiskAPI::endpoint(marker.0.as_ref()) != EcstoreDiskAPI::endpoint(owner.as_ref())
                         || !marker.1.matches_source(&source)
                     {
-                        return Err(Error::other(format!("Root heal quarantine source changed {task_id}")));
+                        inventory
+                            .conflicted
+                            .insert(task_id.clone(), format!("Root heal quarantine source changed {task_id}"));
+                        continue;
                     }
                     inventory.quarantined_task_ids.insert(task_id.clone());
                     continue;
@@ -1001,22 +1045,32 @@ impl RootHealRecovery {
                 }
             }
             if let Some(marker) = markers.get(&(RootHealRecordKind::Terminal, task_id.clone())) {
-                return Err(Error::other(format!(
-                    "Root heal quarantine marker has no retained terminal source {} ({} bytes)",
-                    task_id, marker.1.source_prefix_len
-                )));
+                inventory.conflicted.insert(
+                    task_id.clone(),
+                    format!(
+                        "Root heal quarantine marker has no retained terminal source {} ({} bytes)",
+                        task_id, marker.1.source_prefix_len
+                    ),
+                );
+                continue;
             }
 
             let intent_raw = Self::read_raw(disks, &intent_path(task_id)?).await?;
             if intent_raw.len() > 1 {
-                return Err(Error::other(format!("Multiple root heal recovery owners for {task_id}")));
+                inventory
+                    .conflicted
+                    .insert(task_id.clone(), format!("Multiple root heal recovery owners for {task_id}"));
+                continue;
             }
             let Some((owner, source)) = intent_raw.into_iter().next() else {
                 if let Some(marker) = markers.get(&(RootHealRecordKind::Intent, task_id.clone())) {
-                    return Err(Error::other(format!(
-                        "Root heal quarantine marker has no retained intent source {} ({} bytes)",
-                        task_id, marker.1.source_prefix_len
-                    )));
+                    inventory.conflicted.insert(
+                        task_id.clone(),
+                        format!(
+                            "Root heal quarantine marker has no retained intent source {} ({} bytes)",
+                            task_id, marker.1.source_prefix_len
+                        ),
+                    );
                 }
                 continue;
             };
@@ -1024,7 +1078,10 @@ impl RootHealRecovery {
                 if EcstoreDiskAPI::endpoint(marker.0.as_ref()) != EcstoreDiskAPI::endpoint(owner.as_ref())
                     || !marker.1.matches_source(&source)
                 {
-                    return Err(Error::other(format!("Root heal quarantine source changed {task_id}")));
+                    inventory
+                        .conflicted
+                        .insert(task_id.clone(), format!("Root heal quarantine source changed {task_id}"));
+                    continue;
                 }
                 inventory.quarantined_task_ids.insert(task_id.clone());
                 continue;
@@ -1037,6 +1094,9 @@ impl RootHealRecovery {
                 }
             }
         }
+        inventory
+            .quarantined_task_ids
+            .retain(|task_id| !inventory.conflicted.contains_key(task_id));
         inventory
             .requests
             .sort_by(|left, right| left.created_at.cmp(&right.created_at).then_with(|| left.id.cmp(&right.id)));
@@ -1585,6 +1645,17 @@ impl RootHealRecovery {
     pub(super) async fn pending(&self) -> Result<Vec<HealRequest>> {
         Ok(self.inventory().await?.requests)
     }
+
+    /// Why a durable record for `task_id` cannot run, if the inventory can be
+    /// read. Status queries are best-effort: an unreadable inventory reports
+    /// no issue rather than failing the query.
+    pub(crate) async fn record_issue(&self, task_id: &str) -> Option<String> {
+        #[cfg(any(test, feature = "test-util"))]
+        if self.disabled_for_tests {
+            return None;
+        }
+        self.inventory().await.ok()?.record_issue(task_id)
+    }
 }
 
 impl HealManager {
@@ -1592,7 +1663,20 @@ impl HealManager {
         // Decode every record before admitting anything. These are already
         // accepted responsibilities, so restore distinct IDs even when their
         // paths overlap or the configured admission capacity has changed.
-        let pending = self.root_recovery.inventory().await?.requests;
+        let inventory = self.root_recovery.inventory().await?;
+        for (task_id, reason) in &inventory.conflicted {
+            warn!(
+                target: "rustfs::heal::manager",
+                event = EVENT_HEAL_MANAGER_STATE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_MANAGER,
+                task_id,
+                result = "conflicting_record_skipped",
+                reason,
+                "Root heal recovery record skipped; operator repair required"
+            );
+        }
+        let pending = inventory.requests;
         let mut requests = Vec::with_capacity(pending.len());
         for request in pending {
             if let HealType::Bucket { bucket } = &request.heal_type {

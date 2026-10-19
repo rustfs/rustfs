@@ -28,6 +28,8 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(10);
 
 struct ScannerStorage {
     survivor: DiskStore,
+    /// Additional survivors exposed through the same set inventory.
+    sibling_survivors: Vec<DiskStore>,
     identity: ReplacementTargetIdentity,
     inventory_calls: AtomicUsize,
 }
@@ -40,7 +42,9 @@ impl HealStorageAPI for ScannerStorage {
         // This disk is deliberately outside the node's local registry. The
         // mock supplies the same inventory boundary as a remote survivor,
         // while real disk I/O exercises durable intent discovery and loading.
-        Ok(vec![self.survivor.clone()])
+        let mut disks = vec![self.survivor.clone()];
+        disks.extend(self.sibling_survivors.iter().cloned());
+        Ok(disks)
     }
 
     async fn replacement_target_identities(&self, targets: &[String]) -> Result<Vec<ReplacementTargetIdentity>> {
@@ -103,7 +107,7 @@ impl HealStorageAPI for ScannerStorage {
 }
 
 struct ScannerFixture {
-    _temp: TempDir,
+    temp: TempDir,
     manager: HealManager,
     storage: Arc<ScannerStorage>,
     owner: ResumeManager,
@@ -209,6 +213,7 @@ impl ScannerFixture {
             .expect("durable in-budget FileNotFound failure");
         let storage = Arc::new(ScannerStorage {
             survivor,
+            sibling_survivors: Vec::new(),
             identity,
             inventory_calls: AtomicUsize::new(0),
         });
@@ -220,7 +225,7 @@ impl ScannerFixture {
             }),
         );
         Self {
-            _temp: temp,
+            temp,
             manager,
             storage,
             owner,
@@ -263,7 +268,7 @@ impl ScannerFixture {
                 .get(&self.task_id),
             Some(&self.storage.survivor.endpoint().to_string())
         );
-        assert!(!self.manager.replacement_recovery_set_is_blocked(SET));
+        assert!(self.manager.replacement_recovery_blocks().is_empty());
         assert_eq!(
             self.storage.inventory_calls.load(Ordering::SeqCst),
             1,
@@ -346,7 +351,7 @@ async fn scanner_tick_finishes_existing_owner_before_admitting_new_unformatted_t
         assert_ne!(next.id, fixture.task_id, "the follow-up replacement gets a fresh generation");
         assert_eq!(next.heal_endpoints, fixture.local_targets[1..]);
         assert_eq!(next.source, HealRequestSource::AutoHeal);
-        assert!(!fixture.manager.replacement_recovery_set_is_blocked(SET));
+        assert!(fixture.manager.replacement_recovery_blocks().is_empty());
         assert_eq!(fixture.storage.inventory_calls.load(Ordering::SeqCst), 2);
     })
     .await;
@@ -374,4 +379,70 @@ async fn recovery_disk_index_keeps_first_snapshot_and_sorted_unique_endpoints() 
         vec![&local_endpoint, &survivor_endpoint],
         "discovery order remains lexical regardless of insertion order"
     );
+}
+
+#[tokio::test(start_paused = true)]
+#[serial_test::serial(replacement_auto_scan)]
+async fn scanner_tick_blocks_only_the_conflicting_generation_of_a_set() {
+    // backlog#2902 step 3: two survivors hold the same revision of a sibling
+    // generation with different bytes. That generation is unverifiable, but
+    // the set's other generation must still be replayed.
+    let mut fixture = ScannerFixture::new(false).await;
+    let sibling_a = make_manager_resume_disk(&fixture.temp, "sibling-survivor-a").await;
+    let sibling_b = make_manager_resume_disk(&fixture.temp, "sibling-survivor-b").await;
+    let sibling_id = ResumeUtils::generate_task_id();
+    let sibling_identity = ReplacementTargetIdentity {
+        endpoint: fixture.local_targets[1].clone(),
+        canonical_path: fixture.local_targets[1].clone(),
+        physical_device_ids: vec!["replacement-target-1".into()],
+        filesystem_identity: "replacement-target-1-incarnation".into(),
+    };
+    for (disk, copy) in [(&sibling_a, "copy-a"), (&sibling_b, "copy-b")] {
+        let manager = ResumeManager::new_replacement_intent(
+            disk.clone(),
+            sibling_id.clone(),
+            SET.into(),
+            vec!["seeded-bucket".into()],
+            vec![fixture.local_targets[1].clone()],
+            vec![sibling_identity.clone()],
+        )
+        .await
+        .expect("durable sibling generation copy");
+        manager
+            .set_error(format!("divergent {copy}"))
+            .await
+            .expect("diverge the copies");
+    }
+    let storage = Arc::new(ScannerStorage {
+        survivor: fixture.storage.survivor.clone(),
+        sibling_survivors: vec![sibling_a, sibling_b],
+        identity: fixture.storage.identity.clone(),
+        inventory_calls: AtomicUsize::new(0),
+    });
+    fixture.storage = storage.clone();
+    fixture.manager = HealManager::new_without_root_recovery_for_test(
+        storage,
+        Some(HealConfig {
+            heal_interval: SCAN_INTERVAL,
+            ..HealConfig::default()
+        }),
+    );
+    fixture
+        .manager
+        .start_auto_disk_scanner()
+        .await
+        .expect("start only the periodic replacement scanner");
+
+    let request = fixture.queued_request().await;
+    assert_eq!(request.id, fixture.task_id, "the clean generation of the set is replayed");
+    assert_eq!(request.heal_endpoints, vec![fixture.local_targets[0].clone()]);
+    assert_eq!(fixture.owner.get_state().await.retry_count, 1, "replay must not touch the durable budget");
+    assert!(!fixture.manager.replacement_recovery_generation_is_blocked(&fixture.task_id));
+    let blocks = fixture.manager.replacement_recovery_blocks();
+    assert_eq!(blocks.len(), 1, "only the unverifiable generation is blocked: {blocks:?}");
+    assert_eq!(blocks[0].task_id, sibling_id);
+    assert_eq!(blocks[0].set_disk_id, SET);
+    assert!(blocks[0].reason.contains("diverge"), "{}", blocks[0].reason);
+    assert!(blocks[0].reserves_targets, "an active intent still reserves its slot");
+    assert!(blocks[0].blocked_since > 0);
 }
