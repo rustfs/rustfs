@@ -117,10 +117,13 @@ async fn issue_8297_contended_follower_clears_only_transient_cycle_recovery() {
             .await
             .expect("hold live leader");
         let transient = seed_transient_cycle_read_failure().await;
-        assert!(!record_scanner_cycle_recovery_retry(MAX_SCANNER_CYCLE_RECOVERY_RETRIES));
-        let paused = scanner_cycle_recovery_status();
-        assert_eq!(paused.state, "paused");
-        let mut cases = vec![(transient, true), (paused, true)];
+        let retry = record_scanner_cycle_recovery_retry(MAX_SCANNER_CYCLE_RECOVERY_RETRIES, Duration::from_secs(1));
+        assert_eq!(retry.attempt, MAX_SCANNER_CYCLE_RECOVERY_RETRIES);
+        let backoff = scanner_cycle_recovery_status();
+        assert_eq!(backoff.state, "backoff");
+        assert!(backoff.retryable, "budget exhaustion must stay retryable: {backoff:?}");
+        assert!(backoff.next_attempt_at_unix_secs.is_some());
+        let mut cases = vec![(transient, true), (backoff, true)];
         for (state, classification, retryable) in [
             ("recovery-required", None, false),
             ("blocked", None, false),
@@ -129,7 +132,7 @@ async fn issue_8297_contended_follower_clears_only_transient_cycle_recovery() {
             ("cleanup-pending", Some("corrupt"), true),
             ("usage_floor_load_failed", Some("usage_floor_load_failed"), true),
             ("usage_floor_recovery_pending", Some("legacy_empty_usage_floor"), true),
-            ("paused", Some("usage_floor_load_failed"), false),
+            ("backoff", Some("usage_floor_load_failed"), true),
             ("cache_cycle_ahead", Some("cache_cycle_ahead"), true),
         ] {
             cases.push((
@@ -199,9 +202,11 @@ async fn issue_8297_supervisor_recovers_paused_follower_without_restart() {
                 .expect("hold live leader");
             for attempt in 1..=MAX_SCANNER_CYCLE_RECOVERY_RETRIES {
                 seed_transient_cycle_read_failure().await;
-                assert_eq!(record_scanner_cycle_recovery_retry(attempt), attempt < MAX_SCANNER_CYCLE_RECOVERY_RETRIES);
+                assert_eq!(record_scanner_cycle_recovery_retry(attempt, Duration::from_secs(1)).attempt, attempt);
             }
-            assert_eq!(scanner_cycle_recovery_status().state, "paused");
+            let backoff = scanner_cycle_recovery_status();
+            assert_eq!(backoff.state, "backoff");
+            assert!(backoff.retryable);
             assert!(!crate::scanner_runtime_initialized(), "test must own the scanner runtime");
             let ctx = CancellationToken::new();
             let _cancel_on_drop = ctx.clone().drop_guard();
@@ -221,7 +226,7 @@ async fn issue_8297_supervisor_recovers_paused_follower_without_restart() {
             })
             .await
             .expect("cancelled scanner supervisor must stop");
-            recovered.expect("follower must recover without another five-minute pause or process restart");
+            recovered.expect("follower must recover without waiting out the backoff or restarting the process");
             assert_eq!(scanner_cycle_schedule_status().execution_role, "follower");
             let status = scanner_cycle_recovery_status();
             assert_eq!(status.retry_count, 0);
