@@ -10736,9 +10736,9 @@ fn decommission_delete_marker_opts(
     }
 }
 
-fn decommission_object_migration_read_opts(version_id: Option<String>) -> ObjectOptions {
+fn decommission_object_migration_read_opts(version: &rustfs_filemeta::FileInfo) -> ObjectOptions {
     ObjectOptions {
-        version_id,
+        version_id: Some(data_movement::data_movement_exact_version_id(version.version_id)),
         no_lock: true,
         data_movement: true,
         raw_data_movement_read: true,
@@ -15325,6 +15325,7 @@ impl ECStore {
         let mut expired: usize = 0;
         let mut free_version_disposition = DecommissionFreeVersionDisposition::default();
         let mut cleanup_preflight_allowed_missing = Vec::new();
+        let mut cleanup_preflight_vanished = Vec::new();
         let mut entry_blocked = false;
 
         for version in fivs.versions.iter() {
@@ -15660,6 +15661,9 @@ impl ECStore {
                 }
 
                 if ignore {
+                    if cleanup_ignored {
+                        cleanup_preflight_vanished.push(data_movement::source_cleanup_version_identity(version));
+                    }
                     if should_count_decommission_version_complete(ignore, cleanup_ignored, failure) {
                         decommissioned += 1;
                     }
@@ -15842,7 +15846,7 @@ impl ECStore {
                         &encode_dir_object(&version.name),
                         None,
                         HeaderMap::new(),
-                        &decommission_object_migration_read_opts(version_id.clone()),
+                        &decommission_object_migration_read_opts(version),
                     )
                     .await;
                 #[cfg(test)]
@@ -16033,6 +16037,9 @@ impl ECStore {
             }
 
             if ignore {
+                if cleanup_ignored {
+                    cleanup_preflight_vanished.push(data_movement::source_cleanup_version_identity(version));
+                }
                 if should_count_decommission_version_complete(ignore, cleanup_ignored, failure) {
                     decommissioned += 1;
                 }
@@ -16121,13 +16128,14 @@ impl ECStore {
             let source_cleanup_mutation_fence = self
                 .acquire_decommission_source_cleanup_fence(bucket.as_str(), entry.name.as_str(), set.as_ref())
                 .await?;
+            let cleanup_expected = data_movement::source_cleanup_expected_without_vanished(&fivs, &cleanup_preflight_vanished);
             let cleanup_result = self
                 .run_guarded_decommission_side_effect(&rx, &operation_gate, || async {
                     data_movement::cleanup_source_entry_if_unchanged(
                         set.clone(),
                         bucket.as_str(),
                         entry.name.as_str(),
-                        &fivs,
+                        &cleanup_expected,
                         &cleanup_preflight_allowed_missing,
                         data_movement::SourceCleanupBucketFence {
                             expected_incarnation_id: expected_bucket_incarnation_id,
@@ -23321,9 +23329,16 @@ mod tests {
 
     #[test]
     fn test_decommission_object_migration_read_opts_are_raw_data_movement() {
-        let opts = decommission_object_migration_read_opts(Some("vid-1".to_string()));
+        let version_id = uuid::Uuid::from_u128(1);
+        let opts = decommission_object_migration_read_opts(&rustfs_filemeta::FileInfo {
+            version_id: Some(version_id),
+            ..Default::default()
+        });
 
-        assert_eq!(opts.version_id.as_deref(), Some("vid-1"));
+        assert_eq!(opts.version_id, Some(version_id.to_string()));
+        // `None` would read the latest version, not the listed null version.
+        let null_opts = decommission_object_migration_read_opts(&rustfs_filemeta::FileInfo::default());
+        assert_eq!(null_opts.version_id, Some(uuid::Uuid::nil().to_string()));
         assert!(opts.no_lock);
         assert!(opts.data_movement);
         assert!(opts.raw_data_movement_read);

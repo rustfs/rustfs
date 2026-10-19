@@ -67,9 +67,9 @@ fn rebalance_remote_tiered_opts(
     }
 }
 
-pub(super) fn rebalance_object_migration_read_opts(version_id: Option<String>) -> ObjectOptions {
+pub(super) fn rebalance_object_migration_read_opts(version: &FileInfo) -> ObjectOptions {
     ObjectOptions {
-        version_id,
+        version_id: Some(crate::data_movement::data_movement_exact_version_id(version.version_id)),
         no_lock: true,
         data_movement: true,
         raw_data_movement_read: true,
@@ -350,7 +350,7 @@ where
                 &encode_dir_object(&version.name),
                 None,
                 HeaderMap::new(),
-                &rebalance_object_migration_read_opts(version_id.clone()),
+                &rebalance_object_migration_read_opts(version),
             )
             .await
         {

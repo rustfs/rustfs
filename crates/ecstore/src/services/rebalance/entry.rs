@@ -282,6 +282,7 @@ impl ECStore {
         let mut rebalanced: usize = 0;
         let mut expired: usize = 0;
         let mut cleanup_preflight_allowed_missing = Vec::new();
+        let mut cleanup_preflight_vanished = Vec::new();
         let mut stats_updates = Vec::with_capacity(fivs.versions.len());
         for version in fivs.versions.iter() {
             ensure_rebalance_entry_active(&cancel)?;
@@ -386,6 +387,9 @@ impl ECStore {
             run_guard.ensure_held("rebalance version migration")?;
 
             if result.ignored {
+                if result.cleanup_ignored {
+                    cleanup_preflight_vanished.push(data_movement::source_cleanup_version_identity(version));
+                }
                 if should_count_rebalance_version_complete(&result) {
                     rebalanced += 1;
                 }
@@ -478,6 +482,7 @@ impl ECStore {
             if bucket_incarnation_fence.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
                 return Err(Error::other("rebalance bucket incarnation fence was lost before source cleanup"));
             }
+            let cleanup_expected = data_movement::source_cleanup_expected_without_vanished(&fivs, &cleanup_preflight_vanished);
             let cleanup_result = self
                 .finish_rebalance_entry_after_cleanup(
                     &RebalanceEntryCleanupContext {
@@ -493,7 +498,7 @@ impl ECStore {
                         set.clone(),
                         bucket.as_str(),
                         entry.name.as_str(),
-                        &fivs,
+                        &cleanup_expected,
                         &cleanup_preflight_allowed_missing,
                         data_movement::SourceCleanupBucketFence {
                             expected_incarnation_id: bucket_configs.bucket_incarnation_id,
