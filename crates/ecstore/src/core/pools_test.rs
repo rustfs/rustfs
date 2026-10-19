@@ -7473,6 +7473,30 @@ mod decommission_lock_order_tests {
         committed: bool,
         object: &str,
     ) -> (String, uuid::Uuid) {
+        // The routine also migrates `.rustfs.sys` bucket metadata, so keep the
+        // reservation far above every fixture object.
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        kill_leader_inside_target_put_with_capacity(
+            store,
+            committed,
+            object,
+            vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64 << 20, 64 << 20),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 1 << 30, 1 << 30, 0),
+            ],
+        )
+        .await
+    }
+
+    /// Like `kill_leader_inside_target_put`, with the capacity snapshot the
+    /// decommission reserves from. The selection must route the killed
+    /// migration to target pool 1.
+    async fn kill_leader_inside_target_put_with_capacity(
+        store: &Arc<crate::store::ECStore>,
+        committed: bool,
+        object: &str,
+        capacity: Vec<DecommissionPoolCapacityInfo>,
+    ) -> (String, uuid::Uuid) {
         let bucket = test_bucket("killed-leader-put");
         store
             .make_bucket(&bucket, &MakeBucketOptions::default())
@@ -7487,16 +7511,7 @@ mod decommission_lock_order_tests {
             .bucket_incarnation_id(&bucket)
             .await
             .expect("load the killed-leader bucket incarnation");
-        // The routine also migrates `.rustfs.sys` bucket metadata, so keep the
-        // reservation far above every fixture object.
-        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
-        set_decommission_capacity_info_overrides_for_test(
-            store.id,
-            vec![vec![
-                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64 << 20, 64 << 20),
-                DecommissionPoolCapacityInfo::for_test(1, layout, 1 << 30, 1 << 30, 0),
-            ]],
-        );
+        set_decommission_capacity_info_overrides_for_test(store.id, vec![capacity]);
         store
             .save_current_pool_meta_for_decommission_start(
                 &[0],
@@ -7664,6 +7679,91 @@ mod decommission_lock_order_tests {
     fn resumed_legacy_decommission_settles_a_leader_killed_before_the_target_commit() {
         run_large_stack_async_test("resumed-legacy-decommission-killed-before-commit", || {
             resumed_decommission_settles_a_killed_leader_put_case(false, true)
+        });
+    }
+
+    /// Move part of one target's remaining allocation to another target and
+    /// persist it, so that the next selection by remaining allocation alone
+    /// would prefer `to`.
+    async fn shift_decommission_target_allocation(store: &Arc<crate::store::ECStore>, from: usize, to: usize, bytes: usize) {
+        let mut meta = store.pool_meta.read().await.clone();
+        let reservation = meta.pools[0]
+            .decommission
+            .as_mut()
+            .and_then(|info| info.capacity_reservation.as_mut())
+            .expect("the decommission reservation should be active");
+        for target in &mut reservation.targets {
+            if target.pool_index == from {
+                target.reserved_physical_bytes -= bytes;
+            } else if target.pool_index == to {
+                target.reserved_physical_bytes += bytes;
+            }
+        }
+        meta.save(store.pools.clone())
+            .await
+            .expect("persist the shifted target allocation");
+        *store.pool_meta.write().await = meta;
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resumed_decommission_returns_an_uncommitted_retry_to_its_adopted_target() {
+        run_large_stack_async_test("resumed-decommission-sticky-adopted-target", || async {
+            let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_three_pool_stores(None).await;
+            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+            // Target 1 holds most of the allocation when the leader is killed
+            // before its target commit there.
+            let object = "sticky-adopted-target.bin";
+            let (bucket, interrupted) = kill_leader_inside_target_put_with_capacity(
+                &store,
+                false,
+                object,
+                vec![
+                    DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64 << 20, 64 << 20),
+                    DecommissionPoolCapacityInfo::for_test(1, layout, 100 << 20, 100 << 20, 0),
+                    DecommissionPoolCapacityInfo::for_test(2, layout, 1 << 30, 1 << 30, 0),
+                ],
+            )
+            .await;
+            // Before the resume, target 2 has the larger remaining allocation.
+            shift_decommission_target_allocation(&store, 1, 2, 80 << 20).await;
+            assert!(
+                killed_leader_target(&store, 2).await.reserved_physical_bytes
+                    > killed_leader_target(&store, 1).await.reserved_physical_bytes
+            );
+
+            run_resumed_decommission_routine(&store).await;
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert!(
+                info.complete && !info.failed && !info.canceled,
+                "the resumed decommission must complete: complete={}, failed={}, canceled={}, blocked_reason={:?}",
+                info.complete,
+                info.failed,
+                info.canceled,
+                info.capacity_blocked_reason
+            );
+            drop(local);
+            let adopted = crate::core::pools::decommission_adopted_intent_mutation_id(interrupted);
+            for target_pool_index in [1, 2] {
+                let target = killed_leader_target(&store, target_pool_index).await;
+                assert_ne!(target.pending_mutation_id, Some(interrupted));
+                assert!(
+                    target
+                        .temporary_mutations
+                        .iter()
+                        .all(|mutation| mutation.mutation_id != interrupted && mutation.mutation_id != adopted),
+                    "target pool {target_pool_index} must not keep a marker of the interrupted mutation: {:?}",
+                    target.temporary_mutations
+                );
+            }
+            store.pools[1]
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect("the retry must commit on the target that holds its adopted completion");
         });
     }
 

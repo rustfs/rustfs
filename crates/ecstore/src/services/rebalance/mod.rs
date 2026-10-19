@@ -100,6 +100,17 @@ pub(crate) async fn test_two_pool_stores(
     test_pool_stores_with_contexts(rebalance_meta, false, 2, 2).await
 }
 
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) async fn test_three_pool_stores(
+    rebalance_meta: Option<RebalanceMeta>,
+) -> (
+    Vec<tempfile::TempDir>,
+    std::sync::Arc<crate::store::ECStore>,
+    std::sync::Arc<crate::store::ECStore>,
+) {
+    test_pool_stores_with_contexts(rebalance_meta, false, 3, 2).await
+}
+
 #[cfg(test)]
 pub(crate) async fn test_two_pool_stores_with_isolated_node_contexts(
     rebalance_meta: Option<RebalanceMeta>,

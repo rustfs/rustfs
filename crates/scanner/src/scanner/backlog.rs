@@ -3769,6 +3769,52 @@ mod tests {
         });
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn native_retirement_waits_for_an_adopted_target_intent() {
+        run_native_retirement_test(async || {
+            let (_root, store) = native_retirement_store().await;
+            let seeded = ScannerPauseBacklogController::claim(Arc::clone(&store), unix_now())
+                .await
+                .expect("seed the real native record on every set");
+            drop(seeded);
+            let (source_bytes, _) = native_replica_bytes(&store.pools[0].disk_set[0]).await;
+            store
+                .prepare_scanner_pause_backlog_retirement_for_test(0, source_bytes.len() * 2)
+                .await
+                .expect("activate native retirement");
+            store
+                .stage_scanner_pause_backlog_retirement_intent_for_test(0, 0)
+                .await
+                .expect("retain a real target intent after failure in the admitted operation");
+            // A resumed decommission routine moves the leftover intent into
+            // the mutation's adopted marker.
+            store
+                .adopt_previous_incarnation_decommission_capacity_intents_for_test(0)
+                .await
+                .expect("adopt the leftover retirement intent");
+            {
+                let meta = store.pool_meta.read().await;
+                let reservation = meta.pools[0]
+                    .decommission
+                    .as_ref()
+                    .unwrap()
+                    .capacity_reservation
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(reservation.pending_target_physical_bytes, 0);
+                assert!(reservation.inflight_target_physical_bytes > 0);
+            }
+            let blocked = store
+                .retire_scanner_pause_backlog_for_test(0, 0)
+                .await
+                .expect_err("an adopted target intent still blocks retirement");
+            assert!(blocked.to_string().contains("unresolved target capacity intent"), "{blocked}");
+            assert_eq!(native_replica_bytes(&store.pools[0].disk_set[0]).await.0, source_bytes);
+            shutdown_native_retirement_store(store).await;
+        });
+    }
+
     fn observation(now: u64, paused: bool, pending: u64) -> ScannerPauseBacklogObservation {
         ScannerPauseBacklogObservation {
             now_unix_secs: now,
