@@ -829,3 +829,92 @@ async fn handoff_gc_retains_pending_and_committed_authority() {
     assert!(ResumeManager::has_replacement_intent(&parent.disk, &parent.get_state().await.task_id).await);
     assert!(ResumeManager::has_replacement_intent(&parent.disk, &child.get_state().await.task_id).await);
 }
+
+#[tokio::test]
+async fn handoff_chain_does_not_consume_the_rebuild_retry_budget() {
+    // rustfs/rustfs#8664: every mount change hands the generation off again.
+    // Interruptions are not rebuild failures, so three consecutive handoffs
+    // must leave the full `max_retries` budget for the eventual rebuild.
+    let (_dirs, root, execution) = fixture(1).await;
+    let max_retries = root.get_state().await.max_retries;
+    let mut current = root;
+    let mut mount = 0;
+    for interruption in 0..3 {
+        mount += 1;
+        let next_mount = ReplacementExecution::for_test(
+            execution.test_disks().to_vec(),
+            vec![identity("replacement-0", &format!("mount-{mount}:fs-1:root-1"))],
+        );
+        let child = current
+            .prepare_replacement_handoff(&next_mount, Vec::new())
+            .await
+            .unwrap_or_else(|error| panic!("interruption {interruption} must still hand off: {error}"));
+        child
+            .acquire_replacement_markers(&next_mount)
+            .await
+            .expect("successor takes the markers");
+        let state = child.get_state().await;
+        assert_eq!(state.retry_count, 0, "handoff {interruption} must not spend a rebuild attempt");
+        assert_eq!(state.max_retries, max_retries);
+        assert_eq!(state.replacement_lineage.len(), interruption + 1);
+        current = child;
+    }
+    let final_mount = ReplacementExecution::for_test(
+        execution.test_disks().to_vec(),
+        vec![identity("replacement-0", &format!("mount-{mount}:fs-1:root-1"))],
+    );
+    current
+        .mark_replacement_rebuilding(final_mount.identities().to_vec())
+        .await
+        .expect("the last successor rebuilds");
+    current
+        .mark_replacement_completed_and_verified()
+        .await
+        .expect("the last successor completes");
+    assert_eq!(current.get_state().await.replacement_phase, ReplacementPhase::Verified);
+}
+
+#[tokio::test]
+async fn committed_predecessor_is_collectible_once_its_successor_is_verified() {
+    let (_dirs, parent, execution) = fixture(1).await;
+    let parent_id = parent.get_state().await.task_id;
+    let child = parent
+        .prepare_replacement_handoff(&execution, Vec::new())
+        .await
+        .expect("prepare");
+    child.acquire_replacement_markers(&execution).await.expect("commit");
+    let child_id = child.get_state().await.task_id;
+    // The commit advanced the predecessor through its own handle; reload the
+    // durable revision before aging both records.
+    let parent = ResumeManager::load_replacement_intent(parent.disk.clone(), &parent_id)
+        .await
+        .expect("reload committed predecessor");
+    for manager in [&parent, &child] {
+        manager.state.write().await.last_update = 1;
+        manager.save_state_strict().await.expect("age the record");
+    }
+    ResumeUtils::cleanup_expired_states(&parent.disk, 0)
+        .await
+        .expect("GC before verification");
+    assert!(
+        ResumeManager::has_replacement_intent(&parent.disk, &parent_id).await,
+        "a committed authority is retained while its successor may still need it"
+    );
+
+    child
+        .mark_replacement_rebuilding(execution.identities().to_vec())
+        .await
+        .expect("rebuild");
+    child.mark_replacement_completed_and_verified().await.expect("verify");
+    ResumeUtils::cleanup_expired_states(&parent.disk, 0)
+        .await
+        .expect("GC after verification");
+    assert!(
+        !ResumeManager::has_replacement_intent(&parent.disk, &parent_id).await,
+        "a committed predecessor of a verified successor is collectible"
+    );
+    assert!(
+        ResumeManager::has_replacement_intent(&parent.disk, &child_id).await,
+        "the verified successor keeps its own record until cleanup"
+    );
+}

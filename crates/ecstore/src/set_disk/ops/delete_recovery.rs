@@ -20,6 +20,7 @@ use crate::disk::{
     DELETE_RECOVERY_PROTOCOL_VERSION, DeleteRecoveryAction, DeleteRecoveryInspection, DeleteRecoveryState, DeleteTransactionId,
     DiskAPI, DiskStore,
 };
+use crate::error::StorageError;
 use crate::set_disk::SetDisks;
 use futures::future::join_all;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -35,6 +36,9 @@ pub(crate) struct DeleteRecoverySummary {
     pub committed: usize,
     pub rolled_back: usize,
     pub blocked: usize,
+    /// Groups blocked by a `LegacyAmbiguous` residue. Unlike other blocks this
+    /// is deterministic: the residue cannot be classified by retrying.
+    pub legacy_ambiguous: usize,
     pub pending: usize,
     pub failed: usize,
     pub reclaimed: usize,
@@ -77,9 +81,23 @@ impl DeleteRecoverySummary {
         self.committed += other.committed;
         self.rolled_back += other.rolled_back;
         self.blocked += other.blocked;
+        self.legacy_ambiguous += other.legacy_ambiguous;
         self.pending += other.pending;
         self.failed += other.failed;
         self.reclaimed += other.reclaimed;
+    }
+
+    /// The error a heal must return when recovery left this key unresolved.
+    /// An ambiguous legacy residue is permanent and gets its own error; other
+    /// pending or blocked groups remain the retryable `SlowDown`.
+    pub(crate) fn unresolved_heal_error(&self) -> Option<StorageError> {
+        if self.legacy_ambiguous > 0 {
+            Some(StorageError::DeleteRecoveryLegacyAmbiguous)
+        } else if self.pending > 0 || self.blocked > 0 {
+            Some(StorageError::SlowDown)
+        } else {
+            None
+        }
     }
 }
 
@@ -643,6 +661,7 @@ impl SetDisks {
                     }
                 } else {
                     summary.blocked += 1;
+                    summary.legacy_ambiguous += 1;
                     unresolved = true;
                 }
                 continue;
@@ -948,6 +967,37 @@ fn unavailable(error: &DiskError) -> bool {
 mod tests {
     use super::*;
     use crate::bucket::metadata_sys::{self, init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+
+    #[test]
+    fn unresolved_heal_error_distinguishes_legacy_ambiguity_from_transient_blocks() {
+        // rustfs/rustfs#8608: a legacy residue is deterministic and must not be
+        // reported as request-rate pressure.
+        let resolved = DeleteRecoverySummary::default();
+        assert!(resolved.unresolved_heal_error().is_none());
+        let pending = DeleteRecoverySummary {
+            pending: 1,
+            ..Default::default()
+        };
+        assert!(matches!(pending.unresolved_heal_error(), Some(StorageError::SlowDown)));
+        let blocked = DeleteRecoverySummary {
+            blocked: 1,
+            ..Default::default()
+        };
+        assert!(matches!(blocked.unresolved_heal_error(), Some(StorageError::SlowDown)));
+        let ambiguous = DeleteRecoverySummary {
+            blocked: 1,
+            legacy_ambiguous: 1,
+            pending: 1,
+            ..Default::default()
+        };
+        assert!(matches!(
+            ambiguous.unresolved_heal_error(),
+            Some(StorageError::DeleteRecoveryLegacyAmbiguous)
+        ));
+        let mut total = DeleteRecoverySummary::default();
+        total.add(ambiguous);
+        assert_eq!(total.legacy_ambiguous, 1);
+    }
     use crate::disk::{DeleteOptions, ReadOptions, STORAGE_FORMAT_FILE};
     use crate::object_api::{ObjectOptions, PutObjReader};
     use crate::storage_api_contracts::bucket::{BucketOperations, DeleteBucketOptions, MakeBucketOptions};
