@@ -42,7 +42,7 @@ on:
   merge_group:
     types: [ checks_requested ]
   schedule:
-    - cron: "11 0 * * 0" # Weekly on Sunday 00:11 UTC
+    - cron: "11 0 * * *" # Nightly 00:11 UTC, after the 22:41 UTC cache-warm run
   workflow_dispatch:
 
 permissions:
@@ -356,17 +356,20 @@ jobs:
             rotation_waits_for_threshold_and_stops_on_revocation -- --exact
 
       # The guard in rustfs/src/connect/registration.rs is cfg(not(debug_assertions)),
-      # the setting the release profile turns off. Handing that one flag to the
-      # rustfs lib through `cargo rustc` trips it against the cached dev-profile
-      # dependencies instead of a cold `cargo check --release` of the whole graph.
-      - name: Reject short credentials without debug assertions
-        env:
-          CARGO_BUILD_JOBS: "2"
+      # and it must be tripped by a profile that turns debug assertions off for
+      # the whole graph. Handing `-C debug-assertions=off` to the rustfs lib alone
+      # through `cargo rustc` leaves its dependencies on the dev-profile cfg, so
+      # the lib also fails on items gated on one side only (E0599 on
+      # Filenames::Embedded) and "fails solely at the compile_error" can never
+      # hold. `cargo check --release` is metadata-only and needs no
+      # link-concurrency limit; it is cold because ci-dev holds no release
+      # artifacts.
+      - name: Reject short credentials in release builds
         run: |
           log="$(mktemp)"
           set +e
-          CARGO_TERM_COLOR=never cargo rustc -p rustfs --lib \
-            --features connect-e2e-short-credentials -- -C debug-assertions=off >"$log" 2>&1
+          CARGO_TERM_COLOR=never cargo check -p rustfs --release \
+            --features connect-e2e-short-credentials >"$log" 2>&1
           status=$?
           set -e
           cat "$log"
@@ -388,9 +391,11 @@ jobs:
 
   test-and-lint-rio-v2:
     name: Test and Lint (rio-v2)
-    # Alternate feature configurations run on main, merge groups, and scheduled
-    # or manual validation; the default workspace remains the PR gate.
-    if: needs.classify-changes.outputs.mode == 'full' && github.event_name != 'pull_request'
+    # Alternate feature configurations run on the nightly schedule, merge
+    # groups and manual dispatch. The default workspace remains the PR gate and
+    # the per-push main baseline: repeating four feature builds on every merge
+    # bought nothing the nightly run does not report within a day.
+    if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["merge_group", "schedule", "workflow_dispatch"]'), github.event_name)
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
@@ -448,7 +453,8 @@ jobs:
 
   test-and-lint-protocols:
     name: "Test and Lint (${{ matrix.features.name }})"
-    if: needs.classify-changes.outputs.mode == 'full' && github.event_name != 'pull_request'
+    # Same cadence as test-and-lint-rio-v2 above.
+    if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["merge_group", "schedule", "workflow_dispatch"]'), github.event_name)
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
@@ -604,7 +610,7 @@ jobs:
   build-rustfs-debug-binary-rio-v2:
     name: Build RustFS Debug Binary (rio-v2)
     # Dormant rio-v2 variant (rustfs/backlog#1835): the feature ships in no
-    # default build, so this full-suite lane runs only on the weekly schedule
+    # default build, so this full-suite lane runs only on the nightly schedule
     # and manual dispatch. Per-PR cfg-seam coverage stays with
     # test-and-lint-rio-v2. Lifecycle and the promote-or-delete condition:
     # docs/architecture/minio-file-format-compat.md ("rio-v2 variant lifecycle").
