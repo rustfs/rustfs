@@ -14,7 +14,7 @@ const PROOF_CYCLE: u64 = 11;
 
 async fn settle_namespace_commits(store: &ECStore) {
     tokio::time::timeout(Duration::from_secs(30), async {
-        while store.scanner_data_usage_publication_blocked().await {
+        while ecstore_namespace_commits_pending(store) {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })

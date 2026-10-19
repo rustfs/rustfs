@@ -908,6 +908,8 @@ impl DataUsageCache {
             || self.info.scan_coverage_receipt.is_some()
     }
 
+    /// Resume and reuse under one plan; fixtures that model a single digest.
+    #[cfg(test)]
     pub(crate) fn prepare_bucket_checkpoint(
         &mut self,
         name: &str,
@@ -915,6 +917,34 @@ impl DataUsageCache {
         leader_epoch: u64,
         source: DataUsageCacheSource,
         scan_plan_digest: DataUsageScanPlanDigest,
+        identity: DataUsageScanIdentity,
+    ) -> DataUsageCachePrepareOutcome {
+        self.prepare_bucket_checkpoint_with_coverage(
+            name,
+            next_cycle,
+            leader_epoch,
+            source,
+            scan_plan_digest,
+            scan_plan_digest,
+            identity,
+        )
+    }
+
+    /// `scan_plan_digest` is the reuse plan a complete cache is current under;
+    /// `checkpoint_plan_digest` is the coverage plan a sweep is started and
+    /// resumed under (`scanner_activity_coverage_digest`). The two differ by
+    /// the inputs that force a new walk without changing the namespace a
+    /// walk traverses, so a coordinator restart invalidates finished results
+    /// but not a sweep in progress.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_bucket_checkpoint_with_coverage(
+        &mut self,
+        name: &str,
+        next_cycle: u64,
+        leader_epoch: u64,
+        source: DataUsageCacheSource,
+        scan_plan_digest: DataUsageScanPlanDigest,
+        checkpoint_plan_digest: DataUsageScanPlanDigest,
         identity: DataUsageScanIdentity,
     ) -> DataUsageCachePrepareOutcome {
         if self.info.next_cycle > next_cycle {
@@ -1045,11 +1075,11 @@ impl DataUsageCache {
         if let Some(progress) = &mut self.info.scan_progress
             && has_position
         {
-            progress.requested_plan = scan_plan_digest;
+            progress.requested_plan = checkpoint_plan_digest;
         } else {
             self.info.scan_progress = Some(DataUsageScanProgress {
-                started_plan: scan_plan_digest,
-                requested_plan: scan_plan_digest,
+                started_plan: checkpoint_plan_digest,
+                requested_plan: checkpoint_plan_digest,
             });
             self.info.scan_resume_after = None;
             self.info.scan_checkpoint = None;

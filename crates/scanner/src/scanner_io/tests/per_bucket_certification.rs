@@ -4,7 +4,8 @@
 //! Per-bucket certification on the single-disk fixture: a bucket written
 //! during the walk is reported pending while the other buckets are certified,
 //! the publication stays authoritative, and the next cycle is scoped to the
-//! pending bucket. A guardrail veto still supersedes the whole cycle.
+//! pending bucket. A PUT tail pending across the walk is ordinary namespace
+//! activity; a guardrail veto still supersedes the whole cycle.
 
 use super::*;
 
@@ -196,6 +197,61 @@ async fn write_during_walk_leaves_only_that_bucket_pending_and_scopes_the_next_c
 
 #[tokio::test]
 #[serial]
+async fn pending_put_tail_across_the_walk_no_longer_vetoes_the_cycle() {
+    let (_temp_dir, store) = setup_local_scanner_store(1, 1).await;
+    clear_dirty_usage_buckets_for_tests();
+    for bucket in BUCKETS {
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        put_fixture_object(&store, bucket, "initial").await;
+        record_dirty_usage_bucket(bucket);
+    }
+    wait_for_namespace_commit_tails(store.as_ref()).await;
+    let vetoes_before = global_metrics().report().await.usage_freshness.guardrail_veto_total;
+
+    // A PUT whose rename fanout is still pending when the post-walk probe
+    // runs used to flip the local publication barrier and supersede the
+    // whole cycle (rustfs/rustfs#8494). It is ordinary namespace activity:
+    // the walk certifies every bucket and publishes authority.
+    let pending_commit = ecstore_hold_namespace_commit(store.as_ref());
+    assert!(ecstore_namespace_commits_pending(store.as_ref()));
+    assert!(!store.scanner_data_usage_publication_blocked().await);
+    let (result, snapshot) = run_cycle(
+        &store,
+        1,
+        None,
+        true,
+        CycleHooks {
+            resolved_scope_observer: None,
+            post_walk_gate: None,
+        },
+    )
+    .await;
+    drop(pending_commit);
+
+    assert_eq!(result.status, ScannerCycleStatus::Complete);
+    assert_eq!(result.pending_dirty_usage_buckets(), 0);
+    assert!(!snapshot.usage_snapshot_observational, "the publication takes the authoritative route");
+    assert_eq!(snapshot.usage_snapshot_converged, Some(true));
+    assert!(snapshot.usage_snapshot_pending_buckets.is_empty());
+    assert!(snapshot.is_complete_bucket_usage_snapshot());
+    for bucket in BUCKETS {
+        assert_eq!(snapshot.buckets_usage[bucket].objects_count, 1);
+    }
+    assert!(result.clear_verified_usage().is_empty());
+    assert!(dirty_usage_buckets_for_tests().is_empty(), "a converged cycle clears the dirty map");
+    let freshness = global_metrics().report().await.usage_freshness;
+    assert_eq!(
+        freshness.guardrail_veto_total, vetoes_before,
+        "a pending PUT tail is not a guardrail veto"
+    );
+    clear_dirty_usage_buckets_for_tests();
+}
+
+#[tokio::test]
+#[serial]
 async fn guardrail_veto_still_supersedes_the_cycle_onto_the_observed_route() {
     let (_temp_dir, store) = setup_local_scanner_store(1, 1).await;
     clear_dirty_usage_buckets_for_tests();
@@ -210,22 +266,29 @@ async fn guardrail_veto_still_supersedes_the_cycle_onto_the_observed_route() {
     wait_for_namespace_commit_tails(store.as_ref()).await;
     let vetoes_before = global_metrics().report().await.usage_freshness.guardrail_veto_total;
 
-    // A PUT tail held across the walk flips the local publication barrier,
-    // which is a guardrail veto regardless of the dirty map.
-    let pending_commit = ecstore_hold_namespace_commit(store.as_ref());
-    assert!(store.scanner_data_usage_publication_blocked().await);
+    // A maintenance publication during the walk moves a guardrail field. It
+    // is not part of the coverage plan, so bucket checkpoints keep their
+    // plan, but the cycle it moved in is still superseded regardless of the
+    // dirty map: no cycle records whether it published that work.
+    let (observer, resolved_scope) = tokio::sync::oneshot::channel();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let maintainer = tokio::spawn(async move {
+        resolved_scope.await.expect("the cycle should report its resolved scope");
+        record_scanner_maintenance_change("hot-bucket");
+        release.send(()).expect("the cycle should still be waiting on the gate");
+    });
     let (result, snapshot) = run_cycle(
         &store,
         1,
         None,
         true,
         CycleHooks {
-            resolved_scope_observer: None,
-            post_walk_gate: None,
+            resolved_scope_observer: Some(observer),
+            post_walk_gate: Some(gate),
         },
     )
     .await;
-    drop(pending_commit);
+    maintainer.await.expect("the maintenance task should finish");
 
     assert_eq!(result.status, ScannerCycleStatus::Superseded);
     assert_eq!(result.pending_dirty_usage_buckets(), 0);
@@ -239,7 +302,7 @@ async fn guardrail_veto_still_supersedes_the_cycle_onto_the_observed_route() {
     assert_eq!(freshness.guardrail_veto_total, vetoes_before + 1);
     assert_eq!(
         freshness.last_guardrail_veto_reason,
-        format!("publication_blocked@{}", crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE)
+        format!("maintenance_generation@{}", crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE)
     );
     clear_dirty_usage_buckets_for_tests();
 }

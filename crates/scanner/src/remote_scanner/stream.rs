@@ -741,6 +741,9 @@ async fn scan_and_persist_local_bucket(
             )
             .await
             .ok(),
+            // One digest travels on the wire: a remote sweep resumes under
+            // the reuse plan it was requested with.
+            checkpoint_plan_digest: None,
         },
     );
     match scan_state {
