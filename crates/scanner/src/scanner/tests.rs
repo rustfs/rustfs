@@ -10895,6 +10895,42 @@ fn test_get_cycle_scan_mode_can_disable_periodic_deep_scan() {
 }
 
 #[test]
+fn scan_mode_without_recorded_bitrot_start_stays_normal_until_the_cycle_elapses() {
+    // Regression for rustfs/backlog#2905 (rustfs/rustfs#8015): a cycle that
+    // finds no recorded bitrot start (missing heal object, or a save that
+    // keeps failing) must not open a Deep window. Three consecutive cycles
+    // with the default `BackgroundHealInfo` used to run Deep through the
+    // selection window because `bitrot_start_cycle` defaults to 0.
+    let policy = ScannerBitrotPolicy::new(Some(Duration::from_secs(3600)), true, 1024);
+    let modes: Vec<_> = (1..=3).map(|cycle| get_cycle_scan_mode(cycle, 0, None, policy)).collect();
+    assert_eq!(modes, vec![HealScanMode::Normal; 3]);
+
+    // A recorded start keeps the Deep selection window, and an elapsed
+    // cadence still triggers the next Deep window.
+    let started = Utc::now();
+    assert_eq!(get_cycle_scan_mode(1, 1, Some(started), policy), HealScanMode::Deep);
+    assert_eq!(
+        get_cycle_scan_mode(2048, 1, Some(started - chrono::Duration::hours(2)), policy),
+        HealScanMode::Deep
+    );
+    assert_eq!(get_cycle_scan_mode(2048, 1, Some(started), policy), HealScanMode::Normal);
+}
+
+#[test]
+fn bitrot_start_is_recorded_on_the_first_normal_cycle() {
+    // The start of the cadence is recorded as soon as it is missing, so a
+    // Normal cycle still produces state to persist (and to remember in
+    // memory when persistence is unavailable).
+    let now = Utc::now();
+    let policy = ScannerBitrotPolicy::new(Some(Duration::from_secs(3600)), true, 1024);
+    let info = background_heal_info_for_scan_start(BackgroundHealInfo::default(), 3, HealScanMode::Normal, now, policy)
+        .expect("a missing bitrot start must be recorded even when the cycle runs Normal");
+    assert_eq!(info.bitrot_start_cycle, 3);
+    assert_eq!(info.bitrot_start_time, Some(now));
+    assert_eq!(info.current_scan_mode, HealScanMode::Normal);
+}
+
+#[test]
 fn test_erasure_sd_does_not_enter_deep_scan_mode() {
     let started = Utc::now();
     let cycle = Some(Duration::from_secs(3600));
