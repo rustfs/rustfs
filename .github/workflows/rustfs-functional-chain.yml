@@ -314,8 +314,32 @@ jobs:
             > "${VALIDATION_ROOT}/tool-manifest.json"
           printf 'VALIDATION_HEAL_TOOL_DIRECTORY=%s\n' "${TOOL_DIRECTORY}" >> "${GITHUB_ENV}"
 
+      - name: Select exact-source G01 native evidence
+        id: race_native
+        if: ${{ inputs.validation_case == 'heal.race-unversioned-overwrite' }}
+        env:
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          required=false
+          if [ -f auto-testing/scripts/validation_heal/race_native.py ]; then
+            status=0
+            python3 -B auto-testing/scripts/validation_heal/race_native.py supports \
+              --commit "${CANDIDATE_SHA}" --case-id heal.race-unversioned-overwrite || status=$?
+            if [ "${status}" -eq 0 ]; then
+              required=true
+            elif [ "${status}" -ne 2 ]; then
+              exit "${status}"
+            fi
+          fi
+          if [ "${CANDIDATE_SHA}" = 6afdec9fe1b0b88007f2e5b445c19bf73d51d3ca ] && [ "${required}" != true ]; then
+            printf 'G01 candidate requires its reviewed native collector before fleet execution\n' >&2
+            exit 1
+          fi
+          printf 'required=%s\n' "${required}" >> "${GITHUB_OUTPUT}"
+
       - name: Download pinned native storage evidence
-        if: ${{ inputs.validation_case == 'heal.conflicting-subquorum-authority' || inputs.validation_case == 'heal.bucket-incarnation-recreation' }}
+        if: ${{ inputs.validation_case == 'heal.conflicting-subquorum-authority' || inputs.validation_case == 'heal.bucket-incarnation-recreation' || steps.race_native.outputs.required == 'true' }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           github-token: ${{ github.token }}
@@ -344,6 +368,20 @@ jobs:
             --directory "${NATIVE_DIRECTORY}" --candidate "${VALIDATION_ROOT}/candidate.json" \
             --testing-commit "${{ inputs.auto_testing_sha }}" \
             > "${VALIDATION_ROOT}/native-incarnation-manifest.json"
+          printf 'VALIDATION_HEAL_NATIVE_DIRECTORY=%s\n' "${NATIVE_DIRECTORY}" >> "${GITHUB_ENV}"
+
+      - name: Verify G01 exact-source native commit and cleanup evidence
+        if: ${{ steps.race_native.outputs.required == 'true' }}
+        env:
+          AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+        run: |
+          set -euo pipefail
+          NATIVE_DIRECTORY="${RUNNER_TEMP}/rustfs-validation-native-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cp "${VALIDATION_ROOT}/tool-run.json" "${NATIVE_DIRECTORY}/tool-run.json"
+          python3 -B auto-testing/scripts/validation_heal/race_native_evidence.py \
+            --directory "${NATIVE_DIRECTORY}" --candidate "${VALIDATION_ROOT}/candidate.json" \
+            --testing-commit "${AUTO_TESTING_SHA}" --case-id heal.race-unversioned-overwrite \
+            > "${VALIDATION_ROOT}/native-race-manifest.json"
           printf 'VALIDATION_HEAL_NATIVE_DIRECTORY=%s\n' "${NATIVE_DIRECTORY}" >> "${GITHUB_ENV}"
 
       - name: Download pinned manager persistence and incarnation evidence
