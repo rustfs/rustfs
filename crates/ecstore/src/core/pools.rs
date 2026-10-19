@@ -2476,9 +2476,13 @@ struct DecommissionAdoptedIntentSplit {
 /// completion would have, because finalize charges the same bytes as
 /// consumption, which shrinks the budget by that amount.
 ///
-/// The adopted marker takes at least the intent's bytes, so it never reaches
-/// zero and a cleanup that frees staged bytes cannot drop it. The staged
-/// marker keeps the rest of the total and never grows.
+/// A mutation killed twice leaves an adopted completion and then a new
+/// intent for the same object version. Both reserve that same completion, so
+/// they merge by their maximum before the staged parts are added.
+///
+/// The adopted marker takes at least the completion's bytes, so it never
+/// reaches zero and a cleanup that frees staged bytes cannot drop it. The
+/// staged marker keeps the rest of the total and never grows.
 fn decommission_adopted_intent_split(
     meta: &PoolMeta,
     source_pool_index: usize,
@@ -2510,11 +2514,12 @@ fn decommission_adopted_intent_split(
     let other_inflight = target.inflight_physical_bytes.saturating_sub(recorded);
     let temporary_budget = target.remaining_reserved_physical_bytes(reservation.temporary_copies)
         / 1usize.saturating_add(reservation.temporary_copies);
-    let total = recorded
-        .saturating_add(intent.physical_bytes)
+    let completion = adopted.max(intent.physical_bytes);
+    let total = staged
+        .saturating_add(completion)
         .min(temporary_budget.saturating_sub(other_inflight))
-        .max(recorded.max(intent.physical_bytes));
-    let staged_after = total.saturating_sub(adopted.max(intent.physical_bytes)).min(staged);
+        .max(recorded.max(completion));
+    let staged_after = total.saturating_sub(completion).min(staged);
     Ok(DecommissionAdoptedIntentSplit {
         staged: staged_after,
         adopted: total.saturating_sub(staged_after),
@@ -2613,6 +2618,12 @@ fn decommission_capacity_target_candidate(
 /// equivalent target there settles the adopted marker, so committing on
 /// another target would leave it behind as inflight bytes. Otherwise the
 /// target with the most remaining allocation wins.
+///
+/// For an adopted completion the fallback cannot help: the target stops
+/// fitting the object only when its temporary-copy budget drops below the
+/// object's bytes, which the adopted marker already holds as inflight, so
+/// `ensure_decommission_capacity_reservations_available` fails before any
+/// placement on another target is admitted.
 fn decommission_reserved_target_choice(
     reservation: &DecommissionCapacityReservation,
     mutation_id: Option<uuid::Uuid>,
@@ -13669,8 +13680,9 @@ impl ECStore {
             )
             .await?;
         // Log as soon as the adopted ledger is durable: a fence lost after this
-        // point leaves nothing to adopt next time, and operators rely on this
-        // event before rolling back.
+        // point leaves nothing to adopt next time. A save that ends as
+        // TransactionUnknown can still apply the adoption without this event,
+        // so the rollback rule must not depend on it.
         warn!(
             event = EVENT_DECOMMISSION_STATE,
             component = LOG_COMPONENT_ECSTORE,
@@ -32902,36 +32914,42 @@ mod pools_tests {
     }
 
     #[test]
-    fn adopting_the_same_mutation_twice_keeps_inflight_equal_to_its_markers() {
+    fn adopting_the_same_completion_twice_counts_it_once() {
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let capacity_infos = vec![DecommissionPoolCapacityInfo::for_test(1, layout, 400, 400, 0)];
         let mutation_id = uuid::Uuid::new_v4();
         let mut meta = decommission_test_cleanup_meta(
             DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION,
             Vec::new(),
             0,
-            Some((mutation_id, 11)),
+            Some((mutation_id, 30)),
         );
         adopt_intent_adoption_test_intents(&mut meta);
-        // The resumed routine's retry reserves again and is killed again
-        // before finalizing; the next incarnation adopts the new intent too.
-        reserve_decommission_target_pending(&mut meta, 0, 1, 11, mutation_id, OffsetDateTime::UNIX_EPOCH)
+        // The resumed routine's retry reserves the same completion again and
+        // is killed again before finalizing; the next incarnation adopts it.
+        reserve_decommission_target_pending(&mut meta, 0, 1, 30, mutation_id, OffsetDateTime::UNIX_EPOCH)
             .expect("reserve the second attempt");
         adopt_intent_adoption_test_intents(&mut meta);
 
         let reservation = intent_adoption_test_reservation(&meta);
         let target = &reservation.targets[0];
         assert_eq!(target.pending_mutation_id, None);
-        assert_eq!(intent_adoption_test_marker(&meta, mutation_id), Some(22));
         assert_eq!(
-            target.inflight_physical_bytes,
-            target
-                .temporary_mutations
-                .iter()
-                .map(|mutation| mutation.physical_bytes)
-                .sum::<usize>()
+            intent_adoption_test_marker(&meta, mutation_id),
+            Some(30),
+            "both adoptions reserved the same completion"
         );
-        assert_eq!(reservation.inflight_target_physical_bytes, target.inflight_physical_bytes);
+        assert_eq!(target.inflight_physical_bytes, 30);
+        assert_eq!(reservation.inflight_target_physical_bytes, 30);
 
-        commit_intent_adoption_test_mutation(&mut meta, 1, mutation_id, 11);
+        // Another mutation commits 60 bytes and shrinks the temporary-copy
+        // budget to 40 bytes, which the completion counted once still fits.
+        commit_intent_adoption_test_mutation(&mut meta, 1, uuid::Uuid::new_v4(), 60);
+        assert_eq!(intent_adoption_test_temporary_budget(&meta), 40);
+        ensure_decommission_capacity_reservations_available(&meta, &capacity_infos, "migration")
+            .expect("later admission must not trip over a completion counted twice");
+
+        commit_intent_adoption_test_mutation(&mut meta, 1, mutation_id, 30);
         assert_no_intent_adoption_test_record(&meta, mutation_id);
     }
 

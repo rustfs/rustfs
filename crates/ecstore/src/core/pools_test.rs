@@ -7705,65 +7705,93 @@ mod decommission_lock_order_tests {
         *store.pool_meta.write().await = meta;
     }
 
+    async fn resumed_decommission_returns_an_uncommitted_retry_to_its_adopted_target_case(legacy: bool) {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_three_pool_stores(None).await;
+        let _proof_guard = legacy.then(crate::services::notification_sys::without_decommission_target_fence_fleet_proof_for_test);
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        // Target 1 holds most of the allocation when the leader is killed
+        // before its target commit there.
+        let object = "sticky-adopted-target.bin";
+        let (bucket, interrupted) = kill_leader_inside_target_put_with_capacity(
+            &store,
+            false,
+            object,
+            vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64 << 20, 64 << 20),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 100 << 20, 100 << 20, 0),
+                DecommissionPoolCapacityInfo::for_test(2, layout, 1 << 30, 1 << 30, 0),
+            ],
+        )
+        .await;
+        // Before the resume, target 2 has the larger remaining allocation.
+        shift_decommission_target_allocation(&store, 1, 2, 80 << 20).await;
+        assert!(
+            killed_leader_target(&store, 2).await.reserved_physical_bytes
+                > killed_leader_target(&store, 1).await.reserved_physical_bytes
+        );
+
+        run_resumed_decommission_routine(&store).await;
+        let local = store.pool_meta.read().await;
+        let info = local.pools[0]
+            .decommission
+            .as_ref()
+            .expect("the decommission state should remain present");
+        assert!(
+            info.complete && !info.failed && !info.canceled,
+            "the resumed decommission must complete: complete={}, failed={}, canceled={}, blocked_reason={:?}",
+            info.complete,
+            info.failed,
+            info.canceled,
+            info.capacity_blocked_reason
+        );
+        assert_eq!(info.items_decommission_failed, 0);
+        drop(local);
+        let adopted = crate::core::pools::decommission_adopted_intent_mutation_id(interrupted);
+        for target_pool_index in [1, 2] {
+            let target = killed_leader_target(&store, target_pool_index).await;
+            assert_ne!(target.pending_mutation_id, Some(interrupted));
+            assert!(
+                target
+                    .temporary_mutations
+                    .iter()
+                    .all(|mutation| mutation.mutation_id != interrupted && mutation.mutation_id != adopted),
+                "target pool {target_pool_index} must not keep a marker of the interrupted mutation: {:?}",
+                target.temporary_mutations
+            );
+        }
+        assert!(
+            killed_leader_target(&store, 1).await.consumed_physical_bytes > 0,
+            "the retry's commit must be charged on the target that held its adopted completion"
+        );
+        store.pools[1]
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("the retry must commit on the target that holds its adopted completion");
+        let source = store.pools[0]
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await;
+        assert!(
+            source
+                .as_ref()
+                .err()
+                .is_some_and(|err| crate::error::is_err_object_not_found(err) || crate::error::is_err_version_not_found(err)),
+            "the source copy should be cleaned after migration: {source:?}"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn resumed_decommission_returns_an_uncommitted_retry_to_its_adopted_target() {
-        run_large_stack_async_test("resumed-decommission-sticky-adopted-target", || async {
-            let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_three_pool_stores(None).await;
-            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
-            // Target 1 holds most of the allocation when the leader is killed
-            // before its target commit there.
-            let object = "sticky-adopted-target.bin";
-            let (bucket, interrupted) = kill_leader_inside_target_put_with_capacity(
-                &store,
-                false,
-                object,
-                vec![
-                    DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64 << 20, 64 << 20),
-                    DecommissionPoolCapacityInfo::for_test(1, layout, 100 << 20, 100 << 20, 0),
-                    DecommissionPoolCapacityInfo::for_test(2, layout, 1 << 30, 1 << 30, 0),
-                ],
-            )
-            .await;
-            // Before the resume, target 2 has the larger remaining allocation.
-            shift_decommission_target_allocation(&store, 1, 2, 80 << 20).await;
-            assert!(
-                killed_leader_target(&store, 2).await.reserved_physical_bytes
-                    > killed_leader_target(&store, 1).await.reserved_physical_bytes
-            );
+        run_large_stack_async_test("resumed-decommission-sticky-adopted-target", || {
+            resumed_decommission_returns_an_uncommitted_retry_to_its_adopted_target_case(false)
+        });
+    }
 
-            run_resumed_decommission_routine(&store).await;
-            let local = store.pool_meta.read().await;
-            let info = local.pools[0]
-                .decommission
-                .as_ref()
-                .expect("the decommission state should remain present");
-            assert!(
-                info.complete && !info.failed && !info.canceled,
-                "the resumed decommission must complete: complete={}, failed={}, canceled={}, blocked_reason={:?}",
-                info.complete,
-                info.failed,
-                info.canceled,
-                info.capacity_blocked_reason
-            );
-            drop(local);
-            let adopted = crate::core::pools::decommission_adopted_intent_mutation_id(interrupted);
-            for target_pool_index in [1, 2] {
-                let target = killed_leader_target(&store, target_pool_index).await;
-                assert_ne!(target.pending_mutation_id, Some(interrupted));
-                assert!(
-                    target
-                        .temporary_mutations
-                        .iter()
-                        .all(|mutation| mutation.mutation_id != interrupted && mutation.mutation_id != adopted),
-                    "target pool {target_pool_index} must not keep a marker of the interrupted mutation: {:?}",
-                    target.temporary_mutations
-                );
-            }
-            store.pools[1]
-                .get_object_info(&bucket, object, &ObjectOptions::default())
-                .await
-                .expect("the retry must commit on the target that holds its adopted completion");
+    #[test]
+    #[serial_test::serial]
+    fn resumed_legacy_decommission_returns_an_uncommitted_retry_to_its_adopted_target() {
+        run_large_stack_async_test("resumed-legacy-decommission-sticky-adopted-target", || {
+            resumed_decommission_returns_an_uncommitted_retry_to_its_adopted_target_case(true)
         });
     }
 
