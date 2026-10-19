@@ -50,6 +50,7 @@ use tracing::{debug, error, info, warn};
 const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_REBALANCE: &str = "rebalance";
 const EVENT_ADMIN_REBALANCE_STATE: &str = "admin_rebalance_state";
+const REBALANCE_NOT_STARTED_MESSAGE: &str = "pool rebalance is not started";
 const REBALANCE_START_FLEET_PROOF_MARKER: &str = "pool activation requires a live fleet capability proof";
 const REBALANCE_START_FLEET_PROOF_RETRY_BUDGET: Duration = Duration::from_secs(30);
 const REBALANCE_START_FLEET_PROOF_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -929,7 +930,7 @@ impl Operation for RebalanceStatus {
                     "admin rebalance state"
                 );
                 // Preserve the idle 404 contract without triggering the custom-route error logger.
-                let (parts, body) = s3_error!(NoSuchResource, "pool rebalance is not started")
+                let (parts, body) = S3Error::with_message(S3ErrorCode::NoSuchResource, REBALANCE_NOT_STARTED_MESSAGE)
                     .to_http_response()?
                     .into_parts();
                 let mut response = S3Response::with_headers((parts.status, body), parts.headers);
@@ -1060,7 +1061,7 @@ impl Operation for RebalanceStop {
 
         let Some(expected_rebalance_id) = rebalance_stop_target_id(&store).await? else {
             log_rebalance_request_rejected("stop", "rebalance_not_started", &request_id, &actor, &remote_addr);
-            return Err(s3_error!(NoSuchResource, "pool rebalance is not started"));
+            return Err(S3Error::with_message(S3ErrorCode::NoSuchResource, REBALANCE_NOT_STARTED_MESSAGE));
         };
 
         let notification_sys = current_notification_system();
