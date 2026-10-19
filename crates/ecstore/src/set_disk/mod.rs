@@ -5346,6 +5346,14 @@ impl SetDisks {
         metadata_sys::get_bucket_incarnation_id_in(&self.ctx, bucket).await
     }
 
+    /// Read a persisted identity without treating lookup failures as legacy absence.
+    pub async fn find_bucket_incarnation_id_from_disk(&self, bucket: &str) -> Result<Option<Uuid>> {
+        if crate::bucket::utils::is_meta_bucketname(bucket) {
+            return Err(Error::other("system metadata bucket has no bucket incarnation"));
+        }
+        metadata_sys::find_bucket_incarnation_id_in(&self.ctx, bucket).await
+    }
+
     /// Admit one short scanner cache publication under this set's instance
     /// movement fence. The caller must hold the returned guard through its
     /// final conditional cache write; no scan-round work belongs under it.
@@ -8013,10 +8021,27 @@ mod tests {
                 .await
                 .expect("system metadata identity lookup must not reacquire the held pool metadata lock")
                 .expect_err("system metadata buckets have no user bucket incarnation");
+            tokio::time::timeout(Duration::from_secs(30), set.find_bucket_incarnation_id_from_disk(bucket))
+                .await
+                .expect("optional identity lookup must not reacquire the held pool metadata lock")
+                .expect_err("system metadata buckets must not become a legacy identity");
         }
 
         drop(_pool_meta_guard);
         let bucket = "user-incarnation-boundary";
+        assert_eq!(
+            set.find_bucket_incarnation_id_from_disk(bucket)
+                .await
+                .expect("a confirmed absent identity is distinct from a read error"),
+            None,
+        );
+        assert_eq!(
+            set.bucket_incarnation_id_from_disk(bucket)
+                .await
+                .expect_err("required lookup retains its missing-identity error")
+                .to_string(),
+            format!("Io error: bucket incarnation metadata is not authoritative: {bucket}"),
+        );
         let incarnation = Uuid::new_v4();
         crate::bucket::metadata::save_bucket_incarnation(Arc::clone(&store), bucket, incarnation)
             .await
@@ -8027,6 +8052,28 @@ mod tests {
                 .expect("user bucket identities must still load from the metadata owner"),
             incarnation,
         );
+        assert_eq!(
+            set.find_bucket_incarnation_id_from_disk(bucket)
+                .await
+                .expect("persisted identity"),
+            Some(incarnation)
+        );
+
+        let identity_key = format!(
+            "{}/{bucket}/{}",
+            crate::disk::BUCKET_META_PREFIX,
+            crate::bucket::metadata::BUCKET_INCARNATION_FILE
+        );
+        for invalid in [Vec::new(), vec![1; 15], Uuid::nil().as_bytes().to_vec()] {
+            crate::config::com::save_config(store.clone(), &identity_key, invalid)
+                .await
+                .expect("persist an invalid identity fixture");
+            assert!(
+                set.find_bucket_incarnation_id_from_disk(bucket).await.is_err(),
+                "invalid identity bytes must not enable the legacy rebuild path"
+            );
+            assert!(set.bucket_incarnation_id_from_disk(bucket).await.is_err());
+        }
     }
 
     async fn make_test_set_disks_with_ctx(
