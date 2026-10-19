@@ -61,8 +61,6 @@ pub(crate) const DURABILITY_EVENT: &str = "disk_local_durability_mode";
 /// profile terminates a test after 6 x 120 s, which bounds every case here.
 pub(crate) const MOVEMENT_COMPLETE_TIMEOUT: Duration = Duration::from_secs(240);
 pub(crate) const MOVEMENT_ACTIVE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Barrier release polling inside the server times out after 120 s.
-pub(crate) const BARRIER_REACH_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) const ADMIN_START_TIMEOUT: Duration = Duration::from_secs(45);
 pub(crate) const SEED_POOL: usize = 0;
 
@@ -300,6 +298,13 @@ impl Drop for TopologyRun {
     }
 }
 
+/// The data movement a fault window belongs to.
+#[derive(Clone, Copy)]
+pub(crate) enum MovementOperation<'a> {
+    Decommission(usize),
+    Rebalance(&'a str),
+}
+
 /// Driver for the file-based data-movement barrier (`arm.json`, `reached.*`,
 /// `release.<nonce>`).
 pub(crate) struct FileBarrier {
@@ -364,6 +369,64 @@ impl FileBarrier {
             }
         }
         Ok(observations)
+    }
+
+    /// Wait until the mover reaches the armed window while the operation is
+    /// still running. A window can sit deep in the object order, so the wait
+    /// shares the movement budget; an operation that ends without entering the
+    /// window fails at once instead of being counted as a fault test.
+    pub(crate) async fn wait_reached_during(
+        &self,
+        cluster: &RustFSTestClusterEnvironment,
+        operation: MovementOperation<'_>,
+        timeout: Duration,
+    ) -> TestResult<Vec<Value>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let observations = self.reached_observations()?;
+            if !observations.is_empty() {
+                return Ok(observations);
+            }
+            match operation {
+                MovementOperation::Decommission(pool_id) => {
+                    let pool = decommission_pool_entry(&decommission_status_json(cluster).await?, pool_id)?;
+                    if ["complete", "failed", "canceled"]
+                        .iter()
+                        .any(|flag| decommission_flag(&pool, flag))
+                    {
+                        return Err(format!(
+                            "decommission of pool {pool_id} ended without entering barrier {}; the fault was not injected: {pool}",
+                            self.nonce
+                        )
+                        .into());
+                    }
+                }
+                MovementOperation::Rebalance(rebalance_id) => {
+                    let status = super::harness::rebalance_status_json(cluster).await?;
+                    let ended = super::harness::rebalance_complete(&status, rebalance_id).unwrap_or(false)
+                        || rebalance_stopped(&status, rebalance_id).unwrap_or(false)
+                        || status
+                            .get("pools")
+                            .and_then(Value::as_array)
+                            .is_some_and(|pools| pools.iter().any(|pool| pool_status_text(pool) == "failed"));
+                    if ended {
+                        return Err(format!(
+                            "rebalance {rebalance_id} ended without entering barrier {}; the fault was not injected: {status}",
+                            self.nonce
+                        )
+                        .into());
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "data movement barrier {} was not reached within {timeout:?} while the operation was still running; the fault was not injected",
+                    self.nonce
+                )
+                .into());
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
     }
 
     /// Wait until the server records that it reached the armed window.

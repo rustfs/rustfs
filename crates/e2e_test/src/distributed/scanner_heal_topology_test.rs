@@ -28,7 +28,7 @@ use super::harness::{
     wait_for_rebalance_active, wait_for_rebalance_complete,
 };
 use super::scanner_heal_topology_fixture::{
-    BARRIER_REACH_TIMEOUT, LiveWorkload, MOVEMENT_ACTIVE_TIMEOUT, MOVEMENT_COMPLETE_TIMEOUT, SEED_POOL,
+    LiveWorkload, MOVEMENT_ACTIVE_TIMEOUT, MOVEMENT_COMPLETE_TIMEOUT, MovementOperation, SEED_POOL,
     STAGE_AFTER_RESPONSIBILITY_PERSISTED, STAGE_BEFORE_SOURCE_CLEANUP, STAGE_BEFORE_TARGET_COMMIT, TopologyManifest, TopologyRun,
     assert_bucket_durability_strict, assert_every_node_serves, assert_probe_objects, assert_process_durability_strict,
     assert_seed_pool_census_unchanged, assert_single_pool_placement, cancel_decommission, capture_seed_pool_census,
@@ -131,7 +131,7 @@ fn timeouts() -> Value {
     json!({
         "movement_active_secs": MOVEMENT_ACTIVE_TIMEOUT.as_secs(),
         "movement_complete_secs": MOVEMENT_COMPLETE_TIMEOUT.as_secs(),
-        "barrier_reach_secs": BARRIER_REACH_TIMEOUT.as_secs(),
+        "barrier_reach_secs": MOVEMENT_COMPLETE_TIMEOUT.as_secs(),
         "terminal_transition_secs": TERMINAL_TRANSITION_TIMEOUT.as_secs(),
     })
 }
@@ -498,7 +498,14 @@ async fn scanner_heal_topology_decommission_kill_before_source_cleanup_resumes_w
     run.movement_barrier
         .arm_movement("decommission", &manifest.plain_bucket, &key, STAGE_BEFORE_SOURCE_CLEANUP)?;
     start_decommission(&run.dist.cluster, DECOMMISSION_POOL_ID).await?;
-    let reached = run.movement_barrier.wait_reached(BARRIER_REACH_TIMEOUT).await?;
+    let reached = run
+        .movement_barrier
+        .wait_reached_during(
+            &run.dist.cluster,
+            MovementOperation::Decommission(DECOMMISSION_POOL_ID),
+            MOVEMENT_COMPLETE_TIMEOUT,
+        )
+        .await?;
     let window = pools_holding(&run.dist, &manifest.plain_bucket, &key, None)?;
     if !window.contains(&SEED_POOL) || window.len() < 2 {
         return Err(format!(
@@ -550,7 +557,14 @@ async fn scanner_heal_topology_decommission_target_commit_failure_retains_source
     run.movement_barrier
         .arm_movement("decommission", &manifest.plain_bucket, &key, STAGE_BEFORE_TARGET_COMMIT)?;
     start_decommission(&run.dist.cluster, DECOMMISSION_POOL_ID).await?;
-    let reached = run.movement_barrier.wait_reached(BARRIER_REACH_TIMEOUT).await?;
+    let reached = run
+        .movement_barrier
+        .wait_reached_during(
+            &run.dist.cluster,
+            MovementOperation::Decommission(DECOMMISSION_POOL_ID),
+            MOVEMENT_COMPLETE_TIMEOUT,
+        )
+        .await?;
     let window = pools_holding(&run.dist, &manifest.plain_bucket, &key, None)?;
     if window != pools(&[SEED_POOL]) {
         return Err(format!("the target must not be published before its commit; {key} is held by {window:?}").into());
@@ -693,7 +707,10 @@ async fn scanner_heal_topology_rebalance_kill_before_source_cleanup_resumes_with
     run.movement_barrier
         .arm_movement("rebalance", &manifest.plain_bucket, &key, STAGE_BEFORE_SOURCE_CLEANUP)?;
     let rebalance_id = start_rebalance(&run.dist.cluster).await?;
-    let reached = run.movement_barrier.wait_reached(BARRIER_REACH_TIMEOUT).await?;
+    let reached = run
+        .movement_barrier
+        .wait_reached_during(&run.dist.cluster, MovementOperation::Rebalance(&rebalance_id), MOVEMENT_COMPLETE_TIMEOUT)
+        .await?;
     let window = pools_holding(&run.dist, &manifest.plain_bucket, &key, None)?;
     if !window.contains(&SEED_POOL) || window.len() < 2 {
         return Err(format!(
