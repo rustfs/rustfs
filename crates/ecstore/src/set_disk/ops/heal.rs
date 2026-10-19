@@ -7976,6 +7976,325 @@ mod heal_result_report_tests {
         assert_eq!(survivor.size, 1024 * 1024, "survivor size must be intact");
     }
 
+    #[derive(Clone, Copy)]
+    enum VersionCommitMutation {
+        Append,
+        DeleteHistorical,
+        DeleteCurrent,
+    }
+
+    struct VersionCommitFixture {
+        version: Uuid,
+        data_dir: Uuid,
+        body: Vec<u8>,
+        parts: Vec<Vec<u8>>,
+    }
+
+    async fn explicit_version_commit_fence(mutation: VersionCommitMutation) {
+        use crate::object_api::{ShardIntegrityWriteMode, WriteCompletion};
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        for (disk_count, parity) in [(4, 2), (16, 4)] {
+            let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(disk_count, 0, parity).await;
+            let label = match mutation {
+                VersionCommitMutation::Append => "append",
+                VersionCommitMutation::DeleteHistorical => "delete-historical",
+                VersionCommitMutation::DeleteCurrent => "delete-current",
+            };
+            let prefix = if matches!(mutation, VersionCommitMutation::Append) {
+                "native_g02"
+            } else {
+                "native_g03"
+            };
+            let bucket = format!("version-commit-{label}-{disk_count}");
+            let object = "object.bin";
+            set.make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create isolated versioned bucket");
+            let options = ObjectOptions {
+                versioned: true,
+                write_completion: WriteCompletion::TailDrained,
+                shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
+                ..Default::default()
+            };
+            let mut versions = Vec::new();
+            for byte in [0x11, 0x22, 0x33] {
+                let body = vec![byte; 1024 * 1024 + 123];
+                let info = set
+                    .put_object(&bucket, object, &mut PutObjReader::from_vec(body.clone()), &options)
+                    .await
+                    .expect("ACK original version after its full rename tail");
+                let version = info.version_id.expect("independent version id");
+                let meta = disks[0]
+                    .read_version("", &bucket, object, &version.to_string(), &ReadOptions::default())
+                    .await
+                    .expect("read original version metadata");
+                assert!(meta.data.is_none(), "native version fence must reconstruct external data");
+                assert_eq!(meta.erasure.data_blocks, disk_count - parity);
+                assert_eq!(meta.erasure.parity_blocks, parity);
+                let data_dir = meta.data_dir.expect("actual external generation");
+                let mut parts = Vec::new();
+                for dir in &dirs {
+                    parts.push(
+                        tokio::fs::read(
+                            dir.path()
+                                .join(&bucket)
+                                .join(object)
+                                .join(data_dir.to_string())
+                                .join("part.1"),
+                        )
+                        .await
+                        .expect("every original encoded shard after ACK"),
+                    );
+                }
+                versions.push(VersionCommitFixture {
+                    version,
+                    data_dir,
+                    body,
+                    parts,
+                });
+            }
+            let selected = if matches!(mutation, VersionCommitMutation::DeleteCurrent) {
+                2
+            } else {
+                0
+            };
+            let selected_version = versions[selected].version;
+            let selected_dir = versions[selected].data_dir;
+            let missing = dirs[0]
+                .path()
+                .join(&bucket)
+                .join(object)
+                .join(selected_dir.to_string())
+                .join("part.1");
+            tokio::fs::remove_file(&missing)
+                .await
+                .expect("remove exact selected-version shard");
+            let (_pause, arrived, release) = ReadRepairPauseScope::install(&bucket, object);
+            let heal_set = set.clone();
+            let heal_bucket = bucket.clone();
+            let heal = tokio::spawn(async move {
+                heal_set
+                    .heal_object(
+                        &heal_bucket,
+                        object,
+                        &selected_version.to_string(),
+                        &HealOpts {
+                            scan_mode: HealScanMode::Deep,
+                            read_repair: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), arrived.notified())
+                .await
+                .expect("actual selected-version reconstruction reaches final commit fence");
+            assert!(!heal.is_finished() && !missing.exists());
+            println!("{prefix}: geometry={disk_count}/{parity} mutation={label} reconstruction_paused_before_final_rename");
+
+            if matches!(mutation, VersionCommitMutation::Append) {
+                let body = vec![0x44; 1024 * 1024 + 123];
+                let info = set
+                    .put_object(&bucket, object, &mut PutObjReader::from_vec(body.clone()), &options)
+                    .await
+                    .expect("new version ACK while historical reconstruction is paused");
+                let version = info.version_id.expect("new acknowledged version id");
+                assert!(versions.iter().all(|v| v.version != version));
+                let meta = disks[0]
+                    .read_version("", &bucket, object, &version.to_string(), &ReadOptions::default())
+                    .await
+                    .expect("new physical version metadata");
+                let data_dir = meta.data_dir.expect("new external generation");
+                let mut parts = Vec::new();
+                for dir in &dirs {
+                    parts.push(
+                        tokio::fs::read(
+                            dir.path()
+                                .join(&bucket)
+                                .join(object)
+                                .join(data_dir.to_string())
+                                .join("part.1"),
+                        )
+                        .await
+                        .expect("new version ACK has every physical shard"),
+                    );
+                }
+                versions.push(VersionCommitFixture {
+                    version,
+                    data_dir,
+                    body,
+                    parts,
+                });
+            } else {
+                set.delete_object(
+                    &bucket,
+                    object,
+                    ObjectOptions {
+                        versioned: true,
+                        version_id: Some(selected_version.to_string()),
+                        object_lock_config_snapshot: Some(Arc::new(crate::set_disk::ObjectLockConfigSnapshot::new(
+                            crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                        ))),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("exact version delete ACK before releasing stale reconstruction");
+            }
+            // Commit pause has dropped the Heal read guard. Acquire this key's
+            // write fence only after the foreground ACK, draining its physical
+            // cleanup before snapshots; release it before resuming the Heal.
+            let namespace = set.new_ns_lock(&bucket, object).await.expect("foreground drain fence");
+            let drained = namespace
+                .get_write_lock(Duration::from_secs(30))
+                .await
+                .expect("foreground physical tail drains");
+            let mut committed_metadata = Vec::new();
+            for dir in &dirs {
+                committed_metadata.push(
+                    tokio::fs::read(dir.path().join(&bucket).join(object).join(STORAGE_FORMAT_FILE))
+                        .await
+                        .expect("foreground committed metadata on every drive"),
+                );
+                if !matches!(mutation, VersionCommitMutation::Append) {
+                    assert!(!dir.path().join(&bucket).join(object).join(selected_dir.to_string()).exists());
+                }
+            }
+            drop(drained);
+            assert!(!heal.is_finished());
+            println!(
+                "{prefix}: geometry={disk_count}/{parity} mutation={label} foreground_ack_and_physical_tail_verified_before_release"
+            );
+            release.notify_one();
+            let outcome = tokio::time::timeout(Duration::from_secs(30), heal)
+                .await
+                .expect("Heal leaves its released final fence")
+                .expect("Heal task joins");
+            if matches!(mutation, VersionCommitMutation::Append) {
+                assert!(outcome.expect("historical version remains healable").1.is_none());
+            } else {
+                assert!(
+                    matches!(outcome, Err(DiskError::FileVersionNotFound)),
+                    "deleted version must remain typed absent: {outcome:?}"
+                );
+            }
+            for (slot, dir) in dirs.iter().enumerate() {
+                if slot != 0 || !matches!(mutation, VersionCommitMutation::Append) {
+                    assert_eq!(
+                        tokio::fs::read(dir.path().join(&bucket).join(object).join(STORAGE_FORMAT_FILE))
+                            .await
+                            .expect("metadata after Heal"),
+                        committed_metadata[slot],
+                        "Heal must preserve every committed successor metadata byte outside its repaired target"
+                    );
+                }
+                if !matches!(mutation, VersionCommitMutation::Append) {
+                    assert!(!dir.path().join(&bucket).join(object).join(selected_dir.to_string()).exists());
+                }
+                for version in &versions {
+                    if !matches!(mutation, VersionCommitMutation::Append) && version.version == selected_version {
+                        assert!(matches!(
+                            disks[slot]
+                                .read_version("", &bucket, object, &version.version.to_string(), &ReadOptions::default())
+                                .await,
+                            Err(DiskError::FileVersionNotFound)
+                        ));
+                        continue;
+                    }
+                    let meta = disks[slot]
+                        .read_version("", &bucket, object, &version.version.to_string(), &ReadOptions::default())
+                        .await
+                        .expect("every acknowledged surviving version metadata");
+                    assert_eq!(meta.data_dir, Some(version.data_dir));
+                    assert_eq!(meta.size, version.body.len() as i64);
+                    assert_eq!(
+                        tokio::fs::read(
+                            dir.path()
+                                .join(&bucket)
+                                .join(object)
+                                .join(version.data_dir.to_string())
+                                .join("part.1")
+                        )
+                        .await
+                        .expect("physical shard before any GET"),
+                        version.parts[slot],
+                        "every surviving version must retain its exact original encoded shard"
+                    );
+                }
+            }
+            for version in &versions {
+                if !matches!(mutation, VersionCommitMutation::Append) && version.version == selected_version {
+                    continue;
+                }
+                let mut reader = set
+                    .get_object_reader(
+                        &bucket,
+                        object,
+                        None,
+                        Default::default(),
+                        &ObjectOptions {
+                            versioned: true,
+                            version_id: Some(version.version.to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("read exact surviving version after physical proof");
+                let mut actual = Vec::new();
+                reader
+                    .read_to_end(&mut actual)
+                    .await
+                    .expect("read complete surviving version");
+                assert_eq!(actual, version.body);
+            }
+            let current = if matches!(mutation, VersionCommitMutation::DeleteCurrent) {
+                &versions[1]
+            } else {
+                versions.last().unwrap()
+            };
+            let mut reader = set
+                .get_object_reader(
+                    &bucket,
+                    object,
+                    None,
+                    Default::default(),
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("read exact last surviving current generation");
+            let mut actual = Vec::new();
+            reader.read_to_end(&mut actual).await.expect("read full current generation");
+            assert_eq!(actual, current.body);
+            println!(
+                "{prefix}: geometry={disk_count}/{parity} mutation={label} exact_version_outcome_physical_generations_and_full_bodies_verified"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_explicit_version_commit_preserves_acknowledged_new_version() {
+        explicit_version_commit_fence(VersionCommitMutation::Append).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_explicit_version_commit_refuses_deleted_historical_and_current_versions() {
+        explicit_version_commit_fence(VersionCommitMutation::DeleteHistorical).await;
+        explicit_version_commit_fence(VersionCommitMutation::DeleteCurrent).await;
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn read_repair_commit_aborts_when_object_changes_before_final_rename() {

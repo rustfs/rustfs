@@ -21143,7 +21143,12 @@ mod put_object_tmp_cleanup_tests {
                 .join("part.1");
             assert!(tokio::fs::try_exists(&old_part).await.expect("original part exists"));
 
-            let barrier = rename_fanout_barrier::arm(&object, 0, rename_fanout_barrier::PHASE_CLEANUP);
+            // Cleanup slots follow the writer's shuffled erasure distribution,
+            // not the physical fixture order. Pause every real cleanup slot so
+            // no physical old shard can disappear before the proof below.
+            let barriers: Vec<_> = (0..disk_count)
+                .map(|slot| rename_fanout_barrier::arm(&object, slot, rename_fanout_barrier::PHASE_CLEANUP))
+                .collect();
             let writer_set = Arc::clone(&set);
             let writer_object = object.clone();
             let writer_options = options.clone();
@@ -21154,9 +21159,13 @@ mod put_object_tmp_cleanup_tests {
                     .put_object(bucket, &writer_object, &mut PutObjReader::from_vec(writer_payload), &writer_options)
                     .await
             });
-            tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
-                .await
-                .expect("overwrite commits before its real old-data cleanup pause");
+            tokio::time::timeout(Duration::from_secs(30), async {
+                for barrier in &barriers {
+                    barrier.wait_until_paused().await;
+                }
+            })
+            .await
+            .expect("overwrite commits before its real old-data cleanup pause");
             assert!(!writer.is_finished(), "tail-drained ACK must remain pending at cleanup");
             assert!(
                 tokio::fs::try_exists(&old_part)
@@ -21190,6 +21199,20 @@ mod put_object_tmp_cleanup_tests {
                 .join(new_dir.to_string())
                 .join("part.1");
             let expected_part = tokio::fs::read(&new_part).await.expect("exact new source bytes");
+            let mut committed_parts = Vec::new();
+            for dir in &dirs {
+                let original = dir.path().join(bucket).join(&object).join(old_dir.to_string()).join("part.1");
+                assert!(
+                    tokio::fs::try_exists(original)
+                        .await
+                        .expect("every old cleanup slot is paused")
+                );
+                committed_parts.push(
+                    tokio::fs::read(dir.path().join(bucket).join(&object).join(new_dir.to_string()).join("part.1"))
+                        .await
+                        .expect("every new encoded shard before fault"),
+                );
+            }
             tokio::fs::remove_file(&new_part)
                 .await
                 .expect("remove only the newly committed target shard");
@@ -21236,14 +21259,31 @@ mod put_object_tmp_cleanup_tests {
                 "native_g01: geometry={disk_count}/{parity} read_repair={read_repair} locked_heal_completed new_generation_part_rebuilt_before_get"
             );
 
-            barrier.release();
+            for barrier in &barriers {
+                barrier.release();
+            }
             let acknowledged = tokio::time::timeout(Duration::from_secs(30), writer)
                 .await
                 .expect("cleanup drains")
                 .expect("writer joins")
                 .expect("overwrite ACK remains successful");
             assert_eq!(acknowledged.size, i64::try_from(payload.len()).expect("fixture size fits i64"));
-            drop(barrier);
+            drop(barriers);
+            for (slot, dir) in dirs.iter().enumerate() {
+                let root = dir.path().join(bucket).join(&object);
+                assert!(
+                    !tokio::fs::try_exists(root.join(old_dir.to_string()))
+                        .await
+                        .expect("old cleanup completed")
+                );
+                assert_eq!(
+                    tokio::fs::read(root.join(new_dir.to_string()).join("part.1"))
+                        .await
+                        .expect("new shard survives cleanup before GET"),
+                    committed_parts[slot],
+                    "old cleanup must preserve every exact committed encoded shard"
+                );
+            }
             let mut reader = set
                 .get_object_reader(bucket, &object, None, HeaderMap::new(), &options)
                 .await

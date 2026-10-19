@@ -1476,9 +1476,11 @@ mod tests {
     fn rpc_unavailable_preserves_service_refusal_across_io_boundaries() {
         let status = || tonic::Status::unavailable("private transport detail must not reach the S3 response");
         let storage = || StorageError::from(status());
+        let original = storage();
+        let cloned = original.clone();
         for error in [
-            ApiError::from(storage()),
-            ApiError::from(storage().clone()),
+            ApiError::from(original),
+            ApiError::from(cloned),
             ApiError::from(StorageError::Io(IoError::other(IoError::other(status())))),
             ApiError::from(IoError::other(status())),
             ApiError::from(IoError::other(storage())),
