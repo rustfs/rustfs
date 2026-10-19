@@ -942,6 +942,15 @@ impl ECStore {
         self.scanner_data_usage_publication_snapshot_blocked().await
     }
 
+    /// Whether an ordinary namespace commit (a PUT rename fanout, including a
+    /// tail that outlives a cancelled handler) still holds its physical owner.
+    /// Usage publication no longer consults it; tests use it to observe owner
+    /// retention directly.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn namespace_commits_pending_for_test(&self) -> bool {
+        self.ctx.namespace_commits_pending()
+    }
+
     pub async fn scanner_data_movement_pause_status(&self) -> ScannerDataMovementPauseStatus {
         let operation_gate = self.ctx.data_movement_operation_gate();
         let _operation_guard = operation_gate.read_owned().await;
