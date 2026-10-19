@@ -293,7 +293,16 @@ async fn assert_coordinator_partial_progress(resume_mixed_plan: bool, fail_cycle
             .expect("persist a prefix from a different process plan");
 
         let tail_budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, ScannerCycleBudgetConfig::default());
-        let failure_guard = fail_cycle_save.map(|after_commit| super::cycle_persist_failure::fail_next_save(1, after_commit));
+        // A committed-then-failed write is confirmed from durable state by the
+        // save itself, so only an uncommitted fault that outlives every bounded
+        // retry makes the cycle-state save fail.
+        let failure_guard = fail_cycle_save.map(|after_commit| {
+            if after_commit {
+                super::cycle_persist_failure::fail_next_save(1, true)
+            } else {
+                super::cycle_persist_failure::fail_saves(1, false, SCANNER_PERSIST_CAS_RETRIES + 1)
+            }
+        });
         let tail_outcome = run_data_scanner_cycle_with_budget(
             &ctx,
             &store,
@@ -331,19 +340,27 @@ async fn assert_coordinator_partial_progress(resume_mixed_plan: bool, fail_cycle
         );
         assert_eq!(crate::scanner_io::dirty_usage_buckets_for_tests(), dirty_before);
         if let Some(after_commit) = fail_cycle_save {
-            assert_eq!(tail_outcome, ScannerCycleOutcome::StatePersistenceFailed);
-            assert!(!tail_budget.cycle_state_persisted());
             assert!(super::cycle_persist_failure::take_failure(1).is_none(), "injected fault must have fired");
             let state = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
                 .await
                 .expect("last durable cycle");
-            assert_eq!(
-                decode_scanner_cycle_state(&state)
-                    .expect("cycle after failed acknowledgement")
-                    .0
-                    .next,
-                353 + u64::from(after_commit)
-            );
+            let durable_next = decode_scanner_cycle_state(&state)
+                .expect("cycle after failed acknowledgement")
+                .0
+                .next;
+            if after_commit {
+                // The write committed before the error surfaced; the save
+                // confirms it from durable state under the same epoch.
+                assert_eq!(tail_outcome, ScannerCycleOutcome::Partial);
+                assert!(tail_budget.cycle_state_persisted());
+                assert_eq!(durable_next, 354);
+            } else {
+                // Every bounded retry failed: progress stays unacknowledged
+                // and the durable cycle does not move.
+                assert_eq!(tail_outcome, ScannerCycleOutcome::StatePersistenceFailed);
+                assert!(!tail_budget.cycle_state_persisted());
+                assert_eq!(durable_next, 353);
+            }
             drop(failure_guard);
             global_metrics().set_cycle(None).await;
             crate::scanner_io::clear_dirty_usage_buckets_for_tests();

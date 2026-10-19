@@ -230,6 +230,52 @@ Missing, undecodable, or identity-less data is not converted to zero. It is
 reported as uninitialized, recovery-required, observed-only, or unavailable
 according to the reader's surface.
 
+Every fail-closed scanner gate has an automatic exit and a bounded dwell time.
+None of the exits deletes evidence or relaxes the leadership, CAS, movement, or
+usage-floor fences:
+
+- A retryable recovery observation (a transient cycle-state read failure, a
+  usage-floor load failure, a pending legacy floor recovery, or a quarantine
+  marker that could not be written) never becomes terminal. Once the short
+  retry budget is spent the state reads `backoff`, `retryable` stays true, the
+  supervisor keeps retrying with an exponential delay capped at ten minutes or
+  sooner when recovery is explicitly woken, and `next_attempt_at_unix_secs`
+  plus the `reason` name the next attempt. A successful iteration resets the
+  count, and an observation older than 24 hours restarts its budget. Followers
+  still clear only an unclassified `transient` or `backoff` observation on lock
+  contention.
+- A `.bloomcycle.bin` that this reader classifies as `corrupt` is quarantined
+  by writing the marker, and the next leader iteration rebuilds the counter: it
+  starts from an uninitialized cycle raised to the usage-floor cycle and lets
+  the ordinary leadership claim CAS-replace the quarantined revision under a
+  higher epoch. The marker is retained as evidence. Because its
+  `primary_revision` no longer matches the primary, older and newer readers
+  start normally, and the supported cycle-state reset remains the way to remove
+  it. A `future_schema` counter and a `cleanup-pending` marker stay blocked: the
+  first belongs to a newer binary and the second to an operator reset in
+  progress. Only a marker that cannot be written or read keeps the node in
+  `blocked`, probed every five minutes.
+- A pause ledger that cannot be claimed (no replicas, or conflicting or invalid
+  replica records) runs the leader in `degraded` mode instead of skipping every
+  cycle. Cycles run untracked against an empty in-memory ledger, publication is
+  still admitted only through the data-movement fence, `persistence_state`
+  reports `degraded` with the claim error, and the claim is retried on every
+  scheduler wake and every movement probe, at most once per five minutes. When
+  the claim succeeds the durable ledger resumes with its persisted phase and
+  catch-up semantics.
+- The usage-state full-rebuild reset accepts a cluster whose usage slots are
+  all corrupt and whose cycle state is missing. It starts from the empty
+  baseline and epoch 1 exactly as a missing floor does, and quota-bearing
+  buckets keep failing closed until the rebuilt baseline publishes. A corrupt
+  cycle state must still be rebuilt first.
+- A cycle-state save that fails without revealing a newer leadership epoch is
+  retried under the same epoch: inside the save by reconciling against durable
+  state (a committed write is confirmed from the read-back, a failed write is
+  retried with the current revision), and after an exhausted save by reloading
+  durable state in place. Only a durable state owned by another epoch, or one
+  that cannot be read back, ends the leader iteration and triggers a new claim,
+  so peers see a changed `(cycle, epoch)` fence only when ownership changed.
+
 ## Diagnosing Incomplete Census Progress
 
 Treat bucket coverage, set-worker completion, cycle certification, and usage

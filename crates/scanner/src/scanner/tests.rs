@@ -39,6 +39,7 @@ const TEST_DEFAULT_SCANNER_CYCLE_SECS: u64 = 24 * 60 * 60;
 
 mod cycle_budget_publication;
 pub(super) mod cycle_persist_failure;
+mod gate_self_heal;
 mod quota_reset_preservation;
 
 mod recovery_control;
@@ -902,6 +903,8 @@ struct MemoryConfigStore {
     delayed_gets: Mutex<HashMap<String, Duration>>,
     non_regular_objects: Mutex<HashSet<String>>,
     fail_put_number: Mutex<HashMap<String, usize>>,
+    /// Fail every put whose number is at least the stored value.
+    fail_puts_from: Mutex<HashMap<String, usize>>,
     object_not_found_put_number: Mutex<HashMap<String, usize>>,
     error_after_commit_put_number: Mutex<HashMap<String, usize>>,
     interleaving_puts: Mutex<HashMap<String, (usize, Vec<u8>)>>,
@@ -1020,7 +1023,14 @@ impl crate::storage_api::scanner_io::ObjectIO for MemoryConfigStore {
             *put_count
         };
 
-        if self.fail_put_number.lock().await.get(&key) == Some(&put_count) {
+        if self.fail_put_number.lock().await.get(&key) == Some(&put_count)
+            || self
+                .fail_puts_from
+                .lock()
+                .await
+                .get(&key)
+                .is_some_and(|from| put_count >= *from)
+        {
             return Err(EcstoreError::other("injected put failure"));
         }
         if self.object_not_found_put_number.lock().await.get(&key) == Some(&put_count) {
@@ -2092,11 +2102,19 @@ async fn corrupt_cycle_state_is_quarantined_once() {
     assert_eq!(marker.quarantine_path, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str());
     assert_eq!(marker.classification, "corrupt");
 
-    // A second startup sees the matching marker before consuming the poison body.
+    // A second startup sees the durable marker before consuming the poison
+    // body and schedules the automatic rebuild instead of blocking again.
     assert!(matches!(
         load_scanner_cycle_state_for_startup(store.clone()).await,
-        ScannerCycleStateStartup::Blocked
+        ScannerCycleStateStartup::RebuildFromQuarantine {
+            revision: DataUsageCacheRevision::Etag(ref revision)
+        } if revision == "memory-7"
     ));
+    assert_eq!(
+        store.objects.lock().await.get(&marker_key),
+        Some(&marker_data),
+        "scheduling the rebuild must not rewrite the marker"
+    );
 
     // Replacing the primary object advances its revision; the stale marker must
     // not quarantine the newer, valid state.
@@ -2169,8 +2187,24 @@ async fn concurrent_leaders_cannot_quarantine_newer_cycle_state() {
         load_scanner_cycle_state_for_startup(store.clone()),
         load_scanner_cycle_state_for_startup(store.clone()),
     );
-    assert!(matches!(first, ScannerCycleStateStartup::Blocked));
-    assert!(matches!(second, ScannerCycleStateStartup::Blocked));
+    // Whichever contender publishes the marker blocks; the other either races
+    // the marker write (blocked or transient) or sees the durable marker and
+    // schedules the rebuild. Neither may quarantine a different revision.
+    for outcome in [&first, &second] {
+        assert!(
+            matches!(
+                outcome,
+                ScannerCycleStateStartup::Blocked
+                    | ScannerCycleStateStartup::Transient(_)
+                    | ScannerCycleStateStartup::RebuildFromQuarantine { .. }
+            ),
+            "{outcome:?}"
+        );
+    }
+    assert!(
+        matches!(first, ScannerCycleStateStartup::Blocked) || matches!(second, ScannerCycleStateStartup::Blocked),
+        "one contender must publish the marker: {first:?} / {second:?}"
+    );
 
     let marker_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_RECOVERY_PATH.as_str());
     let marker_data = store
@@ -3697,7 +3731,7 @@ async fn scanner_usage_floor_recovery_retry_budget_uses_marker_epoch_identity() 
     persisted_usage_floor_for_startup(store.clone(), true)
         .await
         .expect("legacy empty primary should enter recovery");
-    assert!(record_scanner_cycle_recovery_retry(3));
+    assert_eq!(record_scanner_cycle_recovery_retry(3, Duration::from_secs(1)).attempt, 3);
     let first_detected = scanner_cycle_recovery_status().first_detected_at_unix_secs;
 
     let primary = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
@@ -3860,10 +3894,22 @@ fn scanner_usage_floor_failure_is_exposed_and_cleared() {
     assert_eq!(blocked.reason.as_deref(), Some("persisted usage floor is invalid"));
     let first_detected = blocked.first_detected_at_unix_secs;
 
-    assert!(record_scanner_cycle_recovery_retry(2));
+    let retry = record_scanner_cycle_recovery_retry(2, Duration::from_secs(1));
+    assert_eq!(retry.attempt, 2);
+    assert_eq!(retry.delay, Duration::from_secs(2));
+    let scheduled = scanner_cycle_recovery_status();
+    assert_eq!(scheduled.retry_count, 2);
+    assert!(scheduled.next_attempt_at_unix_secs.is_some());
+    assert!(
+        scheduled
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("persisted usage floor is invalid; next automatic attempt at unix "))
+    );
     record_scanner_usage_floor_failure("persisted usage floor remains invalid".to_string());
     let retried = scanner_cycle_recovery_status();
-    assert_eq!(retried.retry_count, 2);
+    assert_eq!(retried.retry_count, 0, "the supervisor owns the retry budget across attempts");
+    assert!(retried.next_attempt_at_unix_secs.is_none());
     assert_eq!(retried.first_detected_at_unix_secs, first_detected);
 
     clear_scanner_usage_floor_failure();
@@ -3885,7 +3931,7 @@ fn scanner_usage_floor_recovery_stays_retryable_until_claim_cleanup() {
     assert_eq!(pending.quarantine_path.as_deref(), Some(DATA_USAGE_RECOVERY_PATH.as_str()));
     let first_detected = pending.first_detected_at_unix_secs;
 
-    assert!(record_scanner_cycle_recovery_retry(3));
+    assert_eq!(record_scanner_cycle_recovery_retry(3, Duration::from_secs(1)).attempt, 3);
     record_legacy_incomplete_usage_floor_recovery_pending(7);
     let retried = scanner_cycle_recovery_status();
     assert_eq!(retried.retry_count, 3);
@@ -3917,7 +3963,7 @@ fn scanner_cache_cycle_ahead_is_visible_until_a_later_scan_clears_it() {
     assert_eq!(observed_again.retry_count, 0);
     assert_eq!(observed_again.first_detected_at_unix_secs, first_detected);
 
-    assert!(record_scanner_cycle_recovery_retry(4));
+    assert_eq!(record_scanner_cycle_recovery_retry(4, Duration::from_secs(1)).attempt, 4);
     assert_eq!(scanner_cycle_recovery_status().retry_count, 0);
 
     record_scanner_cache_cycle_recovery_attempt();
@@ -4855,7 +4901,8 @@ async fn test_finalize_partial_scan_cycle_reports_persist_failure() {
     let store = Arc::new(MemoryConfigStore::default());
     let ctx = CancellationToken::new();
     let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
-    store.fail_put_number.lock().await.insert(key, 1);
+    // Every attempt of the bounded in-save retry fails.
+    store.fail_puts_from.lock().await.insert(key, 1);
     let mut revision = DataUsageCacheRevision::Missing;
     let mut cycle_info = CurrentCycle {
         current: 12,
@@ -6018,30 +6065,47 @@ async fn scanner_usage_state_reset_cancels_during_publication_admission() {
     }
 }
 
+/// Corrupt slots without any cycle state are the rustfs/rustfs#8670 shape. The
+/// full rebuild starts from the empty baseline exactly as a missing floor
+/// does: the result is a bootstrap-pending marker, never an authoritative zero
+/// floor, so quota-bearing buckets keep failing closed until a complete
+/// publication. A valid backup still supplies the recovery floor instead.
 #[tokio::test]
 #[serial]
-async fn scanner_usage_state_reset_rejects_corruption_without_a_trusted_floor() {
+async fn scanner_usage_state_reset_rebuilds_corruption_without_a_trusted_floor_from_empty_baseline() {
     let (_temp_dir, store) = setup_scanner_cycle_store_with_usage_baseline(false).await;
     save_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), b"{corrupt".to_vec())
         .await
         .expect("corrupt primary should persist");
-    let before = read_config_with_revision(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+    let result = reset_scanner_usage_state_for_full_rebuild(CancellationToken::new(), store.clone())
         .await
-        .expect("evidence should load");
-    let err = reset_scanner_usage_state_for_full_rebuild(CancellationToken::new(), store.clone())
+        .expect("corrupt slots without a cycle state start from the empty baseline");
+    assert_eq!(result.leader_epoch, 1);
+    assert_eq!(result.next_cycle, 0);
+    assert_eq!(result.usage_state, "bootstrap-pending");
+    let primary = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
         .await
-        .expect_err("corruption must not become a zero floor");
-    assert!(err.to_string().contains("no trusted cycle or usage floor"), "{err}");
-    assert_eq!(
-        read_config_with_revision(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .expect("reset should replace the corrupt primary with a bootstrap marker");
+    let primary: DataUsageInfo = serde_json::from_slice(&primary).expect("bootstrap marker should decode");
+    assert!(data_usage_info_is_bootstrap_pending(&primary), "corruption must not become a zero floor");
+    assert!(!data_usage_info_has_persisted_baseline_identity(&primary));
+    let (cycle, leader_epoch) = decode_scanner_cycle_state(
+        &read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
             .await
-            .expect("evidence should remain"),
-        before
-    );
-    assert!(matches!(
-        read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str()).await,
-        Err(EcstoreError::ConfigNotFound)
-    ));
+            .expect("reset should fence a fresh cycle state"),
+    )
+    .expect("fenced cycle state should decode");
+    assert_eq!((cycle.next, leader_epoch), (0, 1));
+    let (floor, startup) = persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect("startup should accept the bootstrap marker");
+    assert_eq!(startup, PersistedUsageFloorStartup::BootstrapPending);
+    assert_eq!(floor.leader_epoch, 1);
+
+    let (_temp_dir, store) = setup_scanner_cycle_store_with_usage_baseline(false).await;
+    save_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), b"{corrupt".to_vec())
+        .await
+        .expect("corrupt primary should persist");
     let mut backup = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
     backup.scanner_epoch = Some(7);
     backup.scanner_cycle = Some(40);
@@ -6093,10 +6157,12 @@ async fn scanner_usage_state_reset_rejects_replaced_intent_and_newer_cleanup_slo
     assert_eq!(read_config(store, &path).await.expect("newer snapshot should remain"), bytes);
 }
 
+/// Valid JSON without a baseline identity proves no floor either. The full
+/// rebuild treats it like corruption: it starts from the empty baseline with
+/// a bootstrap-pending marker instead of promoting the untrusted values.
 #[tokio::test]
 #[serial]
-async fn scanner_usage_state_reset_rejects_decodable_untrusted_floor() {
-    let (_temp_dir, store) = setup_scanner_cycle_store_with_usage_baseline(false).await;
+async fn scanner_usage_state_reset_rebuilds_decodable_untrusted_floor_from_empty_baseline() {
     let invalid_identity = DataUsageInfo {
         usage_snapshot_complete: true,
         buckets_count: 1,
@@ -6104,6 +6170,7 @@ async fn scanner_usage_state_reset_rejects_decodable_untrusted_floor() {
         ..Default::default()
     };
     for usage in [DataUsageInfo::default(), invalid_identity] {
+        let (_temp_dir, store) = setup_scanner_cycle_store_with_usage_baseline(false).await;
         save_config(
             store.clone(),
             DATA_USAGE_OBJ_NAME_PATH.as_str(),
@@ -6111,23 +6178,22 @@ async fn scanner_usage_state_reset_rejects_decodable_untrusted_floor() {
         )
         .await
         .expect("untrusted primary should persist");
-        let before = read_config_with_revision(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        let result = reset_scanner_usage_state_for_full_rebuild(CancellationToken::new(), store.clone())
             .await
-            .expect("primary should load");
-        let err = reset_scanner_usage_state_for_full_rebuild(CancellationToken::new(), store.clone())
+            .expect("an untrusted floor without a cycle state starts from the empty baseline");
+        assert_eq!((result.leader_epoch, result.next_cycle), (1, 0));
+        assert_eq!(result.usage_state, "bootstrap-pending");
+        let primary = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
             .await
-            .expect_err("valid JSON alone cannot prove a usage floor");
-        assert!(err.to_string().contains("no trusted cycle or usage floor"), "{err}");
-        assert_eq!(
-            read_config_with_revision(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
-                .await
-                .expect("evidence should remain"),
-            before
-        );
-        assert!(matches!(
-            read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str()).await,
-            Err(EcstoreError::ConfigNotFound)
-        ));
+            .expect("reset should replace the untrusted primary with a bootstrap marker");
+        let primary: DataUsageInfo = serde_json::from_slice(&primary).expect("bootstrap marker should decode");
+        assert!(data_usage_info_is_bootstrap_pending(&primary), "valid JSON alone must not become a floor");
+        assert_eq!(primary.buckets_count, 0, "untrusted values must not be promoted");
+        let (floor, startup) = persisted_usage_floor_for_startup(store.clone(), true)
+            .await
+            .expect("startup should accept the bootstrap marker");
+        assert_eq!(startup, PersistedUsageFloorStartup::BootstrapPending);
+        assert_eq!(floor.leader_epoch, 1);
     }
 }
 
