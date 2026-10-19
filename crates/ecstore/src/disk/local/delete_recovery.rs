@@ -1420,7 +1420,7 @@ impl LocalDisk {
         action: DeleteRecoveryAction,
         owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<DeleteRecoveryInspection> {
-        let observed = self
+        let mut observed = self
             .delete_recovery_inspect_owned(volume, object, transaction, owner.clone())
             .await?;
         if observed.fingerprint != expected_fingerprint {
@@ -1547,13 +1547,13 @@ impl LocalDisk {
                     },
                 )
                 .await?;
+                observed = self
+                    .delete_recovery_inspect_owned(volume, object, transaction, owner.clone())
+                    .await?;
             } else {
                 return Ok(observed);
             }
         }
-        let observed = self
-            .delete_recovery_inspect_owned(volume, object, transaction, owner.clone())
-            .await?;
         if action == DeleteRecoveryAction::DiscardLegacy {
             if observed.state != DeleteRecoveryState::LegacyAmbiguous || !observed.explicit_delete_safe {
                 return Err(DiskError::FileCorrupt);
@@ -2262,6 +2262,42 @@ mod tests {
             .expect("object directory");
         fs::write(path, &bytes).await.expect("original metadata");
         (temp, disk, info, bytes)
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_absent_publish_refreshes_prepared_witness() {
+        let (_temp, disk, _info, _original) = fixture().await;
+        let root = disk.io_get_object_path("recovery", "object").expect("object path");
+        fs::remove_file(root.join(STORAGE_FORMAT_FILE)).await.expect("absent object");
+        let transaction = Uuid::new_v4();
+        let absent = disk
+            .inspect_delete_transaction("recovery", "object", transaction)
+            .await
+            .expect("inspect absent transaction");
+        assert_eq!(absent.state, DeleteRecoveryState::Absent);
+        let mut observed = absent;
+        for (action, expected) in [
+            (DeleteRecoveryAction::PublishCommit, DeleteRecoveryState::QuorumCommitted),
+            (DeleteRecoveryAction::PublishCommit, DeleteRecoveryState::QuorumCommitted),
+            (DeleteRecoveryAction::FinishCommit, DeleteRecoveryState::CommitFinished),
+            (DeleteRecoveryAction::FinalizeCommit, DeleteRecoveryState::Absent),
+        ] {
+            observed = disk
+                .settle_delete_transaction("recovery", "object", transaction, observed.fingerprint, action)
+                .await
+                .expect("settle absent-key witness");
+            assert_eq!(observed.state, expected);
+            assert!(observed.current_digest.is_none());
+            assert!(!root.join(STORAGE_FORMAT_FILE).exists(), "the witness cannot resurrect metadata");
+            if let Some(journal) = &observed.journal {
+                assert_eq!(journal.transaction, transaction);
+                assert!(journal.original_digest.is_none() && journal.target_digest.is_none());
+                assert!(journal.data_dirs.is_empty());
+            } else {
+                assert_eq!(expected, DeleteRecoveryState::Absent);
+            }
+        }
+        assert!(!root.join(transaction.to_string()).exists(), "finalization retires the witness");
     }
 
     #[tokio::test]
