@@ -175,6 +175,8 @@ Contract: [decommission-compatibility.md](../architecture/decommission-compatibi
 - Supported only on multi-pool, non-legacy (ellipsis) deployments; anything else returns `NotImplemented`. A rebalance in progress blocks start.
 - Targets are validated as a batch before anything is persisted: unknown, duplicate, active, queued, or completed targets are rejected; failed or canceled targets must be cleared first unless they hold unresolved listing entries, in which case a new start is the retry path (`DecommissionStartPoolState::Retryable` versus `Blocked` in `crates/ecstore/src/core/pools.rs`).
 - Requests go to any node and are forwarded to the pool leader (§1).
+- A start never waits indefinitely for in-flight data movement (an object copy or source cleanup, another start, a scanner publication lease) to release the start, rebalance activation, and data-movement gates: the leader's rebalance pre-check and the activation each allow those waits 30 seconds. If a gate stays busy, the leader fails the start with a lock timeout naming the gate and persists nothing; served by the leader itself, the request answers `503 ServiceUnavailable` with `Retry-After`. Retry the same request.
+- Status reads (`pools/list`, `pools/status`, `decommission/status`) never wait for data movement. While movement holds the gates, a node answers from the persisted `pool.bin` and `rebalance.bin` merged into its in-memory view without publishing them; with the gates free it also publishes the refresh, as before.
 
 ```text
 POST /rustfs/admin/v3/pools/decommission?pool=<a>[,<b>]      # by command line
