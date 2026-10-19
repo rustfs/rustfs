@@ -7596,12 +7596,13 @@ mod decommission_lock_order_tests {
         let target = killed_leader_target(store, 1).await;
         assert_eq!(target.pending_mutation_id, None);
         assert_eq!(target.pending_physical_bytes, 0);
+        let adopted = crate::core::pools::decommission_adopted_intent_mutation_id(interrupted);
         assert!(
             target
                 .temporary_mutations
                 .iter()
-                .all(|mutation| mutation.mutation_id != interrupted),
-            "the interrupted mutation's retry must settle its adopted marker: {:?}",
+                .all(|mutation| mutation.mutation_id != interrupted && mutation.mutation_id != adopted),
+            "the interrupted mutation's retry must settle its markers: {:?}",
             target.temporary_mutations
         );
         assert!(target.consumed_physical_bytes > 0);
@@ -7849,13 +7850,14 @@ mod decommission_lock_order_tests {
             .adopt_previous_incarnation_decommission_capacity_intents_for_test(0)
             .await
             .expect("the resumed routine should adopt the interrupted completion");
+        let adopted = crate::core::pools::decommission_adopted_intent_mutation_id(interrupted);
         let adopted_marker = killed_leader_target(&store, 2)
             .await
             .temporary_mutations
             .iter()
-            .find(|mutation| mutation.mutation_id == interrupted)
+            .find(|mutation| mutation.mutation_id == adopted)
             .map(|mutation| mutation.physical_bytes)
-            .expect("the interrupted completion should become its mutation's marker");
+            .expect("the interrupted completion should become its adopted-completion marker");
         assert!(adopted_marker >= completion_bytes);
 
         // The failed attempt's cleanup runs after the resume and finds the
@@ -7892,7 +7894,7 @@ mod decommission_lock_order_tests {
                 .await
                 .temporary_mutations
                 .iter()
-                .find(|mutation| mutation.mutation_id == interrupted)
+                .find(|mutation| mutation.mutation_id == adopted)
                 .map(|mutation| mutation.physical_bytes),
             Some(adopted_marker),
             "a cleanup that proves the committed target must not release the adopted completion"
@@ -7909,7 +7911,7 @@ mod decommission_lock_order_tests {
             settled
                 .temporary_mutations
                 .iter()
-                .all(|mutation| mutation.mutation_id != interrupted)
+                .all(|mutation| mutation.mutation_id != interrupted && mutation.mutation_id != adopted)
         );
         assert_eq!(settled.inflight_physical_bytes, 0);
     }
