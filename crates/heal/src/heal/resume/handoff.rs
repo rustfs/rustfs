@@ -154,7 +154,6 @@ impl ResumeManager {
         &self,
         storage: &dyn crate::heal::storage::HealStorageAPI,
     ) -> Result<ResumeState> {
-        let attempt = self.get_state().await.retry_count.saturating_add(1);
         match self.resolve_replacement_recovery_inner(storage).await {
             Ok(state) if !state.completed && state.retry_count >= state.max_retries => {
                 Err(Error::ReplacementRetryBudgetExhausted)
@@ -167,7 +166,9 @@ impl ResumeManager {
             // restarts.  This is a readiness observation, not a failed
             // generation attempt, so do not consume the durable retry budget.
             Err(error @ Error::ReplacementTargetNotReady(_)) => Err(error),
-            Err(failure) => match self.record_replacement_failure(&failure, attempt).await {
+            // Resolution precedes any rebuild: keep the reason for status and
+            // the next discovery pass, but never spend a rebuild attempt.
+            Err(failure) => match self.record_replacement_resolution_failure(&failure).await {
                 Ok(()) => Err(failure),
                 Err(persistence) => Err(Error::ReplacementFailurePersistence {
                     failure: Box::new(failure),
@@ -290,7 +291,10 @@ impl ResumeManager {
                 "replacement generation is not eligible for an online handoff",
             ));
         }
-        if !preformat_retry && state.retry_count.saturating_add(1) >= state.max_retries {
+        // A handoff is not a rebuild attempt. Only a generation whose rebuild
+        // budget is already spent stays terminal; the compatibility re-arm
+        // below is the single exception for stranded pre-format intents.
+        if !preformat_retry && state.retry_count >= state.max_retries {
             return Err(Error::ReplacementRetryBudgetExhausted);
         }
         if state.replacement_phase == ReplacementPhase::OwnershipPending {
@@ -353,9 +357,9 @@ impl ResumeManager {
             }
             if preformat_retry {
                 current.replacement_preformat_handoff_retry_done = true;
-                // One handoff consumes one attempt; its successor must still
-                // have exactly one actual rebuild attempt under the same cap.
-                current.retry_count = current.max_retries - 2;
+                // The successor inherits this count unchanged and must have
+                // exactly one actual rebuild attempt under the same cap.
+                current.retry_count = current.max_retries - 1;
             }
             current.replacement_handoff = Some(ReplacementHandoff {
                 phase: ReplacementHandoffPhase::Prepared,
@@ -458,10 +462,9 @@ impl ResumeManager {
         // The constructor marks this compatibility grant consumed for every
         // successor, including descendants of a recovered older generation.
         state.replacement_predecessor = Some(predecessor.task_id.clone());
-        state.retry_count = predecessor
-            .retry_count
-            .checked_add(1)
-            .ok_or_else(|| replacement_recovery_conflict("handoff retry overflow"))?;
+        // The successor continues the same bounded rebuild; the handoff that
+        // created it is an interruption, not a spent attempt.
+        state.retry_count = predecessor.retry_count;
         state.max_retries = predecessor.max_retries;
         state.replacement_lineage = predecessor.replacement_lineage.clone();
         state.replacement_legacy_import = predecessor.replacement_legacy_import.clone();

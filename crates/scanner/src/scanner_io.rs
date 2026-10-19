@@ -1580,8 +1580,10 @@ pub(crate) async fn scanner_bucket_checkpoint_identity(
     publication_epoch: u64,
     tier_registry_generation: u64,
     scan_mode: HealScanMode,
-) -> Result<crate::DataUsageScanIdentity> {
-    let bucket_incarnation = set.bucket_incarnation_id_from_disk(bucket).await?;
+) -> Result<Option<crate::DataUsageScanIdentity>> {
+    let Some(bucket_incarnation) = set.find_bucket_incarnation_id_from_disk(bucket).await? else {
+        return Ok(None);
+    };
     let disks = set
         .format
         .erasure
@@ -1597,14 +1599,14 @@ pub(crate) async fn scanner_bucket_checkpoint_identity(
     for disk in disks {
         digest.update(disk.as_bytes());
     }
-    Ok(crate::DataUsageScanIdentity {
+    Ok(Some(crate::DataUsageScanIdentity {
         version: 1,
         bucket_incarnation,
         set_layout: crate::DataUsageScanPlanDigest(digest.finalize().into()),
         publication_epoch,
         tier_registry_generation,
         scan_mode,
-    })
+    }))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

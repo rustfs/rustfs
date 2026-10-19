@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::heal_info::{classify_background_heal_read_error, decode_background_heal_info};
+use super::heal_info::{
+    ScannerBitrotStart, classify_background_heal_read_error, decode_background_heal_info, record_scanner_bitrot_status,
+    reset_bitrot_cadence_anchor_for_test, resolve_background_heal_info, scanner_bitrot_start_for_cycle,
+};
 use super::*;
 use crate::EcstoreResult;
 use crate::storage_api::owner::{WriteCommitGuard, WriteCompletion, ecstore_hold_namespace_commit};
@@ -1683,10 +1686,13 @@ async fn assert_bootstrap_observation_retry(drives_per_set: usize) {
     )
     .await
     .expect("the same cycle must converge after the pending PUT drains");
+    // Without a recorded Deep window both layouts run Normal (an erasure set
+    // used to open a Deep window here and revisit every bucket), so the
+    // retry reuses the cold inventory and only walks the dirty bucket.
     assert_eq!(
         retry_budget.progress().0,
-        if drives_per_set == 1 { 1 } else { 2 },
-        "Normal retries reuse cold inventory; Deep retries still visit every bucket"
+        1,
+        "Normal retries reuse cold inventory (drives_per_set={drives_per_set})"
     );
     assert!(matches!(
         outcome,
@@ -11006,7 +11012,11 @@ async fn scanner_activity_probe_wait_stops_after_leader_lock_loss() {
 #[serial]
 fn test_get_cycle_scan_mode_runs_deep_until_selection_window_completes() {
     with_var(ENV_SCANNER_BITROT_CYCLE_SECS, Some("3600"), || {
-        let mode = get_cycle_scan_mode(10, 0, Some(Utc::now()), ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1024));
+        let start = ScannerBitrotStart::Window {
+            cycle: 0,
+            started: Utc::now(),
+        };
+        let mode = get_cycle_scan_mode(10, start, ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1024));
         assert_eq!(mode, HealScanMode::Deep);
     });
 }
@@ -11018,12 +11028,17 @@ fn test_get_cycle_scan_mode_respects_elapsed_bitrot_cycle() {
         let recent = Utc::now() - chrono::Duration::minutes(30);
         let old = Utc::now() - chrono::Duration::hours(2);
 
+        let recent = ScannerBitrotStart::Window {
+            cycle: 0,
+            started: recent,
+        };
+        let old = ScannerBitrotStart::Window { cycle: 0, started: old };
         assert_eq!(
-            get_cycle_scan_mode(2048, 0, Some(recent), ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1024)),
+            get_cycle_scan_mode(2048, recent, ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1024)),
             HealScanMode::Normal
         );
         assert_eq!(
-            get_cycle_scan_mode(2048, 0, Some(old), ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1024)),
+            get_cycle_scan_mode(2048, old, ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1024)),
             HealScanMode::Deep
         );
     });
@@ -11034,10 +11049,223 @@ fn test_get_cycle_scan_mode_respects_elapsed_bitrot_cycle() {
 fn test_get_cycle_scan_mode_can_disable_periodic_deep_scan() {
     with_var(ENV_SCANNER_BITROT_CYCLE_SECS, Some("off"), || {
         assert_eq!(
-            get_cycle_scan_mode(1, 0, None, ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1)),
+            get_cycle_scan_mode(1, ScannerBitrotStart::None, ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1)),
+            HealScanMode::Normal
+        );
+        assert_eq!(
+            get_cycle_scan_mode(
+                1,
+                ScannerBitrotStart::Anchor(Utc::now() - chrono::Duration::days(400)),
+                ScannerBitrotPolicy::new(bitrot_scan_cycle(), true, 1)
+            ),
             HealScanMode::Normal
         );
     });
+}
+
+#[test]
+fn scan_mode_without_recorded_bitrot_start_stays_normal_until_the_cycle_elapses() {
+    // Regression for rustfs/backlog#2905 (rustfs/rustfs#8015): a cycle that
+    // finds no recorded bitrot start (missing heal object, or a save that
+    // keeps failing) must not open a Deep window. Three consecutive cycles
+    // with the default `BackgroundHealInfo` used to run Deep through the
+    // selection window because `bitrot_start_cycle` defaults to 0.
+    let policy = ScannerBitrotPolicy::new(Some(Duration::from_secs(3600)), true, 1024);
+    let modes: Vec<_> = (1..=3)
+        .map(|cycle| get_cycle_scan_mode(cycle, ScannerBitrotStart::None, policy))
+        .collect();
+    assert_eq!(modes, vec![HealScanMode::Normal; 3]);
+
+    // An in-memory anchor counts the cadence without opening a selection
+    // window: Normal until the cycle elapses, Deep afterwards.
+    let anchored = ScannerBitrotStart::Anchor(Utc::now());
+    let modes: Vec<_> = (1..=3).map(|cycle| get_cycle_scan_mode(cycle, anchored, policy)).collect();
+    assert_eq!(modes, vec![HealScanMode::Normal; 3]);
+    assert_eq!(
+        get_cycle_scan_mode(4, ScannerBitrotStart::Anchor(Utc::now() - chrono::Duration::hours(2)), policy),
+        HealScanMode::Deep
+    );
+
+    // A recorded Deep window keeps its selection window, and an elapsed
+    // cadence still triggers the next window.
+    let started = Utc::now();
+    let window = ScannerBitrotStart::Window { cycle: 1, started };
+    assert_eq!(get_cycle_scan_mode(1, window, policy), HealScanMode::Deep);
+    assert_eq!(
+        get_cycle_scan_mode(
+            2048,
+            ScannerBitrotStart::Window {
+                cycle: 1,
+                started: started - chrono::Duration::hours(2),
+            },
+            policy
+        ),
+        HealScanMode::Deep
+    );
+    assert_eq!(get_cycle_scan_mode(2048, window, policy), HealScanMode::Normal);
+}
+
+#[test]
+#[serial]
+fn bitrot_cadence_anchor_is_remembered_in_memory_without_a_persisted_write() {
+    reset_bitrot_cadence_anchor_for_test();
+    let now = Utc::now();
+    let policy = ScannerBitrotPolicy::new(Some(Duration::from_secs(3600)), true, 1024);
+
+    // A Normal cycle without a recorded window writes nothing to storage ...
+    assert!(
+        background_heal_info_for_scan_start(BackgroundHealInfo::default(), 3, HealScanMode::Normal, now, policy).is_none(),
+        "a Normal cycle must not persist a start that would open a Deep window"
+    );
+
+    // ... but the process anchors the cadence at its first such cycle and
+    // keeps that anchor for later cycles.
+    let first = scanner_bitrot_start_for_cycle(&BackgroundHealInfo::default(), now);
+    assert_eq!(first, ScannerBitrotStart::Anchor(now));
+    let later = scanner_bitrot_start_for_cycle(&BackgroundHealInfo::default(), now + chrono::Duration::hours(2));
+    assert_eq!(later, ScannerBitrotStart::Anchor(now));
+    assert_eq!(get_cycle_scan_mode(4, later, policy), HealScanMode::Normal);
+
+    // A recorded window start takes precedence over the anchor.
+    let recorded = BackgroundHealInfo {
+        bitrot_start_time: Some(now),
+        bitrot_start_cycle: 7,
+        current_scan_mode: HealScanMode::Normal,
+    };
+    assert_eq!(
+        scanner_bitrot_start_for_cycle(&recorded, now),
+        ScannerBitrotStart::Window { cycle: 7, started: now }
+    );
+
+    // Once the cadence elapses on the anchor, the Deep cycle records the
+    // window start for persistence (and for the in-memory record).
+    let opened = background_heal_info_for_scan_start(BackgroundHealInfo::default(), 9, HealScanMode::Deep, now, policy)
+        .expect("opening a Deep window records its start");
+    assert_eq!(opened.bitrot_start_cycle, 9);
+    assert_eq!(opened.bitrot_start_time, Some(now));
+    assert_eq!(opened.current_scan_mode, HealScanMode::Deep);
+    reset_bitrot_cadence_anchor_for_test();
+}
+
+#[test]
+#[serial]
+fn bitrot_start_memory_record_outlives_a_skipped_persisted_save() {
+    reset_bitrot_cadence_anchor_for_test();
+    let now = Utc::now();
+    let policy = ScannerBitrotPolicy::new(Some(Duration::from_secs(3600)), true, 1024);
+    let recorded = BackgroundHealInfo {
+        bitrot_start_time: Some(now),
+        bitrot_start_cycle: 4,
+        current_scan_mode: HealScanMode::Normal,
+    };
+
+    // Storage never returned a start (missing object, or a save skipped
+    // without movement admission): the in-memory record keeps the cadence.
+    let (info, source) = resolve_background_heal_info(None, Some(&recorded));
+    assert_eq!(source, ScannerBitrotStartSource::Memory);
+    assert_eq!(info.bitrot_start_cycle, 4);
+    let start = scanner_bitrot_start_for_cycle(&info, now);
+    assert_eq!(start, ScannerBitrotStart::Window { cycle: 4, started: now });
+    assert_eq!(
+        get_cycle_scan_mode(5, start, policy),
+        HealScanMode::Deep,
+        "a remembered start keeps the Deep selection window it opened"
+    );
+    assert_eq!(
+        get_cycle_scan_mode(2048, start, policy),
+        HealScanMode::Normal,
+        "and stays Normal after the window until the cadence elapses"
+    );
+
+    // A persisted start wins ties and older in-memory records.
+    let stored = BackgroundHealInfo {
+        bitrot_start_time: Some(now),
+        bitrot_start_cycle: 4,
+        current_scan_mode: HealScanMode::Deep,
+    };
+    let (info, source) = resolve_background_heal_info(Some(&stored), Some(&recorded));
+    assert_eq!(source, ScannerBitrotStartSource::Persisted);
+    assert_eq!(info.current_scan_mode, HealScanMode::Deep);
+
+    // A newer in-memory start (a Deep window opened after the last
+    // successful save) wins over the stale persisted record.
+    let newer = BackgroundHealInfo {
+        bitrot_start_time: Some(now + chrono::Duration::seconds(1)),
+        bitrot_start_cycle: 9,
+        current_scan_mode: HealScanMode::Deep,
+    };
+    let (info, source) = resolve_background_heal_info(Some(&stored), Some(&newer));
+    assert_eq!(source, ScannerBitrotStartSource::Memory);
+    assert_eq!(info.bitrot_start_cycle, 9);
+
+    // Nothing recorded anywhere: the persisted record is used as-is, the
+    // source says so, and the cycle runs Normal instead of opening a window.
+    let legacy = BackgroundHealInfo {
+        bitrot_start_time: None,
+        bitrot_start_cycle: 0,
+        current_scan_mode: HealScanMode::Deep,
+    };
+    let (info, source) = resolve_background_heal_info(Some(&legacy), None);
+    assert_eq!(source, ScannerBitrotStartSource::None);
+    assert_eq!(info.current_scan_mode, HealScanMode::Deep);
+    let start = scanner_bitrot_start_for_cycle(&info, now);
+    assert_eq!(start, ScannerBitrotStart::Anchor(now));
+    assert_eq!(get_cycle_scan_mode(1, start, policy), HealScanMode::Normal);
+    reset_bitrot_cadence_anchor_for_test();
+}
+
+#[test]
+#[serial]
+fn scan_mode_status_reports_bitrot_start_source_and_topology_support() {
+    let now = Utc::now();
+    let info = BackgroundHealInfo {
+        bitrot_start_time: Some(now),
+        bitrot_start_cycle: 2,
+        current_scan_mode: HealScanMode::Normal,
+    };
+    record_scanner_bitrot_status(
+        scanner_bitrot_start_for_cycle(&info, now),
+        ScannerBitrotStartSource::Memory,
+        false,
+        HealScanMode::Normal,
+    );
+
+    let status = scanner_bitrot_status();
+    assert!(!status.deep_scan_supported);
+    assert_eq!(status.bitrot_start_source, ScannerBitrotStartSource::Memory);
+    assert_eq!(status.bitrot_start_source.as_str(), "memory");
+    assert_eq!(status.bitrot_start_kind, "deep_window");
+    assert_eq!(status.bitrot_start_cycle, 2);
+    assert_eq!(
+        status.bitrot_start_unix_secs,
+        u64::try_from(now.timestamp()).expect("current time is after the epoch")
+    );
+    assert_eq!(status.current_scan_mode, "normal");
+    let encoded = serde_json::to_value(status).expect("bitrot status serializes");
+    assert_eq!(encoded["bitrot_start_source"], "memory");
+    assert_eq!(encoded["deep_scan_supported"], false);
+
+    record_scanner_bitrot_status(ScannerBitrotStart::None, ScannerBitrotStartSource::None, true, HealScanMode::Deep);
+    let status = scanner_bitrot_status();
+    assert!(status.deep_scan_supported);
+    assert_eq!(status.bitrot_start_source, ScannerBitrotStartSource::None);
+    assert_eq!(status.bitrot_start_kind, "none");
+    assert_eq!(status.bitrot_start_unix_secs, 0);
+    assert_eq!(status.current_scan_mode, "deep");
+
+    record_scanner_bitrot_status(
+        ScannerBitrotStart::Anchor(now),
+        ScannerBitrotStartSource::Memory,
+        true,
+        HealScanMode::Normal,
+    );
+    let status = scanner_bitrot_status();
+    assert_eq!(status.bitrot_start_kind, "anchor");
+    assert_eq!(status.bitrot_start_cycle, 0);
+    assert_eq!(
+        status.bitrot_start_unix_secs,
+        u64::try_from(now.timestamp()).expect("current time is after the epoch")
+    );
 }
 
 #[test]
@@ -11046,10 +11274,18 @@ fn test_erasure_sd_does_not_enter_deep_scan_mode() {
     let cycle = Some(Duration::from_secs(3600));
 
     let unsupported_policy = ScannerBitrotPolicy::new(cycle, false, 1024);
-    assert_eq!(get_cycle_scan_mode(10, 10, Some(started), unsupported_policy), HealScanMode::Normal);
-    assert_eq!(get_cycle_scan_mode(11, 10, None, unsupported_policy), HealScanMode::Normal);
+    let window = ScannerBitrotStart::Window { cycle: 10, started };
+    assert_eq!(get_cycle_scan_mode(10, window, unsupported_policy), HealScanMode::Normal);
     assert_eq!(
-        get_cycle_scan_mode(10, 10, None, ScannerBitrotPolicy::new(Some(Duration::ZERO), false, 1024)),
+        get_cycle_scan_mode(11, ScannerBitrotStart::None, unsupported_policy),
+        HealScanMode::Normal
+    );
+    assert_eq!(
+        get_cycle_scan_mode(11, ScannerBitrotStart::Anchor(started), unsupported_policy),
+        HealScanMode::Normal
+    );
+    assert_eq!(
+        get_cycle_scan_mode(10, ScannerBitrotStart::None, ScannerBitrotPolicy::new(Some(Duration::ZERO), false, 1024)),
         HealScanMode::Normal
     );
 

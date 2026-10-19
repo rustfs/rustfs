@@ -310,6 +310,15 @@ the speed factor. On a single-disk deployment this is one walker, one bucket,
 one object at a time, at roughly one third duty cycle under the default
 speed. Walker count is therefore a property of topology, not of the work.
 
+Two later controls bound that walk per disk rather than per object.
+rustfs/rustfs#8389 added the local-disk foreground-priority admission gate,
+which orders scanner I/O behind foreground requests. rustfs/backlog#2905 added
+a per-disk token-bucket budget (operations and bytes per second, defaults by
+detected media) that `DynamicSleeper` charges before each directory listing
+and metadata read; it is a hard ceiling layered on admission and never lets
+the scanner exceed what admission allows. The operator view is in
+`docs/operations/scanner-runtime-controls.md`.
+
 A collector's pacer sets collector work from the mutator's rate under a
 resource ceiling. The scanner adopts the same shape:
 

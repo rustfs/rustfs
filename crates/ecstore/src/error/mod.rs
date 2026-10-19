@@ -264,6 +264,11 @@ pub enum StorageError {
     StorageFull,
     #[error("Please reduce your request rate")]
     SlowDown,
+    /// Delete recovery found a legacy residue it cannot classify. This is a
+    /// deterministic ambiguity that retrying cannot resolve; the object is
+    /// retained for operator inspection.
+    #[error("delete recovery found an ambiguous legacy residue; operator inspection is required")]
+    DeleteRecoveryLegacyAmbiguous,
     #[error("Decommission not started")]
     DecommissionNotStarted,
     #[error("Decommission already running")]
@@ -704,6 +709,7 @@ impl Clone for StorageError {
             StorageError::BucketExists(a) => StorageError::BucketExists(a.clone()),
             StorageError::StorageFull => StorageError::StorageFull,
             StorageError::SlowDown => StorageError::SlowDown,
+            StorageError::DeleteRecoveryLegacyAmbiguous => StorageError::DeleteRecoveryLegacyAmbiguous,
             StorageError::PrefixAccessDenied(a, b) => StorageError::PrefixAccessDenied(a.clone(), b.clone()),
             StorageError::InvalidUploadIDKeyCombination(a, b) => {
                 StorageError::InvalidUploadIDKeyCombination(a.clone(), b.clone())
@@ -845,6 +851,7 @@ impl StorageError {
             StorageError::BucketExists(_) => StorageErrorCode::BucketExists,
             StorageError::StorageFull => StorageErrorCode::StorageFull,
             StorageError::SlowDown => StorageErrorCode::SlowDown,
+            StorageError::DeleteRecoveryLegacyAmbiguous => StorageErrorCode::DeleteRecoveryLegacyAmbiguous,
             StorageError::PrefixAccessDenied(_, _) => StorageErrorCode::PrefixAccessDenied,
             StorageError::InvalidUploadIDKeyCombination(_, _) => StorageErrorCode::InvalidUploadIDKeyCombination,
             StorageError::MalformedUploadID(_) => StorageErrorCode::MalformedUploadID,
@@ -950,6 +957,7 @@ impl StorageError {
             StorageErrorCode::BucketExists => Some(StorageError::BucketExists(Default::default())),
             StorageErrorCode::StorageFull => Some(StorageError::StorageFull),
             StorageErrorCode::SlowDown => Some(StorageError::SlowDown),
+            StorageErrorCode::DeleteRecoveryLegacyAmbiguous => Some(StorageError::DeleteRecoveryLegacyAmbiguous),
             StorageErrorCode::PrefixAccessDenied => {
                 Some(StorageError::PrefixAccessDenied(Default::default(), Default::default()))
             }

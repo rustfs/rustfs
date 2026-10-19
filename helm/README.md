@@ -177,6 +177,8 @@ behavior.
 | config.rustfs.scanner.max_concurrent_set_scans | string | `""` | Cap concurrent scanner set tasks with `RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS` (`0` keeps topology-derived concurrency). |
 | config.rustfs.scanner.max_concurrent_disk_scans | string | `""` | Cap concurrent scanner disk bucket walks per set with `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` (`0` keeps disk-count-derived concurrency). |
 | config.rustfs.scanner.walkers_per_disk | string | `""` | Bucket walkers per local disk with `RUSTFS_SCANNER_WALKERS_PER_DISK` (`1` to `16`; the default `1` keeps one bucket walk per disk, raise it on flash so one disk walks several buckets concurrently). |
+| config.rustfs.scanner.disk_io_budget_iops | string | `""` | Per-local-disk ceiling on scanner metadata operations per second with `RUSTFS_SCANNER_DISK_IO_BUDGET_IOPS` (`auto` picks the media default, `off` removes the cap, a number is an explicit rate). |
+| config.rustfs.scanner.disk_io_budget_bytes_per_sec | string | `""` | Per-local-disk ceiling on scanner metadata bytes per second with `RUSTFS_SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC` (`auto` picks the media default, `off` removes the cap, a number is an explicit rate). |
 | config.rustfs.scanner.yield_every_n_objects | string | `""` | Yield to the async runtime every N scanned objects with `RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS` (`0` disables extra yield). |
 | config.rustfs.scanner.alert_excess_versions | string | `""` | Set version count threshold for scanner alerts with `RUSTFS_SCANNER_ALERT_EXCESS_VERSIONS`. |
 | config.rustfs.scanner.alert_excess_version_size | string | `""` | Set retained version byte threshold for scanner alerts with `RUSTFS_SCANNER_ALERT_EXCESS_VERSION_SIZE`. |

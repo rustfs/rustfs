@@ -1398,6 +1398,9 @@ pub(crate) struct ReplacementRecoveryStatusResponse {
     pub path: String,
     pub scope: &'static str,
     pub local: rustfs_heal::ReplacementRecoverySnapshot,
+    /// Generations this node's discovery could not verify or resolve, with
+    /// reasons. Node-local and additive; it is not part of the peer merge.
+    pub local_blocked: Vec<rustfs_heal::ReplacementRecoveryBlock>,
     pub cluster: ReplacementRecoveryClusterStatus,
 }
 
@@ -1411,6 +1414,7 @@ pub(crate) struct ReplacementRecoveryClusterStatus {
 
 fn build_replacement_recovery_status_response(
     local: rustfs_heal::ReplacementRecoverySnapshot,
+    local_blocked: Vec<rustfs_heal::ReplacementRecoveryBlock>,
     cluster: ReplacementRecoveryClusterStatus,
 ) -> ReplacementRecoveryStatusResponse {
     ReplacementRecoveryStatusResponse {
@@ -1418,6 +1422,7 @@ fn build_replacement_recovery_status_response(
         path: format!("{}{}", ADMIN_PREFIX, REPLACEMENT_RECOVERY_STATUS_ROUTE_SUFFIX),
         scope: "cluster_survivor_disks",
         local,
+        local_blocked,
         cluster,
     }
 }
@@ -1918,7 +1923,8 @@ impl Operation for ReplacementRecoveryStatusHandler {
         let local = rustfs_heal::current_replacement_recovery_snapshot().await;
         let cluster =
             read_cluster_replacement_recovery_status(local.clone(), notification_system.as_deref(), expected_nodes).await?;
-        let response = build_replacement_recovery_status_response(local, cluster);
+        let local_blocked = rustfs_heal::current_replacement_recovery_blocks();
+        let response = build_replacement_recovery_status_response(local, local_blocked, cluster);
         let body = encode_replacement_recovery_status(&response)?;
         info!(
             event = EVENT_ADMIN_RESPONSE_EMITTED,
@@ -2361,7 +2367,7 @@ mod tests {
     fn replacement_recovery_status_response_reports_cluster_proof() {
         let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
         let cluster = aggregate_replacement_recovery_cluster_status(vec![local.clone()], Vec::new(), 1, true);
-        let response = build_replacement_recovery_status_response(local, cluster);
+        let response = build_replacement_recovery_status_response(local, Vec::new(), cluster);
         let value = serde_json::to_value(response).expect("replacement status response should serialize");
 
         assert_eq!(value["contractVersion"], 2);
@@ -2369,6 +2375,7 @@ mod tests {
         assert_eq!(value["scope"], "cluster_survivor_disks");
         assert_eq!(value["local"]["definitive"], true);
         assert_eq!(value["local"]["records"][0]["state"], "completed");
+        assert_eq!(value["localBlocked"], serde_json::json!([]));
         assert_eq!(value["cluster"]["definitive"], true);
         assert!(value["cluster"]["reason"].is_null());
         assert_eq!(value["cluster"]["records"][0]["state"], "completed");

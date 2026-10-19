@@ -3616,8 +3616,8 @@ impl SetDisks {
                     None,
                 ));
             }
-            if recovery.pending > 0 || recovery.blocked > 0 {
-                return Err(StorageError::SlowDown);
+            if let Some(error) = recovery.unresolved_heal_error() {
+                return Err(error);
             }
         }
 

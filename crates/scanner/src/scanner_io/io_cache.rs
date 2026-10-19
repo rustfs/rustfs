@@ -894,10 +894,10 @@ impl ScannerIOCache for SetDisks {
                                         event = EVENT_SCANNER_DISK_BUCKET_STATE,
                                         component = LOG_COMPONENT_SCANNER,
                                         subsystem = LOG_SUBSYSTEM_IO,
-                                        bucket = %bucket.name,
                                         state = "remote_zero_progress_requeued",
+                                        bucket = %bucket.name,
                                         error = %e,
-                                        "Remote scanner requeued bucket rejected before execution"
+                                        "Remote scanner requeued bucket work"
                                     );
                                     break;
                                 }
@@ -1031,7 +1031,7 @@ impl ScannerIOCache for SetDisks {
                     };
                     // Lack of an authoritative legacy identity disables the new
                     // checkpoint protocol; the existing full rebuild remains available.
-                    let checkpoint_identity = scanner_bucket_checkpoint_identity(
+                    let checkpoint_identity = match scanner_bucket_checkpoint_identity(
                         &store_clone_clone,
                         &bucket.name,
                         expected_publication_epoch_clone,
@@ -1039,7 +1039,28 @@ impl ScannerIOCache for SetDisks {
                         scan_mode,
                     )
                     .await
-                    .ok();
+                    {
+                        Ok(identity) => identity,
+                        Err(error) => {
+                            record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
+                            warn!(
+                                target: "rustfs::scanner::io",
+                                event = EVENT_SCANNER_DISK_BUCKET_STATE,
+                                component = LOG_COMPONENT_SCANNER,
+                                subsystem = LOG_SUBSYSTEM_IO,
+                                state = "checkpoint_identity_unavailable",
+                                stage = "admission",
+                                bucket = %bucket.name,
+                                pool = source.pool_index,
+                                set = source.set_index,
+                                cycle = want_cycle,
+                                leader_epoch,
+                                error = %error,
+                                "Scanner retained the bucket checkpoint after an identity lookup failure"
+                            );
+                            continue;
+                        }
+                    };
                     let scan_state = current_cache_root_or_prepare_with_generation(
                         &mut cache,
                         &bucket.name,
@@ -1260,8 +1281,8 @@ impl ScannerIOCache for SetDisks {
                             }
                         }
                     };
-                    if let Some(expected) = checkpoint_identity
-                        && scanner_bucket_checkpoint_identity(
+                    if let Some(expected) = checkpoint_identity {
+                        let current_identity = match scanner_bucket_checkpoint_identity(
                             &store_clone_clone,
                             &bucket.name,
                             expected_publication_epoch_clone,
@@ -1269,11 +1290,46 @@ impl ScannerIOCache for SetDisks {
                             scan_mode,
                         )
                         .await
-                        .ok()
-                            != Some(expected)
-                    {
-                        record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
-                        continue;
+                        {
+                            Ok(identity) => identity,
+                            Err(error) => {
+                                record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
+                                warn!(
+                                    target: "rustfs::scanner::io",
+                                    event = EVENT_SCANNER_DISK_BUCKET_STATE,
+                                    component = LOG_COMPONENT_SCANNER,
+                                    subsystem = LOG_SUBSYSTEM_IO,
+                                    state = "checkpoint_identity_unavailable",
+                                    stage = "post_scan",
+                                    bucket = %bucket.name,
+                                    pool = source.pool_index,
+                                    set = source.set_index,
+                                    cycle = want_cycle,
+                                    leader_epoch,
+                                    error = %error,
+                                    "Scanner could not verify the bucket identity before persistence"
+                                );
+                                continue;
+                            }
+                        };
+                        if current_identity != Some(expected) {
+                            record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
+                            warn!(
+                                target: "rustfs::scanner::io",
+                                event = EVENT_SCANNER_DISK_BUCKET_STATE,
+                                component = LOG_COMPONENT_SCANNER,
+                                subsystem = LOG_SUBSYSTEM_IO,
+                                state = "checkpoint_identity_changed",
+                                stage = "post_scan",
+                                bucket = %bucket.name,
+                                pool = source.pool_index,
+                                set = source.set_index,
+                                cycle = want_cycle,
+                                leader_epoch,
+                                "Scanner rejected the bucket result after an identity change"
+                            );
+                            continue;
+                        }
                     }
                     let scan_outcome = match scan_result {
                         Ok(scan_outcome) => scan_outcome,
