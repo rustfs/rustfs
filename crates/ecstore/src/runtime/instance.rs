@@ -217,6 +217,10 @@ pub struct InstanceContext {
     /// Readers are held across one publication commit; movement transitions
     /// take the writer at their durable state commit boundary.
     data_movement_operation_gate: Arc<RwLock<()>>,
+    /// Set while an operator decommission start runs on this instance. A
+    /// start runs detached from its caller, so this keeps abandoned requests
+    /// and their retries from stacking concurrent starts and preflight heals.
+    decommission_start_in_flight: AtomicBool,
     /// Remote scanner publication leases own a read guard until explicit
     /// release or bounded expiry.  Keeping the guard in storage-owned state
     /// makes a remote movement transition wait on the same fence as a local
@@ -290,6 +294,7 @@ impl InstanceContext {
             bucket_metadata_sys: std::sync::Mutex::new(None),
             background_cancel_token: OnceLock::new(),
             data_movement_operation_gate: Arc::new(RwLock::new(())),
+            decommission_start_in_flight: AtomicBool::new(false),
             scanner_publication_leases: Arc::new(Mutex::new(HashMap::new())),
             data_movement_operation_epoch: AtomicU64::new(0),
             data_movement_operation_epoch_exhausted: AtomicBool::new(false),
@@ -347,6 +352,18 @@ impl InstanceContext {
 
     pub(crate) fn data_movement_operation_gate(&self) -> Arc<RwLock<()>> {
         Arc::clone(&self.data_movement_operation_gate)
+    }
+
+    /// Claim the single decommission start slot; `false` when a start is
+    /// already running. Release it with [`Self::end_decommission_start`].
+    pub(crate) fn try_begin_decommission_start(&self) -> bool {
+        self.decommission_start_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn end_decommission_start(&self) {
+        self.decommission_start_in_flight.store(false, Ordering::Release);
     }
 
     pub(crate) async fn install_scanner_publication_lease(
