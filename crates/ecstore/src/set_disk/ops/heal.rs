@@ -8297,6 +8297,375 @@ mod heal_result_report_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn native_marker_and_batch_delete_fence_preserves_acknowledged_version_set() {
+        use crate::object_api::{ShardIntegrityWriteMode, WriteCompletion};
+        use crate::storage_api_contracts::object::ObjectToDelete;
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        for (disk_count, parity) in [(4, 2), (16, 4)] {
+            for mutation in ["create-marker", "delete-marker", "batch-version-delete", "unversioned-delete"] {
+                let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(disk_count, 0, parity).await;
+                let bucket = format!("marker-fence-{mutation}-{disk_count}");
+                let object = "object.bin";
+                let versioned = mutation != "unversioned-delete";
+                set.make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        versioning_enabled: versioned,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create isolated marker fence bucket");
+                let options = ObjectOptions {
+                    versioned,
+                    write_completion: WriteCompletion::TailDrained,
+                    shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
+                    object_lock_config_snapshot: Some(Arc::new(crate::set_disk::ObjectLockConfigSnapshot::new(
+                        crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                };
+                let mut versions = Vec::new();
+                for byte in if versioned { vec![0x51, 0x62, 0x73] } else { vec![0x51] } {
+                    let body = vec![byte; 1024 * 1024 + 123];
+                    let info = set
+                        .put_object(&bucket, object, &mut PutObjReader::from_vec(body.clone()), &options)
+                        .await
+                        .expect("ACK complete original external version");
+                    let version = info.version_id.unwrap_or(Uuid::nil());
+                    assert_eq!(!version.is_nil(), versioned);
+                    let meta = disks[0]
+                        .read_version("", &bucket, object, &version.to_string(), &ReadOptions::default())
+                        .await
+                        .expect("read independent acknowledged metadata");
+                    assert!(meta.data.is_none());
+                    let data_dir = meta.data_dir.expect("external data generation");
+                    let mut parts = Vec::new();
+                    for dir in &dirs {
+                        parts.push(
+                            tokio::fs::read(
+                                dir.path()
+                                    .join(&bucket)
+                                    .join(object)
+                                    .join(data_dir.to_string())
+                                    .join("part.1"),
+                            )
+                            .await
+                            .expect("full encoded original shard after ACK"),
+                        );
+                    }
+                    versions.push(VersionCommitFixture {
+                        version,
+                        data_dir,
+                        body,
+                        parts,
+                    });
+                }
+                let mut marker = None;
+                if mutation == "delete-marker" {
+                    marker = Some(
+                        set.delete_object(&bucket, object, options.clone())
+                            .await
+                            .expect("ACK original current marker")
+                            .version_id
+                            .expect("real marker identity"),
+                    );
+                }
+                let selected = versions[0].version;
+                let missing = dirs[0]
+                    .path()
+                    .join(&bucket)
+                    .join(object)
+                    .join(versions[0].data_dir.to_string())
+                    .join("part.1");
+                tokio::fs::remove_file(&missing)
+                    .await
+                    .expect("remove selected original data shard");
+                let (_pause, arrived, release) = ReadRepairPauseScope::install(&bucket, object);
+                let heal_set = set.clone();
+                let heal_bucket = bucket.clone();
+                let heal = tokio::spawn(async move {
+                    heal_set
+                        .heal_object(
+                            &heal_bucket,
+                            object,
+                            &selected.to_string(),
+                            &HealOpts {
+                                scan_mode: HealScanMode::Deep,
+                                read_repair: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(30), arrived.notified())
+                    .await
+                    .expect("real original reconstruction pauses before final metadata rename");
+                assert!(!heal.is_finished() && !missing.exists());
+                println!(
+                    "native_g04: geometry={disk_count}/{parity} mutation={mutation} reconstruction_paused_before_final_rename"
+                );
+                let mut removed = Vec::new();
+                match mutation {
+                    "create-marker" => {
+                        marker = Some(
+                            set.delete_object(&bucket, object, options.clone())
+                                .await
+                                .expect("ACK marker creation before stale Heal resumes")
+                                .version_id
+                                .expect("new marker identity"),
+                        );
+                    }
+                    "delete-marker" => {
+                        let version = marker.expect("fixture marker identity");
+                        let ack = set
+                            .delete_object(
+                                &bucket,
+                                object,
+                                ObjectOptions {
+                                    version_id: Some(version.to_string()),
+                                    ..options.clone()
+                                },
+                            )
+                            .await
+                            .expect("ACK exact current marker removal before stale Heal resumes");
+                        assert_eq!(ack.version_id, Some(version));
+                    }
+                    "batch-version-delete" => {
+                        removed.extend([versions[0].version, versions[1].version]);
+                        let requests = removed
+                            .iter()
+                            .map(|version| ObjectToDelete {
+                                object_name: object.to_owned(),
+                                version_id: Some(*version),
+                                ..Default::default()
+                            })
+                            .collect();
+                        let (deleted, errors) = set.delete_objects(&bucket, requests, options.clone()).await;
+                        assert_eq!(deleted.len(), removed.len());
+                        assert_eq!(errors.len(), removed.len());
+                        for ((ack, error), version) in deleted.iter().zip(&errors).zip(&removed) {
+                            assert!(error.is_none(), "every batch item must ACK separately: {error:?}");
+                            assert_eq!(ack.object_name, object);
+                            assert_eq!(ack.version_id, Some(*version));
+                            assert!(!ack.delete_marker);
+                        }
+                    }
+                    "unversioned-delete" => {
+                        set.delete_object(&bucket, object, options.clone())
+                            .await
+                            .expect("ACK unversioned delete");
+                        removed.push(selected);
+                    }
+                    _ => unreachable!(),
+                }
+                if let Some(marker) = marker {
+                    assert!(
+                        !marker.is_nil() && versions.iter().all(|version| version.version != marker),
+                        "marker ACK must have its own real version identity"
+                    );
+                }
+                // Drain the actual foreground metadata/cleanup tail under this
+                // key's write fence before releasing the older reconstruction.
+                let namespace = set.new_ns_lock(&bucket, object).await.expect("foreground drain fence");
+                let drained = namespace
+                    .get_write_lock(Duration::from_secs(30))
+                    .await
+                    .expect("foreground tail drains");
+                let mut committed = Vec::new();
+                for dir in &dirs {
+                    let metadata = dir.path().join(&bucket).join(object).join(STORAGE_FORMAT_FILE);
+                    committed.push(match tokio::fs::read(metadata).await {
+                        Ok(bytes) => Some(bytes),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !versioned => None,
+                        Err(error) => panic!("foreground metadata cannot be read: {error}"),
+                    });
+                    for version in &versions {
+                        if removed.contains(&version.version) {
+                            assert!(
+                                !dir.path()
+                                    .join(&bucket)
+                                    .join(object)
+                                    .join(version.data_dir.to_string())
+                                    .exists()
+                            );
+                        }
+                    }
+                }
+                drop(drained);
+                assert!(!heal.is_finished());
+                println!(
+                    "native_g04: geometry={disk_count}/{parity} mutation={mutation} exact_foreground_acks_and_physical_tail_verified_before_release"
+                );
+                release.notify_one();
+                let outcome = tokio::time::timeout(Duration::from_secs(30), heal)
+                    .await
+                    .expect("stale Heal leaves the released fence")
+                    .expect("Heal task joins");
+                if removed.contains(&selected) {
+                    assert!(
+                        matches!(outcome, Err(DiskError::FileVersionNotFound)),
+                        "deleted target must remain typed absent: {outcome:?}"
+                    );
+                } else {
+                    assert!(outcome.expect("surviving explicit data version remains healable").1.is_none());
+                }
+                let mut expected_versions: std::collections::HashSet<_> = versions
+                    .iter()
+                    .filter(|version| !removed.contains(&version.version))
+                    .map(|version| Some(version.version))
+                    .collect();
+                if mutation == "create-marker" {
+                    expected_versions.insert(marker);
+                }
+                for (slot, dir) in dirs.iter().enumerate() {
+                    let metadata = dir.path().join(&bucket).join(object).join(STORAGE_FORMAT_FILE);
+                    if !expected_versions.is_empty() {
+                        let mut decoded = rustfs_filemeta::FileMeta::default();
+                        decoded
+                            .unmarshal_msg(&tokio::fs::read(&metadata).await.expect("complete physical metadata"))
+                            .expect("decode final version inventory independently");
+                        assert_eq!(
+                            decoded.versions.len(),
+                            expected_versions.len(),
+                            "no duplicate or invented physical versions"
+                        );
+                        let actual: std::collections::HashSet<_> =
+                            decoded.versions.iter().map(|version| version.header.version_id).collect();
+                        assert_eq!(actual, expected_versions, "exact data and marker version set on every member");
+                    }
+                    if removed.contains(&selected) || slot != 0 {
+                        let after = tokio::fs::read(&metadata).await;
+                        if let Some(expected) = &committed[slot] {
+                            assert_eq!(&after.expect("committed metadata survives"), expected);
+                        } else {
+                            assert_eq!(
+                                after.expect_err("deleted unversioned metadata must not resurrect").kind(),
+                                std::io::ErrorKind::NotFound
+                            );
+                        }
+                    }
+                    if let Some(marker) = marker {
+                        let observed = disks[slot]
+                            .read_version("", &bucket, object, &marker.to_string(), &ReadOptions::default())
+                            .await;
+                        if mutation == "create-marker" {
+                            let info = observed.expect("new marker survives on every disk");
+                            assert!(info.deleted);
+                            assert_eq!(info.version_id, Some(marker));
+                            let current = disks[slot]
+                                .read_version("", &bucket, object, "", &ReadOptions::default())
+                                .await
+                                .expect("read current marker");
+                            assert!(current.deleted);
+                            assert_eq!(current.version_id, Some(marker));
+                        } else {
+                            assert!(matches!(observed, Err(DiskError::FileVersionNotFound)));
+                        }
+                    }
+                    for version in &versions {
+                        let observed = disks[slot]
+                            .read_version("", &bucket, object, &version.version.to_string(), &ReadOptions::default())
+                            .await;
+                        let part = dir
+                            .path()
+                            .join(&bucket)
+                            .join(object)
+                            .join(version.data_dir.to_string())
+                            .join("part.1");
+                        if removed.contains(&version.version) {
+                            assert!(observed.is_err());
+                            assert!(!part.parent().unwrap().exists(), "deleted data directory must not resurrect");
+                        } else {
+                            assert_eq!(observed.expect("surviving exact version").data_dir, Some(version.data_dir));
+                            assert_eq!(tokio::fs::read(part).await.expect("surviving part before any GET"), version.parts[slot]);
+                        }
+                    }
+                }
+                for version in &versions {
+                    if removed.contains(&version.version) {
+                        continue;
+                    }
+                    let mut reader = set
+                        .get_object_reader(
+                            &bucket,
+                            object,
+                            None,
+                            Default::default(),
+                            &ObjectOptions {
+                                versioned,
+                                version_id: Some(version.version.to_string()),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("read exact surviving original version");
+                    let mut body = Vec::new();
+                    reader.read_to_end(&mut body).await.expect("complete surviving body");
+                    assert_eq!(body, version.body);
+                }
+                if mutation == "create-marker" {
+                    // The storage info API exposes marker identity to its S3
+                    // caller; it must not substitute the previous live data.
+                    let current = set
+                        .get_object_info(
+                            &bucket,
+                            object,
+                            &ObjectOptions {
+                                versioned,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("current storage info retains marker identity");
+                    assert!(current.delete_marker && current.is_latest);
+                    assert_eq!(current.version_id, marker);
+                } else if !versioned {
+                    let absent = set
+                        .get_object_info(
+                            &bucket,
+                            object,
+                            &ObjectOptions {
+                                versioned,
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    assert!(
+                        matches!(absent, Err(Error::ObjectNotFound(_, _))),
+                        "current deleted object must remain typed absent: {absent:?}"
+                    );
+                } else {
+                    let expected = versions.last().expect("surviving current version");
+                    let mut reader = set
+                        .get_object_reader(
+                            &bucket,
+                            object,
+                            None,
+                            Default::default(),
+                            &ObjectOptions {
+                                versioned,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("current read after marker or batch deletion");
+                    assert_eq!(reader.object_info.version_id, Some(expected.version));
+                    let mut body = Vec::new();
+                    reader.read_to_end(&mut body).await.expect("full current body");
+                    assert_eq!(body, expected.body);
+                }
+                println!(
+                    "native_g04: geometry={disk_count}/{parity} mutation={mutation} marker_set_deleted_directories_surviving_shards_and_full_bodies_verified"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn read_repair_commit_aborts_when_object_changes_before_final_rename() {
         let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
         let bucket = "read-repair-stale-commit";
