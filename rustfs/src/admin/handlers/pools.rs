@@ -344,14 +344,24 @@ fn decommission_start_api_error(err: crate::storage_api::error::StorageError) ->
             source: Some(Box::new(err)),
         };
     }
+    // Keep the reason: a start rejected because another one is running
+    // should say so, not just "Invalid Request".
+    if matches!(err, crate::storage_api::error::StorageError::DecommissionAlreadyRunning) {
+        return ApiError {
+            code: S3ErrorCode::InvalidRequest,
+            message: err.to_string(),
+            source: Some(Box::new(err)),
+        };
+    }
     ApiError::from(err)
 }
 
 /// The leader-local pre-check refreshes rebalance metadata before the start.
-/// A busy gate there is the same retryable 503 the start itself reports;
-/// any other refresh failure stays an internal error.
+/// A busy gate there is the same retryable 503 the start itself reports, and
+/// a start already running is the same rejection; any other refresh failure
+/// stays an internal error.
 fn decommission_start_rebalance_refresh_error(err: crate::storage_api::error::StorageError, pools_indices: &[usize]) -> S3Error {
-    if is_lock_timeout(&err) {
+    if is_lock_timeout(&err) || matches!(err, crate::storage_api::error::StorageError::DecommissionAlreadyRunning) {
         S3Error::from(contextualize_admin_pool_api_error(
             decommission_start_api_error(err),
             "start decommission",
@@ -1322,6 +1332,17 @@ mod pools_handler_tests {
             busy.headers().and_then(|headers| headers.get(http::header::RETRY_AFTER)),
             Some(&http::HeaderValue::from_static("1")),
             "a busy gate is advertised as retryable"
+        );
+
+        let running =
+            decommission_start_rebalance_refresh_error(crate::storage_api::error::StorageError::DecommissionAlreadyRunning, &[0]);
+        assert_eq!(running.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert!(
+            running
+                .message()
+                .is_some_and(|message| message.contains("pools [0]") && message.contains("already running")),
+            "{:?}",
+            running.message()
         );
 
         let failed = decommission_start_rebalance_refresh_error(
