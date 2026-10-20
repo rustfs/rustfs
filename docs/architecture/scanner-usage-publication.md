@@ -358,7 +358,11 @@ An unlimited walk budget can also leave a retryable authoritative publication
 waiting for leadership loss or a successful proof. Observational and
 authoritative publication both retain the movement fence, on this node and
 through the remote publication leases. Do not remove those fences to clear a
-status. Verify
+status. A lease-scoped target operation (validation, rename, or delete on the
+leasing node) shares the read admission the lease already holds rather than
+queueing a new read on the movement gate. The gate is write-preferring, so a
+new read would wait behind a movement writer that is itself waiting for the
+lease, and neither would progress until the lease expired (rustfs/backlog#2873). Verify
 that a deployment contains the relevant fixes by commit ancestry; a newer
 release name alone is not evidence that it includes current main.
 

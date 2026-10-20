@@ -1236,7 +1236,10 @@ impl ECStore {
     /// the complete rename/write operation.  A lease token is process-owned;
     /// restart, expiry, generation changes, or blocked movement all reject it
     /// before the target disk is touched.
-    pub async fn acquire_scanner_publication_lease_guard(&self, token: Uuid) -> Result<tokio::sync::OwnedRwLockReadGuard<()>> {
+    pub async fn acquire_scanner_publication_lease_guard(
+        &self,
+        token: Uuid,
+    ) -> Result<Arc<tokio::sync::OwnedRwLockReadGuard<()>>> {
         self.acquire_scanner_publication_lease_guard_with_target(
             token,
             None,
@@ -1251,7 +1254,7 @@ impl ECStore {
         token: Uuid,
         volume: &str,
         path: &str,
-    ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>> {
+    ) -> Result<Arc<tokio::sync::OwnedRwLockReadGuard<()>>> {
         let target = format!(
             "{}/{}",
             crate::disk::BUCKET_META_PREFIX,
@@ -1268,18 +1271,24 @@ impl ECStore {
         observed_target: Option<(&str, &str)>,
         validation_only: bool,
         expected_purpose: Option<ScannerPublicationLeasePurpose>,
-    ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>> {
-        let operation_gate = self.ctx.data_movement_operation_gate();
-        let operation_guard = operation_gate.read_owned().await;
+    ) -> Result<Arc<tokio::sync::OwnedRwLockReadGuard<()>>> {
+        // Share the read admission the lease already holds instead of queueing
+        // a new read. A movement writer may already be waiting for this very
+        // lease; on the write-preferring gate a new read would queue behind
+        // that writer, so the coordinator could not finish the publication
+        // that releases the lease and both would stall until lease expiry.
+        // The shared admission has kept movement writers out since the grant
+        // and outlives a release or expiry until the caller drops it.
+        let Some((lease_generation, _, purpose, operation_guard)) = self.ctx.scanner_publication_lease_admission(token).await
+        else {
+            return Err(Error::other("scanner publication lease is unknown or expired"));
+        };
         if self.ctx.data_movement_generation_exhausted() || self.ctx.data_movement_operation_epoch_exhausted() {
             return Err(Error::other("scanner publication lease generation is exhausted"));
         }
         if self.scanner_data_movement_snapshot_locked().await.1 {
             return Err(Error::other("scanner publication lease is blocked by data movement"));
         }
-        let Some((lease_generation, _, purpose)) = self.ctx.scanner_publication_lease_generations(token).await else {
-            return Err(Error::other("scanner publication lease is unknown or expired"));
-        };
         if expected_purpose.is_some_and(|expected| expected != purpose) {
             return Err(Error::other("scanner publication lease purpose does not match its request"));
         }
@@ -2668,6 +2677,54 @@ mod tests {
             "an expired lease must not validate after its read guard is released"
         );
         assert!(!store.release_scanner_publication_lease(expiring_token).await);
+    }
+
+    #[tokio::test]
+    async fn lease_scoped_target_admission_does_not_queue_behind_a_waiting_movement_writer() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let (token, generation) = store
+            .acquire_scanner_publication_lease(0, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL)
+            .await
+            .expect("an idle store should grant a publication lease");
+
+        // A decommission start or a status refresh queues a movement writer
+        // behind the lease's read admission.
+        let gate = store.ctx.data_movement_operation_gate();
+        let mut movement_writer = tokio::spawn(gate.clone().write_owned());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            // A queued writer claims every spare permit, so reads stop succeeding.
+            while gate.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the movement writer should queue behind the lease");
+
+        // The coordinator's validation and target rename for that lease must
+        // proceed; otherwise neither side progresses until the lease expires.
+        tokio::time::timeout(Duration::from_secs(5), store.validate_scanner_publication_lease(token, generation))
+            .await
+            .expect("lease validation must not queue behind the writer waiting for that lease")
+            .expect("a live lease validates");
+        let rename_guard = tokio::time::timeout(
+            Duration::from_secs(5),
+            store.acquire_scanner_publication_lease_guard_for_rename(token, RUSTFS_META_BUCKET, "buckets/.usage.v2.json"),
+        )
+        .await
+        .expect("a lease-scoped rename must not queue behind the writer waiting for that lease")
+        .expect("a live lease admits its target rename");
+
+        assert!(store.release_scanner_publication_lease(token).await);
+        tokio::task::yield_now().await;
+        assert!(
+            !movement_writer.is_finished(),
+            "the target rename keeps movement out after the lease is released"
+        );
+        drop(rename_guard);
+        tokio::time::timeout(Duration::from_secs(5), &mut movement_writer)
+            .await
+            .expect("the movement writer should proceed once the rename finishes")
+            .expect("movement writer task should not panic");
     }
 
     #[tokio::test]

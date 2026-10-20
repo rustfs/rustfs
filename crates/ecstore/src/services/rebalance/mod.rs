@@ -40,6 +40,8 @@ pub(crate) const REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX: &str = "deferre
 const REBALANCE_CLEANUP_WARNING_ENTRY_LIMIT: usize = 10;
 
 mod control;
+#[cfg(test)]
+pub(crate) use control::{REBALANCE_REFRESH_ACTIVATION_GATE, REBALANCE_REFRESH_MOVEMENT_GATE, REBALANCE_REFRESH_START_GATE};
 mod entry;
 mod meta;
 mod migration;
@@ -98,6 +100,17 @@ pub(crate) async fn test_two_pool_stores(
     std::sync::Arc<crate::store::ECStore>,
 ) {
     test_pool_stores_with_contexts(rebalance_meta, false, 2, 2).await
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) async fn test_three_pool_stores(
+    rebalance_meta: Option<RebalanceMeta>,
+) -> (
+    Vec<tempfile::TempDir>,
+    std::sync::Arc<crate::store::ECStore>,
+    std::sync::Arc<crate::store::ECStore>,
+) {
+    test_pool_stores_with_contexts(rebalance_meta, false, 3, 2).await
 }
 
 #[cfg(test)]

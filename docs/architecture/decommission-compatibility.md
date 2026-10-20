@@ -24,7 +24,7 @@ Deterministic request rejections (unsupported single-pool operations, missing or
 
 The local-leader-prefix rule keeps the active worker on the leader for the pool being moved while still allowing a request to contain later targets whose leaders are different nodes. Later queued targets are recovered or promoted by the leader that owns that target.
 
-Start, cancel (`POST /v3/pools/cancel`), and clear (`POST /v3/pools/clear`) requests may arrive on any cluster node. When the target pool's first endpoint is remote, RustFS forwards the operation over the authenticated internode RPC channel to that endpoint; the receiving node still enforces the local-leader rule before mutating decommission state.
+Start, cancel (`POST /v3/pools/cancel`), and clear (`POST /v3/pools/clear`) requests may arrive on any cluster node. When the target pool's first endpoint is remote, RustFS forwards the operation over the authenticated internode RPC channel to that endpoint; the receiving node still enforces the local-leader rule before mutating decommission state. On the leader a start runs in its own task (`ECStore::decommission`), so a caller that stops waiting, such as a forwarding node whose RPC timed out, only loses the answer: the start cannot stop between recording the pool as active in `pool.bin` and having the peers reload and the local worker start, or rolling back. One start runs per leader at a time; another start is rejected as already running until it finishes. These guarantees need the leader to run a release that includes them.
 
 ### Persisted Metadata Shape
 

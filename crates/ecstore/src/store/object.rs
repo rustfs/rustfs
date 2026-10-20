@@ -1956,7 +1956,20 @@ fn version_aware_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptio
 }
 
 fn data_movement_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptions {
-    writer_pool_lookup_opts(opts, no_lock)
+    let mut lookup_opts = writer_pool_lookup_opts(opts, no_lock);
+    // A moved null version still joins the pool that holds the object's latest
+    // version. A later null-slot overwrite is routed there and must replace it
+    // in place rather than leave a second null version in another pool.
+    if opts
+        .version_id
+        .as_deref()
+        .and_then(|version_id| Uuid::parse_str(version_id).ok())
+        .is_some_and(|version_id| version_id.is_nil())
+    {
+        lookup_opts.version_id = None;
+        lookup_opts.metadata_chg = false;
+    }
+    lookup_opts
 }
 
 fn uses_data_movement_pool_selection(opts: &ObjectOptions) -> bool {
@@ -2989,7 +3002,7 @@ impl RemoteTuplePublicationFence {
             RemoteTuplePublicationSource::Object(expected) => {
                 let lookup_opts = ObjectOptions {
                     versioned: expected.version_id.is_some(),
-                    version_id: expected.version_id.map(|version_id| version_id.to_string()),
+                    version_id: Some(crate::data_movement::data_movement_exact_version_id(expected.version_id)),
                     incl_free_versions: expected.transitioned_object.free_version,
                     include_part_checksums: true,
                     no_lock: true,
@@ -9307,6 +9320,23 @@ mod tests {
 
         assert!(lookup_opts.no_lock);
         assert!(lookup_opts.metadata_chg);
+        assert!(lookup_opts.skip_decommissioned);
+        assert!(lookup_opts.skip_rebalancing);
+    }
+
+    #[test]
+    fn data_movement_pool_lookup_places_null_version_with_the_latest_version() {
+        let lookup_opts = data_movement_pool_lookup_opts(
+            &ObjectOptions {
+                data_movement: true,
+                version_id: Some(Uuid::nil().to_string()),
+                ..Default::default()
+            },
+            false,
+        );
+
+        assert!(lookup_opts.version_id.is_none());
+        assert!(!lookup_opts.metadata_chg);
         assert!(lookup_opts.skip_decommissioned);
         assert!(lookup_opts.skip_rebalancing);
     }

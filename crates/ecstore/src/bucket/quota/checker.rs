@@ -19,7 +19,7 @@ use super::{
 use crate::bucket::metadata_sys::{
     BucketMetadataSys, update, update_if_incarnation, update_quota_with_sys_if_incarnation_and_revision,
 };
-use crate::data_usage::get_bucket_usage_memory;
+use crate::data_usage::{get_bucket_usage_memory, reload_unknown_bucket_usage};
 use crate::error::StorageError;
 use rustfs_config::QUOTA_CONFIG_FILE;
 use rustfs_scanner_metrics::metrics::Metric;
@@ -257,7 +257,9 @@ impl QuotaChecker {
     /// input only, so a failed lookup degrades to "unknown" and is counted
     /// instead of becoming an error the write path would fail on.
     async fn report_only_usage(&self, bucket: &str) -> Option<u64> {
-        match self.get_real_time_usage(bucket).await {
+        // The plain lookup: a report must not wait for an early snapshot reload.
+        let usage = get_bucket_usage_memory(bucket).await;
+        match self.usage_or_degraded_baseline(bucket, usage).await {
             Ok(usage) => Some(usage),
             Err(err) => {
                 metrics::counter!(METRIC_QUOTA_USAGE_REPORT_UNAVAILABLE_TOTAL).increment(1);
@@ -390,8 +392,22 @@ impl QuotaChecker {
         self.metadata_sys.read().await.get(bucket).await.is_ok()
     }
 
+    /// Usage for a caller that fails closed without it. In a distributed
+    /// deployment a bucket the cached usage snapshot does not cover yet may
+    /// reload that snapshot before the degraded fallback is consulted.
     pub async fn get_real_time_usage(&self, bucket: &str) -> Result<u64, QuotaError> {
-        if let Some(usage) = get_bucket_usage_memory(bucket).await {
+        let usage = match get_bucket_usage_memory(bucket).await {
+            Some(usage) => Some(usage),
+            // Boxed like the degraded fallback below: the snapshot reload
+            // would otherwise grow every write's state machine, and it only
+            // runs for a bucket the cached snapshot does not cover.
+            None => Box::pin(reload_unknown_bucket_usage(bucket)).await,
+        };
+        self.usage_or_degraded_baseline(bucket, usage).await
+    }
+
+    async fn usage_or_degraded_baseline(&self, bucket: &str, usage: Option<u64>) -> Result<u64, QuotaError> {
+        if let Some(usage) = usage {
             return Ok(usage);
         }
 
@@ -695,6 +711,11 @@ mod tests {
             .await
             .expect("stats for a ledger-admitted bucket degrade to an absent usage");
         assert_eq!(usage, None);
+        assert_eq!(
+            crate::data_usage::reload_unknown_bucket_usage_calls_for_test(&bucket),
+            0,
+            "reporting a ledger-admitted bucket's usage must not wait for an early snapshot reload"
+        );
 
         // Negative control: the ledger, not the scanner, still refuses an
         // over-limit write with the same error.
@@ -718,7 +739,18 @@ mod tests {
             checker.check_quota(&legacy, QuotaOperation::PutObject, 512).await,
             Err(QuotaError::UsageUnavailable { .. })
         ));
+        assert_eq!(
+            crate::data_usage::reload_unknown_bucket_usage_calls_for_test(&legacy),
+            1,
+            "fail-closed admission takes the early-reload lookup"
+        );
         assert!(matches!(checker.get_quota_stats(&legacy).await, Err(QuotaError::UsageUnavailable { .. })));
+        assert_eq!(crate::data_usage::reload_unknown_bucket_usage_calls_for_test(&legacy), 2);
+        assert_eq!(
+            crate::data_usage::reload_unknown_bucket_usage_calls_for_test(&bucket),
+            0,
+            "ledger-admitted writes never take the early-reload lookup"
+        );
 
         crate::data_usage::prepare_bucket_usage_for_namespace_change(&bucket, None)
             .await

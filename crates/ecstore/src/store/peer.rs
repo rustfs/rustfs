@@ -764,11 +764,11 @@ impl ECStore {
         scanner_token: Option<Uuid>,
     ) -> DiskResult<RenameDataResp> {
         let external_guard: Option<Arc<dyn Send + Sync>> = if let Some(token) = scanner_token {
-            Some(Arc::new(
+            Some(
                 self.acquire_scanner_publication_lease_guard_for_rename(token, destination.0, destination.1)
                     .await
-                    .map_err(|err| DiskError::other(err.to_string()))?,
-            ))
+                    .map_err(|err| DiskError::other(err.to_string()))? as Arc<dyn Send + Sync>,
+            )
         } else {
             None
         };

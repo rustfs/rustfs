@@ -291,7 +291,7 @@ fn data_movement_new_multipart_opts(object_info: &ObjectInfo, src_pool_idx: usiz
     rustfs_utils::http::insert_str(&mut user_defined, SUFFIX_DATA_MOVEMENT_UPLOAD, upload_identity);
     ObjectOptions {
         versioned: object_info.version_id.is_some(),
-        version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
+        version_id: Some(data_movement_exact_version_id(object_info.version_id)),
         user_defined,
         preserve_etag: object_info.etag.clone(),
         src_pool_idx,
@@ -461,7 +461,7 @@ fn data_movement_complete_multipart_opts(
     }
     Ok(ObjectOptions {
         versioned: object_info.version_id.is_some(),
-        version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
+        version_id: Some(data_movement_exact_version_id(object_info.version_id)),
         http_preconditions: Some(data_movement_target_precondition()),
         data_movement: true,
         mod_time: object_info.mod_time,
@@ -478,13 +478,22 @@ fn data_movement_put_object_opts(object_info: &ObjectInfo, src_pool_idx: usize) 
         src_pool_idx,
         data_movement: true,
         shard_integrity_write_mode: Some(object_info.shard_integrity_write_mode()),
-        version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
+        version_id: Some(data_movement_exact_version_id(object_info.version_id)),
         http_preconditions: Some(data_movement_target_precondition()),
         mod_time: object_info.mod_time,
         user_defined: data_movement_user_defined(object_info),
         preserve_etag: object_info.etag.clone(),
         ..Default::default()
     }
+}
+
+/// Exact `ObjectOptions::version_id` selector for one migrated version.
+///
+/// `None` selects the latest version, so the null version (stored with an
+/// absent or nil UUID) is addressed by the nil UUID. Otherwise a source read or
+/// target lookup resolves to a newer version or a delete marker instead.
+pub(crate) fn data_movement_exact_version_id(version_id: Option<uuid::Uuid>) -> String {
+    version_id.unwrap_or_else(uuid::Uuid::nil).to_string()
 }
 
 fn is_unversioned_data_movement_object(object_info: &ObjectInfo) -> bool {
@@ -532,11 +541,12 @@ pub(crate) fn can_replace_stale_data_movement_target(target: &ObjectInfo, opts: 
         return false;
     }
 
-    let version_matches = match (opts.version_id.as_deref(), target.version_id) {
-        (None, None) => true,
-        (Some(expected), Some(actual)) => uuid::Uuid::parse_str(expected).ok() == Some(actual),
-        _ => false,
+    // The null version is addressed by the nil UUID but surfaces without an id.
+    let expected_version = match opts.version_id.as_deref() {
+        Some(expected) => uuid::Uuid::parse_str(expected).ok(),
+        None => Some(uuid::Uuid::nil()),
     };
+    let version_matches = expected_version == Some(target.version_id.unwrap_or_else(uuid::Uuid::nil));
 
     version_matches
         && target
@@ -1173,6 +1183,34 @@ pub(crate) struct SourceCleanupBucketFence<'a> {
     pub(crate) object_mutation_fence: Option<&'a SourceCleanupMutationFence>,
 }
 
+/// Removes versions a mover skipped as not found from the cleanup snapshot.
+///
+/// "Not found" only makes a version safe to clean up if it is really gone.
+/// Without it in the snapshot, the preflight reports `SourceChanged` while
+/// that exact version still exists instead of deleting it with the entry.
+pub(crate) fn source_cleanup_expected_without_vanished<'a>(
+    expected: &'a FileInfoVersions,
+    vanished: &[SourceCleanupVersionIdentity],
+) -> std::borrow::Cow<'a, FileInfoVersions> {
+    if vanished.is_empty() {
+        return std::borrow::Cow::Borrowed(expected);
+    }
+
+    let mut remaining = vanished.to_vec();
+    let mut narrowed = expected.clone();
+    narrowed.versions.retain(|version| {
+        let identity = source_cleanup_version_identity(version);
+        match remaining.iter().position(|vanished| *vanished == identity) {
+            Some(index) => {
+                remaining.swap_remove(index);
+                false
+            }
+            None => true,
+        }
+    });
+    std::borrow::Cow::Owned(narrowed)
+}
+
 fn ensure_source_cleanup_versions_match(
     expected: &FileInfoVersions,
     current: &FileInfoVersions,
@@ -1405,7 +1443,7 @@ async fn find_data_movement_target_info(
 ) -> Result<Option<ObjectInfo>> {
     let opts = ObjectOptions {
         versioned: object_info.version_id.is_some(),
-        version_id: object_info.version_id.as_ref().map(|v| v.to_string()),
+        version_id: Some(data_movement_exact_version_id(object_info.version_id)),
         no_lock: true,
         include_part_checksums: true,
         ..Default::default()
@@ -2394,6 +2432,34 @@ mod tests {
     }
 
     #[test]
+    fn source_cleanup_preflight_requires_vanished_versions_to_be_gone() {
+        let mut marker = cleanup_test_file_info("object.txt", Uuid::from_u128(1), "marker");
+        marker.deleted = true;
+        let mut null_version = cleanup_test_file_info("object.txt", Uuid::nil(), "null");
+        null_version.version_id = None;
+        let expected = cleanup_test_versions(vec![marker.clone(), null_version.clone()]);
+        let vanished = vec![source_cleanup_version_identity(&null_version)];
+        let narrowed = source_cleanup_expected_without_vanished(&expected, &vanished);
+        assert_eq!(narrowed.versions.len(), 1);
+        assert!(matches!(
+            source_cleanup_expected_without_vanished(&expected, &[]),
+            std::borrow::Cow::Borrowed(_)
+        ));
+
+        // The unchanged source used to pass the preflight even though the mover
+        // never copied the version it reported as not found.
+        let unchanged = cleanup_test_versions(vec![marker.clone(), null_version]);
+        assert!(source_cleanup_versions_match_with_allowed_missing(&expected, &unchanged, &[]));
+        let err = ensure_source_cleanup_versions_match(&narrowed, &unchanged, &[])
+            .expect_err("a version skipped as not found must not be deleted while it still exists");
+        assert!(matches!(err, SourceCleanupError::SourceChanged));
+
+        let gone = cleanup_test_versions(vec![marker]);
+        ensure_source_cleanup_versions_match(&narrowed, &gone, &[])
+            .expect("a version that really vanished must not block cleanup");
+    }
+
+    #[test]
     fn test_new_multipart_abort_flag_defaults_to_abort_enabled() {
         let flag = new_multipart_abort_flag();
         assert!(should_abort_multipart_upload(&flag));
@@ -3102,6 +3168,29 @@ mod tests {
     }
 
     #[test]
+    fn data_movement_target_opts_address_the_null_version_exactly() {
+        let nil = Uuid::nil().to_string();
+        assert_eq!(data_movement_exact_version_id(None), nil);
+        assert_eq!(data_movement_exact_version_id(Some(Uuid::nil())), nil);
+        assert_eq!(data_movement_exact_version_id(Some(Uuid::from_u128(9))), Uuid::from_u128(9).to_string());
+
+        // The null version keeps its unversioned write semantics, but the
+        // target precondition must not resolve to a newer version or marker.
+        let null_version = ObjectInfo {
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        };
+        let put = data_movement_put_object_opts(&null_version, 0);
+        let new_multipart = data_movement_new_multipart_opts(&null_version, 0);
+        let complete =
+            data_movement_complete_multipart_opts(&null_version, 0, false).expect("complete opts should encode metadata");
+        for opts in [&put, &new_multipart, &complete] {
+            assert!(!opts.versioned);
+            assert_eq!(opts.version_id.as_deref(), Some(nil.as_str()));
+        }
+    }
+
+    #[test]
     fn test_data_movement_put_opts_do_not_persist_multipart_part_checksums() {
         let object_info = ObjectInfo {
             etag: Some("0123456789abcdef0123456789abcdef".to_string()),
@@ -3214,6 +3303,16 @@ mod tests {
         let mut same_generation = target.clone();
         same_generation.mod_time = Some(source_time);
         assert!(!can_replace_stale_data_movement_target(&same_generation, &opts));
+
+        let null_opts = ObjectOptions {
+            versioned: false,
+            version_id: Some(data_movement_exact_version_id(None)),
+            ..opts.clone()
+        };
+        let mut null_target = target.clone();
+        null_target.version_id = None;
+        assert!(can_replace_stale_data_movement_target(&null_target, &null_opts));
+        assert!(!can_replace_stale_data_movement_target(&target, &null_opts));
 
         let mut delete_marker = target;
         delete_marker.delete_marker = true;
