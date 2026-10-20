@@ -5571,10 +5571,6 @@ fn validate_start_decommission_request(indices: &[usize], single_pool: bool) -> 
     ensure_decommission_terminal_operation_supported(single_pool, "start decommission")
 }
 
-fn require_decommission_store<T>(store: Option<T>, operation: &str) -> Result<T> {
-    store.ok_or_else(|| Error::other(format!("failed to {operation}: store not initialized")))
-}
-
 fn ensure_decommission_listing_disks_available(has_disks: bool, bucket: &str) -> Result<()> {
     if !has_disks {
         return Err(Error::other(format!(
@@ -10850,36 +10846,48 @@ pub(crate) fn set_decommission_start_gate_wait_for_test(store_id: uuid::Uuid, wa
         .insert(store_id, wait);
 }
 
-/// Parks one decommission start of a store just before it waits for the
-/// activation movement writer, so a test can change gate state there.
+/// Points where a test can park one decommission start of a store.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum DecommissionStartPausePoint {
+    /// Just before the wait for the activation movement writer.
+    Activation,
+    /// After the start is persisted, where the peers are asked to reload.
+    PeerReload,
+}
+
 #[cfg(test)]
 #[derive(Default)]
-pub(crate) struct DecommissionActivationPause {
+pub(crate) struct DecommissionStartPause {
     pub(crate) reached: tokio::sync::Notify,
     pub(crate) proceed: tokio::sync::Notify,
 }
 
 #[cfg(test)]
-static DECOMMISSION_ACTIVATION_PAUSES: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<uuid::Uuid, Arc<DecommissionActivationPause>>>,
-> = std::sync::OnceLock::new();
+type DecommissionStartPauses = std::sync::Mutex<HashMap<(uuid::Uuid, DecommissionStartPausePoint), Arc<DecommissionStartPause>>>;
 
 #[cfg(test)]
-pub(crate) fn install_decommission_activation_pause_for_test(store_id: uuid::Uuid) -> Arc<DecommissionActivationPause> {
-    let pause = Arc::new(DecommissionActivationPause::default());
-    DECOMMISSION_ACTIVATION_PAUSES
+static DECOMMISSION_START_PAUSES: std::sync::OnceLock<DecommissionStartPauses> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn install_decommission_start_pause_for_test(
+    store_id: uuid::Uuid,
+    point: DecommissionStartPausePoint,
+) -> Arc<DecommissionStartPause> {
+    let pause = Arc::new(DecommissionStartPause::default());
+    DECOMMISSION_START_PAUSES
         .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
         .lock()
-        .expect("decommission activation pause should not be poisoned")
-        .insert(store_id, Arc::clone(&pause));
+        .expect("decommission start pause should not be poisoned")
+        .insert((store_id, point), Arc::clone(&pause));
     pause
 }
 
 #[cfg(test)]
-async fn pause_decommission_activation_for_test(store_id: uuid::Uuid) {
-    let pause = DECOMMISSION_ACTIVATION_PAUSES
+async fn pause_decommission_start_for_test(store_id: uuid::Uuid, point: DecommissionStartPausePoint) {
+    let pause = DECOMMISSION_START_PAUSES
         .get()
-        .and_then(|pauses| pauses.lock().ok()?.remove(&store_id));
+        .and_then(|pauses| pauses.lock().ok()?.remove(&(store_id, point)));
     if let Some(pause) = pause {
         pause.reached.notify_one();
         pause.proceed.notified().await;
@@ -15017,7 +15025,7 @@ impl ECStore {
     }
 
     #[tracing::instrument(skip(self, rx))]
-    pub async fn decommission(&self, rx: CancellationToken, indices: Vec<usize>) -> Result<()> {
+    pub async fn decommission(self: &Arc<Self>, rx: CancellationToken, indices: Vec<usize>) -> Result<()> {
         let indices = dedup_indices(&indices);
 
         info!(
@@ -15033,13 +15041,16 @@ impl ECStore {
         let budget = self.decommission_start_gate_budget();
         self.ensure_decommission_rebalance_idle_after_refresh(&budget).await?;
 
-        let store = require_decommission_store(runtime_sources::object_store_handle(), "start decommission")?;
-        let local_indices = local_decommission_queue_prefix(&self.endpoints(), &indices)?;
+        #[cfg(test)]
+        let endpoints = self.instance_endpoints().unwrap_or_else(|| self.endpoints());
+        #[cfg(not(test))]
+        let endpoints = self.endpoints();
+        let local_indices = local_decommission_queue_prefix(&endpoints, &indices)?;
         let index_cancelers = self
             .start_decommission_inner(indices, Some((&rx, local_indices.as_slice())), &budget)
             .await?;
         drop(spawn_decommission_index_cancelers(
-            store,
+            Arc::clone(self),
             rx,
             index_cancelers,
             Arc::new(Semaphore::new(decommission_entry_concurrency_limit())),
@@ -18178,7 +18189,7 @@ impl ECStore {
         self.cancel_decommission_routines(&indices).await;
         let movement_gate = self.ctx.data_movement_operation_gate();
         #[cfg(test)]
-        pause_decommission_activation_for_test(self.id).await;
+        pause_decommission_start_for_test(self.id, DecommissionStartPausePoint::Activation).await;
         // The writer waits for every in-flight movement read; bound the wait
         // so one slow or stalled side effect fails this start instead of
         // holding it, and every movement read queued behind it, open.
@@ -18209,6 +18220,8 @@ impl ECStore {
         // before any peer RPC; remote reload must not block scanner admission.
         drop(_movement_guard);
 
+        #[cfg(test)]
+        pause_decommission_start_for_test(self.id, DecommissionStartPausePoint::PeerReload).await;
         if let Some(notification_sys) = runtime_sources::notification_sys()
             && let Err(err) = resolve_start_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await)
         {
@@ -20738,6 +20751,54 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn decommission_start_survives_a_caller_dropped_during_peer_reload() {
+        let (_temp_dirs, store, _other_store) = startable_decommission_store().await;
+        let baseline = load_pool_meta_replicas(store.pools.clone(), true)
+            .await
+            .expect("baseline pool metadata should be readable");
+        let reload = install_decommission_start_pause_for_test(store.id, DecommissionStartPausePoint::PeerReload);
+        let rx = CancellationToken::new();
+
+        // A forwarded start whose RPC times out has its handler future
+        // dropped; here that happens while the peers reload pool metadata,
+        // after the start is persisted and before its worker is spawned.
+        {
+            let start = store.decommission(rx.clone(), vec![0]);
+            tokio::pin!(start);
+            tokio::select! {
+                _ = reload.reached.notified() => {}
+                result = &mut start => panic!("the start finished before its peer reload: {result:?}"),
+            }
+        }
+        reload.proceed.notify_one();
+
+        // Either nothing was persisted, or the start ran to its end: a local
+        // worker owns the pool, or one already took it to a terminal state.
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let persisted = load_pool_meta_replicas(store.pools.clone(), true)
+                    .await
+                    .expect("pool metadata should stay readable");
+                if persisted.canonical == baseline.canonical {
+                    return "not persisted";
+                }
+                let terminal = persisted.meta.pools[0]
+                    .decommission
+                    .as_ref()
+                    .is_some_and(|info| info.complete || info.failed || info.canceled);
+                if terminal || store.has_active_local_decommission_worker().await {
+                    return "worker started";
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        rx.cancel();
+        outcome.expect("a dropped start must not leave the pool persisted as active without a worker");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn decommission_start_rebalance_refresh_wait_is_bounded() {
         let (_temp_dirs, store, _other_store) = startable_decommission_store().await;
         let baseline = load_pool_meta_replicas(store.pools.clone(), true)
@@ -20784,7 +20845,7 @@ mod tests {
             .await
             .expect("baseline pool metadata should be readable");
         set_decommission_start_gate_wait_for_test(store.id, std::time::Duration::from_millis(500));
-        let pause = install_decommission_activation_pause_for_test(store.id);
+        let pause = install_decommission_start_pause_for_test(store.id, DecommissionStartPausePoint::Activation);
 
         let start = tokio::spawn({
             let store = Arc::clone(&store);
@@ -20815,7 +20876,7 @@ mod tests {
     async fn decommission_start_gate_budget_survives_slow_preflight() {
         let (_temp_dirs, store, _other_store) = startable_decommission_store().await;
         set_decommission_start_gate_wait_for_test(store.id, std::time::Duration::from_millis(300));
-        let pause = install_decommission_activation_pause_for_test(store.id);
+        let pause = install_decommission_start_pause_for_test(store.id, DecommissionStartPausePoint::Activation);
 
         let start = tokio::spawn({
             let store = Arc::clone(&store);
@@ -26486,7 +26547,7 @@ mod pools_tests {
         parse_decommission_durable_ilm_receipt_path, pool_meta_has_active_decommission, publish_pool_meta_updates,
         read_pool_meta_replica, reconcile_decommission_meta_buckets, reconcile_decommission_unresolved_entries_for_completion,
         record_decommission_unresolved_entry, recover_decommission_capacity_reservations,
-        renew_decommission_capacity_reservation, require_decommission_store, reserve_decommission_start_cancelers,
+        renew_decommission_capacity_reservation, reserve_decommission_start_cancelers,
         reserve_decommission_start_target_capacity, resolve_decommission_bucket_state,
         resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
         resolve_decommission_entry_exact_versions, resolve_decommission_entry_reload_result,
@@ -35868,21 +35929,6 @@ mod pools_tests {
     #[test]
     fn test_contextualized_decommission_listing_disks_available_allows_online_disks() {
         assert!(ensure_decommission_listing_disks_available(true, "bucket-a").is_ok());
-    }
-
-    #[test]
-    fn test_require_decommission_store_returns_value_when_present() {
-        let store = require_decommission_store(Some(7_u8), "start decommission").expect("present store should be returned");
-        assert_eq!(store, 7);
-    }
-
-    #[test]
-    fn test_require_decommission_store_returns_error_when_missing() {
-        let err = require_decommission_store::<u8>(None, "start decommission").expect_err("missing store should return error");
-        assert!(
-            err.to_string()
-                .contains("failed to start decommission: store not initialized")
-        );
     }
 
     #[test]
