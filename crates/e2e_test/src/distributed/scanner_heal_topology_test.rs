@@ -616,12 +616,14 @@ async fn scanner_heal_topology_decommission_kill_after_responsibility_persisted_
         // Mirror start_decommission: the init stage answers 500 with the fleet
         // proof marker until the fleet has proven its capability.
         let path = format!("/rustfs/admin/v3/pools/decommission?pool={DECOMMISSION_POOL_ID}&by-id=true");
-        let deadline = Instant::now() + Duration::from_secs(45);
+        // A busy movement gate answers a retryable 503; keep retrying within
+        // the window budget so a refused start is never read as a reached window.
+        let deadline = Instant::now() + PRE_ACK_REACH_TIMEOUT;
         loop {
             match admin_request(&leader_url, Method::POST, &path, None, &access_key, &secret_key).await {
                 Ok((status, body))
-                    if status.as_u16() == 500
-                        && body.contains("requires a live fleet capability proof")
+                    if (status.as_u16() == 503
+                        || (status.as_u16() == 500 && body.contains("requires a live fleet capability proof")))
                         && Instant::now() < deadline =>
                 {
                     sleep(Duration::from_secs(1)).await;

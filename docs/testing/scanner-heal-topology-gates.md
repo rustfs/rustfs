@@ -61,6 +61,7 @@ The barrier directory is set for every node of a run; only the process whose ope
 | movement barrier reach | 240 s (the movement budget) | a window can sit deep in the object order; on Linux CI a busy target capacity gate (160 inline retries, entries deferred to round end) delayed the first fault object by about 2 minutes. The wait fails at once if the operation completes, fails or is canceled without entering the window. Each status probe is bounded to 5 s and a slow probe counts as "still running", because the admin status request can wait on the held mover until the barrier itself times out. The server releases a held barrier on its own after 120 s |
 | pre-ACK window reach | 60 s | the decommission start normally reaches its durable save in about a second (POST to response ~0.8 s locally); exceeding 60 s is reported as a stalled start path, not retried with a longer budget |
 | cancel, stop and terminal transitions | 90 s | stop and cancel are acknowledged before every in-flight entry finishes its cleanup, so terminal state and placement are polled within this budget |
+| decommission start retry | 503 within the movement budget; fleet-proof 500 for 45 s | a start that meets a busy movement gate answers a retryable 503 instead of waiting; any other status is fatal |
 | per test (lane) | 6 × 120 s | `slow-timeout` of `[profile.e2e-distributed]`, which also serializes the lane |
 
 ## Run

@@ -64,7 +64,6 @@ pub(crate) const MOVEMENT_ACTIVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// A status probe that outlives this is treated as "still running": a held
 /// barrier can block the admin status request until the barrier itself times out.
 const STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-pub(crate) const ADMIN_START_TIMEOUT: Duration = Duration::from_secs(45);
 pub(crate) const SEED_POOL: usize = 0;
 
 const TOPOLOGY_ENV: &[(&str, &str)] = &[
@@ -1114,21 +1113,7 @@ pub(crate) fn assert_process_durability_strict(log_paths: &[PathBuf]) -> TestRes
 /// Start a (possibly queued) decommission and fail closed unless acknowledged.
 pub(crate) async fn start_decommission_targets(cluster: &RustFSTestClusterEnvironment, targets: &str) -> TestResult<String> {
     let path = format!("/rustfs/admin/v3/pools/decommission?pool={}&by-id=true", urlencoding::encode(targets));
-    let deadline = Instant::now() + ADMIN_START_TIMEOUT;
-    loop {
-        let (status, response) = cluster_admin(cluster, Method::POST, &path, None).await?;
-        if status.is_success() {
-            return Ok(response);
-        }
-        if status == StatusCode::INTERNAL_SERVER_ERROR
-            && response.contains("requires a live fleet capability proof")
-            && Instant::now() < deadline
-        {
-            sleep(Duration::from_secs(1)).await;
-            continue;
-        }
-        return Err(format!("POST {path} did not start decommission: {status} {response}").into());
-    }
+    super::harness::post_decommission_start(cluster, &path, MOVEMENT_COMPLETE_TIMEOUT).await
 }
 
 /// Decommission start that must be rejected deterministically (4xx).

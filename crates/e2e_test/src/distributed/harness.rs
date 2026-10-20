@@ -718,23 +718,44 @@ pub(crate) async fn set_bucket_quota(cluster: &RustFSTestClusterEnvironment, buc
     .await
 }
 
+/// The existing decommission cases wait up to 180 s for movement to finish; a
+/// start refused because a movement gate is busy is retried within the same budget.
+const DECOMMISSION_START_BUSY_BUDGET: Duration = Duration::from_secs(180);
+const DECOMMISSION_START_PROOF_BUDGET: Duration = Duration::from_secs(45);
+
 /// Start decommission and fail closed unless the admin API acknowledges it.
 pub(crate) async fn start_decommission(cluster: &RustFSTestClusterEnvironment, pool_id: usize) -> TestResult {
     let path = format!("/rustfs/admin/v3/pools/decommission?pool={pool_id}&by-id=true");
-    let deadline = Instant::now() + Duration::from_secs(45);
+    post_decommission_start(cluster, &path, DECOMMISSION_START_BUSY_BUDGET).await?;
+    Ok(())
+}
+
+/// POST a decommission start and return the response body. A start that meets
+/// a busy movement gate answers a retryable 503 and is retried within
+/// `busy_budget`; the init stage's missing fleet capability proof (500) is
+/// retried for 45 s. Every other status is fatal.
+pub(crate) async fn post_decommission_start(
+    cluster: &RustFSTestClusterEnvironment,
+    path: &str,
+    busy_budget: Duration,
+) -> TestResult<String> {
+    let started = Instant::now();
+    let mut delay = Duration::from_millis(250);
     loop {
-        let (status, response) = cluster_admin(cluster, Method::POST, &path, None).await?;
+        let (status, response) = cluster_admin(cluster, Method::POST, path, None).await?;
         if status.is_success() {
-            return Ok(());
+            return Ok(response);
         }
-        if status == StatusCode::INTERNAL_SERVER_ERROR
+        let elapsed = started.elapsed();
+        let busy = status == StatusCode::SERVICE_UNAVAILABLE && elapsed < busy_budget;
+        let awaiting_proof = status == StatusCode::INTERNAL_SERVER_ERROR
             && response.contains("requires a live fleet capability proof")
-            && Instant::now() < deadline
-        {
-            sleep(Duration::from_secs(1)).await;
-            continue;
+            && elapsed < DECOMMISSION_START_PROOF_BUDGET;
+        if !busy && !awaiting_proof {
+            return Err(format!("POST {path} did not start decommission: {status} {response}").into());
         }
-        return Err(format!("POST {path} did not start decommission: {status} {response}").into());
+        sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(2));
     }
 }
 
