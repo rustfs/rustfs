@@ -111,14 +111,17 @@ const POOL_ACTIVATION_FLEET_PROOF_REQUIRED: &str = "pool activation requires a l
 const POOL_ACTIVATION_FLEET_PROOF_EXPIRED: &str = "pool activation fleet capability proof expired before commit";
 const DECOMMISSION_TARGET_FLEET_PROOF_EXPIRED: &str =
     "decommission target fence fleet capability proof expired before reservation commit";
-/// Bound on how long an operator decommission start waits for the gates that
-/// running data movement can hold: the start gate, the rebalance activation
-/// gate and the data-movement writer. A movement side effect keeps a read on
-/// the movement gate for as long as it runs, so a large or stalled copy would
-/// otherwise hold the start, and every reader queued behind it, indefinitely.
-const DECOMMISSION_START_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-const DECOMMISSION_START_GATE_RESOURCE: &str = "decommission start gate";
-pub(crate) const DATA_MOVEMENT_GATE_RESOURCE: &str = "data movement operation gate";
+/// Total time an operator decommission start may spend waiting for the gates
+/// that running data movement can hold: the start gate, the rebalance
+/// activation gate and the data-movement writer. A movement side effect keeps
+/// a read on the movement gate for as long as it runs, so a large or stalled
+/// copy would otherwise hold the start, and every reader queued behind it,
+/// indefinitely. It stays below the default internode RPC timeout (30 s) so a
+/// start forwarded from another node gets the leader's answer, not an RPC
+/// timeout.
+const DECOMMISSION_START_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+pub(crate) const DECOMMISSION_ACTIVATION_START_GATE: &str = "start gate (decommission activation)";
+pub(crate) const DECOMMISSION_ACTIVATION_MOVEMENT_GATE: &str = "data movement gate (decommission activation)";
 const DECOMMISSION_STAGE_MIGRATE_OBJECT: &str = "migrate_object";
 const DECOMMISSION_STAGE_CLEANUP_PREFLIGHT: &str = "cleanup_preflight";
 const DECOMMISSION_STAGE_SOURCE_CLEANUP: &str = "source_cleanup";
@@ -4520,38 +4523,59 @@ pub(crate) async fn acquire_pool_activation_fleet_proof(
         .ok_or_else(|| Error::other(POOL_ACTIVATION_FLEET_PROOF_REQUIRED))
 }
 
-/// One wait budget shared by every gate a single operator start acquires.
-/// Expiry is a retryable lock timeout raised before the start changes any
-/// state, so a busy gate fails the request instead of holding it open.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct GateWaitDeadline {
-    at: tokio::time::Instant,
+/// Gate-waiting budget shared by every gate a single operator start acquires.
+/// Only time spent actually waiting for a gate counts, so slow preflight work
+/// between the waits (bucket heals, capacity scans) cannot use it up, and a
+/// gate that is free when asked for is always taken. Expiry is a retryable
+/// lock timeout that reports the total time waited.
+#[derive(Debug)]
+pub(crate) struct GateWaitBudget {
     budget: std::time::Duration,
+    waited_nanos: std::sync::atomic::AtomicU64,
 }
 
-impl GateWaitDeadline {
-    pub(crate) fn after(budget: std::time::Duration) -> Self {
+impl GateWaitBudget {
+    pub(crate) fn new(budget: std::time::Duration) -> Self {
         Self {
-            at: tokio::time::Instant::now() + budget,
             budget,
+            waited_nanos: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    pub(crate) async fn acquire<F: std::future::Future>(self, resource: &'static str, acquire: F) -> Result<F::Output> {
-        tokio::time::timeout_at(self.at, acquire)
-            .await
-            .map_err(|_| Error::Lock(rustfs_lock::LockError::timeout(resource, self.budget)))
+    pub(crate) async fn acquire<F: std::future::Future>(&self, resource: &'static str, acquire: F) -> Result<F::Output> {
+        let remaining = self.budget.saturating_sub(self.waited());
+        let started = tokio::time::Instant::now();
+        // `timeout` polls `acquire` before its timer, so a free gate is taken
+        // even when the budget is already spent.
+        let acquired = tokio::time::timeout(remaining, acquire).await;
+        let waited = self.record_wait(started.elapsed());
+        acquired.map_err(|_| Error::Lock(rustfs_lock::LockError::timeout(resource, waited)))
+    }
+
+    fn waited(&self) -> std::time::Duration {
+        std::time::Duration::from_nanos(self.waited_nanos.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    fn record_wait(&self, elapsed: std::time::Duration) -> std::time::Duration {
+        let elapsed = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let previous = self
+            .waited_nanos
+            .try_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |waited| {
+                Some(waited.saturating_add(elapsed))
+            })
+            .unwrap_or_else(|waited| waited);
+        std::time::Duration::from_nanos(previous.saturating_add(elapsed))
     }
 }
 
-/// Wait for `acquire` within `deadline`, or without bound when there is none.
-pub(crate) async fn acquire_gate_until<F: std::future::Future>(
-    deadline: Option<GateWaitDeadline>,
+/// Wait for `acquire` within `budget`, or without bound when there is none.
+pub(crate) async fn acquire_gate_within<F: std::future::Future>(
+    budget: Option<&GateWaitBudget>,
     resource: &'static str,
     acquire: F,
 ) -> Result<F::Output> {
-    match deadline {
-        Some(deadline) => deadline.acquire(resource, acquire).await,
+    match budget {
+        Some(budget) => budget.acquire(resource, acquire).await,
         None => Ok(acquire.await),
     }
 }
@@ -10825,6 +10849,42 @@ pub(crate) fn set_decommission_start_gate_wait_for_test(store_id: uuid::Uuid, wa
         .insert(store_id, wait);
 }
 
+/// Parks one decommission start of a store just before it waits for the
+/// activation movement writer, so a test can change gate state there.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct DecommissionActivationPause {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) proceed: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static DECOMMISSION_ACTIVATION_PAUSES: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<uuid::Uuid, Arc<DecommissionActivationPause>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn install_decommission_activation_pause_for_test(store_id: uuid::Uuid) -> Arc<DecommissionActivationPause> {
+    let pause = Arc::new(DecommissionActivationPause::default());
+    DECOMMISSION_ACTIVATION_PAUSES
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("decommission activation pause should not be poisoned")
+        .insert(store_id, Arc::clone(&pause));
+    pause
+}
+
+#[cfg(test)]
+async fn pause_decommission_activation_for_test(store_id: uuid::Uuid) {
+    let pause = DECOMMISSION_ACTIVATION_PAUSES
+        .get()
+        .and_then(|pauses| pauses.lock().ok()?.remove(&store_id));
+    if let Some(pause) = pause {
+        pause.reached.notify_one();
+        pause.proceed.notified().await;
+    }
+}
+
 #[cfg(any(test, feature = "test-util"))]
 type DecommissionCapacityInfoOverrides =
     std::sync::Mutex<HashMap<uuid::Uuid, std::collections::VecDeque<Vec<DecommissionPoolCapacityInfo>>>>;
@@ -13749,37 +13809,31 @@ impl ECStore {
         Ok(())
     }
 
-    fn decommission_start_gate_deadline(&self) -> GateWaitDeadline {
+    fn decommission_start_gate_budget(&self) -> GateWaitBudget {
         #[cfg(test)]
         if let Some(wait) = DECOMMISSION_START_GATE_WAIT_OVERRIDES
             .get()
             .and_then(|overrides| overrides.lock().ok()?.get(&self.id).copied())
         {
-            return GateWaitDeadline::after(wait);
+            return GateWaitBudget::new(wait);
         }
-        GateWaitDeadline::after(DECOMMISSION_START_GATE_WAIT)
+        GateWaitBudget::new(DECOMMISSION_START_GATE_WAIT)
     }
 
-    /// Refresh rebalance metadata ahead of an operator decommission start,
-    /// within the same bounded gate wait the start itself uses.
+    /// Refresh rebalance metadata ahead of an operator decommission start
+    /// (the leader-local admin pre-check), with the start's gate budget.
     pub async fn load_rebalance_meta_for_decommission_start(&self) -> Result<()> {
-        let deadline = self.decommission_start_gate_deadline();
-        let _start_guard = deadline
-            .acquire(DECOMMISSION_START_GATE_RESOURCE, self.start_gate.lock())
-            .await?;
-        self.load_rebalance_meta_under_start_gate_until(Some(deadline)).await
-    }
-
-    async fn ensure_decommission_rebalance_idle_after_refresh(&self, deadline: GateWaitDeadline) -> Result<()> {
-        let _start_guard = deadline
-            .acquire(DECOMMISSION_START_GATE_RESOURCE, self.start_gate.lock())
-            .await?;
-        self.ensure_decommission_rebalance_idle_after_refresh_under_start_gate(deadline)
+        self.load_rebalance_meta_within(Some(&self.decommission_start_gate_budget()))
             .await
     }
 
-    async fn ensure_decommission_rebalance_idle_after_refresh_under_start_gate(&self, deadline: GateWaitDeadline) -> Result<()> {
-        self.load_rebalance_meta_under_start_gate_until(Some(deadline)).await?;
+    async fn ensure_decommission_rebalance_idle_after_refresh(&self, budget: &GateWaitBudget) -> Result<()> {
+        self.load_rebalance_meta_within(Some(budget)).await?;
+        ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)
+    }
+
+    async fn ensure_decommission_rebalance_idle_after_refresh_under_start_gate(&self, budget: &GateWaitBudget) -> Result<()> {
+        self.load_rebalance_meta_under_start_gate_within(Some(budget)).await?;
         ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)
     }
 
@@ -14975,13 +15029,13 @@ impl ECStore {
         );
         validate_start_decommission_request(&indices, self.single_pool())?;
 
-        let deadline = self.decommission_start_gate_deadline();
-        self.ensure_decommission_rebalance_idle_after_refresh(deadline).await?;
+        let budget = self.decommission_start_gate_budget();
+        self.ensure_decommission_rebalance_idle_after_refresh(&budget).await?;
 
         let store = require_decommission_store(runtime_sources::object_store_handle(), "start decommission")?;
         let local_indices = local_decommission_queue_prefix(&self.endpoints(), &indices)?;
         let index_cancelers = self
-            .start_decommission_inner(indices, Some((&rx, local_indices.as_slice())), deadline)
+            .start_decommission_inner(indices, Some((&rx, local_indices.as_slice())), &budget)
             .await?;
         drop(spawn_decommission_index_cancelers(
             store,
@@ -18052,22 +18106,22 @@ impl ECStore {
 
     #[tracing::instrument(skip(self))]
     pub async fn start_decommission(&self, indices: Vec<usize>) -> Result<()> {
-        let deadline = self.decommission_start_gate_deadline();
-        self.start_decommission_inner(indices, None, deadline).await.map(|_| ())
+        let budget = self.decommission_start_gate_budget();
+        self.start_decommission_inner(indices, None, &budget).await.map(|_| ())
     }
 
-    /// Every gate this start waits for shares `deadline`; on expiry the start
-    /// fails with a retryable lock timeout before anything is persisted.
+    /// Every gate this start waits for draws on `budget`; once it is spent the
+    /// start fails with a retryable lock timeout before anything is persisted.
     async fn start_decommission_inner(
         &self,
         indices: Vec<usize>,
         reservation: Option<(&CancellationToken, &[usize])>,
-        deadline: GateWaitDeadline,
+        budget: &GateWaitBudget,
     ) -> Result<Vec<(usize, DecommissionCancelerGuard)>> {
         let indices = dedup_indices(&indices);
         validate_start_decommission_request(&indices, self.single_pool())?;
 
-        self.ensure_decommission_rebalance_idle_after_refresh(deadline).await?;
+        self.ensure_decommission_rebalance_idle_after_refresh(budget).await?;
         #[cfg(test)]
         let endpoints = self.instance_endpoints().unwrap_or_else(|| self.endpoints());
         #[cfg(not(test))]
@@ -18109,10 +18163,10 @@ impl ECStore {
             }
         }
 
-        let _start_guard = deadline
-            .acquire(DECOMMISSION_START_GATE_RESOURCE, self.start_gate.lock())
+        let _start_guard = budget
+            .acquire(DECOMMISSION_ACTIVATION_START_GATE, self.start_gate.lock())
             .await?;
-        self.ensure_decommission_rebalance_idle_after_refresh_under_start_gate(deadline)
+        self.ensure_decommission_rebalance_idle_after_refresh_under_start_gate(budget)
             .await?;
 
         let all_capacity_infos = self.get_decommission_all_pool_capacity_infos_with_owned_usage().await?;
@@ -18122,10 +18176,14 @@ impl ECStore {
         // object operations can observe the signal and release read guards.
         self.cancel_decommission_routines(&indices).await;
         let movement_gate = self.ctx.data_movement_operation_gate();
+        #[cfg(test)]
+        pause_decommission_activation_for_test(self.id).await;
         // The writer waits for every in-flight movement read; bound the wait
         // so one slow or stalled side effect fails this start instead of
         // holding it, and every movement read queued behind it, open.
-        let _movement_guard = deadline.acquire(DATA_MOVEMENT_GATE_RESOURCE, movement_gate.write()).await?;
+        let _movement_guard = budget
+            .acquire(DECOMMISSION_ACTIVATION_MOVEMENT_GATE, movement_gate.write())
+            .await?;
 
         let index_cancelers = if let Some((rx, local_indices)) = reservation {
             // Lock order matches terminal transitions: movement gate, then
@@ -20497,25 +20555,30 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn decommission_start_fails_retryably_instead_of_waiting_for_a_stuck_movement_side_effect() {
-        let (_temp_dirs, store, _other_store) = Box::pin(crate::services::rebalance::test_two_pool_stores(None)).await;
+    /// A two-pool store whose pool 0 can start decommissioning onto pool 1.
+    async fn startable_decommission_store() -> (Vec<tempfile::TempDir>, Arc<ECStore>, Arc<ECStore>) {
+        let (temp_dirs, store, other_store) =
+            Box::pin(crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None)).await;
         crate::services::rebalance::promote_test_pool_meta_to_v2(&store).await;
-        let baseline = load_pool_meta_replicas(store.pools.clone(), true)
-            .await
-            .expect("baseline pool metadata should be readable");
-        set_decommission_start_gate_wait_for_test(store.id, std::time::Duration::from_millis(500));
-
-        let stuck_side_effect = store.ctx.data_movement_operation_gate().read_owned().await;
-        let err = tokio::time::timeout(std::time::Duration::from_secs(10), store.start_decommission(vec![0]))
-            .await
-            .expect("a start must not hang behind a stuck movement side effect")
-            .expect_err("a start must fail while the movement gate stays busy");
-        assert!(
-            matches!(&err, Error::Lock(rustfs_lock::LockError::Timeout { resource, .. }) if resource == DATA_MOVEMENT_GATE_RESOURCE),
-            "a busy gate must surface as a retryable lock timeout: {err:?}"
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 100, 100),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 200, 200, 0),
+            ]],
         );
+        (temp_dirs, store, other_store)
+    }
+
+    fn timed_out_gate(err: &Error) -> Option<(&str, std::time::Duration)> {
+        match err {
+            Error::Lock(rustfs_lock::LockError::Timeout { resource, timeout }) => Some((resource.as_str(), *timeout)),
+            _ => None,
+        }
+    }
+
+    async fn assert_start_left_no_trace(store: &ECStore, baseline: &PoolMetaSelection) {
         assert!(
             store
                 .pool_meta
@@ -20530,15 +20593,150 @@ mod tests {
             .await
             .expect("pool metadata should stay readable");
         assert_eq!(after.canonical, baseline.canonical, "a timed-out start must not persist anything");
-
-        // A queued start writer must not keep movement reads waiting either:
-        // once the start gives up, a new movement read is admitted at once.
+        // The abandoned writer must not keep movement reads queued either.
         let next_side_effect =
             tokio::time::timeout(std::time::Duration::from_secs(1), store.ctx.data_movement_operation_gate().read_owned())
                 .await
                 .expect("movement reads must not stay queued behind an abandoned start");
         drop(next_side_effect);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_wait_budget_counts_only_time_spent_waiting() {
+        let budget = GateWaitBudget::new(std::time::Duration::from_millis(100));
+        let gate = Arc::new(tokio::sync::RwLock::new(()));
+
+        let held = Arc::clone(&gate).read_owned().await;
+        let err = budget
+            .acquire("test gate", gate.write())
+            .await
+            .expect_err("a held gate must time out once the budget is spent");
+        assert_eq!(
+            timed_out_gate(&err),
+            Some(("test gate", std::time::Duration::from_millis(100))),
+            "the timeout reports the time actually waited"
+        );
+        drop(held);
+
+        // Time spent outside gate waits does not count, and a free gate is
+        // taken even with nothing left to wait.
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        drop(
+            budget
+                .acquire("test gate", gate.write())
+                .await
+                .expect("a free gate is taken with the budget spent"),
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_start_rebalance_refresh_wait_is_bounded() {
+        let (_temp_dirs, store, _other_store) = startable_decommission_store().await;
+        let baseline = load_pool_meta_replicas(store.pools.clone(), true)
+            .await
+            .expect("baseline pool metadata should be readable");
+        set_decommission_start_gate_wait_for_test(store.id, std::time::Duration::from_millis(500));
+
+        let stuck_side_effect = store.ctx.data_movement_operation_gate().read_owned().await;
+        let err = tokio::time::timeout(std::time::Duration::from_secs(10), store.start_decommission(vec![0]))
+            .await
+            .expect("a start must not hang behind a stuck movement side effect")
+            .expect_err("a start must fail while the movement gate stays busy");
+        let (gate, waited) = timed_out_gate(&err).unwrap_or_else(|| panic!("a busy gate must be a lock timeout: {err:?}"));
+        assert_eq!(gate, crate::services::rebalance::REBALANCE_REFRESH_MOVEMENT_GATE);
+        assert!(waited >= std::time::Duration::from_millis(500), "{waited:?}");
+        assert_start_left_no_trace(&store, &baseline).await;
         drop(stuck_side_effect);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_admin_rebalance_precheck_wait_is_bounded() {
+        let (_temp_dirs, store, _other_store) = startable_decommission_store().await;
+        set_decommission_start_gate_wait_for_test(store.id, std::time::Duration::from_millis(500));
+
+        let stuck_side_effect = store.ctx.data_movement_operation_gate().read_owned().await;
+        let err = tokio::time::timeout(std::time::Duration::from_secs(10), store.load_rebalance_meta_for_decommission_start())
+            .await
+            .expect("the admin pre-check must not hang behind a stuck movement side effect")
+            .expect_err("the admin pre-check must fail while the movement gate stays busy");
+        assert_eq!(
+            timed_out_gate(&err).map(|(gate, _)| gate),
+            Some(crate::services::rebalance::REBALANCE_REFRESH_MOVEMENT_GATE),
+            "{err:?}"
+        );
+        drop(stuck_side_effect);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_activation_wait_is_bounded() {
+        let (_temp_dirs, store, _other_store) = startable_decommission_store().await;
+        let baseline = load_pool_meta_replicas(store.pools.clone(), true)
+            .await
+            .expect("baseline pool metadata should be readable");
+        set_decommission_start_gate_wait_for_test(store.id, std::time::Duration::from_millis(500));
+        let pause = install_decommission_activation_pause_for_test(store.id);
+
+        let start = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move { store.start_decommission(vec![0]).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), pause.reached.notified())
+            .await
+            .expect("the start should reach its activation wait");
+        let stuck_side_effect = store.ctx.data_movement_operation_gate().read_owned().await;
+        pause.proceed.notify_one();
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(10), start)
+            .await
+            .expect("the activation must not hang behind a stuck movement side effect")
+            .expect("start task should not panic")
+            .expect_err("the activation must fail while the movement gate stays busy");
+        assert_eq!(
+            timed_out_gate(&err).map(|(gate, _)| gate),
+            Some(DECOMMISSION_ACTIVATION_MOVEMENT_GATE),
+            "{err:?}"
+        );
+        assert_start_left_no_trace(&store, &baseline).await;
+        drop(stuck_side_effect);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_start_gate_budget_survives_slow_preflight() {
+        let (_temp_dirs, store, _other_store) = startable_decommission_store().await;
+        set_decommission_start_gate_wait_for_test(store.id, std::time::Duration::from_millis(300));
+        let pause = install_decommission_activation_pause_for_test(store.id);
+
+        let start = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move { store.start_decommission(vec![0]).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), pause.reached.notified())
+            .await
+            .expect("the start should reach its activation wait");
+        // Preflight work (bucket heals, capacity scans) outlasts the whole
+        // budget, then a short movement side effect holds the gate briefly.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let brief_side_effect = store.ctx.data_movement_operation_gate().read_owned().await;
+        pause.proceed.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(brief_side_effect);
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), start)
+            .await
+            .expect("the start should finish")
+            .expect("start task should not panic")
+            .expect("a brief gate wait after slow preflight must not exhaust the budget");
+        assert!(
+            store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .is_some_and(PoolDecommissionInfo::has_decommission_state),
+            "the start should be published"
+        );
     }
 
     #[tokio::test]

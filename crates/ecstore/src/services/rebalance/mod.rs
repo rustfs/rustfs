@@ -40,6 +40,8 @@ pub(crate) const REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX: &str = "deferre
 const REBALANCE_CLEANUP_WARNING_ENTRY_LIMIT: usize = 10;
 
 mod control;
+#[cfg(test)]
+pub(crate) use control::REBALANCE_REFRESH_MOVEMENT_GATE;
 mod entry;
 mod meta;
 mod migration;

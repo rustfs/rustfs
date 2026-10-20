@@ -18,9 +18,9 @@ use super::{
     encode_rebalance_stop_propagation_record,
 };
 use crate::core::pools::{
-    DATA_MOVEMENT_GATE_RESOURCE, GateWaitDeadline, PoolMeta, PoolRebalanceActivationFence, PoolRebalanceWorkerFence,
-    acquire_gate_until, acquire_pool_activation_fleet_proof, acquire_pool_rebalance_activation_locks,
-    acquire_pool_rebalance_worker_locks, pool_meta_has_active_decommission,
+    GateWaitBudget, PoolMeta, PoolRebalanceActivationFence, PoolRebalanceWorkerFence, acquire_gate_within,
+    acquire_pool_activation_fleet_proof, acquire_pool_rebalance_activation_locks, acquire_pool_rebalance_worker_locks,
+    pool_meta_has_active_decommission,
 };
 use crate::error::{Error, Result};
 use crate::object_api::ObjectOptions;
@@ -37,7 +37,9 @@ use time::OffsetDateTime;
 use tracing::{debug, info};
 use uuid::Uuid;
 
-const REBALANCE_ACTIVATION_GATE_RESOURCE: &str = "rebalance activation gate";
+pub(crate) const REBALANCE_REFRESH_START_GATE: &str = "start gate (rebalance metadata refresh)";
+pub(crate) const REBALANCE_REFRESH_ACTIVATION_GATE: &str = "rebalance activation gate (rebalance metadata refresh)";
+pub(crate) const REBALANCE_REFRESH_MOVEMENT_GATE: &str = "data movement gate (rebalance metadata refresh)";
 
 #[cfg(test)]
 static FAIL_NEXT_REBALANCE_ACTIVATION_SAVE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -430,14 +432,14 @@ impl ECStore {
         expected_id: Option<&str>,
         stage: &str,
     ) -> Result<Option<tokio::sync::OwnedRwLockWriteGuard<()>>> {
-        self.rebalance_activation_write_guard_until(expected_id, stage, None).await
+        self.rebalance_activation_write_guard_within(expected_id, stage, None).await
     }
 
-    async fn rebalance_activation_write_guard_until(
+    async fn rebalance_activation_write_guard_within(
         &self,
         expected_id: Option<&str>,
         stage: &str,
-        deadline: Option<GateWaitDeadline>,
+        budget: Option<&GateWaitBudget>,
     ) -> Result<Option<tokio::sync::OwnedRwLockWriteGuard<()>>> {
         let activation_gate = {
             let meta = self.rebalance_meta.read().await;
@@ -447,7 +449,7 @@ impl ECStore {
             meta.as_ref().map(|meta| Arc::clone(&meta.activation_gate))
         };
         Ok(match activation_gate {
-            Some(gate) => Some(acquire_gate_until(deadline, REBALANCE_ACTIVATION_GATE_RESOURCE, gate.write_owned()).await?),
+            Some(gate) => Some(acquire_gate_within(budget, REBALANCE_REFRESH_ACTIVATION_GATE, gate.write_owned()).await?),
             None => None,
         })
     }
@@ -677,8 +679,14 @@ impl ECStore {
 
     #[tracing::instrument(skip_all)]
     pub async fn load_rebalance_meta(&self) -> Result<()> {
-        let _start_guard = self.start_gate.lock().await;
-        self.load_rebalance_meta_under_start_gate().await
+        self.load_rebalance_meta_within(None).await
+    }
+
+    /// `budget` bounds the waits for the start, activation and movement gates;
+    /// once it is spent the load fails before it reads or publishes anything.
+    pub(crate) async fn load_rebalance_meta_within(&self, budget: Option<&GateWaitBudget>) -> Result<()> {
+        let _start_guard = acquire_gate_within(budget, REBALANCE_REFRESH_START_GATE, self.start_gate.lock()).await?;
+        self.load_rebalance_meta_under_start_gate_within(budget).await
     }
 
     /// Cancels local admission before refreshing the persisted stop target under the start gate.
@@ -734,12 +742,12 @@ impl ECStore {
     }
 
     pub(crate) async fn load_rebalance_meta_under_start_gate(&self) -> Result<()> {
-        self.load_rebalance_meta_under_start_gate_until(None).await
+        self.load_rebalance_meta_under_start_gate_within(None).await
     }
 
-    /// `deadline` bounds the waits for the activation and movement writers;
-    /// on expiry the load fails before it reads or publishes anything.
-    pub(crate) async fn load_rebalance_meta_under_start_gate_until(&self, deadline: Option<GateWaitDeadline>) -> Result<()> {
+    /// `budget` bounds the waits for the activation and movement writers;
+    /// once it is spent the load fails before it reads or publishes anything.
+    pub(crate) async fn load_rebalance_meta_under_start_gate_within(&self, budget: Option<&GateWaitBudget>) -> Result<()> {
         let mut meta = RebalanceMeta::new();
         debug!(
             event = EVENT_REBALANCE_STATE,
@@ -750,10 +758,10 @@ impl ECStore {
         );
         let pool = clone_first_arc(&self.pools, "rebalanceMeta: no pools available")?;
         let _activation_guard = self
-            .rebalance_activation_write_guard_until(None, "load rebalance metadata", deadline)
+            .rebalance_activation_write_guard_within(None, "load rebalance metadata", budget)
             .await?;
         let movement_gate = self.ctx.data_movement_operation_gate();
-        let _movement_guard = acquire_gate_until(deadline, DATA_MOVEMENT_GATE_RESOURCE, movement_gate.write()).await?;
+        let _movement_guard = acquire_gate_within(budget, REBALANCE_REFRESH_MOVEMENT_GATE, movement_gate.write()).await?;
         let loaded = resolve_rebalance_meta_load_result(meta.load(pool).await)?;
         if loaded {
             let movement_changed = rebalance_movement_snapshot_changed(self.rebalance_meta.read().await.as_ref(), &meta);
@@ -1505,6 +1513,61 @@ mod tests {
             store.ctx.data_movement_operation_epoch() > epoch,
             "a published refresh advances the epoch"
         );
+    }
+
+    #[tokio::test]
+    async fn rebalance_status_snapshot_does_not_wait_for_an_in_flight_rebalance_entry() {
+        let id = "rebalance-status-activation";
+        let (_temp_dirs, store) = crate::services::rebalance::test_store_with_persisted_rebalance_meta(RebalanceMeta {
+            id: id.to_string(),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Completed,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await;
+        // This node knows the run but not yet its per-pool state.
+        let activation_gate = {
+            let mut rebalance_meta = store.rebalance_meta.write().await;
+            let meta = rebalance_meta.as_mut().expect("the fixture installs the run in memory");
+            meta.pool_stats.clear();
+            Arc::clone(&meta.activation_gate)
+        };
+
+        // An in-flight rebalance entry holds the activation read gate.
+        let in_flight_entry = activation_gate.read_owned().await;
+        let epoch = store.ctx.data_movement_operation_epoch();
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(10), store.rebalance_status_meta_snapshot())
+            .await
+            .expect("a status read must not wait for an in-flight rebalance entry")
+            .expect("persisted rebalance metadata should be readable");
+        assert_eq!(
+            snapshot.as_ref().map(|meta| meta.pool_stats.len()),
+            Some(1),
+            "the status read reports the persisted pool state"
+        );
+        assert!(
+            store
+                .rebalance_meta
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|meta| meta.pool_stats.is_empty()),
+            "a busy activation gate must keep the refresh from publishing"
+        );
+        assert_eq!(store.ctx.data_movement_operation_epoch(), epoch);
+
+        drop(in_flight_entry);
+        store
+            .rebalance_status_meta_snapshot()
+            .await
+            .expect("free gates should allow the refresh to publish");
+        assert_eq!(store.rebalance_meta.read().await.as_ref().map(|meta| meta.pool_stats.len()), Some(1));
     }
 
     #[tokio::test]
