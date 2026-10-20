@@ -316,7 +316,7 @@ jobs:
 
       - name: Select exact-source race native evidence
         id: race_native
-        if: ${{ inputs.validation_case == 'heal.race-unversioned-overwrite' || inputs.validation_case == 'heal.race-versioned-put' || inputs.validation_case == 'heal.race-version-delete' }}
+        if: ${{ inputs.validation_case == 'heal.race-unversioned-overwrite' || inputs.validation_case == 'heal.race-versioned-put' || inputs.validation_case == 'heal.race-version-delete' || inputs.validation_case == 'heal.race-markers-and-batch-delete' }}
         env:
           CANDIDATE_SHA: ${{ steps.candidate.outputs.source_sha }}
           VALIDATION_CASE_ID: ${{ inputs.validation_case }}
@@ -338,7 +338,11 @@ jobs:
             6afdec9fe1b0b88007f2e5b445c19bf73d51d3ca:heal.race-unversioned-overwrite | \
             bd0671ba781d8ebf509f4f03533228dfb44496f1:heal.race-unversioned-overwrite | \
             bd0671ba781d8ebf509f4f03533228dfb44496f1:heal.race-versioned-put | \
-            bd0671ba781d8ebf509f4f03533228dfb44496f1:heal.race-version-delete) reviewed=true ;;
+            bd0671ba781d8ebf509f4f03533228dfb44496f1:heal.race-version-delete | \
+            8380466f3a27c3c3ef4115084178a0ab99a78f32:heal.race-unversioned-overwrite | \
+            8380466f3a27c3c3ef4115084178a0ab99a78f32:heal.race-versioned-put | \
+            8380466f3a27c3c3ef4115084178a0ab99a78f32:heal.race-version-delete | \
+            8380466f3a27c3c3ef4115084178a0ab99a78f32:heal.race-markers-and-batch-delete) reviewed=true ;;
           esac
           if [ "${reviewed}" = true ] && [ "${required}" != true ]; then
             printf 'Race candidate requires its reviewed native collector before fleet execution\n' >&2

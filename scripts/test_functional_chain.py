@@ -33,6 +33,8 @@ class RaceNativeToolsWorkflowTests(unittest.TestCase):
         reviewed = [('6afdec9fe1b0b88007f2e5b445c19bf73d51d3ca', g01)]
         reviewed += [('bd0671ba781d8ebf509f4f03533228dfb44496f1', case) for case in
                      (g01, 'heal.race-versioned-put', 'heal.race-version-delete')]
+        reviewed += [('8380466f3a27c3c3ef4115084178a0ab99a78f32', case) for case in
+                     (g01, 'heal.race-versioned-put', 'heal.race-version-delete', 'heal.race-markers-and-batch-delete')]
         for source, case in reviewed:
             cases += [(False, 2, 1, None, source, case), (True, 2, 1, None, source, case),
                       (True, 0, 0, 'true', source, case)]
@@ -54,7 +56,8 @@ class RaceNativeToolsWorkflowTests(unittest.TestCase):
 
     def test_race_actual_admission_requires_native_and_runtime_before_exporting_directory(self):
         shell = self.chain_shell_step('Verify exact-source race native and runtime evidence')
-        for case in ('heal.race-unversioned-overwrite', 'heal.race-versioned-put', 'heal.race-version-delete'):
+        for case in ('heal.race-unversioned-overwrite', 'heal.race-versioned-put', 'heal.race-version-delete',
+                     'heal.race-markers-and-batch-delete'):
             for native_exit, runtime in [(0, 0), (42, 0), (0, 42), (0, 'missing'), (0, 'collector-only')]:
                 with self.subTest(case=case, native_exit=native_exit, runtime=runtime), tempfile.TemporaryDirectory() as name:
                     root = Path(name)
@@ -95,6 +98,7 @@ class RaceNativeToolsWorkflowTests(unittest.TestCase):
         self.assertLess(workflow.index('Verify exact-source race native and runtime'),
                         workflow.index('Run selected canonical validation case'))
         self.assertIn("steps.race_native.outputs.required == 'true'", workflow)
+        self.assertIn("inputs.validation_case == 'heal.race-markers-and-batch-delete'", workflow)
 
     def shell_step(self, name):
         from check_test_wiring import yaml_block
