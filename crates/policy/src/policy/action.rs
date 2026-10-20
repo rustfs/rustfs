@@ -586,6 +586,8 @@ pub enum AdminAction {
     RetirePluginArtifactVersionAction,
     #[strum(serialize = "admin:DeletePluginArtifactVersion")]
     DeletePluginArtifactVersionAction,
+    #[strum(serialize = "admin:RetainPluginArtifactBackups")]
+    RetainPluginArtifactBackupsAction,
     #[strum(serialize = "admin:SubmitPluginJob")]
     SubmitPluginJobAction,
     #[strum(serialize = "admin:GetPluginRun")]
@@ -644,6 +646,7 @@ impl AdminAction {
                 | Self::InventoryPluginArtifactAttemptAction
                 | Self::RetirePluginArtifactVersionAction
                 | Self::DeletePluginArtifactVersionAction
+                | Self::RetainPluginArtifactBackupsAction
         )
     }
 
@@ -766,6 +769,7 @@ impl AdminAction {
                 | AdminAction::InventoryPluginArtifactAttemptAction
                 | AdminAction::RetirePluginArtifactVersionAction
                 | AdminAction::DeletePluginArtifactVersionAction
+                | AdminAction::RetainPluginArtifactBackupsAction
                 | AdminAction::SubmitPluginJobAction
                 | AdminAction::GetPluginRunAction
                 | AdminAction::CancelPluginRunAction
@@ -1160,6 +1164,13 @@ mod tests {
         assert_eq!(set_action, AdminAction::SetTableMetadataLocationAction);
         assert!(get_action.is_valid());
         assert!(set_action.is_valid());
+    }
+
+    #[test]
+    fn artifact_backup_retention_requires_resource_scoped_admin_action() {
+        let action = AdminAction::try_from("admin:RetainPluginArtifactBackups").expect("retention action recognized");
+        assert!(action.is_valid(), "O02P3_RETENTION_ACTION_VALID");
+        assert!(action.is_artifact_resource_scoped(), "O02P3_RETENTION_ACTION_SCOPED");
     }
 
     #[test]

@@ -438,6 +438,7 @@ pub struct BucketMetadata {
     pub lock_enabled: bool, // While marked as unused, it may need to be retained
     pub bucket_incarnation_id: Uuid,
     pub artifact_base_prefix: Option<String>,
+    pub artifact_backup_retained: bool,
     pub(crate) bucket_incarnation_sidecar: bool,
     pub(crate) bucket_creation_committed: bool,
     pub policy_config_json: Vec<u8>,
@@ -514,6 +515,7 @@ impl Default for BucketMetadata {
             lock_enabled: Default::default(),
             bucket_incarnation_id: Uuid::nil(),
             artifact_base_prefix: None,
+            artifact_backup_retained: false,
             bucket_incarnation_sidecar: false,
             bucket_creation_committed: false,
             policy_config_json: Default::default(),
@@ -706,6 +708,12 @@ impl BucketMetadata {
                     self.bucket_incarnation_id =
                         Uuid::from_slice(&bytes).map_err(|err| Error::other(format!("invalid BucketIncarnationID: {err}")))?;
                 }
+                "ArtifactBackupRetained" => {
+                    if self.artifact_backup_retained || !rmp::decode::read_bool(rd)? {
+                        return Err(Error::other("invalid artifact backup retention marker"));
+                    }
+                    self.artifact_backup_retained = true;
+                }
                 "ArtifactBasePrefix" => {
                     if self.artifact_base_prefix.is_some() {
                         return Err(Error::other("duplicate artifact namespace"));
@@ -778,7 +786,7 @@ impl BucketMetadata {
     /// Encode to msgp bytes. Field order follows MinIO BucketMetadata for compatibility.
     pub fn encode_to<W: Write>(&self, wr: &mut W) -> Result<()> {
         // Map size: MinIO fields (25) + RustFS extensions (22)
-        let map_len: u32 = 47 + u32::from(self.artifact_base_prefix.is_some());
+        let map_len: u32 = 47 + u32::from(self.artifact_base_prefix.is_some()) + u32::from(self.artifact_backup_retained);
         rmp::encode::write_map_len(wr, map_len)?;
 
         // MinIO field order (same as Go struct)
@@ -795,6 +803,11 @@ impl BucketMetadata {
         if let Some(prefix) = &self.artifact_base_prefix {
             rmp::encode::write_str(wr, "ArtifactBasePrefix")?;
             rmp::encode::write_str(wr, prefix)?;
+        }
+
+        if self.artifact_backup_retained {
+            rmp::encode::write_str(wr, "ArtifactBackupRetained")?;
+            rmp::encode::write_bool(wr, true)?;
         }
 
         write_bin_field(wr, "PolicyConfigJSON", &self.policy_config_json)?;
@@ -896,11 +909,26 @@ impl BucketMetadata {
         }
 
         match version {
-            BUCKET_METADATA_VERSION => {}
+            BUCKET_METADATA_VERSION | 2 => {}
             _ => return Err(Error::other("read_bucket_metadata: version invalid")),
         }
 
         Ok(())
+    }
+
+    /// Version two is reserved for permanent artifact backup retention. Older
+    /// readers reject its header instead of skipping the protection field.
+    pub(crate) fn decode_file(bytes: &[u8]) -> Result<Self> {
+        Self::check_header(bytes)?;
+        let metadata = Self::unmarshal(&bytes[4..])?;
+        let retained_header = LittleEndian::read_u16(&bytes[2..4]) == 2;
+        if retained_header != metadata.artifact_backup_retained {
+            return Err(Error::other("artifact backup retention header mismatch"));
+        }
+        if metadata.artifact_backup_retained {
+            metadata.validate_artifact_configuration()?;
+        }
+        Ok(metadata)
     }
 
     pub(crate) fn default_timestamps(&mut self) {
@@ -1147,13 +1175,33 @@ impl BucketMetadata {
         store: std::sync::Arc<crate::store::ECStore>,
         write_completion: WriteCompletion,
     ) -> Result<()> {
+        let opts = crate::object_api::ObjectOptions {
+            max_parity: true,
+            write_completion,
+            ..Default::default()
+        };
+        self.save_with_store_options(store, &opts).await
+    }
+
+    pub(crate) async fn save_with_store_options(
+        &mut self,
+        store: Arc<ECStore>,
+        opts: &crate::object_api::ObjectOptions,
+    ) -> Result<()> {
         self.parse_all_configs()?;
         self.validate_artifact_update(store.clone()).await?;
         let mut buf: Vec<u8> = vec![0; 4];
 
         LittleEndian::write_u16(&mut buf[0..2], BUCKET_METADATA_FORMAT);
 
-        LittleEndian::write_u16(&mut buf[2..4], BUCKET_METADATA_VERSION);
+        LittleEndian::write_u16(
+            &mut buf[2..4],
+            if self.artifact_backup_retained {
+                2
+            } else {
+                BUCKET_METADATA_VERSION
+            },
+        );
 
         let data = self
             .marshal_msg()
@@ -1161,22 +1209,15 @@ impl BucketMetadata {
 
         buf.extend_from_slice(&data);
 
-        save_config_with_opts(
-            store,
-            self.save_file_path().as_str(),
-            buf,
-            &crate::object_api::ObjectOptions {
-                max_parity: true,
-                write_completion,
-                ..Default::default()
-            },
-        )
-        .await?;
+        save_config_with_opts(store, self.save_file_path().as_str(), buf, opts).await?;
 
         Ok(())
     }
 
     fn validate_artifact_configuration(&self) -> Result<()> {
+        if self.artifact_backup_retained && (self.artifact_base_prefix.is_none() || !self.bucket_creation_committed) {
+            return Err(Error::other("artifact backup retention requires a committed managed bucket"));
+        }
         if let Some(prefix) = &self.artifact_base_prefix {
             if !crate::storage_api_contracts::bucket::valid_artifact_base_prefix(prefix) || self.bucket_incarnation_id.is_nil() {
                 return Err(Error::other("invalid artifact bucket identity"));
@@ -1195,9 +1236,11 @@ impl BucketMetadata {
         // An existing empty/corrupt metadata object is not permission to create an identity.
         match read_config_preserve_empty(store, &self.save_file_path()).await {
             Ok(data) => {
-                Self::check_header(&data)?;
-                let previous = Self::unmarshal(&data[4..])?;
+                let previous = Self::decode_file(&data)?;
                 previous.validate_artifact_configuration()?;
+                if previous.artifact_backup_retained && !self.artifact_backup_retained {
+                    return Err(Error::other("artifact backup retention cannot be removed"));
+                }
                 // Deletion removes this record before recreation. A caller-supplied
                 // incarnation cannot turn an existing bucket into a new generation.
                 if previous.artifact_base_prefix != self.artifact_base_prefix
@@ -1621,9 +1664,7 @@ async fn read_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Result<BucketM
 
     let data = read_config(api, &file_path).await?;
 
-    BucketMetadata::check_header(&data)?;
-
-    let bm = BucketMetadata::unmarshal(&data[4..])?;
+    let bm = BucketMetadata::decode_file(&data)?;
 
     Ok(bm)
 }
@@ -1671,6 +1712,53 @@ mod test {
             rmp::encode::write_str(&mut invalid, prefix).expect("encode invalid prefix");
             assert!(BucketMetadata::unmarshal(&invalid).is_err(), "ARTIFACT_CORRUPT_PREFIX");
         }
+    }
+
+    #[test]
+    fn artifact_backup_retention_marker_rejects_false_and_duplicates() {
+        for count in [1, 2] {
+            let mut bytes = Vec::new();
+            rmp::encode::write_map_len(&mut bytes, count).unwrap();
+            for _ in 0..count {
+                rmp::encode::write_str(&mut bytes, "ArtifactBackupRetained").unwrap();
+                rmp::encode::write_bool(&mut bytes, count == 2).unwrap();
+            }
+            assert!(BucketMetadata::unmarshal(&bytes).is_err(), "O02P3_INVALID_RETENTION_MARKER");
+        }
+    }
+
+    #[test]
+    fn artifact_backup_retention_requires_matching_header_and_identity() {
+        let mut metadata = BucketMetadata::new("retained");
+        metadata.bucket_incarnation_id = Uuid::new_v4();
+        metadata.bucket_creation_committed = true;
+        metadata.artifact_base_prefix = Some("outputs/".to_owned());
+        metadata.versioning_config_xml = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
+        let file = |metadata: &BucketMetadata, version: u16| {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&BUCKET_METADATA_FORMAT.to_le_bytes());
+            bytes.extend_from_slice(&version.to_le_bytes());
+            bytes.extend_from_slice(&metadata.marshal_msg().unwrap());
+            bytes
+        };
+        assert!(BucketMetadata::decode_file(&file(&metadata, 1)).is_ok(), "O02P3_ORDINARY_V1_COMPATIBLE");
+        assert!(BucketMetadata::decode_file(&file(&metadata, 2)).is_err(), "O02P3_MARKER_REQUIRED");
+        metadata.artifact_backup_retained = true;
+        assert!(
+            BucketMetadata::decode_file(&file(&metadata, 1)).is_err(),
+            "O02P3_PROTECTION_CANNOT_DOWNGRADE_HEADER"
+        );
+        assert!(
+            BucketMetadata::decode_file(&file(&metadata, 2))
+                .unwrap()
+                .artifact_backup_retained,
+            "O02P3_PROTECTED_V2_ROUNDTRIP"
+        );
+        metadata.artifact_base_prefix = None;
+        assert!(
+            BucketMetadata::decode_file(&file(&metadata, 2)).is_err(),
+            "O02P3_PROTECTION_REQUIRES_MANAGED_BUCKET"
+        );
     }
 
     #[test]

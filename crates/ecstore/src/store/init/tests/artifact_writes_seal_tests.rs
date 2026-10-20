@@ -1139,3 +1139,170 @@ fn artifact_writes_seal_root_switch_drains_the_original_physical_owner() {
         shutdown.cancel();
     });
 }
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_backup_retention_preserves_exact_versions_and_reopen() {
+    run_large_stack_async_test("artifact-backup-retention", || async {
+        let root = tempfile::tempdir().expect("retention root");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(root.path(), "artifact-backup-retention", &[4])).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let incarnation = create_bucket(&store, BUCKET, true).await;
+        let attempt = prefix();
+        let object = format!("{attempt}image.png");
+        let version = put(&store, BUCKET, &object)
+            .await
+            .expect("actual version")
+            .version_id
+            .expect("versioned");
+        assert!(
+            !store
+                .inspect_artifact_backup_retention(BUCKET, incarnation, "outputs/")
+                .await
+                .expect("default off")
+        );
+        for (expected, base) in [(Uuid::new_v4(), "outputs/"), (incarnation, "wrong/")] {
+            assert!(
+                store.clone().retain_artifact_backups(BUCKET, expected, base).await.is_err(),
+                "O02P3_IDENTITY_BOUND"
+            );
+        }
+        store
+            .clone()
+            .retain_artifact_backups(BUCKET, incarnation, "outputs/")
+            .await
+            .expect("durable retention");
+        store
+            .clone()
+            .retain_artifact_backups(BUCKET, incarnation, "outputs/")
+            .await
+            .expect("idempotent retry");
+        store
+            .clone()
+            .seal_artifact_attempt_writes(BUCKET, incarnation, &attempt)
+            .await
+            .expect("seal actual version");
+        assert!(
+            store
+                .clone()
+                .delete_artifact_object_version(BUCKET, incarnation, &attempt, &object, version)
+                .await
+                .is_err(),
+            "O02P3_RETAINED_DELETE_DENIED"
+        );
+        let exact = ObjectOptions {
+            version_id: Some(version.to_string()),
+            suppress_read_repair: true,
+            ..Default::default()
+        };
+        let mut reader = store
+            .get_object_reader(BUCKET, &object, None, Default::default(), &exact)
+            .await
+            .expect("O02P3_EXACT_VERSION_SURVIVES");
+        let mut bytes = Vec::new();
+        reader.stream.read_to_end(&mut bytes).await.expect("actual bytes");
+        assert_eq!(bytes, vec![0xA5; 1024 * 1024], "O02P3_EXACT_BYTES_SURVIVE");
+        let (mut metadata, _) = crate::bucket::metadata::load_bucket_metadata_parse_with_presence(store.clone(), BUCKET, true)
+            .await
+            .expect("persisted marker");
+        metadata.artifact_backup_retained = false;
+        assert!(metadata.save_with_store(store.clone()).await.is_err(), "O02P3_CANNOT_REMOVE_PROTECTION");
+        for force in [false, true] {
+            assert!(
+                store
+                    .delete_bucket(
+                        BUCKET,
+                        &crate::storage_api_contracts::bucket::DeleteBucketOptions {
+                            force,
+                            ..Default::default()
+                        }
+                    )
+                    .await
+                    .is_err(),
+                "O02P3_BUCKET_DELETE_DENIED"
+            );
+        }
+        shutdown.cancel();
+        assert!(ctx.wait_for_detached_mutations(DEADLINE).await);
+        drop(reader);
+        drop(store);
+        drop(ctx);
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(root.path(), "artifact-backup-retention-reopen", &[4])).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        assert!(
+            store
+                .inspect_artifact_backup_retention(BUCKET, incarnation, "outputs/")
+                .await
+                .expect("O02P3_REOPEN_PROTECTED")
+        );
+        assert!(
+            store
+                .clone()
+                .delete_artifact_object_version(BUCKET, incarnation, &attempt, &object, version)
+                .await
+                .is_err(),
+            "O02P3_REOPEN_DELETE_DENIED"
+        );
+        assert!(
+            store.get_object_info(BUCKET, &object, &exact).await.is_ok(),
+            "O02P3_REOPEN_VERSION_SURVIVES"
+        );
+        shutdown.cancel();
+    });
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_backup_retention_cancelled_waiter_keeps_owned_fence() {
+    run_large_stack_async_test("artifact-backup-retention-owner", || async {
+        let root = tempfile::tempdir().expect("retention owner root");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(root.path(), "artifact-backup-retention-owner", &[4])).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let incarnation = create_bucket(&store, BUCKET, true).await;
+        let earlier_delete = store
+            .acquire_bucket_lifecycle_read_lock(BUCKET)
+            .await
+            .expect("prior delete lifecycle owner");
+        let worker_store = store.clone();
+        let mut waiter = tokio::spawn(async move { worker_store.retain_artifact_backups(BUCKET, incarnation, "outputs/").await });
+        tokio::time::timeout(DEADLINE, async {
+            while ctx.detached_mutation_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retention owner registered");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut waiter).await.is_err(),
+            "O02P3_PRIOR_DELETE_DRAINED"
+        );
+        waiter.abort();
+        assert!(waiter.await.expect_err("caller cancelled").is_cancelled());
+        drop(earlier_delete);
+        assert!(ctx.wait_for_detached_mutations(DEADLINE).await, "O02P3_CANCELLED_OWNER_DRAINS");
+        assert!(
+            store
+                .inspect_artifact_backup_retention(BUCKET, incarnation, "outputs/")
+                .await
+                .expect("protection published after cancellation"),
+            "O02P3_CANCELLED_RETENTION_PERSISTS"
+        );
+        assert!(
+            store
+                .delete_bucket(
+                    BUCKET,
+                    &crate::storage_api_contracts::bucket::DeleteBucketOptions {
+                        force: true,
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_err(),
+            "O02P3_EMPTY_BUCKET_RETAINED"
+        );
+        shutdown.cancel();
+    });
+}

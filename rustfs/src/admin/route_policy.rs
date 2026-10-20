@@ -23,6 +23,7 @@ const SEAL_PLUGIN_ARTIFACT: AdminActionRef = AdminActionRef::new("SealPluginArti
 const SEAL_PLUGIN_ARTIFACT_REPAIRS: AdminActionRef = AdminActionRef::new("SealPluginArtifactRepairsAction");
 const SEAL_PLUGIN_ARTIFACT_WRITES: AdminActionRef = AdminActionRef::new("SealPluginArtifactWritesAction");
 const INVENTORY_PLUGIN_ARTIFACT: AdminActionRef = AdminActionRef::new("InventoryPluginArtifactAttemptAction");
+const RETAIN_PLUGIN_ARTIFACT_BACKUPS: AdminActionRef = AdminActionRef::new("RetainPluginArtifactBackupsAction");
 const DELETE_PLUGIN_ARTIFACT: AdminActionRef = AdminActionRef::new("DeletePluginArtifactVersionAction");
 const RETIRE_PLUGIN_ARTIFACT: AdminActionRef = AdminActionRef::new("RetirePluginArtifactVersionAction");
 const ALL_ADMIN: AdminActionRef = AdminActionRef::new("AllAdminActions");
@@ -713,6 +714,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HttpMethod::Post,
         "/rustfs/admin/v3/plugin-artifacts/retire-version",
         RETIRE_PLUGIN_ARTIFACT,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-artifacts/buckets/retain-backups",
+        RETAIN_PLUGIN_ARTIFACT_BACKUPS,
         RouteRiskLevel::High,
     ),
     admin(
@@ -2528,6 +2535,20 @@ mod tests {
             (HttpMethod::Post, "/rustfs/admin/v3/kms/keys/untag"),
         ] {
             assert_not_action(method, path, SERVER_INFO);
+        }
+    }
+
+    #[test]
+    fn artifact_backup_retention_route_requires_independent_action() {
+        let route = "/rustfs/admin/v3/plugin-artifacts/buckets/retain-backups";
+        assert_action(HttpMethod::Post, route, RETAIN_PLUGIN_ARTIFACT_BACKUPS);
+        for action in [
+            DELETE_PLUGIN_ARTIFACT,
+            INVENTORY_PLUGIN_ARTIFACT,
+            RETIRE_PLUGIN_ARTIFACT,
+            SERVER_INFO,
+        ] {
+            assert_not_action(HttpMethod::Post, route, action);
         }
     }
 

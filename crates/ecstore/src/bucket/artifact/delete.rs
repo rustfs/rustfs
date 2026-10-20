@@ -71,6 +71,7 @@ impl ECStore {
             return Err(Error::other("artifact exact deletion requires namespace locking"));
         }
         let lifecycle = Arc::new(self.acquire_bucket_lifecycle_read_lock(bucket).await?);
+        self.require_no_artifact_backup_retention(bucket).await?;
         let put = self
             .inventory_artifact_record(bucket, expected_incarnation, attempt_prefix)
             .await?;

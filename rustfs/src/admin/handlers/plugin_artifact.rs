@@ -51,6 +51,8 @@ struct BucketIdentityReceipt {
     versioning_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     exact_delete_supported: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup_retained: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -200,6 +202,11 @@ pub fn register_plugin_artifact_routes(router: &mut S3Router<AdminOperation>) ->
     )?;
     router.insert(
         Method::POST,
+        &format!("{ADMIN_PREFIX}/v3/plugin-artifacts/buckets/retain-backups"),
+        AdminOperation(&RetainBackups),
+    )?;
+    router.insert(
+        Method::POST,
         &format!("{ADMIN_PREFIX}/v3/plugin-artifacts/seal-attempt"),
         AdminOperation(&Seal),
     )?;
@@ -257,6 +264,7 @@ impl Operation for Create {
             bucket_incarnation: incarnation,
             versioning_enabled: true,
             exact_delete_supported: None,
+            backup_retained: None,
         })
     }
 }
@@ -267,7 +275,7 @@ impl Operation for Inspect {
     async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         require_builtin_authorization().await?;
         let input: BucketIdentityRequest = request_body(&mut req).await?;
-        input.validate(2)?;
+        input.validate(3)?;
         let store = request_store(&req)?;
         owner_for_resource(
             &req,
@@ -275,7 +283,7 @@ impl Operation for Inspect {
             AdminResourceScope::bucket(&input.bucket),
         )
         .await?;
-        let exact_delete_supported = if input.version == 2 {
+        let exact_delete_supported = if input.version >= 2 {
             Some(store.supports_artifact_exact_delete().await)
         } else {
             None
@@ -285,6 +293,19 @@ impl Operation for Inspect {
                 .await
                 .map_err(|_| unconfirmed())?
                 .map_err(|_| unconfirmed())?;
+        let backup_retained = if input.version == 3 {
+            Some(
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    store.inspect_artifact_backup_retention(&input.bucket, incarnation, &input.base_prefix),
+                )
+                .await
+                .map_err(|_| unconfirmed())?
+                .map_err(|_| unconfirmed())?,
+            )
+        } else {
+            None
+        };
         response(&BucketIdentityReceipt {
             version: input.version,
             bucket: input.bucket,
@@ -292,6 +313,64 @@ impl Operation for Inspect {
             bucket_incarnation: incarnation,
             versioning_enabled: true,
             exact_delete_supported,
+            backup_retained,
+        })
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RetainBackupsRequest {
+    version: u32,
+    bucket: String,
+    base_prefix: String,
+    bucket_incarnation: Uuid,
+}
+
+#[derive(Serialize)]
+struct BackupRetentionReceipt {
+    version: u32,
+    bucket: String,
+    base_prefix: String,
+    bucket_incarnation: Uuid,
+    backup_retained: bool,
+}
+
+struct RetainBackups;
+#[async_trait::async_trait]
+impl Operation for RetainBackups {
+    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        require_builtin_authorization().await?;
+        let input: RetainBackupsRequest = request_body(&mut req).await?;
+        BucketIdentityRequest {
+            version: input.version,
+            bucket: input.bucket.clone(),
+            base_prefix: input.base_prefix.clone(),
+        }
+        .validate(1)?;
+        if input.bucket_incarnation.is_nil() {
+            return Err(s3_error!(InvalidRequest, "invalid artifact backup retention incarnation"));
+        }
+        let store = request_store(&req)?;
+        owner_for_resource(
+            &req,
+            AdminAction::RetainPluginArtifactBackupsAction,
+            AdminResourceScope::bucket(&input.bucket),
+        )
+        .await?;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            store.retain_artifact_backups(&input.bucket, input.bucket_incarnation, &input.base_prefix),
+        )
+        .await
+        .map_err(|_| unconfirmed())?
+        .map_err(|_| unconfirmed())?;
+        response(&BackupRetentionReceipt {
+            version: 1,
+            bucket: input.bucket,
+            base_prefix: input.base_prefix,
+            bucket_incarnation: input.bucket_incarnation,
+            backup_retained: true,
         })
     }
 }

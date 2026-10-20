@@ -1480,6 +1480,9 @@ impl ECStore {
             }
         };
         if bucket_exists {
+            if !is_meta_bucketname(bucket) {
+                self.require_no_artifact_backup_retention(bucket).await?;
+            }
             validate_table_bucket_delete_guard(&self.ctx, bucket).await?;
 
             if !opts.force {

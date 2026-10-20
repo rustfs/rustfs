@@ -15,6 +15,7 @@
 //! Persistent artifact attempt fences and exact-version repair retirement.
 //! These records do not authorize object deletion or establish GC eligibility.
 
+mod backup_retention;
 mod delete;
 pub mod inventory;
 #[doc(hidden)]

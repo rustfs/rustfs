@@ -902,7 +902,7 @@ async fn artifact_bucket_inspect_rejections_leave_storage_unchanged() {
     let body = json!({"version":1,"bucket":BUCKET,"base_prefix":"outputs/"});
     for (key, value) in [
         ("unknown", json!(true)),
-        ("version", json!(2)),
+        ("version", json!(4)),
         ("base_prefix", json!(null)),
         ("base_prefix", json!("../")),
     ] {
@@ -1451,17 +1451,20 @@ async fn artifact_delete_inspect_negotiates_without_changing_v1() {
     )
     .expect("inspector policy");
     fixture.iam.set_policy(USER, policy).await.expect("grant inspect authority");
-    for version in [1, 2] {
+    for version in [1, 2, 3] {
         let request = json!({"version":version,"bucket":BUCKET,"base_prefix":"outputs/"});
         let observed = receipt(Inspect.call(fixture.request(&request, Some(USER)), Params::new()).await).await;
         let mut expected = json!({"version":version,"bucket":BUCKET,"base_prefix":"outputs/",
             "bucket_incarnation":fixture.incarnation,"versioning_enabled":true});
-        if version == 2 {
+        if version >= 2 {
             expected["exact_delete_supported"] = json!(true);
+        }
+        if version == 3 {
+            expected["backup_retained"] = json!(false);
         }
         assert_eq!(observed, expected, "A03GC2_INVARIANT explicit capability negotiation");
     }
-    for version in [0, 3] {
+    for version in [0, 4] {
         let request = json!({"version":version,"bucket":BUCKET,"base_prefix":"outputs/"});
         assert_eq!(
             Inspect
@@ -1480,5 +1483,98 @@ async fn artifact_delete_inspect_negotiates_without_changing_v1() {
             .expect_err("create remains version 1")
             .code(),
         &s3s::S3ErrorCode::InvalidRequest
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn artifact_backup_retention_requires_independent_scoped_authority() {
+    let fixture = Fixture::new(prefix()).await;
+    let body = json!({"version":1,"bucket":BUCKET,"base_prefix":"outputs/","bucket_incarnation":fixture.incarnation});
+    for action in [
+        "admin:GetPluginArtifactBucket",
+        "admin:CreatePluginArtifactBucket",
+        "admin:DeletePluginArtifactVersion",
+    ] {
+        fixture.grant_bucket_action(BUCKET, action).await;
+        assert_eq!(
+            RetainBackups
+                .call(fixture.request(&body, Some(USER)), Params::new())
+                .await
+                .expect_err("unrelated action denied")
+                .code(),
+            &s3s::S3ErrorCode::AccessDenied,
+            "O02P3_SEPARATE_BACKUP_AUTHORITY"
+        );
+    }
+    fixture
+        .grant_bucket_action("another-bucket", "admin:RetainPluginArtifactBackups")
+        .await;
+    assert_eq!(
+        RetainBackups
+            .call(fixture.request(&body, Some(USER)), Params::new())
+            .await
+            .expect_err("wrong resource denied")
+            .code(),
+        &s3s::S3ErrorCode::AccessDenied,
+        "O02P3_BACKUP_BUCKET_SCOPE"
+    );
+    fixture.grant_bucket_action(BUCKET, "admin:RetainPluginArtifactBackups").await;
+    let mut mismatch = body.clone();
+    mismatch["bucket_incarnation"] = json!(Uuid::new_v4());
+    assert!(
+        RetainBackups
+            .call(fixture.request(&mismatch, Some(USER)), Params::new())
+            .await
+            .is_err(),
+        "O02P3_BACKUP_WRONG_GENERATION"
+    );
+    assert!(
+        !fixture
+            .store
+            .inspect_artifact_backup_retention(BUCKET, fixture.incarnation, "outputs/")
+            .await
+            .expect("still unprotected")
+    );
+    let mut unknown = body.clone();
+    unknown["retain"] = json!(false);
+    assert!(
+        RetainBackups
+            .call(fixture.request(&unknown, Some(USER)), Params::new())
+            .await
+            .is_err(),
+        "O02P3_NO_UNRETAIN_PROTOCOL"
+    );
+    for _ in 0..2 {
+        let observed = receipt(RetainBackups.call(fixture.request(&body, Some(USER)), Params::new()).await).await;
+        assert_eq!(
+            observed,
+            json!({"version":1,"bucket":BUCKET,"base_prefix":"outputs/","bucket_incarnation":fixture.incarnation,"backup_retained":true}),
+            "O02P3_DURABLE_RETENTION_RECEIPT"
+        );
+    }
+    fixture.grant_bucket_action(BUCKET, "admin:GetPluginArtifactBucket").await;
+    for version in [1, 2, 3] {
+        let request = json!({"version":version,"bucket":BUCKET,"base_prefix":"outputs/"});
+        let observed = receipt(Inspect.call(fixture.request(&request, Some(USER)), Params::new()).await).await;
+        if version == 3 {
+            assert_eq!(observed["backup_retained"], true);
+        } else {
+            assert!(observed.get("backup_retained").is_none(), "O02P3_INSPECT_LEGACY_SHAPE");
+        }
+    }
+    assert!(
+        fixture
+            .store
+            .delete_bucket(
+                BUCKET,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err(),
+        "O02P3_RETAINED_BUCKET_CANNOT_RECREATE"
     );
 }

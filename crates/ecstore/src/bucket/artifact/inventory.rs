@@ -120,8 +120,7 @@ impl ECStore {
         // Observation reads bypass cache and suppress physical read repair.
         let path = BucketMetadata::new(bucket).save_file_path();
         let (bytes, _) = read_config_observation(store.clone(), &path, 64 * 1024 * 1024).await?;
-        BucketMetadata::check_header(&bytes)?;
-        let mut metadata = BucketMetadata::unmarshal(&bytes[4..])?;
+        let mut metadata = BucketMetadata::decode_file(&bytes)?;
         let (sidecar, _) =
             read_config_observation(store, &format!("{BUCKET_META_PREFIX}/{bucket}/{BUCKET_INCARNATION_FILE}"), 16).await?;
         if metadata.name != bucket

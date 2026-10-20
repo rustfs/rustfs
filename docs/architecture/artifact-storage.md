@@ -652,8 +652,9 @@ described above.
 
 Bucket creation does not change STS vending. Existing v1
 vending requires input and output to share the delegation's bucket;
-cross-bucket output credentials need a separate change. GC remains disabled
-until the remaining storage and backup/PITR requirements are satisfied.
+cross-bucket output credentials need a separate change. Bucket creation alone
+does not authorize cleanup or establish backup retention; those require the
+explicit protocols below.
 
 ### Dedicated bucket creation
 
@@ -833,3 +834,53 @@ require `true`. The ordinary `version: 1` inspection response is unchanged, and
 bucket creation still accepts only version 1. The capability check is read-only
 and uses `admin:GetPluginArtifactBucket`. Every later deletion rechecks its
 identity and fences, regardless of this startup observation.
+
+## Permanent backup retention
+
+Backup scheduling is owned by plugin-runner and is disabled by default. Before
+creating a restorable snapshot, the Controller must reserve a permanent
+`BACKUP_GC_DISABLED` database policy and then enable storage protection. This
+storage API does not create a database backup or certify that PostgreSQL WAL is
+complete. A database restored to an older time cannot remove this storage fact.
+
+`POST /rustfs/admin/v3/plugin-artifacts/buckets/retain-backups` accepts exactly:
+
+```json
+{"version":1,"bucket":"plugin-artifacts","base_prefix":"outputs/","bucket_incarnation":"<UUID>"}
+```
+
+It requires the separate bucket-scoped `admin:RetainPluginArtifactBackups`
+action. The response echoes those four fields and adds `backup_retained: true`.
+Unknown fields, a nil/stale incarnation, a wrong prefix, unavailable locks or
+unconfirmed storage fail the request. Retry the same identity after a lost
+response; a timeout does not mean the protection was rolled back. There is no
+unretain endpoint. Turning off backup scheduling leaves existing protection in
+place, and this first mode has no automatic backup expiration or artifact GC.
+
+The storage owner acquires lifecycle WRITE, draining earlier exact DELETE owners,
+then the metadata transaction lock. It validates authoritative metadata and the
+incarnation sidecar, writes the marker with `TailDrained`, and publishes the
+cache only after persistence. The tracked detached owner survives cancellation
+of the HTTP waiter. Exact deletion checks protection under lifecycle READ;
+bucket deletion, including force deletion of an empty bucket, also rejects a
+protected generation. An unreadable metadata record cannot authorize deletion.
+Ordinary metadata updates cannot clear the marker.
+
+Only protected buckets use metadata header version 2. Ordinary buckets retain
+version 1. Old binaries reject version 2 instead of silently ignoring the new
+MessagePack field. The new reader requires agreement between the header and
+marker, a committed managed identity and enabled versioning. Upgrade all serving
+nodes before enabling this irreversible protection; rolling back to an older
+binary does not remove it and may make the protected bucket unavailable.
+
+Inspect with `version: 3` using `admin:GetPluginArtifactBucket`. Its response adds
+`backup_retained` to the version-2 shape. A restore must verify this field is
+true and match the fixed bucket, prefix and incarnation; configuration alone is
+not proof. Version-1 and version-2 response shapes remain unchanged.
+
+This protects versions on the running store against supported cleanup paths. It
+does not replace storage replication or protect against destruction of the
+underlying disks, manual metadata replacement, or an administrator bypassing the
+storage service. Backup/PITR deployment procedures must preserve the same
+artifact store identity and isolate old execution authority before reopening a
+restored Controller.
