@@ -4194,6 +4194,41 @@ fn merge_pool_meta_updates_for_save(
     indices: &[usize],
     operation: &str,
 ) -> Result<()> {
+    merge_pool_meta_updates_for_save_releasing(persisted, current, indices, operation, None)
+}
+
+/// Returns whether `persisted` is still exactly the record a decommission start
+/// committed, with no later write by any writer. Only that start's rollback may
+/// clear such an activation.
+fn is_own_decommission_start_activation(persisted: &PoolStatus, activation: Option<&PoolMeta>, idx: usize) -> bool {
+    activation
+        .and_then(|activation| activation.pools.get(idx))
+        .is_some_and(|activation| PersistedPoolStatus::from(activation) == PersistedPoolStatus::from(persisted))
+}
+
+/// Returns whether a write carrying decommission `generation` would replace a
+/// record that a later operation produced: a later start's generation, or a
+/// clear or start rollback persisted after `generation` began.
+fn is_superseded_decommission_generation(persisted: &PoolStatus, generation: OffsetDateTime) -> bool {
+    match persisted.decommission.as_ref().filter(|info| info.has_decommission_state()) {
+        Some(info) => info
+            .start_time
+            .is_some_and(|persisted_generation| persisted_generation > generation),
+        None => persisted.last_update > generation,
+    }
+}
+
+/// Merges like [`merge_pool_meta_updates_for_save`]. `released_activation` is
+/// the committed save of a decommission start that is rolling itself back: a
+/// persisted active decommission may be cleared only while it still matches
+/// that save exactly.
+fn merge_pool_meta_updates_for_save_releasing(
+    persisted: &mut PoolMeta,
+    current: &PoolMeta,
+    indices: &[usize],
+    operation: &str,
+    released_activation: Option<&PoolMeta>,
+) -> Result<()> {
     if persisted.pools.is_empty() {
         *persisted = current.clone();
         return Ok(());
@@ -4226,6 +4261,7 @@ fn merge_pool_meta_updates_for_save(
             && persisted_pool.decommission.as_ref().is_some_and(|info| {
                 info.has_decommission_state() && is_decommission_active(info.complete, info.failed, info.canceled)
             })
+            && !is_own_decommission_start_activation(persisted_pool, released_activation, idx)
         {
             record_pool_meta_stale_write_rejection("nonterminal_decommission_clear");
             return Err(Error::other(format!(
@@ -4243,6 +4279,20 @@ fn merge_pool_meta_updates_for_save(
                 operation: operation.to_string(),
                 pool_index: idx,
                 reason: "completed or unresolved decommission state cannot be cleared",
+            });
+        }
+        if let Some(generation) = current_pool
+            .decommission
+            .as_ref()
+            .filter(|info| info.has_decommission_state())
+            .and_then(|info| info.start_time)
+            && is_superseded_decommission_generation(persisted_pool, generation)
+        {
+            record_pool_meta_stale_write_rejection("superseded_decommission_generation");
+            return Err(Error::StalePoolMetadataUpdate {
+                operation: operation.to_string(),
+                pool_index: idx,
+                reason: "a later decommission operation superseded this generation",
             });
         }
         if current_pool.last_update < persisted_pool.last_update {
@@ -4706,6 +4756,48 @@ pub fn is_pool_activation_fleet_proof_error(err: &Error) -> bool {
 pub(crate) enum PoolActivationStartKind {
     Rebalance,
     Decommission,
+}
+
+/// Pending injected write conflicts for scoped pool metadata saves, keyed by
+/// the first pool. Each one fails a save attempt after its merge, before any
+/// write, so the save retries against a fresh read.
+#[cfg(test)]
+static POOL_META_SAVE_CONFLICTS_FOR_TEST: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, usize>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn inject_pool_meta_save_conflicts_for_test<S>(pool: &Arc<S>, conflicts: usize) {
+    POOL_META_SAVE_CONFLICTS_FOR_TEST
+        .get_or_init(Default::default)
+        .lock()
+        .expect("pool metadata save conflict injection should not be poisoned")
+        .insert(pool_activation_test_pool_key(pool), conflicts);
+}
+
+#[cfg(test)]
+pub(crate) fn remaining_pool_meta_save_conflicts_for_test<S>(pool: &Arc<S>) -> usize {
+    POOL_META_SAVE_CONFLICTS_FOR_TEST
+        .get_or_init(Default::default)
+        .lock()
+        .expect("pool metadata save conflict injection should not be poisoned")
+        .get(&pool_activation_test_pool_key(pool))
+        .copied()
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn take_pool_meta_save_conflict_for_test<S>(pool: &Arc<S>) -> bool {
+    let mut conflicts = POOL_META_SAVE_CONFLICTS_FOR_TEST
+        .get_or_init(Default::default)
+        .lock()
+        .expect("pool metadata save conflict injection should not be poisoned");
+    match conflicts.get_mut(&pool_activation_test_pool_key(pool)) {
+        Some(remaining) if *remaining > 0 => {
+            *remaining -= 1;
+            true
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -9239,7 +9331,7 @@ impl PoolMeta {
         let mut transaction_arm = write_state.arm_transaction();
         let fence = PoolMetaPersistenceFence::Activation(activation_fence);
         let committed = self
-            .save_no_lock_transaction(pools, write_state, &fence, Some(indices), &mut transaction_arm)
+            .save_no_lock_transaction(pools, write_state, &fence, Some(indices), None, &mut transaction_arm)
             .await
             .map_err(|err| transaction_arm.failure(err))?;
         if transaction_arm.phase.is_some() {
@@ -9280,7 +9372,35 @@ impl PoolMeta {
         // sticky recovery gate.
         let mut transaction_arm = write_state.arm_transaction();
         let committed = self
-            .save_no_lock_transaction(pools, write_state, &fence, indices, &mut transaction_arm)
+            .save_no_lock_transaction(pools, write_state, &fence, indices, None, &mut transaction_arm)
+            .await
+            .map_err(|err| transaction_arm.failure(err))?;
+        if transaction_arm.phase.is_some() {
+            transaction_arm.phase = Some("publication");
+        }
+        Ok(PoolMetaSaveOutcome {
+            transaction_arm,
+            committed,
+        })
+    }
+
+    /// Saves a decommission start's rollback. Only this save may clear the
+    /// start's own `activation` while it is still persisted unchanged.
+    async fn save_no_lock_armed_start_rollback<S>(
+        &self,
+        pools: Vec<Arc<S>>,
+        write_state: &mut PoolMetaWriteState,
+        fence: PoolMetaPersistenceFence<'_>,
+        indices: &[usize],
+        activation: &PoolMeta,
+    ) -> Result<PoolMetaSaveOutcome>
+    where
+        S: EcstoreObjectIO,
+    {
+        write_state.ensure_write_safe("pool metadata save failed")?;
+        let mut transaction_arm = write_state.arm_transaction();
+        let committed = self
+            .save_no_lock_transaction(pools, write_state, &fence, Some(indices), Some(activation), &mut transaction_arm)
             .await
             .map_err(|err| transaction_arm.failure(err))?;
         if transaction_arm.phase.is_some() {
@@ -9298,6 +9418,7 @@ impl PoolMeta {
         write_state: &mut PoolMetaWriteState,
         fence: &PoolMetaPersistenceFence<'_>,
         indices: Option<&[usize]>,
+        released_activation: Option<&PoolMeta>,
         transaction_arm: &mut PoolMetaTransactionArm,
     ) -> Result<PoolMeta>
     where
@@ -9311,7 +9432,7 @@ impl PoolMeta {
         }
         for attempt in 0..POOL_META_CAS_MAX_ATTEMPTS {
             match self
-                .save_no_lock_transaction_once(pools.clone(), write_state, fence, indices, transaction_arm)
+                .save_no_lock_transaction_once(pools.clone(), write_state, fence, indices, released_activation, transaction_arm)
                 .await
             {
                 Ok(committed) => return Ok(committed),
@@ -9328,6 +9449,7 @@ impl PoolMeta {
         write_state: &mut PoolMetaWriteState,
         fence: &PoolMetaPersistenceFence<'_>,
         indices: Option<&[usize]>,
+        released_activation: Option<&PoolMeta>,
         transaction_arm: &mut PoolMetaTransactionArm,
     ) -> Result<PoolMeta>
     where
@@ -9381,7 +9503,17 @@ impl PoolMeta {
                 let mut requested = self.clone();
                 requested.version = selection.meta.version;
                 let mut latest = selection.meta.clone();
-                merge_pool_meta_updates_for_save(&mut latest, &requested, indices, "pool metadata save failed")?;
+                merge_pool_meta_updates_for_save_releasing(
+                    &mut latest,
+                    &requested,
+                    indices,
+                    "pool metadata save failed",
+                    released_activation,
+                )?;
+                #[cfg(test)]
+                if pools.first().is_some_and(take_pool_meta_save_conflict_for_test) {
+                    return Err(Error::PreconditionFailed);
+                }
                 latest
             }
         } else {
@@ -13746,6 +13878,7 @@ impl ECStore {
         let (pool_meta_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "decommission progress save failed")
             .await?;
+        self.ensure_decommission_not_withdrawn(&snapshot, idx).await?;
         let (snapshot, checkpoint) = {
             let rebalance_meta = self.rebalance_meta.read().await.clone();
             let pool_meta = self.pool_meta.read().await;
@@ -13875,11 +14008,24 @@ impl ECStore {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) async fn save_current_pool_meta_for_decommission_start(
         &self,
         indices: &[usize],
         decom_buckets: Vec<DecomBucketInfo>,
     ) -> Result<PoolMeta> {
+        self.save_decommission_start_activation(indices, decom_buckets)
+            .await
+            .map(|(previous_pool_meta, _)| previous_pool_meta)
+    }
+
+    /// Persists a decommission start and returns the pool metadata before it
+    /// with the committed activation, which identifies the start to its rollback.
+    async fn save_decommission_start_activation(
+        &self,
+        indices: &[usize],
+        decom_buckets: Vec<DecomBucketInfo>,
+    ) -> Result<(PoolMeta, PoolMeta)> {
         let mut save_guard = self.pool_meta_save_gate.lock().await;
         save_guard.ensure_write_safe("decommission start failed")?;
         let rebalance_pool = self
@@ -13975,15 +14121,62 @@ impl ECStore {
             publish_pool_meta_updates(&mut pool_meta, &outcome.committed, indices);
         }
         activation_fence.ensure_held()?;
+        let activation = outcome.committed.clone();
         outcome.disarm();
 
-        Ok(previous_pool_meta)
+        Ok((previous_pool_meta, activation))
     }
 
+    /// Fails with `OperationCanceled` when another node withdrew this pool's
+    /// decommission from `pool.bin`, as a start rollback or a clear does, while
+    /// this node still runs it from its in-memory view. The persisted record is
+    /// adopted, so the local worker stops at its next generation check and the
+    /// watchdog does not resume it.
+    async fn ensure_decommission_not_withdrawn(&self, persisted: &PoolMeta, idx: usize) -> Result<()> {
+        let Some(persisted_pool) = persisted.pools.get(idx) else {
+            return Ok(());
+        };
+        if persisted_pool
+            .decommission
+            .as_ref()
+            .is_some_and(PoolDecommissionInfo::has_decommission_state)
+        {
+            return Ok(());
+        }
+        let mut pool_meta = self.pool_meta.write().await;
+        let runs_locally = pool_meta
+            .pools
+            .get(idx)
+            .and_then(|pool| pool.decommission.as_ref())
+            .is_some_and(|info| {
+                info.has_decommission_state() && is_decommission_active(info.complete, info.failed, info.canceled)
+            });
+        if !runs_locally {
+            return Ok(());
+        }
+        publish_pool_meta_updates(&mut pool_meta, persisted, &[idx]);
+        drop(pool_meta);
+        self.ctx.advance_data_movement_operation_epoch();
+        warn!(
+            event = EVENT_DECOMMISSION_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_POOLS,
+            pool_index = idx,
+            state = "withdrawn",
+            "Decommission stopped because pool metadata no longer records it"
+        );
+        Err(Error::OperationCanceled)
+    }
+
+    /// Restores `previous_pool_meta` for `indices`. The save may clear only
+    /// this start's own `activation`; a later activation or worker checkpoint
+    /// of those pools still rejects it. A canceled record is not an active
+    /// decommission, so a cancel that landed first is cleared as well.
     async fn rollback_decommission_start_after_reload_failure(
         &self,
         movement_gate: &Arc<tokio::sync::RwLock<()>>,
         previous_pool_meta: &PoolMeta,
+        activation: &PoolMeta,
         indices: &[usize],
     ) -> Result<()> {
         let _movement_guard = movement_gate.write().await;
@@ -13993,11 +14186,12 @@ impl ECStore {
             .await?;
         rollback_start_decommission_pool_meta(&mut snapshot, previous_pool_meta, indices);
         let outcome = snapshot
-            .save_no_lock_armed(
+            .save_no_lock_armed_start_rollback(
                 self.pools.clone(),
                 &mut save_guard,
                 PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
                 indices,
+                activation,
             )
             .await?;
         let mut pool_meta = self.pool_meta.write().await;
@@ -14925,6 +15119,7 @@ impl ECStore {
             let (pool_meta_guard, mut snapshot) = self
                 .acquire_pool_meta_write_guard(&mut save_guard, "decommission promotion failed")
                 .await?;
+            self.ensure_decommission_not_withdrawn(&snapshot, idx).await?;
             let rebalance_meta = self.rebalance_meta.read().await.clone();
             let capacity_infos = if self.pools.is_empty() {
                 Vec::new()
@@ -18502,9 +18697,7 @@ impl ECStore {
             Vec::new()
         };
 
-        let previous_pool_meta = self
-            .save_current_pool_meta_for_decommission_start(&indices, decom_buckets)
-            .await?;
+        let (previous_pool_meta, activation) = self.save_decommission_start_activation(&indices, decom_buckets).await?;
         self.ctx.advance_data_movement_operation_epoch();
         // The local durable transition is now fenced. Release the writer
         // before any peer RPC; remote reload must not block scanner admission.
@@ -18534,7 +18727,7 @@ impl ECStore {
             );
 
             let rollback_result = self
-                .rollback_decommission_start_after_reload_failure(&movement_gate, &previous_pool_meta, &indices)
+                .rollback_decommission_start_after_reload_failure(&movement_gate, &previous_pool_meta, &activation, &indices)
                 .await;
             if let Err(rollback_save_err) = rollback_result {
                 error!(
@@ -21299,25 +21492,29 @@ mod tests {
             );
             assert!(!store.has_active_local_decommission_worker().await);
 
-            // Known gap, tracked in rustfs/backlog#2873: the rollback save
-            // is refused by the pool metadata stale-write guard, which
-            // never lets a persisted active decommission be cleared, so
-            // the pool stays active without a worker. Update this when the
-            // start rollback can clear its own activation.
+            // The rollback clears the start's own activation, so the pool is
+            // back at its baseline instead of active without a worker.
             let persisted = load_pool_meta_replicas(store.pools.clone(), true)
                 .await
                 .expect("pool metadata should stay readable");
             assert!(
-                persisted_decommission(&persisted).is_some_and(PoolDecommissionInfo::has_decommission_state),
-                "the stale-write guard currently keeps the rollback from clearing the start"
+                !persisted_decommission(&persisted).is_some_and(PoolDecommissionInfo::has_decommission_state),
+                "the rollback must clear the start's own activation"
+            );
+            assert!(
+                !store.pool_meta.read().await.pools[0]
+                    .decommission
+                    .as_ref()
+                    .is_some_and(PoolDecommissionInfo::has_decommission_state),
+                "the leader's in-memory pool metadata must be back at its baseline"
             );
         });
     }
 
     #[test]
     #[serial_test::serial]
-    fn decommission_start_reports_a_failed_rollback_of_a_fresh_start() {
-        run_decommission_start_test("decommission_start_reports_a_failed_rollback_of_a_fresh_start", || async {
+    fn decommission_start_rolls_back_a_fresh_start_after_reload_failure() {
+        run_decommission_start_test("decommission_start_rolls_back_a_fresh_start_after_reload_failure", || async {
             let (_temp_dirs, store, _other_store) = startable_decommission_store().await;
             fail_next_decommission_start_reload_for_test(store.id);
             let rx = CancellationToken::new();
@@ -21326,14 +21523,278 @@ mod tests {
                 .decommission(rx.clone(), vec![0])
                 .await
                 .expect_err("a failed peer reload must fail the start");
-            // Known gap, tracked in rustfs/backlog#2873: the rollback runs but
-            // the stale-write guard refuses to clear the fresh activation.
+            let message = err.to_string();
+            assert!(message.contains("decommission start rollback succeeded"), "{message}");
+            assert!(
+                !persisted_decommission(
+                    &load_pool_meta_replicas(store.pools.clone(), true)
+                        .await
+                        .expect("pool metadata should stay readable"),
+                )
+                .is_some_and(PoolDecommissionInfo::has_decommission_state),
+                "a rolled back fresh start must leave the pool at its baseline"
+            );
+            assert!(!store.has_active_local_decommission_worker().await);
+            rx.cancel();
+        });
+    }
+
+    /// Starts decommissioning pool 0 with a peer reload that will fail, and
+    /// returns once the activation is persisted and the start is paused
+    /// before that reload.
+    async fn start_paused_before_failing_reload(
+        store: &Arc<ECStore>,
+        rx: &CancellationToken,
+    ) -> (tokio::task::JoinHandle<Result<()>>, Arc<DecommissionStartPause>) {
+        let reload = install_decommission_start_pause_for_test(store.id, DecommissionStartPausePoint::PeerReload);
+        fail_next_decommission_start_reload_for_test(store.id);
+        let start = tokio::spawn({
+            let store = Arc::clone(store);
+            let rx = rx.clone();
+            async move { store.decommission(rx, vec![0]).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), reload.reached.notified())
+            .await
+            .expect("the start should persist its activation and reach its peer reload");
+        (start, reload)
+    }
+
+    async fn finish_start_with_failed_reload(
+        start: tokio::task::JoinHandle<Result<()>>,
+        reload: &DecommissionStartPause,
+    ) -> String {
+        reload.proceed.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(10), start)
+            .await
+            .expect("the start should finish")
+            .expect("the start task should not panic")
+            .expect_err("a failed peer reload must fail the start")
+            .to_string()
+    }
+
+    async fn assert_pool_zero_at_baseline(store: &ECStore, context: &str) {
+        let persisted = load_pool_meta_replicas(store.pools.clone(), true)
+            .await
+            .expect("pool metadata should stay readable");
+        assert!(
+            !persisted_decommission(&persisted).is_some_and(PoolDecommissionInfo::has_decommission_state),
+            "{context}: pool.bin must keep pool 0 at its baseline"
+        );
+    }
+
+    fn local_decommission_state(pool_meta: &PoolMeta) -> Option<&PoolDecommissionInfo> {
+        pool_meta.pools[0]
+            .decommission
+            .as_ref()
+            .filter(|info| info.has_decommission_state())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_start_rollback_withdraws_a_peer_queued_promotion() {
+        run_decommission_start_test("decommission_start_rollback_withdraws_a_peer_queued_promotion", || async {
+            let (_temp_dirs, store, peer) = startable_decommission_store().await;
+            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+            set_decommission_capacity_info_overrides_for_test(
+                peer.id,
+                vec![vec![
+                    DecommissionPoolCapacityInfo::for_test(0, layout, 0, 100, 100),
+                    DecommissionPoolCapacityInfo::for_test(1, layout, 200, 200, 0),
+                ]],
+            );
+            let rx = CancellationToken::new();
+            let (start, reload) = start_paused_before_failing_reload(&store, &rx).await;
+
+            // The peer reloads the activation before the leader rolls back.
+            // The two-pool fixture cannot hold a queued entry (the last pool
+            // must stay active), so the peer's entry is marked queued in
+            // memory, as a peer that orders the queue differently would see it.
+            peer.reload_pool_meta().await.expect("the peer should reload the activation");
+            {
+                let mut pool_meta = peer.pool_meta.write().await;
+                let info = pool_meta.pools[0]
+                    .decommission
+                    .as_mut()
+                    .expect("the peer should see the activation");
+                info.queued = true;
+                info.start_time = None;
+            }
+
+            let message = finish_start_with_failed_reload(start, &reload).await;
+            assert!(message.contains("decommission start rollback succeeded"), "{message}");
+
+            // The peer's worker now tries to promote the queued entry.
+            let err = peer
+                .promote_queued_decommission_for_test(0)
+                .await
+                .expect_err("a peer must not promote an entry the leader rolled back");
+            assert!(matches!(err, Error::OperationCanceled), "{err:?}");
+            assert_pool_zero_at_baseline(&store, "after the peer's promotion attempt").await;
+            assert!(
+                local_decommission_state(&*peer.pool_meta.read().await).is_none(),
+                "the peer must adopt the rolled back record"
+            );
+            rx.cancel();
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_start_rollback_fences_a_peer_worker_that_started_before_it() {
+        run_decommission_start_test("decommission_start_rollback_fences_a_peer_worker_that_started_before_it", || async {
+            let (_temp_dirs, store, peer) = startable_decommission_store().await;
+            let rx = CancellationToken::new();
+            let (start, reload) = start_paused_before_failing_reload(&store, &rx).await;
+
+            peer.reload_pool_meta().await.expect("the peer should reload the activation");
+            let generation = local_decommission_state(&*peer.pool_meta.read().await)
+                .and_then(|info| info.start_time)
+                .expect("the peer should see the activation generation");
+
+            let message = finish_start_with_failed_reload(start, &reload).await;
+            assert!(message.contains("decommission start rollback succeeded"), "{message}");
+
+            // A worker of that generation checkpoints after the rollback.
+            {
+                let mut pool_meta = peer.pool_meta.write().await;
+                pool_meta.pools[0].last_update = OffsetDateTime::now_utc() + Duration::seconds(1);
+                if let Some(info) = pool_meta.pools[0].decommission.as_mut() {
+                    info.items_decommissioned += 1;
+                }
+            }
+            let err = peer
+                .save_current_pool_meta_for_test(&[0])
+                .await
+                .expect_err("a write of the rolled back generation must not reactivate the pool");
+            assert!(err.to_string().contains("superseded this generation"), "{err}");
+            assert_pool_zero_at_baseline(&store, "after the peer's stale write").await;
+
+            // Its progress checkpoint stops it and adopts the rolled back record.
+            let err = peer
+                .save_decommission_progress_checkpoint_at(0, generation, OffsetDateTime::now_utc())
+                .await
+                .expect_err("the peer worker must stop once its decommission is withdrawn");
+            assert!(matches!(err, Error::OperationCanceled), "{err:?}");
+            assert!(
+                local_decommission_state(&*peer.pool_meta.read().await).is_none(),
+                "the peer must adopt the rolled back record"
+            );
+            assert_pool_zero_at_baseline(&store, "after the peer's checkpoint").await;
+            rx.cancel();
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_start_rollback_clears_a_cancel_of_its_own_start() {
+        run_decommission_start_test("decommission_start_rollback_clears_a_cancel_of_its_own_start", || async {
+            let (_temp_dirs, store, _peer) = startable_decommission_store().await;
+            let rx = CancellationToken::new();
+            let (start, reload) = start_paused_before_failing_reload(&store, &rx).await;
+
+            // A cancel lands before the rollback and persists a canceled
+            // terminal record. Neither stale-write guard covers a canceled
+            // record, so the rollback restores the baseline over it.
+            {
+                let mut pool_meta = store.pool_meta.write().await;
+                let pool = &mut pool_meta.pools[0];
+                pool.last_update = OffsetDateTime::now_utc() + Duration::seconds(1);
+                let info = pool.decommission.as_mut().expect("the activation should be published");
+                info.canceled = true;
+                info.start_time = None;
+            }
+            store
+                .save_current_pool_meta_for_test(&[0])
+                .await
+                .expect("the cancel should persist");
+
+            let message = finish_start_with_failed_reload(start, &reload).await;
+            assert!(message.contains("decommission start rollback succeeded"), "{message}");
+            assert_pool_zero_at_baseline(&store, "after rolling back over a cancel").await;
+            rx.cancel();
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_start_rollback_keeps_its_identity_across_a_write_conflict() {
+        run_decommission_start_test("decommission_start_rollback_keeps_its_identity_across_a_write_conflict", || async {
+            let (_temp_dirs, store, _peer) = startable_decommission_store().await;
+            let rx = CancellationToken::new();
+            let (start, reload) = start_paused_before_failing_reload(&store, &rx).await;
+
+            // The rollback's first save attempt loses its write race and
+            // retries; the retry must still be allowed to clear the activation.
+            inject_pool_meta_save_conflicts_for_test(&store.pools[0], 1);
+            let message = finish_start_with_failed_reload(start, &reload).await;
+            let remaining = remaining_pool_meta_save_conflicts_for_test(&store.pools[0]);
+            inject_pool_meta_save_conflicts_for_test(&store.pools[0], 0);
+            assert_eq!(remaining, 0, "the rollback save must have hit the injected conflict");
+            assert!(message.contains("decommission start rollback succeeded"), "{message}");
+            assert_pool_zero_at_baseline(&store, "after a retried rollback").await;
+            rx.cancel();
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_start_rollback_does_not_clear_an_activation_it_did_not_write() {
+        run_decommission_start_test("decommission_start_rollback_does_not_clear_an_activation_it_did_not_write", || async {
+            let (_temp_dirs, store, _other_store) = startable_decommission_store().await;
+            let reload = install_decommission_start_pause_for_test(store.id, DecommissionStartPausePoint::PeerReload);
+            fail_next_decommission_start_reload_for_test(store.id);
+            let rx = CancellationToken::new();
+
+            let start = tokio::spawn({
+                let store = Arc::clone(&store);
+                let rx = rx.clone();
+                async move { store.decommission(rx, vec![0]).await }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(30), reload.reached.notified())
+                .await
+                .expect("the start should persist its activation and reach its peer reload");
+
+            // Another writer replaces the activation before the rollback runs,
+            // as a later start that reused the pool would.
+            let other_start = {
+                let mut pool_meta = store.pool_meta.write().await;
+                let pool = &mut pool_meta.pools[0];
+                let own_start = pool
+                    .decommission
+                    .as_ref()
+                    .and_then(|info| info.start_time)
+                    .expect("the start's activation should be published locally");
+                let other_start = std::cmp::max(OffsetDateTime::now_utc(), own_start + Duration::seconds(1));
+                pool.last_update = other_start;
+                if let Some(info) = pool.decommission.as_mut() {
+                    info.start_time = Some(other_start);
+                }
+                other_start
+            };
+            store
+                .save_current_pool_meta_for_test(&[0])
+                .await
+                .expect("the other activation should persist");
+
+            reload.proceed.notify_one();
+            let err = tokio::time::timeout(std::time::Duration::from_secs(10), start)
+                .await
+                .expect("the start should finish")
+                .expect("the start task should not panic")
+                .expect_err("a failed peer reload must fail the start");
             let message = err.to_string();
             assert!(
                 message.contains("rollback save failed") && message.contains("cannot be cleared"),
                 "{message}"
             );
-            assert!(!store.has_active_local_decommission_worker().await);
+            let persisted = load_pool_meta_replicas(store.pools.clone(), true)
+                .await
+                .expect("pool metadata should stay readable");
+            assert_eq!(
+                persisted_decommission(&persisted).and_then(|info| info.start_time),
+                Some(other_start),
+                "the rollback must leave another writer's activation in place"
+            );
             rx.cancel();
         });
     }
@@ -27221,8 +27682,8 @@ mod pools_tests {
         grow_decommission_target_reservation, guard_decommission_cancelers, has_active_decommission_canceler,
         is_decommission_active, is_decommission_cancel_requested, load_decommission_entry_versions,
         local_decommission_queue_prefix, mark_decommission_bucket_done, merge_decommission_durable_ilm_receipts,
-        merge_pool_meta_updates_for_save, merge_pool_status_refresh, missing_decommission_worker_prefix,
-        next_decommission_capacity_generation, observe_decommission_terminal_reload_result,
+        merge_pool_meta_updates_for_save, merge_pool_meta_updates_for_save_releasing, merge_pool_status_refresh,
+        missing_decommission_worker_prefix, next_decommission_capacity_generation, observe_decommission_terminal_reload_result,
         parse_decommission_durable_ilm_receipt_path, pool_meta_has_active_decommission, publish_pool_meta_updates,
         read_pool_meta_replica, reconcile_decommission_meta_buckets, reconcile_decommission_unresolved_entries_for_completion,
         record_decommission_unresolved_entry, recover_decommission_capacity_reservations,
@@ -30177,6 +30638,116 @@ mod pools_tests {
         );
         assert_eq!(persisted.pools[1].last_update, newer);
         assert!(persisted.pools[1].decommission.as_ref().is_some_and(|info| info.failed));
+    }
+
+    #[test]
+    fn test_pool_meta_save_merge_rejects_a_superseded_decommission_generation() {
+        let generation = OffsetDateTime::from_unix_timestamp(2_000).expect("test timestamp should be valid");
+        let cleared_at = generation + Duration::seconds(1);
+        let worker_write_at = generation + Duration::seconds(2);
+        let pool_with = |last_update: OffsetDateTime, start_time: Option<OffsetDateTime>| PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update,
+                decommission: start_time.map(|start_time| PoolDecommissionInfo {
+                    start_time: Some(start_time),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+        let worker_write = pool_with(worker_write_at, Some(generation));
+
+        // A clear or rollback persisted after the generation began.
+        let mut persisted = pool_with(cleared_at, None);
+        let err = merge_pool_meta_updates_for_save(&mut persisted, &worker_write, &[0], "worker")
+            .expect_err("a worker of a withdrawn generation must not reactivate the pool");
+        assert!(err.to_string().contains("superseded this generation"), "{err}");
+        assert!(persisted.pools[0].decommission.is_none());
+
+        // A later start owns the pool.
+        let later = generation + Duration::milliseconds(1500);
+        let mut persisted = pool_with(later, Some(later));
+        let err = merge_pool_meta_updates_for_save(&mut persisted, &worker_write, &[0], "worker")
+            .expect_err("a worker must not overwrite a later start");
+        assert!(err.to_string().contains("superseded this generation"), "{err}");
+
+        // A fresh start after the clear and the same generation's own
+        // checkpoints still merge.
+        let fresh_start = pool_with(worker_write_at, Some(worker_write_at));
+        let mut persisted = pool_with(cleared_at, None);
+        merge_pool_meta_updates_for_save(&mut persisted, &fresh_start, &[0], "start")
+            .expect("a start after the clear must be able to activate the pool");
+        let mut persisted = pool_with(generation, Some(generation));
+        merge_pool_meta_updates_for_save(&mut persisted, &worker_write, &[0], "worker")
+            .expect("a worker must checkpoint its own generation");
+    }
+
+    #[test]
+    fn test_pool_meta_save_merge_releases_only_the_unchanged_own_start_activation() {
+        let before = OffsetDateTime::from_unix_timestamp(1_000).expect("test timestamp should be valid");
+        let started = OffsetDateTime::from_unix_timestamp(2_000).expect("test timestamp should be valid");
+        let rolled_back = OffsetDateTime::from_unix_timestamp(3_000).expect("test timestamp should be valid");
+        let baseline = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: before,
+                decommission: None,
+            }],
+            ..Default::default()
+        };
+        let activation_at = |start: OffsetDateTime| {
+            let mut meta = baseline.clone();
+            meta.pools[0].last_update = start;
+            meta.pools[0].decommission = Some(PoolDecommissionInfo {
+                start_time: Some(start),
+                ..Default::default()
+            });
+            meta
+        };
+        let own = activation_at(started);
+        let mut rollback = baseline.clone();
+        rollback.pools[0].last_update = rolled_back;
+
+        // The start's own activation, still persisted unchanged, is cleared.
+        let mut persisted = own.clone();
+        merge_pool_meta_updates_for_save_releasing(&mut persisted, &rollback, &[0], "rollback", Some(&own))
+            .expect("a start must be able to roll back its own unchanged activation");
+        assert!(persisted.pools[0].decommission.is_none());
+        assert_eq!(persisted.pools[0].last_update, rolled_back);
+
+        // Without the start's identity the guard still refuses the clear.
+        let mut persisted = own.clone();
+        let err = merge_pool_meta_updates_for_save(&mut persisted, &rollback, &[0], "stale writer")
+            .expect_err("an anonymous clear of an active decommission must be rejected");
+        assert!(err.to_string().contains("cannot be cleared"), "{err}");
+
+        // Another start's activation is not this start's to clear.
+        let other = activation_at(started + Duration::seconds(1));
+        let mut persisted = other.clone();
+        let err = merge_pool_meta_updates_for_save_releasing(&mut persisted, &rollback, &[0], "rollback", Some(&own))
+            .expect_err("a rollback must not clear an activation written by another start");
+        assert!(err.to_string().contains("cannot be cleared"), "{err}");
+        assert_eq!(persisted.pools[0].last_update, other.pools[0].last_update);
+        assert_eq!(
+            persisted.pools[0].decommission.as_ref().and_then(|info| info.start_time),
+            Some(started + Duration::seconds(1))
+        );
+
+        // Nor is its own activation once any later write changed it.
+        let mut progressed = own.clone();
+        progressed.pools[0].last_update = started + Duration::milliseconds(1);
+        if let Some(info) = progressed.pools[0].decommission.as_mut() {
+            info.items_decommissioned = 1;
+        }
+        let mut persisted = progressed.clone();
+        let err = merge_pool_meta_updates_for_save_releasing(&mut persisted, &rollback, &[0], "rollback", Some(&own))
+            .expect_err("a rollback must not clear an activation that a worker has advanced");
+        assert!(err.to_string().contains("cannot be cleared"), "{err}");
+        assert_eq!(persisted.pools[0].last_update, progressed.pools[0].last_update);
+        assert_eq!(persisted.pools[0].decommission.as_ref().map(|info| info.items_decommissioned), Some(1));
     }
 
     #[test]
@@ -37378,7 +37949,9 @@ mod pools_tests {
         let (_temp_dirs, store, _other_store) =
             crate::services::rebalance::test_three_pool_stores_with_isolated_node_contexts(None).await;
         persist_v3_pool_meta_for_test(&store).await;
-        let now = OffsetDateTime::UNIX_EPOCH + Duration::hours(3);
+        // A start's generation follows the persisted pool records; an older
+        // generation would be rejected as superseded.
+        let now = OffsetDateTime::now_utc();
         let layout = DecommissionErasureLayout { data: 1, parity: 0 };
         let mut queued_reservation = build_decommission_capacity_reservation(
             DecommissionPoolCapacityInfo::for_test(1, layout, 90, 100, 10),
