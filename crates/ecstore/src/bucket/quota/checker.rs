@@ -711,6 +711,11 @@ mod tests {
             .await
             .expect("stats for a ledger-admitted bucket degrade to an absent usage");
         assert_eq!(usage, None);
+        assert_eq!(
+            crate::data_usage::reload_unknown_bucket_usage_calls_for_test(&bucket),
+            0,
+            "reporting a ledger-admitted bucket's usage must not wait for an early snapshot reload"
+        );
 
         // Negative control: the ledger, not the scanner, still refuses an
         // over-limit write with the same error.
@@ -734,7 +739,18 @@ mod tests {
             checker.check_quota(&legacy, QuotaOperation::PutObject, 512).await,
             Err(QuotaError::UsageUnavailable { .. })
         ));
+        assert_eq!(
+            crate::data_usage::reload_unknown_bucket_usage_calls_for_test(&legacy),
+            1,
+            "fail-closed admission takes the early-reload lookup"
+        );
         assert!(matches!(checker.get_quota_stats(&legacy).await, Err(QuotaError::UsageUnavailable { .. })));
+        assert_eq!(crate::data_usage::reload_unknown_bucket_usage_calls_for_test(&legacy), 2);
+        assert_eq!(
+            crate::data_usage::reload_unknown_bucket_usage_calls_for_test(&bucket),
+            0,
+            "ledger-admitted writes never take the early-reload lookup"
+        );
 
         crate::data_usage::prepare_bucket_usage_for_namespace_change(&bucket, None)
             .await

@@ -2375,12 +2375,36 @@ where
     .is_some()
 }
 
+// Calls of `reload_unknown_bucket_usage` per bucket. Unit tests do not run in
+// a distributed deployment, where the reload itself happens, so this is how
+// they tell which lookup a quota caller took.
+#[cfg(test)]
+static RELOAD_UNKNOWN_BUCKET_USAGE_CALLS: LazyLock<std::sync::Mutex<HashMap<String, usize>>> = LazyLock::new(Default::default);
+
+#[cfg(test)]
+pub(crate) fn reload_unknown_bucket_usage_calls_for_test(bucket: &str) -> usize {
+    RELOAD_UNKNOWN_BUCKET_USAGE_CALLS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(bucket)
+        .copied()
+        .unwrap_or(0)
+}
+
 /// Second lookup for a caller that fails closed after [`get_bucket_usage_memory`]
 /// found no usage: in a distributed deployment, reload the cached persisted
 /// snapshot early when it does not cover `bucket` at all, then look the bucket
 /// up again. The reload is awaited and is a full snapshot load, so reporting
 /// paths do not use this.
 pub async fn reload_unknown_bucket_usage(bucket: &str) -> Option<u64> {
+    #[cfg(test)]
+    {
+        *RELOAD_UNKNOWN_BUCKET_USAGE_CALLS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(bucket.to_string())
+            .or_default() += 1;
+    }
     if !runtime_sources::setup_is_dist_erasure().await {
         return None;
     }
@@ -4354,6 +4378,51 @@ mod tests {
             .await
             .expect("an older early reload must keep the cached snapshot");
         assert_eq!(cached.buckets_usage.get("existing").map(|usage| usage.size), Some(10));
+        clear_unknown_bucket_reload_attempt_for_test();
+        invalidate_data_usage_snapshot_cache().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn early_reload_rejects_a_snapshot_without_last_update() {
+        // With both the primary and the `.bkp` copy missing, the loader returns
+        // an empty snapshot without `last_update`. Installing it over a good
+        // copy would make every bucket unknown and fail snapshot-protocol
+        // admission closed.
+        let cached = data_usage_info_for_test("existing", 1, 10, SystemTime::UNIX_EPOCH + Duration::from_secs(2));
+        install_data_usage_snapshot_cache_for_test(cached, Duration::from_secs(DATA_USAGE_UNKNOWN_BUCKET_REFRESH_SECS)).await;
+        clear_unknown_bucket_reload_attempt_for_test();
+
+        assert!(
+            !reload_snapshot_for_unknown_bucket("created-later", || async {
+                Ok(loaded_usage_for_test(DataUsageInfo::default()))
+            })
+            .await
+        );
+        assert_eq!(
+            cached_bucket_size_for_test("existing").await,
+            Some(10),
+            "a snapshot without last_update must not replace a dated one"
+        );
+        clear_unknown_bucket_reload_attempt_for_test();
+        invalidate_data_usage_snapshot_cache().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn early_reload_accepts_a_snapshot_with_the_same_last_update() {
+        let last_update = SystemTime::UNIX_EPOCH + Duration::from_secs(2);
+        let cached = data_usage_info_for_test("existing", 1, 10, last_update);
+        install_data_usage_snapshot_cache_for_test(cached, Duration::from_secs(DATA_USAGE_UNKNOWN_BUCKET_REFRESH_SECS)).await;
+        clear_unknown_bucket_reload_attempt_for_test();
+
+        let same_age = usage_snapshot_with_new_bucket(last_update, 10);
+        assert!(reload_snapshot_for_unknown_bucket("created-later", || async { Ok(loaded_usage_for_test(same_age)) }).await);
+        assert_eq!(
+            cached_bucket_size_for_test("created-later").await,
+            Some(1024),
+            "a snapshot as recent as the cached one must be accepted"
+        );
         clear_unknown_bucket_reload_attempt_for_test();
         invalidate_data_usage_snapshot_cache().await;
     }
