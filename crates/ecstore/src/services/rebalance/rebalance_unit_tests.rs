@@ -361,6 +361,51 @@ async fn test_migrate_entry_version_remote_not_found_is_cleanup_ignored() {
     assert_eq!(backend.get_calls(), 0);
 }
 
+/// A tier free version reads as a delete marker with no transition status; it
+/// must still move as tier metadata so its remote owner reaches the target.
+#[tokio::test]
+async fn test_migrate_entry_version_moves_tier_free_version_as_remote_metadata() {
+    let backend = MigrationBackendSpy::new(None, None);
+    let mut version = FileInfo {
+        name: "object.bin".to_string(),
+        version_id: Some(uuid::Uuid::new_v4()),
+        deleted: true,
+        transition_tier: "WARM".to_string(),
+        transitioned_objname: "remote/object.bin".to_string(),
+        ..Default::default()
+    };
+    version.set_tier_free_version();
+    assert!(!version.is_remote());
+    let delete_marker_calls = Arc::new(AtomicUsize::new(0));
+    let delete_marker = {
+        let delete_marker_calls = delete_marker_calls.clone();
+        move |_: String, _: String, _: ObjectOptions| {
+            delete_marker_calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok::<_, Error>(ObjectInfo::default()) }
+        }
+    };
+
+    let result = migrate_entry_version(
+        &backend,
+        "bucket".to_string(),
+        0,
+        &version,
+        version.version_id.map(|v| v.to_string()),
+        Some(uuid::Uuid::new_v4()),
+        3,
+        false,
+        |_, _, _| async move { Ok(DataMovementCopy::Committed) },
+        delete_marker,
+    )
+    .await;
+
+    assert!(result.moved);
+    assert!(!result.failed);
+    assert_eq!(backend.move_remote_calls(), 1);
+    assert_eq!(delete_marker_calls.load(Ordering::SeqCst), 0, "a free version is no delete marker");
+    assert_eq!(backend.get_calls(), 0);
+}
+
 #[tokio::test]
 async fn test_migrate_entry_version_remote_overwrite_is_not_ignored() {
     let backend = MigrationBackendSpy::new(
