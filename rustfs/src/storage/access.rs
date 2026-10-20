@@ -2218,10 +2218,10 @@ impl S3Access for FS {
 
         let request_context = cx.extensions_mut().get::<RequestContext>().cloned();
 
-        let region = app_context
-            .as_deref()
-            .and_then(|context| context.region().get())
-            .or_else(runtime_sources::current_region);
+        let region = match app_context.as_deref() {
+            Some(context) => context.region().get(),
+            None => runtime_sources::current_region(),
+        };
 
         let req_info = ReqInfo {
             cred,
