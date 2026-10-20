@@ -67,9 +67,9 @@ fn rebalance_remote_tiered_opts(
     }
 }
 
-pub(super) fn rebalance_object_migration_read_opts(version_id: Option<String>) -> ObjectOptions {
+pub(super) fn rebalance_object_migration_read_opts(version: &FileInfo) -> ObjectOptions {
     ObjectOptions {
-        version_id,
+        version_id: Some(crate::data_movement::data_movement_exact_version_id(version.version_id)),
         no_lock: true,
         data_movement: true,
         raw_data_movement_read: true,
@@ -97,6 +97,16 @@ pub(crate) trait MigrationBackend: Send + Sync {
         fi: &FileInfo,
         opts: &ObjectOptions,
     ) -> Result<()>;
+}
+
+/// Replaces a real source read with an injected error, for the object the
+/// closure selects.
+#[cfg(test)]
+pub(super) type RebalanceSourceReadFault = std::sync::Arc<dyn Fn(&str, &str) -> Option<Error> + Send + Sync>;
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static REBALANCE_SOURCE_READ_FAULT: RebalanceSourceReadFault;
 }
 
 pub(crate) struct RebalanceMigrationBackend<'a> {
@@ -129,6 +139,10 @@ impl MigrationBackend for RebalanceMigrationBackend<'_> {
         h: HeaderMap,
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
+        #[cfg(test)]
+        if let Ok(Some(err)) = REBALANCE_SOURCE_READ_FAULT.try_with(|fault| fault(bucket, object)) {
+            return Err(err);
+        }
         self.source.get_object_reader(bucket, object, range, h, opts).await
     }
 
@@ -350,7 +364,7 @@ where
                 &encode_dir_object(&version.name),
                 None,
                 HeaderMap::new(),
-                &rebalance_object_migration_read_opts(version_id.clone()),
+                &rebalance_object_migration_read_opts(version),
             )
             .await
         {

@@ -809,7 +809,9 @@ async fn test_migrate_entry_version_transfer_retries_before_success() {
     assert_eq!(transfer_count.load(Ordering::SeqCst), 2);
     assert_eq!(wait_count.load(Ordering::SeqCst), 1);
     let read_opts = backend.last_get_opts();
-    assert_eq!(read_opts.version_id.as_deref(), version.version_id.map(|id| id.to_string()).as_deref());
+    // `version_normal` is a null version; `None` would read the latest version.
+    assert!(version.version_id.is_none());
+    assert_eq!(read_opts.version_id, Some(uuid::Uuid::nil().to_string()));
     assert!(read_opts.no_lock);
     assert!(read_opts.data_movement);
     assert!(read_opts.raw_data_movement_read);

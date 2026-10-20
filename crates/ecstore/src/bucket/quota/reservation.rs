@@ -2459,7 +2459,10 @@ mod tests {
         }
     }
 
+    // Its writes read the process-wide usage snapshot cache through the
+    // degraded-baseline fallback, which the data-usage cache tests rewrite.
     #[tokio::test]
+    #[serial]
     async fn sharded_reservation_reloads_allocator_after_concurrent_refill() {
         use crate::object_api::PutObjReader;
         use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};

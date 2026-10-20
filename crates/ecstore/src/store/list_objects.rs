@@ -2956,7 +2956,7 @@ async fn read_fallback_listing_disk(
     endpoint: String,
     options: ListingSupplementOptions,
 ) -> Vec<FallbackListingEntry> {
-    let (rd, mut wr) = duplex(64);
+    let (rd, mut wr) = duplex(64 * 1024);
     let walk_endpoint = endpoint.clone();
     let mut walk_jobs = JoinSet::new();
     walk_jobs.spawn(async move {
@@ -3268,11 +3268,23 @@ fn resolve_agreed_listing_entry(
         return ListingEntryResolution::Rejected;
     }
 
-    let cached = match entry.xl_meta() {
+    let cached = match entry.xl_meta_ref() {
         Ok(cached) => cached,
         Err(_) if resolver.obj_quorum <= 1 => return ListingEntryResolution::Resolved(entry),
         Err(_) => return ListingEntryResolution::Rejected,
     };
+    if resolver.requested_versions == 1
+        && let Some(first) = cached.versions.first()
+        && !first.header.free_version()
+        && reader_disks
+            >= first
+                .write_quorum(resolver.obj_quorum)
+                .saturating_sub(resolver.write_quorum_slack)
+                .max(resolver.obj_quorum)
+    {
+        return ListingEntryResolution::Resolved(entry);
+    }
+    let cached = cached.clone();
     let mut selected_versions = Vec::new();
     let mut selected_object_versions = 0;
     let mut first_selected_idx = None;
