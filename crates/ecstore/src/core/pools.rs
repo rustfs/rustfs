@@ -141,6 +141,9 @@ pub(crate) const DECOMMISSION_MUTATION_GATE_MAX_INLINE_ATTEMPTS: usize = 3;
 static DECOMMISSION_OBJECT_ATTEMPTS_MAX: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
 const DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_PREFIX: &str = "target pool ";
 const DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_SUFFIX: &str = " target capacity mutation gate is busy";
+const DECOMMISSION_CAPACITY_TARGET_OVER_BUDGET_PREFIX: &str = "target pool ";
+const DECOMMISSION_CAPACITY_TARGET_OVER_BUDGET_SUFFIX: &str = " is over a temporary-copy budget: ";
+const METRIC_DECOMMISSION_CAPACITY_TARGET_OVER_BUDGET: &str = "rustfs_decommission_capacity_target_over_budget";
 const METRIC_DECOMMISSION_CAPACITY_CONFLICTS_TOTAL: &str = "rustfs_decommission_capacity_conflicts_total";
 const METRIC_DECOMMISSION_CAPACITY_GATE_RETRIES_TOTAL: &str = "rustfs_decommission_capacity_gate_retries_total";
 /// Entry passes and repeated version-copy attempts within a listing and its
@@ -1063,6 +1066,16 @@ pub(crate) fn is_decommission_capacity_target_gate_busy(err: &Error) -> bool {
     decommission_capacity_target_gate_busy_index(err).is_some()
 }
 
+fn decommission_capacity_target_over_budget_index(err: &Error) -> Option<usize> {
+    if let Error::DecommissionCapacityBlocked { message } = err {
+        let (target_pool_index, _) = message
+            .strip_prefix(DECOMMISSION_CAPACITY_TARGET_OVER_BUDGET_PREFIX)?
+            .split_once(DECOMMISSION_CAPACITY_TARGET_OVER_BUDGET_SUFFIX)?;
+        return target_pool_index.parse().ok();
+    }
+    data_movement::data_movement_stage_source(err).and_then(decommission_capacity_target_over_budget_index)
+}
+
 /// How the decommission capacity path must treat a failure.
 ///
 /// Callers decide between retrying, ignoring, and propagating from this single
@@ -1076,6 +1089,10 @@ pub(crate) enum DecommissionCapacityFailure {
     /// Another mutation's durable target capacity intent is still unresolved.
     /// Transient, but converged on a different retry budget than gate contention.
     IntentConflict,
+    /// The target pool went over a temporary-copy budget after this mutation
+    /// selected it. Target selection skips such a pool, so retrying the entry
+    /// places the object elsewhere; it shares the intent-conflict retry budget.
+    TargetOverBudget { target_pool_index: usize },
     /// The mutation is no longer needed: the object or version disappeared, or
     /// an equivalent target already exists. Never counted as a failure.
     BenignContention,
@@ -1100,6 +1117,9 @@ fn classify_decommission_capacity_failure(err: &Error) -> DecommissionCapacityFa
     if let Some(target_pool_index) = decommission_capacity_target_gate_busy_index(err) {
         return DecommissionCapacityFailure::TargetGateBusy { target_pool_index };
     }
+    if let Some(target_pool_index) = decommission_capacity_target_over_budget_index(err) {
+        return DecommissionCapacityFailure::TargetOverBudget { target_pool_index };
+    }
     if is_decommission_capacity_intent_conflict(err) {
         return DecommissionCapacityFailure::IntentConflict;
     }
@@ -1116,7 +1136,10 @@ enum DecommissionCapacityRetryKind {
 
 fn decommission_capacity_retry_kind(err: &Error, intent_conflict_attempt: usize) -> Option<DecommissionCapacityRetryKind> {
     (intent_conflict_attempt < DECOMMISSION_CAPACITY_INTENT_CONFLICT_MAX_ATTEMPTS
-        && matches!(classify_decommission_capacity_failure(err), DecommissionCapacityFailure::IntentConflict))
+        && matches!(
+            classify_decommission_capacity_failure(err),
+            DecommissionCapacityFailure::IntentConflict | DecommissionCapacityFailure::TargetOverBudget { .. }
+        ))
     .then_some(DecommissionCapacityRetryKind::IntentConflict)
 }
 
@@ -1422,6 +1445,14 @@ fn release_decommission_capacity_reservation(info: &mut PoolDecommissionInfo, re
         "pool_index" => reservation.source_pool_index.to_string()
     )
     .set(0.0);
+    for target in &reservation.targets {
+        metrics::gauge!(
+            METRIC_DECOMMISSION_CAPACITY_TARGET_OVER_BUDGET,
+            "pool_index" => reservation.source_pool_index.to_string(),
+            "target_pool_index" => target.pool_index.to_string()
+        )
+        .set(0.0);
+    }
     true
 }
 
@@ -1832,21 +1863,31 @@ fn observe_decommission_capacity_reservation(
     .record(reservation.prediction_error_bytes.unsigned_abs() as f64);
 }
 
-/// A source allocation's temporary-copy budget: the inflight or pending bytes
-/// it may hold on its target pool at once.
-fn decommission_target_temporary_budget(
+/// Rejection of growth into a target pool where this allocation holds more
+/// inflight or pending bytes than its temporary-copy budget. Selection skips
+/// such a pool, so the failure is retryable (`TargetOverBudget`).
+fn decommission_target_over_budget_error(
+    source_index: usize,
     reservation: &DecommissionCapacityReservation,
     target: &DecommissionCapacityTarget,
-) -> usize {
-    target.remaining_reserved_physical_bytes(reservation.temporary_copies) / 1usize.saturating_add(reservation.temporary_copies)
-}
-
-fn decommission_target_exceeds_temporary_budget(
-    reservation: &DecommissionCapacityReservation,
-    target: &DecommissionCapacityTarget,
-) -> bool {
-    let temporary_budget = decommission_target_temporary_budget(reservation, target);
-    target.inflight_physical_bytes > temporary_budget || target.pending_physical_bytes > temporary_budget
+    phase: &str,
+) -> Error {
+    let temporary_budget = target.temporary_copy_budget(reservation.temporary_copies);
+    let detail = if target.inflight_physical_bytes > temporary_budget {
+        format!(
+            "source pool {source_index} target pool {} has {} inflight physical bytes, exceeding its {temporary_budget}-byte temporary-copy reservation during {phase}",
+            target.pool_index, target.inflight_physical_bytes
+        )
+    } else {
+        format!(
+            "source pool {source_index} target pool {} has {} pending physical bytes, exceeding its {temporary_budget}-byte committed-copy reservation during {phase}",
+            target.pool_index, target.pending_physical_bytes
+        )
+    };
+    decommission_capacity_blocked_error(format!(
+        "{DECOMMISSION_CAPACITY_TARGET_OVER_BUDGET_PREFIX}{}{DECOMMISSION_CAPACITY_TARGET_OVER_BUDGET_SUFFIX}{detail}",
+        target.pool_index
+    ))
 }
 
 /// Target pools where an active source's allocation holds more inflight or
@@ -1867,7 +1908,7 @@ fn decommission_over_budget_target_pools(meta: &PoolMeta) -> HashSet<usize> {
             reservation
                 .targets
                 .iter()
-                .filter(|target| decommission_target_exceeds_temporary_budget(reservation, target))
+                .filter(|target| target.exceeds_temporary_copy_budget(reservation.temporary_copies))
                 .map(|target| target.pool_index)
         })
         .collect()
@@ -1917,18 +1958,15 @@ fn ensure_decommission_capacity_reservations_available(
         )
         .set(reservation.remaining_peak_physical_bytes() as f64);
         for target in &reservation.targets {
-            let temporary_budget = decommission_target_temporary_budget(reservation, target);
-            if growth_pool == Some(target.pool_index) && target.inflight_physical_bytes > temporary_budget {
-                return Err(decommission_capacity_blocked_error(format!(
-                    "source pool {source_index} target pool {} has {} inflight physical bytes, exceeding its {temporary_budget}-byte temporary-copy reservation during {phase}",
-                    target.pool_index, target.inflight_physical_bytes
-                )));
-            }
-            if growth_pool == Some(target.pool_index) && target.pending_physical_bytes > temporary_budget {
-                return Err(decommission_capacity_blocked_error(format!(
-                    "source pool {source_index} target pool {} has {} pending physical bytes, exceeding its {temporary_budget}-byte committed-copy reservation during {phase}",
-                    target.pool_index, target.pending_physical_bytes
-                )));
+            let over_budget = target.exceeds_temporary_copy_budget(reservation.temporary_copies);
+            metrics::gauge!(
+                METRIC_DECOMMISSION_CAPACITY_TARGET_OVER_BUDGET,
+                "pool_index" => source_index.to_string(),
+                "target_pool_index" => target.pool_index.to_string()
+            )
+            .set(if over_budget { 1.0 } else { 0.0 });
+            if over_budget && growth_pool == Some(target.pool_index) {
+                return Err(decommission_target_over_budget_error(source_index, reservation, target, phase));
             }
             let required = required_by_target.entry(target.pool_index).or_default();
             *required = required.saturating_add(target.remaining_reserved_physical_bytes(reservation.temporary_copies));
@@ -2235,8 +2273,7 @@ fn reserve_decommission_target_pending(
                 if requested_physical_bytes <= target.pending_physical_bytes {
                     return Ok(0);
                 }
-                let budget = target.remaining_reserved_physical_bytes(reservation.temporary_copies)
-                    / 1usize.saturating_add(reservation.temporary_copies);
+                let budget = target.temporary_copy_budget(reservation.temporary_copies);
                 if requested_physical_bytes > budget {
                     return Err(decommission_capacity_blocked_error(format!(
                         "source pool {source_pool_index} target pool {target_pool_index} mutation intent size changed during retry"
@@ -2256,8 +2293,7 @@ fn reserve_decommission_target_pending(
             }
         }
     }
-    let budget = target.remaining_reserved_physical_bytes(reservation.temporary_copies)
-        / 1usize.saturating_add(reservation.temporary_copies);
+    let budget = target.temporary_copy_budget(reservation.temporary_copies);
     if requested_physical_bytes > budget {
         return Err(decommission_capacity_blocked_error(format!(
             "source pool {source_pool_index} target pool {target_pool_index} mutation requires {requested_physical_bytes} physical bytes, but only {budget} committed-copy bytes remain"
@@ -2572,8 +2608,7 @@ fn decommission_adopted_intent_split(
     let adopted = marker_bytes(decommission_adopted_intent_mutation_id(intent.mutation_id));
     let recorded = staged.saturating_add(adopted);
     let other_inflight = target.inflight_physical_bytes.saturating_sub(recorded);
-    let temporary_budget = target.remaining_reserved_physical_bytes(reservation.temporary_copies)
-        / 1usize.saturating_add(reservation.temporary_copies);
+    let temporary_budget = target.temporary_copy_budget(reservation.temporary_copies);
     let completion = adopted.max(intent.physical_bytes);
     let total = staged
         .saturating_add(completion)
@@ -2685,12 +2720,16 @@ fn decommission_capacity_target_candidate(
 /// another target would leave it behind as inflight bytes. Otherwise the
 /// target with the most remaining allocation wins.
 ///
-/// For an adopted completion the fallback cannot settle the marker: the
-/// target stops fitting the object only when its temporary-copy budget drops
-/// below the object's bytes, which the adopted marker already holds as
-/// inflight. That pool is then over budget and skipped, so the retry lands on
-/// another pool and the adopted marker stays until the reservation is
-/// released, costing only that pool's growth.
+/// The fallback never settles the adopted marker; it stays until the
+/// reservation is released. It happens when the holding pool is over a
+/// temporary-copy budget for any source, or no longer fits the object. For an
+/// adopted completion the second implies the first: the pool stops fitting
+/// the object only when this source's budget there drops below the object's
+/// bytes, which the adopted marker already holds as inflight. Another source
+/// over budget on the same pool also bypasses it; waiting for that source
+/// instead would tie this decommission's progress to another one's ledger,
+/// while the stranded marker costs only this source's growth on a pool that
+/// accepts none.
 fn decommission_reserved_target_choice(
     reservation: &DecommissionCapacityReservation,
     mutation_id: Option<uuid::Uuid>,
@@ -2728,6 +2767,7 @@ fn log_decommission_adopted_target_choice(
     reservation: &DecommissionCapacityReservation,
     owner: DecommissionCapacityOwner,
     chosen_pool_index: usize,
+    over_budget_pools: &HashSet<usize>,
 ) {
     let Some(mutation_id) = owner.mutation_id else {
         return;
@@ -2767,8 +2807,13 @@ fn log_decommission_adopted_target_choice(
             pool_index = owner.source_pool_index,
             target_pool_index = chosen_pool_index,
             adopted_target_pools = ?adopted_target_pools,
+            reason = if adopted_target_pools.iter().any(|pool| over_budget_pools.contains(pool)) {
+                "over_budget"
+            } else {
+                "does_not_fit"
+            },
             mutation_id = %mutation_id,
-            "Decommission retry no longer fits the target that holds its adopted completion"
+            "Decommission retry cannot return to the target that holds its adopted completion"
         );
     }
 }
@@ -2855,8 +2900,7 @@ fn record_decommission_target_consumption(
         .iter_mut()
         .find(|target| target.pool_index == target_pool_index)
         .ok_or_else(|| decommission_capacity_blocked_error("target allocation disappeared during target write"))?;
-    let remaining_target_bytes = target.remaining_reserved_physical_bytes(reservation.temporary_copies)
-        / 1usize.saturating_add(reservation.temporary_copies);
+    let remaining_target_bytes = target.temporary_copy_budget(reservation.temporary_copies);
     let remaining_total_bytes = reservation
         .predicted_physical_bytes
         .saturating_sub(reservation.consumed_target_physical_bytes);
@@ -4582,8 +4626,8 @@ pub(crate) async fn pause_pool_activation_after_durable_save<S>(pool: &Arc<S>, f
 #[cfg(test)]
 struct PoolActivationStartProbeState {
     kind: PoolActivationStartKind,
-    preflight_side_effect_attempted: std::sync::atomic::AtomicBool,
-    attempted: std::sync::atomic::AtomicBool,
+    preflight_side_effect_attempted: AtomicBool,
+    attempted: AtomicBool,
     notify: tokio::sync::Notify,
 }
 
@@ -4601,8 +4645,8 @@ impl PoolActivationStartProbe {
     pub(crate) fn install(kind: PoolActivationStartKind) -> Self {
         let state = Arc::new(PoolActivationStartProbeState {
             kind,
-            preflight_side_effect_attempted: std::sync::atomic::AtomicBool::new(false),
-            attempted: std::sync::atomic::AtomicBool::new(false),
+            preflight_side_effect_attempted: AtomicBool::new(false),
+            attempted: AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
         });
         POOL_ACTIVATION_START_PROBES
@@ -5058,9 +5102,9 @@ enum DecommissionEntryOutcome {
 /// failure stays terminal.
 fn resolve_decommission_entry_failure(err: Error) -> Result<DecommissionEntryOutcome> {
     match classify_decommission_capacity_failure(&err) {
-        DecommissionCapacityFailure::TargetGateBusy { .. } | DecommissionCapacityFailure::IntentConflict => {
-            Ok(DecommissionEntryOutcome::Deferred(err))
-        }
+        DecommissionCapacityFailure::TargetGateBusy { .. }
+        | DecommissionCapacityFailure::IntentConflict
+        | DecommissionCapacityFailure::TargetOverBudget { .. } => Ok(DecommissionEntryOutcome::Deferred(err)),
         DecommissionCapacityFailure::BenignContention => Ok(DecommissionEntryOutcome::Complete),
         DecommissionCapacityFailure::Fatal => Err(err),
     }
@@ -10399,10 +10443,7 @@ fn plan_exact_delete_capacity_reconciliations(
             .targets
             .iter()
             .find(|target| target.pool_index == target_pool_index)
-            .map(|target| {
-                target.remaining_reserved_physical_bytes(reservation.temporary_copies)
-                    / 1usize.saturating_add(reservation.temporary_copies)
-            })
+            .map(|target| target.temporary_copy_budget(reservation.temporary_copies))
             .unwrap_or_default();
         let remaining_total_physical_bytes = reservation
             .predicted_physical_bytes
@@ -10514,6 +10555,17 @@ impl DecommissionCapacityTarget {
             self.consumed_physical_bytes
                 .saturating_mul(1usize.saturating_add(temporary_copies)),
         )
+    }
+
+    /// The inflight or pending bytes this allocation may hold on its target
+    /// pool at once: one object's share of its remaining reservation.
+    fn temporary_copy_budget(&self, temporary_copies: usize) -> usize {
+        self.remaining_reserved_physical_bytes(temporary_copies) / 1usize.saturating_add(temporary_copies)
+    }
+
+    fn exceeds_temporary_copy_budget(&self, temporary_copies: usize) -> bool {
+        let temporary_budget = self.temporary_copy_budget(temporary_copies);
+        self.inflight_physical_bytes > temporary_budget || self.pending_physical_bytes > temporary_budget
     }
 }
 
@@ -10777,6 +10829,8 @@ struct DecommissionCapacityLockOrderBarrierState {
     target_gate_inline_retry_entries: AtomicUsize,
     target_gate_exact_reloads: AtomicUsize,
     target_gate_acquire_pause_target: AtomicUsize,
+    target_gate_acquire_pause_skips: AtomicUsize,
+    target_gate_acquire_pause_once: AtomicBool,
     target_gate_acquire_entered: tokio::sync::Notify,
     target_gate_acquire_release: tokio::sync::Notify,
     cancel_before_start_entered: tokio::sync::Notify,
@@ -10822,6 +10876,8 @@ impl DecommissionCapacityLockOrderBarrier {
             target_gate_inline_retry_entries: AtomicUsize::new(0),
             target_gate_exact_reloads: AtomicUsize::new(0),
             target_gate_acquire_pause_target: AtomicUsize::new(usize::MAX),
+            target_gate_acquire_pause_skips: AtomicUsize::new(0),
+            target_gate_acquire_pause_once: AtomicBool::new(false),
             target_gate_acquire_entered: tokio::sync::Notify::new(),
             target_gate_acquire_release: tokio::sync::Notify::new(),
             cancel_before_start_entered: tokio::sync::Notify::new(),
@@ -10923,6 +10979,17 @@ impl DecommissionCapacityLockOrderBarrier {
 
     #[cfg(feature = "test-util")]
     pub(crate) fn pause_target_gate_acquire(&self, target_pool_index: usize) {
+        self.state
+            .target_gate_acquire_pause_target
+            .store(target_pool_index, Ordering::Release);
+    }
+
+    /// Let `skips` acquisitions of the target gate pass, pause the next one,
+    /// and let every later one pass.
+    #[cfg(feature = "test-util")]
+    pub(crate) fn pause_one_target_gate_acquire_after(&self, target_pool_index: usize, skips: usize) {
+        self.state.target_gate_acquire_pause_skips.store(skips, Ordering::Release);
+        self.state.target_gate_acquire_pause_once.store(true, Ordering::Release);
         self.state
             .target_gate_acquire_pause_target
             .store(target_pool_index, Ordering::Release);
@@ -11053,6 +11120,27 @@ async fn pause_decommission_capacity_before_target_gate_acquire(store_id: uuid::
         })
         .cloned();
     if let Some(barrier) = barrier {
+        if barrier.target_gate_acquire_pause_once.load(Ordering::Acquire) {
+            let mut skips = barrier.target_gate_acquire_pause_skips.load(Ordering::Acquire);
+            while skips > 0 {
+                match barrier.target_gate_acquire_pause_skips.compare_exchange_weak(
+                    skips,
+                    skips - 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return,
+                    Err(current) => skips = current,
+                }
+            }
+            if barrier
+                .target_gate_acquire_pause_target
+                .compare_exchange(target_pool_index, usize::MAX, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return;
+            }
+        }
         barrier.target_gate_acquire_entered.notify_one();
         barrier.target_gate_acquire_release.notified().await;
     }
@@ -12697,7 +12785,8 @@ impl ECStore {
             false
         } else {
             let data_bytes = expected_data_bytes.unwrap_or(1).max(1);
-            let grew = grow_decommission_target_reservation(
+            // Growth already checked every reservation for this target pool.
+            grow_decommission_target_reservation(
                 &mut snapshot,
                 &capacity_infos,
                 source_pool_index,
@@ -12705,9 +12794,7 @@ impl ECStore {
                 data_bytes,
                 mutation_id,
                 OffsetDateTime::now_utc(),
-            )?;
-            ensure_decommission_capacity_reservations_available(&snapshot, &capacity_infos, "mutation", Some(target_pool_index))?;
-            grew
+            )?
         };
         let target_layout = snapshot
             .pools
@@ -12739,11 +12826,7 @@ impl ECStore {
                         .iter()
                         .find(|target| target.pool_index == target_pool_index)
                         .map(|target| {
-                            (
-                                target.remaining_reserved_physical_bytes(reservation.temporary_copies)
-                                    / 1usize.saturating_add(reservation.temporary_copies),
-                                target.inflight_physical_bytes,
-                            )
+                            (target.temporary_copy_budget(reservation.temporary_copies), target.inflight_physical_bytes)
                         })
                 })
                 .unwrap_or_default();
@@ -13940,7 +14023,7 @@ impl ECStore {
         if let Some(pool_index) =
             decommission_reserved_target_choice(reservation, owner.mutation_id, expected_data_bytes, &over_budget)
         {
-            log_decommission_adopted_target_choice(reservation, owner, pool_index);
+            log_decommission_adopted_target_choice(reservation, owner, pool_index, &over_budget);
             return Ok(pool_index);
         }
         if reservation.source_data_equivalent_bytes > 0 {
@@ -22604,6 +22687,106 @@ mod tests {
             .reconcile_decommission_capacity_after_equivalent_temporary_target(owner, 1, 16)
             .await
             .expect("a repeated temporary reconciliation stays idempotent");
+    }
+
+    /// Start a decommission of pool 0 on a three-pool store and strand
+    /// `stranded` inflight bytes on target 1, as a lost marker would.
+    async fn start_over_budget_test_decommission(store: &Arc<ECStore>, stranded: usize) {
+        // A 200-byte peak: target 1 reserves 198 bytes, target 2 the other 2.
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 100, 100),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 198, 198, 0),
+                DecommissionPoolCapacityInfo::for_test(2, layout, 2, 2, 0),
+            ]],
+        );
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("the decommission reservation should be activated");
+        let mut meta = store.pool_meta.read().await.clone();
+        {
+            let reservation = meta.pools[0]
+                .decommission
+                .as_mut()
+                .and_then(|info| info.capacity_reservation.as_mut())
+                .expect("the decommission reservation should be active");
+            let target = reservation
+                .targets
+                .iter_mut()
+                .find(|target| target.pool_index == 1)
+                .expect("the reservation should allocate target 1");
+            target.temporary_mutations.push(DecommissionCapacityTemporaryMutation {
+                mutation_id: uuid::Uuid::new_v4(),
+                physical_bytes: stranded,
+            });
+            target.inflight_physical_bytes += stranded;
+            target.observed_physical_bytes += stranded;
+            reservation.inflight_target_physical_bytes += stranded;
+            reservation.observed_target_physical_bytes += stranded;
+        }
+        meta.save(store.pools.clone()).await.expect("persist the stranded marker");
+        *store.pool_meta.write().await = meta;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn target_permit_on_an_over_budget_pool_is_discarded() {
+        let (_temp_dirs, store, _other_store) =
+            crate::services::rebalance::test_three_pool_stores_with_isolated_node_contexts(None).await;
+        // Target 1's 99-byte budget is below the 100 stranded bytes.
+        start_over_budget_test_decommission(&store, 100).await;
+        let owner = leftover_intent_test_owner(&store, uuid::Uuid::new_v4()).await;
+        let guard = store
+            .acquire_decommission_capacity_target_guard(1)
+            .await
+            .expect("acquire target 1's gate for the permit");
+        let _permit = install_decommission_capacity_target_permit(store.id, 1, owner, guard).expect("install the permit");
+        assert_eq!(decommission_capacity_target_permit_index(store.id, owner), Some(1));
+
+        let selected = store
+            .select_decommission_capacity_target_pool(owner, 1)
+            .await
+            .expect("another target fits the object");
+        assert_eq!(selected, 2, "a permit must not pin the mutation to an over-budget pool");
+        assert_eq!(
+            decommission_capacity_target_permit_index(store.id, owner),
+            None,
+            "the permit on the over-budget pool is released"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn finalize_that_pushes_its_pool_over_budget_does_not_pause_the_decommission() {
+        let (_temp_dirs, store, _other_store) =
+            crate::services::rebalance::test_three_pool_stores_with_isolated_node_contexts(None).await;
+        start_over_budget_test_decommission(&store, 10).await;
+        let owner = leftover_intent_test_owner(&store, uuid::Uuid::new_v4()).await;
+        // A 90-byte commit shrinks target 1's budget to 9 bytes, below the 10
+        // stranded bytes.
+        store
+            .run_decommission_capacity_admitted_mutation(1, Some(owner), Some(90), || async { Ok::<_, Error>(()) })
+            .await
+            .expect("a commit that pushes its pool over budget still finalizes");
+        let meta = store.pool_meta.read().await;
+        let info = meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("the decommission state should remain present");
+        assert_eq!(info.capacity_blocked_reason, None, "finalize must not pause the decommission");
+        assert_eq!(decommission_over_budget_target_pools(&meta), HashSet::from([1]));
+        drop(meta);
+        let next = leftover_intent_test_owner(&store, uuid::Uuid::new_v4()).await;
+        assert_eq!(
+            store
+                .select_decommission_capacity_target_pool(next, 1)
+                .await
+                .expect("another target fits the object"),
+            2
+        );
     }
 
     #[tokio::test]
@@ -32147,6 +32330,16 @@ mod pools_tests {
     /// Leave inflight bytes on a source allocation that no mutation will
     /// settle, as a lost marker would.
     fn strand_decommission_test_marker(meta: &mut PoolMeta, source_pool_index: usize, target_pool_index: usize, bytes: usize) {
+        strand_decommission_test_marker_as(meta, source_pool_index, target_pool_index, bytes, uuid::Uuid::new_v4());
+    }
+
+    fn strand_decommission_test_marker_as(
+        meta: &mut PoolMeta,
+        source_pool_index: usize,
+        target_pool_index: usize,
+        bytes: usize,
+        mutation_id: uuid::Uuid,
+    ) {
         let reservation = meta.pools[source_pool_index]
             .decommission
             .as_mut()
@@ -32158,7 +32351,7 @@ mod pools_tests {
             .find(|target| target.pool_index == target_pool_index)
             .expect("the source should allocate the target pool");
         target.temporary_mutations.push(DecommissionCapacityTemporaryMutation {
-            mutation_id: uuid::Uuid::new_v4(),
+            mutation_id,
             physical_bytes: bytes,
         });
         target.inflight_physical_bytes += bytes;
@@ -32209,6 +32402,21 @@ mod pools_tests {
         // Target 1's temporary-copy budget is 20 bytes.
         strand_decommission_test_marker(&mut meta, 0, 1, 25);
         assert_eq!(decommission_over_budget_target_pools(&meta), HashSet::from([1]));
+        let reservation = meta.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .expect("the source reservation should be active");
+        assert_eq!(
+            decommission_reserved_target_choice(reservation, None, 1, &HashSet::new()),
+            Some(1),
+            "by remaining allocation alone, target 1 wins"
+        );
+        assert_eq!(
+            decommission_reserved_target_choice(reservation, None, 1, &decommission_over_budget_target_pools(&meta)),
+            Some(2),
+            "selection skips the over-budget pool"
+        );
 
         let err = ensure_decommission_capacity_reservations_available(&meta, &capacity, "mutation", Some(1))
             .expect_err("growth into the over-budget pool must fail");
@@ -32403,15 +32611,51 @@ mod pools_tests {
             .expect("admission into target 2 proceeds");
         ensure_decommission_capacity_reservations_available(&meta, &capacity, "mutation", Some(1))
             .expect_err("target 1 no longer accepts growth");
+    }
+
+    #[test]
+    fn sticky_retry_bypasses_a_pool_another_source_pushed_over_budget() {
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        // Source 0 reserves 50 bytes on target 2 and 10 on target 3; source 1
+        // reserves its 60 bytes on target 3.
+        let capacity = vec![
+            DecommissionPoolCapacityInfo::for_test(0, layout, 0, 30, 30),
+            DecommissionPoolCapacityInfo::for_test(1, layout, 0, 30, 30),
+            DecommissionPoolCapacityInfo::for_test(2, layout, 50, 50, 0),
+            DecommissionPoolCapacityInfo::for_test(3, layout, 200, 200, 0),
+        ];
+        let mut meta = decommission_budget_test_meta(&[0, 1], &capacity);
+        // Source 0's interrupted mutation left a 4-byte adopted completion on
+        // target 3, within source 0's own 5-byte budget there.
+        let interrupted = uuid::Uuid::new_v4();
+        strand_decommission_test_marker_as(&mut meta, 0, 3, 4, decommission_adopted_intent_mutation_id(interrupted));
+        let source_0 = meta.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .expect("source 0 should hold a reservation")
+            .clone();
         assert_eq!(
-            decommission_reserved_target_choice(
-                intent_adoption_test_reservation(&meta),
-                Some(uuid::Uuid::new_v4()),
-                1,
-                &decommission_over_budget_target_pools(&meta)
-            ),
-            Some(2),
-            "selection places new objects on the pool within budget"
+            decommission_reserved_target_choice(&source_0, Some(interrupted), 2, &decommission_over_budget_target_pools(&meta)),
+            Some(3),
+            "the retry returns to its adopted target while no allocation there is over budget"
+        );
+
+        // Source 1 goes over its budget on the shared target 3.
+        strand_decommission_test_marker(&mut meta, 1, 3, 35);
+        assert_eq!(decommission_over_budget_target_pools(&meta), HashSet::from([3]));
+        assert!(
+            source_0
+                .targets
+                .iter()
+                .all(|target| !target.exceeds_temporary_copy_budget(source_0.temporary_copies)),
+            "source 0's own allocations stay within budget"
+        );
+        // Growth into target 3 now fails for every source, so the retry is
+        // placed on target 2 and leaves the adopted marker behind.
+        assert_eq!(
+            decommission_reserved_target_choice(&source_0, Some(interrupted), 2, &decommission_over_budget_target_pools(&meta)),
+            Some(2)
         );
     }
 
@@ -33612,8 +33856,7 @@ mod pools_tests {
 
     fn intent_adoption_test_temporary_budget(meta: &PoolMeta) -> usize {
         let reservation = intent_adoption_test_reservation(meta);
-        reservation.targets[0].remaining_reserved_physical_bytes(reservation.temporary_copies)
-            / (1 + reservation.temporary_copies)
+        reservation.targets[0].temporary_copy_budget(reservation.temporary_copies)
     }
 
     /// A mutation's staged and adopted marker bytes together.

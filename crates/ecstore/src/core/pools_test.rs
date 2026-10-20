@@ -224,7 +224,7 @@ mod decommission_lock_order_tests {
     use std::future::Future;
     use std::sync::{
         Arc, Condvar, Mutex as StdMutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
@@ -536,6 +536,227 @@ mod decommission_lock_order_tests {
             .await
             .expect("persist the stranded target marker");
         *store.pool_meta.write().await = meta;
+    }
+
+    /// Start a decommission of `bucket` on a three-pool store where target 1
+    /// holds most of the allocation and `stranded` inflight bytes of a marker
+    /// no mutation will settle.
+    async fn start_over_budget_routine_decommission(store: &Arc<crate::store::ECStore>, bucket: &str, stranded: usize) {
+        // Of the 128 MiB peak, target 1 takes 100 MiB and target 2 the other
+        // 28 MiB; target 1's temporary-copy budget is 50 MiB.
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64 << 20, 64 << 20),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 100 << 20, 100 << 20, 0),
+                DecommissionPoolCapacityInfo::for_test(2, layout, 1 << 30, 1 << 30, 0),
+            ]],
+        );
+        store
+            .save_current_pool_meta_for_decommission_start(
+                &[0],
+                vec![crate::core::pools::DecomBucketInfo {
+                    name: bucket.to_string(),
+                    prefix: String::new(),
+                }],
+            )
+            .await
+            .expect("activate the decommission");
+        strand_decommission_target_marker(store, 1, stranded).await;
+    }
+
+    /// Pause one of `object`'s own target-1 gate acquisitions, after `skips`
+    /// of them, by arming the pause when the routine reads that object.
+    fn pause_object_target_gate_acquire(
+        barrier: Arc<DecommissionCapacityLockOrderBarrier>,
+        bucket: String,
+        object: String,
+        skips: usize,
+    ) -> DecommissionTestFaultGuard {
+        let armed = Arc::new(AtomicBool::new(false));
+        DecommissionTestFaultGuard::install(Arc::new(move |stage, entry_bucket, entry_object, _, _| {
+            if stage == "object_read" && entry_bucket == bucket && entry_object == object && !armed.swap(true, Ordering::AcqRel) {
+                barrier.pause_one_target_gate_acquire_after(1, skips);
+            }
+            false
+        }))
+    }
+
+    /// Another mutation commits `bytes` on target 1, as a concurrent entry
+    /// would.
+    async fn commit_other_mutation_on_target_1(store: &Arc<crate::store::ECStore>, bytes: usize) {
+        let owner = decommission_capacity_owner(&*store.pool_meta.read().await).with_mutation_id(uuid::Uuid::new_v4());
+        store
+            .run_decommission_capacity_admitted_mutation(1, Some(owner), Some(bytes), || async {
+                Ok::<_, crate::error::Error>(())
+            })
+            .await
+            .expect("the other mutation commits on target 1");
+    }
+
+    async fn assert_target_1_over_budget(store: &Arc<crate::store::ECStore>) {
+        let target = killed_leader_target(store, 1).await;
+        let budget = target
+            .reserved_physical_bytes
+            .saturating_sub(target.consumed_physical_bytes * 2)
+            / 2;
+        assert!(
+            target.inflight_physical_bytes > budget,
+            "target 1 must be over its {budget}-byte budget: {target:?}"
+        );
+    }
+
+    async fn run_routine_over_a_target_going_over_budget(
+        store: &Arc<crate::store::ECStore>,
+        barrier: &DecommissionCapacityLockOrderBarrier,
+        other_commit_bytes: usize,
+        before_other_commit: impl std::future::Future<Output = ()>,
+    ) {
+        let routine = tokio::spawn({
+            let store = Arc::clone(store);
+            async move {
+                let canceler = crate::core::pools::DecommissionCanceler::new(CancellationToken::new());
+                store.decommission_cancelers.write().await[0] = Some(canceler.clone());
+                store
+                    .do_decommission_in_routine(canceler, 0, Arc::new(tokio::sync::Semaphore::new(2)))
+                    .await
+            }
+        });
+        // The object selected target 1 and waits to acquire its gate.
+        barrier.wait_until_target_gate_acquire_paused().await;
+        before_other_commit.await;
+        commit_other_mutation_on_target_1(store, other_commit_bytes).await;
+        assert_target_1_over_budget(store).await;
+        barrier.release_target_gate_acquire();
+        routine
+            .await
+            .expect("the decommission routine task should join")
+            .expect("the decommission routine should return");
+        let local = store.pool_meta.read().await;
+        let info = local.pools[0]
+            .decommission
+            .as_ref()
+            .expect("the decommission state should remain present");
+        assert!(
+            info.complete && !info.failed && !info.canceled && info.capacity_blocked_reason.is_none(),
+            "a target that went over budget after selection must not pause the decommission: complete={}, failed={}, canceled={}, blocked_reason={:?}",
+            info.complete,
+            info.failed,
+            info.canceled,
+            info.capacity_blocked_reason
+        );
+        assert_eq!(info.items_decommission_failed, 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_reselects_a_target_that_went_over_budget_after_selection() {
+        run_large_stack_async_test("decommission-reselect-over-budget-target", || async {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("reselect-over-budget");
+            let object = "late.bin";
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create the reselection bucket");
+            let mut source = PutObjReader::from_vec(b"selected target 1 before it went over budget".to_vec());
+            store.pools[0]
+                .put_object(&bucket, object, &mut source, &ObjectOptions::default())
+                .await
+                .expect("write the source object");
+            // 45 of target 1's 50 MiB budget are stranded.
+            start_over_budget_routine_decommission(&store, &bucket, 45 << 20).await;
+            let barrier = Arc::new(DecommissionCapacityLockOrderBarrier::install(store.id, store.id));
+            barrier.disable_owner_pause();
+            let _fault = pause_object_target_gate_acquire(Arc::clone(&barrier), bucket.clone(), object.to_string(), 0);
+
+            // A 6 MiB commit shrinks target 1's budget to 44 MiB.
+            run_routine_over_a_target_going_over_budget(&store, &barrier, 6 << 20, async {}).await;
+            store.pools[2]
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect("the entry must be placed on target 2 after target 1 went over budget");
+            assert!(
+                store.pools[1]
+                    .get_object_info(&bucket, object, &ObjectOptions::default())
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_restarts_a_multipart_upload_pinned_to_a_target_that_went_over_budget() {
+        run_large_stack_async_test("decommission-reselect-over-budget-multipart", || async {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("reselect-over-budget-mpu");
+            let object = "late-multipart.bin";
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create the multipart reselection bucket");
+            let source_upload = new_multipart_upload(&store, 0, &bucket, object, ObjectOptions::default())
+                .await
+                .expect("create the source multipart upload");
+            let source_opts = multipart_options(&store, &bucket, ObjectOptions::default()).await;
+            let mut source_parts = Vec::with_capacity(2);
+            for (part_num, part_body) in [(1, vec![0x31; 5 << 20]), (2, vec![0x32; 1])] {
+                let part = store.pools[0]
+                    .put_object_part(
+                        &bucket,
+                        object,
+                        &source_upload.upload_id,
+                        part_num,
+                        &mut PutObjReader::from_vec(part_body),
+                        &source_opts,
+                    )
+                    .await
+                    .expect("stage the source multipart part");
+                source_parts.push(crate::storage_api_contracts::multipart::CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                });
+            }
+            let source_info = store.pools[0]
+                .clone()
+                .complete_multipart_upload(&bucket, object, &source_upload.upload_id, source_parts, &source_opts)
+                .await
+                .expect("complete the source multipart object");
+            assert!(source_info.is_multipart());
+            // 40 of target 1's 50 MiB budget are stranded.
+            start_over_budget_routine_decommission(&store, &bucket, 40 << 20).await;
+            let barrier = Arc::new(DecommissionCapacityLockOrderBarrier::install(store.id, store.id));
+            barrier.disable_owner_pause();
+            // Skip the upload creation and part 1; pause before part 2.
+            let _fault = pause_object_target_gate_acquire(Arc::clone(&barrier), bucket.clone(), object.to_string(), 2);
+
+            // A 12 MiB commit shrinks target 1's budget to 38 MiB while the
+            // upload, pinned to target 1, waits to upload part 2.
+            let store_for_check = Arc::clone(&store);
+            run_routine_over_a_target_going_over_budget(&store, &barrier, 12 << 20, async move {
+                let target = killed_leader_target(&store_for_check, 1).await;
+                assert!(
+                    target.temporary_mutations.len() >= 2,
+                    "the upload must hold its staging record on target 1 next to the stranded marker: {:?}",
+                    target.temporary_mutations
+                );
+            })
+            .await;
+            let migrated = store.pools[2]
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect("the restarted upload must complete on target 2");
+            assert!(migrated.is_multipart());
+            assert!(
+                store.pools[1]
+                    .get_object_info(&bucket, object, &ObjectOptions::default())
+                    .await
+                    .is_err()
+            );
+        });
     }
 
     #[test]
