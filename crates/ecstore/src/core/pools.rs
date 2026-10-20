@@ -155,6 +155,7 @@ const DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_PREFIX: &str = "target pool ";
 const DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_SUFFIX: &str = " target capacity mutation gate is busy";
 const DECOMMISSION_CAPACITY_TARGET_OVER_BUDGET_PREFIX: &str = "target pool ";
 const DECOMMISSION_CAPACITY_TARGET_OVER_BUDGET_SUFFIX: &str = " is over a temporary-copy budget: ";
+const DECOMMISSION_CAPACITY_TARGET_NO_LONGER_FITS_SUFFIX: &str = " no longer fits the selected mutation: ";
 const METRIC_DECOMMISSION_CAPACITY_TARGET_OVER_BUDGET: &str = "rustfs_decommission_capacity_target_over_budget";
 const METRIC_DECOMMISSION_CAPACITY_CONFLICTS_TOTAL: &str = "rustfs_decommission_capacity_conflicts_total";
 const METRIC_DECOMMISSION_CAPACITY_GATE_RETRIES_TOTAL: &str = "rustfs_decommission_capacity_gate_retries_total";
@@ -1078,14 +1079,28 @@ pub(crate) fn is_decommission_capacity_target_gate_busy(err: &Error) -> bool {
     decommission_capacity_target_gate_busy_index(err).is_some()
 }
 
-fn decommission_capacity_target_over_budget_index(err: &Error) -> Option<usize> {
+/// The target pool of a failure that only shows the mutation's target
+/// selection went stale: the pool went over a temporary-copy budget, or no
+/// longer fits the mutation it was selected for.
+fn decommission_capacity_stale_target_index(err: &Error) -> Option<usize> {
     if let Error::DecommissionCapacityBlocked { message } = err {
-        let (target_pool_index, _) = message
-            .strip_prefix(DECOMMISSION_CAPACITY_TARGET_OVER_BUDGET_PREFIX)?
-            .split_once(DECOMMISSION_CAPACITY_TARGET_OVER_BUDGET_SUFFIX)?;
+        let rest = message.strip_prefix(DECOMMISSION_CAPACITY_TARGET_OVER_BUDGET_PREFIX)?;
+        let (target_pool_index, _) = rest
+            .split_once(DECOMMISSION_CAPACITY_TARGET_OVER_BUDGET_SUFFIX)
+            .or_else(|| rest.split_once(DECOMMISSION_CAPACITY_TARGET_NO_LONGER_FITS_SUFFIX))?;
         return target_pool_index.parse().ok();
     }
-    data_movement::data_movement_stage_source(err).and_then(decommission_capacity_target_over_budget_index)
+    data_movement::data_movement_stage_source(err).and_then(decommission_capacity_stale_target_index)
+}
+
+/// Rejection of a mutation whose selected target can no longer take it, for
+/// example because a concurrent commit used up the room it was selected for.
+/// Selection checks the fit again, so the failure is retryable
+/// (`StaleTargetSelection`).
+fn decommission_target_no_longer_fits_error(target_pool_index: usize, detail: impl Display) -> Error {
+    decommission_capacity_blocked_error(format!(
+        "{DECOMMISSION_CAPACITY_TARGET_OVER_BUDGET_PREFIX}{target_pool_index}{DECOMMISSION_CAPACITY_TARGET_NO_LONGER_FITS_SUFFIX}{detail}"
+    ))
 }
 
 /// How the decommission capacity path must treat a failure.
@@ -1101,10 +1116,12 @@ pub(crate) enum DecommissionCapacityFailure {
     /// Another mutation's durable target capacity intent is still unresolved.
     /// Transient, but converged on a different retry budget than gate contention.
     IntentConflict,
-    /// The target pool went over a temporary-copy budget after this mutation
-    /// selected it. Target selection skips such a pool, so retrying the entry
-    /// places the object elsewhere; it shares the intent-conflict retry budget.
-    TargetOverBudget { target_pool_index: usize },
+    /// The target selection went stale between selection and admission: the
+    /// pool went over a temporary-copy budget, or no longer fits the mutation.
+    /// Selection skips over-budget pools and checks the fit again, so
+    /// retrying the entry places the object elsewhere; it shares the
+    /// intent-conflict retry budget.
+    StaleTargetSelection { target_pool_index: usize },
     /// The mutation is no longer needed: the object or version disappeared, or
     /// an equivalent target already exists. Never counted as a failure.
     BenignContention,
@@ -1129,8 +1146,8 @@ fn classify_decommission_capacity_failure(err: &Error) -> DecommissionCapacityFa
     if let Some(target_pool_index) = decommission_capacity_target_gate_busy_index(err) {
         return DecommissionCapacityFailure::TargetGateBusy { target_pool_index };
     }
-    if let Some(target_pool_index) = decommission_capacity_target_over_budget_index(err) {
-        return DecommissionCapacityFailure::TargetOverBudget { target_pool_index };
+    if let Some(target_pool_index) = decommission_capacity_stale_target_index(err) {
+        return DecommissionCapacityFailure::StaleTargetSelection { target_pool_index };
     }
     if is_decommission_capacity_intent_conflict(err) {
         return DecommissionCapacityFailure::IntentConflict;
@@ -1150,7 +1167,7 @@ fn decommission_capacity_retry_kind(err: &Error, intent_conflict_attempt: usize)
     (intent_conflict_attempt < DECOMMISSION_CAPACITY_INTENT_CONFLICT_MAX_ATTEMPTS
         && matches!(
             classify_decommission_capacity_failure(err),
-            DecommissionCapacityFailure::IntentConflict | DecommissionCapacityFailure::TargetOverBudget { .. }
+            DecommissionCapacityFailure::IntentConflict | DecommissionCapacityFailure::StaleTargetSelection { .. }
         ))
     .then_some(DecommissionCapacityRetryKind::IntentConflict)
 }
@@ -1877,7 +1894,7 @@ fn observe_decommission_capacity_reservation(
 
 /// Rejection of growth into a target pool where this allocation holds more
 /// inflight or pending bytes than its temporary-copy budget. Selection skips
-/// such a pool, so the failure is retryable (`TargetOverBudget`).
+/// such a pool, so the failure is retryable (`StaleTargetSelection`).
 fn decommission_target_over_budget_error(
     source_index: usize,
     reservation: &DecommissionCapacityReservation,
@@ -1949,6 +1966,8 @@ fn ensure_decommission_capacity_reservations_available(
     let mut required_by_target = HashMap::<usize, usize>::new();
     let mut inflight_by_target = HashMap::<usize, usize>::new();
     let mut pending_by_target = HashMap::<usize, usize>::new();
+    // Reject growth only after every allocation refreshed its gauge.
+    let mut growth_rejection = None;
     for source_index in active_decommission_source_indices(meta) {
         let info = meta.pools[source_index]
             .decommission
@@ -1977,8 +1996,8 @@ fn ensure_decommission_capacity_reservations_available(
                 "target_pool_index" => target.pool_index.to_string()
             )
             .set(if over_budget { 1.0 } else { 0.0 });
-            if over_budget && growth_pool == Some(target.pool_index) {
-                return Err(decommission_target_over_budget_error(source_index, reservation, target, phase));
+            if over_budget && growth_pool == Some(target.pool_index) && growth_rejection.is_none() {
+                growth_rejection = Some(decommission_target_over_budget_error(source_index, reservation, target, phase));
             }
             let required = required_by_target.entry(target.pool_index).or_default();
             *required = required.saturating_add(target.remaining_reserved_physical_bytes(reservation.temporary_copies));
@@ -1987,6 +2006,9 @@ fn ensure_decommission_capacity_reservations_available(
             let pending = pending_by_target.entry(target.pool_index).or_default();
             *pending = pending.saturating_add(target.pending_physical_bytes);
         }
+    }
+    if let Some(err) = growth_rejection {
+        return Err(err);
     }
     for (target_pool_index, required) in required_by_target {
         let available = capacity_infos
@@ -2141,9 +2163,10 @@ fn grow_decommission_target_reservation(
             return Ok(false);
         }
         if reservation.source_data_equivalent_bytes > 0 {
-            return Err(decommission_capacity_blocked_error(format!(
-                "source pool {source_pool_index} reservation estimate is exhausted"
-            )));
+            return Err(decommission_target_no_longer_fits_error(
+                target_pool_index,
+                format!("source pool {source_pool_index} reservation estimate is exhausted"),
+            ));
         }
         if let Some(target) = existing_target
             && target_capacity.physical_free <= target.physical_free_at_reservation
@@ -2307,9 +2330,12 @@ fn reserve_decommission_target_pending(
     }
     let budget = target.temporary_copy_budget(reservation.temporary_copies);
     if requested_physical_bytes > budget {
-        return Err(decommission_capacity_blocked_error(format!(
-            "source pool {source_pool_index} target pool {target_pool_index} mutation requires {requested_physical_bytes} physical bytes, but only {budget} committed-copy bytes remain"
-        )));
+        return Err(decommission_target_no_longer_fits_error(
+            target_pool_index,
+            format!(
+                "source pool {source_pool_index} target pool {target_pool_index} mutation requires {requested_physical_bytes} physical bytes, but only {budget} committed-copy bytes remain"
+            ),
+        ));
     }
     let additional = requested_physical_bytes;
     target.pending_mutation_id = Some(mutation_id);
@@ -2739,9 +2765,11 @@ fn decommission_capacity_target_candidate(
 /// the object only when this source's budget there drops below the object's
 /// bytes, which the adopted marker already holds as inflight. Another source
 /// over budget on the same pool also bypasses it; waiting for that source
-/// instead would tie this decommission's progress to another one's ledger,
-/// while the stranded marker costs only this source's growth on a pool that
-/// accepts none.
+/// instead would tie this decommission's progress to another one's ledger.
+/// The stranded marker keeps holding this source's temporary-copy budget on
+/// that pool after the other source recovers, so as later commits shrink that
+/// budget it can push this source over budget there too, which again stops
+/// growth into the pool for every source.
 fn decommission_reserved_target_choice(
     reservation: &DecommissionCapacityReservation,
     mutation_id: Option<uuid::Uuid>,
@@ -5173,7 +5201,7 @@ fn resolve_decommission_entry_failure(err: Error) -> Result<DecommissionEntryOut
     match classify_decommission_capacity_failure(&err) {
         DecommissionCapacityFailure::TargetGateBusy { .. }
         | DecommissionCapacityFailure::IntentConflict
-        | DecommissionCapacityFailure::TargetOverBudget { .. } => Ok(DecommissionEntryOutcome::Deferred(err)),
+        | DecommissionCapacityFailure::StaleTargetSelection { .. } => Ok(DecommissionEntryOutcome::Deferred(err)),
         DecommissionCapacityFailure::BenignContention => Ok(DecommissionEntryOutcome::Complete),
         DecommissionCapacityFailure::Fatal => Err(err),
     }
@@ -11211,6 +11239,31 @@ impl Drop for DecommissionCapacityLockOrderBarrier {
 }
 
 #[cfg(test)]
+static DECOMMISSION_TEST_OBSERVED_EXPECTED_BYTES: std::sync::OnceLock<std::sync::Mutex<HashSet<uuid::Uuid>>> =
+    std::sync::OnceLock::new();
+
+/// Static capacity snapshots observe no free-space change, so temporary
+/// writes would stage zero bytes. Make `store_id`'s mutations observe at
+/// least the bytes they reserved.
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) fn observe_expected_decommission_target_bytes_for_test(store_id: uuid::Uuid) {
+    DECOMMISSION_TEST_OBSERVED_EXPECTED_BYTES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(store_id);
+}
+
+#[cfg(test)]
+fn decommission_test_observes_expected_bytes(store_id: uuid::Uuid) -> bool {
+    DECOMMISSION_TEST_OBSERVED_EXPECTED_BYTES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&store_id)
+}
+
+#[cfg(test)]
 async fn pause_decommission_capacity_before_owner_write(store_id: uuid::Uuid) {
     let barrier = DECOMMISSION_CAPACITY_LOCK_ORDER_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -12950,9 +13003,12 @@ impl ECStore {
                 .unwrap_or_default();
             let available = remaining.saturating_sub(inflight);
             if expected_target_physical_bytes > available {
-                return Err(decommission_capacity_blocked_error(format!(
-                    "source pool {source_pool_index} target pool {target_pool_index} temporary operation requires {expected_target_physical_bytes} physical bytes, but only {available} temporary-copy bytes remain"
-                )));
+                return Err(decommission_target_no_longer_fits_error(
+                    target_pool_index,
+                    format!(
+                        "source pool {source_pool_index} target pool {target_pool_index} temporary operation requires {expected_target_physical_bytes} physical bytes, but only {available} temporary-copy bytes remain"
+                    ),
+                ));
             }
         } else {
             ensure_decommission_target_owner_admission(
@@ -13055,6 +13111,12 @@ impl ECStore {
             .map(|capacity| capacity.physical_free)
             .ok_or_else(|| decommission_capacity_blocked_error("target capacity snapshot is missing after mutation"))?;
         let observed_physical_bytes = before_free.saturating_sub(after_free);
+        #[cfg(test)]
+        let observed_physical_bytes = if decommission_test_observes_expected_bytes(self.id) {
+            observed_physical_bytes.max(expected_target_physical_bytes)
+        } else {
+            observed_physical_bytes
+        };
         let released_physical_bytes = after_free.saturating_sub(before_free);
         let now = OffsetDateTime::now_utc();
         let progress_changed = if temporary_release {
@@ -16361,6 +16423,18 @@ impl ECStore {
                     }
                 }
 
+                // Like the other copy paths, hand a capacity failure to the
+                // entry retry without counting the version: a retry that
+                // succeeds must still count it as decommissioned.
+                if capacity_failure {
+                    return Err(with_decommission_entry_context(
+                        "decommission_tier_free_version",
+                        bucket.as_str(),
+                        version.name.as_str(),
+                        migration_error.expect("capacity failure must retain its error"),
+                    ));
+                }
+
                 if counted_versions.insert((version.version_id, version.deleted)) {
                     let mut pool_meta = self.pool_meta.write().await;
                     ensure_decommission_generation(&pool_meta, idx, generation)?;
@@ -16411,15 +16485,6 @@ impl ECStore {
                     },
                     "Decommission free-version disposition recorded"
                 );
-
-                if capacity_failure {
-                    return Err(with_decommission_entry_context(
-                        "decommission_tier_free_version",
-                        bucket.as_str(),
-                        version.name.as_str(),
-                        migration_error.expect("capacity failure must retain its error"),
-                    ));
-                }
 
                 if !migrated && !consumed {
                     break;
@@ -24485,6 +24550,88 @@ mod tests {
         ));
     }
 
+    fn stale_target_selection_test_errors() -> [Error; 2] {
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let reservation = build_decommission_capacity_reservation_with_model(
+            DecommissionPoolCapacityInfo::for_test(0, layout, 0, 100, 100),
+            layout,
+            uuid::Uuid::new_v4(),
+            1,
+            OffsetDateTime::UNIX_EPOCH,
+            DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION,
+        )
+        .expect("the test reservation should build");
+        // 30 inflight bytes against a 20-byte budget.
+        let target = DecommissionCapacityTarget {
+            pool_index: 3,
+            layout,
+            physical_total_at_reservation: 200,
+            physical_free_at_reservation: 200,
+            reserved_physical_bytes: 40,
+            consumed_physical_bytes: 0,
+            observed_physical_bytes: 30,
+            inflight_physical_bytes: 30,
+            pending_physical_bytes: 0,
+            pending_mutation_id: None,
+            temporary_mutations: Vec::new(),
+        };
+        [
+            decommission_target_over_budget_error(0, &reservation, &target, "mutation"),
+            decommission_target_no_longer_fits_error(3, "source pool 0 reservation estimate is exhausted"),
+        ]
+    }
+
+    #[test]
+    fn stale_target_selection_is_classified_through_every_wrapper() {
+        for err in stale_target_selection_test_errors() {
+            for wrapped in [
+                err.clone(),
+                data_movement::data_movement_stage_error_for_test("decommission_object", "put_object", "b", "o", err.clone()),
+                with_decommission_entry_context("migrate_object", "b", "o", err.clone()),
+            ] {
+                assert_eq!(
+                    classify_decommission_capacity_failure(&wrapped),
+                    DecommissionCapacityFailure::StaleTargetSelection { target_pool_index: 3 },
+                    "unexpected class for {wrapped}"
+                );
+                assert_eq!(decommission_capacity_target_gate_busy_index(&wrapped), None);
+            }
+        }
+        let gate_busy = decommission_capacity_blocked_error(format!(
+            "{DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_PREFIX}3{DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_SUFFIX}"
+        ));
+        assert_eq!(decommission_capacity_stale_target_index(&gate_busy), None);
+        assert_eq!(
+            classify_decommission_capacity_failure(&gate_busy),
+            DecommissionCapacityFailure::TargetGateBusy { target_pool_index: 3 }
+        );
+    }
+
+    #[test]
+    fn stale_target_selection_retries_the_entry() {
+        for err in stale_target_selection_test_errors() {
+            assert_eq!(
+                decommission_capacity_retry_kind(&err, 0),
+                Some(DecommissionCapacityRetryKind::IntentConflict),
+                "a stale target selection must retry the entry so it selects again"
+            );
+            assert_eq!(
+                decommission_capacity_retry_kind(&err, DECOMMISSION_CAPACITY_INTENT_CONFLICT_MAX_ATTEMPTS),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn stale_target_selection_defers_the_entry_once_its_retries_are_spent() {
+        for err in stale_target_selection_test_errors() {
+            assert!(
+                matches!(resolve_decommission_entry_failure(err), Ok(DecommissionEntryOutcome::Deferred(_))),
+                "a stale target selection must defer the entry, never fail it"
+            );
+        }
+    }
+
     /// A stage wrapper must not hide the underlying capacity class.
     #[test]
     fn decommission_capacity_failure_classification_sees_through_a_stage_wrapper() {
@@ -26446,7 +26593,6 @@ mod pools_tests {
     use std::collections::{HashMap, HashSet};
 
     use super::DECOMMISSION_PROGRESS_SAVE_RETRY_BACKOFF;
-    use super::decommission_over_budget_target_pools;
     use super::persist_v3_pool_meta_for_test;
     use super::record_decommission_entry_error;
     use super::resolve_decommission_partial_listing_entry;
@@ -26520,6 +26666,7 @@ mod pools_tests {
         resolve_decommission_target_pending, set_decommission_capacity_info_overrides_for_test,
         validate_decommission_capacity_reservation,
     };
+    use super::{METRIC_DECOMMISSION_CAPACITY_TARGET_OVER_BUDGET, decommission_over_budget_target_pools};
     use super::{
         decommission_bucket_failure, decommission_reserved_target_choice, decommission_root_cause,
         decommission_target_has_mutation_marker, settle_decommission_target_non_growing_replacement,
@@ -33051,6 +33198,50 @@ mod pools_tests {
             .find(|target| target.pool_index == target_pool_index)
             .map(|target| target.remaining_reserved_physical_bytes(reservation.temporary_copies))
             .expect("the source should allocate the target pool")
+    }
+
+    #[test]
+    fn over_budget_gauge_covers_every_allocation_even_when_growth_is_rejected() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let capacity = vec![
+            DecommissionPoolCapacityInfo::for_test(0, layout, 0, 30, 30),
+            DecommissionPoolCapacityInfo::for_test(1, layout, 40, 40, 0),
+            DecommissionPoolCapacityInfo::for_test(2, layout, 100, 100, 0),
+        ];
+        let mut meta = decommission_budget_test_meta(&[0], &capacity);
+        strand_decommission_test_marker(&mut meta, 0, 1, 25);
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            ensure_decommission_capacity_reservations_available(&meta, &capacity, "mutation", Some(1))
+                .expect_err("growth into the over-budget pool fails");
+        });
+        let gauges = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| key.key().name() == METRIC_DECOMMISSION_CAPACITY_TARGET_OVER_BUDGET)
+            .filter_map(|(key, _, _, value)| {
+                let target_pool_index = key
+                    .key()
+                    .labels()
+                    .find(|label| label.key() == "target_pool_index")?
+                    .value()
+                    .to_string();
+                match value {
+                    DebugValue::Gauge(value) => Some((target_pool_index, value.into_inner())),
+                    _ => None,
+                }
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(gauges.get("1"), Some(&1.0), "target 1 is over budget: {gauges:?}");
+        assert_eq!(
+            gauges.get("2"),
+            Some(&0.0),
+            "the rejection must not skip the gauges of later allocations: {gauges:?}"
+        );
     }
 
     #[test]
