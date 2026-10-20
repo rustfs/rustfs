@@ -746,8 +746,15 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
                 return Err(DiskError::InvalidPath);
             }
             let name = entry.file_name().into_string().map_err(|_| DiskError::FileCorrupt)?;
+            let id = Uuid::parse_str(&name).ok();
+            if kind.is_dir() && id.is_none() {
+                // A non-UUID directory is only a prefix of independent child
+                // keys, which settle under their own exact-key locks and may
+                // vanish or appear concurrently. Settlement never touches it.
+                continue;
+            }
             descriptions.push((name.clone(), kind.is_dir(), entry.metadata().map_err(to_file_error)?.len()));
-            if kind.is_dir() && Uuid::parse_str(&name).is_ok_and(|id| !id.is_nil()) {
+            if kind.is_dir() && id.is_some_and(|id| !id.is_nil()) {
                 for child in std::fs::read_dir(entry.path()).map_err(to_file_error)? {
                     let child = child.map_err(to_file_error)?;
                     let kind = child.file_type().map_err(to_file_error)?;
@@ -3333,6 +3340,72 @@ mod tests {
             .expect("finalize after coordinator convergence proof");
         assert_eq!(settled.state, DeleteRecoveryState::Absent);
         assert!(!disk.io_get_object_path("recovery", "object").expect("object path").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_fingerprint_ignores_prefix_child_keys() {
+        // `object/child` is an independent key that only shares this key's
+        // directory as a prefix. Its delete removes `object/child/` under its
+        // own exact-key lock, so it can vanish (or appear) between this key's
+        // inspection and settlement.
+        for child_appears in [false, true] {
+            let (_temp, disk, _info, _original) = fixture().await;
+            let root = disk.io_get_object_path("recovery", "object").expect("object path");
+            let child = root.join("child");
+            if !child_appears {
+                std::fs::create_dir_all(&child).expect("create child key prefix");
+                std::fs::write(child.join(STORAGE_FORMAT_FILE), b"child").expect("write child key metadata");
+            }
+            let transaction = Uuid::new_v4();
+            let applied = apply(&disk, transaction).await;
+            let committed = disk
+                .settle_delete_transaction(
+                    "recovery",
+                    "object",
+                    transaction,
+                    applied.fingerprint,
+                    DeleteRecoveryAction::PublishCommit,
+                )
+                .await
+                .expect("durable set decision");
+            let finished = disk
+                .settle_delete_transaction(
+                    "recovery",
+                    "object",
+                    transaction,
+                    committed.fingerprint,
+                    DeleteRecoveryAction::FinishCommit,
+                )
+                .await
+                .expect("physical cleanup");
+            assert_eq!(finished.state, DeleteRecoveryState::CommitFinished);
+            let observed = disk
+                .inspect_delete_transaction("recovery", "object", transaction)
+                .await
+                .expect("GC inspection");
+            if child_appears {
+                std::fs::create_dir_all(&child).expect("create child key prefix");
+                std::fs::write(child.join(STORAGE_FORMAT_FILE), b"child").expect("write child key metadata");
+            } else {
+                std::fs::remove_dir_all(&child).expect("concurrent child key delete");
+            }
+            let settled = disk
+                .settle_delete_transaction(
+                    "recovery",
+                    "object",
+                    transaction,
+                    observed.fingerprint,
+                    DeleteRecoveryAction::FinalizeCommit,
+                )
+                .await
+                .expect("a child key change is not a change of this key's protocol evidence");
+            assert_eq!(settled.state, DeleteRecoveryState::Absent);
+            assert!(!root.join(transaction.to_string()).exists(), "transaction proof must be finalized");
+            assert_eq!(root.exists(), child_appears, "only a live child key may keep the prefix directory");
+            if child_appears {
+                assert_eq!(std::fs::read(child.join(STORAGE_FORMAT_FILE)).expect("child key survives"), b"child");
+            }
+        }
     }
 
     #[tokio::test]

@@ -29,6 +29,42 @@ use uuid::Uuid;
 
 const DISCOVERY_PAGE_SIZE: u32 = 128;
 const MAX_DISCOVERED_TRANSACTIONS: usize = 1_000_000;
+/// Inline cleanup attempts after a certified decision. Later attempts start
+/// from a fresh inspection; the recovery hint retains any remaining work.
+const PUBLISHED_CLEANUP_ATTEMPTS: usize = 3;
+const EVENT_DELETE_RECOVERY_CLEANUP_DEFERRED: &str = "delete_recovery_cleanup_deferred";
+
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use futures::future::BoxFuture;
+    use std::sync::{Arc, Mutex};
+
+    type Hook = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
+
+    static BEFORE_GC_FINALIZE: Mutex<Vec<(String, String, Hook)>> = Mutex::new(Vec::new());
+
+    /// Runs `hook` once, after the key-wide GC inspection and before its
+    /// finalization, the next time `bucket/object` reaches that point.
+    pub(crate) fn before_gc_finalize(bucket: &str, object: &str, hook: Hook) {
+        BEFORE_GC_FINALIZE
+            .lock()
+            .expect("GC finalize hooks")
+            .push((bucket.to_owned(), object.to_owned(), hook));
+    }
+
+    pub(super) async fn run_before_gc_finalize(bucket: &str, object: &str) {
+        let hook = {
+            let mut hooks = BEFORE_GC_FINALIZE.lock().expect("GC finalize hooks");
+            hooks
+                .iter()
+                .position(|(hook_bucket, hook_object, _)| hook_bucket == bucket && hook_object == object)
+                .map(|index| hooks.swap_remove(index).2)
+        };
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct DeleteRecoverySummary {
@@ -362,13 +398,40 @@ impl SetDisks {
         // Physical cleanup is retryable after the certified decision. An
         // unavailable participant retains the decision for its eventual return.
         let ticket = context.recovery_ticket.clone();
-        if let Ok(summary) = self.recover_delete_key(bucket, object, context).await
-            && summary.pending == 0
-            && summary.blocked == 0
-            && summary.failed == 0
-            && let Some(ticket) = ticket.as_ref()
-        {
-            self.ctx.delete_recovery_hints().ack(ticket);
+        let mut attempt = 1;
+        let cleanup = loop {
+            match self.recover_delete_key(bucket, object, context.clone()).await {
+                // A stale settlement fingerprint only means the snapshot raced
+                // another writer; each attempt re-inspects every participant.
+                Err(DiskError::OutdatedXLMeta) if attempt < PUBLISHED_CLEANUP_ATTEMPTS && can_commit() => attempt += 1,
+                result => break result,
+            }
+        };
+        match cleanup {
+            Ok(summary) => {
+                if summary.pending == 0
+                    && summary.blocked == 0
+                    && summary.failed == 0
+                    && let Some(ticket) = ticket.as_ref()
+                {
+                    self.ctx.delete_recovery_hints().ack(ticket);
+                }
+            }
+            Err(error) => {
+                // The decision is durable; the retained hint completes cleanup.
+                tracing::warn!(
+                    event = EVENT_DELETE_RECOVERY_CLEANUP_DEFERRED,
+                    component = crate::set_disk::LOG_COMPONENT_ECSTORE,
+                    subsystem = crate::set_disk::LOG_SUBSYSTEM_SET_DISK,
+                    state = "deferred",
+                    bucket,
+                    object,
+                    %transaction,
+                    attempts = attempt,
+                    error = %error,
+                    "Delete decision published but inline cleanup was deferred"
+                );
+            }
         }
         Ok(())
     }
@@ -860,6 +923,8 @@ impl SetDisks {
                         return Ok(summary);
                     }
                 }
+                #[cfg(test)]
+                test_hooks::run_before_gc_finalize(bucket, object).await;
                 if settle_group(
                     &disks,
                     bucket,
@@ -2585,5 +2650,116 @@ mod tests {
             }
             *set.disks.write().await = inventory;
         }
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_batch_delete_of_prefix_sharing_keys_leaves_no_proof() {
+        // CI s3-tests `test_bucket_list(v2)_delimiter_basic`: one DeleteObjects
+        // removes `foo/bar` and its child key `foo/bar/xyzzy` under separate
+        // exact-key locks. The child's finalization removes `foo/bar/xyzzy/`
+        // between the parent's GC inspection and finalization.
+        let bucket = "recover-prefix-sharing-batch";
+        let (_dirs, store, disks) = fixture(bucket).await;
+        let keys = ["asdf", "boo/bar", "foo/bar", "foo/bar/xyzzy", "quux/thud"];
+        for key in keys {
+            let mut reader = PutObjReader::from_vec(vec![7; 64]);
+            store
+                .put_object(
+                    bucket,
+                    key,
+                    &mut reader,
+                    &ObjectOptions {
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("put prefix-sharing key");
+        }
+        let parent_inspected = Arc::new(tokio::sync::Notify::new());
+        let parent_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let parent_inspected = parent_inspected.clone();
+            let parent_paused = parent_paused.clone();
+            let disks = disks.clone();
+            test_hooks::before_gc_finalize(
+                bucket,
+                "foo/bar",
+                Arc::new(move || {
+                    let parent_inspected = parent_inspected.clone();
+                    let parent_paused = parent_paused.clone();
+                    let disks = disks.clone();
+                    Box::pin(async move {
+                        parent_paused.store(true, std::sync::atomic::Ordering::SeqCst);
+                        parent_inspected.notify_one();
+                        let child_finalized = async {
+                            loop {
+                                let mut residue = false;
+                                for disk in &disks {
+                                    // The probe races the child's own cleanup;
+                                    // a vanishing directory is retried.
+                                    residue |= disk
+                                        .discover_delete_transactions(bucket, Some("foo/bar/xyzzy"), None, 128)
+                                        .await
+                                        .map_or(true, |page| !page.transactions.is_empty());
+                                }
+                                if !residue {
+                                    break;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                            }
+                        };
+                        tokio::time::timeout(std::time::Duration::from_secs(30), child_finalized)
+                            .await
+                            .expect("child key finalizes while the parent is paused");
+                    })
+                }),
+            );
+        }
+        {
+            let parent_inspected = parent_inspected.clone();
+            test_hooks::before_gc_finalize(
+                bucket,
+                "foo/bar/xyzzy",
+                Arc::new(move || {
+                    let parent_inspected = parent_inspected.clone();
+                    Box::pin(async move {
+                        tokio::time::timeout(std::time::Duration::from_secs(30), parent_inspected.notified())
+                            .await
+                            .expect("parent key reaches its GC inspection");
+                    })
+                }),
+            );
+        }
+        let objects = keys
+            .into_iter()
+            .map(|name| crate::storage_api_contracts::object::ObjectToDelete {
+                object_name: name.to_owned(),
+                ..Default::default()
+            })
+            .collect();
+        let (deleted, errors) = store.delete_objects(bucket, objects, ObjectOptions::default()).await;
+        assert!(errors.iter().all(Option::is_none), "batch delete must succeed: {errors:?}");
+        assert_eq!(deleted.len(), keys.len());
+        assert!(
+            parent_paused.load(std::sync::atomic::Ordering::SeqCst),
+            "the interleaving under test must have been exercised"
+        );
+        for disk in &disks {
+            for key in keys {
+                assert!(
+                    disk.discover_delete_transactions(bucket, Some(key), None, 128)
+                        .await
+                        .expect("discover delete proof")
+                        .transactions
+                        .is_empty(),
+                    "inline cleanup must not leave a proof for {key}"
+                );
+            }
+        }
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("an emptied bucket is deletable without background recovery");
     }
 }
