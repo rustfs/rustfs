@@ -280,6 +280,113 @@ async fn table_catalog_authentication_and_credentials_use_the_request_context() 
 }
 
 #[tokio::test]
+async fn warehouse_location_claim_checks_request_identity_and_relocation() {
+    let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    rustfs_iam::store::object::ObjectStore::new(store.clone())
+        .save_iam_config(
+            serde_json::json!({"version": 1}),
+            format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+        )
+        .await
+        .expect("seed IAM format");
+    let iam = rustfs_iam::build_iam_sys(store.clone()).await.expect("initialize IAM");
+    let access_key = "location-creator";
+    let secret_key = "location-creator-secret";
+    iam.create_user(
+        access_key,
+        &AddOrUpdateUserReq {
+            secret_key: secret_key.to_string(),
+            policy: None,
+            status: AccountStatus::Enabled,
+        },
+    )
+    .await
+    .expect("create restricted user");
+    iam.set_policy(
+        "location-creator",
+        Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":"admin:CreateTable","Resource":"arn:aws:s3:::warehouse/namespaces/analytics"},
+                {"Effect":"Allow","Action":"admin:ClaimTableLocation","Resource":[
+                    "arn:aws:s3:::warehouse/owned", "arn:aws:s3:::warehouse/owned/*"
+                ]}
+            ]}"#,
+        )
+        .expect("parse location policy"),
+    )
+    .await
+    .expect("store location policy");
+    iam.policy_db_set(access_key, UserType::Reg, false, "location-creator")
+        .await
+        .expect("attach location policy");
+    let context = Arc::new(AppContext::new(store, Arc::new(RequestIam { handle: iam }), Arc::new(RequestKms)));
+    assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+        access_key: "location-root".to_string(),
+        secret_key: "location-root-secret".to_string(),
+        status: "on".to_string(),
+        ..Default::default()
+    }));
+    let request = || table_catalog_handler_request(context.clone(), access_key, secret_key);
+    for location in ["s3://warehouse/owned", "s3://warehouse/owned/", "s3://warehouse/owned/child"] {
+        authorize_table_warehouse_location_request(&request(), "warehouse", location)
+            .await
+            .expect("explicit prefix grant permits adoption");
+    }
+    for (bucket, location) in [
+        ("warehouse", "s3://warehouse/shared"),
+        ("warehouse", "s3://warehouse/owned2"),
+        ("other-bucket", "s3://other-bucket/owned"),
+    ] {
+        let error = authorize_table_warehouse_location_request(&request(), bucket, location)
+            .await
+            .expect_err("namespace create grant cannot authorize another prefix");
+        assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+    }
+    let mut anonymous = request();
+    anonymous.credentials = None;
+    assert!(
+        authorize_table_warehouse_location_request(&anonymous, "warehouse", "s3://warehouse/owned")
+            .await
+            .is_err()
+    );
+    let root = table_catalog_handler_request(context.clone(), "location-root", "location-root-secret");
+    authorize_table_warehouse_location_request(&root, "warehouse", "s3://warehouse/shared")
+        .await
+        .expect("root can explicitly adopt a location");
+
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace");
+    let (entry, metadata) = table_entry_from_create_table_request(
+        "warehouse",
+        &namespace,
+        serde_json::from_value(serde_json::json!({
+            "name": "events",
+            "schema": {"type":"struct","fields":[{"id":1,"name":"id","required":false,"type":"long"}]}
+        }))
+        .expect("create request"),
+    )
+    .expect("initial metadata");
+    for (location, allowed) in [
+        (entry.warehouse_location.as_str(), true),
+        ("s3://warehouse/owned", true),
+        ("s3://warehouse/shared", false),
+    ] {
+        let backend = TableCommitObjectBackend::for_request(TestTableCatalogObjectBackend::default(), request());
+        let mut target = metadata.clone();
+        target["location"] = serde_json::json!(location);
+        let result = validate_table_metadata_snapshot_graph(&backend, "warehouse", &entry, Some(&metadata), &target).await;
+        let result = backend.finish(result).await;
+        if allowed {
+            result.expect("unchanged or explicitly authorized warehouse location");
+        } else {
+            assert_eq!(
+                result.expect_err("relocation requires prefix authorization").code(),
+                &S3ErrorCode::AccessDenied
+            );
+        }
+    }
+}
+
+#[tokio::test]
 #[serial_test::serial]
 async fn table_maintenance_worker_handler_enforces_conditions_after_authorization() {
     use crate::admin::storage_api::RUSTFS_META_BUCKET;

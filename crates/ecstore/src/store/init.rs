@@ -9168,6 +9168,7 @@ mod tests {
                 &cleanup_object,
                 &expected_source_versions,
                 &[],
+                &[],
                 crate::data_movement::SourceCleanupBucketFence {
                     object_mutation_fence: Some(&mutation_fence),
                     ..Default::default()
@@ -9287,6 +9288,7 @@ mod tests {
                 &cleanup_bucket,
                 object,
                 &expected_source_versions,
+                &[],
                 &[],
                 crate::data_movement::SourceCleanupBucketFence {
                     object_mutation_fence: Some(&mutation_fence),
