@@ -79,11 +79,19 @@ RustFS S3 Tables is an Iceberg REST Catalog and table-bucket implementation on t
 | Area | Status | Covered behavior |
 |---|---|---|
 | Table-aware S3 policy bridge | Supported | Ordinary S3 actions on warehouse paths are checked through the table bridge; table policy cannot be bypassed by direct object access. |
+| Warehouse location authorization | Supported | Caller-selected locations require `admin:ClaimTableLocation` on the normalized physical prefix without a trailing slash, for example `arn:aws:s3:::warehouse/shared`. To also allow claims on descendant prefixes, include `arn:aws:s3:::warehouse/shared/*`. This applies to explicit create locations, staged publication, register/import, external catalog registration, and warehouse relocation. Server-assigned create locations retain the namespace `admin:CreateTable` requirement. Existing table operations that retain the warehouse prefix keep their existing permissions. |
 | Reserved catalog protection | Supported | Catalog-reserved prefixes are protected from ordinary object mutation. |
 | Static S3 credentials | Automated | Default PyIceberg smoke path. |
 | Catalog-vended credentials | Automated when enabled | `rustfs-vended-credentials` verifies the returned prefix, then checks Put/Head/Get/DeleteObject inside it and denies access outside it. |
 | Credential lifetime | Supported | Server-side TTL clamped to a short-lived range. |
 | No-long-term-data-credential bootstrap | Not claimed | Catalog setup still uses the configured principal before table-scoped credentials are requested. |
+
+Granting `admin:ClaimTableLocation` authorizes changing the catalog ownership and
+access requirements of all existing objects and versions under that prefix. It
+does not grant S3 read or write access. Upgrade every server before adding the
+action to policies; older servers do not recognize it. Applications using custom
+locations, staged publication, or table registration need an explicit grant for
+their warehouse prefixes.
 
 ## Maintenance Matrix
 

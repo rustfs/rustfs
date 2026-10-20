@@ -1224,6 +1224,31 @@ async fn authorize_table_catalog_resource_for_principal(
     action: AdminAction,
 ) -> S3Result<()> {
     let object_path = resource.object_path();
+    authorize_table_catalog_object_for_principal(req, principal, resource.warehouse, object_path.as_deref().unwrap_or(""), action)
+        .await
+}
+
+async fn authorize_table_warehouse_location_request(req: &S3Request<Body>, bucket: &str, location: &str) -> S3Result<()> {
+    let prefix =
+        crate::table_catalog::table_warehouse_object_prefix_from_location(bucket, location).map_err(catalog_store_error)?;
+    let principal = table_catalog_request_principal(req).await?;
+    authorize_table_catalog_object_for_principal(
+        req,
+        &principal,
+        bucket,
+        prefix.trim_end_matches('/'),
+        AdminAction::ClaimTableLocationAction,
+    )
+    .await
+}
+
+async fn authorize_table_catalog_object_for_principal(
+    req: &S3Request<Body>,
+    principal: &TableCatalogRequestPrincipal,
+    bucket: &str,
+    object: &str,
+    action: AdminAction,
+) -> S3Result<()> {
     validate_admin_action_with_bucket_object_for_iam(
         principal.iam_store.clone(),
         &req.headers,
@@ -1231,7 +1256,7 @@ async fn authorize_table_catalog_resource_for_principal(
         principal.owner,
         Action::AdminAction(action),
         req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        AdminResourceScope::bucket_object(resource.warehouse, object_path.as_deref().unwrap_or("")),
+        AdminResourceScope::bucket_object(bucket, object),
     )
     .await
 }
@@ -1443,6 +1468,10 @@ where
                 }
             }
         };
+        self.record_authorization_result(result).await
+    }
+
+    async fn record_authorization_result(&self, result: S3Result<()>) -> crate::table_catalog::TableCatalogStoreResult<()> {
         if let Err(err) = result {
             let mut authorization_error = self.authorization_error.lock().await;
             if authorization_error.is_none() {
@@ -1866,6 +1895,25 @@ where
         table_bucket: &str,
     ) -> crate::table_catalog::TableCatalogStoreResult<()> {
         self.begin_bucket_publication(table_bucket).await
+    }
+
+    async fn authorize_table_warehouse_location(
+        &self,
+        table_bucket: &str,
+        location: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        let result = match &self.authorization {
+            TableCommitObjectAuthorization::Request(req) => {
+                let req = req.lock().await;
+                authorize_table_warehouse_location_request(&req, table_bucket, location).await
+            }
+            TableCommitObjectAuthorization::Preauthorized => Ok(()),
+            #[cfg(test)]
+            TableCommitObjectAuthorization::Test { .. } => {
+                return self.backend.authorize_table_warehouse_location(table_bucket, location).await;
+            }
+        };
+        self.record_authorization_result(result).await
     }
 
     fn table_bucket_commit_publication_is_held(&self, table_bucket: &str) -> bool {
@@ -5764,6 +5812,10 @@ where
     let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
     validate_metadata_table_location_in_bucket(bucket, &metadata)?;
     adopt_registered_metadata_identity(&mut entry, &metadata)?;
+    metadata_backend
+        .authorize_table_warehouse_location(bucket, &entry.warehouse_location)
+        .await
+        .map_err(catalog_store_error)?;
     validate_table_metadata_snapshot_graph(metadata_backend, bucket, &entry, None, &metadata).await?;
     store
         .register_table_with_publication(entry.clone(), metadata_backend)
@@ -5953,6 +6005,13 @@ where
 {
     let mut target_entry = entry.clone();
     target_entry.warehouse_location = crate::table_catalog::table_metadata_location(metadata)?.to_string();
+    if crate::table_catalog::table_warehouse_object_prefix(&target_entry)?
+        != crate::table_catalog::table_warehouse_object_prefix(entry)?
+    {
+        metadata_backend
+            .authorize_table_warehouse_location(bucket, &target_entry.warehouse_location)
+            .await?;
+    }
     let context = crate::table_catalog::TableSnapshotGraphValidationContext::new(metadata_backend, bucket, &target_entry);
     crate::table_catalog::validate_table_snapshot_changes(&context, current_metadata, metadata).await
 }
@@ -6639,6 +6698,10 @@ where
         updated_at: None,
     };
     adopt_registered_metadata_identity(&mut entry, &metadata)?;
+    metadata_backend
+        .authorize_table_warehouse_location(bucket, &entry.warehouse_location)
+        .await
+        .map_err(catalog_store_error)?;
     validate_table_metadata_snapshot_graph(metadata_backend, bucket, &entry, None, &metadata).await?;
 
     crate::table_catalog::TableCommitPublication::begin_table_bucket(metadata_backend, bucket)
@@ -7637,6 +7700,10 @@ where
             },
         )?;
         adopt_registered_metadata_identity(&mut entry, &target_metadata)?;
+        metadata_backend
+            .authorize_table_warehouse_location(bucket, &entry.warehouse_location)
+            .await
+            .map_err(catalog_store_error)?;
         validate_table_metadata_snapshot_graph(metadata_backend, bucket, &entry, None, &target_metadata).await?;
         store
             .register_table_with_publication(entry.clone(), metadata_backend)
@@ -7680,6 +7747,10 @@ where
         let metadata = read_table_metadata_json(metadata_backend, bucket, &entry.metadata_location).await?;
         validate_metadata_table_location_in_bucket(bucket, &metadata)?;
         adopt_registered_metadata_identity(&mut entry, &metadata)?;
+        metadata_backend
+            .authorize_table_warehouse_location(bucket, &entry.warehouse_location)
+            .await
+            .map_err(catalog_store_error)?;
         validate_table_metadata_snapshot_graph(metadata_backend, bucket, &entry, None, &metadata).await?;
         if let Some(existing) = store
             .load_table(bucket, &namespace.public_name(), table)

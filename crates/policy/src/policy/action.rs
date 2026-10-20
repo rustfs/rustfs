@@ -556,6 +556,8 @@ pub enum AdminAction {
     SetTableAction,
     #[strum(serialize = "admin:CreateTable")]
     CreateTableAction,
+    #[strum(serialize = "admin:ClaimTableLocation")]
+    ClaimTableLocationAction,
     #[strum(serialize = "admin:RegisterTable")]
     RegisterTableAction,
     #[strum(serialize = "admin:CommitTable")]
@@ -611,6 +613,7 @@ impl AdminAction {
                 | AdminAction::GetTableAction
                 | AdminAction::SetTableAction
                 | AdminAction::CreateTableAction
+                | AdminAction::ClaimTableLocationAction
                 | AdminAction::RegisterTableAction
                 | AdminAction::CommitTableAction
                 | AdminAction::DeleteTableAction
@@ -703,6 +706,7 @@ impl AdminAction {
                 | AdminAction::GetTableAction
                 | AdminAction::SetTableAction
                 | AdminAction::CreateTableAction
+                | AdminAction::ClaimTableLocationAction
                 | AdminAction::RegisterTableAction
                 | AdminAction::CommitTableAction
                 | AdminAction::DeleteTableAction

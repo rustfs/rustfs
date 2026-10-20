@@ -74,12 +74,15 @@ pub struct RestCreateTableHandler {}
 
 #[async_trait::async_trait]
 impl Operation for RestCreateTableHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let resource = TableCatalogResource::namespace(&warehouse, &namespace);
         authorize_table_catalog_resource_request(&req, &resource, AdminAction::CreateTableAction).await?;
-        let request = read_json_body::<CreateTableRequest>(req.input).await?;
+        let request = read_json_body::<CreateTableRequest>(std::mem::take(&mut req.input)).await?;
+        if let Some(location) = request.location.as_deref() {
+            authorize_table_warehouse_location_request(&req, &warehouse, location).await?;
+        }
         let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let table_bucket_enabled = table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
