@@ -56,6 +56,12 @@ pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
 const DATA_COMPRESSION_TOTAL_NAME: &str = ".compression.json";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 const DATA_USAGE_CACHE_TTL_SECS: u64 = 30;
+// A scanner save invalidates only the saving process's snapshot cache; every
+// other node sees it only after reloading. A lookup for a bucket that the
+// cached snapshot does not mention at all reloads a copy this old, so a
+// bucket created after the last load is not reported unknown for the rest of
+// the TTL once the scanner leader has published it.
+const DATA_USAGE_UNKNOWN_BUCKET_REFRESH_SECS: u64 = 5;
 const LIVE_BUCKET_USAGE_MAX_ENTRIES: u64 = 1024;
 const DATA_USAGE_REMOVE_CAS_RETRIES: usize = 3;
 
@@ -188,7 +194,7 @@ static USAGE_MEMORY_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// authoritative snapshot first, backfilled per bucket from the observed
 /// (nonconverged) snapshot for buckets no authoritative cycle has covered
 /// yet (issue #6852). Loads go through the TTL-bounded
-/// snapshot cache, so the quota path adds at most one backend read per
+/// snapshot cache, so this lookup adds at most one backend read per
 /// [`DATA_USAGE_CACHE_TTL_SECS`] window. Returns `None` for buckets absent
 /// from every persisted snapshot — those still fail closed.
 pub async fn lookup_degraded_bucket_usage_baseline(store: Arc<ECStore>, bucket: &str) -> Option<u64> {
@@ -1244,8 +1250,8 @@ async fn load_data_usage_from_backend_with_baseline(store: Arc<ECStore>) -> Resu
     // gate ties the observation to this exact authoritative snapshot, so a
     // stale observed object left behind by an earlier incarnation (e.g. a
     // deleted and recreated bucket) cannot inject ghost usage. Loads sit
-    // behind the same TTL cache as the snapshot itself, so this adds at most
-    // one backend read per TTL window.
+    // behind the same cache as the snapshot itself, so this adds one backend
+    // read per snapshot refresh.
     let mut observed_unavailable = false;
     match load_observed_data_usage_snapshot(store).await {
         Ok(Some(observed)) if observed_data_usage_is_newer(&observed, &authoritative_as_persisted) => {
@@ -1470,11 +1476,18 @@ async fn normalize_loaded_data_usage(
 ///
 /// Admin read endpoints call this on every request; the cache bounds backend
 /// reads (and the associated JSON parse and INFO log) to once per
-/// `DATA_USAGE_CACHE_TTL_SECS` per process. `save_data_usage_in_backend`
-/// invalidates the cache so a fresh scanner save is visible immediately.
+/// `DATA_USAGE_CACHE_TTL_SECS` per process; a lookup for a bucket the snapshot
+/// does not mention may reload after `DATA_USAGE_UNKNOWN_BUCKET_REFRESH_SECS`.
+/// `save_data_usage_in_backend` invalidates the cache so a fresh scanner save
+/// is visible immediately in the saving process.
 pub async fn load_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
-    let ttl = Duration::from_secs(DATA_USAGE_CACHE_TTL_SECS);
+    load_data_usage_from_backend_cached_within(store, Duration::from_secs(DATA_USAGE_CACHE_TTL_SECS)).await
+}
 
+/// [`load_data_usage_from_backend_cached`] with a caller-chosen maximum age.
+/// A shorter age shares the same cache and refresh lock, so concurrent
+/// callers still coalesce on one backend read.
+async fn load_data_usage_from_backend_cached_within(store: Arc<ECStore>, ttl: Duration) -> Result<DataUsageInfo, Error> {
     loop {
         {
             let cache = data_usage_snapshot_cache().read().await;
@@ -2260,7 +2273,28 @@ pub async fn record_bucket_delete_marker_memory(bucket: &str) {
 /// Get bucket usage from the authoritative cache for this topology.
 async fn get_persisted_bucket_usage(bucket: &str) -> Option<u64> {
     let store = runtime_sources::object_store_handle()?;
-    let info = load_data_usage_from_backend_cached(store).await.ok()?;
+    persisted_bucket_usage(store, bucket).await
+}
+
+async fn persisted_bucket_usage(store: Arc<ECStore>, bucket: &str) -> Option<u64> {
+    let info = load_data_usage_from_backend_cached(store.clone()).await.ok()?;
+    if let Some(usage) = info.buckets_usage.get(bucket) {
+        return Some(usage.size);
+    }
+    // The degraded baseline serves a bucket it covers; reloading for it would
+    // only re-read a snapshot whose bucket data is still incomplete. Checking
+    // the age here keeps a fresh copy from being cloned a second time on
+    // every write to a bucket the scanner has not reached yet.
+    let refresh_age = Duration::from_secs(DATA_USAGE_UNKNOWN_BUCKET_REFRESH_SECS);
+    let reload = data_usage_snapshot_cache()
+        .read()
+        .await
+        .as_ref()
+        .is_some_and(|cached| !cached.degraded_baseline.contains_key(bucket) && cached.loaded_at.elapsed() >= refresh_age);
+    if !reload {
+        return None;
+    }
+    let info = load_data_usage_from_backend_cached_within(store, refresh_age).await.ok()?;
     info.buckets_usage.get(bucket).map(|usage| usage.size)
 }
 
@@ -3989,6 +4023,112 @@ mod tests {
         assert_eq!((displayed.objects_total_count, displayed.objects_total_size), (2, 42));
         assert_eq!(displayed.snapshot_identity(), reconciled.snapshot_identity());
         clear_usage_memory_cache_for_test().await;
+        invalidate_data_usage_snapshot_cache().await;
+    }
+
+    async fn set_data_usage_snapshot_cache_age_for_test(age: Duration) {
+        let mut cache = data_usage_snapshot_cache().write().await;
+        let cached = cache.as_mut().expect("the snapshot cache must hold a load");
+        cached.loaded_at = tokio::time::Instant::now()
+            .checked_sub(age)
+            .expect("the monotonic clock must reach back by the requested age");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn unknown_bucket_lookup_reloads_a_snapshot_another_node_published() {
+        use crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
+        use crate::config::com::save_config;
+
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        let before = data_usage_info_for_test("existing", 1, 10, SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        save_config(
+            store.clone(),
+            DATA_USAGE_OBJ_NAME_PATH.as_str(),
+            serde_json::to_vec(&before).expect("encode usage"),
+        )
+        .await
+        .expect("persist usage that predates the new bucket");
+        invalidate_data_usage_snapshot_cache().await;
+        assert_eq!(persisted_bucket_usage(store.clone(), "existing").await, Some(10));
+
+        // The scanner leader on another node publishes a snapshot covering the
+        // new bucket. Its save does not invalidate this process's cache.
+        let mut after = data_usage_info_for_test("existing", 2, 20, SystemTime::UNIX_EPOCH + Duration::from_secs(2));
+        after.buckets_usage.insert(
+            "created-later".to_string(),
+            BucketUsageInfo {
+                objects_count: 1,
+                versions_count: 1,
+                size: 1024,
+                ..Default::default()
+            },
+        );
+        after.bucket_sizes.insert("created-later".to_string(), 1024);
+        after.buckets_count = after.buckets_usage.len() as u64;
+        after.calculate_totals();
+        save_config(
+            store.clone(),
+            DATA_USAGE_OBJ_NAME_PATH.as_str(),
+            serde_json::to_vec(&after).expect("encode usage"),
+        )
+        .await
+        .expect("persist the later snapshot");
+
+        // A fresh copy is reused even for an unknown bucket, which bounds reloads.
+        set_data_usage_snapshot_cache_age_for_test(Duration::ZERO).await;
+        assert_eq!(persisted_bucket_usage(store.clone(), "created-later").await, None);
+
+        set_data_usage_snapshot_cache_age_for_test(Duration::from_secs(DATA_USAGE_UNKNOWN_BUCKET_REFRESH_SECS)).await;
+        assert_eq!(
+            persisted_bucket_usage(store.clone(), "existing").await,
+            Some(10),
+            "a bucket the cached copy covers keeps the cached value for the full TTL"
+        );
+        assert_eq!(
+            persisted_bucket_usage(store.clone(), "created-later").await,
+            Some(1024),
+            "an unknown bucket must reload an aged copy instead of waiting out the TTL"
+        );
+        assert_eq!(persisted_bucket_usage(store, "existing").await, Some(20));
+        invalidate_data_usage_snapshot_cache().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn degraded_baseline_bucket_lookup_does_not_reload_the_snapshot() {
+        use crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
+        use crate::config::com::save_config;
+
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        let mut incomplete = data_usage_info_for_test("legacy", 1, 7, SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        incomplete.usage_snapshot_complete = false;
+        save_config(
+            store.clone(),
+            DATA_USAGE_OBJ_NAME_PATH.as_str(),
+            serde_json::to_vec(&incomplete).expect("encode usage"),
+        )
+        .await
+        .expect("persist an incomplete snapshot");
+        invalidate_data_usage_snapshot_cache().await;
+        assert_eq!(persisted_bucket_usage(store.clone(), "legacy").await, None);
+        assert_eq!(lookup_degraded_bucket_usage_baseline(store.clone(), "legacy").await, Some(7));
+
+        save_config(
+            store.clone(),
+            DATA_USAGE_OBJ_NAME_PATH.as_str(),
+            serde_json::to_vec(&data_usage_info_for_test("legacy", 2, 9, SystemTime::UNIX_EPOCH + Duration::from_secs(2)))
+                .expect("encode usage"),
+        )
+        .await
+        .expect("persist the later complete snapshot");
+        set_data_usage_snapshot_cache_age_for_test(Duration::from_secs(DATA_USAGE_UNKNOWN_BUCKET_REFRESH_SECS)).await;
+        assert_eq!(persisted_bucket_usage(store.clone(), "legacy").await, None);
+        assert_eq!(
+            lookup_degraded_bucket_usage_baseline(store, "legacy").await,
+            Some(7),
+            "a bucket the degraded baseline covers must not reload the snapshot early"
+        );
         invalidate_data_usage_snapshot_cache().await;
     }
 
