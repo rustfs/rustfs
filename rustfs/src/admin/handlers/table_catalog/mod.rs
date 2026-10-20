@@ -4748,10 +4748,11 @@ impl SnapshotFileChanges {
         &mut self,
         reference: crate::table_catalog::ManifestDataFileReference,
         current_live_files: &SnapshotLiveFiles,
+        partition_spec_id: i32,
     ) {
         self.invalid_existing_files |= !current_live_files
             .identity(&reference.location, &reference.object_kind)
-            .is_some_and(|identity| identity.matches_existing_reference(&reference));
+            .is_some_and(|identity| identity.matches_existing_reference(&reference, partition_spec_id));
         self.invalid_existing_files |= !self.existing_files.insert(reference.location);
     }
 
@@ -4781,17 +4782,26 @@ struct SnapshotManifestIdentity {
     added_snapshot_id: Option<i64>,
 }
 
-#[derive(PartialEq, Eq)]
 struct SnapshotFileIdentity {
     content: crate::table_catalog::ManifestDataFileContent,
+    snapshot_id: Option<i64>,
+    partition_spec_id: i32,
+    data_file_metadata: crate::table_catalog::ManifestDataFileMetadata,
     sequence_number: Option<i64>,
     file_sequence_number: Option<i64>,
 }
 
 impl SnapshotFileIdentity {
-    fn matches_existing_reference(&self, reference: &crate::table_catalog::ManifestDataFileReference) -> bool {
+    fn matches_existing_reference(
+        &self,
+        reference: &crate::table_catalog::ManifestDataFileReference,
+        partition_spec_id: i32,
+    ) -> bool {
         // Iceberg v1 files have implicit sequence zero when carried into v2 manifests.
         self.content == reference.content
+            && self.snapshot_id == reference.snapshot_id
+            && self.partition_spec_id == partition_spec_id
+            && self.data_file_metadata == reference.data_file_metadata
             && self.sequence_number.unwrap_or(0) == reference.sequence_number.unwrap_or(0)
             && self.file_sequence_number.unwrap_or(0) == reference.file_sequence_number.unwrap_or(0)
     }
@@ -4944,6 +4954,7 @@ where
             manifest_path,
             sequence_number,
             added_snapshot_id,
+            partition_spec_id,
         } = manifest.location;
         live_files.manifest_files.insert(
             manifest_path,
@@ -4960,6 +4971,9 @@ where
                 0 | 1 => {
                     let identity = SnapshotFileIdentity {
                         content: reference.content,
+                        snapshot_id: reference.snapshot_id,
+                        partition_spec_id: partition_spec_id.unwrap_or(0),
+                        data_file_metadata: reference.data_file_metadata,
                         sequence_number: reference.sequence_number,
                         file_sequence_number: reference.file_sequence_number,
                     };
@@ -5017,7 +5031,11 @@ where
                     .into_iter()
                     .filter(|reference| matches!(reference.entry_status, Some(0 | 1)))
                 {
-                    changes.record_existing_file(reference, context.current_live_files);
+                    changes.record_existing_file(
+                        reference,
+                        context.current_live_files,
+                        manifest.location.partition_spec_id.unwrap_or(0),
+                    );
                 }
             }
             continue;
@@ -5074,7 +5092,11 @@ where
             match (status, &reference.object_kind) {
                 (0, _) => {
                     if context.track_existing_files {
-                        changes.record_existing_file(reference, context.current_live_files);
+                        changes.record_existing_file(
+                            reference,
+                            context.current_live_files,
+                            manifest.location.partition_spec_id.unwrap_or(0),
+                        );
                     }
                 }
                 (1, crate::table_catalog::TableMetadataMaintenanceObjectKind::DataFile) => {
@@ -5112,7 +5134,7 @@ where
 {
     let manifest_locations = snapshot_manifest_locations(metadata_backend, bucket, entry, snapshot).await?;
     let mut manifests = Vec::new();
-    for manifest_location in manifest_locations {
+    for mut manifest_location in manifest_locations {
         let manifest_key = table_commit_object_key(
             bucket,
             entry,
@@ -5124,10 +5146,11 @@ where
             .await
             .map_err(catalog_store_error)?
             .ok_or_else(|| s3_error!(InvalidRequest, "snapshot manifest object is missing"))?;
-        let file_references = crate::table_catalog::decode_manifest_avro_async(manifest_object.data)
+        let decoded_manifest = crate::table_catalog::decode_manifest_avro_async(manifest_object.data)
             .await
-            .map_err(catalog_store_error)?
-            .references;
+            .map_err(catalog_store_error)?;
+        manifest_location.partition_spec_id = manifest_location.partition_spec_id.or(decoded_manifest.partition_spec_id);
+        let file_references = decoded_manifest.references;
         let mut references = Vec::with_capacity(file_references.len());
         for mut reference in file_references {
             if reference.snapshot_id.is_none() {
@@ -5153,6 +5176,7 @@ where
 #[derive(Debug)]
 struct SnapshotManifestLocation {
     manifest_path: String,
+    partition_spec_id: Option<i32>,
     sequence_number: Option<i64>,
     added_snapshot_id: Option<i64>,
 }
@@ -5186,6 +5210,7 @@ where
             .into_iter()
             .map(|reference| SnapshotManifestLocation {
                 manifest_path: reference.manifest_path,
+                partition_spec_id: reference.partition_spec_id,
                 sequence_number: reference.sequence_number,
                 added_snapshot_id: reference.added_snapshot_id,
             })
@@ -5203,6 +5228,7 @@ where
                 .filter(|manifest| !manifest.is_empty())
                 .map(|manifest| SnapshotManifestLocation {
                     manifest_path: manifest.to_string(),
+                    partition_spec_id: None,
                     sequence_number: None,
                     added_snapshot_id: None,
                 })

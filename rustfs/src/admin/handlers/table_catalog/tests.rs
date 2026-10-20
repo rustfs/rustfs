@@ -9447,6 +9447,224 @@ async fn row_level_conflict_rejects_changed_inherited_manifest_identity() {
     assert_eq!(unchanged.generation, current.generation);
 }
 
+fn manifest_rewrite_metadata_bytes(bytes: Vec<u8>, case: &str) -> Vec<u8> {
+    use apache_avro::types::Value;
+    let reader = apache_avro::Reader::new(bytes.as_slice()).unwrap();
+    let mut schema_json = serde_json::to_value(reader.writer_schema()).unwrap();
+    let metadata = reader.user_metadata().clone();
+    let mut records = reader.map(Result::unwrap).collect::<Vec<_>>();
+    let fields = schema_json["fields"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|field| field["name"] == "data_file")
+        .unwrap()["type"]["fields"]
+        .as_array_mut()
+        .unwrap();
+    let mut replacements = vec![(
+        "file_format",
+        serde_json::json!("string"),
+        Value::String(
+            if case == "file_format" {
+                "ORC"
+            } else if case == "format_case" {
+                "parquet"
+            } else {
+                "PARQUET"
+            }
+            .to_string(),
+        ),
+    )];
+    if case != "legacy" {
+        replacements.extend([
+            (
+                "partition",
+                serde_json::json!({"type": "record", "name": "partition", "fields": [{"name": "id", "type": ["null", "long"]}]}),
+                Value::Record(vec![(
+                    "id".to_string(),
+                    Value::Union(1, Box::new(Value::Long(if case == "partition" { 43 } else { 42 }))),
+                )]),
+            ),
+            (
+                "record_count",
+                serde_json::json!("long"),
+                Value::Long(if case == "record_count" { 2 } else { 1 }),
+            ),
+            (
+                "file_size_in_bytes",
+                serde_json::json!("long"),
+                Value::Long(if case == "file_size_in_bytes" { 2 } else { 1 }),
+            ),
+            (
+                "sort_order_id",
+                serde_json::json!(["null", "int"]),
+                Value::Union(1, Box::new(Value::Int(if case == "sort_order_id" { 2 } else { 1 }))),
+            ),
+            (
+                "key_metadata",
+                serde_json::json!(["null", "bytes"]),
+                Value::Union(1, Box::new(Value::Bytes(vec![u8::from(case == "key_metadata")]))),
+            ),
+            (
+                "split_offsets",
+                serde_json::json!(["null", {"type": "array", "items": "long"}]),
+                Value::Union(1, Box::new(Value::Array(vec![Value::Long(i64::from(case == "split_offsets"))]))),
+            ),
+            (
+                "equality_ids",
+                serde_json::json!(["null", {"type": "array", "items": "int"}]),
+                Value::Union(1, Box::new(Value::Array(vec![Value::Int(if case == "equality_ids" { 2 } else { 1 })]))),
+            ),
+            (
+                "custom_metadata",
+                serde_json::json!(["null", "long"]),
+                Value::Union(1, Box::new(Value::Long(i64::from(case == "custom_metadata")))),
+            ),
+        ]);
+        for name in [
+            "column_sizes",
+            "value_counts",
+            "null_value_counts",
+            "nan_value_counts",
+            "lower_bounds",
+            "upper_bounds",
+        ] {
+            if case == "missing_metric" && name == "lower_bounds" {
+                continue;
+            }
+            let is_bound = matches!(name, "lower_bounds" | "upper_bounds");
+            let mut entries = (1..=2)
+                .map(|key| {
+                    let number = u8::from(case == name && key == 1);
+                    let value = if is_bound {
+                        Value::Bytes(vec![number])
+                    } else {
+                        Value::Long(i64::from(number))
+                    };
+                    Value::Record(vec![("key".to_string(), Value::Int(key)), ("value".to_string(), value)])
+                })
+                .collect::<Vec<_>>();
+            if case == "reordered_metadata" {
+                entries.reverse();
+            }
+            replacements.push((
+                name,
+                serde_json::json!(["null", {"type": "array", "items": {
+                    "type": "record", "name": format!("{name}_entry"), "fields": [
+                        {"name": "key", "type": "int"}, {"name": "value", "type": if is_bound { "bytes" } else { "long" }}
+                    ]
+                }}]),
+                Value::Union(1, Box::new(Value::Array(entries))),
+            ));
+        }
+    }
+    if matches!(case, "optional_null" | "legacy") {
+        replacements.push((
+            "referenced_data_file",
+            serde_json::json!(["null", "string"]),
+            Value::Union(0, Box::new(Value::Null)),
+        ));
+    }
+    if case == "legacy" {
+        replacements.push((
+            "sort_order_id",
+            serde_json::json!(["null", "int"]),
+            Value::Union(1, Box::new(Value::Int(0))),
+        ));
+    }
+    let floating_partition = match case {
+        "positive_zero" => Some(Value::Double(0.0)),
+        "negative_zero" => Some(Value::Double(-0.0)),
+        "nan" => Some(Value::Double(f64::NAN)),
+        "other_nan" => Some(Value::Double(f64::from_bits(0x7ff8_0000_0000_0001))),
+        "float_zero" => Some(Value::Float(0.0)),
+        "float_negative_zero" => Some(Value::Float(-0.0)),
+        "float_nan" => Some(Value::Float(f32::NAN)),
+        _ => None,
+    };
+    if let Some(value) = floating_partition {
+        let field_type = if matches!(value, Value::Float(_)) { "float" } else { "double" };
+        replacements.push((
+            "partition",
+            serde_json::json!({"type": "record", "name": "partition", "fields": [{"name": "id", "type": field_type}]}),
+            Value::Record(vec![("id".to_string(), value)]),
+        ));
+    }
+    for (name, field_type, _) in &replacements {
+        if let Some(field) = fields.iter_mut().find(|field| field["name"] == *name) {
+            field["type"] = field_type.clone();
+        } else {
+            fields.push(serde_json::json!({"name": name, "type": field_type}));
+        }
+    }
+    if case == "reordered_metadata" {
+        fields.reverse();
+    }
+    let field_order = fields
+        .iter()
+        .map(|field| field["name"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    for record in &mut records {
+        let Value::Record(entry_fields) = record else { panic!("expected manifest entry") };
+        let Value::Record(data_fields) = &mut entry_fields.iter_mut().find(|(name, _)| name == "data_file").unwrap().1 else {
+            panic!("expected data_file")
+        };
+        for (name, _, value) in &replacements {
+            if let Some((_, existing)) = data_fields.iter_mut().find(|(field, _)| field == name) {
+                *existing = value.clone();
+            } else {
+                data_fields.push((name.to_string(), value.clone()));
+            }
+        }
+        let content = data_fields
+            .iter()
+            .find(|(name, _)| name == "content")
+            .and_then(|(_, value)| match value {
+                Value::Int(content) => Some(*content),
+                _ => None,
+            });
+        for (name, value) in data_fields.iter_mut() {
+            if (name == "equality_ids" && content != Some(2) && case != "equality_ids")
+                || (name == "sort_order_id" && content == Some(1) && case != "sort_order_id")
+            {
+                *value = Value::Union(0, Box::new(Value::Null));
+            }
+        }
+        data_fields.sort_by_key(|(name, _)| field_order.iter().position(|field| field == name).unwrap());
+    }
+    let schema = apache_avro::Schema::parse(&schema_json).unwrap();
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new()).unwrap();
+    for (key, value) in metadata {
+        writer.add_user_metadata(key, value).unwrap();
+    }
+    for record in records {
+        writer.append_value(record).unwrap();
+    }
+    writer.into_inner().unwrap()
+}
+
+#[test]
+fn manifest_rewrite_compares_floating_partition_values() {
+    let metadata = |case| {
+        let bytes = manifest_rewrite_metadata_bytes(
+            test_manifest_avro_bytes(&[("s3://warehouse/table/data/file.parquet", 0, 0, 10, 1)]),
+            case,
+        );
+        crate::table_catalog::data_file_references_from_manifest_avro(&bytes)
+            .unwrap()
+            .remove(0)
+            .data_file_metadata
+    };
+    assert_ne!(metadata("positive_zero"), metadata("negative_zero"));
+    assert_ne!(metadata("float_zero"), metadata("float_negative_zero"));
+    assert_ne!(metadata("float_zero"), metadata("negative_zero"));
+    assert_eq!(metadata("float_zero"), metadata("positive_zero"));
+    assert_eq!(metadata("float_negative_zero"), metadata("negative_zero"));
+    assert_eq!(metadata("nan"), metadata("other_nan"));
+    assert_eq!(metadata("float_nan"), metadata("nan"));
+    assert_ne!(metadata("nan"), metadata("positive_zero"));
+}
+
 fn manifest_rewrite_list_bytes(entries: &[(&str, usize, i32, i32, i64, i64, i64)], statuses: &[i32]) -> Vec<u8> {
     let bytes = crate::table_catalog::test_support::manifest_list_avro_entries_with_min_sequences(entries);
     let reader = apache_avro::Reader::new(bytes.as_slice()).unwrap();
@@ -9524,6 +9742,28 @@ async fn manifest_rewrite_commit_preserves_live_files() {
             "data_sequence",
             "file_sequence",
             "content_kind",
+            "snapshot_id",
+            "partition",
+            "partition_spec",
+            "inherited_partition_spec",
+            "file_format",
+            "format_case",
+            "record_count",
+            "file_size_in_bytes",
+            "sort_order_id",
+            "column_sizes",
+            "value_counts",
+            "null_value_counts",
+            "nan_value_counts",
+            "lower_bounds",
+            "upper_bounds",
+            "key_metadata",
+            "split_offsets",
+            "equality_ids",
+            "custom_metadata",
+            "missing_metric",
+            "reordered_metadata",
+            "optional_null",
             "duplicate_file",
             "intermediate_duplicate",
             "stale_requirement",
@@ -9534,6 +9774,15 @@ async fn manifest_rewrite_commit_preserves_live_files() {
             let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
             let namespace = crate::table_catalog::Namespace::parse("analytics").unwrap();
             let created = create_standard_events_table(&store, &backend, &namespace).await;
+            commit_table_response(
+                &store, &trusted_table_commit_backend(&backend), "warehouse", &namespace, "events",
+                serde_json::from_value(serde_json::json!({"updates": [
+                    {"action": "add-spec", "spec": {"spec-id": 1, "fields": [{"source-id": 1, "field-id": 1000, "name": "id", "transform": "identity"}]}},
+                    {"action": "add-spec", "spec": {"spec-id": 2, "fields": [{"source-id": 1, "field-id": 1001, "name": "id", "transform": "truncate[10]"}]}},
+                    {"action": "add-sort-order", "sort-order": {"order-id": 1, "fields": [{"source-id": 1, "transform": "identity", "direction": "asc", "null-order": "nulls-first"}]}},
+                    {"action": "add-sort-order", "sort-order": {"order-id": 2, "fields": [{"source-id": 1, "transform": "identity", "direction": "desc", "null-order": "nulls-first"}]}}
+                ]})).unwrap(),
+            ).await.unwrap();
             let location = created.metadata["location"].as_str().unwrap();
             let removed = format!("{location}/data/removed.parquet");
             let retained = format!("{location}/data/retained.parquet");
@@ -9553,7 +9802,10 @@ async fn manifest_rewrite_commit_preserves_live_files() {
                 let mut manifests = Vec::new();
                 for (index, (file, file_content, status, entry_snapshot, entry_sequence)) in files.iter().enumerate() {
                     let manifest = format!("{location}/metadata/manifest-{snapshot_id}-{index}.avro");
-                    let bytes = test_manifest_avro_bytes(&[(file, *file_content, *status, *entry_snapshot, *entry_sequence)]);
+                    let bytes = manifest_rewrite_metadata_bytes(
+                        test_manifest_avro_bytes(&[(file, *file_content, *status, *entry_snapshot, *entry_sequence)]),
+                        "unchanged",
+                    );
                     manifests.push((manifest.clone(), bytes.len(), i32::from(*file_content != 0), *entry_sequence));
                     backend
                         .put_bytes("warehouse", &test_snapshot_object_key("warehouse", &manifest), bytes)
@@ -9571,7 +9823,7 @@ async fn manifest_rewrite_commit_preserves_live_files() {
                 let list = format!("{location}/metadata/snap-{snapshot_id}.avro");
                 let entries = manifests
                     .iter()
-                    .map(|(p, len, kind, min)| (p.as_str(), *len, 0, *kind, sequence, *min, snapshot_id))
+                    .map(|(p, len, kind, min)| (p.as_str(), *len, 1, *kind, sequence, *min, snapshot_id))
                     .collect::<Vec<_>>();
                 backend
                     .put_bytes(
@@ -9642,7 +9894,7 @@ async fn manifest_rewrite_commit_preserves_live_files() {
                         .await
                         .unwrap();
                 }
-                "omitted_file" | "inherited_manifest" => {
+                "omitted_file" | "inherited_manifest" | "inherited_partition_spec" => {
                     rewritten.pop();
                 }
                 "extra_file" => {
@@ -9656,6 +9908,9 @@ async fn manifest_rewrite_commit_preserves_live_files() {
                 }
                 "file_sequence" => {
                     rewritten[1].5 = Some(1);
+                }
+                "snapshot_id" => {
+                    rewritten[1].3 = 10;
                 }
                 "content_kind" => {
                     rewritten[1].1 = if content == 0 {
@@ -9677,15 +9932,34 @@ async fn manifest_rewrite_commit_preserves_live_files() {
             let mut manifests = Vec::new();
             for (index, reference) in rewritten.iter().enumerate() {
                 let manifest = format!("{location}/metadata/rewrite-{index}.avro");
-                let bytes = manifest_avro_bytes_with_entry_sequences(&[*reference]);
-                manifests.push((manifest.clone(), bytes.len(), 0, i32::from(reference.1 != 0), 3, reference.4.unwrap(), 12));
+                let bytes = manifest_rewrite_metadata_bytes(
+                    manifest_avro_bytes_with_entry_sequences(&[*reference]),
+                    if index == 1 { case } else { "unchanged" },
+                );
+                manifests.push((
+                    manifest.clone(),
+                    bytes.len(),
+                    if case == "partition_spec" && index == 1 { 2 } else { 1 },
+                    i32::from(reference.1 != 0),
+                    3,
+                    reference.4.unwrap(),
+                    12,
+                ));
                 backend
                     .put_bytes("warehouse", &test_snapshot_object_key("warehouse", &manifest), bytes)
                     .await;
             }
-            if case == "inherited_manifest" {
+            if matches!(case, "inherited_manifest" | "inherited_partition_spec") {
                 let (manifest, size, kind, min) = &parent_manifests[2];
-                manifests.push((manifest.clone(), *size, 0, *kind, 2, *min, 11));
+                manifests.push((
+                    manifest.clone(),
+                    *size,
+                    if case == "inherited_partition_spec" { 2 } else { 1 },
+                    *kind,
+                    2,
+                    *min,
+                    11,
+                ));
             }
             let list = format!("{location}/metadata/snap-12.avro");
             let entries = manifests
@@ -9701,7 +9975,7 @@ async fn manifest_rewrite_commit_preserves_live_files() {
                         &rewritten
                             .iter()
                             .map(|entry| entry.2)
-                            .chain((case == "inherited_manifest").then_some(1))
+                            .chain(matches!(case, "inherited_manifest" | "inherited_partition_spec").then_some(1))
                             .collect::<Vec<_>>(),
                     ),
                 )
@@ -9786,7 +10060,16 @@ async fn manifest_rewrite_commit_preserves_live_files() {
             )
             .await;
             let after = store.load_table("warehouse", "analytics", "events").await.unwrap().unwrap();
-            if matches!(case, "rewrite" | "missing_deleted" | "inherited_manifest" | "staged_retry") {
+            if matches!(
+                case,
+                "rewrite"
+                    | "missing_deleted"
+                    | "inherited_manifest"
+                    | "staged_retry"
+                    | "reordered_metadata"
+                    | "optional_null"
+                    | "format_case"
+            ) {
                 let response = result.unwrap_or_else(|err| panic!("content={content}, case={case}: {err}"));
                 assert_eq!(response.metadata["current-snapshot-id"], 12);
                 assert_eq!(after.generation, before.generation + 1);
@@ -9874,7 +10157,8 @@ async fn manifest_rewrite_preserves_v1_files_after_upgrade() {
                 {"name": "file_format", "type": "string"},
                 {"name": "partition", "type": {"type": "record", "name": "partition", "fields": []}},
                 {"name": "record_count", "type": "long"},
-                {"name": "file_size_in_bytes", "type": "long"}
+                {"name": "file_size_in_bytes", "type": "long"},
+                {"name": "block_size_in_bytes", "type": "long"}
             ]}}
         ]
     }"#,
@@ -9895,6 +10179,7 @@ async fn manifest_rewrite_preserves_v1_files_after_upgrade() {
                     ("partition".to_string(), Value::Record(Vec::new())),
                     ("record_count".to_string(), Value::Long(1)),
                     ("file_size_in_bytes".to_string(), Value::Long(1)),
+                    ("block_size_in_bytes".to_string(), Value::Long(64 * 1024 * 1024)),
                 ]),
             ),
         ]))
@@ -9974,7 +10259,7 @@ async fn manifest_rewrite_preserves_v1_files_after_upgrade() {
         }
     }
     let rewritten = format!("{location}/metadata/rewritten.avro");
-    let bytes = test_manifest_avro_bytes(&[(&file, 0, 0, 10, 0)]);
+    let bytes = manifest_rewrite_metadata_bytes(test_manifest_avro_bytes(&[(&file, 0, 0, 10, 0)]), "legacy");
     let list = format!("{location}/metadata/snap-12.avro");
     backend
         .put_bytes(
