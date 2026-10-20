@@ -372,7 +372,7 @@ async fn list_path_raw_inner(
         let cancel_rx_clone = cancel_rx.clone();
         let producer_errs_clone = producer_errs.clone();
         let disk_io_context_clone = disk_io_context.clone();
-        let (rd, wr) = tokio::io::duplex(64);
+        let (rd, wr) = tokio::io::duplex(64 * 1024);
         readers.push(MetacacheReader::new(rd));
         jobs.spawn(with_optional_disk_io_context(disk_io_context_clone, async move {
             let mut wr = PublishedBytesWriter::new(wr);
@@ -702,6 +702,7 @@ async fn list_path_raw_inner(
 
         loop {
             let mut current = MetaCacheEntry::default();
+            let mut current_idx: Option<usize> = None;
 
             // warn!(
             //     "list_path_raw: loop start, bucket: {}, path: {}, current: {:?}",
@@ -840,22 +841,10 @@ async fn list_path_raw_inner(
 
                 // If no current, add it.
                 if current.name.is_empty() {
-                    top_entries[i] = Some(entry.clone());
+                    current_idx = Some(i);
                     current = entry;
                     agree += 1;
 
-                    continue;
-                }
-                // If exact match, we agree.
-                if let (_, true) = current.matches(Some(&entry), true) {
-                    top_entries[i] = Some(entry);
-                    agree += 1;
-
-                    continue;
-                }
-                // If only the name matches we didn't agree, but add it for resolution.
-                if entry.name == current.name {
-                    top_entries[i] = Some(entry);
                     continue;
                 }
                 // We got different entries
@@ -863,7 +852,21 @@ async fn list_path_raw_inner(
                     pending_entries[i] = Some(entry);
                     continue;
                 }
+                if entry.name == current.name {
+                    // If exact match, we agree.
+                    if current.matches_strict(&entry) {
+                        top_entries[i] = Some(entry);
+                        agree += 1;
+                    } else {
+                        // If only the name matches we didn't agree, but add it for resolution.
+                        top_entries[i] = Some(entry);
+                    }
+                    continue;
+                }
 
+                if let Some(idx) = current_idx.take() {
+                    pending_entries[idx] = Some(std::mem::take(&mut current));
+                }
                 for (idx, item) in top_entries.iter_mut().enumerate().take(i) {
                     if let Some(entry) = item.take() {
                         pending_entries[idx] = Some(entry);
@@ -871,7 +874,7 @@ async fn list_path_raw_inner(
                 }
 
                 agree = 1;
-                top_entries[i] = Some(entry.clone());
+                current_idx = Some(i);
                 current = entry;
             }
 
@@ -976,6 +979,10 @@ async fn list_path_raw_inner(
             }
 
             // warn!("list_path_raw: skip start, current: {:?}", &current.name);
+
+            if let Some(idx) = current_idx.take() {
+                top_entries[idx] = Some(current);
+            }
 
             for (i, r) in readers.iter_mut().enumerate() {
                 if top_entries[i].is_some() {

@@ -292,17 +292,17 @@ impl MetaCacheEntry {
         }
 
         let self_vers = match &self.cached {
-            Some(file_meta) => file_meta.clone(),
+            Some(file_meta) => std::borrow::Cow::Borrowed(file_meta),
             None => match FileMeta::load(&self.metadata) {
-                Ok(meta) => meta,
+                Ok(meta) => std::borrow::Cow::Owned(meta),
                 Err(_) => return (None, false),
             },
         };
 
         let other_vers = match &other.cached {
-            Some(file_meta) => file_meta.clone(),
+            Some(file_meta) => std::borrow::Cow::Borrowed(file_meta),
             None => match FileMeta::load(&other.metadata) {
-                Ok(meta) => meta,
+                Ok(meta) => std::borrow::Cow::Owned(meta),
                 Err(_) => return (None, false),
             },
         };
@@ -322,17 +322,7 @@ impl MetaCacheEntry {
 
         let mut prefer = None;
         for (s_version, o_version) in self_vers.versions.iter().zip(other_vers.versions.iter()) {
-            if s_version.header != o_version.header {
-                if s_version.header.has_ec() != o_version.header.has_ec() {
-                    // One version has EC and the other doesn't - may have been written later.
-                    // Compare without considering EC.
-                    let (mut a, mut b) = (s_version.header.clone(), o_version.header.clone());
-                    (a.ec_n, a.ec_m, b.ec_n, b.ec_m) = (0, 0, 0, 0);
-                    if a == b {
-                        continue;
-                    }
-                }
-
+            if !FileMeta::headers_match_strict(&s_version.header, &o_version.header) {
                 if !strict && s_version.header.matches_not_strict(&o_version.header) {
                     if prefer.is_none() {
                         if s_version.header.sorts_before(&o_version.header) {
@@ -363,22 +353,52 @@ impl MetaCacheEntry {
         (prefer, true)
     }
 
-    pub fn xl_meta(&mut self) -> Result<FileMeta> {
+    pub fn matches_strict(&mut self, other: &MetaCacheEntry) -> bool {
+        if self.name != other.name {
+            return false;
+        }
+
+        if other.is_dir() || self.is_dir() {
+            return other.is_dir() == self.is_dir();
+        }
+
+        let Ok(self_vers) = self.xl_meta_ref() else {
+            return false;
+        };
+
+        if let Some(other_vers) = &other.cached {
+            if self_vers.versions.len() != other_vers.versions.len() {
+                return false;
+            }
+            return self_vers
+                .versions
+                .iter()
+                .zip(other_vers.versions.iter())
+                .all(|(s, o)| FileMeta::headers_match_strict(&s.header, &o.header));
+        }
+
+        self_vers.matches_buf_strict(&other.metadata)
+    }
+
+    pub fn xl_meta_ref(&mut self) -> Result<&FileMeta> {
         if self.is_dir() {
             return Err(Error::FileNotFound);
         }
 
-        if let Some(meta) = &self.cached {
-            Ok(meta.clone())
-        } else {
+        if self.cached.is_none() {
             if self.metadata.is_empty() {
                 return Err(Error::FileNotFound);
             }
 
             let meta = FileMeta::load(&self.metadata)?;
-            self.cached = Some(meta.clone());
-            Ok(meta)
+            self.cached = Some(meta);
         }
+
+        Ok(self.cached.as_ref().expect("cached metadata must be populated"))
+    }
+
+    pub fn xl_meta(&mut self) -> Result<FileMeta> {
+        self.xl_meta_ref().cloned()
     }
 }
 
@@ -633,13 +653,13 @@ impl MetaCacheEntries {
             }
             if entry.is_dir() {
                 dir_exists += 1;
-                directory = Some(entry.clone());
-                debug!(entry = %entry.name, "metacache resolve observed directory candidate");
+                directory = Some(entry);
+                debug!(entry = %directory.as_ref().expect("directory entry").name, "metacache resolve observed directory candidate");
                 continue;
             }
 
-            let xl = match entry.xl_meta() {
-                Ok(xl) => xl,
+            let versions = match entry.xl_meta_ref() {
+                Ok(xl) => xl.versions.clone(),
                 Err(e) => {
                     debug!(entry = %entry.name, error = ?e, "metacache resolve skipped candidate with unreadable xl.meta");
                     continue;
@@ -647,12 +667,12 @@ impl MetaCacheEntries {
             };
 
             objs_valid += 1;
-            params.candidates.push(xl.versions.clone());
+            params.candidates.push(versions);
 
             if selected.is_none() {
-                selected = Some(entry.clone());
-                objs_agree = 1;
                 debug!(entry = %entry.name, "metacache resolve selected initial candidate");
+                selected = Some(entry);
+                objs_agree = 1;
                 continue;
             }
 
@@ -3198,5 +3218,44 @@ mod tests {
 
         assert_eq!(cached, uncached);
         assert!(cached.parts.iter().all(|part| part.checksums.is_none()));
+    }
+
+    #[test]
+    fn matches_strict_caches_self_and_matches_strict_tuple_contract() {
+        let now = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut base = metacache_entry_single_version(1, now, "etag-1");
+        base.cached = None;
+        let mut same = base.clone();
+        let mut different_etag = metacache_entry_single_version(1, now, "etag-2");
+        different_etag.cached = None;
+
+        let mut ec_variant_meta = FileMeta::load(&base.metadata).expect("decode base");
+        ec_variant_meta.versions[0].header.ec_n = 0;
+        ec_variant_meta.versions[0].header.ec_m = 0;
+        let ec_variant = MetaCacheEntry {
+            name: base.name.clone(),
+            metadata: ec_variant_meta.marshal_msg().expect("marshal ec variant"),
+            cached: None,
+            reusable: false,
+        };
+
+        let corrupt = MetaCacheEntry {
+            name: base.name.clone(),
+            metadata: b"not-xl-meta".to_vec(),
+            cached: None,
+            reusable: false,
+        };
+
+        assert!(base.matches_strict(&same));
+        assert!(base.cached.is_some(), "matches_strict must populate self.cached once");
+        same.cached = base.cached.clone();
+        assert!(base.matches_strict(&same));
+        assert!(base.matches_strict(&ec_variant));
+        assert!(!base.matches_strict(&different_etag));
+        assert!(!base.matches_strict(&corrupt));
+
+        for candidate in [&same, &ec_variant, &different_etag, &corrupt] {
+            assert_eq!(base.matches_strict(candidate), base.matches(Some(candidate), true).1);
+        }
     }
 }
