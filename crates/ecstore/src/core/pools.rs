@@ -2330,12 +2330,9 @@ fn reserve_decommission_target_pending(
     }
     let budget = target.temporary_copy_budget(reservation.temporary_copies);
     if requested_physical_bytes > budget {
-        return Err(decommission_target_no_longer_fits_error(
-            target_pool_index,
-            format!(
-                "source pool {source_pool_index} target pool {target_pool_index} mutation requires {requested_physical_bytes} physical bytes, but only {budget} committed-copy bytes remain"
-            ),
-        ));
+        return Err(decommission_capacity_blocked_error(format!(
+            "source pool {source_pool_index} target pool {target_pool_index} mutation requires {requested_physical_bytes} physical bytes, but only {budget} committed-copy bytes remain"
+        )));
     }
     let additional = requested_physical_bytes;
     target.pending_mutation_id = Some(mutation_id);
@@ -4902,13 +4899,22 @@ fn resolve_decommission_listing_worker_result(
 /// The deferred round is the last chance for a contended entry; leaving one
 /// unresolved would mark the bucket done and drop the object. This is reported
 /// as a capacity failure so the pool takes the existing durable-pause path
-/// instead of a terminal failure.
-fn ensure_decommission_deferred_drained(bucket: &str, set_idx: usize, deferred_remaining: usize) -> Result<()> {
+/// instead of a terminal failure. The pause reason carries the cause of the
+/// last deferral, which would otherwise only appear in the logs.
+fn ensure_decommission_deferred_drained(
+    bucket: &str,
+    set_idx: usize,
+    deferred_remaining: usize,
+    last_deferral: Option<&str>,
+) -> Result<()> {
     if deferred_remaining == 0 {
         return Ok(());
     }
+    let cause = last_deferral
+        .map(|cause| format!("; last deferral: {cause}"))
+        .unwrap_or_default();
     Err(decommission_capacity_blocked_error(format!(
-        "decommission bucket {bucket} set {set_idx} finished with {deferred_remaining} deferred entries remaining"
+        "decommission bucket {bucket} set {set_idx} finished with {deferred_remaining} deferred entries remaining{cause}"
     )))
 }
 
@@ -11243,8 +11249,8 @@ static DECOMMISSION_TEST_OBSERVED_EXPECTED_BYTES: std::sync::OnceLock<std::sync:
     std::sync::OnceLock::new();
 
 /// Static capacity snapshots observe no free-space change, so temporary
-/// writes would stage zero bytes. Make `store_id`'s mutations observe at
-/// least the bytes they reserved.
+/// writes would stage zero bytes. Make `store_id`'s mutations that declare
+/// their size observe at least the bytes they reserved.
 #[cfg(all(test, feature = "test-util"))]
 pub(crate) fn observe_expected_decommission_target_bytes_for_test(store_id: uuid::Uuid) {
     DECOMMISSION_TEST_OBSERVED_EXPECTED_BYTES
@@ -13112,7 +13118,7 @@ impl ECStore {
             .ok_or_else(|| decommission_capacity_blocked_error("target capacity snapshot is missing after mutation"))?;
         let observed_physical_bytes = before_free.saturating_sub(after_free);
         #[cfg(test)]
-        let observed_physical_bytes = if decommission_test_observes_expected_bytes(self.id) {
+        let observed_physical_bytes = if expected_data_bytes.is_some() && decommission_test_observes_expected_bytes(self.id) {
             observed_physical_bytes.max(expected_target_physical_bytes)
         } else {
             observed_physical_bytes
@@ -15600,6 +15606,7 @@ impl ECStore {
         // bucket must not be reported complete while a deferred entry remains.
         let deferred_entries = std::mem::take(&mut *deferred.lock().await);
         let deferred_remaining = Arc::new(AtomicUsize::new(0));
+        let last_deferral = Arc::new(std::sync::Mutex::new(None::<String>));
         if !deferred_entries.is_empty() {
             // The replay keeps the set's own worker bound: a whole-bucket
             // deferral must not spawn one task per object.
@@ -15616,6 +15623,7 @@ impl ECStore {
                     let entry_budget = entry_budget.clone();
                     let entry_error = entry_error.clone();
                     let deferred_remaining = Arc::clone(&deferred_remaining);
+                    let last_deferral = Arc::clone(&last_deferral);
                     async move {
                         let outcome = this
                             .replay_deferred_decommission_entry(
@@ -15635,8 +15643,9 @@ impl ECStore {
                                 entry_error,
                             )
                             .await;
-                        if matches!(outcome, Ok(DecommissionEntryOutcome::Deferred(_))) {
+                        if let Ok(DecommissionEntryOutcome::Deferred(err)) = outcome {
                             deferred_remaining.fetch_add(1, Ordering::Relaxed);
+                            *last_deferral.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(err.to_string());
                         }
                     }
                 })
@@ -15648,7 +15657,8 @@ impl ECStore {
         let deferred_remaining = deferred_remaining.load(Ordering::Relaxed);
         // A set must not report success while an entry is still deferred: the
         // bucket would be marked done and the object silently dropped.
-        ensure_decommission_deferred_drained(bi.name.as_str(), set_idx, deferred_remaining)
+        let last_deferral = last_deferral.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        ensure_decommission_deferred_drained(bi.name.as_str(), set_idx, deferred_remaining, last_deferral.as_deref())
     }
 
     async fn track_decommission_entry_progress_stage(
@@ -25172,14 +25182,18 @@ mod tests {
     /// A set that still holds a deferred entry must not report success.
     #[test]
     fn decommission_deferred_drain_invariant_rejects_unresolved_entries() {
-        assert!(ensure_decommission_deferred_drained("bucket-a", 2, 0).is_ok());
+        assert!(ensure_decommission_deferred_drained("bucket-a", 2, 0, None).is_ok());
 
-        let err = ensure_decommission_deferred_drained("bucket-a", 2, 3)
+        let err = ensure_decommission_deferred_drained("bucket-a", 2, 3, Some("target pool 1 no longer fits"))
             .expect_err("a set with deferred entries remaining must not complete");
         let message = err.to_string();
         assert!(message.contains("bucket-a"), "{message}");
         assert!(message.contains('2'), "{message}");
         assert!(message.contains('3'), "{message}");
+        assert!(
+            message.contains("last deferral: target pool 1 no longer fits"),
+            "the pause must name its cause: {message}"
+        );
     }
 
     /// Contention defers, benign contention completes without counting a
