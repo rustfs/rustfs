@@ -13889,7 +13889,14 @@ impl ECStore {
 
     /// Refresh rebalance metadata ahead of an operator decommission start
     /// (the leader-local admin pre-check), with the start's gate budget.
+    ///
+    /// A start that is already running holds the start gate until it ends,
+    /// so a retry is turned away here as already running rather than
+    /// waiting out its gate budget behind that start.
     pub async fn load_rebalance_meta_for_decommission_start(&self) -> Result<()> {
+        if self.ctx.decommission_start_running() {
+            return Err(Error::DecommissionAlreadyRunning);
+        }
         self.load_rebalance_meta_within(Some(&self.decommission_start_gate_budget()))
             .await
     }
@@ -20956,6 +20963,11 @@ mod tests {
             // The caller goes away while the peers reload pool metadata, after
             // the start is persisted and before its worker is spawned.
             drop_decommission_caller_at(&store, &rx, &reload).await;
+            assert_eq!(
+                store.ctx.detached_mutation_count(),
+                1,
+                "the abandoned start must stay tracked so shutdown waits for it"
+            );
             let persisted = load_pool_meta_replicas(store.pools.clone(), true)
                 .await
                 .expect("pool metadata should be readable");
@@ -21107,6 +21119,10 @@ mod tests {
             })
             .await
             .expect("the detached start should finish and release its slot");
+            assert!(
+                take_decommission_start_reload_failure_for_test(store.id).is_none(),
+                "the detached start must have reached its peer reload"
+            );
             assert!(!store.has_active_local_decommission_worker().await);
 
             // Known gap, tracked in rustfs/backlog#2873: the rollback save
@@ -21121,6 +21137,53 @@ mod tests {
                 persisted_decommission(&persisted).is_some_and(PoolDecommissionInfo::has_decommission_state),
                 "the stale-write guard currently keeps the rollback from clearing the start"
             );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_start_reports_a_failed_rollback_of_a_fresh_start() {
+        run_decommission_start_test("decommission_start_reports_a_failed_rollback_of_a_fresh_start", || async {
+            let (_temp_dirs, store, _other_store) = startable_decommission_store().await;
+            fail_next_decommission_start_reload_for_test(store.id);
+            let rx = CancellationToken::new();
+
+            let err = store
+                .decommission(rx.clone(), vec![0])
+                .await
+                .expect_err("a failed peer reload must fail the start");
+            // Known gap, tracked in rustfs/backlog#2873: the rollback runs but
+            // the stale-write guard refuses to clear the fresh activation.
+            let message = err.to_string();
+            assert!(
+                message.contains("rollback save failed") && message.contains("cannot be cleared"),
+                "{message}"
+            );
+            assert!(!store.has_active_local_decommission_worker().await);
+            rx.cancel();
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_admin_precheck_turns_a_retry_away_while_a_start_runs() {
+        run_decommission_start_test("decommission_admin_precheck_turns_a_retry_away_while_a_start_runs", || async {
+            let (_temp_dirs, store, _other_store) = startable_decommission_store().await;
+            set_decommission_start_gate_wait_for_test(store.id, std::time::Duration::from_millis(300));
+            let reload = install_decommission_start_pause_for_test(store.id, DecommissionStartPausePoint::PeerReload);
+            let rx = CancellationToken::new();
+
+            // The running start holds the start gate through its peer reload.
+            drop_decommission_caller_at(&store, &rx, &reload).await;
+            let err =
+                tokio::time::timeout(std::time::Duration::from_millis(250), store.load_rebalance_meta_for_decommission_start())
+                    .await
+                    .expect("a leader-local retry must not wait out the gate budget behind the running start")
+                    .expect_err("a leader-local retry must be turned away while a start runs");
+            assert!(matches!(err, Error::DecommissionAlreadyRunning), "{err:?}");
+
+            reload.proceed.notify_one();
+            rx.cancel();
         });
     }
 

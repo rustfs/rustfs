@@ -366,6 +366,10 @@ impl InstanceContext {
         self.decommission_start_in_flight.store(false, Ordering::Release);
     }
 
+    pub(crate) fn decommission_start_running(&self) -> bool {
+        self.decommission_start_in_flight.load(Ordering::Acquire)
+    }
+
     pub(crate) async fn install_scanner_publication_lease(
         &self,
         token: Uuid,
