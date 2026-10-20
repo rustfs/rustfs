@@ -4511,8 +4511,15 @@ fn resolve_decommission_entry_failure(err: Error) -> Result<DecommissionEntryOut
 #[cfg(test)]
 pub(crate) type DecommissionTestFaultDecision = Arc<dyn Fn(&'static str, &str, &str, usize, bool) -> bool + Send + Sync>;
 
+/// Builds the error an injected fault reports; a generic error by default.
 #[cfg(test)]
-static DECOMMISSION_TEST_FAULT_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<DecommissionTestFaultDecision>>> =
+pub(crate) type DecommissionTestFaultError = Arc<dyn Fn(&'static str, &str, &str) -> Error + Send + Sync>;
+
+#[cfg(test)]
+type DecommissionTestFault = (DecommissionTestFaultDecision, Option<DecommissionTestFaultError>);
+
+#[cfg(test)]
+static DECOMMISSION_TEST_FAULT_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<DecommissionTestFault>>> =
     std::sync::OnceLock::new();
 
 #[cfg(test)]
@@ -4521,13 +4528,17 @@ pub(crate) struct DecommissionTestFaultGuard(DecommissionTestFaultDecision);
 #[cfg(test)]
 impl DecommissionTestFaultGuard {
     pub(crate) fn install(decision: DecommissionTestFaultDecision) -> Self {
+        Self::install_with_error(decision, None)
+    }
+
+    pub(crate) fn install_with_error(decision: DecommissionTestFaultDecision, error: Option<DecommissionTestFaultError>) -> Self {
         let mut slot = DECOMMISSION_TEST_FAULT_HOOK
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
             .expect("decommission test fault hook mutex should not poison");
         assert!(slot.is_none(), "decommission test fault hook must be unique");
         let stored = Arc::clone(&decision);
-        *slot = Some(decision);
+        *slot = Some((decision, error));
         Self(stored)
     }
 }
@@ -4539,7 +4550,7 @@ impl Drop for DecommissionTestFaultGuard {
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
             .expect("decommission test fault hook mutex should not poison");
-        if slot.as_ref().is_some_and(|decision| Arc::ptr_eq(decision, &self.0)) {
+        if slot.as_ref().is_some_and(|(decision, _)| Arc::ptr_eq(decision, &self.0)) {
             *slot = None;
         }
     }
@@ -4553,16 +4564,22 @@ fn decommission_test_wrap_result<T>(
     attempt: usize,
     result: Result<T>,
 ) -> Result<T> {
-    let decision = DECOMMISSION_TEST_FAULT_HOOK
+    let fault = DECOMMISSION_TEST_FAULT_HOOK
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
         .expect("decommission test fault hook mutex should not poison")
         .clone();
-    let inject = decision.is_some_and(|decision| decision(stage, bucket, object, attempt, result.is_ok()));
+    let Some((decision, error)) = fault else {
+        return result;
+    };
+    let inject = decision(stage, bucket, object, attempt, result.is_ok());
     if result.is_ok() && inject {
-        return Err(Error::other(format!(
-            "injected decommission test fault at {stage} attempt {attempt} for {bucket}/{object}"
-        )));
+        return Err(match error {
+            Some(error) => error(stage, bucket, object),
+            None => Error::other(format!(
+                "injected decommission test fault at {stage} attempt {attempt} for {bucket}/{object}"
+            )),
+        });
     }
     result
 }
@@ -10736,9 +10753,9 @@ fn decommission_delete_marker_opts(
     }
 }
 
-fn decommission_object_migration_read_opts(version_id: Option<String>) -> ObjectOptions {
+fn decommission_object_migration_read_opts(version: &rustfs_filemeta::FileInfo) -> ObjectOptions {
     ObjectOptions {
-        version_id,
+        version_id: Some(data_movement::data_movement_exact_version_id(version.version_id)),
         no_lock: true,
         data_movement: true,
         raw_data_movement_read: true,
@@ -15325,6 +15342,7 @@ impl ECStore {
         let mut expired: usize = 0;
         let mut free_version_disposition = DecommissionFreeVersionDisposition::default();
         let mut cleanup_preflight_allowed_missing = Vec::new();
+        let mut cleanup_preflight_vanished = Vec::new();
         let mut entry_blocked = false;
 
         for version in fivs.versions.iter() {
@@ -15660,6 +15678,9 @@ impl ECStore {
                 }
 
                 if ignore {
+                    if cleanup_ignored {
+                        cleanup_preflight_vanished.push(data_movement::source_cleanup_version_identity(version));
+                    }
                     if should_count_decommission_version_complete(ignore, cleanup_ignored, failure) {
                         decommissioned += 1;
                     }
@@ -15842,7 +15863,7 @@ impl ECStore {
                         &encode_dir_object(&version.name),
                         None,
                         HeaderMap::new(),
-                        &decommission_object_migration_read_opts(version_id.clone()),
+                        &decommission_object_migration_read_opts(version),
                     )
                     .await;
                 #[cfg(test)]
@@ -16033,6 +16054,9 @@ impl ECStore {
             }
 
             if ignore {
+                if cleanup_ignored {
+                    cleanup_preflight_vanished.push(data_movement::source_cleanup_version_identity(version));
+                }
                 if should_count_decommission_version_complete(ignore, cleanup_ignored, failure) {
                     decommissioned += 1;
                 }
@@ -16121,13 +16145,14 @@ impl ECStore {
             let source_cleanup_mutation_fence = self
                 .acquire_decommission_source_cleanup_fence(bucket.as_str(), entry.name.as_str(), set.as_ref())
                 .await?;
+            let cleanup_expected = data_movement::source_cleanup_expected_without_vanished(&fivs, &cleanup_preflight_vanished);
             let cleanup_result = self
                 .run_guarded_decommission_side_effect(&rx, &operation_gate, || async {
                     data_movement::cleanup_source_entry_if_unchanged(
                         set.clone(),
                         bucket.as_str(),
                         entry.name.as_str(),
-                        &fivs,
+                        &cleanup_expected,
                         &cleanup_preflight_allowed_missing,
                         data_movement::SourceCleanupBucketFence {
                             expected_incarnation_id: expected_bucket_incarnation_id,
@@ -22812,6 +22837,367 @@ mod tests {
         assert_eq!(attempts, 4, "carry two attempts, then count the entry pass and copy retry");
     }
 
+    /// What sits above the pre-versioning null version in the null-version
+    /// fixtures (backlog#2873).
+    #[derive(Clone, Copy, Debug)]
+    enum NullVersionTop {
+        DeleteMarker,
+        NewerVersion,
+    }
+
+    /// One decommissioning entry: a null version written before versioning was
+    /// enabled, with a delete marker or a newer version above it, on pool 0 of a
+    /// two-pool store with an active reservation.
+    struct NullVersionDecommission {
+        _temp_dirs: Vec<tempfile::TempDir>,
+        store: Arc<ECStore>,
+        bucket: &'static str,
+        object: &'static str,
+        incarnation: uuid::Uuid,
+        payload: Vec<u8>,
+        seeded: FileInfoVersions,
+        source_set: Arc<SetDisks>,
+    }
+
+    impl NullVersionDecommission {
+        async fn new(top: NullVersionTop) -> Self {
+            use crate::object_api::PutObjReader;
+            let (temp_dirs, store, _other_store) =
+                Box::pin(crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None)).await;
+            let bucket = "decommission-null-version";
+            let object = "pre-versioning.bin";
+            Box::pin(store.make_bucket(bucket, &MakeBucketOptions::default()))
+                .await
+                .expect("create bucket");
+            let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
+            let payload = b"written before versioning was enabled".repeat(128);
+            let source_set = store.pools[0].get_disks_by_key(object);
+            Box::pin(source_set.put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(payload.clone()),
+                &ObjectOptions {
+                    expected_bucket_incarnation_id: Some(incarnation),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("seed null version");
+            let versioned = ObjectOptions {
+                versioned: true,
+                expected_bucket_incarnation_id: Some(incarnation),
+                ..Default::default()
+            };
+            match top {
+                NullVersionTop::DeleteMarker => {
+                    let marker = Box::pin(source_set.delete_object(bucket, object, versioned))
+                        .await
+                        .expect("seed delete marker over the null version");
+                    assert!(marker.delete_marker);
+                }
+                NullVersionTop::NewerVersion => {
+                    Box::pin(source_set.put_object(
+                        bucket,
+                        object,
+                        &mut PutObjReader::from_vec(b"written after versioning was enabled".to_vec()),
+                        &versioned,
+                    ))
+                    .await
+                    .expect("seed newer version over the null version");
+                }
+            }
+            let seeded = source_set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("read seeded versions")
+                .expect("seeded versions must exist");
+            assert_eq!(seeded.versions.len(), 2);
+            assert_eq!(seeded.versions[0].deleted, matches!(top, NullVersionTop::DeleteMarker));
+            assert!(seeded.versions[0].version_id.is_some(), "the latest version must have a real id");
+            assert!(seeded.versions[1].version_id.is_none(), "the oldest version must be the null version");
+
+            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+            set_decommission_capacity_info_overrides_for_test(
+                store.id,
+                vec![vec![
+                    DecommissionPoolCapacityInfo::for_test(0, layout, 0, 16_384, 16_384),
+                    DecommissionPoolCapacityInfo::for_test(1, layout, 131_072, 131_072, 0),
+                ]],
+            );
+            Box::pin(store.save_current_pool_meta_for_decommission_start(&[0], Vec::new()))
+                .await
+                .expect("activate reservation");
+            Self {
+                _temp_dirs: temp_dirs,
+                store,
+                bucket,
+                object,
+                incarnation,
+                payload,
+                seeded,
+                source_set,
+            }
+        }
+
+        /// Runs one entry and returns its outcome and how many entries
+        /// exhausted their source-cleanup retries.
+        async fn run_entry(&self) -> (DecommissionEntryOutcome, usize) {
+            let generation = self.store.active_decommission_generation(0).await.expect("active generation");
+            let exhaustions = Arc::new(AtomicUsize::new(0));
+            let outcome = Box::pin(self.store.decommission_entry(
+                CancellationToken::new(),
+                0,
+                generation,
+                MetaCacheEntry {
+                    name: self.object.into(),
+                    ..Default::default()
+                },
+                self.bucket.into(),
+                self.source_set.clone(),
+                None,
+                None,
+                None,
+                Some(self.incarnation),
+                Arc::clone(&exhaustions),
+                &mut 0,
+            ))
+            .await
+            .expect("decommission entry");
+            (outcome, exhaustions.load(Ordering::Relaxed))
+        }
+
+        async fn source_versions(&self) -> Option<FileInfoVersions> {
+            self.source_set
+                .load_file_info_versions_exact(self.bucket, self.object)
+                .await
+                .expect("read source versions")
+        }
+
+        async fn target_versions(&self) -> Option<FileInfoVersions> {
+            self.store.pools[1]
+                .get_disks_by_key(self.object)
+                .load_file_info_versions_exact(self.bucket, self.object)
+                .await
+                .expect("read target versions")
+        }
+
+        async fn assert_target_null_version_intact(&self) {
+            use tokio::io::AsyncReadExt as _;
+            let mut reader = self.store.pools[1]
+                .get_object_reader(
+                    self.bucket,
+                    self.object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        version_id: Some(uuid::Uuid::nil().to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("the migrated null version must be readable");
+            let mut actual = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut actual)
+                .await
+                .expect("drain the migrated null version");
+            assert_eq!(hex_sha256(&actual, str::to_owned), hex_sha256(&self.payload, str::to_owned));
+            assert_eq!(actual, self.payload);
+        }
+
+        /// Both versions are on the target with their identities, the null
+        /// version's content and SHA-256 are intact, and the source is gone.
+        async fn assert_moved(&self) {
+            let target = self.target_versions().await.expect("versions must reach the target pool");
+            assert_eq!(target.versions.len(), 2, "both versions must move");
+            assert_eq!(target.versions[0].version_id, self.seeded.versions[0].version_id);
+            assert_eq!(target.versions[0].deleted, self.seeded.versions[0].deleted);
+            assert!(target.versions[1].version_id.is_none(), "the null version must keep its null identity");
+            assert_eq!(target.versions[1].mod_time, self.seeded.versions[1].mod_time);
+            self.assert_target_null_version_intact().await;
+            assert!(
+                self.source_versions().await.is_none(),
+                "the source entry must be removed only after both versions moved"
+            );
+        }
+
+        async fn assert_source_retained(&self) {
+            let source = self.source_versions().await.expect("the source entry must be retained");
+            assert_eq!(source.versions.len(), 2, "every source version must be retained");
+            assert_eq!(source.versions[0].version_id, self.seeded.versions[0].version_id);
+            assert!(source.versions[1].version_id.is_none());
+        }
+    }
+
+    fn null_version_not_found_fault() -> DecommissionTestFaultError {
+        Arc::new(|_, bucket, object| Error::VersionNotFound(bucket.to_string(), object.to_string(), "null".to_string()))
+    }
+
+    /// A pre-versioning null version hidden behind a delete marker must reach
+    /// the target pool intact before the source entry is removed (backlog#2873).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_migrates_null_version_behind_delete_marker() {
+        let fixture = NullVersionDecommission::new(NullVersionTop::DeleteMarker).await;
+        let (outcome, exhaustions) = fixture.run_entry().await;
+        assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
+        assert_eq!(exhaustions, 0);
+        fixture.assert_moved().await;
+    }
+
+    /// Overwriting after versioning was enabled leaves a newer version above
+    /// the null version. The old `None` read selected that newer version, the
+    /// target accepted it as an equivalent copy, and cleanup then deleted the
+    /// null version without ever reporting it as missing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_migrates_null_version_behind_newer_version() {
+        let fixture = NullVersionDecommission::new(NullVersionTop::NewerVersion).await;
+        let (outcome, exhaustions) = fixture.run_entry().await;
+        assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
+        assert_eq!(exhaustions, 0);
+        fixture.assert_moved().await;
+    }
+
+    /// A version the mover reports as not found while it still exists must not
+    /// be deleted with the entry: cleanup keeps refusing until its retries run
+    /// out, and the entry is recorded as failed with its source retained.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_retains_source_when_null_version_read_reports_not_found() {
+        let fixture = NullVersionDecommission::new(NullVersionTop::DeleteMarker).await;
+        let object = fixture.object;
+        let _fault = DecommissionTestFaultGuard::install_with_error(
+            Arc::new(move |stage, _, faulted, _, success| stage == "object_read" && faulted == object && success),
+            Some(null_version_not_found_fault()),
+        );
+        let (outcome, exhaustions) = fixture.run_entry().await;
+        assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
+        assert_eq!(exhaustions, 1, "every cleanup attempt must be refused");
+        fixture.assert_source_retained().await;
+        let target = fixture.target_versions().await.expect("the marker still moves");
+        assert!(target.versions.iter().all(|version| version.version_id.is_some()));
+    }
+
+    /// The same rule protects a delete marker whose copy reports not found.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_retains_source_when_delete_marker_copy_reports_not_found() {
+        let fixture = NullVersionDecommission::new(NullVersionTop::DeleteMarker).await;
+        let object = fixture.object;
+        let _fault = DecommissionTestFaultGuard::install_with_error(
+            Arc::new(move |stage, _, faulted, _, success| stage == "delete_marker_copy" && faulted == object && success),
+            Some(null_version_not_found_fault()),
+        );
+        let (outcome, exhaustions) = fixture.run_entry().await;
+        assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
+        assert_eq!(exhaustions, 1, "every cleanup attempt must be refused");
+        fixture.assert_source_retained().await;
+    }
+
+    /// Control: a version that really vanished does not block cleanup, and the
+    /// entry finishes in its first attempt.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_cleans_up_when_not_found_version_really_vanished() {
+        let fixture = NullVersionDecommission::new(NullVersionTop::DeleteMarker).await;
+        let object = fixture.object;
+        let injected = Arc::new(AtomicBool::new(false));
+        let _fault = DecommissionTestFaultGuard::install_with_error(
+            Arc::new({
+                let injected = Arc::clone(&injected);
+                move |stage, _, faulted, _, success| {
+                    stage == "object_read" && faulted == object && success && !injected.swap(true, Ordering::SeqCst)
+                }
+            }),
+            Some(null_version_not_found_fault()),
+        );
+        let cleanup_attempts = Arc::new(AtomicUsize::new(0));
+        let _mutation = DecommissionCleanupMutationGuard::install(Arc::new({
+            let cleanup_attempts = Arc::clone(&cleanup_attempts);
+            let source_set = fixture.source_set.clone();
+            let incarnation = fixture.incarnation;
+            move |bucket, mutated, _attempt| {
+                let cleanup_attempts = Arc::clone(&cleanup_attempts);
+                let source_set = source_set.clone();
+                let bucket = bucket.to_string();
+                let is_target = mutated == object;
+                Box::pin(async move {
+                    if !is_target || cleanup_attempts.fetch_add(1, Ordering::SeqCst) > 0 {
+                        return;
+                    }
+                    source_set
+                        .delete_object(
+                            &bucket,
+                            object,
+                            ObjectOptions {
+                                versioned: true,
+                                version_id: Some(uuid::Uuid::nil().to_string()),
+                                expected_bucket_incarnation_id: Some(incarnation),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("really delete the null version before cleanup");
+                })
+            }
+        }));
+        let (outcome, exhaustions) = fixture.run_entry().await;
+        assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
+        assert_eq!(exhaustions, 0);
+        assert_eq!(cleanup_attempts.load(Ordering::SeqCst), 1, "cleanup must succeed without a retry");
+        assert!(fixture.source_versions().await.is_none(), "the source entry must be removed");
+        let target = fixture.target_versions().await.expect("the marker must reach the target");
+        assert_eq!(target.versions.len(), 1);
+        assert!(target.versions[0].deleted);
+    }
+
+    /// The null version is committed to the target but the copy reports a
+    /// failure before source cleanup; the retry must recognize the equivalent
+    /// target instead of failing on it, and settle every capacity intent.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_resumes_after_null_version_committed_before_cleanup() {
+        let fixture = NullVersionDecommission::new(NullVersionTop::NewerVersion).await;
+        let object = fixture.object;
+        let committed_then_failed = Arc::new(AtomicUsize::new(0));
+        let _fault = DecommissionTestFaultGuard::install(Arc::new({
+            let committed_then_failed = Arc::clone(&committed_then_failed);
+            move |stage, _, faulted, attempt, success| {
+                let inject = stage == DECOMMISSION_STAGE_MIGRATE_OBJECT && faulted == object && attempt == 1 && success;
+                if inject {
+                    committed_then_failed.fetch_add(1, Ordering::SeqCst);
+                }
+                inject
+            }
+        }));
+        let (outcome, exhaustions) = fixture.run_entry().await;
+        assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
+        assert_eq!(exhaustions, 0);
+        assert_eq!(
+            committed_then_failed.load(Ordering::SeqCst),
+            2,
+            "both versions commit on their first attempt before the injected failure"
+        );
+        fixture.assert_moved().await;
+        let pool_meta = fixture.store.pool_meta.read().await;
+        let reservation = pool_meta.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .expect("the reservation must remain installed");
+        assert_eq!(reservation.pending_target_physical_bytes, 0, "no capacity intent may stay pending");
+        assert!(
+            reservation
+                .targets
+                .iter()
+                .all(|target| target.pending_mutation_id.is_none() && target.temporary_mutations.is_empty()),
+            "{:?}",
+            reservation.targets
+        );
+    }
+
     #[test]
     fn decommission_object_attempt_metric_keeps_the_peak() {
         let mut attempts = 0;
@@ -23194,9 +23580,16 @@ mod tests {
 
     #[test]
     fn test_decommission_object_migration_read_opts_are_raw_data_movement() {
-        let opts = decommission_object_migration_read_opts(Some("vid-1".to_string()));
+        let version_id = uuid::Uuid::from_u128(1);
+        let opts = decommission_object_migration_read_opts(&rustfs_filemeta::FileInfo {
+            version_id: Some(version_id),
+            ..Default::default()
+        });
 
-        assert_eq!(opts.version_id.as_deref(), Some("vid-1"));
+        assert_eq!(opts.version_id, Some(version_id.to_string()));
+        // `None` would read the latest version, not the listed null version.
+        let null_opts = decommission_object_migration_read_opts(&rustfs_filemeta::FileInfo::default());
+        assert_eq!(null_opts.version_id, Some(uuid::Uuid::nil().to_string()));
         assert!(opts.no_lock);
         assert!(opts.data_movement);
         assert!(opts.raw_data_movement_read);
