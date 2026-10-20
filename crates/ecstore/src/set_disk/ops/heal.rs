@@ -8666,6 +8666,421 @@ mod heal_result_report_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn native_multipart_continue_complete_abort_fences_stale_heal() {
+        use crate::object_api::{ShardIntegrityWriteMode, WriteCompletion};
+        use crate::storage_api_contracts::multipart::{CompletePart, MultipartOperations as _};
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        for (disk_count, parity) in [(4, 2), (16, 4)] {
+            let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(disk_count, 0, parity).await;
+            let bucket = format!("multipart-heal-fence-{disk_count}");
+            let object = "object.bin";
+            set.make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create isolated MPU fence bucket");
+            let options = ObjectOptions {
+                write_completion: WriteCompletion::TailDrained,
+                shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
+                ..Default::default()
+            };
+            let first_size = 5 * 1024 * 1024 + 17;
+            let middle_size = 5 * 1024 * 1024 + 93;
+            let last_size = 1024 * 1024 + 47;
+            let original = set
+                .new_multipart_upload(&bucket, object, &options)
+                .await
+                .expect("original multipart upload");
+            let mut original_parts = Vec::new();
+            for (number, byte, size) in [(1, 0x21, first_size), (2, 0x32, middle_size), (3, 0x43, last_size)] {
+                let part = set
+                    .put_object_part(
+                        &bucket,
+                        object,
+                        &original.upload_id,
+                        number,
+                        &mut PutObjReader::from_vec(vec![byte; size]),
+                        &options,
+                    )
+                    .await
+                    .expect("ACK original multipart part");
+                assert!(part.etag.as_ref().is_some_and(|value| !value.is_empty()));
+                original_parts.push(CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                });
+            }
+            let original_ack = set
+                .clone()
+                .complete_multipart_upload(&bucket, object, &original.upload_id, original_parts, &options)
+                .await
+                .expect("ACK original completed multipart object");
+            let old = disks[0]
+                .read_version("", &bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("original external metadata");
+            assert_eq!(old.parts.len(), 3);
+            let old_dir = old.data_dir.expect("original external generation");
+            let mut original_reader = set
+                .get_object_reader(&bucket, object, None, Default::default(), &options)
+                .await
+                .expect("read complete committed multipart baseline before fault");
+            let mut original_body = Vec::new();
+            original_reader
+                .read_to_end(&mut original_body)
+                .await
+                .expect("full original multipart body");
+            assert_eq!(
+                original_body,
+                [vec![0x21; first_size], vec![0x32; middle_size], vec![0x43; last_size]].concat()
+            );
+            drop(original_reader);
+            let mut old_metadata = Vec::new();
+            let mut old_shards = Vec::new();
+            for dir in &dirs {
+                let mut parts = Vec::new();
+                for number in [1, 2, 3] {
+                    parts.push(
+                        tokio::fs::read(
+                            dir.path()
+                                .join(&bucket)
+                                .join(object)
+                                .join(old_dir.to_string())
+                                .join(format!("part.{number}")),
+                        )
+                        .await
+                        .expect("original complete encoded multipart part"),
+                    );
+                }
+                old_shards.push(parts);
+                old_metadata.push(
+                    tokio::fs::read(dir.path().join(&bucket).join(object).join(STORAGE_FORMAT_FILE))
+                        .await
+                        .expect("original metadata after full-tail completion"),
+                );
+            }
+            let active = set
+                .new_multipart_upload(&bucket, object, &options)
+                .await
+                .expect("pending upload A");
+            let cancelled = set
+                .new_multipart_upload(&bucket, object, &options)
+                .await
+                .expect("pending upload B");
+            assert_ne!(active.upload_id, cancelled.upload_id);
+            assert_ne!(active.upload_id, original.upload_id);
+            let first_body = vec![0x63; first_size];
+            let middle_body = vec![0x69; middle_size];
+            let last_body = vec![0x74; last_size];
+            let first = set
+                .put_object_part(
+                    &bucket,
+                    object,
+                    &active.upload_id,
+                    1,
+                    &mut PutObjReader::from_vec(first_body.clone()),
+                    &options,
+                )
+                .await
+                .expect("ACK A first part");
+            let middle = set
+                .put_object_part(
+                    &bucket,
+                    object,
+                    &active.upload_id,
+                    2,
+                    &mut PutObjReader::from_vec(middle_body.clone()),
+                    &options,
+                )
+                .await
+                .expect("ACK A second initial part");
+            let mut other_parts = Vec::new();
+            for (number, byte, size) in [(1, 0x85, first_size), (2, 0x96, middle_size), (3, 0xa7, last_size)] {
+                other_parts.push(
+                    set.put_object_part(
+                        &bucket,
+                        object,
+                        &cancelled.upload_id,
+                        number,
+                        &mut PutObjReader::from_vec(vec![byte; size]),
+                        &options,
+                    )
+                    .await
+                    .expect("ACK B independent pending part"),
+                );
+            }
+            assert_ne!(first.etag, other_parts[0].etag);
+            let (active_meta, _) = set
+                .check_upload_id_exists(&bucket, object, &active.upload_id, false)
+                .await
+                .expect("independent active upload metadata");
+            let active_dir = active_meta.data_dir.expect("A physical staging generation");
+            let active_path = SetDisks::get_multipart_upload_dir(&bucket, object, &active.upload_id, false);
+            let cancelled_path = SetDisks::get_multipart_upload_dir(&bucket, object, &cancelled.upload_id, false);
+            let mut active_original_shards = Vec::new();
+            for dir in &dirs {
+                let mut parts = Vec::new();
+                for number in [1, 2] {
+                    parts.push(
+                        tokio::fs::read(
+                            dir.path()
+                                .join(crate::disk::RUSTFS_META_MULTIPART_BUCKET)
+                                .join(&active_path)
+                                .join(active_dir.to_string())
+                                .join(format!("part.{number}")),
+                        )
+                        .await
+                        .expect("A original acknowledged staging shard"),
+                    );
+                }
+                active_original_shards.push(parts);
+            }
+            println!("native_g05: geometry={disk_count}/{parity} committed_multipart_and_two_distinct_pending_uploads_seeded");
+            let missing = dirs[0]
+                .path()
+                .join(&bucket)
+                .join(object)
+                .join(old_dir.to_string())
+                .join("part.1");
+            tokio::fs::remove_file(&missing)
+                .await
+                .expect("remove original committed multipart shard");
+            let (_pause, arrived, release) = ReadRepairPauseScope::install(&bucket, object);
+            let heal_set = set.clone();
+            let heal_bucket = bucket.clone();
+            let heal = tokio::spawn(async move {
+                heal_set
+                    .heal_object(
+                        &heal_bucket,
+                        object,
+                        "",
+                        &HealOpts {
+                            read_repair: true,
+                            scan_mode: HealScanMode::Deep,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), arrived.notified())
+                .await
+                .expect("real MPU reconstruction reaches final rename pause");
+            assert!(!heal.is_finished() && !missing.exists());
+            println!("native_g05: geometry={disk_count}/{parity} real_committed_object_heal_paused_before_final_rename");
+            let last = set
+                .put_object_part(
+                    &bucket,
+                    object,
+                    &active.upload_id,
+                    3,
+                    &mut PutObjReader::from_vec(last_body.clone()),
+                    &options,
+                )
+                .await
+                .expect("ACK continued A part during paused Heal");
+            set.abort_multipart_upload(&bucket, object, &cancelled.upload_id, &options)
+                .await
+                .expect("ACK B abort during paused Heal");
+            let gone = set
+                .list_object_parts(&bucket, object, &cancelled.upload_id, None, 1000, &options)
+                .await;
+            assert!(
+                matches!(gone, Err(Error::InvalidUploadID(ref b, ref o, ref id)) if b==&bucket && o==object && id==&cancelled.upload_id)
+            );
+            let pending = set
+                .list_object_parts(&bucket, object, &active.upload_id, None, 1000, &options)
+                .await
+                .expect("B abort cannot remove A");
+            assert!(!pending.is_truncated);
+            assert_eq!(pending.upload_id, active.upload_id);
+            assert_eq!(pending.parts.len(), 3);
+            for (actual, expected) in pending.parts.iter().zip([&first, &middle, &last]) {
+                assert_eq!(actual.part_num, expected.part_num);
+                assert_eq!(actual.etag, expected.etag);
+                assert_eq!(actual.size, expected.size);
+            }
+            for (slot, dir) in dirs.iter().enumerate() {
+                assert_eq!(
+                    tokio::fs::read(dir.path().join(&bucket).join(object).join(STORAGE_FORMAT_FILE))
+                        .await
+                        .expect("pending parts cannot publish an object"),
+                    old_metadata[slot]
+                );
+                for number in [1, 2, 3] {
+                    let path = dir
+                        .path()
+                        .join(&bucket)
+                        .join(object)
+                        .join(old_dir.to_string())
+                        .join(format!("part.{number}"));
+                    if slot == 0 && number == 1 {
+                        assert!(!path.exists(), "paused Heal cannot have published its missing old shard");
+                    } else {
+                        assert_eq!(
+                            tokio::fs::read(path)
+                                .await
+                                .expect("Abort preserves committed data before Complete"),
+                            old_shards[slot][number - 1]
+                        );
+                    }
+                }
+                for number in [1, 2] {
+                    assert_eq!(
+                        tokio::fs::read(
+                            dir.path()
+                                .join(crate::disk::RUSTFS_META_MULTIPART_BUCKET)
+                                .join(&active_path)
+                                .join(active_dir.to_string())
+                                .join(format!("part.{number}"))
+                        )
+                        .await
+                        .expect("B abort preserves each original A shard"),
+                        active_original_shards[slot][number - 1]
+                    );
+                }
+                assert!(
+                    !dir.path()
+                        .join(crate::disk::RUSTFS_META_MULTIPART_BUCKET)
+                        .join(&cancelled_path)
+                        .exists()
+                );
+            }
+            assert!(!heal.is_finished() && !missing.exists());
+            println!(
+                "native_g05: geometry={disk_count}/{parity} continue_ack_and_other_abort_preserve_pending_parts_and_original_commit"
+            );
+            let completed = set
+                .clone()
+                .complete_multipart_upload(
+                    &bucket,
+                    object,
+                    &active.upload_id,
+                    vec![
+                        CompletePart {
+                            part_num: first.part_num,
+                            etag: first.etag.clone(),
+                            ..Default::default()
+                        },
+                        CompletePart {
+                            part_num: middle.part_num,
+                            etag: middle.etag.clone(),
+                            ..Default::default()
+                        },
+                        CompletePart {
+                            part_num: last.part_num,
+                            etag: last.etag.clone(),
+                            ..Default::default()
+                        },
+                    ],
+                    &options,
+                )
+                .await
+                .expect("ACK A completion before releasing obsolete Heal");
+            assert!(completed.etag.as_ref().is_some_and(|value| !value.is_empty()));
+            assert_ne!(completed.etag, original_ack.etag);
+            let namespace = set
+                .new_ns_lock(&bucket, object)
+                .await
+                .expect("completed MPU physical drain fence");
+            let drained = namespace
+                .get_write_lock(Duration::from_secs(30))
+                .await
+                .expect("completed MPU tail drains");
+            let current = disks[0]
+                .read_version("", &bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("new completion metadata");
+            let new_dir = current.data_dir.expect("new multipart physical generation");
+            assert_ne!(new_dir, old_dir);
+            assert_eq!(current.parts.len(), 3);
+            let mut committed = Vec::new();
+            let mut new_shards = Vec::new();
+            for dir in &dirs {
+                let root = dir.path().join(&bucket).join(object);
+                committed.push(
+                    tokio::fs::read(root.join(STORAGE_FORMAT_FILE))
+                        .await
+                        .expect("ACK completion metadata"),
+                );
+                let mut parts = Vec::new();
+                for number in [1, 2, 3] {
+                    parts.push(
+                        tokio::fs::read(root.join(new_dir.to_string()).join(format!("part.{number}")))
+                            .await
+                            .expect("ACK completion publishes every encoded part"),
+                    );
+                }
+                new_shards.push(parts);
+                assert!(
+                    !root.join(old_dir.to_string()).exists(),
+                    "completion reclaims the old multipart generation"
+                );
+                assert!(
+                    !dir.path()
+                        .join(crate::disk::RUSTFS_META_MULTIPART_BUCKET)
+                        .join(&active_path)
+                        .exists()
+                );
+            }
+            drop(drained);
+            assert!(!heal.is_finished());
+            println!("native_g05: geometry={disk_count}/{parity} complete_ack_and_all_physical_tails_verified_before_release");
+            release.notify_one();
+            let (_, error) = tokio::time::timeout(Duration::from_secs(30), heal)
+                .await
+                .expect("stale MPU Heal exits its fence")
+                .expect("Heal task joins")
+                .expect("stale reconstruction returns its typed retry disposition");
+            assert_eq!(error, Some(DiskError::Timeout));
+            for (slot, dir) in dirs.iter().enumerate() {
+                let root = dir.path().join(&bucket).join(object);
+                assert_eq!(
+                    tokio::fs::read(root.join(STORAGE_FORMAT_FILE))
+                        .await
+                        .expect("completion metadata after stale Heal"),
+                    committed[slot]
+                );
+                let mut decoded = rustfs_filemeta::FileMeta::default();
+                decoded
+                    .unmarshal_msg(&committed[slot])
+                    .expect("decode final generation independently");
+                assert_eq!(decoded.versions.len(), 1, "completion must not publish another object version");
+                for number in [1, 2, 3] {
+                    assert_eq!(
+                        tokio::fs::read(root.join(new_dir.to_string()).join(format!("part.{number}")))
+                            .await
+                            .expect("new parts before any GET"),
+                        new_shards[slot][number - 1]
+                    );
+                }
+                assert!(!root.join(old_dir.to_string()).exists(), "stale Heal cannot resurrect the old generation");
+                for path in [&active_path, &cancelled_path] {
+                    assert!(!dir.path().join(crate::disk::RUSTFS_META_MULTIPART_BUCKET).join(path).exists());
+                }
+            }
+            for id in [&active.upload_id, &cancelled.upload_id] {
+                let gone = set.list_object_parts(&bucket, object, id, None, 1000, &options).await;
+                assert!(
+                    matches!(gone, Err(Error::InvalidUploadID(ref b, ref o, ref upload)) if b==&bucket && o==object && upload==id)
+                );
+            }
+            let mut reader = set
+                .get_object_reader(&bucket, object, None, Default::default(), &options)
+                .await
+                .expect("read exact completed current object");
+            assert_eq!(reader.object_info.etag, completed.etag);
+            let mut actual = Vec::new();
+            reader.read_to_end(&mut actual).await.expect("full completed multipart body");
+            assert_eq!(actual, [first_body, middle_body, last_body].concat());
+            println!(
+                "native_g05: geometry={disk_count}/{parity} stale_heal_rejected_exact_completed_parts_full_body_and_upload_retirement_verified"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn read_repair_commit_aborts_when_object_changes_before_final_rename() {
         let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
         let bucket = "read-repair-stale-commit";
