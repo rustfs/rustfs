@@ -24,18 +24,25 @@ class RaceNativeToolsWorkflowTests(unittest.TestCase):
         return '\n'.join(line[10:] for line in shell.splitlines()
                          if not line.strip() or line.startswith('          '))
 
-    def test_g01_actual_workflow_selection_preserves_legacy_and_propagates_failures(self):
-        shell = self.chain_shell_step('Select exact-source G01 native evidence')
-        cases = [(False, 2, 0, 'false', 'a' * 40), (True, 2, 0, 'false', 'a' * 40),
-                 (True, 0, 0, 'true', 'a' * 40), (True, 1, 1, None, 'a' * 40), (True, 42, 42, None, 'a' * 40)]
-        exact = '6afdec9fe1b0b88007f2e5b445c19bf73d51d3ca'
-        cases += [(False, 2, 1, None, exact), (True, 2, 1, None, exact), (True, 0, 0, 'true', exact)]
-        for helper, support, code, required, source in cases:
-            with self.subTest(helper=helper, support=support), tempfile.TemporaryDirectory() as name:
+    def test_race_actual_workflow_selection_preserves_legacy_and_propagates_failures(self):
+        shell = self.chain_shell_step('Select exact-source race native evidence')
+        g01 = 'heal.race-unversioned-overwrite'
+        cases = [(False, 2, 0, 'false', 'a' * 40, g01), (True, 2, 0, 'false', 'a' * 40, g01),
+                 (True, 0, 0, 'true', 'a' * 40, g01), (True, 1, 1, None, 'a' * 40, g01),
+                 (True, 42, 42, None, 'a' * 40, g01)]
+        reviewed = [('6afdec9fe1b0b88007f2e5b445c19bf73d51d3ca', g01)]
+        reviewed += [('bd0671ba781d8ebf509f4f03533228dfb44496f1', case) for case in
+                     (g01, 'heal.race-versioned-put', 'heal.race-version-delete')]
+        for source, case in reviewed:
+            cases += [(False, 2, 1, None, source, case), (True, 2, 1, None, source, case),
+                      (True, 0, 0, 'true', source, case)]
+        for helper, support, code, required, source, case in cases:
+            with self.subTest(helper=helper, support=support, source=source, case=case), tempfile.TemporaryDirectory() as name:
                 root = Path(name)
                 env = self.fixture(root, new_helper=helper)
                 output = root / 'output'
-                env.update(SUPPORT_STATUS=str(support), GITHUB_OUTPUT=str(output), CANDIDATE_SHA=source)
+                env.update(SUPPORT_STATUS=str(support), GITHUB_OUTPUT=str(output), CANDIDATE_SHA=source,
+                           VALIDATION_CASE_ID=case)
                 result = subprocess.run(['bash', '-c', shell], cwd=root, env=env, capture_output=True, text=True)
                 self.assertEqual(result.returncode, code, result.stderr)
                 self.assertEqual(output.read_text() if output.exists() else None,
@@ -43,32 +50,50 @@ class RaceNativeToolsWorkflowTests(unittest.TestCase):
                 if helper:
                     calls = [json.loads(line) for line in (root / 'calls.jsonl').read_text().splitlines()]
                     self.assertEqual(calls, [{'kind': 'race_native', 'args': ['supports', '--commit', source,
-                                      '--case-id', 'heal.race-unversioned-overwrite']}])
+                                      '--case-id', case]}])
 
-    def test_g01_actual_workflow_admission_exports_native_directory_only_after_success(self):
-        shell = self.chain_shell_step('Verify G01 exact-source native commit and cleanup evidence')
-        for failure in (0, 42):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as name:
-                root = Path(name)
-                env = self.fixture(root, new_helper=True)
-                verifier = root / 'auto-testing/scripts/validation_heal/race_native_evidence.py'
-                verifier.write_text('import os,sys\nprint("{}")\nsys.exit(int(os.environ["VERIFY_EXIT"]))\n')
-                validation = root / 'validation'
-                validation.mkdir()
-                (validation / 'tool-run.json').write_text('{"id":123}')
-                native = root / 'rustfs-validation-native-77-1'
-                native.mkdir()
-                output = root / 'env'
-                env.update(RUNNER_TEMP=str(root), GITHUB_RUN_ID='77', GITHUB_RUN_ATTEMPT='1',
-                           VALIDATION_ROOT=str(validation), GITHUB_ENV=str(output), VERIFY_EXIT=str(failure))
-                result = subprocess.run(['bash', '-c', shell], cwd=root, env=env, capture_output=True, text=True)
-                self.assertEqual(result.returncode, failure, result.stderr)
-                self.assertEqual((native / 'tool-run.json').read_bytes(), (validation / 'tool-run.json').read_bytes())
-                self.assertEqual(output.exists(), failure == 0)
-                if not failure:
-                    self.assertEqual(output.read_text(), 'VALIDATION_HEAL_NATIVE_DIRECTORY=' + str(native) + '\n')
+    def test_race_actual_admission_requires_native_and_runtime_before_exporting_directory(self):
+        shell = self.chain_shell_step('Verify exact-source race native and runtime evidence')
+        for case in ('heal.race-unversioned-overwrite', 'heal.race-versioned-put', 'heal.race-version-delete'):
+            for native_exit, runtime in [(0, 0), (42, 0), (0, 42), (0, 'missing'), (0, 'collector-only')]:
+                with self.subTest(case=case, native_exit=native_exit, runtime=runtime), tempfile.TemporaryDirectory() as name:
+                    root = Path(name)
+                    env = self.fixture(root, new_helper=True)
+                    directory = root / 'auto-testing/scripts/validation_heal'
+                    (directory / 'race_native_evidence.py').write_text(
+                        'import os,sys\nprint("{}")\nsys.exit(int(os.environ["VERIFY_EXIT"]))\n')
+                    if runtime == 'collector-only':
+                        (directory / 'race.py').write_text(
+                            'import argparse\np=argparse.ArgumentParser()\np.add_argument("--rc-bin", required=True)\np.parse_args()\n')
+                    elif runtime != 'missing':
+                        (directory / 'race.py').write_text(
+                            'import json,os,pathlib,sys\n'
+                            'assert not pathlib.Path(os.environ["GITHUB_ENV"]).exists()\n'
+                            'assert sys.argv[1] == "preflight"\n'
+                            'assert sys.argv[-2:] == ["--case-id",os.environ["VALIDATION_CASE_ID"]]\n'
+                            'assert pathlib.Path(os.environ["VALIDATION_HEAL_NATIVE_DIRECTORY"],"tool-run.json").is_file()\n'
+                            'pathlib.Path("runtime-call.json").write_text(json.dumps(sys.argv[1:]))\n'
+                            'sys.exit(int(os.environ["RUNTIME_EXIT"]))\n')
+                    validation = root / 'validation'
+                    validation.mkdir()
+                    (validation / 'tool-run.json').write_text('{"id":123}')
+                    native = root / 'rustfs-validation-native-77-1'
+                    native.mkdir()
+                    output = root / 'env'
+                    env.update(RUNNER_TEMP=str(root), GITHUB_RUN_ID='77', GITHUB_RUN_ATTEMPT='1',
+                               VALIDATION_ROOT=str(validation), GITHUB_ENV=str(output), VERIFY_EXIT=str(native_exit),
+                               RUNTIME_EXIT=str(runtime), VALIDATION_CASE_ID=case)
+                    result = subprocess.run(['bash', '-c', shell], cwd=root, env=env, capture_output=True, text=True)
+                    expected = native_exit or (runtime if isinstance(runtime, int) else 2)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    self.assertEqual((native / 'tool-run.json').read_bytes(), (validation / 'tool-run.json').read_bytes())
+                    self.assertEqual(output.exists(), expected == 0)
+                    self.assertEqual((root / 'runtime-call.json').exists(), native_exit == 0 and isinstance(runtime, int))
+                    if expected == 0:
+                        self.assertEqual(output.read_text(), 'VALIDATION_HEAL_NATIVE_DIRECTORY=' + str(native) + '\n')
         workflow = (candidate.ROOT / '.github/workflows/rustfs-functional-chain.yml').read_text()
-        self.assertLess(workflow.index('Verify G01 exact-source native'), workflow.index('Run selected canonical validation case'))
+        self.assertLess(workflow.index('Verify exact-source race native and runtime'),
+                        workflow.index('Run selected canonical validation case'))
         self.assertIn("steps.race_native.outputs.required == 'true'", workflow)
 
     def shell_step(self, name):

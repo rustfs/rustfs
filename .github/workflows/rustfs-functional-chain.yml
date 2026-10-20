@@ -314,26 +314,34 @@ jobs:
             > "${VALIDATION_ROOT}/tool-manifest.json"
           printf 'VALIDATION_HEAL_TOOL_DIRECTORY=%s\n' "${TOOL_DIRECTORY}" >> "${GITHUB_ENV}"
 
-      - name: Select exact-source G01 native evidence
+      - name: Select exact-source race native evidence
         id: race_native
-        if: ${{ inputs.validation_case == 'heal.race-unversioned-overwrite' }}
+        if: ${{ inputs.validation_case == 'heal.race-unversioned-overwrite' || inputs.validation_case == 'heal.race-versioned-put' || inputs.validation_case == 'heal.race-version-delete' }}
         env:
           CANDIDATE_SHA: ${{ steps.candidate.outputs.source_sha }}
+          VALIDATION_CASE_ID: ${{ inputs.validation_case }}
         run: |
           set -euo pipefail
           required=false
           if [ -f auto-testing/scripts/validation_heal/race_native.py ]; then
             status=0
             python3 -B auto-testing/scripts/validation_heal/race_native.py supports \
-              --commit "${CANDIDATE_SHA}" --case-id heal.race-unversioned-overwrite || status=$?
+              --commit "${CANDIDATE_SHA}" --case-id "${VALIDATION_CASE_ID}" || status=$?
             if [ "${status}" -eq 0 ]; then
               required=true
             elif [ "${status}" -ne 2 ]; then
               exit "${status}"
             fi
           fi
-          if [ "${CANDIDATE_SHA}" = 6afdec9fe1b0b88007f2e5b445c19bf73d51d3ca ] && [ "${required}" != true ]; then
-            printf 'G01 candidate requires its reviewed native collector before fleet execution\n' >&2
+          reviewed=false
+          case "${CANDIDATE_SHA}:${VALIDATION_CASE_ID}" in
+            6afdec9fe1b0b88007f2e5b445c19bf73d51d3ca:heal.race-unversioned-overwrite | \
+            bd0671ba781d8ebf509f4f03533228dfb44496f1:heal.race-unversioned-overwrite | \
+            bd0671ba781d8ebf509f4f03533228dfb44496f1:heal.race-versioned-put | \
+            bd0671ba781d8ebf509f4f03533228dfb44496f1:heal.race-version-delete) reviewed=true ;;
+          esac
+          if [ "${reviewed}" = true ] && [ "${required}" != true ]; then
+            printf 'Race candidate requires its reviewed native collector before fleet execution\n' >&2
             exit 1
           fi
           printf 'required=%s\n' "${required}" >> "${GITHUB_OUTPUT}"
@@ -370,18 +378,24 @@ jobs:
             > "${VALIDATION_ROOT}/native-incarnation-manifest.json"
           printf 'VALIDATION_HEAL_NATIVE_DIRECTORY=%s\n' "${NATIVE_DIRECTORY}" >> "${GITHUB_ENV}"
 
-      - name: Verify G01 exact-source native commit and cleanup evidence
+      - name: Verify exact-source race native and runtime evidence
         if: ${{ steps.race_native.outputs.required == 'true' }}
         env:
           AUTO_TESTING_SHA: ${{ inputs.auto_testing_sha }}
+          VALIDATION_CASE_ID: ${{ inputs.validation_case }}
         run: |
           set -euo pipefail
           NATIVE_DIRECTORY="${RUNNER_TEMP}/rustfs-validation-native-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           cp "${VALIDATION_ROOT}/tool-run.json" "${NATIVE_DIRECTORY}/tool-run.json"
           python3 -B auto-testing/scripts/validation_heal/race_native_evidence.py \
             --directory "${NATIVE_DIRECTORY}" --candidate "${VALIDATION_ROOT}/candidate.json" \
-            --testing-commit "${AUTO_TESTING_SHA}" --case-id heal.race-unversioned-overwrite \
+            --testing-commit "${AUTO_TESTING_SHA}" --case-id "${VALIDATION_CASE_ID}" \
             > "${VALIDATION_ROOT}/native-race-manifest.json"
+          VALIDATION_HEAL_NATIVE_DIRECTORY="${NATIVE_DIRECTORY}" \
+            python3 -B auto-testing/scripts/validation_heal/race.py preflight \
+              --candidate "${VALIDATION_ROOT}/candidate.json" --testing-commit "${AUTO_TESTING_SHA}" \
+              --case-id "${VALIDATION_CASE_ID}" \
+              > "${VALIDATION_ROOT}/native-race-runtime-preflight.json"
           printf 'VALIDATION_HEAL_NATIVE_DIRECTORY=%s\n' "${NATIVE_DIRECTORY}" >> "${GITHUB_ENV}"
 
       - name: Download pinned manager persistence and incarnation evidence
