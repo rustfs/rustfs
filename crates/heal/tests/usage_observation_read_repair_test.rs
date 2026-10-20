@@ -77,7 +77,7 @@ async fn usage_observation_read_repair_survives_snapshot_cleanup() {
     .await
     .expect("the real degraded GET must emit a repair request");
     assert_eq!(request.source, HealRequestSource::ReadRepair);
-    assert_eq!(request.recreate_missing, Some(true));
+    assert_eq!(request.recreate_missing, None, "a degraded read does not instruct recreation");
 
     // Authoritative usage publication deletes the obsolete observation with
     // these prefix options. Delay admission until that deletion has finished.

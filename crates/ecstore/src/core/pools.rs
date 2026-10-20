@@ -1040,8 +1040,12 @@ fn is_decommission_capacity_intent_conflict(err: &Error) -> bool {
         return message.contains("unresolved target capacity intent")
             || message.contains("pending capacity intent belongs to another mutation");
     }
-    data_movement::data_movement_stage_source(err).is_some_and(is_decommission_capacity_intent_conflict)
-        || err.to_string().contains("unresolved target capacity intent")
+    if data_movement::data_movement_stage_source(err).is_some_and(is_decommission_capacity_intent_conflict) {
+        return true;
+    }
+    let rendered = err.to_string();
+    rendered.contains("unresolved target capacity intent")
+        || rendered.contains("pending capacity intent belongs to another mutation")
 }
 
 pub(crate) fn decommission_capacity_target_gate_busy_index(err: &Error) -> Option<usize> {
@@ -2248,6 +2252,316 @@ fn resolve_decommission_target_pending(
     Ok(())
 }
 
+/// A pending target intent that an earlier incarnation of a decommission
+/// routine left in its still-active capacity reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecommissionCapacityLeftoverIntent {
+    target_pool_index: usize,
+    mutation_id: uuid::Uuid,
+    physical_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecommissionCapacityIntentAdoptionPlan {
+    model_version: u16,
+    operation_id: uuid::Uuid,
+    generation: u64,
+    intents: Vec<DecommissionCapacityLeftoverIntent>,
+}
+
+/// Plan which pending target intents a resumed decommission routine adopts.
+///
+/// The caller must be a routine for `source_pool_index` that has not started
+/// any worker yet, so no intent in the reservation belongs to a mutation of
+/// this incarnation. Outside its target write window, a pending intent is only
+/// a crash marker: the previous incarnation was killed before finalizing the
+/// mutation, or a writer failed after persisting it and has not retried yet.
+/// Adoption holds the target fence while it applies, so no write is in flight,
+/// and it keeps the intent's mutation identity and bytes as an inflight
+/// marker, so the mutation's later retry settles it exactly. The persisted
+/// decommission start time and the reservation identity pin the plan to the
+/// same decommission. Intents without an object identity are left in place
+/// because nothing can settle them.
+fn decommission_capacity_intent_adoption_plan(
+    meta: &PoolMeta,
+    source_pool_index: usize,
+    decommission_generation: OffsetDateTime,
+) -> Result<Option<DecommissionCapacityIntentAdoptionPlan>> {
+    ensure_decommission_generation(meta, source_pool_index, decommission_generation)?;
+    let Some(reservation) = meta
+        .pools
+        .get(source_pool_index)
+        .and_then(|pool| pool.decommission.as_ref())
+        .and_then(|info| info.capacity_reservation.as_ref())
+        .filter(|reservation| reservation.active())
+    else {
+        return Ok(None);
+    };
+    if reservation.source_pool_index != source_pool_index {
+        return Err(decommission_capacity_blocked_error(
+            "decommission intent adoption found a mismatched capacity source",
+        ));
+    }
+    if !matches!(
+        reservation.model_version,
+        DECOMMISSION_CAPACITY_LEGACY_MODEL_VERSION | DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION
+    ) {
+        return Err(Error::DecommissionCapacity(format!(
+            "decommission intent adoption found unsupported capacity lock model {}",
+            reservation.model_version
+        )));
+    }
+    let mut intents = reservation
+        .targets
+        .iter()
+        .filter(|target| target.pending_physical_bytes > 0)
+        .filter_map(|target| {
+            let mutation_id = target.pending_mutation_id.filter(|mutation_id| !mutation_id.is_nil())?;
+            Some(DecommissionCapacityLeftoverIntent {
+                target_pool_index: target.pool_index,
+                mutation_id,
+                physical_bytes: target.pending_physical_bytes,
+            })
+        })
+        .collect::<Vec<_>>();
+    if intents.is_empty() {
+        return Ok(None);
+    }
+    intents.sort_unstable_by_key(|intent| intent.target_pool_index);
+    Ok(Some(DecommissionCapacityIntentAdoptionPlan {
+        model_version: reservation.model_version,
+        operation_id: reservation.operation_id,
+        generation: reservation.generation,
+        intents,
+    }))
+}
+
+/// Id of the inflight marker that holds a mutation's adopted completion.
+///
+/// The marker is a separate entry, derived deterministically from the
+/// mutation id, so that a cleanup releasing the mutation's staged bytes cannot
+/// drop it. Only the mutation's commit, its equivalent-target reconciliation,
+/// or a cleanup that proved the exact target absent settles it. A node without
+/// adoption never matches the derived id, so it never releases the marker:
+/// the bytes stay inflight until the reservation is released, and once later
+/// commits shrink that target's temporary-copy budget below its inflight
+/// bytes, `ensure_decommission_capacity_reservations_available` rejects every
+/// decommission mutation, not only those for that target.
+pub(crate) fn decommission_adopted_intent_mutation_id(mutation_id: uuid::Uuid) -> uuid::Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(b"rustfs-decommission-adopted-intent");
+    hasher.update(mutation_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Uuid::from_bytes(bytes)
+}
+
+/// Move each planned leftover intent out of its target's exclusive pending
+/// slot into the mutation's adopted-completion marker.
+///
+/// The marker keeps the mutation identity and the bytes that mutation may
+/// have placed on the target. Its own retry settles it through the existing
+/// paths (a committed write or an equivalent target records consumption and
+/// releases it; a cleanup that proves the target absent releases it), while
+/// other mutations can use the target again instead of waiting on a slot that
+/// no write holds.
+fn adopt_decommission_capacity_leftover_intents(
+    meta: &mut PoolMeta,
+    source_pool_index: usize,
+    decommission_generation: OffsetDateTime,
+    plan: &DecommissionCapacityIntentAdoptionPlan,
+    now: OffsetDateTime,
+) -> Result<()> {
+    if decommission_capacity_intent_adoption_plan(meta, source_pool_index, decommission_generation)?.as_ref() != Some(plan) {
+        return Err(decommission_capacity_blocked_error(
+            "decommission capacity owner or leftover target intents changed before adoption",
+        ));
+    }
+    for intent in &plan.intents {
+        let split = decommission_adopted_intent_split(meta, source_pool_index, intent)?;
+        resolve_decommission_target_pending(
+            meta,
+            source_pool_index,
+            intent.target_pool_index,
+            intent.physical_bytes,
+            intent.mutation_id,
+        )?;
+        let pool_count = meta.pools.len();
+        let pool = meta
+            .pools
+            .get_mut(source_pool_index)
+            .ok_or_else(|| invalid_decommission_pool_index_error(pool_count, source_pool_index))?;
+        let reservation = pool
+            .decommission
+            .as_mut()
+            .and_then(|info| info.capacity_reservation.as_mut())
+            .filter(|reservation| reservation.active())
+            .ok_or_else(|| decommission_capacity_blocked_error("active reservation disappeared during intent adoption"))?;
+        let model_version = reservation.model_version;
+        let target = reservation
+            .targets
+            .iter_mut()
+            .find(|target| target.pool_index == intent.target_pool_index)
+            .ok_or_else(|| decommission_capacity_blocked_error("target allocation disappeared during intent adoption"))?;
+        // A target-fence ledger keeps a zero-byte staged marker as the
+        // multipart discovery record; the legacy ledger cannot store one.
+        set_decommission_target_marker_bytes(
+            target,
+            intent.mutation_id,
+            split.staged,
+            model_version == DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION,
+        );
+        set_decommission_target_marker_bytes(
+            target,
+            decommission_adopted_intent_mutation_id(intent.mutation_id),
+            split.adopted,
+            false,
+        );
+        target.inflight_physical_bytes = target.inflight_physical_bytes.saturating_add(split.growth);
+        target.observed_physical_bytes = target.observed_physical_bytes.saturating_add(split.growth);
+        reservation.inflight_target_physical_bytes = reservation.inflight_target_physical_bytes.saturating_add(split.growth);
+        reservation.observed_target_physical_bytes = reservation.observed_target_physical_bytes.saturating_add(split.growth);
+        reservation.prediction_error_bytes =
+            signed_capacity_difference(reservation.observed_target_physical_bytes, reservation.consumed_target_physical_bytes);
+        renew_decommission_capacity_reservation(reservation, now, true);
+        pool.last_update = pool.last_update.max(now);
+    }
+    Ok(())
+}
+
+/// Replace a marker's bytes, dropping the entry at zero unless a zero-byte
+/// entry that already exists should stay as a discovery record.
+fn set_decommission_target_marker_bytes(
+    target: &mut DecommissionCapacityTarget,
+    mutation_id: uuid::Uuid,
+    physical_bytes: usize,
+    keep_existing_zero_byte_entry: bool,
+) {
+    match target
+        .temporary_mutations
+        .iter()
+        .position(|mutation| mutation.mutation_id == mutation_id)
+    {
+        Some(index) if physical_bytes == 0 && !keep_existing_zero_byte_entry => {
+            target.temporary_mutations.remove(index);
+        }
+        Some(index) => target.temporary_mutations[index].physical_bytes = physical_bytes,
+        None if physical_bytes > 0 => target.temporary_mutations.push(DecommissionCapacityTemporaryMutation {
+            mutation_id,
+            physical_bytes,
+        }),
+        None => {}
+    }
+}
+
+/// How an adopted intent splits between the mutation's staged marker and its
+/// adopted-completion marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecommissionAdoptedIntentSplit {
+    staged: usize,
+    adopted: usize,
+    growth: usize,
+}
+
+/// A multipart data movement stages parts (the staged marker) and then
+/// reserves its completion for the whole object (the intent). The completion
+/// moves the staged parts into the object, so the two overlap: committed or
+/// not, the target holds about the larger of them. An intent left by a part
+/// upload instead adds to the parts staged before it, and that part was
+/// admitted only while all staged bytes plus the part fit the target's
+/// temporary-copy budget. The mutation's total therefore counts the sum while
+/// it fits that budget and otherwise stops at the budget, never below the
+/// larger of the two; it then exceeds the budget only when finalizing the
+/// completion would have, because finalize charges the same bytes as
+/// consumption, which shrinks the budget by that amount.
+///
+/// A mutation killed twice leaves an adopted completion and then a new
+/// intent for the same object version. Both reserve that same completion, so
+/// they merge by their maximum before the staged parts are added.
+///
+/// The adopted marker takes at least the completion's bytes, so it never
+/// reaches zero and a cleanup that frees staged bytes cannot drop it. The
+/// staged marker keeps the rest of the total and never grows.
+fn decommission_adopted_intent_split(
+    meta: &PoolMeta,
+    source_pool_index: usize,
+    intent: &DecommissionCapacityLeftoverIntent,
+) -> Result<DecommissionAdoptedIntentSplit> {
+    let reservation = meta
+        .pools
+        .get(source_pool_index)
+        .and_then(|pool| pool.decommission.as_ref())
+        .and_then(|info| info.capacity_reservation.as_ref())
+        .filter(|reservation| reservation.active())
+        .ok_or_else(|| decommission_capacity_blocked_error("active reservation disappeared during intent adoption"))?;
+    let target = reservation
+        .targets
+        .iter()
+        .find(|target| target.pool_index == intent.target_pool_index)
+        .ok_or_else(|| decommission_capacity_blocked_error("target allocation disappeared during intent adoption"))?;
+    let marker_bytes = |mutation_id: uuid::Uuid| {
+        target
+            .temporary_mutations
+            .iter()
+            .find(|mutation| mutation.mutation_id == mutation_id)
+            .map(|mutation| mutation.physical_bytes)
+            .unwrap_or_default()
+    };
+    let staged = marker_bytes(intent.mutation_id);
+    let adopted = marker_bytes(decommission_adopted_intent_mutation_id(intent.mutation_id));
+    let recorded = staged.saturating_add(adopted);
+    let other_inflight = target.inflight_physical_bytes.saturating_sub(recorded);
+    let temporary_budget = target.remaining_reserved_physical_bytes(reservation.temporary_copies)
+        / 1usize.saturating_add(reservation.temporary_copies);
+    let completion = adopted.max(intent.physical_bytes);
+    let total = staged
+        .saturating_add(completion)
+        .min(temporary_budget.saturating_sub(other_inflight))
+        .max(recorded.max(completion));
+    let staged_after = total.saturating_sub(completion).min(staged);
+    Ok(DecommissionAdoptedIntentSplit {
+        staged: staged_after,
+        adopted: total.saturating_sub(staged_after),
+        growth: total.saturating_sub(recorded),
+    })
+}
+
+#[cfg(test)]
+static DECOMMISSION_INTENT_ADOPTION_TEST_FAILURES: std::sync::OnceLock<std::sync::Mutex<HashSet<uuid::Uuid>>> =
+    std::sync::OnceLock::new();
+
+/// Make the next intent adoption of `store_id` fail with an ordinary error.
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) fn fail_next_decommission_intent_adoption_for_test(store_id: uuid::Uuid) {
+    DECOMMISSION_INTENT_ADOPTION_TEST_FAILURES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(store_id);
+}
+
+#[cfg(test)]
+fn take_decommission_intent_adoption_test_failure(store_id: uuid::Uuid) -> bool {
+    DECOMMISSION_INTENT_ADOPTION_TEST_FAILURES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&store_id)
+}
+
+/// A routine that cannot settle its predecessor's intents, for example while
+/// a lock quorum is still forming after a restart, pauses without a terminal
+/// transition so the next incarnation retries the adoption.
+fn decommission_intent_adoption_failure(err: Error) -> Error {
+    if is_err_operation_canceled(&err) || is_decommission_capacity_blocked_error(&err) {
+        return err;
+    }
+    decommission_capacity_blocked_error(format!(
+        "failed to adopt target capacity intents left by a previous decommission incarnation: {err}"
+    ))
+}
+
 fn release_decommission_target_temporary_mutation(
     target: &mut DecommissionCapacityTarget,
     mutation_id: uuid::Uuid,
@@ -2268,6 +2582,135 @@ fn release_decommission_target_temporary_mutation(
     }
     target.inflight_physical_bytes = target.inflight_physical_bytes.saturating_sub(released);
     (released, released > 0 || removed)
+}
+
+/// Release both of a mutation's markers once its commit is settled: the bytes
+/// it staged and the completion a resumed routine adopted for it.
+fn release_decommission_target_mutation_markers(
+    target: &mut DecommissionCapacityTarget,
+    mutation_id: uuid::Uuid,
+) -> (usize, bool) {
+    let (staged, staged_changed) = release_decommission_target_temporary_mutation(target, mutation_id, usize::MAX);
+    // An adopted marker is never zero bytes, so releasing it always changes
+    // the ledger.
+    let (adopted, _) =
+        release_decommission_target_temporary_mutation(target, decommission_adopted_intent_mutation_id(mutation_id), usize::MAX);
+    (staged.saturating_add(adopted), staged_changed || adopted > 0)
+}
+
+/// The target's remaining allocation if it still fits one object of
+/// `expected_data_bytes` with its temporary copies.
+fn decommission_capacity_target_candidate(
+    reservation: &DecommissionCapacityReservation,
+    target: &DecommissionCapacityTarget,
+    expected_data_bytes: usize,
+) -> Option<(usize, usize)> {
+    let expected_physical_bytes = capacity_target_physical_bytes(expected_data_bytes.max(1), target.layout).ok()?;
+    let required_peak = expected_physical_bytes.saturating_mul(1usize.saturating_add(reservation.temporary_copies));
+    let remaining = target.remaining_reserved_physical_bytes(reservation.temporary_copies);
+    (required_peak <= remaining).then_some((target.pool_index, remaining))
+}
+
+/// Choose the reserved target for a mutation's next attempt.
+///
+/// A retry goes back to a target that holds the mutation's adopted
+/// completion while that target still fits the object: only a commit or an
+/// equivalent target there settles the adopted marker, so committing on
+/// another target would leave it behind as inflight bytes. Otherwise the
+/// target with the most remaining allocation wins.
+///
+/// For an adopted completion the fallback cannot help: the target stops
+/// fitting the object only when its temporary-copy budget drops below the
+/// object's bytes, which the adopted marker already holds as inflight, so
+/// `ensure_decommission_capacity_reservations_available` fails before any
+/// placement on another target is admitted.
+fn decommission_reserved_target_choice(
+    reservation: &DecommissionCapacityReservation,
+    mutation_id: Option<uuid::Uuid>,
+    expected_data_bytes: usize,
+) -> Option<usize> {
+    let candidate =
+        |target: &DecommissionCapacityTarget| decommission_capacity_target_candidate(reservation, target, expected_data_bytes);
+    let adopted_mutation_id = mutation_id.map(decommission_adopted_intent_mutation_id);
+    reservation
+        .targets
+        .iter()
+        .filter(|target| {
+            target
+                .temporary_mutations
+                .iter()
+                .any(|mutation| Some(mutation.mutation_id) == adopted_mutation_id)
+        })
+        .find_map(candidate)
+        .or_else(|| {
+            reservation
+                .targets
+                .iter()
+                .filter_map(candidate)
+                .max_by_key(|(_, remaining)| *remaining)
+        })
+        .map(|(pool_index, _)| pool_index)
+}
+
+/// Record whether a mutation with an adopted completion went back to the
+/// target that holds it, or had to be placed elsewhere and so leaves the
+/// adopted marker behind.
+fn log_decommission_adopted_target_choice(
+    reservation: &DecommissionCapacityReservation,
+    owner: DecommissionCapacityOwner,
+    chosen_pool_index: usize,
+) {
+    let Some(mutation_id) = owner.mutation_id else {
+        return;
+    };
+    let adopted_mutation_id = decommission_adopted_intent_mutation_id(mutation_id);
+    let adopted_target_pools = reservation
+        .targets
+        .iter()
+        .filter(|target| {
+            target
+                .temporary_mutations
+                .iter()
+                .any(|mutation| mutation.mutation_id == adopted_mutation_id)
+        })
+        .map(|target| target.pool_index)
+        .collect::<Vec<_>>();
+    if adopted_target_pools.is_empty() {
+        return;
+    }
+    if adopted_target_pools.contains(&chosen_pool_index) {
+        info!(
+            event = EVENT_DECOMMISSION_ENTRY,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_POOLS,
+            state = "adopted_target_reused",
+            pool_index = owner.source_pool_index,
+            target_pool_index = chosen_pool_index,
+            mutation_id = %mutation_id,
+            "Decommission retry returns to the target that holds its adopted completion"
+        );
+    } else {
+        warn!(
+            event = EVENT_DECOMMISSION_ENTRY,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_POOLS,
+            state = "adopted_target_bypassed",
+            pool_index = owner.source_pool_index,
+            target_pool_index = chosen_pool_index,
+            adopted_target_pools = ?adopted_target_pools,
+            mutation_id = %mutation_id,
+            "Decommission retry no longer fits the target that holds its adopted completion"
+        );
+    }
+}
+
+/// Whether a target still holds a marker of this mutation, staged or adopted.
+fn decommission_target_has_mutation_marker(target: &DecommissionCapacityTarget, mutation_id: uuid::Uuid) -> bool {
+    let adopted = decommission_adopted_intent_mutation_id(mutation_id);
+    target
+        .temporary_mutations
+        .iter()
+        .any(|mutation| mutation.mutation_id == mutation_id || mutation.mutation_id == adopted)
 }
 
 fn settle_decommission_target_non_growing_replacement(
@@ -2296,7 +2739,7 @@ fn settle_decommission_target_non_growing_replacement(
         .iter_mut()
         .find(|target| target.pool_index == target_pool_index)
         .ok_or_else(|| decommission_capacity_blocked_error("target allocation disappeared during target replacement"))?;
-    let (released, changed) = release_decommission_target_temporary_mutation(target, mutation_id, usize::MAX);
+    let (released, changed) = release_decommission_target_mutation_markers(target, mutation_id);
     reservation.inflight_target_physical_bytes = reservation.inflight_target_physical_bytes.saturating_sub(released);
     if changed {
         renew_decommission_capacity_reservation(reservation, now, true);
@@ -2352,7 +2795,7 @@ fn record_decommission_target_consumption(
     target.consumed_physical_bytes = target.consumed_physical_bytes.saturating_add(consumed);
     target.observed_physical_bytes = target.observed_physical_bytes.saturating_add(observed_physical_bytes);
     let has_scoped_temporary_mutations = !target.temporary_mutations.is_empty();
-    let (released_inflight, _) = release_decommission_target_temporary_mutation(target, mutation_id, usize::MAX);
+    let (released_inflight, _) = release_decommission_target_mutation_markers(target, mutation_id);
     let released_inflight = if released_inflight == 0 && !has_scoped_temporary_mutations {
         let released = target.inflight_physical_bytes.min(consumed);
         target.inflight_physical_bytes = target.inflight_physical_bytes.saturating_sub(released);
@@ -2512,6 +2955,19 @@ fn release_decommission_target_inflight(
         .ok_or_else(|| decommission_capacity_blocked_error("target allocation disappeared during target cleanup"))?;
     let has_temporary_mutations = !target.temporary_mutations.is_empty();
     let pending_belongs_to_mutation = target.pending_mutation_id == Some(mutation_id);
+    // An adopted completion is the mutation's published intent moved out of
+    // the pending slot; it keeps that intent's delayed-release exemption while
+    // every marker on the target is this mutation's. A staged marker with
+    // bytes is released below, so the exemption never applies to it.
+    let adopted_mutation_id = decommission_adopted_intent_mutation_id(mutation_id);
+    let holds_only_own_adopted_completion = target
+        .temporary_mutations
+        .iter()
+        .any(|mutation| mutation.mutation_id == adopted_mutation_id)
+        && target
+            .temporary_mutations
+            .iter()
+            .all(|mutation| mutation.mutation_id == adopted_mutation_id || mutation.mutation_id == mutation_id);
     let zero_ledger_cleanup = confirmed_absent
         && model_version == DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION
         && !has_temporary_mutations
@@ -2533,13 +2989,21 @@ fn release_decommission_target_inflight(
     } else {
         released
     };
+    // Only a cleanup that proved the exact target absent shows that an adopted
+    // completion never committed. Any other cleanup leaves it for the commit or
+    // the equivalent-target reconciliation to charge.
+    let released_adopted = if confirmed_absent && clear_pending {
+        release_decommission_target_temporary_mutation(target, adopted_mutation_id, usize::MAX).0
+    } else {
+        0
+    };
     let pending_matches = clear_pending && confirmed_absent && pending_belongs_to_mutation;
     let published_pending_delayed_release = confirmed_absent
         && model_version == DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION
         && !clear_pending
-        && !has_temporary_mutations
-        && pending_belongs_to_mutation;
+        && ((!has_temporary_mutations && pending_belongs_to_mutation) || holds_only_own_adopted_completion);
     if released == 0
+        && released_adopted == 0
         && released_physical_bytes > 0
         && !zero_ledger_cleanup
         && !published_pending_delayed_release
@@ -2549,7 +3013,9 @@ fn release_decommission_target_inflight(
             "temporary target cleanup released bytes that cannot be attributed to its mutation",
         ));
     }
-    reservation.inflight_target_physical_bytes = reservation.inflight_target_physical_bytes.saturating_sub(released);
+    reservation.inflight_target_physical_bytes = reservation
+        .inflight_target_physical_bytes
+        .saturating_sub(released.saturating_add(released_adopted));
     let cleared_pending = if pending_matches {
         let cleared = target.pending_physical_bytes;
         target.pending_physical_bytes = 0;
@@ -2559,7 +3025,7 @@ fn release_decommission_target_inflight(
     } else {
         0
     };
-    let changed = released > 0 || temporary_mutation_changed || cleared_pending > 0;
+    let changed = released > 0 || released_adopted > 0 || temporary_mutation_changed || cleared_pending > 0;
     if changed {
         renew_decommission_capacity_reservation(reservation, now, true);
         pool.last_update = pool.last_update.max(now);
@@ -2895,8 +3361,16 @@ fn is_decommission_set_local_usage_cache(bucket: &str, object: &str) -> bool {
     name.strip_suffix(".bkp").unwrap_or(name) == DATA_USAGE_CACHE_NAME
 }
 
-fn with_decommission_entry_context<E: Display>(stage: &str, bucket: &str, object: &str, err: E) -> Error {
-    Error::other(format!("decommission entry {stage} failed for bucket {bucket} object {object}: {err}"))
+/// Keep the typed cause reachable so the entry retry loop and the routine
+/// classify a wrapped capacity block or intent conflict by type.
+fn with_decommission_entry_context<E>(stage: &str, bucket: &str, object: &str, err: E) -> Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    data_movement::data_movement_context_error(
+        format!("decommission entry {stage} failed for bucket {bucket} object {object}: {err}"),
+        err,
+    )
 }
 
 #[cfg(test)]
@@ -2940,17 +3414,32 @@ async fn load_decommission_entry_exact_versions(
 fn resolve_decommission_check_after_list_result(list_result: Result<()>, entry_error: Option<Error>) -> Result<()> {
     match list_result {
         Ok(()) => entry_error.map_or(Ok(()), Err),
-        Err(list_err) => resolve_decommission_listing_error(Some(list_err), entry_error).map_or(Ok(()), Err),
+        Err(list_err) => decommission_root_cause(Some(list_err), entry_error).map_or(Ok(()), Err),
     }
 }
 
-fn resolve_decommission_listing_error(listing_error: Option<Error>, entry_error: Option<Error>) -> Option<Error> {
-    match (listing_error, entry_error) {
-        (Some(listing_error), Some(entry_error)) if is_err_operation_canceled(&listing_error) => Some(entry_error),
-        (Some(listing_error), Some(entry_error)) if is_err_operation_canceled(&entry_error) => Some(listing_error),
-        (Some(listing_error), _) => Some(listing_error),
-        (None, entry_error) => entry_error,
+/// The first failure of concurrent decommission work cancels its siblings,
+/// which then report `OperationCanceled`, possibly before the failing task
+/// returns. Keep the failure that caused the cancellation so the routine
+/// classifies the real cause: a capacity block pauses instead of ending the
+/// decommission as failed. Between two real failures the earlier one stays.
+fn decommission_root_cause(first: Option<Error>, next: Option<Error>) -> Option<Error> {
+    match (first, next) {
+        (Some(first), Some(next)) if is_err_operation_canceled(&first) && !is_err_operation_canceled(&next) => Some(next),
+        (Some(first), _) => Some(first),
+        (None, next) => next,
     }
+}
+
+/// The failure a bucket reports once its listing workers and entries
+/// finished. An entry failure cancels the listing workers, so a canceled
+/// listing must not hide the entry error that caused it.
+fn decommission_bucket_failure(listing_results: Vec<Result<()>>, entry_error: Option<Error>) -> Option<Error> {
+    let listing_error = listing_results
+        .into_iter()
+        .filter_map(Result::err)
+        .fold(None, |first, err| decommission_root_cause(first, Some(err)));
+    decommission_root_cause(listing_error, entry_error)
 }
 
 fn decommission_unresolved_listing_error(entry: &DecommissionUnresolvedEntry) -> Error {
@@ -2983,6 +3472,11 @@ fn resolve_decommission_partial_listing_entry(
     if let Some(entry) = entries.resolve(resolver) {
         return Ok(entry);
     }
+    if disk_error_count == 0
+        && let Some(prefix_dir) = decommission_prefix_directory_candidate(entries.as_ref())
+    {
+        return Ok(prefix_dir);
+    }
 
     let object = entries
         .as_ref()
@@ -3003,6 +3497,24 @@ fn resolve_decommission_partial_listing_entry(
         observed_at: OffsetDateTime::now_utc(),
         reason: "metadata_resolution_failed".to_string(),
     })
+}
+
+/// The prefix directory a partial listing sample consists of, when every
+/// candidate is one.
+///
+/// The walker emits a directory with empty metadata only when it holds no
+/// `xl.meta`, so such a sample is listing structure rather than erasure-coded
+/// data: node-local files such as the MRF journal under
+/// `.rustfs.sys/buckets/.heal/` create one on a single drive, and the
+/// recursive walk lists any object beneath it as its own entry. Below the
+/// directory quorum there is nothing to reconcile, so the callback receives the
+/// prefix exactly as a quorum-resolved one and skips it. Objects whose metadata
+/// is present but unreadable keep their metadata bytes and never match here;
+/// mixed samples stay unresolved.
+fn decommission_prefix_directory_candidate(candidates: &[Option<MetaCacheEntry>]) -> Option<MetaCacheEntry> {
+    let mut candidates = candidates.iter().flatten();
+    let first = candidates.next()?;
+    (first.is_dir() && candidates.all(MetaCacheEntry::is_dir)).then(|| first.clone())
 }
 
 fn validate_decommission_durable_ilm_copy(
@@ -4488,8 +5000,15 @@ fn resolve_decommission_entry_failure(err: Error) -> Result<DecommissionEntryOut
 #[cfg(test)]
 pub(crate) type DecommissionTestFaultDecision = Arc<dyn Fn(&'static str, &str, &str, usize, bool) -> bool + Send + Sync>;
 
+/// Builds the error an injected fault reports; a generic error by default.
 #[cfg(test)]
-static DECOMMISSION_TEST_FAULT_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<DecommissionTestFaultDecision>>> =
+pub(crate) type DecommissionTestFaultError = Arc<dyn Fn(&'static str, &str, &str) -> Error + Send + Sync>;
+
+#[cfg(test)]
+type DecommissionTestFault = (DecommissionTestFaultDecision, Option<DecommissionTestFaultError>);
+
+#[cfg(test)]
+static DECOMMISSION_TEST_FAULT_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<DecommissionTestFault>>> =
     std::sync::OnceLock::new();
 
 #[cfg(test)]
@@ -4498,13 +5017,17 @@ pub(crate) struct DecommissionTestFaultGuard(DecommissionTestFaultDecision);
 #[cfg(test)]
 impl DecommissionTestFaultGuard {
     pub(crate) fn install(decision: DecommissionTestFaultDecision) -> Self {
+        Self::install_with_error(decision, None)
+    }
+
+    pub(crate) fn install_with_error(decision: DecommissionTestFaultDecision, error: Option<DecommissionTestFaultError>) -> Self {
         let mut slot = DECOMMISSION_TEST_FAULT_HOOK
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
             .expect("decommission test fault hook mutex should not poison");
         assert!(slot.is_none(), "decommission test fault hook must be unique");
         let stored = Arc::clone(&decision);
-        *slot = Some(decision);
+        *slot = Some((decision, error));
         Self(stored)
     }
 }
@@ -4516,7 +5039,7 @@ impl Drop for DecommissionTestFaultGuard {
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
             .expect("decommission test fault hook mutex should not poison");
-        if slot.as_ref().is_some_and(|decision| Arc::ptr_eq(decision, &self.0)) {
+        if slot.as_ref().is_some_and(|(decision, _)| Arc::ptr_eq(decision, &self.0)) {
             *slot = None;
         }
     }
@@ -4530,16 +5053,22 @@ fn decommission_test_wrap_result<T>(
     attempt: usize,
     result: Result<T>,
 ) -> Result<T> {
-    let decision = DECOMMISSION_TEST_FAULT_HOOK
+    let fault = DECOMMISSION_TEST_FAULT_HOOK
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
         .expect("decommission test fault hook mutex should not poison")
         .clone();
-    let inject = decision.is_some_and(|decision| decision(stage, bucket, object, attempt, result.is_ok()));
+    let Some((decision, error)) = fault else {
+        return result;
+    };
+    let inject = decision(stage, bucket, object, attempt, result.is_ok());
     if result.is_ok() && inject {
-        return Err(Error::other(format!(
-            "injected decommission test fault at {stage} attempt {attempt} for {bucket}/{object}"
-        )));
+        return Err(match error {
+            Some(error) => error(stage, bucket, object),
+            None => Error::other(format!(
+                "injected decommission test fault at {stage} attempt {attempt} for {bucket}/{object}"
+            )),
+        });
     }
     result
 }
@@ -4720,9 +5249,7 @@ where
     while let Some(result) = active.next().await {
         if let Err(err) = result {
             rx.cancel();
-            if first_err.is_none() {
-                first_err = Some(err);
-            }
+            first_err = decommission_root_cause(first_err, Some(err));
             continue;
         }
 
@@ -10713,9 +11240,9 @@ fn decommission_delete_marker_opts(
     }
 }
 
-fn decommission_object_migration_read_opts(version_id: Option<String>) -> ObjectOptions {
+fn decommission_object_migration_read_opts(version: &rustfs_filemeta::FileInfo) -> ObjectOptions {
     ObjectOptions {
-        version_id,
+        version_id: Some(data_movement::data_movement_exact_version_id(version.version_id)),
         no_lock: true,
         data_movement: true,
         raw_data_movement_read: true,
@@ -11586,7 +12113,16 @@ impl ECStore {
             .acquire_pool_meta_write_guard(&mut save_guard, "decommission equivalent target reconciliation failed")
             .await?;
         let source_pool_index = owner.source_pool_index;
-        let (target_layout, target_pending_physical_bytes, target_consumed_physical_bytes) = {
+        let mutation_id = owner.mutation_id.ok_or_else(|| {
+            decommission_capacity_blocked_error("equivalent target reconciliation mutation identity is missing")
+        })?;
+        let (
+            target_layout,
+            target_pending_physical_bytes,
+            target_pending_mutation_id,
+            target_consumed_physical_bytes,
+            has_temporary_mutation,
+        ) = {
             let reservation = snapshot
                 .pools
                 .get(source_pool_index)
@@ -11605,13 +12141,38 @@ impl ECStore {
                 .iter()
                 .find(|target| target.pool_index == target_pool_index)
                 .ok_or_else(|| decommission_capacity_blocked_error("equivalent target reconciliation allocation is missing"))?;
-            (target.layout, target.pending_physical_bytes, target.consumed_physical_bytes)
+            (
+                target.layout,
+                target.pending_physical_bytes,
+                target.pending_mutation_id,
+                target.consumed_physical_bytes,
+                decommission_target_has_mutation_marker(target, mutation_id),
+            )
         };
-        let mutation_id = owner.mutation_id.ok_or_else(|| {
-            decommission_capacity_blocked_error("equivalent target reconciliation mutation identity is missing")
-        })?;
         let expected_target_physical_bytes = capacity_target_physical_bytes(expected_data_bytes.max(1), target_layout)?;
-        if target_pending_physical_bytes == 0 {
+        // A target holds one pending intent at a time, so a pending intent of
+        // another mutation means this mutation has none here; that intent is
+        // not this mutation's to check or resolve. Without its own pending
+        // intent, this mutation's inflight marker is the only unsettled record
+        // of it: either bytes it staged or an intent a previous routine
+        // incarnation left and the resumed routine adopted. The equivalent
+        // committed target proves the commit, so settle that marker into
+        // consumption exactly as the lost finalize would have. With neither,
+        // the commit was already charged.
+        let owns_pending = target_pending_physical_bytes > 0 && target_pending_mutation_id == Some(mutation_id);
+        let settles_marker_only = has_temporary_mutation && !owns_pending;
+        if !owns_pending && !has_temporary_mutation {
+            debug!(
+                event = EVENT_DECOMMISSION_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                state = "equivalent_target_already_charged",
+                pool_index = source_pool_index,
+                target_pool_index,
+                other_pending_intent = target_pending_physical_bytes > 0,
+                consumption_covers_object = target_consumed_physical_bytes >= expected_target_physical_bytes,
+                "Decommission equivalent target has no unsettled capacity record"
+            );
             if target_consumed_physical_bytes >= expected_target_physical_bytes {
                 let mut pool_meta = self.pool_meta.write().await;
                 ensure_pool_meta_write_fence(&pool_meta_guard, "equivalent target idempotent publication")?;
@@ -11629,19 +12190,20 @@ impl ECStore {
                 "equivalent target has no pending capacity intent to reconcile",
             ));
         }
-        if target_pending_physical_bytes < expected_target_physical_bytes {
-            return Err(decommission_capacity_blocked_error(
-                "equivalent target pending capacity is smaller than the committed object",
-            ));
+        if !settles_marker_only {
+            if target_pending_physical_bytes < expected_target_physical_bytes {
+                return Err(decommission_capacity_blocked_error(
+                    "equivalent target pending capacity is smaller than the committed object",
+                ));
+            }
+            resolve_decommission_target_pending(
+                &mut snapshot,
+                source_pool_index,
+                target_pool_index,
+                expected_target_physical_bytes,
+                mutation_id,
+            )?;
         }
-
-        resolve_decommission_target_pending(
-            &mut snapshot,
-            source_pool_index,
-            target_pool_index,
-            expected_target_physical_bytes,
-            mutation_id,
-        )?;
         record_decommission_target_consumption(
             &mut snapshot,
             source_pool_index,
@@ -11794,13 +12356,13 @@ impl ECStore {
                 target.layout,
                 target.pending_physical_bytes,
                 target.pending_mutation_id,
-                target
-                    .temporary_mutations
-                    .iter()
-                    .any(|mutation| mutation.mutation_id == mutation_id),
+                decommission_target_has_mutation_marker(target, mutation_id),
             )
         };
-        if pending_physical_bytes == 0 && !has_temporary_mutation {
+        // A target holds one pending intent at a time, so another mutation's
+        // pending intent means this mutation has none here to settle.
+        let owns_pending = pending_physical_bytes > 0 && pending_mutation_id == Some(mutation_id);
+        if !owns_pending && !has_temporary_mutation {
             // A prior successful attempt already settled both durable halves.
             ensure_pool_meta_write_fence(&pool_meta_guard, "equivalent temporary target reconciliation fence failed")?;
             if let Some(target_guard) = target_guard.as_ref() {
@@ -11812,18 +12374,13 @@ impl ECStore {
             }
             return Ok(());
         }
-        if pending_physical_bytes > 0 && pending_mutation_id != Some(mutation_id) {
-            return Err(decommission_capacity_blocked_error(
-                "equivalent temporary target pending intent belongs to another mutation",
-            ));
-        }
         let expected_target_physical_bytes = capacity_target_physical_bytes(expected_data_bytes.max(1), target_layout)?;
-        if pending_physical_bytes > 0 && pending_physical_bytes != expected_target_physical_bytes {
+        if owns_pending && pending_physical_bytes != expected_target_physical_bytes {
             return Err(decommission_capacity_blocked_error(
                 "equivalent temporary target pending capacity does not match the committed checkpoint",
             ));
         }
-        if pending_physical_bytes > 0 {
+        if owns_pending {
             resolve_decommission_target_pending(
                 &mut snapshot,
                 source_pool_index,
@@ -11905,10 +12462,7 @@ impl ECStore {
                     true
                 } else {
                     (target.pending_physical_bytes > 0 && target.pending_mutation_id == Some(mutation_id))
-                        || target
-                            .temporary_mutations
-                            .iter()
-                            .any(|mutation| mutation.mutation_id == mutation_id)
+                        || decommission_target_has_mutation_marker(target, mutation_id)
                 }
             })
     }
@@ -13134,6 +13688,108 @@ impl ECStore {
         ensure_decommission_capacity_reservations_available(&pool_meta, &capacity_infos, "migration")
     }
 
+    /// Adopt the pending target intents that an earlier incarnation of this
+    /// decommission routine left behind. Call it before this incarnation
+    /// starts any worker; `decommission_capacity_intent_adoption_plan` explains
+    /// why adopting them cannot take over a write in flight.
+    ///
+    /// Lock order: start gate, target gates, save gate, distributed pool
+    /// metadata fence, then pool_meta, matching terminal transitions. Holding
+    /// each target gate, or for the legacy model the pool metadata write fence
+    /// that legacy mutations keep through target I/O, proves that no mutation
+    /// is inside its target write window while the plan is applied.
+    async fn adopt_previous_incarnation_decommission_capacity_intents(
+        &self,
+        idx: usize,
+        generation: OffsetDateTime,
+    ) -> Result<()> {
+        let local_plan = {
+            let pool_meta = self.pool_meta.read().await;
+            decommission_capacity_intent_adoption_plan(&pool_meta, idx, generation)?
+        };
+        if local_plan.is_none() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if take_decommission_intent_adoption_test_failure(self.id) {
+            return Err(Error::other("injected decommission intent adoption failure"));
+        }
+        let _start_guard = self.start_gate.lock().await;
+        let plan = {
+            let save_guard = self.pool_meta_save_gate.lock().await;
+            let (_read_guard, snapshot) = self
+                .acquire_pool_meta_read_guard(&save_guard, "decommission intent adoption planning failed")
+                .await?;
+            decommission_capacity_intent_adoption_plan(&snapshot, idx, generation)?
+        };
+        let Some(plan) = plan else {
+            return Ok(());
+        };
+        let mut target_guards = Vec::with_capacity(plan.intents.len());
+        if plan.model_version == DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION {
+            for intent in &plan.intents {
+                let guard = self
+                    .acquire_decommission_capacity_target_guard_retried(intent.target_pool_index)
+                    .await?;
+                ensure_decommission_capacity_target_fence(&guard, intent.target_pool_index, "leftover intent adoption")?;
+                target_guards.push((intent.target_pool_index, guard));
+            }
+        }
+        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let (pool_meta_guard, mut snapshot) = self
+            .acquire_pool_meta_write_guard(&mut save_guard, "decommission intent adoption failed")
+            .await?;
+        adopt_decommission_capacity_leftover_intents(&mut snapshot, idx, generation, &plan, OffsetDateTime::now_utc())?;
+        let outcome = snapshot
+            .save_no_lock_armed(
+                self.pools.clone(),
+                &mut save_guard,
+                PoolMetaPersistenceFence::Owned(Arc::clone(&pool_meta_guard)),
+                &[idx],
+            )
+            .await?;
+        // Log as soon as the adopted ledger is durable: a fence lost after this
+        // point leaves nothing to adopt next time. A save that ends as
+        // TransactionUnknown can still apply the adoption without this event,
+        // so the rollback rule must not depend on it.
+        warn!(
+            event = EVENT_DECOMMISSION_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_POOLS,
+            state = "capacity_intents_adopted",
+            pool_index = idx,
+            operation_id = %plan.operation_id,
+            generation = plan.generation,
+            adopted_intents = plan.intents.len(),
+            adopted_physical_bytes = plan
+                .intents
+                .iter()
+                .fold(0usize, |total, intent| total.saturating_add(intent.physical_bytes)),
+            "Decommission adopted target capacity intents left by a previous incarnation"
+        );
+        ensure_pool_meta_write_fence(&pool_meta_guard, "decommission intent adoption save failed")?;
+        for (target_pool_index, guard) in &target_guards {
+            ensure_decommission_capacity_target_fence(guard, *target_pool_index, "leftover intent adoption save")?;
+        }
+        {
+            let mut pool_meta = self.pool_meta.write().await;
+            publish_decommission_capacity_update(&mut pool_meta, &outcome.committed, idx)?;
+        }
+        ensure_pool_meta_write_fence(&pool_meta_guard, "decommission intent adoption save failed")?;
+        for (target_pool_index, guard) in &target_guards {
+            ensure_decommission_capacity_target_fence(guard, *target_pool_index, "leftover intent adoption publication")?;
+        }
+        outcome.disarm();
+        Ok(())
+    }
+
+    #[cfg(feature = "test-util")]
+    pub async fn adopt_previous_incarnation_decommission_capacity_intents_for_test(&self, idx: usize) -> Result<()> {
+        let generation = self.active_decommission_generation(idx).await?;
+        self.adopt_previous_incarnation_decommission_capacity_intents(idx, generation)
+            .await
+    }
+
     async fn decommission_capacity_owner_for_worker(
         &self,
         idx: usize,
@@ -13195,18 +13851,12 @@ impl ECStore {
             .and_then(|info| info.capacity_reservation.as_ref())
             .filter(|reservation| reservation.admits_owner(owner, OffsetDateTime::now_utc()))
             .ok_or_else(|| decommission_capacity_blocked_error("decommission target selection reservation is stale"))?;
-        let candidate = |target: &DecommissionCapacityTarget| {
-            let expected_physical_bytes = capacity_target_physical_bytes(expected_data_bytes.max(1), target.layout).ok()?;
-            let required_peak = expected_physical_bytes.saturating_mul(1usize.saturating_add(reservation.temporary_copies));
-            let remaining = target.remaining_reserved_physical_bytes(reservation.temporary_copies);
-            (required_peak <= remaining).then_some((target.pool_index, remaining))
-        };
         if let Some(permitted_target_pool_index) = decommission_capacity_target_permit_index(self.id, owner) {
             if let Some((pool_index, _)) = reservation
                 .targets
                 .iter()
                 .find(|target| target.pool_index == permitted_target_pool_index)
-                .and_then(candidate)
+                .and_then(|target| decommission_capacity_target_candidate(reservation, target, expected_data_bytes))
             {
                 return Ok(pool_index);
             }
@@ -13215,12 +13865,8 @@ impl ECStore {
             // different target so one mutation never holds two target gates.
             discard_decommission_capacity_target_permit_except(self.id, owner, None);
         }
-        if let Some((pool_index, _)) = reservation
-            .targets
-            .iter()
-            .filter_map(candidate)
-            .max_by_key(|(_, remaining)| *remaining)
-        {
+        if let Some(pool_index) = decommission_reserved_target_choice(reservation, owner.mutation_id, expected_data_bytes) {
+            log_decommission_adopted_target_choice(reservation, owner, pool_index);
             return Ok(pool_index);
         }
         if reservation.source_data_equivalent_bytes > 0 {
@@ -14867,11 +15513,7 @@ impl ECStore {
             .ok_or_else(|| decommission_capacity_blocked_error("scanner pause backlog retirement reservation is stale"))?;
         let mutation_id = decommission_capacity_version_mutation_id(owner, RUSTFS_META_BUCKET, version);
         if reservation.targets.iter().any(|target| {
-            target.pending_mutation_id == Some(mutation_id)
-                || target
-                    .temporary_mutations
-                    .iter()
-                    .any(|mutation| mutation.mutation_id == mutation_id)
+            target.pending_mutation_id == Some(mutation_id) || decommission_target_has_mutation_marker(target, mutation_id)
         }) {
             return Err(decommission_capacity_blocked_error(
                 "scanner pause backlog retirement has an unresolved target capacity intent",
@@ -15302,6 +15944,7 @@ impl ECStore {
         let mut expired: usize = 0;
         let mut free_version_disposition = DecommissionFreeVersionDisposition::default();
         let mut cleanup_preflight_allowed_missing = Vec::new();
+        let mut cleanup_preflight_vanished = Vec::new();
         let mut entry_blocked = false;
 
         for version in fivs.versions.iter() {
@@ -15637,6 +16280,9 @@ impl ECStore {
                 }
 
                 if ignore {
+                    if cleanup_ignored {
+                        cleanup_preflight_vanished.push(data_movement::source_cleanup_version_identity(version));
+                    }
                     if should_count_decommission_version_complete(ignore, cleanup_ignored, failure) {
                         decommissioned += 1;
                     }
@@ -15819,7 +16465,7 @@ impl ECStore {
                         &encode_dir_object(&version.name),
                         None,
                         HeaderMap::new(),
-                        &decommission_object_migration_read_opts(version_id.clone()),
+                        &decommission_object_migration_read_opts(version),
                     )
                     .await;
                 #[cfg(test)]
@@ -16010,6 +16656,9 @@ impl ECStore {
             }
 
             if ignore {
+                if cleanup_ignored {
+                    cleanup_preflight_vanished.push(data_movement::source_cleanup_version_identity(version));
+                }
                 if should_count_decommission_version_complete(ignore, cleanup_ignored, failure) {
                     decommissioned += 1;
                 }
@@ -16098,13 +16747,14 @@ impl ECStore {
             let source_cleanup_mutation_fence = self
                 .acquire_decommission_source_cleanup_fence(bucket.as_str(), entry.name.as_str(), set.as_ref())
                 .await?;
+            let cleanup_expected = data_movement::source_cleanup_expected_without_vanished(&fivs, &cleanup_preflight_vanished);
             let cleanup_result = self
                 .run_guarded_decommission_side_effect(&rx, &operation_gate, || async {
                     data_movement::cleanup_source_entry_if_unchanged(
                         set.clone(),
                         bucket.as_str(),
                         entry.name.as_str(),
-                        &fivs,
+                        &cleanup_expected,
                         &cleanup_preflight_allowed_missing,
                         data_movement::SourceCleanupBucketFence {
                             expected_incarnation_id: expected_bucket_incarnation_id,
@@ -16479,21 +17129,16 @@ impl ECStore {
             "Decommission waiting for workers"
         );
 
-        let mut listing_worker_error = None;
+        let mut listing_results = Vec::with_capacity(listing_workers.len());
         for (set_id, worker) in listing_workers {
-            if let Err(err) = resolve_decommission_listing_worker_result(set_id, worker.await) {
+            let result = resolve_decommission_listing_worker_result(set_id, worker.await);
+            if result.is_err() {
                 rx.cancel();
-                if listing_worker_error.is_none() {
-                    listing_worker_error = Some(err);
-                }
             }
+            listing_results.push(result);
         }
 
-        if let Some(err) = listing_worker_error {
-            return Err(err);
-        }
-
-        if let Some(err) = entry_error.lock().await.clone() {
+        if let Some(err) = decommission_bucket_failure(listing_results, entry_error.lock().await.clone()) {
             return Err(err);
         }
 
@@ -16609,9 +17254,18 @@ impl ECStore {
             }
             return Ok(());
         }
-        let result = self
-            .decommission_in_background(rx.clone(), idx, generation, entry_budget)
-            .await;
+        // Settle the previous incarnation's unfinished target intents before
+        // any worker of this incarnation can create an intent of its own.
+        let result = match self
+            .adopt_previous_incarnation_decommission_capacity_intents(idx, generation)
+            .await
+        {
+            Ok(()) => {
+                self.decommission_in_background(rx.clone(), idx, generation, entry_budget)
+                    .await
+            }
+            Err(err) => Err(decommission_intent_adoption_failure(err)),
+        };
 
         if let Err(err) = &result
             && (is_decommission_capacity_blocked_error(err) || is_decommission_target_capacity_error(err))
@@ -21528,6 +22182,387 @@ mod tests {
         );
     }
 
+    async fn start_leftover_intent_test_decommission(
+        store: &Arc<ECStore>,
+        decom_buckets: Vec<DecomBucketInfo>,
+        expected_model_version: u16,
+    ) {
+        // The routine also migrates `.rustfs.sys` bucket metadata, so keep the
+        // reservation far above every fixture object.
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64 << 20, 64 << 20),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 1 << 30, 1 << 30, 0),
+            ]],
+        );
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], decom_buckets)
+            .await
+            .expect("the decommission reservation should be activated");
+        let pool_meta = store.pool_meta.read().await;
+        let reservation = pool_meta.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .expect("the decommission reservation should be active");
+        assert_eq!(reservation.model_version, expected_model_version);
+    }
+
+    async fn leftover_intent_test_owner(store: &Arc<ECStore>, mutation_id: uuid::Uuid) -> DecommissionCapacityOwner {
+        let pool_meta = store.pool_meta.read().await;
+        let reservation = pool_meta.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .expect("the decommission reservation should be active");
+        DecommissionCapacityOwner {
+            source_pool_index: 0,
+            operation_id: reservation.operation_id,
+            generation: reservation.generation,
+            owner_nonce: reservation.owner_nonce,
+            mutation_id: Some(mutation_id),
+        }
+    }
+
+    async fn leftover_intent_test_target(store: &Arc<ECStore>, target_pool_index: usize) -> DecommissionCapacityTarget {
+        store.pool_meta.read().await.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .and_then(|reservation| {
+                reservation
+                    .targets
+                    .iter()
+                    .find(|target| target.pool_index == target_pool_index)
+            })
+            .cloned()
+            .expect("the reservation should allocate the target pool")
+    }
+
+    /// Leave the durable trace of a target mutation whose leader died after it
+    /// persisted the capacity intent but before it finalized the mutation.
+    async fn leave_unfinalized_decommission_target_intent(
+        store: &Arc<ECStore>,
+        target_pool_index: usize,
+        mutation_id: uuid::Uuid,
+        expected_data_bytes: usize,
+    ) {
+        let owner = leftover_intent_test_owner(store, mutation_id).await;
+        store
+            .run_decommission_capacity_admitted_mutation_with_capacity_lease(
+                target_pool_index,
+                Some(owner),
+                Some(expected_data_bytes),
+                |_| async { Err::<(), _>(Error::other("leader killed before finalizing the target mutation")) },
+            )
+            .await
+            .expect_err("the interrupted target mutation must not report success");
+        let target = leftover_intent_test_target(store, target_pool_index).await;
+        assert_eq!(
+            target.pending_mutation_id,
+            Some(mutation_id),
+            "the interrupted mutation must leave its durable capacity intent"
+        );
+        let mut persisted = PoolMeta::default();
+        persisted
+            .load_no_lock_from_replicas(store.pools.clone())
+            .await
+            .expect("the interrupted intent should be durable");
+        assert_eq!(
+            persisted.pools[0]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .and_then(|reservation| reservation
+                    .targets
+                    .iter()
+                    .find(|target| target.pool_index == target_pool_index))
+                .and_then(|target| target.pending_mutation_id),
+            Some(mutation_id)
+        );
+    }
+
+    async fn decommission_intent_adoption_never_takes_a_live_mutation_intent_case(legacy: bool) {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        let _proof_guard = legacy.then(crate::services::notification_sys::without_decommission_target_fence_fleet_proof_for_test);
+        start_leftover_intent_test_decommission(
+            &store,
+            Vec::new(),
+            if legacy {
+                DECOMMISSION_CAPACITY_LEGACY_MODEL_VERSION
+            } else {
+                DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION
+            },
+        )
+        .await;
+        let generation = store
+            .active_decommission_generation(0)
+            .await
+            .expect("the decommission generation should be active");
+
+        let live = uuid::Uuid::new_v4();
+        let live_owner = leftover_intent_test_owner(&store, live).await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let live_store = Arc::clone(&store);
+        let live_mutation = tokio::spawn(async move {
+            live_store
+                .run_decommission_capacity_admitted_mutation_with_capacity_lease(1, Some(live_owner), Some(16), |_| async {
+                    entered_tx.send(()).expect("the live mutation entry should be observed");
+                    release_rx.await.expect("the live mutation should be released");
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx)
+            .await
+            .expect("the live mutation should enter its target write")
+            .expect("the live mutation should report entry");
+        assert_eq!(leftover_intent_test_target(&store, 1).await.pending_mutation_id, Some(live));
+
+        if legacy {
+            // A legacy mutation keeps the pool metadata write fence through its
+            // target I/O, so adoption cannot even plan until it finalizes.
+            let adoption_store = Arc::clone(&store);
+            let mut adoption = tokio::spawn(async move {
+                adoption_store
+                    .adopt_previous_incarnation_decommission_capacity_intents(0, generation)
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut adoption)
+                .await
+                .expect_err("adoption must wait while the live legacy mutation holds the metadata fence");
+            let target = leftover_intent_test_target(&store, 1).await;
+            assert_eq!(target.pending_mutation_id, Some(live), "the live intent must stay with its mutation");
+            assert!(target.temporary_mutations.is_empty());
+            release_tx.send(()).expect("release the live mutation");
+            live_mutation
+                .await
+                .expect("the live mutation task should not panic")
+                .expect("the live mutation should finalize its own intent");
+            tokio::time::timeout(std::time::Duration::from_secs(30), adoption)
+                .await
+                .expect("adoption should proceed once the live mutation finalizes")
+                .expect("the adoption task should not panic")
+                .expect("a finalized live mutation leaves nothing to adopt");
+        } else {
+            let err = store
+                .adopt_previous_incarnation_decommission_capacity_intents(0, generation)
+                .await
+                .expect_err("adoption must not take an intent whose mutation still holds the target fence");
+            assert!(is_decommission_capacity_target_gate_busy(&err), "unexpected adoption error: {err}");
+            let target = leftover_intent_test_target(&store, 1).await;
+            assert_eq!(target.pending_mutation_id, Some(live), "the live intent must stay with its mutation");
+            assert!(target.temporary_mutations.is_empty());
+            release_tx.send(()).expect("release the live mutation");
+            live_mutation
+                .await
+                .expect("the live mutation task should not panic")
+                .expect("the live mutation should finalize its own intent");
+        }
+        let target = leftover_intent_test_target(&store, 1).await;
+        assert_eq!(target.pending_mutation_id, None);
+        assert!(target.temporary_mutations.is_empty(), "a live intent must never become an adopted marker");
+        assert_eq!(target.consumed_physical_bytes, 16);
+        store
+            .adopt_previous_incarnation_decommission_capacity_intents(0, generation)
+            .await
+            .expect("a finalized live mutation leaves nothing to adopt");
+        assert_eq!(leftover_intent_test_target(&store, 1).await, target);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_intent_adoption_never_takes_a_live_mutation_intent() {
+        decommission_intent_adoption_never_takes_a_live_mutation_intent_case(false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_decommission_intent_adoption_never_takes_a_live_mutation_intent() {
+        decommission_intent_adoption_never_takes_a_live_mutation_intent_case(true).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn adopted_marker_settles_while_another_mutation_holds_the_pending_slot() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        start_leftover_intent_test_decommission(&store, Vec::new(), DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION).await;
+        let generation = store
+            .active_decommission_generation(0)
+            .await
+            .expect("the decommission generation should be active");
+        let adopted = uuid::Uuid::new_v4();
+        leave_unfinalized_decommission_target_intent(&store, 1, adopted, 16).await;
+        store
+            .adopt_previous_incarnation_decommission_capacity_intents(0, generation)
+            .await
+            .expect("the resumed routine should adopt the leftover intent");
+        // A mutation of the resumed incarnation failed after persisting its
+        // own intent and has not retried yet.
+        let waiting = uuid::Uuid::new_v4();
+        leave_unfinalized_decommission_target_intent(&store, 1, waiting, 8).await;
+
+        let owner = leftover_intent_test_owner(&store, adopted).await;
+        store
+            .reconcile_decommission_capacity_after_equivalent_target(owner, 1, 16)
+            .await
+            .expect("another mutation's pending slot must not block settling an adopted marker");
+        let target = leftover_intent_test_target(&store, 1).await;
+        assert_eq!(target.consumed_physical_bytes, 16);
+        assert!(
+            !decommission_target_has_mutation_marker(&target, adopted),
+            "the adopted marker should be settled: {:?}",
+            target.temporary_mutations
+        );
+        assert_eq!(target.pending_mutation_id, Some(waiting), "the other mutation keeps its pending intent");
+        assert_eq!(target.pending_physical_bytes, 8);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn settled_equivalent_target_does_not_wait_for_another_mutations_pending_slot() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        start_leftover_intent_test_decommission(&store, Vec::new(), DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION).await;
+        // An earlier attempt committed and charged this copy, for example a
+        // delete marker whose source cleanup never ran.
+        let settled = uuid::Uuid::new_v4();
+        let settled_owner = leftover_intent_test_owner(&store, settled).await;
+        store
+            .run_decommission_capacity_admitted_mutation_with_capacity_lease(1, Some(settled_owner), Some(1), |_| async {
+                Ok(())
+            })
+            .await
+            .expect("charge the settled copy");
+        // Another mutation holds the slot between a failed write and its retry.
+        let waiting = uuid::Uuid::new_v4();
+        leave_unfinalized_decommission_target_intent(&store, 1, waiting, 8).await;
+        let before = leftover_intent_test_target(&store, 1).await;
+
+        store
+            .reconcile_decommission_capacity_after_equivalent_target(settled_owner, 1, 0)
+            .await
+            .expect("an equivalent copy that is already charged has nothing to wait for");
+        store
+            .reconcile_decommission_capacity_after_equivalent_temporary_target(settled_owner, 1, 1)
+            .await
+            .expect("an equivalent checkpoint that is already settled has nothing to wait for");
+        assert_eq!(
+            leftover_intent_test_target(&store, 1).await,
+            before,
+            "neither reconciliation may resolve the other mutation's intent or charge the copy again"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn equivalent_target_settles_an_adopted_intent_into_consumption() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        start_leftover_intent_test_decommission(&store, Vec::new(), DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION).await;
+        let generation = store
+            .active_decommission_generation(0)
+            .await
+            .expect("the decommission generation should be active");
+        let leftover = uuid::Uuid::new_v4();
+        leave_unfinalized_decommission_target_intent(&store, 1, leftover, 16).await;
+        store
+            .adopt_previous_incarnation_decommission_capacity_intents(0, generation)
+            .await
+            .expect("the resumed routine should adopt the leftover intent");
+        let adopted = leftover_intent_test_target(&store, 1).await;
+        assert_eq!(adopted.pending_mutation_id, None);
+        assert_eq!(
+            adopted.consumed_physical_bytes, 0,
+            "adoption must not assume the interrupted write committed"
+        );
+        assert_eq!(adopted.inflight_physical_bytes, 16);
+
+        // The interrupted mutation's retry finds its committed copy on the
+        // target and settles the adopted marker exactly once.
+        let owner = leftover_intent_test_owner(&store, leftover).await;
+        store
+            .reconcile_decommission_capacity_after_equivalent_target(owner, 1, 16)
+            .await
+            .expect("an equivalent committed target settles the adopted marker");
+        let settled = leftover_intent_test_target(&store, 1).await;
+        assert!(settled.temporary_mutations.is_empty());
+        assert_eq!(settled.inflight_physical_bytes, 0);
+        assert_eq!(settled.consumed_physical_bytes, 16);
+        store
+            .reconcile_decommission_capacity_after_equivalent_target(owner, 1, 16)
+            .await
+            .expect("a repeated equivalent reconciliation stays idempotent");
+        assert_eq!(leftover_intent_test_target(&store, 1).await.consumed_physical_bytes, 16);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn equivalent_temporary_target_settles_an_adopted_checkpoint_intent() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        start_leftover_intent_test_decommission(&store, Vec::new(), DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION).await;
+        let generation = store
+            .active_decommission_generation(0)
+            .await
+            .expect("the decommission generation should be active");
+        // A checkpoint replacement persisted its intent and failed before
+        // finalizing; the resumed routine adopts that intent.
+        let checkpoint = uuid::Uuid::new_v4();
+        leave_unfinalized_decommission_target_intent(&store, 1, checkpoint, 16).await;
+        store
+            .adopt_previous_incarnation_decommission_capacity_intents(0, generation)
+            .await
+            .expect("the resumed routine should adopt the checkpoint intent");
+        let adopted = leftover_intent_test_target(&store, 1).await;
+        assert_eq!(adopted.pending_mutation_id, None);
+        assert!(decommission_target_has_mutation_marker(&adopted, checkpoint));
+
+        // Multipart discovery and the checkpoint gate see the adopted marker
+        // as the mutation's temporary state.
+        let owner = leftover_intent_test_owner(&store, checkpoint).await;
+        assert!(store.has_decommission_capacity_temporary_mutation_state(1, owner).await);
+
+        store
+            .reconcile_decommission_capacity_after_equivalent_temporary_target(owner, 1, 16)
+            .await
+            .expect("the committed checkpoint settles the adopted marker");
+        let settled = leftover_intent_test_target(&store, 1).await;
+        assert!(!decommission_target_has_mutation_marker(&settled, checkpoint));
+        assert_eq!(settled.inflight_physical_bytes, 0);
+        assert_eq!(settled.consumed_physical_bytes, 0, "a non-growing replacement charges nothing");
+        assert!(!store.has_decommission_capacity_temporary_mutation_state(1, owner).await);
+        store
+            .reconcile_decommission_capacity_after_equivalent_temporary_target(owner, 1, 16)
+            .await
+            .expect("a repeated temporary reconciliation stays idempotent");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn uncharged_equivalent_target_without_a_record_still_fails_closed() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        start_leftover_intent_test_decommission(&store, Vec::new(), DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION).await;
+        // Another mutation holds the slot, nothing was charged on the target,
+        // and this mutation has neither a pending intent nor a marker there.
+        let waiting = uuid::Uuid::new_v4();
+        leave_unfinalized_decommission_target_intent(&store, 1, waiting, 8).await;
+        let before = leftover_intent_test_target(&store, 1).await;
+        assert_eq!(before.consumed_physical_bytes, 0);
+        let unrecorded_owner = leftover_intent_test_owner(&store, uuid::Uuid::new_v4()).await;
+
+        let err = store
+            .reconcile_decommission_capacity_after_equivalent_target(unrecorded_owner, 1, 16)
+            .await
+            .expect_err("a commit the target never charged must not be assumed charged");
+        assert!(
+            err.to_string()
+                .contains("equivalent target has no pending capacity intent to reconcile"),
+            "unexpected reconciliation error: {err}"
+        );
+        assert_eq!(leftover_intent_test_target(&store, 1).await, before);
+    }
+
     fn pool_meta_replica_test_meta(cmd_line: &str) -> PoolMeta {
         PoolMeta {
             version: POOL_META_VERSION,
@@ -22649,6 +23684,24 @@ mod tests {
         );
     }
 
+    /// The entry context must not hide a busy target gate either.
+    #[test]
+    fn decommission_entry_context_keeps_a_busy_target_gate_deferred() {
+        let gate_busy = decommission_capacity_blocked_error(format!(
+            "{DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_PREFIX}1{DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_SUFFIX}"
+        ));
+        let wrapped = with_decommission_entry_context("delete_marker_copy", "b", "o", gate_busy);
+
+        assert_eq!(
+            classify_decommission_capacity_failure(&wrapped),
+            DecommissionCapacityFailure::TargetGateBusy { target_pool_index: 1 }
+        );
+        assert!(matches!(
+            resolve_decommission_entry_failure(wrapped),
+            Ok(DecommissionEntryOutcome::Deferred(_))
+        ));
+    }
+
     /// A stage wrapper must not hide the underlying capacity class.
     #[test]
     fn decommission_capacity_failure_classification_sees_through_a_stage_wrapper() {
@@ -22796,6 +23849,367 @@ mod tests {
         assert!(matches!(result, DecommissionEntryOutcome::Complete));
         assert_eq!(faults.load(Ordering::Relaxed), 1, "inject one actual read failure");
         assert_eq!(attempts, 4, "carry two attempts, then count the entry pass and copy retry");
+    }
+
+    /// What sits above the pre-versioning null version in the null-version
+    /// fixtures (backlog#2873).
+    #[derive(Clone, Copy, Debug)]
+    enum NullVersionTop {
+        DeleteMarker,
+        NewerVersion,
+    }
+
+    /// One decommissioning entry: a null version written before versioning was
+    /// enabled, with a delete marker or a newer version above it, on pool 0 of a
+    /// two-pool store with an active reservation.
+    struct NullVersionDecommission {
+        _temp_dirs: Vec<tempfile::TempDir>,
+        store: Arc<ECStore>,
+        bucket: &'static str,
+        object: &'static str,
+        incarnation: uuid::Uuid,
+        payload: Vec<u8>,
+        seeded: FileInfoVersions,
+        source_set: Arc<SetDisks>,
+    }
+
+    impl NullVersionDecommission {
+        async fn new(top: NullVersionTop) -> Self {
+            use crate::object_api::PutObjReader;
+            let (temp_dirs, store, _other_store) =
+                Box::pin(crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None)).await;
+            let bucket = "decommission-null-version";
+            let object = "pre-versioning.bin";
+            Box::pin(store.make_bucket(bucket, &MakeBucketOptions::default()))
+                .await
+                .expect("create bucket");
+            let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
+            let payload = b"written before versioning was enabled".repeat(128);
+            let source_set = store.pools[0].get_disks_by_key(object);
+            Box::pin(source_set.put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(payload.clone()),
+                &ObjectOptions {
+                    expected_bucket_incarnation_id: Some(incarnation),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("seed null version");
+            let versioned = ObjectOptions {
+                versioned: true,
+                expected_bucket_incarnation_id: Some(incarnation),
+                ..Default::default()
+            };
+            match top {
+                NullVersionTop::DeleteMarker => {
+                    let marker = Box::pin(source_set.delete_object(bucket, object, versioned))
+                        .await
+                        .expect("seed delete marker over the null version");
+                    assert!(marker.delete_marker);
+                }
+                NullVersionTop::NewerVersion => {
+                    Box::pin(source_set.put_object(
+                        bucket,
+                        object,
+                        &mut PutObjReader::from_vec(b"written after versioning was enabled".to_vec()),
+                        &versioned,
+                    ))
+                    .await
+                    .expect("seed newer version over the null version");
+                }
+            }
+            let seeded = source_set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("read seeded versions")
+                .expect("seeded versions must exist");
+            assert_eq!(seeded.versions.len(), 2);
+            assert_eq!(seeded.versions[0].deleted, matches!(top, NullVersionTop::DeleteMarker));
+            assert!(seeded.versions[0].version_id.is_some(), "the latest version must have a real id");
+            assert!(seeded.versions[1].version_id.is_none(), "the oldest version must be the null version");
+
+            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+            set_decommission_capacity_info_overrides_for_test(
+                store.id,
+                vec![vec![
+                    DecommissionPoolCapacityInfo::for_test(0, layout, 0, 16_384, 16_384),
+                    DecommissionPoolCapacityInfo::for_test(1, layout, 131_072, 131_072, 0),
+                ]],
+            );
+            Box::pin(store.save_current_pool_meta_for_decommission_start(&[0], Vec::new()))
+                .await
+                .expect("activate reservation");
+            Self {
+                _temp_dirs: temp_dirs,
+                store,
+                bucket,
+                object,
+                incarnation,
+                payload,
+                seeded,
+                source_set,
+            }
+        }
+
+        /// Runs one entry and returns its outcome and how many entries
+        /// exhausted their source-cleanup retries.
+        async fn run_entry(&self) -> (DecommissionEntryOutcome, usize) {
+            let generation = self.store.active_decommission_generation(0).await.expect("active generation");
+            let exhaustions = Arc::new(AtomicUsize::new(0));
+            let outcome = Box::pin(self.store.decommission_entry(
+                CancellationToken::new(),
+                0,
+                generation,
+                MetaCacheEntry {
+                    name: self.object.into(),
+                    ..Default::default()
+                },
+                self.bucket.into(),
+                self.source_set.clone(),
+                None,
+                None,
+                None,
+                Some(self.incarnation),
+                Arc::clone(&exhaustions),
+                &mut 0,
+            ))
+            .await
+            .expect("decommission entry");
+            (outcome, exhaustions.load(Ordering::Relaxed))
+        }
+
+        async fn source_versions(&self) -> Option<FileInfoVersions> {
+            self.source_set
+                .load_file_info_versions_exact(self.bucket, self.object)
+                .await
+                .expect("read source versions")
+        }
+
+        async fn target_versions(&self) -> Option<FileInfoVersions> {
+            self.store.pools[1]
+                .get_disks_by_key(self.object)
+                .load_file_info_versions_exact(self.bucket, self.object)
+                .await
+                .expect("read target versions")
+        }
+
+        async fn assert_target_null_version_intact(&self) {
+            use tokio::io::AsyncReadExt as _;
+            let mut reader = self.store.pools[1]
+                .get_object_reader(
+                    self.bucket,
+                    self.object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        version_id: Some(uuid::Uuid::nil().to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("the migrated null version must be readable");
+            let mut actual = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut actual)
+                .await
+                .expect("drain the migrated null version");
+            assert_eq!(hex_sha256(&actual, str::to_owned), hex_sha256(&self.payload, str::to_owned));
+            assert_eq!(actual, self.payload);
+        }
+
+        /// Both versions are on the target with their identities, the null
+        /// version's content and SHA-256 are intact, and the source is gone.
+        async fn assert_moved(&self) {
+            let target = self.target_versions().await.expect("versions must reach the target pool");
+            assert_eq!(target.versions.len(), 2, "both versions must move");
+            assert_eq!(target.versions[0].version_id, self.seeded.versions[0].version_id);
+            assert_eq!(target.versions[0].deleted, self.seeded.versions[0].deleted);
+            assert!(target.versions[1].version_id.is_none(), "the null version must keep its null identity");
+            assert_eq!(target.versions[1].mod_time, self.seeded.versions[1].mod_time);
+            self.assert_target_null_version_intact().await;
+            assert!(
+                self.source_versions().await.is_none(),
+                "the source entry must be removed only after both versions moved"
+            );
+        }
+
+        async fn assert_source_retained(&self) {
+            let source = self.source_versions().await.expect("the source entry must be retained");
+            assert_eq!(source.versions.len(), 2, "every source version must be retained");
+            assert_eq!(source.versions[0].version_id, self.seeded.versions[0].version_id);
+            assert!(source.versions[1].version_id.is_none());
+        }
+    }
+
+    fn null_version_not_found_fault() -> DecommissionTestFaultError {
+        Arc::new(|_, bucket, object| Error::VersionNotFound(bucket.to_string(), object.to_string(), "null".to_string()))
+    }
+
+    /// A pre-versioning null version hidden behind a delete marker must reach
+    /// the target pool intact before the source entry is removed (backlog#2873).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_migrates_null_version_behind_delete_marker() {
+        let fixture = NullVersionDecommission::new(NullVersionTop::DeleteMarker).await;
+        let (outcome, exhaustions) = fixture.run_entry().await;
+        assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
+        assert_eq!(exhaustions, 0);
+        fixture.assert_moved().await;
+    }
+
+    /// Overwriting after versioning was enabled leaves a newer version above
+    /// the null version. The old `None` read selected that newer version, the
+    /// target accepted it as an equivalent copy, and cleanup then deleted the
+    /// null version without ever reporting it as missing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_migrates_null_version_behind_newer_version() {
+        let fixture = NullVersionDecommission::new(NullVersionTop::NewerVersion).await;
+        let (outcome, exhaustions) = fixture.run_entry().await;
+        assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
+        assert_eq!(exhaustions, 0);
+        fixture.assert_moved().await;
+    }
+
+    /// A version the mover reports as not found while it still exists must not
+    /// be deleted with the entry: cleanup keeps refusing until its retries run
+    /// out, and the entry is recorded as failed with its source retained.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_retains_source_when_null_version_read_reports_not_found() {
+        let fixture = NullVersionDecommission::new(NullVersionTop::DeleteMarker).await;
+        let object = fixture.object;
+        let _fault = DecommissionTestFaultGuard::install_with_error(
+            Arc::new(move |stage, _, faulted, _, success| stage == "object_read" && faulted == object && success),
+            Some(null_version_not_found_fault()),
+        );
+        let (outcome, exhaustions) = fixture.run_entry().await;
+        assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
+        assert_eq!(exhaustions, 1, "every cleanup attempt must be refused");
+        fixture.assert_source_retained().await;
+        let target = fixture.target_versions().await.expect("the marker still moves");
+        assert!(target.versions.iter().all(|version| version.version_id.is_some()));
+    }
+
+    /// The same rule protects a delete marker whose copy reports not found.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_retains_source_when_delete_marker_copy_reports_not_found() {
+        let fixture = NullVersionDecommission::new(NullVersionTop::DeleteMarker).await;
+        let object = fixture.object;
+        let _fault = DecommissionTestFaultGuard::install_with_error(
+            Arc::new(move |stage, _, faulted, _, success| stage == "delete_marker_copy" && faulted == object && success),
+            Some(null_version_not_found_fault()),
+        );
+        let (outcome, exhaustions) = fixture.run_entry().await;
+        assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
+        assert_eq!(exhaustions, 1, "every cleanup attempt must be refused");
+        fixture.assert_source_retained().await;
+    }
+
+    /// Control: a version that really vanished does not block cleanup, and the
+    /// entry finishes in its first attempt.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_cleans_up_when_not_found_version_really_vanished() {
+        let fixture = NullVersionDecommission::new(NullVersionTop::DeleteMarker).await;
+        let object = fixture.object;
+        let injected = Arc::new(AtomicBool::new(false));
+        let _fault = DecommissionTestFaultGuard::install_with_error(
+            Arc::new({
+                let injected = Arc::clone(&injected);
+                move |stage, _, faulted, _, success| {
+                    stage == "object_read" && faulted == object && success && !injected.swap(true, Ordering::SeqCst)
+                }
+            }),
+            Some(null_version_not_found_fault()),
+        );
+        let cleanup_attempts = Arc::new(AtomicUsize::new(0));
+        let _mutation = DecommissionCleanupMutationGuard::install(Arc::new({
+            let cleanup_attempts = Arc::clone(&cleanup_attempts);
+            let source_set = fixture.source_set.clone();
+            let incarnation = fixture.incarnation;
+            move |bucket, mutated, _attempt| {
+                let cleanup_attempts = Arc::clone(&cleanup_attempts);
+                let source_set = source_set.clone();
+                let bucket = bucket.to_string();
+                let is_target = mutated == object;
+                Box::pin(async move {
+                    if !is_target || cleanup_attempts.fetch_add(1, Ordering::SeqCst) > 0 {
+                        return;
+                    }
+                    source_set
+                        .delete_object(
+                            &bucket,
+                            object,
+                            ObjectOptions {
+                                versioned: true,
+                                version_id: Some(uuid::Uuid::nil().to_string()),
+                                expected_bucket_incarnation_id: Some(incarnation),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("really delete the null version before cleanup");
+                })
+            }
+        }));
+        let (outcome, exhaustions) = fixture.run_entry().await;
+        assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
+        assert_eq!(exhaustions, 0);
+        assert_eq!(cleanup_attempts.load(Ordering::SeqCst), 1, "cleanup must succeed without a retry");
+        assert!(fixture.source_versions().await.is_none(), "the source entry must be removed");
+        let target = fixture.target_versions().await.expect("the marker must reach the target");
+        assert_eq!(target.versions.len(), 1);
+        assert!(target.versions[0].deleted);
+    }
+
+    /// The null version is committed to the target but the copy reports a
+    /// failure before source cleanup; the retry must recognize the equivalent
+    /// target instead of failing on it, and settle every capacity intent.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_resumes_after_null_version_committed_before_cleanup() {
+        let fixture = NullVersionDecommission::new(NullVersionTop::NewerVersion).await;
+        let object = fixture.object;
+        let committed_then_failed = Arc::new(AtomicUsize::new(0));
+        let _fault = DecommissionTestFaultGuard::install(Arc::new({
+            let committed_then_failed = Arc::clone(&committed_then_failed);
+            move |stage, _, faulted, attempt, success| {
+                let inject = stage == DECOMMISSION_STAGE_MIGRATE_OBJECT && faulted == object && attempt == 1 && success;
+                if inject {
+                    committed_then_failed.fetch_add(1, Ordering::SeqCst);
+                }
+                inject
+            }
+        }));
+        let (outcome, exhaustions) = fixture.run_entry().await;
+        assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
+        assert_eq!(exhaustions, 0);
+        assert_eq!(
+            committed_then_failed.load(Ordering::SeqCst),
+            2,
+            "both versions commit on their first attempt before the injected failure"
+        );
+        fixture.assert_moved().await;
+        let pool_meta = fixture.store.pool_meta.read().await;
+        let reservation = pool_meta.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .expect("the reservation must remain installed");
+        assert_eq!(reservation.pending_target_physical_bytes, 0, "no capacity intent may stay pending");
+        assert!(
+            reservation
+                .targets
+                .iter()
+                .all(|target| target.pending_mutation_id.is_none() && target.temporary_mutations.is_empty()),
+            "{:?}",
+            reservation.targets
+        );
     }
 
     #[test]
@@ -23034,6 +24448,34 @@ mod tests {
     }
 
     #[test]
+    fn decommission_capacity_conflict_stays_classified_through_entry_context_and_clone() {
+        let err = with_decommission_entry_context(
+            "delete_marker_copy",
+            "bucket",
+            "object",
+            decommission_capacity_blocked_error(
+                "source pool 0 target pool 1 pending capacity intent belongs to another mutation",
+            ),
+        );
+        // A shared entry error slot hands out clones, which keep only the
+        // rendered message of an I/O error.
+        let cloned = err.clone();
+        assert!(is_decommission_capacity_blocked_error(&err));
+        assert_eq!(
+            decommission_capacity_retry_kind(&err, 0),
+            Some(DecommissionCapacityRetryKind::IntentConflict),
+            "a wrapped conflict must keep the bounded intent-conflict retry"
+        );
+        // The routine pauses on either capacity predicate; a clone is still
+        // recognized as a capacity block and as an intent conflict.
+        assert!(is_decommission_capacity_blocked_error(&cloned) || is_decommission_target_capacity_error(&cloned));
+        assert!(is_decommission_capacity_intent_conflict(&cloned));
+        assert!(!is_decommission_capacity_blocked_error(&Error::other(
+            "decommission entry update_after failed"
+        )));
+    }
+
+    #[test]
     fn decommission_target_capacity_error_rejects_unrelated_errors() {
         assert!(!is_decommission_target_capacity_error(&Error::SlowDown));
     }
@@ -23180,9 +24622,16 @@ mod tests {
 
     #[test]
     fn test_decommission_object_migration_read_opts_are_raw_data_movement() {
-        let opts = decommission_object_migration_read_opts(Some("vid-1".to_string()));
+        let version_id = uuid::Uuid::from_u128(1);
+        let opts = decommission_object_migration_read_opts(&rustfs_filemeta::FileInfo {
+            version_id: Some(version_id),
+            ..Default::default()
+        });
 
-        assert_eq!(opts.version_id.as_deref(), Some("vid-1"));
+        assert_eq!(opts.version_id, Some(version_id.to_string()));
+        // `None` would read the latest version, not the listed null version.
+        let null_opts = decommission_object_migration_read_opts(&rustfs_filemeta::FileInfo::default());
+        assert_eq!(null_opts.version_id, Some(uuid::Uuid::nil().to_string()));
         assert!(opts.no_lock);
         assert!(opts.data_movement);
         assert!(opts.raw_data_movement_read);
@@ -24216,7 +25665,6 @@ mod pools_tests {
     use super::DECOMMISSION_PROGRESS_SAVE_RETRY_BACKOFF;
     use super::persist_v3_pool_meta_for_test;
     use super::record_decommission_entry_error;
-    use super::resolve_decommission_listing_error;
     use super::resolve_decommission_partial_listing_entry;
     use super::{
         DECOMMISSION_CAPACITY_LEGACY_MODEL_VERSION, DECOMMISSION_CAPACITY_MODEL_VERSION, DECOMMISSION_CAPACITY_RELEASE_CANCELED,
@@ -24277,13 +25725,20 @@ mod pools_tests {
     };
     use super::{
         DECOMMISSION_CAPACITY_TARGET_GATE_MAX_ATTEMPTS, DECOMMISSION_RETRY_BACKOFF_CAP, DecommissionCapacityAdmission,
-        DecommissionCapacityOwner, DecommissionCapacityReleaseProof, DecommissionCapacityReservation,
-        DecommissionCapacityTemporaryMutation, decommission_capacity_mutation_id,
-        decommission_capacity_target_gate_retry_exhausted, ensure_decommission_target_owner_admission,
+        DecommissionCapacityLeftoverIntent, DecommissionCapacityOwner, DecommissionCapacityReleaseProof,
+        DecommissionCapacityReservation, DecommissionCapacityTemporaryMutation, adopt_decommission_capacity_leftover_intents,
+        decommission_adopted_intent_mutation_id, decommission_capacity_blocked_error, decommission_capacity_intent_adoption_plan,
+        decommission_capacity_mutation_id, decommission_capacity_target_gate_retry_exhausted,
+        decommission_intent_adoption_failure, ensure_decommission_target_owner_admission,
         ensure_exact_delete_capacity_namespace_fences, ensure_external_decommission_target_admission,
         is_decommission_capacity_blocked_error, plan_exact_delete_capacity_reconciliations,
         record_decommission_target_consumption, release_decommission_target_inflight, reserve_decommission_target_pending,
         resolve_decommission_target_pending, set_decommission_capacity_info_overrides_for_test,
+        validate_decommission_capacity_reservation,
+    };
+    use super::{
+        decommission_bucket_failure, decommission_reserved_target_choice, decommission_root_cause,
+        decommission_target_has_mutation_marker, settle_decommission_target_non_growing_replacement,
     };
     use crate::bucket::lifecycle::{
         DurableIlmRecordCheckpoint,
@@ -24293,7 +25748,7 @@ mod pools_tests {
     };
     use crate::bucket::metadata_sys;
     use crate::data_movement;
-    use crate::disk::{STORAGE_FORMAT_FILE, endpoint::Endpoint};
+    use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE, endpoint::Endpoint};
     use crate::error::{Error, StorageError};
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::object_api::{ObjectInfo, ObjectOptions};
@@ -27528,6 +28983,63 @@ mod pools_tests {
         assert_eq!(running.load(Ordering::SeqCst), 0);
     }
 
+    #[test]
+    fn decommission_bucket_failure_reports_the_cause_behind_canceled_listings() {
+        let capacity = || decommission_capacity_blocked_error("pending capacity intent belongs to another mutation");
+        // A listing worker canceled by another set's capacity-blocked entry.
+        let err = decommission_bucket_failure(vec![Ok(()), Err(Error::OperationCanceled)], Some(capacity()))
+            .expect("the bucket must fail");
+        assert!(is_decommission_capacity_blocked_error(&err), "unexpected bucket failure: {err:?}");
+        // A canceled listing worker ahead of a capacity-blocked one.
+        let err = decommission_bucket_failure(vec![Err(Error::OperationCanceled), Err(capacity())], None)
+            .expect("the bucket must fail");
+        assert!(is_decommission_capacity_blocked_error(&err), "unexpected bucket failure: {err:?}");
+        // The first real failure stays the reported cause.
+        let err = decommission_bucket_failure(vec![Err(Error::SlowDown)], Some(capacity())).expect("the bucket must fail");
+        assert!(matches!(err, Error::SlowDown), "unexpected bucket failure: {err:?}");
+        assert!(decommission_bucket_failure(vec![Ok(()), Ok(())], None).is_none());
+        assert!(matches!(
+            decommission_root_cause(Some(Error::OperationCanceled), Some(Error::OperationCanceled)),
+            Some(Error::OperationCanceled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_run_decommission_buckets_bounded_reports_the_failure_behind_a_sibling_cancellation() {
+        let rx = CancellationToken::new();
+        let buckets = ["failing", "sibling"]
+            .into_iter()
+            .map(|name| DecomBucketInfo {
+                name: name.to_string(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        let err = run_decommission_buckets_bounded(rx, buckets, 2, |bucket, rx| {
+            Box::pin(async move {
+                if bucket.name == "failing" {
+                    // A failing bucket cancels the shared token from inside,
+                    // then still drains its own workers before returning.
+                    rx.cancel();
+                    tokio::time::sleep(StdDuration::from_millis(50)).await;
+                    Err(decommission_capacity_blocked_error(
+                        "source pool 0 target pool 1 pending capacity intent belongs to another mutation",
+                    ))
+                } else {
+                    rx.cancelled().await;
+                    Err(Error::OperationCanceled)
+                }
+            })
+        })
+        .await
+        .expect_err("a failed bucket must fail the phase");
+
+        assert!(
+            is_decommission_capacity_blocked_error(&err),
+            "the routine must see the capacity block, not the sibling's cancellation: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_run_decommission_buckets_bounded_cancels_and_stops_launching_after_failure() {
         let rx = CancellationToken::new();
@@ -28791,6 +30303,122 @@ mod pools_tests {
         assert!(message.contains("1 disk error(s)"));
     }
 
+    fn decommission_listing_resolver() -> MetadataResolutionParams {
+        MetadataResolutionParams {
+            dir_quorum: 2,
+            obj_quorum: 2,
+            bucket: RUSTFS_META_BUCKET.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn node_local_prefix_directory_entry() -> MetaCacheEntry {
+        MetaCacheEntry {
+            name: "buckets/.heal/".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn single_version_object_entry(name: &str) -> MetaCacheEntry {
+        let mut meta = rustfs_filemeta::FileMeta::new();
+        meta.add_version(FileInfo {
+            volume: RUSTFS_META_BUCKET.to_string(),
+            name: name.to_string(),
+            size: 1,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        })
+        .expect("test file metadata should accept object version");
+        MetaCacheEntry {
+            name: name.to_string(),
+            metadata: meta.marshal_msg().expect("test file metadata should marshal"),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_resolve_decommission_partial_listing_entry_passes_prefix_directory_below_dir_quorum() {
+        let entry = resolve_decommission_partial_listing_entry(
+            MetaCacheEntries(vec![Some(node_local_prefix_directory_entry()), None, None]),
+            decommission_listing_resolver(),
+            RUSTFS_META_BUCKET,
+            BUCKET_META_PREFIX,
+            0,
+            1,
+            0,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("a prefix directory on one healthy drive is listing structure, not unresolved metadata");
+
+        assert_eq!(entry.name, "buckets/.heal/");
+        assert!(entry.is_dir());
+    }
+
+    #[test]
+    fn test_resolve_decommission_partial_listing_entry_keeps_prefix_directory_fail_closed_on_disk_error() {
+        let unresolved_entry = resolve_decommission_partial_listing_entry(
+            MetaCacheEntries(vec![Some(node_local_prefix_directory_entry()), None, None]),
+            decommission_listing_resolver(),
+            RUSTFS_META_BUCKET,
+            BUCKET_META_PREFIX,
+            1,
+            1,
+            0,
+            OffsetDateTime::now_utc(),
+        )
+        .expect_err("a prefix directory sampled beside a drive error must stay fail-closed");
+
+        assert_eq!(unresolved_entry.bucket, RUSTFS_META_BUCKET);
+        assert_eq!(unresolved_entry.object, "buckets/.heal/");
+        assert_eq!(unresolved_entry.candidate_count, 1);
+        assert_eq!(unresolved_entry.disk_error_count, 1);
+        assert_eq!(unresolved_entry.reason, "metadata_resolution_failed");
+    }
+
+    #[test]
+    fn test_resolve_decommission_partial_listing_entry_rejects_object_below_obj_quorum() {
+        let object = "buckets/photos/.metadata.bin";
+        let unresolved_entry = resolve_decommission_partial_listing_entry(
+            MetaCacheEntries(vec![Some(single_version_object_entry(object)), None, None]),
+            decommission_listing_resolver(),
+            RUSTFS_META_BUCKET,
+            BUCKET_META_PREFIX,
+            0,
+            1,
+            0,
+            OffsetDateTime::now_utc(),
+        )
+        .expect_err("an object sampled below the metadata quorum must stay unresolved");
+
+        assert_eq!(unresolved_entry.object, object);
+        assert_eq!(unresolved_entry.candidate_count, 1);
+        assert_eq!(unresolved_entry.disk_error_count, 0);
+        assert_eq!(unresolved_entry.reason, "metadata_resolution_failed");
+    }
+
+    #[test]
+    fn test_resolve_decommission_partial_listing_entry_rejects_mixed_prefix_and_directory_object_sample() {
+        let unresolved_entry = resolve_decommission_partial_listing_entry(
+            MetaCacheEntries(vec![
+                Some(node_local_prefix_directory_entry()),
+                Some(single_version_object_entry("buckets/.heal/")),
+                None,
+            ]),
+            decommission_listing_resolver(),
+            RUSTFS_META_BUCKET,
+            BUCKET_META_PREFIX,
+            0,
+            1,
+            0,
+            OffsetDateTime::now_utc(),
+        )
+        .expect_err("a prefix directory beside a same-name directory object must stay unresolved");
+
+        assert_eq!(unresolved_entry.object, "buckets/.heal/");
+        assert_eq!(unresolved_entry.candidate_count, 2);
+        assert_eq!(unresolved_entry.disk_error_count, 0);
+    }
+
     #[test]
     fn unresolved_entry_ledger_requires_individual_verification_before_completion() {
         let generation = OffsetDateTime::now_utc();
@@ -28953,6 +30581,100 @@ mod pools_tests {
                 .expect("reloaded decommission should exist")
                 .unresolved_entries,
             in_memory_entries
+        );
+    }
+
+    #[tokio::test]
+    async fn decommission_listing_skips_node_local_heal_journal_prefix() {
+        let (dirs, store) = metadata_sys::test_support::isolated_store_over_temp_disks().await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let generation = OffsetDateTime::now_utc();
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            pool_meta.dont_save = false;
+            pool_meta.pools[0].decommission = Some(PoolDecommissionInfo {
+                start_time: Some(generation),
+                ..Default::default()
+            });
+        }
+        store
+            .save_current_pool_meta_for_test(&[0])
+            .await
+            .expect("active decommission metadata should be persisted before listing");
+
+        // The MRF queue writes its journals with raw local-disk writes on the
+        // node that owns them, so one drive ends up with a plain directory tree
+        // that holds no xl.meta anywhere.
+        let journal_dir = dirs[0]
+            .path()
+            .join(RUSTFS_META_BUCKET)
+            .join(BUCKET_META_PREFIX)
+            .join(".heal")
+            .join("mrf");
+        tokio::fs::create_dir_all(&journal_dir)
+            .await
+            .expect("node-local journal directory should be created");
+        tokio::fs::write(journal_dir.join("journal.bin"), b"")
+            .await
+            .expect("legacy journal should be written");
+        tokio::fs::write(journal_dir.join("journal-scoped.bin"), b"scoped-journal")
+            .await
+            .expect("scoped journal should be written");
+
+        let listed = Arc::new(tokio::sync::Mutex::new(Vec::<MetaCacheEntry>::new()));
+        let listed_cb = listed.clone();
+        let callback: ListCallback = Arc::new(move |entry: MetaCacheEntry| {
+            let listed = listed_cb.clone();
+            Box::pin(async move {
+                listed.lock().await.push(entry);
+            })
+        });
+        let entry_error = Arc::new(tokio::sync::Mutex::new(None::<Error>));
+
+        store.pools[0].disk_set[0]
+            .list_objects_to_decommission(
+                store.clone(),
+                CancellationToken::new(),
+                DecomBucketInfo {
+                    name: RUSTFS_META_BUCKET.to_string(),
+                    prefix: BUCKET_META_PREFIX.to_string(),
+                },
+                callback,
+                entry_error.clone(),
+                0,
+                0,
+                generation,
+                false,
+            )
+            .await
+            .expect("a node-local journal directory must not fail the decommission listing");
+
+        assert!(entry_error.lock().await.is_none(), "{:?}", entry_error.lock().await);
+        assert!(
+            store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("decommission should remain active")
+                .unresolved_entries
+                .is_empty(),
+            "a node-local prefix must not be recorded as unresolved object metadata"
+        );
+
+        let listed = listed.lock().await;
+        let heal_entries = listed
+            .iter()
+            .filter(|entry| entry.name.starts_with("buckets/.heal/"))
+            .collect::<Vec<_>>();
+        assert!(
+            heal_entries
+                .iter()
+                .any(|entry| entry.name == "buckets/.heal/" && entry.is_dir()),
+            "the journal prefix should reach the callback as a skippable directory: {heal_entries:?}"
+        );
+        assert!(
+            heal_entries.iter().all(|entry| !entry.is_object()),
+            "raw journal files must never surface as objects: {heal_entries:?}"
         );
     }
 
@@ -29138,11 +30860,11 @@ mod pools_tests {
 
     #[test]
     fn test_resolve_decommission_listing_error_preserves_real_listing_failure() {
-        let err = resolve_decommission_listing_error(Some(Error::SlowDown), Some(Error::OperationCanceled))
+        let err = decommission_root_cause(Some(Error::SlowDown), Some(Error::OperationCanceled))
             .expect("listing failure should be returned");
         assert!(matches!(err, Error::SlowDown));
 
-        let err = resolve_decommission_listing_error(Some(Error::OperationCanceled), Some(Error::SlowDown))
+        let err = decommission_root_cause(Some(Error::OperationCanceled), Some(Error::SlowDown))
             .expect("entry failure should be returned");
         assert!(matches!(err, Error::SlowDown));
     }
@@ -31121,6 +32843,133 @@ mod pools_tests {
     }
 
     #[test]
+    fn cleanup_without_an_absence_proof_keeps_an_adopted_completion() {
+        let generation = OffsetDateTime::UNIX_EPOCH;
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1);
+        let completion = uuid::Uuid::new_v4();
+        let mut meta = decommission_test_cleanup_meta(
+            DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION,
+            Vec::new(),
+            0,
+            Some((completion, 40)),
+        );
+        let plan = decommission_capacity_intent_adoption_plan(&meta, 0, generation)
+            .expect("plan adoption")
+            .expect("the interrupted completion should be planned");
+        adopt_decommission_capacity_leftover_intents(&mut meta, 0, generation, &plan, now)
+            .expect("adopt the interrupted completion");
+        let adopted = decommission_adopted_intent_mutation_id(completion);
+        let adopted_bytes = |meta: &PoolMeta| {
+            intent_adoption_test_reservation(meta).targets[0]
+                .temporary_mutations
+                .iter()
+                .find(|mutation| mutation.mutation_id == adopted)
+                .map(|mutation| mutation.physical_bytes)
+        };
+        assert_eq!(adopted_bytes(&meta), Some(40));
+
+        // Whatever the pool-wide free-space delta reads, a cleanup that did not
+        // prove the exact target absent cannot settle the adopted completion.
+        for released_physical_bytes in [0, 40, 1 << 20] {
+            let mut target_present = meta.clone();
+            release_decommission_target_inflight(
+                &mut target_present,
+                0,
+                1,
+                released_physical_bytes,
+                completion,
+                DecommissionCapacityReleaseProof::confirmed_absence(false),
+                now,
+            )
+            .expect("a cleanup that found the target should complete");
+            assert_eq!(
+                adopted_bytes(&target_present),
+                Some(40),
+                "free-space delta {released_physical_bytes} must not settle the adopted completion"
+            );
+            validate_decommission_capacity_reservation(Some(intent_adoption_test_reservation(&target_present)))
+                .expect("the ledger must remain loadable");
+        }
+
+        // As for a published pending intent, freed bytes another mutation's
+        // marker could own stay unattributable.
+        let mut foreign_present = meta.clone();
+        {
+            let reservation = foreign_present.pools[0]
+                .decommission
+                .as_mut()
+                .and_then(|info| info.capacity_reservation.as_mut())
+                .expect("adoption should keep the reservation");
+            reservation.targets[0]
+                .temporary_mutations
+                .push(DecommissionCapacityTemporaryMutation {
+                    mutation_id: uuid::Uuid::new_v4(),
+                    physical_bytes: 20,
+                });
+            reservation.targets[0].inflight_physical_bytes += 20;
+            reservation.inflight_target_physical_bytes += 20;
+        }
+        let err = release_decommission_target_inflight(
+            &mut foreign_present,
+            0,
+            1,
+            20,
+            completion,
+            DecommissionCapacityReleaseProof::confirmed_absence(false),
+            now,
+        )
+        .expect_err("a delta another mutation could own must fail closed");
+        assert!(is_decommission_capacity_blocked_error(&err), "unexpected cleanup error: {err:?}");
+
+        // Only a proven-absent target means nothing committed.
+        let mut target_absent = meta;
+        release_decommission_target_inflight(
+            &mut target_absent,
+            0,
+            1,
+            40,
+            completion,
+            DecommissionCapacityReleaseProof::confirmed_absence(true),
+            now,
+        )
+        .expect("a cleanup that proved the target absent should release the adopted completion");
+        assert_eq!(adopted_bytes(&target_absent), None);
+        assert_eq!(intent_adoption_test_reservation(&target_absent).inflight_target_physical_bytes, 0);
+    }
+
+    #[test]
+    fn cleanup_without_an_absence_proof_still_releases_staged_bytes() {
+        let staged = uuid::Uuid::new_v4();
+        let mut meta = decommission_test_cleanup_meta(
+            DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION,
+            vec![DecommissionCapacityTemporaryMutation {
+                mutation_id: staged,
+                physical_bytes: 30,
+            }],
+            30,
+            None,
+        );
+        // The cleanup finished within the free-space sampling interval, so the
+        // observed delta is zero; the staged uploads are still confirmed gone.
+        release_decommission_target_inflight(
+            &mut meta,
+            0,
+            1,
+            0,
+            staged,
+            DecommissionCapacityReleaseProof::confirmed_absence(false),
+            OffsetDateTime::UNIX_EPOCH + Duration::seconds(1),
+        )
+        .expect("a cleanup that found the target should release staged bytes");
+        let reservation = intent_adoption_test_reservation(&meta);
+        assert!(
+            reservation.targets[0].temporary_mutations.is_empty(),
+            "staged bytes must not survive a cleanup that confirmed the uploads absent"
+        );
+        assert_eq!(reservation.inflight_target_physical_bytes, 0);
+    }
+
+    #[test]
     fn published_pending_ignores_a_delayed_release_observation() {
         let mutation_id = uuid::Uuid::new_v4();
         let mut meta = decommission_test_cleanup_meta(
@@ -31257,6 +33106,612 @@ mod pools_tests {
             .and_then(|info| info.capacity_reservation.as_ref())
             .expect("cleanup reservation should remain present");
         assert_eq!(after, &before);
+    }
+
+    fn intent_adoption_test_reservation(meta: &PoolMeta) -> &DecommissionCapacityReservation {
+        meta.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .expect("intent adoption test reservation should be present")
+    }
+
+    #[test]
+    fn resumed_decommission_adopts_leftover_target_intent_as_mutation_marker() {
+        let generation = OffsetDateTime::UNIX_EPOCH;
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1);
+        for model_version in [
+            DECOMMISSION_CAPACITY_LEGACY_MODEL_VERSION,
+            DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION,
+        ] {
+            let leftover = uuid::Uuid::new_v4();
+            let waiting = uuid::Uuid::new_v4();
+            let mut meta = decommission_test_cleanup_meta(model_version, Vec::new(), 0, Some((leftover, 11)));
+            let err = reserve_decommission_target_pending(&mut meta.clone(), 0, 1, 5, waiting, now)
+                .expect_err("an unadopted leftover intent blocks every other mutation on its target");
+            assert!(err.to_string().contains("unresolved target capacity intent"));
+
+            let plan = decommission_capacity_intent_adoption_plan(&meta, 0, generation)
+                .expect("the same decommission should plan adoption")
+                .expect("the leftover intent should be planned");
+            assert_eq!(
+                plan.intents,
+                vec![DecommissionCapacityLeftoverIntent {
+                    target_pool_index: 1,
+                    mutation_id: leftover,
+                    physical_bytes: 11,
+                }]
+            );
+            adopt_decommission_capacity_leftover_intents(&mut meta, 0, generation, &plan, now)
+                .expect("the resumed routine should adopt its leftover intent");
+
+            let reservation = intent_adoption_test_reservation(&meta);
+            validate_decommission_capacity_reservation(Some(reservation)).expect("the adopted ledger must remain loadable");
+            let target = &reservation.targets[0];
+            assert_eq!(target.pending_physical_bytes, 0);
+            assert_eq!(target.pending_mutation_id, None);
+            assert_eq!(
+                target.temporary_mutations,
+                vec![DecommissionCapacityTemporaryMutation {
+                    mutation_id: decommission_adopted_intent_mutation_id(leftover),
+                    physical_bytes: 11,
+                }]
+            );
+            assert_eq!(target.inflight_physical_bytes, 11);
+            assert_eq!(reservation.pending_target_physical_bytes, 0);
+            assert_eq!(reservation.inflight_target_physical_bytes, 11);
+            assert_eq!(
+                reservation.consumed_target_physical_bytes, 0,
+                "adoption must not assume the interrupted write committed"
+            );
+            assert!(
+                decommission_capacity_intent_adoption_plan(&meta, 0, generation)
+                    .expect("planning after adoption should succeed")
+                    .is_none()
+            );
+            assert_eq!(
+                reserve_decommission_target_pending(&mut meta.clone(), 0, 1, 5, waiting, now)
+                    .expect("another mutation of the resumed routine may use the target"),
+                5
+            );
+
+            // The interrupted mutation's own retry re-reserves and settles its
+            // adopted marker exactly once.
+            assert_eq!(
+                reserve_decommission_target_pending(&mut meta, 0, 1, 11, leftover, now)
+                    .expect("the interrupted mutation should be able to retry"),
+                11
+            );
+            resolve_decommission_target_pending(&mut meta, 0, 1, 11, leftover).expect("the retry should resolve its intent");
+            record_decommission_target_consumption(
+                &mut meta,
+                0,
+                1,
+                DecommissionTargetConsumption {
+                    committed_data_bytes: 11,
+                    target_physical_bytes: 11,
+                    observed_physical_bytes: 0,
+                },
+                leftover,
+                now,
+            )
+            .expect("the retry should record its committed bytes");
+            let reservation = intent_adoption_test_reservation(&meta);
+            validate_decommission_capacity_reservation(Some(reservation)).expect("the settled ledger must remain loadable");
+            assert!(reservation.targets[0].temporary_mutations.is_empty());
+            assert_eq!(reservation.inflight_target_physical_bytes, 0);
+            assert_eq!(reservation.consumed_target_physical_bytes, 11);
+        }
+    }
+
+    #[test]
+    fn decommission_intent_adoption_merges_into_the_mutation_staging_marker() {
+        let generation = OffsetDateTime::UNIX_EPOCH;
+        let leftover = uuid::Uuid::new_v4();
+        let mut meta = decommission_test_cleanup_meta(
+            DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION,
+            vec![DecommissionCapacityTemporaryMutation {
+                mutation_id: leftover,
+                physical_bytes: 7,
+            }],
+            7,
+            Some((leftover, 11)),
+        );
+        let plan = decommission_capacity_intent_adoption_plan(&meta, 0, generation)
+            .expect("plan adoption")
+            .expect("the leftover multipart completion intent should be planned");
+        adopt_decommission_capacity_leftover_intents(&mut meta, 0, generation, &plan, OffsetDateTime::UNIX_EPOCH)
+            .expect("adopt the leftover multipart completion intent");
+        let reservation = intent_adoption_test_reservation(&meta);
+        validate_decommission_capacity_reservation(Some(reservation)).expect("the merged ledger must remain loadable");
+        assert_eq!(
+            reservation.targets[0].temporary_mutations,
+            vec![
+                DecommissionCapacityTemporaryMutation {
+                    mutation_id: leftover,
+                    physical_bytes: 7,
+                },
+                DecommissionCapacityTemporaryMutation {
+                    mutation_id: decommission_adopted_intent_mutation_id(leftover),
+                    physical_bytes: 11,
+                },
+            ],
+            "the staged parts keep their own marker beside the adopted completion"
+        );
+        assert_eq!(reservation.inflight_target_physical_bytes, 18);
+    }
+
+    fn intent_adoption_test_temporary_budget(meta: &PoolMeta) -> usize {
+        let reservation = intent_adoption_test_reservation(meta);
+        reservation.targets[0].remaining_reserved_physical_bytes(reservation.temporary_copies)
+            / (1 + reservation.temporary_copies)
+    }
+
+    /// A mutation's staged and adopted marker bytes together.
+    fn intent_adoption_test_marker(meta: &PoolMeta, mutation_id: uuid::Uuid) -> Option<usize> {
+        let adopted = decommission_adopted_intent_mutation_id(mutation_id);
+        intent_adoption_test_reservation(meta).targets[0]
+            .temporary_mutations
+            .iter()
+            .filter(|mutation| mutation.mutation_id == mutation_id || mutation.mutation_id == adopted)
+            .map(|mutation| mutation.physical_bytes)
+            .reduce(usize::saturating_add)
+    }
+
+    /// Adopt every pending intent of the test reservation as a resumed routine
+    /// would, keeping the ledger loadable.
+    fn adopt_intent_adoption_test_intents(meta: &mut PoolMeta) {
+        let generation = OffsetDateTime::UNIX_EPOCH;
+        let plan = decommission_capacity_intent_adoption_plan(meta, 0, generation)
+            .expect("plan adoption")
+            .expect("a pending intent should be planned");
+        adopt_decommission_capacity_leftover_intents(meta, 0, generation, &plan, generation + Duration::seconds(1))
+            .expect("adopt the pending intents");
+        validate_decommission_capacity_reservation(Some(intent_adoption_test_reservation(meta)))
+            .expect("the adopted ledger must remain loadable");
+    }
+
+    /// Finalize a mutation's commit on a target exactly as a successful
+    /// capacity mutation does: reserve its intent, then resolve and charge it.
+    fn commit_intent_adoption_test_mutation(
+        meta: &mut PoolMeta,
+        target_pool_index: usize,
+        mutation_id: uuid::Uuid,
+        bytes: usize,
+    ) {
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(2);
+        reserve_decommission_target_pending(meta, 0, target_pool_index, bytes, mutation_id, now)
+            .expect("reserve the retry intent");
+        resolve_decommission_target_pending(meta, 0, target_pool_index, bytes, mutation_id).expect("resolve the retry intent");
+        record_decommission_target_consumption(
+            meta,
+            0,
+            target_pool_index,
+            DecommissionTargetConsumption {
+                committed_data_bytes: bytes,
+                target_physical_bytes: bytes,
+                observed_physical_bytes: bytes,
+            },
+            mutation_id,
+            now,
+        )
+        .expect("charge the committed retry");
+        validate_decommission_capacity_reservation(Some(intent_adoption_test_reservation(meta)))
+            .expect("the committed ledger must remain loadable");
+    }
+
+    fn assert_no_intent_adoption_test_record(meta: &PoolMeta, mutation_id: uuid::Uuid) {
+        let reservation = intent_adoption_test_reservation(meta);
+        for target in &reservation.targets {
+            assert_ne!(target.pending_mutation_id, Some(mutation_id));
+            assert!(
+                !decommission_target_has_mutation_marker(target, mutation_id),
+                "target pool {} still holds a marker of the mutation: {:?}",
+                target.pool_index,
+                target.temporary_mutations
+            );
+            assert_eq!(target.inflight_physical_bytes, 0);
+        }
+        assert_eq!(reservation.inflight_target_physical_bytes, 0);
+    }
+
+    #[test]
+    fn retry_returns_to_the_target_that_holds_its_adopted_completion() {
+        let interrupted = uuid::Uuid::new_v4();
+        let mut meta = decommission_test_cleanup_meta(
+            DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION,
+            Vec::new(),
+            0,
+            Some((interrupted, 10)),
+        );
+        // Split the allocation so that target 2 has three times the remaining
+        // allocation of target 1, where the leader died before committing.
+        {
+            let reservation = meta.pools[0]
+                .decommission
+                .as_mut()
+                .and_then(|info| info.capacity_reservation.as_mut())
+                .expect("the test reservation should be present");
+            let mut second = reservation.targets[0].clone();
+            reservation.targets[0].reserved_physical_bytes = reservation.peak_physical_bytes / 4;
+            second.pool_index = 2;
+            second.reserved_physical_bytes = reservation.peak_physical_bytes - reservation.peak_physical_bytes / 4;
+            second.observed_physical_bytes = 0;
+            second.inflight_physical_bytes = 0;
+            second.pending_physical_bytes = 0;
+            second.pending_mutation_id = None;
+            reservation.targets.push(second);
+        }
+        meta.pools.push(decommission_test_pool_status(2, None));
+        validate_decommission_capacity_reservation(Some(intent_adoption_test_reservation(&meta)))
+            .expect("the split ledger must be loadable");
+        adopt_intent_adoption_test_intents(&mut meta);
+
+        let reservation = intent_adoption_test_reservation(&meta);
+        assert_eq!(
+            decommission_reserved_target_choice(reservation, None, 10),
+            Some(2),
+            "without an adopted completion the larger allocation wins"
+        );
+        assert_eq!(
+            decommission_reserved_target_choice(reservation, Some(interrupted), 10),
+            Some(1),
+            "the retry must go back to the target that holds its adopted completion"
+        );
+        // The rule cannot help once that target no longer fits the object.
+        assert_eq!(
+            decommission_reserved_target_choice(reservation, Some(interrupted), reservation.peak_physical_bytes / 4),
+            Some(2)
+        );
+
+        commit_intent_adoption_test_mutation(&mut meta, 1, interrupted, 10);
+        assert_no_intent_adoption_test_record(&meta, interrupted);
+    }
+
+    #[test]
+    fn adopting_the_same_completion_twice_counts_it_once() {
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let capacity_infos = vec![DecommissionPoolCapacityInfo::for_test(1, layout, 400, 400, 0)];
+        let mutation_id = uuid::Uuid::new_v4();
+        let mut meta = decommission_test_cleanup_meta(
+            DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION,
+            Vec::new(),
+            0,
+            Some((mutation_id, 30)),
+        );
+        adopt_intent_adoption_test_intents(&mut meta);
+        // The resumed routine's retry reserves the same completion again and
+        // is killed again before finalizing; the next incarnation adopts it.
+        reserve_decommission_target_pending(&mut meta, 0, 1, 30, mutation_id, OffsetDateTime::UNIX_EPOCH)
+            .expect("reserve the second attempt");
+        adopt_intent_adoption_test_intents(&mut meta);
+
+        let reservation = intent_adoption_test_reservation(&meta);
+        let target = &reservation.targets[0];
+        assert_eq!(target.pending_mutation_id, None);
+        assert_eq!(
+            intent_adoption_test_marker(&meta, mutation_id),
+            Some(30),
+            "both adoptions reserved the same completion"
+        );
+        assert_eq!(target.inflight_physical_bytes, 30);
+        assert_eq!(reservation.inflight_target_physical_bytes, 30);
+
+        // Another mutation commits 60 bytes and shrinks the temporary-copy
+        // budget to 40 bytes, which the completion counted once still fits.
+        commit_intent_adoption_test_mutation(&mut meta, 1, uuid::Uuid::new_v4(), 60);
+        assert_eq!(intent_adoption_test_temporary_budget(&meta), 40);
+        ensure_decommission_capacity_reservations_available(&meta, &capacity_infos, "migration")
+            .expect("later admission must not trip over a completion counted twice");
+
+        commit_intent_adoption_test_mutation(&mut meta, 1, mutation_id, 30);
+        assert_no_intent_adoption_test_record(&meta, mutation_id);
+    }
+
+    #[test]
+    fn adoption_keeps_a_zero_byte_staging_record_only_in_the_target_fence_model() {
+        for model_version in [
+            DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION,
+            DECOMMISSION_CAPACITY_LEGACY_MODEL_VERSION,
+        ] {
+            let completion = uuid::Uuid::new_v4();
+            let budget =
+                intent_adoption_test_temporary_budget(&decommission_test_cleanup_meta(model_version, Vec::new(), 0, None));
+            // The completion alone fills the budget, so the staged bytes move
+            // into the adopted marker and the staged marker drops to zero.
+            let staged = budget * 6 / 10;
+            let mut meta = decommission_test_cleanup_meta(
+                model_version,
+                vec![DecommissionCapacityTemporaryMutation {
+                    mutation_id: completion,
+                    physical_bytes: staged,
+                }],
+                staged,
+                Some((completion, budget)),
+            );
+            adopt_intent_adoption_test_intents(&mut meta);
+
+            let target = &intent_adoption_test_reservation(&meta).targets[0];
+            let staged_entry = target
+                .temporary_mutations
+                .iter()
+                .find(|mutation| mutation.mutation_id == completion);
+            if model_version == DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION {
+                assert_eq!(
+                    staged_entry.map(|mutation| mutation.physical_bytes),
+                    Some(0),
+                    "the target-fence ledger keeps the zero-byte multipart discovery record"
+                );
+            } else {
+                assert!(staged_entry.is_none(), "the legacy ledger cannot store a zero-byte marker");
+            }
+            assert_eq!(intent_adoption_test_marker(&meta, completion), Some(budget));
+            assert_eq!(target.inflight_physical_bytes, budget);
+        }
+    }
+
+    #[test]
+    fn non_growing_replacement_settles_an_adopted_checkpoint_intent() {
+        let checkpoint = uuid::Uuid::new_v4();
+        let mut meta = decommission_test_cleanup_meta(
+            DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION,
+            Vec::new(),
+            0,
+            Some((checkpoint, 16)),
+        );
+        adopt_intent_adoption_test_intents(&mut meta);
+        assert_eq!(intent_adoption_test_marker(&meta, checkpoint), Some(16));
+
+        assert!(
+            settle_decommission_target_non_growing_replacement(
+                &mut meta,
+                0,
+                1,
+                checkpoint,
+                OffsetDateTime::UNIX_EPOCH + Duration::seconds(2)
+            )
+            .expect("the checkpoint replacement settles")
+        );
+        assert_no_intent_adoption_test_record(&meta, checkpoint);
+        assert_eq!(
+            intent_adoption_test_reservation(&meta).targets[0].consumed_physical_bytes,
+            0,
+            "a non-growing replacement charges nothing"
+        );
+        validate_decommission_capacity_reservation(Some(intent_adoption_test_reservation(&meta)))
+            .expect("the settled ledger must remain loadable");
+    }
+
+    #[test]
+    fn adopted_multipart_completion_stays_within_the_temporary_copy_budget() {
+        let generation = OffsetDateTime::UNIX_EPOCH;
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let capacity_infos = vec![DecommissionPoolCapacityInfo::for_test(1, layout, 400, 400, 0)];
+        let completion = uuid::Uuid::new_v4();
+        let budget = intent_adoption_test_temporary_budget(&decommission_test_cleanup_meta(
+            DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION,
+            Vec::new(),
+            0,
+            None,
+        ));
+        // The parts staged 60% of the budget and the completion reserved the
+        // same object again; their sum exceeds the budget.
+        let staged = budget * 6 / 10;
+        let mut meta = decommission_test_cleanup_meta(
+            DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION,
+            vec![DecommissionCapacityTemporaryMutation {
+                mutation_id: completion,
+                physical_bytes: staged,
+            }],
+            staged,
+            Some((completion, staged)),
+        );
+        ensure_decommission_capacity_reservations_available(&meta, &capacity_infos, "migration")
+            .expect("the interrupted completion's ledger fits its budget");
+
+        let plan = decommission_capacity_intent_adoption_plan(&meta, 0, generation)
+            .expect("plan adoption")
+            .expect("the interrupted completion should be planned");
+        adopt_decommission_capacity_leftover_intents(&mut meta, 0, generation, &plan, OffsetDateTime::UNIX_EPOCH)
+            .expect("adopt the interrupted completion");
+        validate_decommission_capacity_reservation(Some(intent_adoption_test_reservation(&meta)))
+            .expect("the adopted ledger must remain loadable");
+        assert_eq!(
+            intent_adoption_test_marker(&meta, completion),
+            Some(budget),
+            "the overlapping staged parts and completion are counted up to the budget"
+        );
+        ensure_decommission_capacity_reservations_available(&meta, &capacity_infos, "migration")
+            .expect("adoption must not push inflight bytes past the temporary-copy budget");
+    }
+
+    #[test]
+    fn adopted_part_upload_keeps_its_bytes_on_top_of_earlier_parts() {
+        let generation = OffsetDateTime::UNIX_EPOCH;
+        let upload = uuid::Uuid::new_v4();
+        let mut meta = decommission_test_cleanup_meta(
+            DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION,
+            vec![DecommissionCapacityTemporaryMutation {
+                mutation_id: upload,
+                physical_bytes: 30,
+            }],
+            30,
+            Some((upload, 20)),
+        );
+        let plan = decommission_capacity_intent_adoption_plan(&meta, 0, generation)
+            .expect("plan adoption")
+            .expect("the interrupted part upload should be planned");
+        adopt_decommission_capacity_leftover_intents(&mut meta, 0, generation, &plan, OffsetDateTime::UNIX_EPOCH)
+            .expect("adopt the interrupted part upload");
+        assert_eq!(
+            intent_adoption_test_marker(&meta, upload),
+            Some(50),
+            "a part admitted within the budget adds to the parts staged before it"
+        );
+    }
+
+    #[test]
+    fn adopted_intent_exceeds_the_budget_only_where_its_finalize_would() {
+        let generation = OffsetDateTime::UNIX_EPOCH;
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1);
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let capacity_infos = vec![DecommissionPoolCapacityInfo::for_test(1, layout, 400, 400, 0)];
+        let staging = uuid::Uuid::new_v4();
+        let completion = uuid::Uuid::new_v4();
+        let budget = intent_adoption_test_temporary_budget(&decommission_test_cleanup_meta(
+            DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION,
+            Vec::new(),
+            0,
+            None,
+        ));
+        for (other_staged, completion_bytes) in [(budget / 4, budget / 2), (budget / 2, budget * 6 / 10)] {
+            let meta = decommission_test_cleanup_meta(
+                DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION,
+                vec![DecommissionCapacityTemporaryMutation {
+                    mutation_id: staging,
+                    physical_bytes: other_staged,
+                }],
+                other_staged,
+                Some((completion, completion_bytes)),
+            );
+            ensure_decommission_capacity_reservations_available(&meta, &capacity_infos, "migration")
+                .expect("the interrupted ledger fits its budget");
+
+            let mut finalized = meta.clone();
+            resolve_decommission_target_pending(&mut finalized, 0, 1, completion_bytes, completion)
+                .expect("finalize resolves the completion intent");
+            record_decommission_target_consumption(
+                &mut finalized,
+                0,
+                1,
+                DecommissionTargetConsumption {
+                    committed_data_bytes: completion_bytes,
+                    target_physical_bytes: completion_bytes,
+                    observed_physical_bytes: 0,
+                },
+                completion,
+                now,
+            )
+            .expect("finalize records the completion");
+
+            let mut adopted = meta.clone();
+            let plan = decommission_capacity_intent_adoption_plan(&adopted, 0, generation)
+                .expect("plan adoption")
+                .expect("the interrupted completion should be planned");
+            adopt_decommission_capacity_leftover_intents(&mut adopted, 0, generation, &plan, now)
+                .expect("adopt the interrupted completion");
+
+            assert_eq!(
+                ensure_decommission_capacity_reservations_available(&adopted, &capacity_infos, "migration").is_ok(),
+                ensure_decommission_capacity_reservations_available(&finalized, &capacity_infos, "migration").is_ok(),
+                "adoption must reach the same budget verdict as the lost finalize (other staged {other_staged}, completion {completion_bytes}, budget {budget})"
+            );
+        }
+    }
+
+    #[test]
+    fn decommission_intent_adoption_is_pinned_to_the_same_decommission() {
+        let generation = OffsetDateTime::UNIX_EPOCH;
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1);
+        let leftover = uuid::Uuid::new_v4();
+        let meta =
+            decommission_test_cleanup_meta(DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION, Vec::new(), 0, Some((leftover, 11)));
+
+        let err = decommission_capacity_intent_adoption_plan(&meta, 0, generation + Duration::seconds(1))
+            .expect_err("a routine for another decommission start must not plan adoption");
+        assert!(matches!(err, Error::OperationCanceled), "unexpected planning error: {err}");
+
+        let plan = decommission_capacity_intent_adoption_plan(&meta, 0, generation)
+            .expect("plan adoption")
+            .expect("the leftover intent should be planned");
+        let intent_changes: [fn(&mut DecommissionCapacityReservation); 4] = [
+            |reservation| reservation.operation_id = uuid::Uuid::new_v4(),
+            |reservation| reservation.generation += 1,
+            |reservation| reservation.targets[0].pending_mutation_id = Some(uuid::Uuid::new_v4()),
+            |reservation| {
+                reservation.targets[0].pending_physical_bytes += 1;
+                reservation.pending_target_physical_bytes += 1;
+            },
+        ];
+        for change in intent_changes {
+            let mut changed = meta.clone();
+            change(
+                changed.pools[0]
+                    .decommission
+                    .as_mut()
+                    .and_then(|info| info.capacity_reservation.as_mut())
+                    .expect("intent adoption test reservation should be present"),
+            );
+            let before = intent_adoption_test_reservation(&changed).clone();
+            let err = adopt_decommission_capacity_leftover_intents(&mut changed, 0, generation, &plan, now)
+                .expect_err("a reservation or intent that changed after planning must not be adopted");
+            assert!(err.to_string().contains("changed before adoption"), "unexpected adoption error: {err}");
+            assert_eq!(intent_adoption_test_reservation(&changed), &before);
+        }
+
+        let mut unidentified = meta;
+        unidentified.pools[0]
+            .decommission
+            .as_mut()
+            .and_then(|info| info.capacity_reservation.as_mut())
+            .expect("intent adoption test reservation should be present")
+            .targets[0]
+            .pending_mutation_id = None;
+        assert!(
+            decommission_capacity_intent_adoption_plan(&unidentified, 0, generation)
+                .expect("planning should tolerate an unidentified intent")
+                .is_none(),
+            "an intent without a mutation identity cannot be settled and stays fail-closed"
+        );
+    }
+
+    #[test]
+    fn decommission_intent_adoption_failure_pauses_instead_of_failing_the_routine() {
+        assert!(matches!(
+            decommission_intent_adoption_failure(Error::OperationCanceled),
+            Error::OperationCanceled
+        ));
+        let busy = decommission_intent_adoption_failure(decommission_capacity_blocked_error("target gate busy"));
+        assert_eq!(busy.to_string(), decommission_capacity_blocked_error("target gate busy").to_string());
+        let quorum = decommission_intent_adoption_failure(Error::NamespaceLockQuorumUnavailable {
+            mode: "write",
+            bucket: RUSTFS_META_BUCKET.to_string(),
+            object: "decommission/capacity-target/1".to_string(),
+            required: 2,
+            achieved: 1,
+        });
+        assert!(
+            is_decommission_capacity_blocked_error(&quorum),
+            "a lock failure while adopting must pause the routine, not mark the decommission failed: {quorum}"
+        );
+    }
+
+    #[test]
+    fn decommission_intent_adoption_does_not_bypass_a_live_intent_of_the_same_incarnation() {
+        let generation = OffsetDateTime::UNIX_EPOCH;
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1);
+        let leftover = uuid::Uuid::new_v4();
+        let mut meta =
+            decommission_test_cleanup_meta(DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION, Vec::new(), 0, Some((leftover, 11)));
+        let plan = decommission_capacity_intent_adoption_plan(&meta, 0, generation)
+            .expect("plan adoption")
+            .expect("the leftover intent should be planned");
+        adopt_decommission_capacity_leftover_intents(&mut meta, 0, generation, &plan, now).expect("adopt the leftover intent");
+
+        // Adoption happens once, before workers start. An intent a worker of
+        // this incarnation then persists keeps excluding other mutations.
+        let live = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        reserve_decommission_target_pending(&mut meta, 0, 1, 5, live, now).expect("a live mutation reserves the target");
+        let err = reserve_decommission_target_pending(&mut meta.clone(), 0, 1, 5, other, now)
+            .expect_err("a live intent must still reject a different mutation");
+        assert!(err.to_string().contains("unresolved target capacity intent"));
+        let err = resolve_decommission_target_pending(&mut meta.clone(), 0, 1, 5, other)
+            .expect_err("a different mutation must not resolve a live intent");
+        assert!(err.to_string().contains("belongs to another mutation"));
+        let err = adopt_decommission_capacity_leftover_intents(&mut meta.clone(), 0, generation, &plan, now)
+            .expect_err("a stale plan must not adopt the live intent");
+        assert!(err.to_string().contains("changed before adoption"));
     }
 
     #[test]

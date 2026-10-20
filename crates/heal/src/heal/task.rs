@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::error::{HealErrorClass, classify_heal_error};
 use crate::heal::{
-    DiskError, EcstoreError, ErasureSetHealer, HealDiskExt as _,
+    DiskError, ErasureSetHealer, HealDiskExt as _,
     erasure_healer::target_outcomes_complete,
     outcome::{
         HealAbortReason, HealDeferredReason, HealExecutionOutcome, HealFailureClass, HealObjectDisposition, HealObjectIdentity,
@@ -167,17 +168,10 @@ impl HealType {
     }
 }
 
-fn is_object_level_not_found_error(err: &Error) -> bool {
-    match err {
-        Error::Disk(DiskError::FileNotFound | DiskError::FileVersionNotFound) => true,
-        Error::Storage(EcstoreError::FileNotFound | EcstoreError::FileVersionNotFound) => true,
-        Error::Other(message) => matches!(message.as_str(), "File not found" | "File version not found"),
-        _ => false,
-    }
-}
-
+/// A trailing-slash object-dir candidate whose locked storage read found no
+/// object is a listing artifact, not a missing object.
 pub(crate) fn is_missing_object_dir_heal_result(object: &str, err: &Error) -> bool {
-    object.ends_with(SLASH_SEPARATOR) && is_object_level_not_found_error(err)
+    object.ends_with(SLASH_SEPARATOR) && err.is_object_absent()
 }
 
 /// Sample cap for per-object failure logs during a sweep: returns true (and
@@ -440,6 +434,8 @@ pub struct HealTask {
     replacement_execution: Arc<RwLock<Option<Arc<super::storage::ReplacementExecution>>>>,
     replacement_running: Arc<AtomicBool>,
     replacement_start_retry_count: Arc<AtomicU32>,
+    /// Set when the locked storage read classified the single target as absent.
+    object_absent: Arc<AtomicBool>,
     /// Task status
     pub status: Arc<RwLock<HealTaskStatus>>,
     /// Progress tracking
@@ -511,6 +507,7 @@ impl HealTask {
             replacement_execution: Arc::new(RwLock::new(None)),
             replacement_running: Arc::new(AtomicBool::new(false)),
             replacement_start_retry_count: Arc::new(AtomicU32::new(0)),
+            object_absent: Arc::new(AtomicBool::new(false)),
             status: Arc::new(RwLock::new(HealTaskStatus::Pending)),
             progress: Arc::new(RwLock::new(HealProgress::new())),
             result_items: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_RETAINED_HEAL_RESULT_ITEMS))),
@@ -603,6 +600,16 @@ impl HealTask {
 
     pub async fn get_outcome(&self) -> HealTaskOutcome {
         self.outcome.read().await.clone()
+    }
+
+    /// Record that the locked storage read found the single target absent.
+    pub(crate) fn mark_object_absent(&self) {
+        self.object_absent.store(true, Ordering::Release);
+    }
+
+    /// Whether this task's single target was classified absent.
+    pub(crate) fn object_absent(&self) -> bool {
+        self.object_absent.load(Ordering::Acquire)
     }
 
     fn outcome_identity(
@@ -885,20 +892,7 @@ impl HealTask {
     }
 
     fn is_transient_lock_or_timeout_error(err: &Error) -> bool {
-        // Typed-first (backlog#1845): trust the lock taxonomy and timeout
-        // variants before falling back to message needles for errors whose
-        // typed identity was stringified upstream.
-        if let Error::Storage(EcstoreError::Lock(lock_err)) = err {
-            return lock_err.is_retryable() || matches!(lock_err, rustfs_lock::LockError::QuorumNotReached { .. });
-        }
-        if matches!(err, Error::Disk(DiskError::Timeout) | Error::Storage(EcstoreError::Timeout)) {
-            return true;
-        }
-        let message = err.to_string().to_ascii_lowercase();
-        message.contains("lock acquisition timeout")
-            || message.contains("lock acquisition failed")
-            || message.contains("timed out")
-            || message.contains("deadline has elapsed")
+        matches!(classify_heal_error(err), HealErrorClass::LockContention)
     }
 
     fn should_skip_data_usage_cache_heal_error(bucket: &str, object: &str, err: &Error) -> bool {
@@ -910,32 +904,7 @@ impl HealTask {
     }
 
     fn is_no_heal_required_error(err: &Error) -> bool {
-        match err {
-            Error::Storage(EcstoreError::NoHealRequired) | Error::Disk(DiskError::NoHealRequired) => true,
-            Error::Other(message) => matches!(message.as_str(), "No heal required" | "No healing is required"),
-            _ => matches!(err.to_string().as_str(), "No heal required" | "No healing is required"),
-        }
-    }
-
-    fn is_object_not_found_heal_error(err: &Error) -> bool {
-        match err {
-            Error::Disk(DiskError::FileNotFound | DiskError::FileVersionNotFound) => true,
-            Error::Storage(
-                EcstoreError::FileNotFound
-                | EcstoreError::FileVersionNotFound
-                | EcstoreError::ObjectNotFound(_, _)
-                | EcstoreError::VersionNotFound(_, _, _),
-            ) => true,
-            Error::Other(message) => {
-                message.contains("File not found")
-                    || message.contains("file not found")
-                    || message.contains("File version not found")
-                    || message.contains("file version not found")
-                    || message.contains("Object not found")
-                    || message.contains("object not found")
-            }
-            _ => false,
-        }
+        matches!(classify_heal_error(err), HealErrorClass::NoHealRequired)
     }
 
     pub(super) fn bucket_object_retry_delay(task_id: &str, retry_attempt: u32) -> Duration {
@@ -1019,30 +988,6 @@ impl HealTask {
         progress.set_current_object(Some(format!("skipped: {bucket}/{object}")));
         progress.update_object_progress(1, 0, 0, 1, 0);
         progress.update_stage(3, 3);
-        true
-    }
-
-    async fn skip_scanner_synthetic_object_dir_missing(&self, bucket: &str, object: &str, err: &Error) -> bool {
-        if self.source != HealRequestSource::Scanner || !is_missing_object_dir_heal_result(object, err) {
-            return false;
-        }
-
-        debug!(
-            target: "rustfs::heal::task",
-            event = EVENT_HEAL_OBJECT_RESULT,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_OBJECT,
-            task_id = %self.id,
-            bucket,
-            object,
-            source = self.source.as_str(),
-            result = "synthetic_object_dir_missing",
-            error = %err,
-            "Heal recreate skipped scanner synthetic object-dir candidate after object-level not-found"
-        );
-        let mut progress = self.progress.write().await;
-        progress.set_current_object(Some(format!("skipped: {bucket}/{object}")));
-        progress.update_stage(4, 4);
         true
     }
 

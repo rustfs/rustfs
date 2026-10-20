@@ -22,7 +22,7 @@ use super::super::{BUCKET_META_PREFIX, DiskError, DiskStore, HealDiskExt as _, R
 use super::replacement::{ReplacementPhase, ReplacementRecoveryRecord};
 use super::{
     CheckpointManager, EVENT_HEAL_RESUME_STATE, LOG_COMPONENT_HEAL, LOG_SUBSYSTEM_RESUME, REPLACEMENT_COMPLETION_PROOF_FILE,
-    REPLACEMENT_INTENT_FILE, RESUME_STATE_FILE, ResumeManager, ResumeStateFile, is_replacement_intent, path_to_str,
+    REPLACEMENT_INTENT_FILE, RESUME_STATE_FILE, ResumeManager, ResumeState, ResumeStateFile, is_replacement_intent, path_to_str,
     replacement_recovery_corruption_for_state_load, replacement_recovery_dir, validate_resume_task_id,
 };
 
@@ -226,6 +226,37 @@ impl ResumeUtils {
         Ok(records)
     }
 
+    /// A predecessor that committed its handoff is collectible once its
+    /// successor has verified the rebuild or already cleaned up behind a
+    /// completion proof. Uncommitted authority and predecessors of unfinished
+    /// successors are retained; so is any record whose successor cannot be read.
+    pub(crate) async fn retired_predecessor_is_collectible(disk: &DiskStore, state: &ResumeState) -> bool {
+        if !super::replacement_generation_is_retired(state) {
+            return false;
+        }
+        let Some(successor) = state
+            .replacement_handoff
+            .as_ref()
+            .map(|handoff| handoff.link.successor.as_str())
+        else {
+            return false;
+        };
+        if ResumeManager::has_replacement_intent(disk, successor).await {
+            return match ResumeManager::load_replacement_intent(disk.clone(), successor).await {
+                Ok(manager) => {
+                    let successor = manager.get_state().await;
+                    successor.completed
+                        && matches!(successor.replacement_phase, ReplacementPhase::Verified | ReplacementPhase::CleanupPending)
+                }
+                Err(_) => false,
+            };
+        }
+        matches!(
+            ResumeManager::replacement_completion_proof_if_present(disk.clone(), successor).await,
+            Ok(Some(_))
+        )
+    }
+
     /// cleanup expired resume states
     pub async fn cleanup_expired_states(disk: &DiskStore, max_age_hours: u64) -> Result<()> {
         let task_ids = Self::get_resumable_tasks(disk).await?;
@@ -291,11 +322,13 @@ impl ResumeUtils {
                 let state = resume_manager.get_state().await;
                 let age_hours = current_time.saturating_sub(state.last_update) / 3600;
 
-                // Retain handoff authority even after commit: a successor may still
-                // need it to resume marker ownership. Completion proofs carry the
+                // Retain handoff authority until its successor no longer needs
+                // it to resume marker ownership. Completion proofs carry the
                 // lineage so a future archival policy can verify the whole chain.
-                if state.replacement_handoff.is_some()
-                    || state.replacement_legacy_successor.is_some()
+                if state.replacement_handoff.is_some() && !Self::retired_predecessor_is_collectible(disk, &state).await {
+                    continue;
+                }
+                if state.replacement_legacy_successor.is_some()
                     || (!state.completed
                         && matches!(
                             state.replacement_phase,

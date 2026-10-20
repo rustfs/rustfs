@@ -2,7 +2,7 @@
 
 **Use this when:** tuning scanner pacing or heal runtime knobs, reading `/v3/scanner/status`, deciding whether slow lifecycle/replication/heal progress is a scanner problem or a downstream queue problem, or migrating scanner settings from MinIO.
 
-**Source of truth:** `crates/config/src/constants/scanner.rs` and `crates/config/src/constants/heal.rs` (keys, env names, `DEFAULT_*` constants), `crates/scanner/src/runtime_config.rs` (resolution order, parsing, hot update), `crates/scanner/src/scanner_folder.rs` (env-only scanner knobs, alerts), `crates/scanner/src/sleeper.rs` (throttling), `crates/heal/src/heal/manager.rs` (`HealConfig::default`), `crates/utils/src/envs.rs` (`EXTERNAL_COMPATIBLE_SUFFIXES`, MinIO env aliases).
+**Source of truth:** `crates/config/src/constants/scanner.rs` and `crates/config/src/constants/heal.rs` (keys, env names, `DEFAULT_*` constants), `crates/scanner/src/runtime_config.rs` (resolution order, parsing, hot update), `crates/scanner/src/scanner_folder.rs` (env-only scanner knobs, alerts), `crates/scanner/src/sleeper.rs` and `crates/scanner/src/sleeper/io_budget.rs` (throttling and per-disk I/O budget), `crates/heal/src/heal/manager.rs` (`HealConfig::default`), `crates/utils/src/envs.rs` (`EXTERNAL_COMPATIBLE_SUFFIXES`, MinIO env aliases).
 
 For reproducible scanner-pressure validation and before/after evidence, see [Scanner Benchmark Runbook](scanner-benchmark-runbook.md). Alert thresholds and S3 event names are detailed in [Scanner Excess Alerts](scanner-excess-alerts.md).
 
@@ -45,6 +45,8 @@ Bitrot cycle resolution differs because the canonical persistent key belongs to 
 | `scanner.max_concurrent_set_scans` | `RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS` | count | `4` (`DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS`) | Caps concurrent set-level scanner tasks. `0` keeps topology-derived concurrency. |
 | `scanner.max_concurrent_disk_scans` | `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` | count | `4` (`DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS`) | Caps concurrent disk bucket walks per set. `0` keeps walker-count-derived concurrency. |
 | `scanner.walkers_per_disk` | `RUSTFS_SCANNER_WALKERS_PER_DISK` | count | `1` (`DEFAULT_SCANNER_WALKERS_PER_DISK`) | Bucket walkers spawned per local disk of a set. The walkers of one disk share its scanner admission, so a peer still sees one scan session per physical disk; remote disks keep one walker. The resulting walker count is what `scanner.max_concurrent_disk_scans` caps, and the disk count stays the floor. Valid range is `1` through `16` (`MAX_SCANNER_WALKERS_PER_DISK`); `1` keeps today's I/O profile and is the right value for rotational media. The `disk_concurrency_budget` log line reports `walkers_per_disk`, `walkers`, the effective `concurrency_limit`, and its `reason` (`available_walkers`, `configured_cap`, or `count_budget`). |
+| `scanner.disk_io_budget_iops` | `RUSTFS_SCANNER_DISK_IO_BUDGET_IOPS` | operations/s | `auto` (`DEFAULT_SCANNER_DISK_IO_BUDGET`) | Per-local-disk ceiling on scanner directory listings and object metadata reads. `auto` picks the media default (`100` on rotational or unknown media, `4000` on flash); `off` removes the cap; a number is an explicit rate. See [Per-disk background I/O budget](#per-disk-background-io-budget). |
+| `scanner.disk_io_budget_bytes_per_sec` | `RUSTFS_SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC` | bytes/s | `auto` (`DEFAULT_SCANNER_DISK_IO_BUDGET`) | Per-local-disk ceiling on the metadata bytes the scanner reads. `auto` picks the media default (`16777216` on rotational or unknown media, `268435456` on flash); `off` removes the cap; a number is an explicit rate. |
 | `scanner.yield_every_n_objects` | `RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS` | objects | `128` (`DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS`) | Controls how often object loops yield to the async runtime. `0` disables this extra yield. |
 | `scanner.alert_excess_versions` | `RUSTFS_SCANNER_ALERT_EXCESS_VERSIONS` | versions | `100` (`DEFAULT_SCANNER_ALERT_EXCESS_VERSIONS`) | Version count threshold for scanner alerts. |
 | `scanner.alert_excess_version_size` | `RUSTFS_SCANNER_ALERT_EXCESS_VERSION_SIZE` | bytes | `1099511627776` (`DEFAULT_SCANNER_ALERT_EXCESS_VERSION_SIZE`) | Retained version byte threshold for scanner alerts. |
@@ -129,6 +131,20 @@ The `rustfs_disk_io_admission_active` foreground gauge is sampled while backgrou
 
 This is logical operation admission, not an OS disk scheduler: foreground and background operations may overlap after a background permit is granted, and the gate does not promise a bandwidth or IOPS limit. It is scoped to each `LocalDiskWrapper`; separate paths to one physical device and remote disk RPCs do not share this gate. It also does not observe or schedule unrelated host processes that share the physical device.
 
+## Per-disk background I/O budget
+
+The admission gate orders scanner I/O behind foreground requests but does not bound how much background I/O an idle disk sees. `scanner.disk_io_budget_iops` and `scanner.disk_io_budget_bytes_per_sec` add that bound. Each local disk owns one token bucket per axis (`crates/scanner/src/sleeper/io_budget.rs`); every directory listing charges one operation, and every object metadata read charges one operation plus the `xl.meta` size. A charge that exceeds the remaining budget delays that walker until the rate allows it. The budget is layered on top of admission: a budgeted operation still queues behind foreground requests, so the budget can only slow the scanner down and never lets it exceed what admission allows. It applies whether or not `idle_mode` is enabled.
+
+- Media is detected once per disk path from the backing block device's `rotational` flag on Linux, through partitions, `dm-*`, and software RAID; any spindle in the stack counts as rotational. Undetectable media, including non-Linux hosts and overlay filesystems without a bind-mounted volume, uses the rotational defaults because a spindle is the case that needs protection.
+- `auto` resolves to `100` operations/s and `16 MiB/s` on rotational or unknown media and to `4000` operations/s and `256 MiB/s` on flash. The rotational values leave roughly half of a 7200 rpm spindle's random reads to foreground traffic; the flash values are a few percent of a SATA SSD. The `fastest` speed preset resolves `auto` to no cap; explicit numbers always apply.
+- A budget of `0` or any tiny value never starves a walk: one charge is admitted per second (`SCANNER_DISK_IO_BUDGET_MAX_WAIT`), and an oversized charge owes at most one extra second of debt.
+- The walkers of one disk (`scanner.walkers_per_disk`) share that disk's budget. Remote disks are paced by their owning node.
+- Changes take effect at the next charge without a restart.
+
+The status endpoint lists each disk under `disk_io_budget` with its detected `media`, the effective `iops` and `bytes_per_sec` (`null` when uncapped), charged totals, and accumulated `wait_events` / `wait_seconds`. Budget waits are also reported per cycle as `metrics.current_cycle_disk_io_budget_wait_events` / `_duration_seconds` and `metrics.last_cycle_disk_io_budget_wait_events` / `_duration_seconds`, as `metrics.pacing_pressure.last_cycle_disk_io_budget_wait_ratio` with the `disk_io_budget` primary pressure, and in `metrics.usage_freshness.disk_io_budget_wait_events`, `disk_io_budget_wait_millis`, and `last_disk_io_budget_wait_unix_secs`. Prometheus exports `rustfs_scanner_disk_io_budget_waits_total` and `rustfs_scanner_disk_io_budget_wait_seconds` by disk. The `scanner_disk_io_budget` log line reports the resolved media and rates once per disk.
+
+Like admission, this is in-process pacing: it does not schedule other host processes. Deep bitrot verification reads are issued by the heal subsystem and are paced by heal controls, not by this budget.
+
 ## Status Endpoint
 
 ```text
@@ -142,6 +158,8 @@ The request must be authenticated with an admin identity that has `ServerInfoAdm
 | `runtime_config` | Effective runtime controls and their value sources. |
 | `cycle_schedule` | Current effective cycle interval and clean-idle backoff state. |
 | `cycle_recovery` | This node's cycle-state recovery observation, retry budget, and reason. |
+| `bitrot` | How the current cycle's scan mode was decided: whether Deep is supported on this topology, where the bitrot cadence start came from, and the recorded start. See [Deep scan cadence state](#deep-scan-cadence-state). |
+| `disk_io_budget` | One entry per local disk with detected media, effective per-disk I/O budget, charged totals, and accumulated budget waits. |
 | `metrics` | Scanner work, pressure, checkpoint, lifecycle, replication, heal, bitrot, and alert counters. |
 | `data_movement_pause` | Global-pause policy, current movement reason, operation epoch, start time, duration, and estimated movement work items. |
 | `pause_backlog` | Replicated durable pause ledger, post-pause catch-up phase, rate window, retry state, thresholds, and active alert reasons. |
@@ -161,6 +179,14 @@ cycle_schedule.clean_idle_backoff_enabled
 cycle_schedule.clean_idle_backoff_multiplier
 metrics.pacing_pressure.primary_pressure
 metrics.pacing_pressure.last_cycle_budget_limited
+metrics.pacing_pressure.last_cycle_disk_io_budget_wait_ratio
+metrics.usage_freshness.disk_io_budget_wait_events
+bitrot.deep_scan_supported
+bitrot.bitrot_start_kind
+bitrot.bitrot_start_source
+disk_io_budget[].media
+disk_io_budget[].iops
+disk_io_budget[].wait_seconds
 metrics.lifecycle_transition.current_queued
 metrics.lifecycle_transition.scanner_missed
 metrics.maintenance_control.primary_control
@@ -189,6 +215,20 @@ catch_up_estimate.discovered_expiry_items
 catch_up_estimate.discovered_transition_items
 ```
 
+### Deep scan cadence state
+
+`bitrot` reports how the scanner decided the scan mode of the running or most recent cycle:
+
+| Field | Meaning |
+|---|---|
+| `deep_scan_supported` | `false` on an erasure single-disk deployment, where scanner-originated object heal sampling is unsupported and Deep mode is never selected (rustfs/rustfs#8126). |
+| `bitrot_start_kind` | `deep_window` when a recorded Deep window start is in effect, `anchor` when no Deep window is recorded anywhere and the cadence counts from this process's first cycle without one, `none` before the first cycle. |
+| `bitrot_start_source` | Where the reference came from: `persisted` (read back from the background-heal object), `memory` (the in-memory anchor, or a window start this process recorded that storage has not returned, for example because the save was skipped without movement admission), or `none`. |
+| `bitrot_start_cycle`, `bitrot_start_unix_secs` | The recorded window start, or the anchor time with cycle `0`; both `0` when none. |
+| `current_scan_mode` | `normal` or `deep`. |
+
+A cycle that finds no recorded Deep window runs Normal and anchors the cadence in process memory; nothing is persisted until the configured bitrot cycle has elapsed since that anchor (or on every cycle when the cycle is `0`), at which point the Deep cycle records the window start exactly as before. An anchor never opens the Deep selection window: a missing record used to be read as a window that started at cycle `0`, which made every cycle below the selection window run Deep whenever the start could not be read back (rustfs/rustfs#8015). The window start also stays in process memory across a skipped or failed save, so the next cycle continues the window instead of reopening one; when a persisted and an in-memory start both exist, the newer one wins and ties go to the persisted record. `RUSTFS_SCANNER_BITROT_CYCLE_SECS=off` still never selects Deep, deployments whose background-heal state persists normally keep their existing cadence, and a restart resets the anchor.
+
 ### Periodic checkpoint persistence
 
 `metrics.scan_checkpoint` is the in-memory resume hint; it does not confirm a durable save. `metrics.scan_checkpoints_persisted` lists the latest confirmed periodic save for each `(pool_index, set_index)` handled by this process, with its bucket, `saved_unix_secs`, and optional checkpoint cursor. It retains one observation per set, is reset on process restart, and does not include the final bucket save. Query the peer executing the walk for remote-worker observations. `metrics.scan_checkpoint_save_failures` counts failed periodic saves, including failures to refresh CAS revisions after a write; failed attempts do not advance the confirmed save observation.
@@ -205,7 +245,7 @@ A confirmed periodic save does not prove restart resumability. Adoption still va
 
 ### Cycle recovery on followers
 
-Cycle recovery status is local to each node. A transient cycle-state read failure can exhaust the short retry budget and enter `paused`; the enabled scanner then retries leadership every five minutes or when recovery is explicitly woken. If the next lock attempt is contended or times out waiting for `leader.lock`, the node records a follower iteration and clears only its unclassified `transient` or `paused` observation. Normal follower retry cadence resumes without restarting the process.
+Cycle recovery status is local to each node. A transient cycle-state read failure can exhaust the short retry budget and enter `backoff`; the observation stays retryable, the enabled scanner keeps retrying leadership with an exponential delay capped at ten minutes or sooner when recovery is explicitly woken, and `next_attempt_at_unix_secs` together with `reason` name the next attempt. If the next lock attempt is contended or times out waiting for `leader.lock`, the node records a follower iteration and clears only its unclassified `transient` or `backoff` observation. Normal follower retry cadence resumes without restarting the process.
 
 This clears local retry bookkeeping, not persisted cycle state or recovery markers. Classified recovery states, cleanup-pending resets, and usage-floor failures remain unchanged. Any later leadership claim revalidates durable cycle state before scanning. A healthy follower recovery status does not prove that leader-dispatched scans are progressing; inspect the work counters separately.
 
@@ -269,7 +309,7 @@ RustFS uses a `global_pause` policy while pool decommission or rebalance can hid
 | `data_movement_pause.reasons` | In-process decommission worker state combined with durable pool and rebalance operation metadata. Exhausted operation epochs or movement generations fail closed and appear as explicit reasons. |
 | `data_movement_pause.duration_seconds`, start time, `movement_backlog_work_items` | From durable metadata; a worker-only or exhausted-counter snapshot can report `paused=true` with zero start time and backlog. `movement_backlog_work_items` counts remaining movement bucket work units, not expired objects. |
 | `catch_up_estimate` | Movement estimate plus dirty-usage buckets and lifecycle items discovered before or during the pause. `undiscovered_ilm_items_known=false` because a global pause cannot count newly expired objects without scanning; use `usage_baseline_unix_secs` to judge the estimate's age. |
-| `pause_backlog.persistence_state` | `persistence_unavailable` when the `.scanner-pause-backlog.json` ledger cannot be read or updated; scanner cycles stay gated and persistence is retried every five minutes. |
+| `pause_backlog.persistence_state` | `degraded` when the `.scanner-pause-backlog.json` ledger cannot be claimed or updated; `error` carries the reason. Scanner cycles keep running untracked behind the data-movement fence, and the ledger claim is retried on each scheduler wake at most every five minutes. `unavailable` means no scanner runtime on this node has attempted a claim. |
 | `pause_backlog.phase` | `idle`, `paused`, `catching_up`, or `retry_exhausted`. The ledger returns to `idle` only after one successful full namespace scan and zero known dirty-usage, expiry, and transition queues. |
 | `membership_repair_pending` | A rejoining decommission source is being re-seeded from the last committed surviving-set ledger before a new full-membership commit is allowed. |
 | `pause_backlog.thresholds` | Exact pause-duration, deferred-cycle, backlog-size, rate, and failure limits used by the running binary. |
@@ -311,11 +351,12 @@ Unlabeled Prometheus gauges:
 |---|---|---|
 | `queued_scans` | Set or disk scan queues are backing up. | Lower scanner concurrency or increase pacing delay if user traffic is affected. |
 | `cycle_budget` | The last cycle stopped because a runtime/object/directory budget was reached. | Check `last_cycle_partial_reason` and `last_cycle_partial_source`; increase the specific budget if scans need to finish sooner. |
+| `disk_io_budget` | The last cycle waited on the per-disk background I/O budget. | Expected on rotational media; raise `scanner.disk_io_budget_iops` or `scanner.disk_io_budget_bytes_per_sec` only when foreground latency has headroom. |
 | `throttle_pause` | Scanner sleeps or cooperative yields were observed. | Expected when `idle_mode` is enabled; inspect pause ratios before tuning. |
 | `active_scans` | Scanner work is active but not currently queued or budget-limited. | Usually healthy; correlate with CPU/disk metrics. |
 | `none` | No current scanner pressure was observed. | No scanner pacing action needed. |
 
-The ratio fields `last_cycle_throttle_sleep_ratio`, `last_cycle_yield_ratio`, and `last_cycle_total_pause_ratio` are fractions of the last cycle duration. If CPU is high but pause ratios are already high, increasing `scanner.delay` or `scanner.max_wait` may have limited value; check active paths, source work, and disk activity before changing the cycle interval.
+The ratio fields `last_cycle_throttle_sleep_ratio`, `last_cycle_disk_io_budget_wait_ratio`, `last_cycle_yield_ratio`, and `last_cycle_total_pause_ratio` are fractions of the last cycle duration. If CPU is high but pause ratios are already high, increasing `scanner.delay` or `scanner.max_wait` may have limited value; check active paths, source work, and disk activity before changing the cycle interval.
 
 ## Reading Source Work
 
@@ -655,6 +696,8 @@ config:
       idle_mode: "true"
       yield_every_n_objects: "128"
       bitrot_cycle_secs: "2592000"
+      disk_io_budget_iops: "100"
+      disk_io_budget_bytes_per_sec: "16777216"
 ```
 
 Use `extraEnv` for environment variables that are not represented by chart values, including every heal knob above.

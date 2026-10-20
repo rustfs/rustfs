@@ -3228,6 +3228,7 @@ mod tests {
     async fn local_runtime_profile_listener_checks_real_peer_credentials() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+        prepare_profile_test_provenance().await;
         for same_owner in [false, true] {
             let state = tempfile::tempdir().unwrap();
             std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();

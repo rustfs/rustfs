@@ -2519,6 +2519,318 @@ mod decommission_lock_order_tests {
         );
     }
 
+    /// Seeds a two-part null version, written before versioning was enabled,
+    /// with a delete marker or a newer version above it, on pool 0
+    /// (backlog#2873). Returns the null version's body and the seeded versions.
+    async fn seed_multipart_null_version(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        incarnation: uuid::Uuid,
+        marker_on_top: bool,
+    ) -> (Vec<u8>, rustfs_filemeta::FileInfoVersions) {
+        let first_part = vec![0x4e; 5 * 1024 * 1024];
+        let second_part = vec![0x55; 1];
+        let null_opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        let upload = new_multipart_upload(store, 0, bucket, object, null_opts.clone())
+            .await
+            .expect("create the null-version upload");
+        let multipart_opts = multipart_options(store, bucket, null_opts).await;
+        let mut parts = Vec::with_capacity(2);
+        for (part_num, part_body) in [(1, first_part.as_slice()), (2, second_part.as_slice())] {
+            let mut reader = PutObjReader::from_vec(part_body.to_vec());
+            let part = store.pools[0]
+                .put_object_part(bucket, object, &upload.upload_id, part_num, &mut reader, &multipart_opts)
+                .await
+                .expect("stage a null-version part");
+            parts.push(crate::storage_api_contracts::multipart::CompletePart {
+                part_num: part.part_num,
+                etag: part.etag,
+                ..Default::default()
+            });
+        }
+        let null_info = store.pools[0]
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload.upload_id, parts, &multipart_opts)
+            .await
+            .expect("complete the null-version upload");
+        assert!(null_info.is_multipart(), "the null version must use multipart data movement");
+
+        let versioned = ObjectOptions {
+            versioned: true,
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        if marker_on_top {
+            store.pools[0]
+                .delete_object(bucket, object, versioned)
+                .await
+                .expect("seed a delete marker over the null version");
+        } else {
+            store.pools[0]
+                .put_object(
+                    bucket,
+                    object,
+                    &mut PutObjReader::from_vec(b"written after versioning was enabled".to_vec()),
+                    &versioned,
+                )
+                .await
+                .expect("seed a newer version over the null version");
+        }
+        let seeded = store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("read the seeded versions")
+            .expect("the seeded versions must exist");
+        assert_eq!(seeded.versions.len(), 2);
+        assert!(seeded.versions[0].version_id.is_some());
+        assert!(seeded.versions[1].version_id.is_none(), "the oldest version must be the null version");
+        let mut body = first_part;
+        body.extend_from_slice(&second_part);
+        (body, seeded)
+    }
+
+    /// Both versions reached pool 1 with their identities, the null version's
+    /// bytes are intact, and the source entry on pool 0 is gone.
+    async fn assert_multipart_null_version_moved(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        body: &[u8],
+        seeded: &rustfs_filemeta::FileInfoVersions,
+    ) {
+        let target = store.pools[1]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("read the target versions")
+            .expect("both versions must reach the target pool");
+        assert_eq!(target.versions.len(), 2, "{object}: both versions must move");
+        assert_eq!(target.versions[0].version_id, seeded.versions[0].version_id);
+        assert_eq!(target.versions[0].deleted, seeded.versions[0].deleted);
+        assert!(
+            target.versions[1].version_id.is_none(),
+            "{object}: the null version must keep its identity"
+        );
+        assert_eq!(target.versions[1].mod_time, seeded.versions[1].mod_time);
+        let mut reader = store.pools[1]
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: Some(uuid::Uuid::nil().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the moved null version must be readable");
+        let mut actual = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut actual)
+            .await
+            .expect("drain the moved null version");
+        assert_eq!(
+            rustfs_utils::crypto::hex_sha256(&actual, str::to_owned),
+            rustfs_utils::crypto::hex_sha256(body, str::to_owned)
+        );
+        assert!(
+            store.pools[0]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("read the source versions")
+                .is_none(),
+            "{object}: the source entry must be removed after both versions moved"
+        );
+    }
+
+    fn multipart_null_version_capacity() -> Vec<DecommissionPoolCapacityInfo> {
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let source = 16 * 1024 * 1024;
+        let target = 256 * 1024 * 1024;
+        vec![
+            DecommissionPoolCapacityInfo::for_test(0, layout, 0, source, source),
+            DecommissionPoolCapacityInfo::for_test(1, layout, target, target, 0),
+        ]
+    }
+
+    /// The legacy (V1) capacity model runs the multipart staging cleanup proof
+    /// on every attempt. That proof must look up the exact null version on the
+    /// target; resolving the latest version found the marker or newer version
+    /// moved first and failed every attempt.
+    #[test]
+    #[serial_test::serial]
+    fn legacy_decommission_moves_multipart_null_version_behind_newer_versions() {
+        run_large_stack_current_thread_async_test(
+            "legacy-multipart-null-version",
+            legacy_decommission_moves_multipart_null_version_behind_newer_versions_case,
+        );
+    }
+
+    async fn legacy_decommission_moves_multipart_null_version_behind_newer_versions_case() {
+        let (_temp_dirs, store, _other_store) =
+            crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
+        let bucket = test_bucket("legacy-mp-null");
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create the legacy multipart null-version bucket");
+        let incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("load the bucket incarnation");
+        let mut seeded = Vec::new();
+        for (object, marker_on_top) in [("behind-marker.bin", true), ("behind-newer.bin", false)] {
+            let (body, versions) = seed_multipart_null_version(&store, &bucket, object, incarnation, marker_on_top).await;
+            seeded.push((object, body, versions));
+        }
+        set_decommission_capacity_info_overrides_for_test(store.id, (0..40).map(|_| multipart_null_version_capacity()).collect());
+        let _proof_guard = crate::services::notification_sys::without_decommission_target_fence_fleet_proof_for_test();
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("activate a legacy capacity reservation");
+        let model_version = store.pool_meta.read().await.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .expect("the legacy reservation must exist")
+            .model_version;
+        assert_eq!(model_version, 1, "a proofless start must use the legacy capacity model");
+
+        for (object, body, versions) in &seeded {
+            store
+                .decommission_entry_with_retry_state_for_test(
+                    CancellationToken::new(),
+                    0,
+                    MetaCacheEntry {
+                        name: object.to_string(),
+                        ..Default::default()
+                    },
+                    bucket.clone(),
+                    store.pools[0].get_disks_by_key(object),
+                    Some(incarnation),
+                    Arc::new(AtomicUsize::new(0)),
+                )
+                .await
+                .unwrap_or_else(|err| panic!("{object}: the legacy multipart null version must move: {err:?}"));
+            assert_multipart_null_version_moved(&store, &bucket, object, body, versions).await;
+        }
+    }
+
+    /// Under the exact (V2) capacity model the staging cleanup proof runs when
+    /// a previous attempt left a pending intent. An interrupted null-version
+    /// upload must not block every later attempt.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_retries_interrupted_multipart_null_version_behind_newer_version() {
+        run_large_stack_current_thread_async_test(
+            "interrupted-multipart-null-version",
+            decommission_retries_interrupted_multipart_null_version_behind_newer_version_case,
+        );
+    }
+
+    async fn decommission_retries_interrupted_multipart_null_version_behind_newer_version_case() {
+        let (_temp_dirs, store, other_store) =
+            crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
+        let bucket = test_bucket("interrupted-mp-null");
+        let object = "interrupted-null.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create the interrupted multipart null-version bucket");
+        let incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("load the bucket incarnation");
+        let (body, seeded) = seed_multipart_null_version(&store, &bucket, object, incarnation, false).await;
+        set_decommission_capacity_info_overrides_for_test(store.id, (0..40).map(|_| multipart_null_version_capacity()).collect());
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("activate an exact capacity reservation");
+        assert_ne!(
+            store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .expect("the exact reservation must exist")
+                .model_version,
+            1,
+            "a proven fleet must use the exact capacity model"
+        );
+
+        let part_barrier = MultipartCommitBarrier::install(&bucket, object, MultipartCommitPause::PutPartAfterRename);
+        let interrupted = tokio::spawn({
+            let store = Arc::clone(&store);
+            let bucket = bucket.clone();
+            let source_set = store.pools[0].get_disks_by_key(object);
+            async move {
+                store
+                    .decommission_entry_with_retry_state_for_test(
+                        CancellationToken::new(),
+                        0,
+                        MetaCacheEntry {
+                            name: object.to_string(),
+                            ..Default::default()
+                        },
+                        bucket,
+                        source_set,
+                        Some(incarnation),
+                        Arc::new(AtomicUsize::new(0)),
+                    )
+                    .await
+            }
+        });
+        part_barrier.wait_until_paused().await;
+        interrupted.abort();
+        let _ = interrupted.await;
+        drop(part_barrier);
+
+        // Resume on a fresh node context from the durable pool metadata, as a
+        // restarted leader would.
+        let mut persisted = crate::core::pools::PoolMeta::default();
+        persisted
+            .load_no_lock_from_replicas(other_store.pools.clone())
+            .await
+            .expect("reload the interrupted reservation");
+        let pending = persisted.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .expect("the interrupted reservation must remain durable")
+            .pending_target_physical_bytes;
+        assert!(pending > 0, "the interrupted upload must leave a pending intent to clean up");
+        *other_store.pool_meta.write().await = persisted;
+        set_decommission_capacity_info_overrides_for_test(
+            other_store.id,
+            (0..80).map(|_| multipart_null_version_capacity()).collect(),
+        );
+        other_store
+            .decommission_entry_with_retry_state_for_test(
+                CancellationToken::new(),
+                0,
+                MetaCacheEntry {
+                    name: object.to_string(),
+                    ..Default::default()
+                },
+                bucket.clone(),
+                other_store.pools[0].get_disks_by_key(object),
+                Some(incarnation),
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .await
+            .expect("the retry must clean up the interrupted upload and move the null version");
+        assert_multipart_null_version_moved(&other_store, &bucket, object, &body, &seeded).await;
+    }
+
     #[test]
     #[serial_test::serial]
     fn data_movement_multipart_restart_cleans_partial_upload_before_exact_fit_retry() {
@@ -7436,5 +7748,611 @@ mod decommission_lock_order_tests {
             })
             .await;
         });
+    }
+
+    async fn killed_leader_target(
+        store: &Arc<crate::store::ECStore>,
+        target_pool_index: usize,
+    ) -> crate::core::pools::DecommissionCapacityTarget {
+        store.pool_meta.read().await.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .and_then(|reservation| {
+                reservation
+                    .targets
+                    .iter()
+                    .find(|target| target.pool_index == target_pool_index)
+            })
+            .cloned()
+            .expect("the reservation should allocate the target pool")
+    }
+
+    async fn run_resumed_decommission_routine(store: &Arc<crate::store::ECStore>) {
+        let canceler = crate::core::pools::DecommissionCanceler::new(CancellationToken::new());
+        store.decommission_cancelers.write().await[0] = Some(canceler.clone());
+        store
+            .do_decommission_in_routine(canceler, 0, Arc::new(tokio::sync::Semaphore::new(1)))
+            .await
+            .expect("the resumed decommission routine should return");
+    }
+
+    /// Kill the decommission leader inside the target write window of a real
+    /// single-PUT migration: before the target commit, or after it but before
+    /// the capacity finalize. Returns the bucket and the interrupted mutation.
+    async fn kill_leader_inside_target_put(
+        store: &Arc<crate::store::ECStore>,
+        committed: bool,
+        object: &str,
+    ) -> (String, uuid::Uuid) {
+        // The routine also migrates `.rustfs.sys` bucket metadata, so keep the
+        // reservation far above every fixture object.
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        kill_leader_inside_target_put_with_capacity(
+            store,
+            committed,
+            object,
+            vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64 << 20, 64 << 20),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 1 << 30, 1 << 30, 0),
+            ],
+        )
+        .await
+    }
+
+    /// Like `kill_leader_inside_target_put`, with the capacity snapshot the
+    /// decommission reserves from. The selection must route the killed
+    /// migration to target pool 1.
+    async fn kill_leader_inside_target_put_with_capacity(
+        store: &Arc<crate::store::ECStore>,
+        committed: bool,
+        object: &str,
+        capacity: Vec<DecommissionPoolCapacityInfo>,
+    ) -> (String, uuid::Uuid) {
+        let bucket = test_bucket("killed-leader-put");
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create the killed-leader bucket");
+        let mut source = PutObjReader::from_vec(b"source survives the leader kill".to_vec());
+        store.pools[0]
+            .put_object(&bucket, object, &mut source, &ObjectOptions::default())
+            .await
+            .expect("write the source object before decommission starts");
+        let incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("load the killed-leader bucket incarnation");
+        set_decommission_capacity_info_overrides_for_test(store.id, vec![capacity]);
+        store
+            .save_current_pool_meta_for_decommission_start(
+                &[0],
+                vec![crate::core::pools::DecomBucketInfo {
+                    name: bucket.clone(),
+                    prefix: String::new(),
+                }],
+            )
+            .await
+            .expect("activate the killed-leader decommission");
+        let owner = decommission_capacity_owner(&*store.pool_meta.read().await);
+        let source_reader = store.pools[0]
+            .get_object_reader(
+                &bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    no_lock: true,
+                    data_movement: true,
+                    raw_data_movement_read: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read the source object for the interrupted migration");
+        let pause = if committed {
+            PutObjectCommitPause::AfterRenameHandoff
+        } else {
+            PutObjectCommitPause::BeforeQuotaRename
+        };
+        let barrier = PutObjectCommitBarrier::install(&bucket, object, pause);
+        let mut migration = tokio::spawn({
+            let migration_store = Arc::clone(store);
+            let migration_bucket = bucket.clone();
+            async move {
+                data_movement::migrate_decommission_object(
+                    migration_store,
+                    0,
+                    migration_bucket,
+                    source_reader,
+                    Some(incarnation),
+                    "killed_leader_put",
+                    Some(owner),
+                )
+                .await
+            }
+        });
+        tokio::select! {
+            () = barrier.wait_until_paused() => {}
+            result = &mut migration => {
+                panic!("the migration finished before the leader could be killed in its target write window: {result:?}");
+            }
+        }
+        // The leader dies inside the target write window.
+        migration.abort();
+        let _ = migration.await;
+        barrier.release();
+        drop(barrier);
+
+        let interrupted = killed_leader_target(store, 1)
+            .await
+            .pending_mutation_id
+            .expect("the killed mutation must leave its durable capacity intent");
+        let target_copy = store.pools[1]
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await;
+        assert_eq!(
+            target_copy.is_ok(),
+            committed,
+            "the kill window must match the requested commit state: {target_copy:?}"
+        );
+        (bucket, interrupted)
+    }
+
+    async fn assert_resumed_decommission_settled(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        interrupted: uuid::Uuid,
+    ) {
+        let local = store.pool_meta.read().await;
+        let info = local.pools[0]
+            .decommission
+            .as_ref()
+            .expect("the decommission state should remain present");
+        assert!(
+            info.complete && !info.failed && !info.canceled,
+            "the resumed decommission must complete: complete={}, failed={}, canceled={}, blocked_reason={:?}",
+            info.complete,
+            info.failed,
+            info.canceled,
+            info.capacity_blocked_reason
+        );
+        assert_eq!(info.items_decommission_failed, 0);
+        drop(local);
+        let target = killed_leader_target(store, 1).await;
+        assert_eq!(target.pending_mutation_id, None);
+        assert_eq!(target.pending_physical_bytes, 0);
+        let adopted = crate::core::pools::decommission_adopted_intent_mutation_id(interrupted);
+        assert!(
+            target
+                .temporary_mutations
+                .iter()
+                .all(|mutation| mutation.mutation_id != interrupted && mutation.mutation_id != adopted),
+            "the interrupted mutation's retry must settle its markers: {:?}",
+            target.temporary_mutations
+        );
+        assert!(target.consumed_physical_bytes > 0);
+        store.pools[1]
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("the resumed decommission should migrate the source object");
+        let source = store.pools[0]
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await;
+        assert!(
+            source
+                .as_ref()
+                .err()
+                .is_some_and(|err| crate::error::is_err_object_not_found(err) || crate::error::is_err_version_not_found(err)),
+            "the source copy should be cleaned after migration: {source:?}"
+        );
+    }
+
+    async fn resumed_decommission_settles_a_killed_leader_put_case(committed: bool, legacy: bool) {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        let _proof_guard = legacy.then(crate::services::notification_sys::without_decommission_target_fence_fleet_proof_for_test);
+        let object = "killed-leader.bin";
+        let (bucket, interrupted) = kill_leader_inside_target_put(&store, committed, object).await;
+
+        // The restarted leader resumes the same decommission. Its retry of the
+        // interrupted object either finds the committed copy and reconciles it
+        // or rewrites it, and either way settles the adopted marker.
+        run_resumed_decommission_routine(&store).await;
+        assert_resumed_decommission_settled(&store, &bucket, object, interrupted).await;
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resumed_decommission_settles_a_leader_killed_after_the_target_commit() {
+        run_large_stack_async_test("resumed-decommission-killed-after-commit", || {
+            resumed_decommission_settles_a_killed_leader_put_case(true, false)
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resumed_decommission_settles_a_leader_killed_before_the_target_commit() {
+        run_large_stack_async_test("resumed-decommission-killed-before-commit", || {
+            resumed_decommission_settles_a_killed_leader_put_case(false, false)
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resumed_legacy_decommission_settles_a_leader_killed_after_the_target_commit() {
+        run_large_stack_async_test("resumed-legacy-decommission-killed-after-commit", || {
+            resumed_decommission_settles_a_killed_leader_put_case(true, true)
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resumed_legacy_decommission_settles_a_leader_killed_before_the_target_commit() {
+        run_large_stack_async_test("resumed-legacy-decommission-killed-before-commit", || {
+            resumed_decommission_settles_a_killed_leader_put_case(false, true)
+        });
+    }
+
+    /// Move part of one target's remaining allocation to another target and
+    /// persist it, so that the next selection by remaining allocation alone
+    /// would prefer `to`.
+    async fn shift_decommission_target_allocation(store: &Arc<crate::store::ECStore>, from: usize, to: usize, bytes: usize) {
+        let mut meta = store.pool_meta.read().await.clone();
+        let reservation = meta.pools[0]
+            .decommission
+            .as_mut()
+            .and_then(|info| info.capacity_reservation.as_mut())
+            .expect("the decommission reservation should be active");
+        for target in &mut reservation.targets {
+            if target.pool_index == from {
+                target.reserved_physical_bytes -= bytes;
+            } else if target.pool_index == to {
+                target.reserved_physical_bytes += bytes;
+            }
+        }
+        meta.save(store.pools.clone())
+            .await
+            .expect("persist the shifted target allocation");
+        *store.pool_meta.write().await = meta;
+    }
+
+    async fn resumed_decommission_returns_an_uncommitted_retry_to_its_adopted_target_case(legacy: bool) {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_three_pool_stores(None).await;
+        let _proof_guard = legacy.then(crate::services::notification_sys::without_decommission_target_fence_fleet_proof_for_test);
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        // Target 1 holds most of the allocation when the leader is killed
+        // before its target commit there.
+        let object = "sticky-adopted-target.bin";
+        let (bucket, interrupted) = kill_leader_inside_target_put_with_capacity(
+            &store,
+            false,
+            object,
+            vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64 << 20, 64 << 20),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 100 << 20, 100 << 20, 0),
+                DecommissionPoolCapacityInfo::for_test(2, layout, 1 << 30, 1 << 30, 0),
+            ],
+        )
+        .await;
+        // Before the resume, target 2 has the larger remaining allocation.
+        shift_decommission_target_allocation(&store, 1, 2, 80 << 20).await;
+        assert!(
+            killed_leader_target(&store, 2).await.reserved_physical_bytes
+                > killed_leader_target(&store, 1).await.reserved_physical_bytes
+        );
+
+        run_resumed_decommission_routine(&store).await;
+        let local = store.pool_meta.read().await;
+        let info = local.pools[0]
+            .decommission
+            .as_ref()
+            .expect("the decommission state should remain present");
+        assert!(
+            info.complete && !info.failed && !info.canceled,
+            "the resumed decommission must complete: complete={}, failed={}, canceled={}, blocked_reason={:?}",
+            info.complete,
+            info.failed,
+            info.canceled,
+            info.capacity_blocked_reason
+        );
+        assert_eq!(info.items_decommission_failed, 0);
+        drop(local);
+        let adopted = crate::core::pools::decommission_adopted_intent_mutation_id(interrupted);
+        for target_pool_index in [1, 2] {
+            let target = killed_leader_target(&store, target_pool_index).await;
+            assert_ne!(target.pending_mutation_id, Some(interrupted));
+            assert!(
+                target
+                    .temporary_mutations
+                    .iter()
+                    .all(|mutation| mutation.mutation_id != interrupted && mutation.mutation_id != adopted),
+                "target pool {target_pool_index} must not keep a marker of the interrupted mutation: {:?}",
+                target.temporary_mutations
+            );
+        }
+        assert!(
+            killed_leader_target(&store, 1).await.consumed_physical_bytes > 0,
+            "the retry's commit must be charged on the target that held its adopted completion"
+        );
+        store.pools[1]
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("the retry must commit on the target that holds its adopted completion");
+        let source = store.pools[0]
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await;
+        assert!(
+            source
+                .as_ref()
+                .err()
+                .is_some_and(|err| crate::error::is_err_object_not_found(err) || crate::error::is_err_version_not_found(err)),
+            "the source copy should be cleaned after migration: {source:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resumed_decommission_returns_an_uncommitted_retry_to_its_adopted_target() {
+        run_large_stack_async_test("resumed-decommission-sticky-adopted-target", || {
+            resumed_decommission_returns_an_uncommitted_retry_to_its_adopted_target_case(false)
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resumed_legacy_decommission_returns_an_uncommitted_retry_to_its_adopted_target() {
+        run_large_stack_async_test("resumed-legacy-decommission-sticky-adopted-target", || {
+            resumed_decommission_returns_an_uncommitted_retry_to_its_adopted_target_case(true)
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn failed_intent_adoption_pauses_and_the_next_incarnation_completes() {
+        run_large_stack_async_test("failed-intent-adoption-pauses", || async {
+            let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+            let object = "adoption-failure.bin";
+            let (bucket, interrupted) = kill_leader_inside_target_put(&store, true, object).await;
+
+            crate::core::pools::fail_next_decommission_intent_adoption_for_test(store.id);
+            run_resumed_decommission_routine(&store).await;
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert!(
+                !info.complete && !info.failed && !info.canceled,
+                "an adoption failure must pause the routine, not end the decommission: complete={}, failed={}, canceled={}",
+                info.complete,
+                info.failed,
+                info.canceled
+            );
+            assert!(
+                info.capacity_blocked_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("failed to adopt target capacity intents")),
+                "the pause must name the adoption failure: {:?}",
+                info.capacity_blocked_reason
+            );
+            drop(local);
+            assert_eq!(killed_leader_target(&store, 1).await.pending_mutation_id, Some(interrupted));
+
+            run_resumed_decommission_routine(&store).await;
+            assert_resumed_decommission_settled(&store, &bucket, object, interrupted).await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn adopted_multipart_completion_survives_a_background_abort_until_reconciled() {
+        run_large_stack_async_test(
+            "adopted-multipart-completion-background-abort",
+            adopted_multipart_completion_survives_a_background_abort_until_reconciled_case,
+        );
+    }
+
+    async fn adopted_multipart_completion_survives_a_background_abort_until_reconciled_case() {
+        let (_temp_dirs, store, _other_store) =
+            test_three_pool_stores_with_three_disk_sets_with_isolated_node_contexts(None).await;
+        let bucket = test_bucket("adopted-mpu");
+        let object = "adopted-multipart-completion.bin";
+        let first_part = vec![0x61; 5 * 1024 * 1024];
+        let second_part = vec![0x62; 1];
+        let body_len = first_part.len() + second_part.len();
+        let source_version = uuid::Uuid::new_v4().to_string();
+        let source_mod_time = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(43);
+
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create the adopted multipart bucket");
+        let incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("load the adopted multipart bucket incarnation");
+        let source_opts = ObjectOptions {
+            versioned: true,
+            version_id: Some(source_version.clone()),
+            mod_time: Some(source_mod_time),
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        let source_upload = new_multipart_upload(&store, 0, &bucket, object, source_opts.clone())
+            .await
+            .expect("create the source multipart upload");
+        let source_multipart_opts = multipart_options(&store, &bucket, source_opts).await;
+        let mut source_parts = Vec::with_capacity(2);
+        for (part_num, part_body) in [(1, first_part.as_slice()), (2, second_part.as_slice())] {
+            let mut part_reader = PutObjReader::from_vec(part_body.to_vec());
+            let part = store.pools[0]
+                .put_object_part(
+                    &bucket,
+                    object,
+                    &source_upload.upload_id,
+                    part_num,
+                    &mut part_reader,
+                    &source_multipart_opts,
+                )
+                .await
+                .expect("stage the source multipart part");
+            source_parts.push(crate::storage_api_contracts::multipart::CompletePart {
+                part_num: part.part_num,
+                etag: part.etag,
+                ..Default::default()
+            });
+        }
+        let source_info = store.pools[0]
+            .clone()
+            .complete_multipart_upload(&bucket, object, &source_upload.upload_id, source_parts, &source_multipart_opts)
+            .await
+            .expect("complete the source multipart object");
+        assert!(source_info.is_multipart(), "the source must take the multipart migration path");
+
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let target_total = body_len.saturating_mul(4);
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, body_len, body_len),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 0, target_total, target_total),
+                DecommissionPoolCapacityInfo::for_test(2, layout, target_total, target_total, 0),
+            ]],
+        );
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("activate the multipart capacity reservation");
+        let owner = decommission_capacity_owner(&*store.pool_meta.read().await);
+        let source_reader = store.pools[0]
+            .get_object_reader(
+                &bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(source_version.clone()),
+                    no_lock: true,
+                    data_movement: true,
+                    raw_data_movement_read: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read the source multipart object for migration");
+
+        // The leader dies after the completion published the target and before
+        // the completion's capacity finalize.
+        let barrier = MultipartCommitBarrier::install(&bucket, object, MultipartCommitPause::AfterObjectPublication);
+        let mut migration = tokio::spawn({
+            let migration_store = Arc::clone(&store);
+            let migration_bucket = bucket.clone();
+            async move {
+                data_movement::migrate_decommission_object(
+                    migration_store,
+                    0,
+                    migration_bucket,
+                    source_reader,
+                    Some(incarnation),
+                    "adopted_multipart_completion",
+                    Some(owner),
+                )
+                .await
+            }
+        });
+        tokio::select! {
+            () = barrier.wait_until_paused() => {}
+            result = &mut migration => {
+                panic!("the multipart migration finished before its completion could be interrupted: {result:?}");
+            }
+        }
+        migration.abort();
+        let _ = migration.await;
+        barrier.release();
+        drop(barrier);
+
+        let interrupted = decommission_capacity_mutation_id(
+            owner,
+            &bucket,
+            object,
+            Some(source_version.as_str()),
+            false,
+            Some(source_mod_time),
+        );
+        let leftover = killed_leader_target(&store, 2).await;
+        assert_eq!(leftover.pending_mutation_id, Some(interrupted));
+        let completion_bytes = leftover.pending_physical_bytes;
+        assert!(completion_bytes > 0);
+
+        store
+            .adopt_previous_incarnation_decommission_capacity_intents_for_test(0)
+            .await
+            .expect("the resumed routine should adopt the interrupted completion");
+        let adopted = crate::core::pools::decommission_adopted_intent_mutation_id(interrupted);
+        let adopted_marker = killed_leader_target(&store, 2)
+            .await
+            .temporary_mutations
+            .iter()
+            .find(|mutation| mutation.mutation_id == adopted)
+            .map(|mutation| mutation.physical_bytes)
+            .expect("the interrupted completion should become its adopted-completion marker");
+        assert!(adopted_marker >= completion_bytes);
+
+        // The failed attempt's cleanup runs after the resume and finds the
+        // published target instead of a staged upload.
+        let mut cleanup_opts = ObjectOptions {
+            data_movement: true,
+            src_pool_idx: 0,
+            versioned: true,
+            version_id: Some(source_version.clone()),
+            mod_time: Some(source_mod_time),
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        let interrupted_owner = owner.with_mutation_id(interrupted);
+        interrupted_owner.apply_to(&mut cleanup_opts);
+        let multipart_fence = store
+            .acquire_decommission_multipart_mutation_fence(interrupted_owner)
+            .await
+            .expect("fence the background multipart cleanup");
+        multipart_fence.add_namespace_lock_fence(&mut cleanup_opts);
+        store
+            .reconcile_multipart_uploads_for_data_movement(
+                2,
+                &bucket,
+                object,
+                &data_movement::data_movement_upload_identity_from_options(&cleanup_opts),
+                &cleanup_opts,
+            )
+            .await
+            .expect("the background cleanup should prove the published target");
+        drop(multipart_fence);
+        assert_eq!(
+            killed_leader_target(&store, 2)
+                .await
+                .temporary_mutations
+                .iter()
+                .find(|mutation| mutation.mutation_id == adopted)
+                .map(|mutation| mutation.physical_bytes),
+            Some(adopted_marker),
+            "a cleanup that proves the committed target must not release the adopted completion"
+        );
+
+        // The interrupted mutation's retry finds the published target.
+        store
+            .reconcile_decommission_capacity_after_equivalent_target(interrupted_owner, 2, body_len)
+            .await
+            .expect("the equivalent target settles the adopted completion");
+        let settled = killed_leader_target(&store, 2).await;
+        assert_eq!(settled.consumed_physical_bytes, completion_bytes);
+        assert!(
+            settled
+                .temporary_mutations
+                .iter()
+                .all(|mutation| mutation.mutation_id != interrupted && mutation.mutation_id != adopted)
+        );
+        assert_eq!(settled.inflight_physical_bytes, 0);
     }
 }

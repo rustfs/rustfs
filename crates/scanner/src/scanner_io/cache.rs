@@ -286,6 +286,10 @@ pub(crate) struct DataUsageCacheReuseOptions {
     pub(crate) require_source: bool,
     pub(crate) tier_registry_generation: Option<u64>,
     pub(crate) checkpoint_identity: Option<crate::DataUsageScanIdentity>,
+    /// The coverage plan a sweep is started and resumed under
+    /// (`scanner_activity_coverage_digest`); `None` resumes under the reuse
+    /// plan itself, as a remote worker does with the single digest on the wire.
+    pub(crate) checkpoint_plan_digest: Option<DataUsageScanPlanDigest>,
 }
 
 #[cfg(test)]
@@ -309,6 +313,7 @@ pub(crate) fn current_cache_root_or_prepare(
             require_source,
             tier_registry_generation: None,
             checkpoint_identity: None,
+            checkpoint_plan_digest: None,
         },
     )
 }
@@ -322,6 +327,7 @@ pub(crate) fn current_cache_root_or_prepare_with_generation(
     scan_plan_digest: DataUsageScanPlanDigest,
     options: DataUsageCacheReuseOptions,
 ) -> DataUsageCacheScanState {
+    let checkpoint_plan_digest = options.checkpoint_plan_digest.unwrap_or(scan_plan_digest);
     if cache.info.next_cycle <= next_cycle
         && cache.info.leader_epoch <= leader_epoch
         && cache.info.scan_identity != options.checkpoint_identity
@@ -350,8 +356,8 @@ pub(crate) fn current_cache_root_or_prepare_with_generation(
         // Replication writebacks leave namespace generations unchanged. A
         // completed cache must start a fresh coverage sweep, even on retry.
         cache.info.scan_progress = Some(crate::DataUsageScanProgress {
-            started_plan: scan_plan_digest,
-            requested_plan: scan_plan_digest,
+            started_plan: checkpoint_plan_digest,
+            requested_plan: checkpoint_plan_digest,
         });
         cache.info.scan_plan_digest = None;
     }
@@ -368,9 +374,15 @@ pub(crate) fn current_cache_root_or_prepare_with_generation(
         current => DataUsageCacheScanState::Prepared {
             invalid_current: current.err(),
             outcome: match options.checkpoint_identity.filter(crate::DataUsageScanIdentity::is_valid) {
-                Some(identity) => {
-                    cache.prepare_bucket_checkpoint(name, next_cycle, leader_epoch, source, scan_plan_digest, identity)
-                }
+                Some(identity) => cache.prepare_bucket_checkpoint_with_coverage(
+                    name,
+                    next_cycle,
+                    leader_epoch,
+                    source,
+                    scan_plan_digest,
+                    checkpoint_plan_digest,
+                    identity,
+                ),
                 None => cache.prepare_for_scan(name, next_cycle, leader_epoch, source, scan_plan_digest, options.require_source),
             },
         },
@@ -390,6 +402,30 @@ pub(super) fn cache_snapshot_is_current(
         current_cache_root_entry_with_generation(cache, name, source, next_cycle, leader_epoch, scan_plan_digest, None),
         Ok(Some(_))
     )
+}
+
+/// A set cache that stands in for buckets whose walk stopped early is not
+/// the execution a full walk of the same cycle produces. Bind the carried
+/// bucket names so neither snapshot is adopted in place of the other by the
+/// same-execution reuse in `persist_and_publish_cache_snapshot`.
+pub(super) fn scanner_carried_execution_digest(
+    execution_digest: DataUsageScanPlanDigest,
+    carried_buckets: &[String],
+) -> DataUsageScanPlanDigest {
+    if carried_buckets.is_empty() {
+        return execution_digest;
+    }
+    let mut carried = carried_buckets.to_vec();
+    carried.sort_unstable();
+    let mut hasher = Sha256::new();
+    hasher.update(b"scanner-carried-execution-v1");
+    hasher.update(execution_digest.0);
+    hasher.update(u64::try_from(carried.len()).unwrap_or(u64::MAX).to_be_bytes());
+    for bucket in carried {
+        hasher.update(u64::try_from(bucket.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(bucket.as_bytes());
+    }
+    DataUsageScanPlanDigest(hasher.finalize().into())
 }
 
 /// Replication statistics are observational and may change within one

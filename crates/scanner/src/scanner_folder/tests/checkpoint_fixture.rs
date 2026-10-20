@@ -31,6 +31,9 @@ const SOURCE: DataUsageCacheSource = DataUsageCacheSource::new(0, 0);
 const PLAN: DataUsageScanPlanDigest = DataUsageScanPlanDigest([17; 32]);
 
 fn scan_options(scan_mode: HealScanMode) -> ScannerDiskScanOptions {
+    // These fixtures walk thousands of synthetic objects through the real
+    // local-disk path; the per-disk I/O budget would only slow them down.
+    crate::SCANNER_SLEEPER.disable_disk_io_budget_for_tests();
     ScannerDiskScanOptions {
         scan_mode,
         prefix_scan_scope: None,
@@ -945,6 +948,7 @@ async fn hot_bucket_certifies_first_full_sweep_after_mixed_end(advance_epoch: bo
                 require_source: true,
                 tier_registry_generation: Some(identity.tier_registry_generation),
                 checkpoint_identity: Some(identity),
+                checkpoint_plan_digest: None,
             },
         );
         cache.info.skip_healing = true;
@@ -1204,6 +1208,7 @@ where
                 require_source: true,
                 tier_registry_generation: None,
                 checkpoint_identity: Some(identity),
+                checkpoint_plan_digest: None,
             },
         );
         let prepared = retained(&cache);
@@ -1343,6 +1348,7 @@ where
                 require_source: true,
                 tier_registry_generation: Some(identity.tier_registry_generation),
                 checkpoint_identity: Some(identity),
+                checkpoint_plan_digest: None,
             },
         );
         cache.info.skip_healing = true;

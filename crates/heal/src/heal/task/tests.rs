@@ -14,8 +14,10 @@
 
 use super::super::{DiskOption, DiskStore, Endpoint, new_disk};
 use super::*;
+use crate::heal::EcstoreError;
 use crate::heal::storage::HealStorageObjectResult;
 
+mod absent_verdict;
 mod concurrent_delete;
 mod deferred_retry;
 mod usage_observation;
@@ -2013,6 +2015,27 @@ fn test_missing_object_dir_heal_result_matches_only_object_level_not_found() {
     assert!(!is_missing_object_dir_heal_result("x.rnd", &Error::Disk(DiskError::FileNotFound)));
 }
 
+#[test]
+fn missing_object_dir_heal_result_not_found_accepts_typed_object_and_version_absence() {
+    assert!(is_missing_object_dir_heal_result(
+        "x.rnd/",
+        &Error::Storage(EcstoreError::ObjectNotFound("bucket".to_string(), "x.rnd/".to_string()))
+    ));
+    assert!(is_missing_object_dir_heal_result(
+        "x.rnd/",
+        &Error::Storage(EcstoreError::VersionNotFound(
+            "bucket".to_string(),
+            "x.rnd/".to_string(),
+            "version".to_string()
+        ))
+    ));
+    assert!(!is_missing_object_dir_heal_result("x.rnd/", &Error::Storage(EcstoreError::DiskNotFound)));
+    assert!(!is_missing_object_dir_heal_result(
+        "x.rnd/",
+        &Error::Storage(EcstoreError::VolumeNotFound)
+    ));
+}
+
 #[async_trait::async_trait]
 impl HealStorageAPI for MockStorage {
     async fn get_object_meta(&self, _bucket: &str, _object: &str) -> Result<Option<HealObjectInfo>> {
@@ -2715,12 +2738,15 @@ async fn replacement_failure_persistence_retains_both_errors() {
 }
 
 #[tokio::test]
-async fn replacement_format_failures_consume_the_durable_budget_across_new_executors() {
+async fn replacement_format_failures_keep_the_durable_budget_across_new_executors() {
+    // backlog#2902: the rebuild budget counts attempts after the target is
+    // formatted. A failed format keeps its durable reason and leaves the
+    // budget intact, whether one executor retries or a new one is admitted.
     let directory = TempDir::new().expect("survivor root");
     let disk = make_resume_disk(&directory).await;
     let mut request = directory_backed_replacement_request();
     request.heal_endpoints = vec!["replacement-a".to_string()];
-    for attempt in 1..=3 {
+    for _attempt in 1..=3 {
         let storage = Arc::new(MockStorage {
             replacement_target_identities_ready: Mutex::new(true),
             resume_disk: Mutex::new(Some(disk.clone())),
@@ -2740,7 +2766,16 @@ async fn replacement_format_failures_consume_the_durable_budget_across_new_execu
             .expect("durable failure")
             .get_state()
             .await;
-        assert_eq!(state.retry_count, attempt, "a new executor must not reset or double-charge the attempt");
+        assert_eq!(state.retry_count, 0, "a pre-format failure must not spend a rebuild attempt");
+        assert!(state.can_retry());
+        assert!(
+            state
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("format failure")),
+            "the durable reason is retained for status: {:?}",
+            state.error_message
+        );
         assert_eq!(state.replacement_phase, ReplacementPhase::Intent);
         assert_eq!(storage.replacement_format_calls.lock().unwrap().len(), 1);
         assert!(storage.bucket_heal_calls.lock().unwrap().is_empty());
@@ -3898,12 +3933,13 @@ async fn test_heal_admin_missing_object_dir_does_not_canonicalize_plain_object()
     request.source = HealRequestSource::Admin;
     let task = HealTask::from_request(request, storage.clone());
 
-    let err = task
-        .execute()
+    task.execute()
         .await
-        .expect_err("admin object-dir request must not be canonicalized");
+        .expect("an absent admin object-dir target completes under the general not-found rule");
 
-    assert!(matches!(err, Error::TaskExecutionFailed { .. }));
+    assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+    // The invariant under test: an administrator request names an exact key
+    // and is never rewritten to the plain object that happens to exist.
     assert_eq!(storage.heal_object_calls.lock().unwrap().as_slice(), ["x.rnd/".to_string()]);
 }
 
@@ -4072,38 +4108,6 @@ async fn test_heal_recreate_scanner_synthetic_object_dir_skips_err_not_found() {
 }
 
 #[tokio::test]
-async fn test_heal_recreate_scanner_non_dir_not_found_fails() {
-    let storage = Arc::new(MockStorage {
-        object_exists: Mutex::new(Some(false)),
-        heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::ErrOther("File not found"))),
-        ..Default::default()
-    });
-    let mut request = HealRequest::new(
-        HealType::Object {
-            bucket: "bucket-a".to_string(),
-            object: "x.rnd".to_string(),
-            version_id: None,
-        },
-        HealOptions {
-            recreate_missing: true,
-            timeout: None,
-            ..Default::default()
-        },
-        HealPriority::Normal,
-    );
-    request.source = HealRequestSource::Scanner;
-    let task = HealTask::from_request(request, storage);
-
-    let err = task
-        .execute()
-        .await
-        .expect_err("scanner non-dir missing object should still fail recreate");
-
-    assert!(matches!(err, Error::TaskExecutionFailed { .. }));
-    assert!(matches!(task.get_status().await, HealTaskStatus::Failed { .. }));
-}
-
-#[tokio::test]
 async fn mrf_recreate_missing_object_records_exact_absence_receipt_with_scope() {
     let incarnation = Uuid::new_v4();
     let storage = Arc::new(MockStorage {
@@ -4254,38 +4258,6 @@ async fn test_heal_recreate_scanner_synthetic_object_dir_disk_not_found_fails() 
         .execute()
         .await
         .expect_err("scanner synthetic object-dir disk-not-found should not be skipped");
-
-    assert!(matches!(err, Error::TaskExecutionFailed { .. }));
-    assert!(matches!(task.get_status().await, HealTaskStatus::Failed { .. }));
-}
-
-#[tokio::test]
-async fn test_heal_recreate_admin_synthetic_object_dir_not_found_fails() {
-    let storage = Arc::new(MockStorage {
-        object_exists: Mutex::new(Some(false)),
-        heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::ErrOther("File not found"))),
-        ..Default::default()
-    });
-    let mut request = HealRequest::new(
-        HealType::Object {
-            bucket: "bucket-a".to_string(),
-            object: "x.rnd/".to_string(),
-            version_id: None,
-        },
-        HealOptions {
-            recreate_missing: true,
-            timeout: None,
-            ..Default::default()
-        },
-        HealPriority::Normal,
-    );
-    request.source = HealRequestSource::Admin;
-    let task = HealTask::from_request(request, storage);
-
-    let err = task
-        .execute()
-        .await
-        .expect_err("admin object-dir not-found recreate should not be skipped");
 
     assert!(matches!(err, Error::TaskExecutionFailed { .. }));
     assert!(matches!(task.get_status().await, HealTaskStatus::Failed { .. }));

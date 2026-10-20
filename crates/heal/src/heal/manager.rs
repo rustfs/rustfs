@@ -16,8 +16,8 @@ use crate::heal::{
     outcome::HealTaskOutcome,
     progress::{HealProgress, HealStatistics},
     resume::{
-        ReplacementPhase, ReplacementRecoveryCandidate, ResumeGc, ResumeManager, ResumeState, ResumeUtils,
-        merge_replacement_recovery_candidate, replacement_retry_is_exhausted_active,
+        ReplacementPhase, ReplacementRecoveryBlock, ReplacementRecoveryCandidate, ResumeGc, ResumeManager, ResumeState,
+        ResumeUtils, merge_replacement_recovery_candidate, replacement_retry_is_exhausted_active,
     },
     storage::HealStorageAPI,
     task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType, demote_to_debug_when},
@@ -985,8 +985,9 @@ pub struct HealManager {
     /// This is rebuilt from durable state after restart and never crosses the
     /// public request boundary.
     replacement_recovery_anchors: Arc<std::sync::Mutex<HashMap<String, String>>>,
-    /// Set IDs whose durable replacement metadata is corrupt or conflicting.
-    replacement_recovery_blocked_sets: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Durable replacement generations that discovery could not verify or
+    /// resolve, keyed by generation and re-evaluated on every pass.
+    replacement_recovery_blocks: ReplacementRecoveryBlocks,
     /// Durable handoff of interrupted administrator root traversals.
     root_recovery: Arc<root_recovery::RootHealRecovery>,
     /// Serialize admin starts and forceStart replacement with shutdown.
@@ -1004,6 +1005,9 @@ pub struct HealManager {
     /// Bounded, low-cardinality admission telemetry exposed through the
     /// existing operations snapshot for cluster E2E assertions.
     admission_telemetry: Arc<StdMutex<HealAdmissionTelemetry>>,
+    /// Node-local memory of terminal per-object verdicts, consulted before
+    /// queue admission (backlog#2900). Not a receipt; empty after a restart.
+    disposition_cache: Arc<StdMutex<HealDispositionCache>>,
 }
 
 /// Where a task-id lookup resolved. The variants carry the resolved state
@@ -1014,6 +1018,9 @@ enum TaskStateLookup {
     Retrying(HealTaskStatus, HealOptions),
     Completed(Arc<CompletedHealStatus>),
     Queued(HealOptions),
+    /// A durable root heal record that cannot be admitted or quarantined;
+    /// it answers status queries with the reason until an operator repairs it.
+    Unrunnable(String),
     NotFound,
 }
 
@@ -1033,6 +1040,7 @@ struct HealQueueContext<'a> {
     notify: &'a Arc<Notify>,
     cancel_token: &'a CancellationToken,
     workload_provider: &'a Option<WorkloadSnapshotProviderRef>,
+    disposition_cache: &'a Arc<StdMutex<HealDispositionCache>>,
 }
 
 impl HealManager {
@@ -1054,6 +1062,37 @@ impl HealManager {
         } else {
             HealAdmissionResult::Merged
         }
+    }
+
+    /// Requests answered from the disposition memory: best-effort object
+    /// heals. Administrator starts, forced starts, high and urgent priorities,
+    /// dry runs and durable MRF repairs always reach the queue.
+    fn disposition_gate(request: &HealRequest, mrf_notice_target: Option<&MrfRepairNoticeTarget>) -> Option<HealDispositionKey> {
+        let HealType::Object {
+            bucket,
+            object,
+            version_id,
+        } = &request.heal_type
+        else {
+            return None;
+        };
+        let durable_mrf = request.expected_mrf_bucket_incarnation_id.is_some()
+            || mrf_notice_target.is_some_and(|target| target.kind.is_durable());
+        if request.force_start
+            || request.source == HealRequestSource::Admin
+            || request.priority > HealPriority::Normal
+            || request.options.dry_run
+            || durable_mrf
+        {
+            return None;
+        }
+        Some(HealDispositionKey::new(
+            bucket,
+            object,
+            version_id.as_deref(),
+            request.options.pool_index,
+            request.options.set_index,
+        ))
     }
 
     fn can_displace_queued_work(request: &HealRequest) -> bool {
@@ -1447,28 +1486,33 @@ impl HealManager {
         remove_task_aliases_for_task(&self.task_aliases, task_id).await;
     }
 
-    fn block_replacement_recovery_set(&self, set_disk_id: &str) {
-        self.replacement_recovery_blocked_sets
-            .lock()
-            .expect("replacement recovery blocked set lock poisoned")
-            .insert(set_disk_id.to_string());
+    /// Durable replacement generations this node could not verify or
+    /// resolve, with the reason and observation times, for the admin status
+    /// surface. Entries are node-local and re-evaluated by every discovery pass.
+    pub fn replacement_recovery_blocks(&self) -> Vec<ReplacementRecoveryBlock> {
+        self.replacement_recovery_blocks.snapshot()
     }
 
-    fn replacement_recovery_set_is_blocked(&self, set_disk_id: &str) -> bool {
-        self.replacement_recovery_blocked_sets
-            .lock()
-            .expect("replacement recovery blocked set lock poisoned")
-            .contains(set_disk_id)
+    #[cfg(test)]
+    pub(super) fn replacement_recovery_generation_is_blocked(&self, task_id: &str) -> bool {
+        self.replacement_recovery_blocks.is_blocked(task_id)
     }
 
-    async fn validate_replacement_recovery_records(disk: &crate::heal::DiskStore) -> Result<()> {
-        if disk.endpoint().is_local {
-            ResumeUtils::migrate_legacy_replacement_records(disk).await?;
-        }
-        for task_id in ResumeUtils::get_replacement_intent_tasks(disk).await? {
-            ResumeManager::load_replacement_intent(disk.clone(), &task_id).await?;
-        }
-        Ok(())
+    #[cfg(test)]
+    pub(super) fn block_replacement_recovery_generation_for_test(
+        &self,
+        task_id: &str,
+        set_disk_id: &str,
+        reason: &str,
+        reserves_targets: bool,
+    ) {
+        self.replacement_recovery_blocks
+            .block(task_id, set_disk_id, reason, reserves_targets);
+    }
+
+    #[cfg(test)]
+    pub(super) fn replacement_recovery_set_has_reserving_block(&self, set_disk_id: &str) -> bool {
+        self.replacement_recovery_blocks.set_has_reserving_block(set_disk_id)
     }
 
     /// Start the bounded resume-state inspector.  Destructive GC remains
@@ -1591,7 +1635,7 @@ impl HealManager {
             retrying_heals: Arc::new(Mutex::new(HashMap::new())),
             mrf_repair_notice_targets: Arc::new(StdMutex::new(HashMap::new())),
             replacement_recovery_anchors: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            replacement_recovery_blocked_sets: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            replacement_recovery_blocks: ReplacementRecoveryBlocks::default(),
             root_recovery,
             admin_start_shutdown: Mutex::new(()),
             storage,
@@ -1600,6 +1644,7 @@ impl HealManager {
             notify: Arc::new(Notify::new()),
             workload_provider,
             admission_telemetry: Arc::new(StdMutex::new(HealAdmissionTelemetry::default())),
+            disposition_cache: Arc::new(StdMutex::new(HealDispositionCache::default())),
         }
     }
 
@@ -1934,17 +1979,17 @@ impl HealManager {
         };
         // Decode all durable responsibilities before forceStart has side effects.
         // Do not hold runtime state locks while scanning recovery records.
-        let mut quarantined_task_ids = HashSet::new();
+        let mut record_issue = None;
         let mut durable_owners = if source == HealRequestSource::Admin {
             let inventory = self.root_recovery.inventory().await?;
-            quarantined_task_ids = inventory.quarantined_task_ids;
+            record_issue = inventory.record_issue(&request.id);
             inventory.requests
         } else {
             Vec::new()
         };
-        if quarantined_task_ids.contains(&request.id) {
+        if let Some(reason) = record_issue {
             return Err(Error::Other(format!(
-                "Root heal recovery task {} is quarantined and requires operator repair",
+                "Root heal recovery task {} requires operator repair: {reason}",
                 request.id
             )));
         }
@@ -2247,6 +2292,50 @@ impl HealManager {
             });
         }
 
+        // A best-effort resubmission of an object whose last task reached a
+        // terminal verdict is answered from the node-local disposition memory
+        // before it can occupy the queue again (backlog#2900).
+        if let Some(key) = Self::disposition_gate(&request, mrf_notice_target.as_ref()) {
+            let verdict = lock_disposition_cache(&self.disposition_cache).consult(&key, tokio::time::Instant::now());
+            if let Some((disposition, recorded_task_id, hits, retry_after)) = verdict.rejection() {
+                let recorded_task_id = recorded_task_id.to_owned();
+                drop(retrying_heals);
+                drop(queue);
+                drop(active_heals);
+                let lock_phase = lock_phase_start.elapsed();
+                let admission = HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped);
+                Self::record_admission_metric(source, admission, "disposition_cache");
+                self.record_admission_observation(HealAdmissionObservation {
+                    source,
+                    result: admission,
+                    context: "disposition_cache",
+                    force_start,
+                    displaced: false,
+                    start_duration: admission_start.elapsed(),
+                    lock_phase,
+                });
+                debug!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_QUEUE_ADMISSION,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    request_id = %request.id,
+                    priority = ?request.priority,
+                    source = source.as_str(),
+                    disposition = disposition.as_str(),
+                    disposition_task_id = %recorded_task_id,
+                    disposition_hits = hits,
+                    retry_after_ms = retry_after.map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)),
+                    result = "dropped_by_disposition",
+                    "Heal queue admission answered from the disposition memory"
+                );
+                return Ok(HealAdmissionReceipt {
+                    result: admission,
+                    task_id: recorded_task_id,
+                });
+            }
+        }
+
         let durable_handoff = root_recovery::is_admin_heal_recovery(&request.heal_type, request.source);
         let durable_handoff_required = durable_handoff
             && (request.force_start
@@ -2401,10 +2490,15 @@ impl HealManager {
             terminal_completed = Some(Arc::new(completed));
         }
 
-        Ok(match terminal_completed {
-            Some(completed) => TaskStateLookup::Completed(completed),
-            None => TaskStateLookup::NotFound,
-        })
+        if let Some(completed) = terminal_completed {
+            return Ok(TaskStateLookup::Completed(completed));
+        }
+        // A durable root record that can neither run nor be quarantined still
+        // answers status queries with its reason.
+        if let Some(reason) = self.root_recovery.record_issue(canonical_task_id).await {
+            return Ok(TaskStateLookup::Unrunnable(reason));
+        }
+        Ok(TaskStateLookup::NotFound)
     }
 
     async fn publish_admin_terminal(
@@ -2466,6 +2560,7 @@ impl HealManager {
             TaskStateLookup::Retrying(status, _) => Ok(status),
             TaskStateLookup::Completed(completed) => Ok(completed.status.clone()),
             TaskStateLookup::Queued(_) => Ok(HealTaskStatus::Pending),
+            TaskStateLookup::Unrunnable(error) => Ok(HealTaskStatus::Failed { error }),
             TaskStateLookup::NotFound => Err(Error::TaskNotFound {
                 task_id: task_id.to_string(),
             }),
@@ -2486,6 +2581,9 @@ impl HealManager {
             TaskStateLookup::Retrying(status, options) => Ok(empty_task_report_with_options(status, options)),
             TaskStateLookup::Completed(completed) => Ok(completed_task_report(&completed, since)),
             TaskStateLookup::Queued(options) => Ok(empty_task_report_with_options(HealTaskStatus::Pending, options)),
+            TaskStateLookup::Unrunnable(error) => {
+                Ok(empty_task_report_with_options(HealTaskStatus::Failed { error }, HealOptions::default()))
+            }
             TaskStateLookup::NotFound => Err(Error::TaskNotFound {
                 task_id: task_id.to_string(),
             }),
@@ -2509,6 +2607,9 @@ impl HealManager {
             TaskStateLookup::Retrying(status, options) => Ok(empty_task_report_with_options(status, options)),
             TaskStateLookup::Completed(completed) => Ok(completed_task_report(&completed, since)),
             TaskStateLookup::Queued(options) => Ok(empty_task_report_with_options(HealTaskStatus::Pending, options)),
+            TaskStateLookup::Unrunnable(error) => {
+                Ok(empty_task_report_with_options(HealTaskStatus::Failed { error }, HealOptions::default()))
+            }
             TaskStateLookup::NotFound => {
                 if self.path_has_task(heal_path).await {
                     return Err(Error::InvalidClientToken);
@@ -2532,6 +2633,7 @@ impl HealManager {
             TaskStateLookup::Retrying(status, _) => Ok(status),
             TaskStateLookup::Completed(completed) => Ok(completed.status.clone()),
             TaskStateLookup::Queued(_) => Ok(HealTaskStatus::Pending),
+            TaskStateLookup::Unrunnable(error) => Ok(HealTaskStatus::Failed { error }),
             TaskStateLookup::NotFound => {
                 if self.path_has_task(heal_path).await {
                     return Err(Error::InvalidClientToken);
@@ -2947,11 +3049,13 @@ impl std::fmt::Debug for HealManager {
 }
 
 mod auto_scan;
+mod disposition;
 mod queue;
 pub(crate) mod root_recovery;
 mod scheduler;
 mod unclean_shutdown;
 
+use disposition::{HealDispositionCache, HealDispositionKey, lock_disposition_cache};
 use queue::*;
 use scheduler::*;
 use unclean_shutdown::*;
