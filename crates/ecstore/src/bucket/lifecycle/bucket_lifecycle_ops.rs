@@ -1038,6 +1038,36 @@ pub struct ExpiryState {
     recovery_notify: Arc<Notify>,
 }
 
+/// Keeps every lifecycle expiry task the process enqueues in its queue until
+/// released, as if the expiry workers were busy.
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) struct HeldExpiryQueue {
+    state: Arc<RwLock<ExpiryState>>,
+    previous: ExpiryState,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+impl HeldExpiryQueue {
+    pub(crate) async fn hold() -> Self {
+        let held = Arc::try_unwrap(ExpiryState::new_with_unconsumed_worker_channel(16))
+            .ok()
+            .expect("a new expiry state has a single owner")
+            .into_inner();
+        let state = runtime_sources::expiry_state_handle();
+        let previous = std::mem::replace(&mut *state.write().await, held);
+        Self { state, previous }
+    }
+
+    pub(crate) async fn pending_tasks(&self) -> usize {
+        self.state.read().await.pending_tasks()
+    }
+
+    /// Drops the held tasks unrun and restores the previous expiry state.
+    pub(crate) async fn release(self) {
+        *self.state.write().await = self.previous;
+    }
+}
+
 impl ExpiryState {
     #[allow(clippy::new_ret_no_self)]
     pub fn new() -> Arc<RwLock<Self>> {

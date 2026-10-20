@@ -16155,6 +16155,7 @@ impl ECStore {
             SCANNER_PAUSE_BACKLOG_PATH,
             expected,
             &[],
+            &[],
             data_movement::SourceCleanupBucketFence {
                 expected_incarnation_id: None,
                 lifecycle_guard: None,
@@ -16491,6 +16492,7 @@ impl ECStore {
         let mut free_version_disposition = DecommissionFreeVersionDisposition::default();
         let mut cleanup_preflight_allowed_missing = Vec::new();
         let mut cleanup_preflight_vanished = Vec::new();
+        let mut cleanup_transferred_tier_versions = Vec::new();
         let mut entry_blocked = false;
 
         for version in fivs.versions.iter() {
@@ -16693,6 +16695,7 @@ impl ECStore {
             let mut cleanup_ignored = false;
             let mut failure = false;
             let mut error = None;
+            let mut copy = None;
             if version.deleted {
                 let mut version_attempt = 1;
                 let mut target_busy_attempt: usize = 0;
@@ -16946,6 +16949,8 @@ impl ECStore {
                         Ok(_) => {
                             failure = false;
                             error = None;
+                            // The tiered copy commits only the exact source tuple.
+                            copy = Some(data_movement::DataMovementCopy::Committed);
                         }
                         Err(err) if is_decommission_copy_cleanup_safe_error(&err) => {
                             ignore = true;
@@ -17128,6 +17133,7 @@ impl ECStore {
                     migrate_result,
                 );
 
+                copy = migrate_result.as_ref().ok().copied();
                 if let Err(err) = migrate_result {
                     if is_decommission_copy_cleanup_safe_error(&err) {
                         ignore = true;
@@ -17243,6 +17249,11 @@ impl ECStore {
 
             if should_count_decommission_version_complete(ignore, cleanup_ignored, failure) {
                 decommissioned += 1;
+                if copy == Some(data_movement::DataMovementCopy::Committed)
+                    && version.transition_status == rustfs_filemeta::TRANSITION_COMPLETE
+                {
+                    cleanup_transferred_tier_versions.push(data_movement::source_cleanup_version_identity(version));
+                }
             }
         }
 
@@ -17305,6 +17316,7 @@ impl ECStore {
                         entry.name.as_str(),
                         &cleanup_expected,
                         &cleanup_preflight_allowed_missing,
+                        &cleanup_transferred_tier_versions,
                         data_movement::SourceCleanupBucketFence {
                             expected_incarnation_id: expected_bucket_incarnation_id,
                             lifecycle_guard: bucket_incarnation_fence
@@ -17560,6 +17572,19 @@ impl ECStore {
         bucket: String,
         set: Arc<SetDisks>,
     ) -> Result<()> {
+        self.decommission_entry_for_test_with_lifecycle(idx, entry, bucket, set, None)
+            .await
+    }
+
+    #[cfg(all(test, feature = "test-util"))]
+    pub(crate) async fn decommission_entry_for_test_with_lifecycle(
+        self: &Arc<Self>,
+        idx: usize,
+        entry: MetaCacheEntry,
+        bucket: String,
+        set: Arc<SetDisks>,
+        lifecycle_config: Option<BucketLifecycleConfiguration>,
+    ) -> Result<()> {
         let expected_bucket_incarnation_id = if is_meta_bucketname(&bucket) {
             None
         } else {
@@ -17574,7 +17599,7 @@ impl ECStore {
                 entry,
                 bucket,
                 set,
-                None,
+                lifecycle_config,
                 None,
                 None,
                 expected_bucket_incarnation_id,
@@ -19830,6 +19855,7 @@ impl ECStore {
             path,
             &source_versions,
             &[],
+            &[],
             data_movement::SourceCleanupBucketFence::default(),
             "decommission durable ILM final sweep",
         )
@@ -20299,7 +20325,7 @@ impl ECStore {
         rd: GetObjectReader,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         capacity_owner: Option<DecommissionCapacityOwner>,
-    ) -> Result<()> {
+    ) -> Result<data_movement::DataMovementCopy> {
         warn!("decommission_object: start {} {}", &bucket, &rd.object_info.name);
         let object_name = rd.object_info.name.clone();
         let mut migration = tokio::task::JoinSet::new();
