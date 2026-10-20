@@ -1707,21 +1707,10 @@ mod decommission_lock_order_tests {
             let tier_name = format!("DECOMTIER{}", &uuid::Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
             let backend = register_mock_tier(&store.pools[0].instance_ctx().tier_config_mgr(), &tier_name).await;
             put_transitioned_source_version(&store, &bucket, object, &tier_name, false, None).await;
+            let mut restore_opts = ObjectOptions::default();
+            restore_opts.transition.restore_request.days = Some(1);
             Arc::clone(&store)
-                .restore_transitioned_object(
-                    &bucket,
-                    object,
-                    &ObjectOptions {
-                        transition: crate::bucket::lifecycle::lifecycle::TransitionOptions {
-                            restore_request: s3s::dto::RestoreRequest {
-                                days: Some(1),
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                )
+                .restore_transitioned_object(&bucket, object, &restore_opts)
                 .await
                 .expect("restore the transitioned source");
             let source_versions = exact_versions(&store, 0, &bucket, object).await;
@@ -1811,24 +1800,34 @@ mod decommission_lock_order_tests {
             };
             let (expired, moved) = (source(expired.version_id), source(moved.version_id));
             assert_ne!(expired.transitioned_objname, moved.transitioned_objname);
-            let lifecycle = s3s::dto::BucketLifecycleConfiguration {
-                expiry_updated_at: None,
-                rules: vec![s3s::dto::LifecycleRule {
-                    status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
-                    expiration: None,
-                    abort_incomplete_multipart_upload: None,
-                    del_marker_expiration: None,
-                    filter: None,
-                    id: Some("expire-noncurrent".to_string()),
-                    noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
-                        noncurrent_days: Some(1),
-                        newer_noncurrent_versions: None,
-                    }),
-                    noncurrent_version_transitions: None,
-                    prefix: None,
-                    transitions: None,
-                }],
-            };
+            let lifecycle_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+  <Rule>
+    <ID>expire-noncurrent</ID>
+    <Status>Enabled</Status>
+    <Filter>
+      <Prefix></Prefix>
+    </Filter>
+    <NoncurrentVersionExpiration>
+      <NoncurrentDays>1</NoncurrentDays>
+    </NoncurrentVersionExpiration>
+  </Rule>
+</LifecycleConfiguration>"#;
+            crate::bucket::metadata_sys::update_in(
+                &store.ctx,
+                &bucket,
+                crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG,
+                lifecycle_xml.as_bytes().to_vec(),
+            )
+            .await
+            .expect("store the noncurrent expiration rule");
+            // Load it the way the decommission routine does for each bucket.
+            let lifecycle = crate::bucket::lifecycle::get_expiry_configs(&store, &bucket)
+                .await
+                .expect("the bucket lifecycle configuration should load")
+                .lifecycle
+                .map(|config| (*config).clone())
+                .expect("the bucket should have a lifecycle configuration");
 
             start_transitioned_entry_decommission(&store, &bucket).await;
             let expiry_queue = crate::bucket::lifecycle::bucket_lifecycle_ops::HeldExpiryQueue::hold().await;
