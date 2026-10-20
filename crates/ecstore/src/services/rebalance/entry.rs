@@ -1818,6 +1818,12 @@ mod tests {
 
     impl TransitionedRebalance {
         async fn new(versioned: bool, restored: bool) -> Self {
+            Self::with_source(versioned, restored, false).await
+        }
+
+        /// With `multipart`, the source is a two-part object, so the copy
+        /// settles on the multipart path rather than a single PUT.
+        async fn with_source(versioned: bool, restored: bool, multipart: bool) -> Self {
             let (temp_dirs, store, _peer) =
                 crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
             let bucket = "rebalance-transitioned";
@@ -1835,20 +1841,59 @@ mod tests {
             let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
             let tier_name = format!("REBALTIER{}", &uuid::Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
             let backend = crate::services::tier::test_util::register_mock_tier(&store.tier_config_mgr(), &tier_name).await;
-            let payload = b"transitioned before the rebalance".to_vec();
             let source_set = store.pools[0].get_disks_by_key(object);
-            let written = Box::pin(source_set.put_object(
-                bucket,
-                object,
-                &mut PutObjReader::from_vec(payload.clone()),
-                &ObjectOptions {
+            let write_opts = ObjectOptions {
+                versioned,
+                expected_bucket_incarnation_id: Some(incarnation),
+                ..Default::default()
+            };
+            let (payload, written) = if multipart {
+                // Set-level multipart writes with a bucket incarnation require
+                // the caller's lifecycle fence; stage these without one.
+                let write_opts = ObjectOptions {
                     versioned,
-                    expected_bucket_incarnation_id: Some(incarnation),
                     ..Default::default()
-                },
-            ))
-            .await
-            .expect("seed the source version");
+                };
+                let parts = [vec![0x31; 5 << 20], vec![0x32; 1]];
+                let upload = Box::pin(source_set.new_multipart_upload(bucket, object, &write_opts))
+                    .await
+                    .expect("create the source multipart upload");
+                let mut completed = Vec::with_capacity(parts.len());
+                for (part_num, body) in (1..).zip(parts.iter()) {
+                    let part = Box::pin(source_set.put_object_part(
+                        bucket,
+                        object,
+                        &upload.upload_id,
+                        part_num,
+                        &mut PutObjReader::from_vec(body.clone()),
+                        &write_opts,
+                    ))
+                    .await
+                    .expect("stage the source part");
+                    completed.push(CompletePart {
+                        part_num: part.part_num,
+                        etag: part.etag,
+                        ..Default::default()
+                    });
+                }
+                let written = Box::pin(Arc::clone(&source_set).complete_multipart_upload(
+                    bucket,
+                    object,
+                    &upload.upload_id,
+                    completed,
+                    &write_opts,
+                ))
+                .await
+                .expect("complete the source multipart object");
+                (parts.concat(), written)
+            } else {
+                let payload = b"transitioned before the rebalance".to_vec();
+                let written =
+                    Box::pin(source_set.put_object(bucket, object, &mut PutObjReader::from_vec(payload.clone()), &write_opts))
+                        .await
+                        .expect("seed the source version");
+                (payload, written)
+            };
             let version_id = written.version_id.map(|version| version.to_string());
             Box::pin(store.pools[0].transition_object(
                 bucket,
@@ -1905,6 +1950,7 @@ mod tests {
             assert_eq!(source.transition_status, TRANSITION_COMPLETE);
             assert_eq!(source.version_id.is_some(), versioned);
             assert_eq!(!source.is_remote(), restored, "a restored source keeps its local copy");
+            assert_eq!(source.parts.len() > 1, multipart, "unexpected source part layout: {:?}", source.parts);
             assert!(
                 backend.metadata(&source.transitioned_objname).await.is_some(),
                 "the transition must upload the remote object"
@@ -2044,42 +2090,56 @@ mod tests {
     /// null source instead of receiving a copy of it. Nothing references the
     /// source's remote object any more, so its source cleanup must keep a tier
     /// free version to delete it.
+    async fn run_superseded_restored_null_version_case(multipart: bool) {
+        let fixture = TransitionedRebalance::with_source(false, true, multipart).await;
+        let newer = b"written to the target after the source".to_vec();
+        Box::pin(fixture.store.pools[1].get_disks_by_key(fixture.object).put_object(
+            fixture.bucket,
+            fixture.object,
+            &mut PutObjReader::from_vec(newer.clone()),
+            &ObjectOptions {
+                expected_bucket_incarnation_id: Some(fixture.incarnation),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("write a newer null version on the target");
+
+        assert_eq!(fixture.run_entry().await, RebalanceEntryOutcome::Completed);
+
+        let left = fixture.versions_on(0).await;
+        assert_eq!(left.len(), 1, "the source must keep one tier free version: {left:?}");
+        assert!(left[0].tier_free_version());
+        fixture.assert_same_remote_tuple(&left[0]);
+        let target = fixture.versions_on(1).await;
+        assert_eq!(target.len(), 1, "the target keeps only its newer version: {target:?}");
+        assert!(!target[0].tier_free_version());
+        assert!(target[0].transition_status.is_empty(), "the newer version references no remote object");
+        let mut reader = fixture.store.pools[1]
+            .get_object_reader(fixture.bucket, fixture.object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("the newer target version should be readable");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("drain the newer version");
+        assert_eq!(body, newer);
+        fixture.assert_remote_object_kept().await;
+    }
+
     #[test]
     #[serial_test::serial]
     fn real_rebalance_keeps_a_free_version_for_a_restored_null_version_superseded_on_target() {
-        run_large_stack_async_test("rebalance-superseded-restored-null-version", || async {
-            let fixture = TransitionedRebalance::new(false, true).await;
-            let newer = b"written to the target after the source".to_vec();
-            Box::pin(fixture.store.pools[1].get_disks_by_key(fixture.object).put_object(
-                fixture.bucket,
-                fixture.object,
-                &mut PutObjReader::from_vec(newer.clone()),
-                &ObjectOptions {
-                    expected_bucket_incarnation_id: Some(fixture.incarnation),
-                    ..Default::default()
-                },
-            ))
-            .await
-            .expect("write a newer null version on the target");
+        run_large_stack_async_test("rebalance-superseded-restored-null-version", || {
+            run_superseded_restored_null_version_case(false)
+        });
+    }
 
-            assert_eq!(fixture.run_entry().await, RebalanceEntryOutcome::Completed);
-
-            let left = fixture.versions_on(0).await;
-            assert_eq!(left.len(), 1, "the source must keep one tier free version: {left:?}");
-            assert!(left[0].tier_free_version());
-            fixture.assert_same_remote_tuple(&left[0]);
-            let target = fixture.versions_on(1).await;
-            assert_eq!(target.len(), 1, "the target keeps only its newer version: {target:?}");
-            assert!(!target[0].tier_free_version());
-            assert!(target[0].transition_status.is_empty(), "the newer version references no remote object");
-            let mut reader = fixture.store.pools[1]
-                .get_object_reader(fixture.bucket, fixture.object, None, HeaderMap::new(), &ObjectOptions::default())
-                .await
-                .expect("the newer target version should be readable");
-            let mut body = Vec::new();
-            reader.stream.read_to_end(&mut body).await.expect("drain the newer version");
-            assert_eq!(body, newer);
-            fixture.assert_remote_object_kept().await;
+    /// The same superseded source as a multipart object settles on the
+    /// multipart copy path.
+    #[test]
+    #[serial_test::serial]
+    fn real_rebalance_keeps_a_free_version_for_a_restored_multipart_null_version_superseded_on_target() {
+        run_large_stack_async_test("rebalance-superseded-restored-multipart", || {
+            run_superseded_restored_null_version_case(true)
         });
     }
 

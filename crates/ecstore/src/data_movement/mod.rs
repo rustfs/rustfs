@@ -4435,6 +4435,83 @@ mod tests {
         }
     }
 
+    /// The resume adjudication tells a target that holds the source version
+    /// (equivalent, an old node's upload takeover, a legacy checksum target)
+    /// from a newer unversioned object that replaced it, and accepts neither
+    /// when the target's remote tier tuple differs (rustfs/backlog#2873).
+    #[test]
+    fn overwrite_resume_copy_separates_committed_from_superseded_targets() {
+        let classify = |err: &Error, target: &ObjectInfo, source: &ObjectInfo| {
+            resolve_data_movement_overwrite_resume_copy(err, Ok(Some(target.clone())), source, 0, 1, true)
+                .expect("the target should be evaluated")
+        };
+        let overwrite = Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string());
+        let mut source = overwrite_equivalence_source();
+        source.transitioned_object.status = rustfs_filemeta::TRANSITION_COMPLETE.to_string();
+        source.transitioned_object.tier = "WARM".to_string();
+        source.transitioned_object.name = "remote/object".to_string();
+        source.transitioned_object.version_id = "remote-version".to_string();
+
+        assert_eq!(classify(&overwrite, &source, &source), Some(DataMovementCopy::Committed));
+
+        let mut legacy = source.clone();
+        let mut legacy_parts = legacy.parts.as_ref().clone();
+        legacy_parts[0].checksums = None;
+        legacy.parts = Arc::new(legacy_parts);
+        let legacy_metadata = Arc::make_mut(&mut legacy.user_defined);
+        rustfs_utils::http::insert_str(legacy_metadata, SUFFIX_DATA_MOVED, "true".to_string());
+        rustfs_utils::http::insert_str(legacy_metadata, SUFFIX_DATA_MOVED_TAGS, "v1:tag=value".to_string());
+        assert_eq!(classify(&overwrite, &legacy, &source), Some(DataMovementCopy::Committed));
+
+        let mut takeover_source = source.clone();
+        let mut takeover_parts = takeover_source.parts.as_ref().clone();
+        takeover_parts[0].checksums = None;
+        takeover_source.parts = Arc::new(takeover_parts);
+        let mut takeover = ObjectInfo {
+            mod_time: OffsetDateTime::UNIX_EPOCH.checked_add(time::Duration::SECOND),
+            ..takeover_source.clone()
+        };
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut takeover.user_defined),
+            SUFFIX_DATA_MOVEMENT_UPLOAD,
+            data_movement_upload_identity(&takeover_source),
+        );
+        let invalid_upload = Error::InvalidUploadID("bucket".to_string(), "object".to_string(), "upload-id".to_string());
+        assert_eq!(classify(&invalid_upload, &takeover, &takeover_source), Some(DataMovementCopy::Committed));
+
+        for (err, target, target_source) in [
+            (&overwrite, &source, &source),
+            (&overwrite, &legacy, &source),
+            (&invalid_upload, &takeover, &takeover_source),
+        ] {
+            let mut other_remote = target.clone();
+            other_remote.transitioned_object.name = "remote/other".to_string();
+            assert_eq!(
+                classify(err, &other_remote, target_source),
+                None,
+                "a different remote tuple is not a copy"
+            );
+        }
+
+        let mut null_source = source;
+        null_source.version_id = None;
+        let newer_null = ObjectInfo {
+            etag: Some("etag-client-write".to_string()),
+            mod_time: OffsetDateTime::UNIX_EPOCH.checked_add(time::Duration::SECOND),
+            transitioned_object: Default::default(),
+            ..null_source.clone()
+        };
+        assert_eq!(
+            classify(&Error::PreconditionFailed, &newer_null, &null_source),
+            Some(DataMovementCopy::Superseded)
+        );
+        assert_eq!(
+            classify(&overwrite, &newer_null, &null_source),
+            None,
+            "only a precondition conflict can be superseded"
+        );
+    }
+
     #[test]
     fn test_overwrite_error_rejects_newer_unversioned_target() {
         let source = ObjectInfo {
