@@ -41,7 +41,7 @@ const REBALANCE_CLEANUP_WARNING_ENTRY_LIMIT: usize = 10;
 
 mod control;
 #[cfg(test)]
-pub(crate) use control::REBALANCE_REFRESH_MOVEMENT_GATE;
+pub(crate) use control::{REBALANCE_REFRESH_ACTIVATION_GATE, REBALANCE_REFRESH_MOVEMENT_GATE, REBALANCE_REFRESH_START_GATE};
 mod entry;
 mod meta;
 mod migration;

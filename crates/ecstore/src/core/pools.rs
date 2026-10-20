@@ -116,9 +116,10 @@ const DECOMMISSION_TARGET_FLEET_PROOF_EXPIRED: &str =
 /// activation gate and the data-movement writer. A movement side effect keeps
 /// a read on the movement gate for as long as it runs, so a large or stalled
 /// copy would otherwise hold the start, and every reader queued behind it,
-/// indefinitely. It stays below the default internode RPC timeout (30 s) so a
-/// start forwarded from another node gets the leader's answer, not an RPC
-/// timeout.
+/// indefinitely. It stays below the default internode RPC timeout (30 s) so
+/// gate waits alone cannot push a forwarded start past that timeout; the
+/// start's other work is not bounded by it, and a forwarded start whose RPC
+/// times out is dropped wherever it is (see the decommission operator docs).
 const DECOMMISSION_START_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 pub(crate) const DECOMMISSION_ACTIVATION_START_GATE: &str = "start gate (decommission activation)";
 pub(crate) const DECOMMISSION_ACTIVATION_MOVEMENT_GATE: &str = "data movement gate (decommission activation)";
@@ -19836,6 +19837,112 @@ mod tests {
                 .await
                 .expect("a free gate is taken with the budget spent"),
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_wait_budget_is_shared_across_waits() {
+        let budget = GateWaitBudget::new(std::time::Duration::from_millis(100));
+        let gate_a = Arc::new(tokio::sync::RwLock::new(()));
+        let gate_b = Arc::new(tokio::sync::RwLock::new(()));
+
+        let held_a = Arc::clone(&gate_a).read_owned().await;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            drop(held_a);
+        });
+        let started = tokio::time::Instant::now();
+        drop(
+            budget
+                .acquire("a", gate_a.write())
+                .await
+                .expect("gate a frees within the budget"),
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::from_millis(60));
+
+        let _held_b = Arc::clone(&gate_b).read_owned().await;
+        let started = tokio::time::Instant::now();
+        let err = budget
+            .acquire("b", gate_b.write())
+            .await
+            .expect_err("gate b gets only what gate a left of the budget");
+        assert_eq!(started.elapsed(), std::time::Duration::from_millis(40));
+        assert_eq!(timed_out_gate(&err), Some(("b", std::time::Duration::from_millis(100))));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_start_wait_for_a_held_start_gate_is_bounded() {
+        let (_temp_dirs, store, _other_store) = startable_decommission_store().await;
+        let baseline = load_pool_meta_replicas(store.pools.clone(), true)
+            .await
+            .expect("baseline pool metadata should be readable");
+        set_decommission_start_gate_wait_for_test(store.id, std::time::Duration::from_millis(500));
+
+        // Another start, a rebalance transition, or intent adoption after a
+        // leader restart holds the start gate.
+        let held_start_gate = store.start_gate.lock().await;
+        let err = tokio::time::timeout(std::time::Duration::from_secs(10), store.start_decommission(vec![0]))
+            .await
+            .expect("a start must not hang behind a held start gate")
+            .expect_err("a start must fail while the start gate stays held");
+        assert_eq!(
+            timed_out_gate(&err).map(|(gate, _)| gate),
+            Some(crate::services::rebalance::REBALANCE_REFRESH_START_GATE),
+            "{err:?}"
+        );
+        drop(held_start_gate);
+        assert_start_left_no_trace(&store, &baseline).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_start_wait_for_an_in_flight_rebalance_entry_is_bounded() {
+        let (_temp_dirs, store, _other_store) = startable_decommission_store().await;
+        let baseline = load_pool_meta_replicas(store.pools.clone(), true)
+            .await
+            .expect("baseline pool metadata should be readable");
+        set_decommission_start_gate_wait_for_test(store.id, std::time::Duration::from_millis(500));
+        let activation_gate = {
+            let mut rebalance_meta = store.rebalance_meta.write().await;
+            let meta = rebalance_meta.insert(RebalanceMeta::default());
+            Arc::clone(&meta.activation_gate)
+        };
+
+        let in_flight_entry = activation_gate.read_owned().await;
+        let err = tokio::time::timeout(std::time::Duration::from_secs(10), store.start_decommission(vec![0]))
+            .await
+            .expect("a start must not hang behind an in-flight rebalance entry")
+            .expect_err("a start must fail while the rebalance activation gate stays held");
+        assert_eq!(
+            timed_out_gate(&err).map(|(gate, _)| gate),
+            Some(crate::services::rebalance::REBALANCE_REFRESH_ACTIVATION_GATE),
+            "{err:?}"
+        );
+        drop(in_flight_entry);
+        assert_start_left_no_trace(&store, &baseline).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_entry_wait_is_bounded() {
+        let (_temp_dirs, store, _other_store) = startable_decommission_store().await;
+        let baseline = load_pool_meta_replicas(store.pools.clone(), true)
+            .await
+            .expect("baseline pool metadata should be readable");
+        set_decommission_start_gate_wait_for_test(store.id, std::time::Duration::from_millis(500));
+
+        let stuck_side_effect = store.ctx.data_movement_operation_gate().read_owned().await;
+        let err = tokio::time::timeout(std::time::Duration::from_secs(10), store.decommission(CancellationToken::new(), vec![0]))
+            .await
+            .expect("the admin and RPC start entry must not hang behind a stuck movement side effect")
+            .expect_err("the start entry must fail while the movement gate stays busy");
+        assert_eq!(
+            timed_out_gate(&err).map(|(gate, _)| gate),
+            Some(crate::services::rebalance::REBALANCE_REFRESH_MOVEMENT_GATE),
+            "{err:?}"
+        );
+        assert_start_left_no_trace(&store, &baseline).await;
+        drop(stuck_side_effect);
     }
 
     #[tokio::test]
