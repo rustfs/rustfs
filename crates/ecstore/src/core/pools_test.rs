@@ -507,6 +507,112 @@ mod decommission_lock_order_tests {
         assert_lock_order_with_tail(mutation, false).await;
     }
 
+    /// Leave inflight bytes on the active decommission's allocation for
+    /// `target_pool_index` that no mutation will settle, as a lost marker
+    /// would, and persist them.
+    async fn strand_decommission_target_marker(store: &Arc<crate::store::ECStore>, target_pool_index: usize, bytes: usize) {
+        let mut meta = store.pool_meta.read().await.clone();
+        let reservation = meta.pools[0]
+            .decommission
+            .as_mut()
+            .and_then(|info| info.capacity_reservation.as_mut())
+            .expect("the decommission reservation should be active");
+        let target = reservation
+            .targets
+            .iter_mut()
+            .find(|target| target.pool_index == target_pool_index)
+            .expect("the reservation should allocate the target pool");
+        target
+            .temporary_mutations
+            .push(crate::core::pools::DecommissionCapacityTemporaryMutation {
+                mutation_id: uuid::Uuid::new_v4(),
+                physical_bytes: bytes,
+            });
+        target.inflight_physical_bytes += bytes;
+        target.observed_physical_bytes += bytes;
+        reservation.inflight_target_physical_bytes += bytes;
+        reservation.observed_target_physical_bytes += bytes;
+        meta.save(store.pools.clone())
+            .await
+            .expect("persist the stranded target marker");
+        *store.pool_meta.write().await = meta;
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_completes_on_other_pools_while_one_pool_exceeds_its_temporary_budget() {
+        run_large_stack_async_test("decommission-over-budget-target-pool", || async {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("over-budget-target-pool");
+            let object = "over-budget-target-pool.bin";
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create the over-budget bucket");
+            let mut source = PutObjReader::from_vec(b"migrates around the over-budget pool".to_vec());
+            store.pools[0]
+                .put_object(&bucket, object, &mut source, &ObjectOptions::default())
+                .await
+                .expect("write the source object before decommission starts");
+            // Of the 128 MiB peak, target 1 takes 100 MiB and target 2 the
+            // other 28 MiB; both stay far above the fixture and the
+            // `.rustfs.sys` metadata the routine also migrates.
+            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+            set_decommission_capacity_info_overrides_for_test(
+                store.id,
+                vec![vec![
+                    DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64 << 20, 64 << 20),
+                    DecommissionPoolCapacityInfo::for_test(1, layout, 100 << 20, 100 << 20, 0),
+                    DecommissionPoolCapacityInfo::for_test(2, layout, 1 << 30, 1 << 30, 0),
+                ]],
+            );
+            store
+                .save_current_pool_meta_for_decommission_start(
+                    &[0],
+                    vec![crate::core::pools::DecomBucketInfo {
+                        name: bucket.clone(),
+                        prefix: String::new(),
+                    }],
+                )
+                .await
+                .expect("activate the decommission");
+            // Target 1's temporary-copy budget is 50 MiB.
+            strand_decommission_target_marker(&store, 1, 60 << 20).await;
+
+            let canceler = crate::core::pools::DecommissionCanceler::new(CancellationToken::new());
+            store.decommission_cancelers.write().await[0] = Some(canceler.clone());
+            store
+                .do_decommission_in_routine(canceler, 0, Arc::new(tokio::sync::Semaphore::new(1)))
+                .await
+                .expect("the decommission routine should return");
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert!(
+                info.complete && !info.failed && !info.canceled,
+                "one over-budget pool must not pause the decommission: complete={}, failed={}, canceled={}, blocked_reason={:?}",
+                info.complete,
+                info.failed,
+                info.canceled,
+                info.capacity_blocked_reason
+            );
+            drop(local);
+            store.pools[2]
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect("the object must migrate to the pool within its budget");
+            assert!(
+                store.pools[1]
+                    .get_object_info(&bucket, object, &ObjectOptions::default())
+                    .await
+                    .is_err(),
+                "target selection must skip the over-budget pool"
+            );
+        });
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn no_active_external_commit_probe_blocks_decommission_activation_until_commit_owns_it() {
