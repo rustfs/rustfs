@@ -144,11 +144,12 @@ mod tests {
         rustfs_common::set_global_local_node_name("").await;
         let (resolving_tx, resolving_rx) = mpsc::channel();
         let (published_tx, published_rx) = mpsc::channel();
+        let runtime = tokio::runtime::Handle::current();
         let writer = std::thread::spawn(move || {
             resolving_rx
                 .recv_timeout(Duration::from_secs(30))
                 .expect("address fallback should announce readiness before publication");
-            *rustfs_common::GLOBAL_LOCAL_NODE_NAME.blocking_write() = "published-node".to_string();
+            runtime.block_on(rustfs_common::set_global_local_node_name("published-node"));
             published_tx.send(()).expect("address fallback should wait for publication");
         });
 

@@ -131,19 +131,18 @@ async fn missing_identity_keeps_loopback_fallback_when_netlink_is_denied() {
 }
 
 #[tokio::test]
-async fn contended_identity_keeps_fallback_and_recovers_after_writer_release() {
+async fn missing_identity_recovers_after_publication_with_netlink_denied() {
     let action = libc::SECCOMP_RET_ERRNO | u32::try_from(libc::EPERM).expect("EPERM fits seccomp errno data");
-    let (unavailable, fallback, published) = with_faulted_worker("node-a:9000", action, || {
-        let mut writer = rustfs_common::GLOBAL_LOCAL_NODE_NAME.blocking_write();
-        *writer = "node-b:9000".to_string();
+    let runtime = tokio::runtime::Handle::current();
+    let (unavailable, fallback, published) = with_faulted_worker("", action, move || {
         let unavailable = rustfs_common::try_get_global_local_node_name().is_none();
         let fallback = current_local_node_identity();
-        drop(writer);
+        runtime.block_on(rustfs_common::set_global_local_node_name("node-b:9000"));
         (unavailable, fallback, current_local_node_identity())
     })
     .await;
 
-    assert!(unavailable, "the real nonblocking getter must observe writer contention");
+    assert!(unavailable, "the real nonblocking getter must observe the missing name");
     assert_eq!(fallback, "127.0.0.1");
     assert_eq!(published, "node-b:9000");
 }
