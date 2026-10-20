@@ -4257,16 +4257,20 @@ fn merge_pool_meta_updates_for_save(
         {
             let persisted_terminal = (persisted_info.complete, persisted_info.failed, persisted_info.canceled);
             let current_terminal = (current_info.complete, current_info.failed, current_info.canceled);
-            if persisted_terminal != (false, false, false) && persisted_terminal != current_terminal {
+            let is_retry = is_decommission_retry_transition(persisted_pool, current_pool);
+            if persisted_terminal != (false, false, false) && persisted_terminal != current_terminal && !is_retry {
                 record_pool_meta_stale_write_rejection("terminal_state_regression");
                 return Err(Error::other(format!(
                     "{operation}: stale pool metadata update rejected for pool {idx}; terminal state cannot be replaced"
                 )));
             }
+            // A retry carries successful progress and its unresolved ledger;
+            // the per-attempt failure counters are intentionally rebuilt.
             if current_info.items_decommissioned < persisted_info.items_decommissioned
-                || current_info.items_decommission_failed < persisted_info.items_decommission_failed
                 || current_info.bytes_done < persisted_info.bytes_done
-                || current_info.bytes_failed < persisted_info.bytes_failed
+                || (!is_retry
+                    && (current_info.items_decommission_failed < persisted_info.items_decommission_failed
+                        || current_info.bytes_failed < persisted_info.bytes_failed))
             {
                 record_pool_meta_stale_write_rejection("progress_regression");
                 return Err(Error::other(format!(
@@ -4278,6 +4282,49 @@ fn merge_pool_meta_updates_for_save(
     }
 
     Ok(())
+}
+
+/// Allow a retry to replace only a terminal record that retains its unresolved
+/// ledger. The active retry gets a new source generation, so that field is
+/// intentionally ignored while the entry identity and observation are fenced.
+fn is_decommission_retry_transition(persisted_pool: &PoolStatus, current_pool: &PoolStatus) -> bool {
+    let (Some(persisted), Some(current)) = (persisted_pool.decommission.as_ref(), current_pool.decommission.as_ref()) else {
+        return false;
+    };
+
+    if (!persisted.failed && !persisted.canceled)
+        || persisted.complete
+        || !is_decommission_active(current.complete, current.failed, current.canceled)
+        || persisted.unresolved_entries.is_empty()
+        || persisted.unresolved_entries.len() != current.unresolved_entries.len()
+        || current_pool.last_update <= persisted_pool.last_update
+    {
+        return false;
+    }
+
+    let generation_advanced = match (persisted.start_time, current.start_time, current.queued) {
+        (previous, Some(current), _) => previous.is_none_or(|previous| current > previous),
+        (None, None, true) => true,
+        _ => false,
+    };
+    if !generation_advanced {
+        return false;
+    }
+
+    persisted
+        .unresolved_entries
+        .iter()
+        .zip(&current.unresolved_entries)
+        .all(|(persisted, current)| {
+            persisted.bucket == current.bucket
+                && persisted.object == current.object
+                && persisted.pool_index == current.pool_index
+                && persisted.set_index == current.set_index
+                && persisted.candidate_count == current.candidate_count
+                && persisted.disk_error_count == current.disk_error_count
+                && persisted.observed_at == current.observed_at
+                && persisted.reason == current.reason
+        })
 }
 
 fn publish_pool_meta_updates(current: &mut PoolMeta, saved: &PoolMeta, indices: &[usize]) {
@@ -30166,6 +30213,135 @@ mod pools_tests {
 
         assert!(err.to_string().contains("stale pool metadata update rejected"));
         assert!(persisted.pools[0].decommission.as_ref().is_some_and(|info| info.canceled));
+    }
+
+    #[test]
+    fn test_pool_meta_save_merge_allows_retry_with_unresolved_entries() {
+        let previous = OffsetDateTime::from_unix_timestamp(1_000).expect("fixed timestamp should be valid");
+        let retry = OffsetDateTime::from_unix_timestamp(2_000).expect("fixed timestamp should be valid");
+        let unresolved_entry = DecommissionUnresolvedEntry {
+            bucket: "bucket-a".to_string(),
+            object: "object-a".to_string(),
+            pool_index: 0,
+            set_index: 0,
+            source_generation: previous,
+            candidate_count: 1,
+            disk_error_count: 1,
+            observed_at: previous,
+            reason: "metadata_resolution_failed".to_string(),
+        };
+
+        for (failed, canceled) in [(true, false), (false, true)] {
+            let mut persisted = PoolMeta {
+                pools: vec![PoolStatus {
+                    id: 0,
+                    cmd_line: "pool-0".to_string(),
+                    last_update: previous,
+                    decommission: Some(PoolDecommissionInfo {
+                        failed,
+                        canceled,
+                        start_time: failed.then_some(previous),
+                        items_decommissioned: 7,
+                        items_decommission_failed: 3,
+                        bytes_done: 1_024,
+                        bytes_failed: 256,
+                        unresolved_entries: vec![unresolved_entry.clone()],
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            };
+            let mut current = persisted.clone();
+            if failed {
+                current
+                    .decommission_at_for_test(
+                        0,
+                        PoolSpaceInfo {
+                            total: 200,
+                            free: 50,
+                            used: 150,
+                        },
+                        retry,
+                        None,
+                    )
+                    .expect("failed decommission with unresolved entries should retry");
+            } else {
+                current
+                    .queue_decommission(
+                        0,
+                        PoolSpaceInfo {
+                            total: 200,
+                            free: 50,
+                            used: 150,
+                        },
+                    )
+                    .expect("canceled decommission with unresolved entries should queue a retry");
+            }
+
+            merge_pool_meta_updates_for_save(&mut persisted, &current, &[0], "decommission retry")
+                .expect("a retry must replace only its matching terminal predecessor");
+            let retried = persisted.pools[0]
+                .decommission
+                .as_ref()
+                .expect("retried decommission metadata should remain present");
+            assert!(!retried.complete);
+            assert!(!retried.failed);
+            assert!(!retried.canceled);
+            assert_eq!(retried.items_decommissioned, 7);
+            assert_eq!(retried.bytes_done, 1_024);
+            assert_eq!(retried.unresolved_entries.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_pool_meta_save_merge_rejects_retry_with_changed_unresolved_entries() {
+        let previous = OffsetDateTime::from_unix_timestamp(1_000).expect("fixed timestamp should be valid");
+        let mut persisted = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: previous,
+                decommission: Some(PoolDecommissionInfo {
+                    failed: true,
+                    unresolved_entries: vec![DecommissionUnresolvedEntry {
+                        bucket: "bucket-a".to_string(),
+                        object: "object-a".to_string(),
+                        pool_index: 0,
+                        set_index: 0,
+                        source_generation: previous,
+                        candidate_count: 1,
+                        disk_error_count: 1,
+                        observed_at: previous,
+                        reason: "metadata_resolution_failed".to_string(),
+                    }],
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+        let mut current = persisted.clone();
+        current
+            .decommission_at_for_test(
+                0,
+                PoolSpaceInfo {
+                    total: 200,
+                    free: 50,
+                    used: 150,
+                },
+                previous + Duration::seconds(1),
+                None,
+            )
+            .expect("failed decommission with unresolved entries should retry");
+        current.pools[0]
+            .decommission
+            .as_mut()
+            .expect("retried decommission metadata should exist")
+            .unresolved_entries[0]
+            .object = "different-object".to_string();
+
+        let err = merge_pool_meta_updates_for_save(&mut persisted, &current, &[0], "decommission retry")
+            .expect_err("a retry must not replace its unresolved-entry ledger");
+        assert!(err.to_string().contains("terminal state cannot be replaced"));
     }
 
     #[test]
