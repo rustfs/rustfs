@@ -966,6 +966,12 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
 
     async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogLockGuard>;
 
+    /// Authorize adopting a caller-selected warehouse prefix. Request adapters
+    /// enforce the caller's policy; trusted storage backends have no IAM identity.
+    async fn authorize_table_warehouse_location(&self, _table_bucket: &str, _location: &str) -> TableCatalogStoreResult<()> {
+        Ok(())
+    }
+
     async fn begin_table_bucket_commit_publication(&self, _table_bucket: &str) -> TableCatalogStoreResult<()> {
         Ok(())
     }

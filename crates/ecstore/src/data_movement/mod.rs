@@ -1130,6 +1130,43 @@ pub(crate) fn source_cleanup_version_identity(version: &FileInfo) -> SourceClean
     }
 }
 
+/// Source versions whose transitioned remote object a committed data-movement
+/// copy now references from the target pool.
+///
+/// Removing a transitioned version from xl.meta normally appends a tier free
+/// version that owns the remote delete. After a move the target copy is the
+/// live reference to that remote object, so the source must not get an owner
+/// of its own: it would fail the decommission post-check and could only be
+/// consumed once the target copy is gone. A version that did not move keeps
+/// its free version: one lifecycle expired during the move, or one a newer
+/// unversioned target object superseded ([`DataMovementCopy::Superseded`]).
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct TransferredTierVersions(Arc<[SourceCleanupVersionIdentity]>);
+
+impl TransferredTierVersions {
+    fn new(versions: &[SourceCleanupVersionIdentity]) -> Option<Self> {
+        (!versions.is_empty()).then(|| Self(versions.iter().cloned().map(Self::without_name).collect()))
+    }
+
+    // Every version of one cleanup belongs to the same key, but the mover and
+    // the delete name a directory object differently.
+    fn without_name(mut identity: SourceCleanupVersionIdentity) -> SourceCleanupVersionIdentity {
+        identity.name.clear();
+        identity
+    }
+
+    pub(crate) fn contains(&self, version: &FileInfo) -> bool {
+        self.0.contains(&Self::without_name(source_cleanup_version_identity(version)))
+    }
+}
+
+impl std::fmt::Debug for TransferredTierVersions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TransferredTierVersions").field(&self.0.len()).finish()
+    }
+}
+
 fn source_cleanup_versions_match_with_allowed_missing(
     expected: &FileInfoVersions,
     current: &FileInfoVersions,
@@ -1359,12 +1396,16 @@ async fn pause_source_cleanup_before_delete(bucket: &str, object: &str) {
     }
 }
 
+/// `transferred_tier_versions` lists the transitioned versions whose copy
+/// settled as [`DataMovementCopy::Committed`]; see [`TransferredTierVersions`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn cleanup_source_entry_if_unchanged(
     set: Arc<SetDisks>,
     bucket: &str,
     object: &str,
     expected: &FileInfoVersions,
     allowed_missing: &[SourceCleanupVersionIdentity],
+    transferred_tier_versions: &[SourceCleanupVersionIdentity],
     bucket_fence: SourceCleanupBucketFence<'_>,
     op_label: &str,
 ) -> std::result::Result<ObjectInfo, SourceCleanupError> {
@@ -1414,6 +1455,7 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
         delete_prefix: true,
         delete_prefix_object: true,
         data_movement: true,
+        data_movement_transferred_tier_versions: TransferredTierVersions::new(transferred_tier_versions),
         no_lock: true,
         expected_bucket_incarnation_id: bucket_fence.expected_incarnation_id,
         ..Default::default()
@@ -1469,6 +1511,19 @@ async fn find_data_movement_target_info(
     }
 }
 
+/// How a data-movement copy settled on its target pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DataMovementCopy {
+    /// The target holds this exact source version, committed by this copy or
+    /// found equivalent from an earlier attempt, so it also holds any remote
+    /// tier tuple of the version.
+    Committed,
+    /// A newer unversioned object on the target replaced the source. The
+    /// target holds no copy of the source and no reference to its remote tier
+    /// object.
+    Superseded,
+}
+
 #[allow(dead_code, reason = "resume adjudication asserted by this file's tests (backlog#1823)")]
 fn resolve_data_movement_overwrite_resume_result(
     err: &Error,
@@ -1477,16 +1532,18 @@ fn resolve_data_movement_overwrite_resume_result(
     src_pool_idx: usize,
     target_pool_idx: usize,
 ) -> Result<bool> {
-    resolve_data_movement_overwrite_resume_result_for(
+    Ok(resolve_data_movement_overwrite_resume_copy(
         err,
         target_result,
         source,
         src_pool_idx,
         target_pool_idx,
         data_movement_part_checksum_writer_enabled(),
-    )
+    )?
+    .is_some())
 }
 
+#[cfg(test)]
 fn resolve_data_movement_overwrite_resume_result_for(
     err: &Error,
     target_result: Result<Option<ObjectInfo>>,
@@ -1495,30 +1552,47 @@ fn resolve_data_movement_overwrite_resume_result_for(
     target_pool_idx: usize,
     compare_part_checksums: bool,
 ) -> Result<bool> {
+    Ok(resolve_data_movement_overwrite_resume_copy(
+        err,
+        target_result,
+        source,
+        src_pool_idx,
+        target_pool_idx,
+        compare_part_checksums,
+    )?
+    .is_some())
+}
+
+fn resolve_data_movement_overwrite_resume_copy(
+    err: &Error,
+    target_result: Result<Option<ObjectInfo>>,
+    source: &ObjectInfo,
+    src_pool_idx: usize,
+    target_pool_idx: usize,
+    compare_part_checksums: bool,
+) -> Result<Option<DataMovementCopy>> {
     if scanner_backlog::is_scanner_pause_backlog(&source.bucket, &source.name)
         || !should_check_data_movement_overwrite_resume(err)
         || !should_check_data_movement_resume_target(src_pool_idx, target_pool_idx)
     {
-        return Ok(false);
+        return Ok(None);
     }
 
     let Some(target) = target_result? else {
-        return Ok(false);
+        return Ok(None);
     };
 
-    if is_equivalent_data_movement_object_identity(source, &target, true, compare_part_checksums) {
-        return Ok(true);
+    if is_equivalent_data_movement_object_identity(source, &target, true, compare_part_checksums)
+        || (compare_part_checksums && is_legacy_data_movement_checksum_target(source, &target))
+        || is_data_movement_upload_takeover_target(source, &target, compare_part_checksums)
+    {
+        return Ok(Some(DataMovementCopy::Committed));
     }
 
-    if compare_part_checksums && is_legacy_data_movement_checksum_target(source, &target) {
-        return Ok(true);
-    }
-
-    if is_data_movement_upload_takeover_target(source, &target, compare_part_checksums) {
-        return Ok(true);
-    }
-
-    Ok(matches!(err, Error::PreconditionFailed) && is_superseding_unversioned_data_movement_object(source, &target))
+    Ok(
+        (matches!(err, Error::PreconditionFailed) && is_superseding_unversioned_data_movement_object(source, &target))
+            .then_some(DataMovementCopy::Superseded),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -1535,13 +1609,13 @@ async fn should_treat_data_movement_overwrite_as_complete(
     err: &Error,
     compare_part_checksums: bool,
     capacity: DataMovementOverwriteCapacity,
-) -> Result<bool> {
+) -> Result<Option<DataMovementCopy>> {
     if !should_check_data_movement_overwrite_resume(err) {
-        return Ok(false);
+        return Ok(None);
     }
     let (src_pool_idx, target_pool_idx) = pool_indices;
 
-    let equivalent = resolve_data_movement_overwrite_resume_result_for(
+    let copy = resolve_data_movement_overwrite_resume_copy(
         err,
         find_data_movement_target_info(store, target_pool_idx, bucket, object_info).await,
         object_info,
@@ -1549,7 +1623,9 @@ async fn should_treat_data_movement_overwrite_as_complete(
         target_pool_idx,
         compare_part_checksums,
     )?;
-    if equivalent && let Some(owner) = capacity.owner {
+    if copy.is_some()
+        && let Some(owner) = capacity.owner
+    {
         let expected_data_bytes = capacity
             .expected_data_bytes
             .ok_or_else(|| Error::other("equivalent data-movement target cannot reconcile unknown committed data size"))?;
@@ -1557,7 +1633,7 @@ async fn should_treat_data_movement_overwrite_as_complete(
             .reconcile_decommission_capacity_after_equivalent_target(owner, target_pool_idx, expected_data_bytes)
             .await?;
     }
-    Ok(equivalent)
+    Ok(copy)
 }
 
 fn data_movement_part_stage_error(
@@ -1617,7 +1693,7 @@ pub(crate) async fn migrate_decommission_object(
     source_bucket_incarnation_id: Option<uuid::Uuid>,
     op_label: &str,
     capacity_owner: Option<DecommissionCapacityOwner>,
-) -> Result<()> {
+) -> Result<DataMovementCopy> {
     let source = rd.object_info.clone();
     let mutation_fence = store
         .acquire_decommission_object_mutation_fence(&bucket, &source.name)
@@ -1651,7 +1727,7 @@ pub(crate) async fn migrate_object(
     rd: GetObjectReader,
     source_bucket_incarnation_id: Option<uuid::Uuid>,
     op_label: &str,
-) -> Result<()> {
+) -> Result<DataMovementCopy> {
     migrate_object_with_lock_lost_signal(store, pool_idx, bucket, rd, source_bucket_incarnation_id, op_label, None).await
 }
 
@@ -1664,7 +1740,7 @@ pub(crate) async fn migrate_object_with_lock_lost_signal(
     source_bucket_incarnation_id: Option<uuid::Uuid>,
     op_label: &str,
     lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
-) -> Result<()> {
+) -> Result<DataMovementCopy> {
     migrate_object_inner(
         store,
         pool_idx,
@@ -1690,7 +1766,7 @@ async fn migrate_object_inner(
     lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
     capacity_owner: Option<DecommissionCapacityOwner>,
     mutation_fence: Option<DecommissionFixedReadAnchor>,
-) -> Result<()> {
+) -> Result<DataMovementCopy> {
     if scanner_backlog::is_scanner_pause_backlog(&bucket, &rd.object_info.name) {
         return Err(Error::other("scanner pause backlog requires native retirement handoff"));
     }
@@ -1764,7 +1840,7 @@ async fn migrate_object_inner(
                     bucket.as_str(),
                     object_info.name.as_str()
                 );
-                return Ok(());
+                return Ok(DataMovementCopy::Committed);
             }
             let mut cleanup_opts = data_movement_abort_opts(
                 &object_info,
@@ -1822,7 +1898,7 @@ async fn migrate_object_inner(
             }
         };
         let abort_multipart_flag = new_multipart_abort_flag();
-        let multipart_result: Result<()> = async {
+        let multipart_result: Result<DataMovementCopy> = async {
             let mut parts = vec![CompletePart::default(); object_info.parts.len()];
             let reader = Arc::new(Mutex::new(rd.stream));
             for (i, part) in object_info.parts.iter().enumerate() {
@@ -1953,7 +2029,7 @@ async fn migrate_object_inner(
                 )
                 .await
             {
-                if should_treat_data_movement_overwrite_as_complete(
+                if let Some(copy) = should_treat_data_movement_overwrite_as_complete(
                     store.as_ref(),
                     (pool_idx, target_pool_idx),
                     bucket.as_str(),
@@ -1972,7 +2048,7 @@ async fn migrate_object_inner(
                         bucket.as_str(),
                         object_info.name.as_str()
                     );
-                    return Ok(());
+                    return Ok(copy);
                 }
 
                 error!("{op_label}: complete_multipart_upload err {:?}", &err);
@@ -1986,11 +2062,13 @@ async fn migrate_object_inner(
             }
 
             mark_multipart_upload_completed(&abort_multipart_flag);
-            Ok(())
+            Ok(DataMovementCopy::Committed)
         }
         .await;
 
-        if multipart_result.is_ok() && should_abort_multipart_upload(&abort_multipart_flag) {
+        if let Ok(copy) = multipart_result
+            && should_abort_multipart_upload(&abort_multipart_flag)
+        {
             let mut abort_opts = data_movement_abort_opts(
                 &object_info,
                 pool_idx,
@@ -2014,9 +2092,9 @@ async fn migrate_object_inner(
                 )
                 .await;
             match abort_result {
-                Ok(()) => return Ok(()),
+                Ok(()) => return Ok(copy),
                 Err(abort_err) if is_err_invalid_upload_id(&abort_err) => {
-                    if should_treat_data_movement_overwrite_as_complete(
+                    if let Some(copy) = should_treat_data_movement_overwrite_as_complete(
                         store.as_ref(),
                         (pool_idx, target_pool_idx),
                         bucket.as_str(),
@@ -2030,7 +2108,7 @@ async fn migrate_object_inner(
                     )
                     .await?
                     {
-                        return Ok(());
+                        return Ok(copy);
                     }
                     return Err(data_movement_stage_error(
                         op_label,
@@ -2123,7 +2201,7 @@ async fn migrate_object_inner(
             return Err(primary_err);
         }
 
-        return Ok(());
+        return multipart_result;
     }
 
     let mut data = data_movement_put_object_reader(bucket.as_str(), &object_info, rd, op_label)?;
@@ -2151,7 +2229,7 @@ async fn migrate_object_inner(
         .await
         .map_err(|err| data_movement_stage_error(op_label, "prepare_put_object", &bucket, &object_info.name, err))?;
     if let Err(err) = put_result {
-        if should_treat_data_movement_overwrite_as_complete(
+        if let Some(copy) = should_treat_data_movement_overwrite_as_complete(
             store.as_ref(),
             (pool_idx, target_pool_idx),
             bucket.as_str(),
@@ -2170,7 +2248,7 @@ async fn migrate_object_inner(
                 bucket.as_str(),
                 object_info.name.as_str()
             );
-            return Ok(());
+            return Ok(copy);
         }
 
         error!("{op_label}: put_object err {:?}", &err);
@@ -2183,7 +2261,7 @@ async fn migrate_object_inner(
         ));
     }
 
-    Ok(())
+    Ok(DataMovementCopy::Committed)
 }
 
 #[cfg(test)]
@@ -4378,6 +4456,83 @@ mod tests {
                     .expect("a UUID delete marker must not erase a null source version")
             );
         }
+    }
+
+    /// The resume adjudication tells a target that holds the source version
+    /// (equivalent, an old node's upload takeover, a legacy checksum target)
+    /// from a newer unversioned object that replaced it, and accepts neither
+    /// when the target's remote tier tuple differs (rustfs/backlog#2873).
+    #[test]
+    fn overwrite_resume_copy_separates_committed_from_superseded_targets() {
+        let classify = |err: &Error, target: &ObjectInfo, source: &ObjectInfo| {
+            resolve_data_movement_overwrite_resume_copy(err, Ok(Some(target.clone())), source, 0, 1, true)
+                .expect("the target should be evaluated")
+        };
+        let overwrite = Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string());
+        let mut source = overwrite_equivalence_source();
+        source.transitioned_object.status = rustfs_filemeta::TRANSITION_COMPLETE.to_string();
+        source.transitioned_object.tier = "WARM".to_string();
+        source.transitioned_object.name = "remote/object".to_string();
+        source.transitioned_object.version_id = "remote-version".to_string();
+
+        assert_eq!(classify(&overwrite, &source, &source), Some(DataMovementCopy::Committed));
+
+        let mut legacy = source.clone();
+        let mut legacy_parts = legacy.parts.as_ref().clone();
+        legacy_parts[0].checksums = None;
+        legacy.parts = Arc::new(legacy_parts);
+        let legacy_metadata = Arc::make_mut(&mut legacy.user_defined);
+        rustfs_utils::http::insert_str(legacy_metadata, SUFFIX_DATA_MOVED, "true".to_string());
+        rustfs_utils::http::insert_str(legacy_metadata, SUFFIX_DATA_MOVED_TAGS, "v1:tag=value".to_string());
+        assert_eq!(classify(&overwrite, &legacy, &source), Some(DataMovementCopy::Committed));
+
+        let mut takeover_source = source.clone();
+        let mut takeover_parts = takeover_source.parts.as_ref().clone();
+        takeover_parts[0].checksums = None;
+        takeover_source.parts = Arc::new(takeover_parts);
+        let mut takeover = ObjectInfo {
+            mod_time: OffsetDateTime::UNIX_EPOCH.checked_add(time::Duration::SECOND),
+            ..takeover_source.clone()
+        };
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut takeover.user_defined),
+            SUFFIX_DATA_MOVEMENT_UPLOAD,
+            data_movement_upload_identity(&takeover_source),
+        );
+        let invalid_upload = Error::InvalidUploadID("bucket".to_string(), "object".to_string(), "upload-id".to_string());
+        assert_eq!(classify(&invalid_upload, &takeover, &takeover_source), Some(DataMovementCopy::Committed));
+
+        for (err, target, target_source) in [
+            (&overwrite, &source, &source),
+            (&overwrite, &legacy, &source),
+            (&invalid_upload, &takeover, &takeover_source),
+        ] {
+            let mut other_remote = target.clone();
+            other_remote.transitioned_object.name = "remote/other".to_string();
+            assert_eq!(
+                classify(err, &other_remote, target_source),
+                None,
+                "a different remote tuple is not a copy"
+            );
+        }
+
+        let mut null_source = source;
+        null_source.version_id = None;
+        let newer_null = ObjectInfo {
+            etag: Some("etag-client-write".to_string()),
+            mod_time: OffsetDateTime::UNIX_EPOCH.checked_add(time::Duration::SECOND),
+            transitioned_object: Default::default(),
+            ..null_source.clone()
+        };
+        assert_eq!(
+            classify(&Error::PreconditionFailed, &newer_null, &null_source),
+            Some(DataMovementCopy::Superseded)
+        );
+        assert_eq!(
+            classify(&overwrite, &newer_null, &null_source),
+            None,
+            "only a precondition conflict can be superseded"
+        );
     }
 
     #[test]

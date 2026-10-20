@@ -573,21 +573,53 @@ mod tests {
         );
     }
 
+    /// Unix timestamp of a wall-clock time in the process-local time zone,
+    /// which is the zone `Rotation::Daily` uses to decide the calendar day.
+    ///
+    /// The fixtures below use mid-January dates, which sit on no DST or
+    /// offset transition in any zone, so every wall-clock time exists exactly once.
+    fn local_ts(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u32) -> i64 {
+        Local
+            .with_ymd_and_hms(year, month, day, hour, min, sec)
+            .single()
+            .expect("fixture local time must exist exactly once")
+            .timestamp()
+    }
+
     #[test]
     fn test_daily_rotation_uses_calendar_day_boundaries() {
-        let now = Zoned::now();
-        let same_day_last = now.timestamp().as_second().saturating_sub(60);
-        assert!(!Rotation::Daily.check_should_roll(same_day_last, now.timestamp().as_second()));
+        // Fixed timestamps so the result never depends on when the test runs
+        // (a `now()`-based version failed in the first minute after midnight).
+        let noon = local_ts(2026, 1, 15, 12, 0, 0);
 
-        let previous_day_last = now.timestamp().as_second().saturating_sub(86_400);
-        let last_day = Local.timestamp_opt(previous_day_last, 0).single().map(|ts| ts.date_naive());
-        let now_day = Local
-            .timestamp_opt(now.timestamp().as_second(), 0)
-            .single()
-            .map(|ts| ts.date_naive());
-        if last_day != now_day {
-            assert!(Rotation::Daily.check_should_roll(previous_day_last, now.timestamp().as_second()));
-        }
+        // Same calendar day: no rotation.
+        assert!(!Rotation::Daily.check_should_roll(noon - 60, noon), "60s earlier on the same day");
+        assert!(
+            !Rotation::Daily.check_should_roll(local_ts(2026, 1, 15, 0, 0, 0), local_ts(2026, 1, 15, 23, 59, 59)),
+            "first and last second of the same day"
+        );
+
+        // Previous calendar day: rotate.
+        assert!(
+            Rotation::Daily.check_should_roll(local_ts(2026, 1, 14, 12, 0, 0), noon),
+            "same time of day, one day earlier"
+        );
+
+        // Crossing midnight by a single second: rotate.
+        let before_midnight = local_ts(2026, 1, 14, 23, 59, 59);
+        let midnight = local_ts(2026, 1, 15, 0, 0, 0);
+        assert_eq!(midnight - before_midnight, 1, "fixture must be exactly one second apart");
+        assert!(
+            Rotation::Daily.check_should_roll(before_midnight, midnight),
+            "23:59:59 -> 00:00:00 crosses the day boundary"
+        );
+
+        // One second on either side of the boundary stays within a day.
+        assert!(!Rotation::Daily.check_should_roll(midnight, midnight + 1), "00:00:00 -> 00:00:01");
+        assert!(
+            !Rotation::Daily.check_should_roll(before_midnight - 1, before_midnight),
+            "23:59:58 -> 23:59:59"
+        );
     }
 
     #[test]
