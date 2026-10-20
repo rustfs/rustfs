@@ -100,7 +100,7 @@ use std::sync::{
 use time::{Duration, OffsetDateTime};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument as _, debug, error, info, warn};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_POOLS: &str = "pools";
@@ -119,7 +119,7 @@ const DECOMMISSION_TARGET_FLEET_PROOF_EXPIRED: &str =
 /// indefinitely. It stays below the default internode RPC timeout (30 s) so
 /// gate waits alone cannot push a forwarded start past that timeout; the
 /// start's other work is not bounded by it, and a forwarded start whose RPC
-/// times out is dropped wherever it is (see the decommission operator docs).
+/// times out keeps running on the leader (see `ECStore::decommission`).
 const DECOMMISSION_START_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 pub(crate) const DECOMMISSION_ACTIVATION_START_GATE: &str = "start gate (decommission activation)";
 pub(crate) const DECOMMISSION_ACTIVATION_MOVEMENT_GATE: &str = "data movement gate (decommission activation)";
@@ -15024,8 +15024,24 @@ impl ECStore {
         Ok(())
     }
 
+    /// Start decommissioning `indices` from this leader.
+    ///
+    /// The start runs in its own task. Once begun it must reach its end: it
+    /// either fails before persisting anything, or persists the pools as
+    /// active, has the peers reload pool metadata and spawns the local
+    /// workers, rolling back if the reload fails. A caller that stops waiting,
+    /// such as a forwarded start whose internode RPC timed out, only gives up
+    /// on the answer; dropping the start itself could leave a pool persisted
+    /// as active with no worker and with peers still on the old metadata.
     #[tracing::instrument(skip(self, rx))]
     pub async fn decommission(self: &Arc<Self>, rx: CancellationToken, indices: Vec<usize>) -> Result<()> {
+        let store = Arc::clone(self);
+        tokio::spawn(async move { store.run_decommission_start(rx, indices).await }.in_current_span())
+            .await
+            .map_err(Error::other)?
+    }
+
+    async fn run_decommission_start(self: Arc<Self>, rx: CancellationToken, indices: Vec<usize>) -> Result<()> {
         let indices = dedup_indices(&indices);
 
         info!(
@@ -15050,7 +15066,7 @@ impl ECStore {
             .start_decommission_inner(indices, Some((&rx, local_indices.as_slice())), &budget)
             .await?;
         drop(spawn_decommission_index_cancelers(
-            Arc::clone(self),
+            Arc::clone(&self),
             rx,
             index_cancelers,
             Arc::new(Semaphore::new(decommission_entry_concurrency_limit())),
@@ -20795,6 +20811,70 @@ mod tests {
         .await;
         rx.cancel();
         outcome.expect("a dropped start must not leave the pool persisted as active without a worker");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_start_retried_while_the_first_runs_starts_once() {
+        let (_temp_dirs, store, _other_store) = startable_decommission_store().await;
+        set_decommission_start_gate_wait_for_test(store.id, std::time::Duration::from_millis(300));
+        let reload = install_decommission_start_pause_for_test(store.id, DecommissionStartPausePoint::PeerReload);
+        let rx = CancellationToken::new();
+
+        let first = tokio::spawn({
+            let store = Arc::clone(&store);
+            let rx = rx.clone();
+            async move { store.decommission(rx, vec![0]).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), reload.reached.notified())
+            .await
+            .expect("the first start should reach its peer reload");
+        let started = load_pool_meta_replicas(store.pools.clone(), true)
+            .await
+            .expect("pool metadata should be readable")
+            .meta
+            .pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.start_time)
+            .expect("the first start is persisted before its peer reload");
+
+        // A retry while the first start still holds the start gate gives up
+        // within its budget instead of starting a second time.
+        let retry = tokio::time::timeout(std::time::Duration::from_secs(10), store.decommission(rx.clone(), vec![0]))
+            .await
+            .expect("a retry must not hang behind the running start")
+            .expect_err("a retry must not start while the first start runs");
+        assert_eq!(
+            timed_out_gate(&retry).map(|(gate, _)| gate),
+            Some(crate::services::rebalance::REBALANCE_REFRESH_START_GATE),
+            "{retry:?}"
+        );
+
+        reload.proceed.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(30), first)
+            .await
+            .expect("the first start should finish")
+            .expect("first start task should not panic")
+            .expect("the first start should succeed");
+
+        // Once it has finished, a retry sees the pool already moving. Give
+        // it room to wait out the new worker's brief gate holds.
+        set_decommission_start_gate_wait_for_test(store.id, std::time::Duration::from_secs(10));
+        let late = store
+            .decommission(rx.clone(), vec![0])
+            .await
+            .expect_err("a pool that is already decommissioning must not start again");
+        assert!(timed_out_gate(&late).is_none(), "{late:?}");
+        let persisted = load_pool_meta_replicas(store.pools.clone(), true)
+            .await
+            .expect("pool metadata should be readable");
+        assert_eq!(
+            persisted.meta.pools[0].decommission.as_ref().and_then(|info| info.start_time),
+            Some(started),
+            "the pool is started exactly once"
+        );
+        rx.cancel();
     }
 
     #[tokio::test]
