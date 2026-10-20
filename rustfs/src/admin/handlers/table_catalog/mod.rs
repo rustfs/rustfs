@@ -4691,9 +4691,22 @@ struct SnapshotFileChanges {
     added_delete_files: BTreeSet<String>,
     deleted_data_files: BTreeSet<String>,
     deleted_delete_files: BTreeSet<String>,
+    existing_files: BTreeSet<String>,
+    invalid_existing_files: bool,
 }
 
 impl SnapshotFileChanges {
+    fn record_existing_file(
+        &mut self,
+        reference: crate::table_catalog::ManifestDataFileReference,
+        current_live_files: &SnapshotLiveFiles,
+    ) {
+        self.invalid_existing_files |= !current_live_files
+            .identity(&reference.location, &reference.object_kind)
+            .is_some_and(|identity| identity.matches_existing_reference(&reference));
+        self.invalid_existing_files |= !self.existing_files.insert(reference.location);
+    }
+
     fn has_delete_or_row_level_change(&self) -> bool {
         !self.added_delete_files.is_empty() || !self.deleted_data_files.is_empty() || !self.deleted_delete_files.is_empty()
     }
@@ -4709,6 +4722,7 @@ impl SnapshotFileChanges {
 
 struct SnapshotChangeContext<'a> {
     current_live_files: &'a SnapshotLiveFiles,
+    track_existing_files: bool,
     snapshot_id: i64,
     sequence_number: i64,
 }
@@ -4721,8 +4735,18 @@ struct SnapshotManifestIdentity {
 
 #[derive(PartialEq, Eq)]
 struct SnapshotFileIdentity {
+    content: crate::table_catalog::ManifestDataFileContent,
     sequence_number: Option<i64>,
     file_sequence_number: Option<i64>,
+}
+
+impl SnapshotFileIdentity {
+    fn matches_existing_reference(&self, reference: &crate::table_catalog::ManifestDataFileReference) -> bool {
+        // Iceberg v1 files have implicit sequence zero when carried into v2 manifests.
+        self.content == reference.content
+            && self.sequence_number.unwrap_or(0) == reference.sequence_number.unwrap_or(0)
+            && self.file_sequence_number.unwrap_or(0) == reference.file_sequence_number.unwrap_or(0)
+    }
 }
 
 async fn validate_table_snapshot_commit_conflicts<B>(
@@ -4785,6 +4809,7 @@ where
         snapshot,
         SnapshotChangeContext {
             current_live_files: &parent_live_files,
+            track_existing_files: operation == "replace",
             snapshot_id,
             sequence_number,
         },
@@ -4809,7 +4834,16 @@ where
             if parent_snapshot_id.is_none() {
                 return Err(s3_error!(InvalidRequest, "row-level snapshot operation requires a parent snapshot"));
             }
-            if operation == "overwrite" {
+            if operation == "replace" && !changes.has_any_change() {
+                if changes.invalid_existing_files
+                    || changes.existing_files.len() != parent_live_files.data_files.len() + parent_live_files.delete_files.len()
+                {
+                    return Err(s3_error!(
+                        InvalidRequest,
+                        "manifest rewrite must preserve the parent snapshot's live files"
+                    ));
+                }
+            } else if operation == "overwrite" {
                 if !changes.has_any_change() {
                     return Err(s3_error!(InvalidRequest, "overwrite snapshot operation requires changed files"));
                 }
@@ -4877,6 +4911,7 @@ where
             match status {
                 0 | 1 => {
                     let identity = SnapshotFileIdentity {
+                        content: reference.content,
                         sequence_number: reference.sequence_number,
                         file_sequence_number: reference.file_sequence_number,
                     };
@@ -4928,6 +4963,15 @@ where
             {
                 return Err(s3_error!(InvalidRequest, "inherited manifest must preserve its manifest-list identity"));
             }
+            if context.track_existing_files {
+                for reference in manifest
+                    .references
+                    .into_iter()
+                    .filter(|reference| matches!(reference.entry_status, Some(0 | 1)))
+                {
+                    changes.record_existing_file(reference, context.current_live_files);
+                }
+            }
             continue;
         }
         if manifest
@@ -4969,11 +5013,8 @@ where
                     .current_live_files
                     .identity(&reference.location, &reference.object_kind)
                     .is_some_and(|current_identity| {
-                        current_identity
-                            != &SnapshotFileIdentity {
-                                sequence_number: reference.sequence_number,
-                                file_sequence_number: reference.file_sequence_number,
-                            }
+                        current_identity.sequence_number != reference.sequence_number
+                            || current_identity.file_sequence_number != reference.file_sequence_number
                     })
             {
                 return Err(s3_error!(
@@ -4982,8 +5023,12 @@ where
                 ));
             }
 
-            match (status, reference.object_kind) {
-                (0, _) => {}
+            match (status, &reference.object_kind) {
+                (0, _) => {
+                    if context.track_existing_files {
+                        changes.record_existing_file(reference, context.current_live_files);
+                    }
+                }
                 (1, crate::table_catalog::TableMetadataMaintenanceObjectKind::DataFile) => {
                     changes.added_data_files.insert(reference.location);
                 }
@@ -5127,9 +5172,13 @@ async fn validate_manifest_data_file_reference<B>(
 where
     B: crate::table_catalog::TableCatalogObjectBackend,
 {
-    table_commit_object_key(bucket, entry, &reference.location, reference.object_kind.clone())?;
-    let object_key = crate::table_catalog::table_catalog_object_key_from_location(bucket, &reference.location)
-        .ok_or_else(|| s3_error!(InvalidRequest, "manifest data file location is invalid"))?;
+    let object_key = table_commit_object_key(bucket, entry, &reference.location, reference.object_kind.clone())?;
+    match reference.entry_status {
+        Some(0 | 1) => {}
+        Some(2) => return Ok(()),
+        Some(_) => return Err(s3_error!(InvalidRequest, "manifest entry status is unsupported")),
+        None => return Err(s3_error!(InvalidRequest, "manifest entry status is required")),
+    }
     if !metadata_backend
         .object_exists(bucket, &object_key)
         .await

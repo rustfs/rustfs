@@ -9340,6 +9340,572 @@ async fn row_level_conflict_rejects_changed_inherited_manifest_identity() {
     assert_eq!(unchanged.generation, current.generation);
 }
 
+fn manifest_rewrite_list_bytes(entries: &[(&str, usize, i32, i32, i64, i64, i64)], statuses: &[i32]) -> Vec<u8> {
+    let bytes = crate::table_catalog::test_support::manifest_list_avro_entries_with_min_sequences(entries);
+    let reader = apache_avro::Reader::new(bytes.as_slice()).unwrap();
+    let schema = reader.writer_schema().clone();
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new()).unwrap();
+    assert_eq!(entries.len(), statuses.len());
+    for (record, status) in reader.zip(statuses) {
+        let apache_avro::types::Value::Record(mut fields) = record.unwrap() else {
+            panic!("manifest-list entry must be a record");
+        };
+        // Each fixture manifest contains one file.
+        for (name, value) in &mut fields {
+            for (prefix, entry_status) in [("existing", 0), ("added", 1), ("deleted", 2)] {
+                let count = i32::from(*status == entry_status);
+                if *name == format!("{prefix}_files_count") {
+                    *value = apache_avro::types::Value::Int(count);
+                } else if *name == format!("{prefix}_rows_count") {
+                    *value = apache_avro::types::Value::Long(i64::from(count));
+                }
+            }
+        }
+        writer.append_value(apache_avro::types::Value::Record(fields)).unwrap();
+    }
+    writer.into_inner().unwrap()
+}
+
+#[tokio::test]
+async fn manifest_rewrite_deleted_reference_validation() {
+    let backend = TestTableCatalogObjectBackend::content_addressed();
+    let store = TestTableCatalogStore::default();
+    let namespace = crate::table_catalog::Namespace::parse("analytics").unwrap();
+    let created = create_standard_events_table(&store, &backend, &namespace).await;
+    let entry = store.load_table("warehouse", "analytics", "events").await.unwrap().unwrap();
+    let location = format!("{}/data/removed.parquet", created.metadata["location"].as_str().unwrap());
+    let bytes = test_manifest_avro_bytes(&[(&location, 0, 2, 11, 1)]);
+    let reference = crate::table_catalog::data_file_references_from_manifest_avro(&bytes)
+        .unwrap()
+        .remove(0);
+    for (status, outside, expected) in [
+        (Some(2), false, None),
+        (Some(0), false, Some("manifest referenced data file is missing")),
+        (Some(1), false, Some("manifest referenced data file is missing")),
+        (Some(2), true, Some("snapshot object is outside the table warehouse")),
+        (Some(3), false, Some("manifest entry status is unsupported")),
+        (None, false, Some("manifest entry status is required")),
+    ] {
+        let mut reference = reference.clone();
+        reference.entry_status = status;
+        if outside {
+            reference.location = "s3://warehouse/outside/data/removed.parquet".to_string();
+        }
+        let result = validate_manifest_data_file_reference(&backend, "warehouse", &entry, &reference).await;
+        if let Some(message) = expected {
+            let error = result.expect_err("invalid references must remain rejected");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            assert_eq!(error.message(), Some(message));
+        } else {
+            result.expect("a deleted entry must not require the removed object");
+        }
+    }
+}
+
+#[tokio::test]
+async fn manifest_rewrite_commit_preserves_live_files() {
+    use crate::table_catalog::test_support::manifest_avro_bytes_with_entry_sequences;
+
+    for content in [0, 1, 2] {
+        for case in [
+            "rewrite",
+            "missing_deleted",
+            "inherited_manifest",
+            "missing_live",
+            "omitted_file",
+            "extra_file",
+            "data_sequence",
+            "file_sequence",
+            "content_kind",
+            "duplicate_file",
+            "intermediate_duplicate",
+            "stale_requirement",
+            "staged_retry",
+            "staged_missing_live",
+        ] {
+            let backend = TestTableCatalogObjectBackend::content_addressed();
+            let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+            let namespace = crate::table_catalog::Namespace::parse("analytics").unwrap();
+            let created = create_standard_events_table(&store, &backend, &namespace).await;
+            let location = created.metadata["location"].as_str().unwrap();
+            let removed = format!("{location}/data/removed.parquet");
+            let retained = format!("{location}/data/retained.parquet");
+            let added = format!("{location}/data/added.parquet");
+            let extra = format!("{location}/data/extra.parquet");
+            let mut parent_manifests = Vec::new();
+
+            for (snapshot_id, sequence, operation, files) in [
+                (10, 1, "append", vec![(&removed, 0, 1, 10, 1), (&retained, 0, 1, 10, 1)]),
+                (
+                    11,
+                    2,
+                    "overwrite",
+                    vec![(&removed, 0, 2, 11, 1), (&retained, 0, 0, 10, 1), (&added, content, 1, 11, 2)],
+                ),
+            ] {
+                let mut manifests = Vec::new();
+                for (index, (file, file_content, status, entry_snapshot, entry_sequence)) in files.iter().enumerate() {
+                    let manifest = format!("{location}/metadata/manifest-{snapshot_id}-{index}.avro");
+                    let bytes = test_manifest_avro_bytes(&[(file, *file_content, *status, *entry_snapshot, *entry_sequence)]);
+                    manifests.push((manifest.clone(), bytes.len(), i32::from(*file_content != 0), *entry_sequence));
+                    backend
+                        .put_bytes("warehouse", &test_snapshot_object_key("warehouse", &manifest), bytes)
+                        .await;
+                }
+                seed_test_manifest_data_files(
+                    &backend,
+                    "warehouse",
+                    &files
+                        .iter()
+                        .map(|(p, c, s, id, seq)| (p.as_str(), *c, *s, *id, *seq))
+                        .collect::<Vec<_>>(),
+                )
+                .await;
+                let list = format!("{location}/metadata/snap-{snapshot_id}.avro");
+                let entries = manifests
+                    .iter()
+                    .map(|(p, len, kind, min)| (p.as_str(), *len, 0, *kind, sequence, *min, snapshot_id))
+                    .collect::<Vec<_>>();
+                backend
+                    .put_bytes(
+                        "warehouse",
+                        &test_snapshot_object_key("warehouse", &list),
+                        manifest_rewrite_list_bytes(
+                            &entries,
+                            &files.iter().map(|(_, _, status, _, _)| *status).collect::<Vec<_>>(),
+                        ),
+                    )
+                    .await;
+                let mut snapshot = serde_json::json!({
+                    "snapshot-id": snapshot_id, "sequence-number": sequence,
+                    "timestamp-ms": 1000 * sequence, "manifest-list": list,
+                    "summary": {"operation": operation}
+                });
+                if snapshot_id == 11 {
+                    snapshot["parent-snapshot-id"] = 10.into();
+                }
+                let request = serde_json::from_value(serde_json::json!({
+                    "updates": [
+                        {"action": "add-snapshot", "snapshot": snapshot},
+                        {"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": snapshot_id, "type": "branch"}
+                    ]
+                }))
+                .unwrap();
+                commit_table_response(
+                    &store,
+                    &trusted_table_commit_backend(&backend),
+                    "warehouse",
+                    &namespace,
+                    "events",
+                    request,
+                )
+                .await
+                .expect("parent snapshot should commit");
+                parent_manifests = manifests;
+            }
+            let expiration = serde_json::from_value(serde_json::json!({
+                "updates": [{"action": "remove-snapshots", "snapshot-ids": [10]}]
+            }))
+            .unwrap();
+            commit_table_response(
+                &store,
+                &trusted_table_commit_backend(&backend),
+                "warehouse",
+                &namespace,
+                "events",
+                expiration,
+            )
+            .await
+            .expect("the last live reference to the removed file should expire");
+
+            let mut rewritten = vec![
+                (retained.as_str(), 0, 0, 10, Some(1), Some(1)),
+                (added.as_str(), content, 0, 11, Some(2), Some(2)),
+            ];
+            match case {
+                "missing_deleted" => {
+                    backend
+                        .delete_object("warehouse", &test_snapshot_object_key("warehouse", &removed))
+                        .await
+                        .unwrap();
+                }
+                "missing_live" => {
+                    backend
+                        .delete_object("warehouse", &test_snapshot_object_key("warehouse", &added))
+                        .await
+                        .unwrap();
+                }
+                "omitted_file" | "inherited_manifest" => {
+                    rewritten.pop();
+                }
+                "extra_file" => {
+                    backend
+                        .put_bytes("warehouse", &test_snapshot_object_key("warehouse", &extra), b"extra".to_vec())
+                        .await;
+                    rewritten.push((extra.as_str(), 0, 0, 10, Some(1), Some(1)));
+                }
+                "data_sequence" => {
+                    rewritten[1].4 = Some(1);
+                }
+                "file_sequence" => {
+                    rewritten[1].5 = Some(1);
+                }
+                "content_kind" => {
+                    rewritten[1].1 = if content == 0 {
+                        1
+                    } else if content == 1 {
+                        2
+                    } else {
+                        1
+                    };
+                }
+                "duplicate_file" => {
+                    rewritten.push(rewritten[0]);
+                }
+                "intermediate_duplicate" => {
+                    rewritten[1] = rewritten[0];
+                }
+                _ => {}
+            }
+            let mut manifests = Vec::new();
+            for (index, reference) in rewritten.iter().enumerate() {
+                let manifest = format!("{location}/metadata/rewrite-{index}.avro");
+                let bytes = manifest_avro_bytes_with_entry_sequences(&[*reference]);
+                manifests.push((manifest.clone(), bytes.len(), 0, i32::from(reference.1 != 0), 3, reference.4.unwrap(), 12));
+                backend
+                    .put_bytes("warehouse", &test_snapshot_object_key("warehouse", &manifest), bytes)
+                    .await;
+            }
+            if case == "inherited_manifest" {
+                let (manifest, size, kind, min) = &parent_manifests[2];
+                manifests.push((manifest.clone(), *size, 0, *kind, 2, *min, 11));
+            }
+            let list = format!("{location}/metadata/snap-12.avro");
+            let entries = manifests
+                .iter()
+                .map(|(p, len, spec, kind, seq, min, id)| (p.as_str(), *len, *spec, *kind, *seq, *min, *id))
+                .collect::<Vec<_>>();
+            backend
+                .put_bytes(
+                    "warehouse",
+                    &test_snapshot_object_key("warehouse", &list),
+                    manifest_rewrite_list_bytes(
+                        &entries,
+                        &rewritten
+                            .iter()
+                            .map(|entry| entry.2)
+                            .chain((case == "inherited_manifest").then_some(1))
+                            .collect::<Vec<_>>(),
+                    ),
+                )
+                .await;
+            let before = store.load_table("warehouse", "analytics", "events").await.unwrap().unwrap();
+            let mut request_json = serde_json::json!({
+                "commit-id": "87200000-0000-4000-8000-000000000012",
+                "requirements": [{"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": if case == "stale_requirement" { 10 } else { 11 }}],
+                "updates": [
+                    {"action": "add-snapshot", "snapshot": {
+                        "snapshot-id": 12, "parent-snapshot-id": 11, "sequence-number": 3, "timestamp-ms": 3000,
+                        "manifest-list": list, "summary": {"operation": "replace"}
+                    }},
+                    {"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": 12, "type": "branch"}
+                ]
+            });
+            if case == "intermediate_duplicate" {
+                let final_list = format!("{location}/metadata/snap-13.avro");
+                backend
+                    .put_bytes(
+                        "warehouse",
+                        &test_snapshot_object_key("warehouse", &final_list),
+                        manifest_rewrite_list_bytes(&entries[..1], &[0]),
+                    )
+                    .await;
+                // Only the final snapshot reaches graph validation; the intermediate rewrite must preserve the live set too.
+                request_json["updates"].as_array_mut().unwrap().extend([
+                    serde_json::json!({"action": "add-snapshot", "snapshot": {
+                        "snapshot-id": 13, "parent-snapshot-id": 12, "sequence-number": 4,
+                        "timestamp-ms": 4000, "manifest-list": final_list, "summary": {"operation": "replace"}
+                    }}),
+                    serde_json::json!({"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": 13, "type": "branch"}),
+                    serde_json::json!({"action": "remove-snapshots", "snapshot-ids": [12]}),
+                ]);
+            }
+            if matches!(case, "staged_retry" | "staged_missing_live") {
+                let table = crate::table_catalog::IdentifierSegment::parse("events").unwrap();
+                *backend.fail_put_object_path.lock().await = Some(
+                    crate::table_catalog::TableCatalogObjectPaths::default().table_entry_path("warehouse", &namespace, &table),
+                );
+                let error = commit_table_response(
+                    &store,
+                    &trusted_table_commit_backend(&backend),
+                    "warehouse",
+                    &namespace,
+                    "events",
+                    serde_json::from_value(request_json.clone()).unwrap(),
+                )
+                .await
+                .expect_err("the injected table pointer write failure should leave a staged commit");
+                assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_REST.into()));
+                assert_eq!(error.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+                assert_eq!(error.message(), Some("injected metadata write failure"));
+                let staged = store
+                    .get_commit_by_id("warehouse", &before.table_id, request_json["commit-id"].as_str().unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(staged.status, crate::table_catalog::CommitLogStatus::Staged);
+                let unchanged = store.load_table("warehouse", "analytics", "events").await.unwrap().unwrap();
+                assert_eq!(unchanged.metadata_location, before.metadata_location);
+                assert_eq!(unchanged.version_token, before.version_token);
+                if case == "staged_missing_live" {
+                    backend
+                        .delete_object("warehouse", &test_snapshot_object_key("warehouse", &added))
+                        .await
+                        .unwrap();
+                } else {
+                    backend
+                        .delete_object("warehouse", &test_snapshot_object_key("warehouse", &removed))
+                        .await
+                        .unwrap();
+                }
+            }
+            let result = commit_table_response(
+                &store,
+                &trusted_table_commit_backend(&backend),
+                "warehouse",
+                &namespace,
+                "events",
+                serde_json::from_value(request_json.clone()).unwrap(),
+            )
+            .await;
+            let after = store.load_table("warehouse", "analytics", "events").await.unwrap().unwrap();
+            if matches!(case, "rewrite" | "missing_deleted" | "inherited_manifest" | "staged_retry") {
+                let response = result.unwrap_or_else(|err| panic!("content={content}, case={case}: {err}"));
+                assert_eq!(response.metadata["current-snapshot-id"], 12);
+                assert_eq!(after.generation, before.generation + 1);
+                let live = load_snapshot_live_files(&backend, "warehouse", &after, &response.metadata, Some(12))
+                    .await
+                    .unwrap();
+                assert_eq!(live.data_files.len() + live.delete_files.len(), 2);
+                assert_eq!(live.data_files[&retained].sequence_number, Some(1));
+                let kind = if content == 0 {
+                    crate::table_catalog::TableMetadataMaintenanceObjectKind::DataFile
+                } else {
+                    crate::table_catalog::TableMetadataMaintenanceObjectKind::DeleteFile
+                };
+                let identity = live.identity(&added, &kind).unwrap();
+                assert_eq!(identity.sequence_number, Some(2));
+                assert_eq!(identity.file_sequence_number, Some(2));
+                let replay = commit_table_response(
+                    &store,
+                    &trusted_table_commit_backend(&backend),
+                    "warehouse",
+                    &namespace,
+                    "events",
+                    serde_json::from_value(request_json).unwrap(),
+                )
+                .await
+                .expect("a committed manifest rewrite should replay");
+                assert_eq!(replay.metadata, response.metadata);
+                let replayed = store.load_table("warehouse", "analytics", "events").await.unwrap().unwrap();
+                assert_eq!(replayed.generation, after.generation);
+                assert_eq!(replayed.metadata_location, after.metadata_location);
+            } else {
+                let error = result.expect_err("an invalid rewrite must fail before publication");
+                if case == "stale_requirement" {
+                    assert_eq!(error.status_code(), Some(StatusCode::CONFLICT));
+                } else {
+                    assert_eq!(error.code(), &S3ErrorCode::InvalidRequest, "content={content}, case={case}: {error}");
+                }
+                let message = match case {
+                    "missing_live" | "staged_missing_live" => Some("manifest referenced data file is missing"),
+                    "duplicate_file" => Some("snapshot contains a duplicate file reference"),
+                    "stale_requirement" => None,
+                    _ => Some("manifest rewrite must preserve the parent snapshot's live files"),
+                };
+                if let Some(message) = message {
+                    assert_eq!(error.message(), Some(message), "content={content}, case={case}");
+                }
+                assert_eq!(after.metadata_location, before.metadata_location);
+                assert_eq!(after.generation, before.generation);
+                assert_eq!(after.version_token, before.version_token);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn manifest_rewrite_preserves_v1_files_after_upgrade() {
+    let backend = TestTableCatalogObjectBackend::content_addressed();
+    let store = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+    let namespace = crate::table_catalog::Namespace::parse("analytics").unwrap();
+    create_standard_events_table(&store, &backend, &namespace).await;
+    let created = create_table_response(
+        &store,
+        &trusted_table_commit_backend(&backend),
+        "warehouse",
+        &namespace,
+        serde_json::from_value(serde_json::json!({
+            "name": "legacy", "properties": {"format-version": "1"},
+            "schema": {"type": "struct", "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]}
+        }))
+        .unwrap(),
+        true,
+    )
+    .await
+    .unwrap();
+    let location = created.metadata["location"].as_str().unwrap();
+    let file = format!("{location}/data/legacy.parquet");
+    let manifest = format!("{location}/metadata/legacy.avro");
+    let schema = apache_avro::Schema::parse_str(
+        r#"{
+        "type": "record", "name": "manifest_entry", "fields": [
+            {"name": "status", "type": "int"},
+            {"name": "snapshot_id", "type": "long"},
+            {"name": "data_file", "type": {"type": "record", "name": "data_file", "fields": [
+                {"name": "file_path", "type": "string"},
+                {"name": "file_format", "type": "string"},
+                {"name": "partition", "type": {"type": "record", "name": "partition", "fields": []}},
+                {"name": "record_count", "type": "long"},
+                {"name": "file_size_in_bytes", "type": "long"}
+            ]}}
+        ]
+    }"#,
+    )
+    .unwrap();
+    let mut writer = apache_avro::Writer::new(&schema, Vec::new()).unwrap();
+    writer.add_user_metadata("partition-spec-id".to_string(), "0").unwrap();
+    use apache_avro::types::Value;
+    writer
+        .append_value(Value::Record(vec![
+            ("status".to_string(), Value::Int(1)),
+            ("snapshot_id".to_string(), Value::Long(10)),
+            (
+                "data_file".to_string(),
+                Value::Record(vec![
+                    ("file_path".to_string(), Value::String(file.clone())),
+                    ("file_format".to_string(), Value::String("PARQUET".to_string())),
+                    ("partition".to_string(), Value::Record(Vec::new())),
+                    ("record_count".to_string(), Value::Long(1)),
+                    ("file_size_in_bytes".to_string(), Value::Long(1)),
+                ]),
+            ),
+        ]))
+        .unwrap();
+    let bytes = writer.into_inner().unwrap();
+    let manifest_length = bytes.len();
+    backend
+        .put_bytes("warehouse", &test_snapshot_object_key("warehouse", &manifest), bytes)
+        .await;
+    backend
+        .put_bytes("warehouse", &test_snapshot_object_key("warehouse", &file), b"legacy".to_vec())
+        .await;
+    commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&backend),
+        "warehouse",
+        &namespace,
+        "legacy",
+        serde_json::from_value(serde_json::json!({"updates": [
+            {"action": "add-snapshot", "snapshot": {
+                "snapshot-id": 10, "timestamp-ms": 1000, "manifests": [manifest], "summary": {"operation": "append"}
+            }},
+            {"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": 10, "type": "branch"}
+        ]}))
+        .unwrap(),
+    )
+    .await
+    .expect("a v1 snapshot without sequence fields should commit");
+    commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&backend),
+        "warehouse",
+        &namespace,
+        "legacy",
+        serde_json::from_value(serde_json::json!({"updates": [{"action": "upgrade-format-version", "format-version": 2}]}))
+            .unwrap(),
+    )
+    .await
+    .expect("the table should upgrade while retaining v1 history");
+    let inherited_list = format!("{location}/metadata/snap-11.avro");
+    for sequence in [1, 0] {
+        backend
+            .put_bytes(
+                "warehouse",
+                &test_snapshot_object_key("warehouse", &inherited_list),
+                manifest_rewrite_list_bytes(&[(&manifest, manifest_length, 0, 0, sequence, 0, 10)], &[1]),
+            )
+            .await;
+        let before = store.load_table("warehouse", "analytics", "legacy").await.unwrap().unwrap();
+        let result = commit_table_response(
+            &store,
+            &trusted_table_commit_backend(&backend),
+            "warehouse",
+            &namespace,
+            "legacy",
+            serde_json::from_value(serde_json::json!({"updates": [
+                {"action": "add-snapshot", "snapshot": {
+                    "snapshot-id": 11, "parent-snapshot-id": 10, "sequence-number": 1,
+                    "timestamp-ms": 2000, "manifest-list": inherited_list, "summary": {"operation": "replace"}
+                }},
+                {"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": 11, "type": "branch"}
+            ]}))
+            .unwrap(),
+        )
+        .await;
+        let after = store.load_table("warehouse", "analytics", "legacy").await.unwrap().unwrap();
+        if sequence == 0 {
+            result.expect("an inherited v1 manifest must retain sequence zero");
+            assert_eq!(after.generation, before.generation + 1);
+        } else {
+            let error = result.expect_err("manifest-list inheritance must not change v1 file sequences");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            assert_eq!(error.message(), Some("manifest rewrite must preserve the parent snapshot's live files"));
+            assert_eq!(after.metadata_location, before.metadata_location);
+            assert_eq!(after.version_token, before.version_token);
+            assert_eq!(after.generation, before.generation);
+        }
+    }
+    let rewritten = format!("{location}/metadata/rewritten.avro");
+    let bytes = test_manifest_avro_bytes(&[(&file, 0, 0, 10, 0)]);
+    let list = format!("{location}/metadata/snap-12.avro");
+    backend
+        .put_bytes(
+            "warehouse",
+            &test_snapshot_object_key("warehouse", &list),
+            manifest_rewrite_list_bytes(&[(&rewritten, bytes.len(), 0, 0, 2, 0, 12)], &[0]),
+        )
+        .await;
+    backend
+        .put_bytes("warehouse", &test_snapshot_object_key("warehouse", &rewritten), bytes)
+        .await;
+    let response = commit_table_response(
+        &store,
+        &trusted_table_commit_backend(&backend),
+        "warehouse",
+        &namespace,
+        "legacy",
+        serde_json::from_value(serde_json::json!({"updates": [
+            {"action": "add-snapshot", "snapshot": {
+                "snapshot-id": 12, "parent-snapshot-id": 11, "sequence-number": 2,
+                "timestamp-ms": 3000, "manifest-list": list, "summary": {"operation": "replace"}
+            }},
+            {"action": "set-snapshot-ref", "ref-name": "main", "snapshot-id": 12, "type": "branch"}
+        ]}))
+        .unwrap(),
+    )
+    .await
+    .expect("v1 files should retain their implicit sequence zero in rewritten v2 manifests");
+    assert_eq!(response.metadata["current-snapshot-id"], 12);
+    let entry = store.load_table("warehouse", "analytics", "legacy").await.unwrap().unwrap();
+    let live = load_snapshot_live_files(&backend, "warehouse", &entry, &response.metadata, Some(12))
+        .await
+        .unwrap();
+    assert_eq!(live.data_files.len(), 1);
+    assert_eq!(live.data_files[&file].sequence_number, Some(0));
+    assert_eq!(live.data_files[&file].file_sequence_number, Some(0));
+}
+
 #[tokio::test]
 async fn row_level_conflict_rewrite_data_sequence_numbers() {
     use crate::table_catalog::test_support::{
