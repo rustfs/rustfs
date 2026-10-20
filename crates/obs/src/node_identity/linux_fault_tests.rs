@@ -14,6 +14,9 @@
 
 use super::{current_local_node_identity, local_node_identity_test_guard};
 
+// SAFETY: The prctl calls use the documented argument layouts and stack-owned
+// filter data that remains live until the kernel has copied it.
+#[allow(unsafe_code)]
 fn install_netlink_fault(action: u32) {
     // This test-only filter applies to the calling worker and its descendants,
     // never to another test thread. Offsets follow the x86_64 seccomp_data ABI.
