@@ -57,10 +57,11 @@ const DATA_COMPRESSION_TOTAL_NAME: &str = ".compression.json";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 const DATA_USAGE_CACHE_TTL_SECS: u64 = 30;
 // A scanner save invalidates only the saving process's snapshot cache; every
-// other node sees it only after reloading. A lookup for a bucket that the
-// cached snapshot does not mention at all reloads a copy this old, so a
-// bucket created after the last load is not reported unknown for the rest of
-// the TTL once the scanner leader has published it.
+// other node sees it only after reloading. A fail-closed usage lookup for a
+// bucket the cached snapshot does not mention at all may reload a copy this
+// old, so a bucket created after the last load is not reported unknown for the
+// rest of the TTL once the scanner leader has published it. Such early
+// reloads are spaced by the same interval whatever their outcome.
 const DATA_USAGE_UNKNOWN_BUCKET_REFRESH_SECS: u64 = 5;
 const LIVE_BUCKET_USAGE_MAX_ENTRIES: u64 = 1024;
 const DATA_USAGE_REMOVE_CAS_RETRIES: usize = 3;
@@ -1476,18 +1477,13 @@ async fn normalize_loaded_data_usage(
 ///
 /// Admin read endpoints call this on every request; the cache bounds backend
 /// reads (and the associated JSON parse and INFO log) to once per
-/// `DATA_USAGE_CACHE_TTL_SECS` per process; a lookup for a bucket the snapshot
-/// does not mention may reload after `DATA_USAGE_UNKNOWN_BUCKET_REFRESH_SECS`.
+/// `DATA_USAGE_CACHE_TTL_SECS` per process, apart from the spaced early
+/// reloads of [`reload_unknown_bucket_usage`].
 /// `save_data_usage_in_backend` invalidates the cache so a fresh scanner save
 /// is visible immediately in the saving process.
 pub async fn load_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
-    load_data_usage_from_backend_cached_within(store, Duration::from_secs(DATA_USAGE_CACHE_TTL_SECS)).await
-}
+    let ttl = Duration::from_secs(DATA_USAGE_CACHE_TTL_SECS);
 
-/// [`load_data_usage_from_backend_cached`] with a caller-chosen maximum age.
-/// A shorter age shares the same cache and refresh lock, so concurrent
-/// callers still coalesce on one backend read.
-async fn load_data_usage_from_backend_cached_within(store: Arc<ECStore>, ttl: Duration) -> Result<DataUsageInfo, Error> {
     loop {
         {
             let cache = data_usage_snapshot_cache().read().await;
@@ -2277,25 +2273,119 @@ async fn get_persisted_bucket_usage(bucket: &str) -> Option<u64> {
 }
 
 async fn persisted_bucket_usage(store: Arc<ECStore>, bucket: &str) -> Option<u64> {
-    let info = load_data_usage_from_backend_cached(store.clone()).await.ok()?;
-    if let Some(usage) = info.buckets_usage.get(bucket) {
-        return Some(usage.size);
-    }
-    // The degraded baseline serves a bucket it covers; reloading for it would
-    // only re-read a snapshot whose bucket data is still incomplete. Checking
-    // the age here keeps a fresh copy from being cloned a second time on
-    // every write to a bucket the scanner has not reached yet.
-    let refresh_age = Duration::from_secs(DATA_USAGE_UNKNOWN_BUCKET_REFRESH_SECS);
-    let reload = data_usage_snapshot_cache()
-        .read()
-        .await
-        .as_ref()
-        .is_some_and(|cached| !cached.degraded_baseline.contains_key(bucket) && cached.loaded_at.elapsed() >= refresh_age);
-    if !reload {
+    let info = load_data_usage_from_backend_cached(store).await.ok()?;
+    info.buckets_usage.get(bucket).map(|usage| usage.size)
+}
+
+async fn reload_persisted_bucket_usage(store: Arc<ECStore>, bucket: &str) -> Option<u64> {
+    let loader_store = Arc::clone(&store);
+    if !reload_snapshot_for_unknown_bucket(bucket, move || load_data_usage_from_backend_with_baseline(loader_store)).await {
         return None;
     }
-    let info = load_data_usage_from_backend_cached_within(store, refresh_age).await.ok()?;
-    info.buckets_usage.get(bucket).map(|usage| usage.size)
+    persisted_bucket_usage(store, bucket).await
+}
+
+/// Last early snapshot reload attempted for a bucket the cached snapshot did
+/// not cover. Attempts are spaced whatever their outcome, so a failing backend
+/// or a bucket the scanner never reaches costs at most one load per interval.
+static UNKNOWN_BUCKET_RELOAD_ATTEMPTED_AT: std::sync::Mutex<Option<tokio::time::Instant>> = std::sync::Mutex::new(None);
+
+fn unknown_bucket_reload_due(cache: &Option<CachedDataUsageSnapshot>, bucket: &str, now: tokio::time::Instant) -> bool {
+    let refresh_age = Duration::from_secs(DATA_USAGE_UNKNOWN_BUCKET_REFRESH_SECS);
+    // A cached failure keeps its TTL backoff. A bucket the degraded baseline
+    // covers is served from it; reloading would only re-read a snapshot whose
+    // bucket data is still incomplete.
+    let Some(cached) = cache.as_ref() else {
+        return false;
+    };
+    let Some(info) = cached.info.as_ref() else {
+        return false;
+    };
+    if info.buckets_usage.contains_key(bucket)
+        || cached.degraded_baseline.contains_key(bucket)
+        || now.duration_since(cached.loaded_at) < refresh_age
+    {
+        return false;
+    }
+    UNKNOWN_BUCKET_RELOAD_ATTEMPTED_AT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_none_or(|attempted_at| now.duration_since(attempted_at) >= refresh_age)
+}
+
+/// Whether a freshly loaded snapshot is older than the cached one, as when a
+/// primary read fails and the loader falls back to the previous `.bkp` copy.
+fn snapshot_predates(loaded: Option<SystemTime>, cached: Option<SystemTime>) -> bool {
+    match (loaded, cached) {
+        (Some(loaded), Some(cached)) => loaded < cached,
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
+/// Reload the cached persisted snapshot ahead of its TTL when it does not
+/// cover `bucket` at all. Only the scanner leader's own save invalidates its
+/// cache, so on every other node a bucket created after the last load would
+/// otherwise stay unknown for the rest of the TTL. A failed load, or one older
+/// than the cached snapshot, never replaces it. Returns whether the cache may
+/// now cover `bucket`.
+///
+/// Lock order: `DATA_USAGE_SNAPSHOT_REFRESH`, then the snapshot cache, then the
+/// attempt stamp, which is never held across an await.
+async fn reload_snapshot_for_unknown_bucket<F, Fut>(bucket: &str, load: F) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<LoadedUsageBaseline, Error>>,
+{
+    if !unknown_bucket_reload_due(&*data_usage_snapshot_cache().read().await, bucket, tokio::time::Instant::now()) {
+        return false;
+    }
+    let _refresh_guard = DATA_USAGE_SNAPSHOT_REFRESH
+        .get_or_init(|| Arc::new(TokioMutex::new(())))
+        .lock()
+        .await;
+    let now = tokio::time::Instant::now();
+    if !unknown_bucket_reload_due(&*data_usage_snapshot_cache().read().await, bucket, now) {
+        // Another caller reloaded, or attempted to, while this one waited.
+        return true;
+    }
+    *UNKNOWN_BUCKET_RELOAD_ATTEMPTED_AT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(now);
+
+    let refresh_generation = data_usage_snapshot_generation();
+    let Ok(loaded) = load().await else {
+        return false;
+    };
+    let mut cache = data_usage_snapshot_cache().write().await;
+    let cached_last_update = cache
+        .as_ref()
+        .and_then(|cached| cached.info.as_ref())
+        .and_then(|info| info.last_update);
+    if snapshot_predates(loaded.info.last_update, cached_last_update) {
+        return false;
+    }
+    cache_data_usage_snapshot_result(
+        &mut cache,
+        Ok(loaded),
+        tokio::time::Instant::now(),
+        refresh_generation,
+        data_usage_snapshot_generation(),
+    )
+    .is_some()
+}
+
+/// Second lookup for a caller that fails closed after [`get_bucket_usage_memory`]
+/// found no usage: in a distributed deployment, reload the cached persisted
+/// snapshot early when it does not cover `bucket` at all, then look the bucket
+/// up again. The reload is awaited and is a full snapshot load, so reporting
+/// paths do not use this.
+pub async fn reload_unknown_bucket_usage(bucket: &str) -> Option<u64> {
+    if !runtime_sources::setup_is_dist_erasure().await {
+        return None;
+    }
+    let store = runtime_sources::object_store_handle()?;
+    reload_persisted_bucket_usage(store, bucket).await
 }
 
 pub async fn get_bucket_usage_memory(bucket: &str) -> Option<u64> {
@@ -4034,6 +4124,66 @@ mod tests {
             .expect("the monotonic clock must reach back by the requested age");
     }
 
+    async fn install_data_usage_snapshot_cache_for_test(info: DataUsageInfo, age: Duration) {
+        let degraded_baseline = info.bucket_sizes.clone();
+        *data_usage_snapshot_cache().write().await = Some(CachedDataUsageSnapshot {
+            info: Some(info),
+            loaded_at: tokio::time::Instant::now()
+                .checked_sub(age)
+                .expect("the monotonic clock must reach back by the requested age"),
+            degraded_baseline,
+        });
+    }
+
+    fn clear_unknown_bucket_reload_attempt_for_test() {
+        *UNKNOWN_BUCKET_RELOAD_ATTEMPTED_AT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    fn usage_snapshot_with_new_bucket(last_update: SystemTime, existing_size: u64) -> DataUsageInfo {
+        let mut info = data_usage_info_for_test("existing", 2, existing_size, last_update);
+        info.buckets_usage.insert(
+            "created-later".to_string(),
+            BucketUsageInfo {
+                objects_count: 1,
+                versions_count: 1,
+                size: 1024,
+                ..Default::default()
+            },
+        );
+        info.bucket_sizes.insert("created-later".to_string(), 1024);
+        info.buckets_count = info.buckets_usage.len() as u64;
+        info.calculate_totals();
+        info
+    }
+
+    fn loaded_usage_for_test(info: DataUsageInfo) -> LoadedUsageBaseline {
+        LoadedUsageBaseline {
+            degraded_baseline: info.bucket_sizes.clone(),
+            info,
+            observed_unavailable: false,
+        }
+    }
+
+    // The fail-closed composition the quota checker uses in a distributed deployment.
+    async fn fail_closed_lookup_for_test(store: &Arc<ECStore>, bucket: &str) -> Option<u64> {
+        match persisted_bucket_usage(Arc::clone(store), bucket).await {
+            Some(usage) => Some(usage),
+            None => reload_persisted_bucket_usage(Arc::clone(store), bucket).await,
+        }
+    }
+
+    async fn cached_bucket_size_for_test(bucket: &str) -> Option<u64> {
+        data_usage_snapshot_cache()
+            .read()
+            .await
+            .as_ref()
+            .and_then(|cached| cached.info.as_ref())
+            .and_then(|info| info.buckets_usage.get(bucket))
+            .map(|usage| usage.size)
+    }
+
     #[tokio::test]
     #[serial]
     async fn unknown_bucket_lookup_reloads_a_snapshot_another_node_published() {
@@ -4050,23 +4200,12 @@ mod tests {
         .await
         .expect("persist usage that predates the new bucket");
         invalidate_data_usage_snapshot_cache().await;
-        assert_eq!(persisted_bucket_usage(store.clone(), "existing").await, Some(10));
+        clear_unknown_bucket_reload_attempt_for_test();
+        assert_eq!(fail_closed_lookup_for_test(&store, "existing").await, Some(10));
 
         // The scanner leader on another node publishes a snapshot covering the
         // new bucket. Its save does not invalidate this process's cache.
-        let mut after = data_usage_info_for_test("existing", 2, 20, SystemTime::UNIX_EPOCH + Duration::from_secs(2));
-        after.buckets_usage.insert(
-            "created-later".to_string(),
-            BucketUsageInfo {
-                objects_count: 1,
-                versions_count: 1,
-                size: 1024,
-                ..Default::default()
-            },
-        );
-        after.bucket_sizes.insert("created-later".to_string(), 1024);
-        after.buckets_count = after.buckets_usage.len() as u64;
-        after.calculate_totals();
+        let after = usage_snapshot_with_new_bucket(SystemTime::UNIX_EPOCH + Duration::from_secs(2), 20);
         save_config(
             store.clone(),
             DATA_USAGE_OBJ_NAME_PATH.as_str(),
@@ -4077,20 +4216,26 @@ mod tests {
 
         // A fresh copy is reused even for an unknown bucket, which bounds reloads.
         set_data_usage_snapshot_cache_age_for_test(Duration::ZERO).await;
-        assert_eq!(persisted_bucket_usage(store.clone(), "created-later").await, None);
+        assert_eq!(fail_closed_lookup_for_test(&store, "created-later").await, None);
 
         set_data_usage_snapshot_cache_age_for_test(Duration::from_secs(DATA_USAGE_UNKNOWN_BUCKET_REFRESH_SECS)).await;
         assert_eq!(
-            persisted_bucket_usage(store.clone(), "existing").await,
+            fail_closed_lookup_for_test(&store, "existing").await,
             Some(10),
             "a bucket the cached copy covers keeps the cached value for the full TTL"
         );
         assert_eq!(
             persisted_bucket_usage(store.clone(), "created-later").await,
+            None,
+            "a reporting lookup never reloads early"
+        );
+        assert_eq!(
+            fail_closed_lookup_for_test(&store, "created-later").await,
             Some(1024),
             "an unknown bucket must reload an aged copy instead of waiting out the TTL"
         );
         assert_eq!(persisted_bucket_usage(store, "existing").await, Some(20));
+        clear_unknown_bucket_reload_attempt_for_test();
         invalidate_data_usage_snapshot_cache().await;
     }
 
@@ -4111,7 +4256,8 @@ mod tests {
         .await
         .expect("persist an incomplete snapshot");
         invalidate_data_usage_snapshot_cache().await;
-        assert_eq!(persisted_bucket_usage(store.clone(), "legacy").await, None);
+        clear_unknown_bucket_reload_attempt_for_test();
+        assert_eq!(fail_closed_lookup_for_test(&store, "legacy").await, None);
         assert_eq!(lookup_degraded_bucket_usage_baseline(store.clone(), "legacy").await, Some(7));
 
         save_config(
@@ -4123,12 +4269,183 @@ mod tests {
         .await
         .expect("persist the later complete snapshot");
         set_data_usage_snapshot_cache_age_for_test(Duration::from_secs(DATA_USAGE_UNKNOWN_BUCKET_REFRESH_SECS)).await;
-        assert_eq!(persisted_bucket_usage(store.clone(), "legacy").await, None);
+        assert_eq!(fail_closed_lookup_for_test(&store, "legacy").await, None);
         assert_eq!(
             lookup_degraded_bucket_usage_baseline(store, "legacy").await,
             Some(7),
             "a bucket the degraded baseline covers must not reload the snapshot early"
         );
+        clear_unknown_bucket_reload_attempt_for_test();
+        invalidate_data_usage_snapshot_cache().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn early_reload_keeps_the_cached_snapshot_when_the_backend_read_fails() {
+        use crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
+        use crate::config::com::save_config;
+
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        let current = data_usage_info_for_test("existing", 1, 10, SystemTime::UNIX_EPOCH + Duration::from_secs(2));
+        save_config(
+            store.clone(),
+            DATA_USAGE_OBJ_NAME_PATH.as_str(),
+            serde_json::to_vec(&current).expect("encode usage"),
+        )
+        .await
+        .expect("persist the current snapshot");
+        invalidate_data_usage_snapshot_cache().await;
+        clear_unknown_bucket_reload_attempt_for_test();
+        assert_eq!(fail_closed_lookup_for_test(&store, "existing").await, Some(10));
+
+        // The primary becomes unreadable and there is no backup.
+        save_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), b"not a usage snapshot".to_vec())
+            .await
+            .expect("corrupt the primary snapshot");
+        set_data_usage_snapshot_cache_age_for_test(Duration::from_secs(DATA_USAGE_UNKNOWN_BUCKET_REFRESH_SECS)).await;
+        assert_eq!(fail_closed_lookup_for_test(&store, "unknown").await, None);
+        let cached = load_data_usage_from_backend_cached(store)
+            .await
+            .expect("a failed early reload must keep the cached snapshot");
+        assert_eq!(cached.buckets_usage.get("existing").map(|usage| usage.size), Some(10));
+        clear_unknown_bucket_reload_attempt_for_test();
+        invalidate_data_usage_snapshot_cache().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn early_reload_keeps_the_cached_snapshot_when_the_backend_regresses_to_an_older_backup() {
+        use crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
+        use crate::config::com::save_config;
+
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        let current = data_usage_info_for_test("existing", 1, 10, SystemTime::UNIX_EPOCH + Duration::from_secs(2));
+        save_config(
+            store.clone(),
+            DATA_USAGE_OBJ_NAME_PATH.as_str(),
+            serde_json::to_vec(&current).expect("encode usage"),
+        )
+        .await
+        .expect("persist the current snapshot");
+        invalidate_data_usage_snapshot_cache().await;
+        clear_unknown_bucket_reload_attempt_for_test();
+        assert_eq!(fail_closed_lookup_for_test(&store, "existing").await, Some(10));
+
+        // The primary becomes unreadable and the loader falls back to an older
+        // backup that would otherwise expose the unknown bucket.
+        save_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), b"not a usage snapshot".to_vec())
+            .await
+            .expect("corrupt the primary snapshot");
+        let older = usage_snapshot_with_new_bucket(SystemTime::UNIX_EPOCH + Duration::from_secs(1), 5);
+        save_config(
+            store.clone(),
+            DATA_USAGE_OBJ_BACKUP_PATH.as_str(),
+            serde_json::to_vec(&older).expect("encode usage"),
+        )
+        .await
+        .expect("persist an older backup snapshot");
+        set_data_usage_snapshot_cache_age_for_test(Duration::from_secs(DATA_USAGE_UNKNOWN_BUCKET_REFRESH_SECS)).await;
+        assert_eq!(
+            fail_closed_lookup_for_test(&store, "created-later").await,
+            None,
+            "an older snapshot must not replace the cached one"
+        );
+        let cached = load_data_usage_from_backend_cached(store)
+            .await
+            .expect("an older early reload must keep the cached snapshot");
+        assert_eq!(cached.buckets_usage.get("existing").map(|usage| usage.size), Some(10));
+        clear_unknown_bucket_reload_attempt_for_test();
+        invalidate_data_usage_snapshot_cache().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn early_reload_attempts_are_spaced_whatever_their_outcome() {
+        let refresh_age = Duration::from_secs(DATA_USAGE_UNKNOWN_BUCKET_REFRESH_SECS);
+        let cached = data_usage_info_for_test("existing", 1, 10, SystemTime::UNIX_EPOCH + Duration::from_secs(2));
+        install_data_usage_snapshot_cache_for_test(cached, refresh_age).await;
+        clear_unknown_bucket_reload_attempt_for_test();
+        let loads = AtomicUsize::new(0);
+
+        assert!(
+            !reload_snapshot_for_unknown_bucket("created-later", || async {
+                loads.fetch_add(1, Ordering::SeqCst);
+                Err(Error::ErasureReadQuorum)
+            })
+            .await
+        );
+        assert_eq!(cached_bucket_size_for_test("existing").await, Some(10));
+
+        let newer = usage_snapshot_with_new_bucket(SystemTime::UNIX_EPOCH + Duration::from_secs(3), 20);
+        assert!(
+            !reload_snapshot_for_unknown_bucket("created-later", || async {
+                loads.fetch_add(1, Ordering::SeqCst);
+                Ok(loaded_usage_for_test(newer.clone()))
+            })
+            .await
+        );
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "a failed attempt must still space the next one");
+
+        *UNKNOWN_BUCKET_RELOAD_ATTEMPTED_AT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = tokio::time::Instant::now().checked_sub(refresh_age);
+        assert!(
+            reload_snapshot_for_unknown_bucket("created-later", || async {
+                loads.fetch_add(1, Ordering::SeqCst);
+                Ok(loaded_usage_for_test(newer.clone()))
+            })
+            .await
+        );
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+        assert_eq!(cached_bucket_size_for_test("created-later").await, Some(1024));
+        clear_unknown_bucket_reload_attempt_for_test();
+        invalidate_data_usage_snapshot_cache().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn concurrent_unknown_and_known_lookups_load_the_snapshot_once() {
+        use crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
+
+        // Nothing is persisted, so any real backend load would replace the
+        // installed snapshot with an empty one and fail the final assertions.
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        let cached = data_usage_info_for_test("existing", 1, 10, SystemTime::UNIX_EPOCH + Duration::from_secs(2));
+        install_data_usage_snapshot_cache_for_test(cached, Duration::from_secs(DATA_USAGE_UNKNOWN_BUCKET_REFRESH_SECS)).await;
+        clear_unknown_bucket_reload_attempt_for_test();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let newer = usage_snapshot_with_new_bucket(SystemTime::UNIX_EPOCH + Duration::from_secs(3), 10);
+
+        let start = Arc::new(tokio::sync::Barrier::new(16));
+        let mut unknown_lookups = Vec::new();
+        let mut known_lookups = Vec::new();
+        for _ in 0..8 {
+            let (unknown_start, loads, newer) = (Arc::clone(&start), Arc::clone(&loads), newer.clone());
+            unknown_lookups.push(tokio::spawn(async move {
+                unknown_start.wait().await;
+                reload_snapshot_for_unknown_bucket("created-later", move || async move {
+                    loads.fetch_add(1, Ordering::SeqCst);
+                    // Hold the refresh lock long enough for the other lookups to queue.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Ok(loaded_usage_for_test(newer))
+                })
+                .await
+            }));
+            let (known_start, store) = (Arc::clone(&start), Arc::clone(&store));
+            known_lookups.push(tokio::spawn(async move {
+                known_start.wait().await;
+                fail_closed_lookup_for_test(&store, "existing").await
+            }));
+        }
+        for lookup in unknown_lookups {
+            lookup.await.expect("unknown-bucket lookup task");
+        }
+        for lookup in known_lookups {
+            assert_eq!(lookup.await.expect("known-bucket lookup task"), Some(10));
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 1, "concurrent lookups must share one backend load");
+        assert_eq!(persisted_bucket_usage(store, "created-later").await, Some(1024));
+        clear_unknown_bucket_reload_attempt_for_test();
         invalidate_data_usage_snapshot_cache().await;
     }
 

@@ -115,6 +115,28 @@ async fn four_node_four_drive_hard_quota_rejects_over_limit_put() -> TestResult 
     let dist = DistCluster::start_with_env(DistLayout::FourByFour, FAST_DATA_USAGE_SCANNER_ENV).await?;
     let bucket = unique_bucket("quota");
     dist.create_bucket(&bucket).await?;
+    // A bucket without a quota reports usage only once a snapshot covers it.
+    // The scanner leader sees its own save at once; every other node holds a
+    // snapshot cached before the bucket existed and must reload it early
+    // rather than answer 503 for the rest of the 30 s cache TTL.
+    wait_until(
+        Duration::from_secs(30),
+        || async {
+            let stats = quota_stats_on_every_node(&dist.cluster, &bucket).await?;
+            Ok(stats.iter().any(|(status, _)| status.is_success()))
+        },
+        "first node reports quota stats for the new bucket",
+    )
+    .await?;
+    wait_until(
+        Duration::from_secs(15),
+        || async {
+            let stats = quota_stats_on_every_node(&dist.cluster, &bucket).await?;
+            Ok(stats.iter().all(|(status, _)| status.is_success()))
+        },
+        "every node reports quota stats for the new bucket",
+    )
+    .await?;
     set_bucket_quota(&dist.cluster, &bucket, 8 * 1024).await?;
 
     let client = dist.client(1)?;
