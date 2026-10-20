@@ -39,6 +39,7 @@ use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::{get_object::GetObjectError, put_object::PutObjectError};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+use futures::future::try_join_all;
 use http::{Method, StatusCode};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -656,13 +657,50 @@ pub(crate) async fn wait_for_replicated_bytes(
     .await
 }
 
+/// Quota stats for `bucket` from every node at once. Each node answers from
+/// its own cached copy of the persisted usage snapshot, and only the scanner
+/// leader's save invalidates that copy. Leadership goes to whichever node
+/// starts its scanner first, so a probe pinned to one node can wait out the
+/// whole cache TTL on a node that never saves.
+pub(crate) async fn quota_stats_on_every_node(
+    cluster: &RustFSTestClusterEnvironment,
+    bucket: &str,
+) -> TestResult<Vec<(StatusCode, String)>> {
+    let path = format!("/rustfs/admin/v3/quota-stats/{bucket}");
+    try_join_all(
+        cluster
+            .nodes
+            .iter()
+            .map(|node| admin_request(&node.url, Method::GET, &path, None, &cluster.access_key, &cluster.secret_key)),
+    )
+    .await
+}
+
+/// `current_usage` from a quota-stats body. `None` means the node has no
+/// scanner usage for the bucket yet: a quota admitted by the reservation
+/// ledger reports `null` rather than a guess.
+pub(crate) fn quota_stats_current_usage(body: &str) -> TestResult<Option<u64>> {
+    let stats: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| format!("quota stats returned invalid JSON: {error}: {body}"))?;
+    match stats.get("current_usage") {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(usage) => Ok(Some(
+            usage
+                .as_u64()
+                .ok_or_else(|| format!("quota stats current_usage is not a byte count: {stats}"))?,
+        )),
+        None => Err(format!("quota stats omitted current_usage: {stats}").into()),
+    }
+}
+
 pub(crate) async fn set_bucket_quota(cluster: &RustFSTestClusterEnvironment, bucket: &str, quota_bytes: u64) -> TestResult {
     wait_until(
         Duration::from_secs(30),
         || async {
-            let (status, _) =
-                cluster_admin(cluster, Method::GET, &format!("/rustfs/admin/v3/quota-stats/{bucket}"), None).await?;
-            Ok(status.is_success() || status == StatusCode::NOT_FOUND)
+            let stats = quota_stats_on_every_node(cluster, bucket).await?;
+            Ok(stats
+                .iter()
+                .any(|(status, _)| status.is_success() || *status == StatusCode::NOT_FOUND))
         },
         "quota stats ready",
     )
