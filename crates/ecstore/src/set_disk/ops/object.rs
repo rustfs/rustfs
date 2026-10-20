@@ -8080,12 +8080,22 @@ fn notify_put_object_commit_namespace_acquired(bucket: &str, object: &str) {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeleteObjectCommitPause {
+    BeforeNamespace,
+    BeforeCommit,
+    AfterPublish,
+}
+
+#[cfg(test)]
 struct DeleteObjectCommitBarrierState {
     bucket: String,
     object: String,
-    pause_after_publish: bool,
+    pause: DeleteObjectCommitPause,
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    namespace_pending: tokio::sync::Notify,
+    namespace_acquired: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
@@ -8100,21 +8110,27 @@ static DELETE_OBJECT_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option
 #[cfg(test)]
 impl DeleteObjectCommitBarrier {
     pub(crate) fn install(bucket: &str, object: &str) -> Self {
-        Self::install_with_mode(bucket, object, false)
+        Self::install_with_mode(bucket, object, DeleteObjectCommitPause::BeforeCommit)
+    }
+
+    pub(crate) fn install_before_namespace(bucket: &str, object: &str) -> Self {
+        Self::install_with_mode(bucket, object, DeleteObjectCommitPause::BeforeNamespace)
     }
 
     #[cfg(feature = "test-util")]
     pub(crate) fn install_after_publish(bucket: &str, object: &str) -> Self {
-        Self::install_with_mode(bucket, object, true)
+        Self::install_with_mode(bucket, object, DeleteObjectCommitPause::AfterPublish)
     }
 
-    fn install_with_mode(bucket: &str, object: &str, pause_after_publish: bool) -> Self {
+    fn install_with_mode(bucket: &str, object: &str, pause: DeleteObjectCommitPause) -> Self {
         let state = Arc::new(DeleteObjectCommitBarrierState {
             bucket: bucket.to_string(),
             object: object.to_string(),
-            pause_after_publish,
+            pause,
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
+            namespace_pending: tokio::sync::Notify::new(),
+            namespace_acquired: std::sync::atomic::AtomicBool::new(false),
         });
         let mut slot = DELETE_OBJECT_COMMIT_BARRIER
             .get_or_init(|| std::sync::Mutex::new(None))
@@ -8134,6 +8150,19 @@ impl DeleteObjectCommitBarrier {
     pub(crate) fn release(&self) {
         self.state.release.notify_one();
     }
+
+    pub(crate) async fn release_and_wait_until_namespace_pending(&self) {
+        assert_eq!(self.state.pause, DeleteObjectCommitPause::BeforeNamespace);
+        let pending = self.state.namespace_pending.notified();
+        self.release();
+        tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("delete object must poll its actual namespace acquisition to Pending");
+    }
+
+    pub(crate) fn namespace_acquired(&self) -> bool {
+        self.state.namespace_acquired.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 #[cfg(test)]
@@ -8151,13 +8180,52 @@ impl Drop for DeleteObjectCommitBarrier {
 }
 
 #[cfg(test)]
+async fn pause_delete_object_before_namespace(bucket: &str, object: &str) {
+    let barrier = DELETE_OBJECT_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("delete object commit barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| {
+            barrier.bucket == bucket && barrier.object == object && barrier.pause == DeleteObjectCommitPause::BeforeNamespace
+        })
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+#[cfg(test)]
+fn notify_delete_object_namespace(bucket: &str, object: &str, acquired: bool) {
+    let barrier = DELETE_OBJECT_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("delete object commit barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| {
+            barrier.bucket == bucket && barrier.object == object && barrier.pause == DeleteObjectCommitPause::BeforeNamespace
+        })
+        .cloned();
+    if let Some(barrier) = barrier {
+        if acquired {
+            barrier.namespace_acquired.store(true, std::sync::atomic::Ordering::Release);
+        } else {
+            barrier.namespace_pending.notify_one();
+        }
+    }
+}
+
+#[cfg(test)]
 async fn pause_delete_object_commit(bucket: &str, object: &str) {
     let barrier = DELETE_OBJECT_COMMIT_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
         .expect("delete object commit barrier mutex should not poison")
         .as_ref()
-        .filter(|barrier| barrier.bucket == bucket && barrier.object == object && !barrier.pause_after_publish)
+        .filter(|barrier| {
+            barrier.bucket == bucket && barrier.object == object && barrier.pause == DeleteObjectCommitPause::BeforeCommit
+        })
         .cloned();
     if let Some(barrier) = barrier {
         barrier.arrived.notify_one();
@@ -8172,7 +8240,9 @@ async fn pause_delete_object_commit_after_publish(bucket: &str, object: &str) {
         .lock()
         .expect("delete object commit barrier mutex should not poison")
         .as_ref()
-        .filter(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.pause_after_publish)
+        .filter(|barrier| {
+            barrier.bucket == bucket && barrier.object == object && barrier.pause == DeleteObjectCommitPause::AfterPublish
+        })
         .cloned();
     if let Some(barrier) = barrier {
         barrier.arrived.notify_one();
@@ -10417,7 +10487,20 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         // Guard lock for single object delete
         let _lock_guard = if (!opts.delete_prefix || opts.delete_prefix_object) && !opts.no_lock {
-            Some(Arc::new(self.acquire_write_lock_diag("delete_object", bucket, object).await?))
+            #[cfg(test)]
+            let guard = {
+                pause_delete_object_before_namespace(bucket, object).await;
+                let guard = self
+                    .acquire_write_lock_diag_with_pending_hook("delete_object", bucket, object, || {
+                        notify_delete_object_namespace(bucket, object, false);
+                    })
+                    .await?;
+                notify_delete_object_namespace(bucket, object, true);
+                guard
+            };
+            #[cfg(not(test))]
+            let guard = self.acquire_write_lock_diag("delete_object", bucket, object).await?;
+            Some(Arc::new(guard))
         } else {
             None
         };

@@ -9081,6 +9081,701 @@ mod heal_result_report_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn native_default_heal_owner_fences_queued_put_and_version_delete() {
+        use crate::object_api::{ShardIntegrityWriteMode, WriteCompletion};
+        use crate::set_disk::ops::object::{DeleteObjectCommitBarrier, PutObjectCommitBarrier, PutObjectCommitPause};
+        use std::collections::HashMap;
+        use std::task::Poll;
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        for (disk_count, parity) in [(4, 2), (16, 4)] {
+            for mutation in ["put", "version-delete"] {
+                let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(disk_count, 0, parity).await;
+                let bucket = format!("default-heal-owner-{disk_count}-{mutation}");
+                let object = "locked/key.bin";
+                let reference = "independent/reference.bin";
+                set.make_bucket(&bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("isolated owner bucket");
+                let options = ObjectOptions {
+                    versioned: mutation == "version-delete",
+                    write_completion: WriteCompletion::TailDrained,
+                    shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
+                    ..Default::default()
+                };
+                let original_body = vec![0x18; 1024 * 1024 + 113];
+                let successor_body = vec![0x29; 1024 * 1024 + 157];
+                let original = set
+                    .put_object(&bucket, object, &mut PutObjReader::from_vec(original_body.clone()), &options)
+                    .await
+                    .expect("original acknowledged version");
+                let selected_version = original.version_id.map(|v| v.to_string()).unwrap_or_default();
+                let current = if mutation == "version-delete" {
+                    Some(
+                        set.put_object(&bucket, object, &mut PutObjReader::from_vec(successor_body.clone()), &options)
+                            .await
+                            .expect("distinct current version remains protected"),
+                    )
+                } else {
+                    None
+                };
+                let mut current_parts = Vec::new();
+                let current_data_dir = if let Some(current) = &current {
+                    let info = disks[0]
+                        .read_version(
+                            "",
+                            &bucket,
+                            object,
+                            &current.version_id.expect("retained current version").to_string(),
+                            &ReadOptions::default(),
+                        )
+                        .await
+                        .expect("independent retained-current physical generation");
+                    let data_dir = info.data_dir.expect("retained current external generation");
+                    for dir in &dirs {
+                        current_parts.push(
+                            tokio::fs::read(
+                                dir.path()
+                                    .join(&bucket)
+                                    .join(object)
+                                    .join(data_dir.to_string())
+                                    .join("part.1"),
+                            )
+                            .await
+                            .expect("independent retained-current shard oracle"),
+                        );
+                    }
+                    Some(data_dir)
+                } else {
+                    None
+                };
+                let mut reference_parts = HashMap::new();
+                if mutation == "put" {
+                    set.put_object(&bucket, reference, &mut PutObjReader::from_vec(successor_body.clone()), &options)
+                        .await
+                        .expect("independent successor payload coding oracle");
+                    for (slot, disk) in disks.iter().enumerate() {
+                        let info = disk
+                            .read_version("", &bucket, reference, "", &ReadOptions::default())
+                            .await
+                            .expect("reference coding index");
+                        let path = dirs[slot]
+                            .path()
+                            .join(&bucket)
+                            .join(reference)
+                            .join(info.data_dir.expect("reference external data").to_string())
+                            .join("part.1");
+                        assert!(
+                            reference_parts
+                                .insert(info.erasure.index, tokio::fs::read(path).await.expect("reference encoded part"))
+                                .is_none()
+                        );
+                    }
+                }
+                let old = disks[0]
+                    .read_version("", &bucket, object, &selected_version, &ReadOptions::default())
+                    .await
+                    .expect("selected original generation");
+                assert_eq!((old.erasure.data_blocks, old.erasure.parity_blocks), (disk_count - parity, parity));
+                let old_dir = old.data_dir.expect("original external generation");
+                let mut original_parts = Vec::new();
+                let mut original_metadata = Vec::new();
+                for dir in &dirs {
+                    let root = dir.path().join(&bucket).join(object);
+                    original_parts.push(
+                        tokio::fs::read(root.join(old_dir.to_string()).join("part.1"))
+                            .await
+                            .expect("original encoded part"),
+                    );
+                    original_metadata.push(
+                        tokio::fs::read(root.join(STORAGE_FORMAT_FILE))
+                            .await
+                            .expect("original complete version metadata"),
+                    );
+                }
+                let namespace = set.new_ns_lock(&bucket, object).await.expect("same actual object namespace");
+                let mut available_reader = Box::pin(namespace.get_read_lock(Duration::from_secs(30)));
+                assert!(
+                    matches!(futures::poll!(available_reader.as_mut()), Poll::Ready(Ok(_))),
+                    "positive control: an unowned local namespace admits a reader immediately"
+                );
+                drop(available_reader);
+                let missing = dirs[0]
+                    .path()
+                    .join(&bucket)
+                    .join(object)
+                    .join(old_dir.to_string())
+                    .join("part.1");
+                tokio::fs::remove_file(&missing)
+                    .await
+                    .expect("one original external shard missing");
+                let (pause, arrived, release) =
+                    ReadRepairPauseScope::install_at(&bucket, object, super::ReadRepairPausePhase::PartStaging(1));
+                let heal_set = set.clone();
+                let heal_bucket = bucket.clone();
+                let heal_version = selected_version.clone();
+                let heal = tokio::spawn(async move {
+                    heal_set
+                        .heal_object(
+                            &heal_bucket,
+                            object,
+                            &heal_version,
+                            &HealOpts {
+                                no_lock: false,
+                                scan_mode: HealScanMode::Deep,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(30), arrived.notified())
+                    .await
+                    .expect("default Deep Heal owns namespace during actual staging");
+                let mut blocked_reader = Box::pin(namespace.get_read_lock(Duration::from_secs(30)));
+                assert!(
+                    matches!(futures::poll!(blocked_reader.as_mut()), Poll::Pending),
+                    "default Heal must own an exclusive namespace before any queued writer exists"
+                );
+                drop(blocked_reader);
+                println!(
+                    "native_a09: geometry={disk_count}/{parity} mutation={mutation} default_deep_heal_staged_exclusive_owner_read_blocked"
+                );
+                let put_before = (mutation == "put")
+                    .then(|| PutObjectCommitBarrier::install(&bucket, object, PutObjectCommitPause::BeforeNamespace));
+                let put_commit = (mutation == "put")
+                    .then(|| PutObjectCommitBarrier::install(&bucket, object, PutObjectCommitPause::AfterNamespace));
+                let mut delete_before =
+                    (mutation == "version-delete").then(|| DeleteObjectCommitBarrier::install_before_namespace(&bucket, object));
+                let foreground_set = set.clone();
+                let foreground_bucket = bucket.clone();
+                let foreground_options = options.clone();
+                let body = successor_body.clone();
+                let version = selected_version.clone();
+                let mut foreground = tokio::spawn(async move {
+                    if mutation == "put" {
+                        foreground_set
+                            .put_object(&foreground_bucket, object, &mut PutObjReader::from_vec(body), &foreground_options)
+                            .await
+                    } else {
+                        foreground_set
+                            .delete_object(
+                                &foreground_bucket,
+                                object,
+                                ObjectOptions {
+                                    version_id: Some(version),
+                                    object_lock_config_snapshot: Some(Arc::new(crate::set_disk::ObjectLockConfigSnapshot::new(
+                                        crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                                    ))),
+                                    ..foreground_options
+                                },
+                            )
+                            .await
+                    }
+                });
+                let delete_commit;
+                if let Some(before) = &put_before {
+                    before.wait_until_paused().await;
+                    before.release_and_wait_until_namespace_pending().await;
+                    assert!(!before.namespace_acquired());
+                    delete_commit = None;
+                } else {
+                    let before = delete_before.take().expect("actual DELETE before-namespace observer");
+                    before.wait_until_paused().await;
+                    before.release_and_wait_until_namespace_pending().await;
+                    assert!(!before.namespace_acquired());
+                    drop(before);
+                    delete_commit = Some(DeleteObjectCommitBarrier::install(&bucket, object));
+                }
+                assert!(!foreground.is_finished() && !heal.is_finished() && !missing.exists());
+                for (slot, dir) in dirs.iter().enumerate() {
+                    let root = dir.path().join(&bucket).join(object);
+                    assert_eq!(
+                        tokio::fs::read(root.join(STORAGE_FORMAT_FILE))
+                            .await
+                            .expect("queued writer cannot change original metadata"),
+                        original_metadata[slot]
+                    );
+                    if slot != 0 {
+                        assert_eq!(
+                            tokio::fs::read(root.join(old_dir.to_string()).join("part.1"))
+                                .await
+                                .expect("surviving original part"),
+                            original_parts[slot]
+                        );
+                    }
+                }
+                println!(
+                    "native_a09: geometry={disk_count}/{parity} mutation={mutation} actual_foreground_namespace_future_pending_original_bytes_unchanged"
+                );
+                release.notify_one();
+                let (result, error) = tokio::time::timeout(Duration::from_secs(30), heal)
+                    .await
+                    .expect("default Heal completes before queued foreground publishes")
+                    .expect("Heal joins")
+                    .expect("actual default Heal result");
+                assert_eq!(error, None);
+                assert!(result.integrity_verified);
+                drop(pause);
+                if let Some(commit) = &put_commit {
+                    tokio::select! {
+                        _ = commit.wait_until_paused() => {},
+                        early = &mut foreground => panic!("PUT must reach its real post-lock barrier before publishing: {early:?}"),
+                    }
+                }
+                if let Some(commit) = &delete_commit {
+                    tokio::select! {
+                        _ = commit.wait_until_paused() => {},
+                        early = &mut foreground => panic!("DELETE must reach its real pre-commit barrier after the Heal owner drains: {early:?}"),
+                    }
+                }
+                assert!(!foreground.is_finished());
+                for (slot, dir) in dirs.iter().enumerate() {
+                    assert_eq!(
+                        tokio::fs::read(dir.path().join(&bucket).join(object).join(old_dir.to_string()).join("part.1"))
+                            .await
+                            .expect("Heal physically reconstructs before foreground commit"),
+                        original_parts[slot]
+                    );
+                }
+                println!(
+                    "native_a09: geometry={disk_count}/{parity} mutation={mutation} heal_reconstructed_before_foreground_commit"
+                );
+                if let Some(commit) = &put_commit {
+                    commit.release();
+                }
+                if let Some(commit) = &delete_commit {
+                    commit.release();
+                }
+                let ack = tokio::time::timeout(Duration::from_secs(30), foreground)
+                    .await
+                    .expect("queued foreground ACK after Heal releases ownership")
+                    .expect("foreground joins")
+                    .expect("real foreground ACK");
+                let drained = namespace
+                    .get_write_lock(Duration::from_secs(30))
+                    .await
+                    .expect("ACK physical tail drain");
+                for (slot, disk) in disks.iter().enumerate() {
+                    let root = dirs[slot].path().join(&bucket).join(object);
+                    assert!(
+                        !root.join(old_dir.to_string()).exists(),
+                        "overwritten/deleted original generation cannot remain"
+                    );
+                    let raw = tokio::fs::read(root.join(STORAGE_FORMAT_FILE))
+                        .await
+                        .expect("final single acknowledged version metadata");
+                    let mut decoded = rustfs_filemeta::FileMeta::default();
+                    decoded.unmarshal_msg(&raw).expect("decode actual final version population");
+                    assert_eq!(decoded.versions.len(), 1);
+                    let final_info = disk
+                        .read_version("", &bucket, object, "", &ReadOptions::default())
+                        .await
+                        .expect("final current generation");
+                    let data_dir = final_info.data_dir.expect("external successor generation");
+                    let part = tokio::fs::read(root.join(data_dir.to_string()).join("part.1"))
+                        .await
+                        .expect("final part before any GET");
+                    if mutation == "put" {
+                        assert_ne!(data_dir, old_dir);
+                        assert_eq!(part, reference_parts[&final_info.erasure.index]);
+                    } else {
+                        assert_eq!(Some(data_dir), current_data_dir);
+                        assert_eq!(
+                            part, current_parts[slot],
+                            "exact version DELETE must preserve every retained-current shard"
+                        );
+                        assert_eq!(ack.version_id, original.version_id);
+                        assert_eq!(final_info.version_id, current.as_ref().expect("retained current ACK").version_id);
+                        assert!(matches!(
+                            disk.read_version("", &bucket, object, &selected_version, &ReadOptions::default())
+                                .await,
+                            Err(DiskError::FileVersionNotFound)
+                        ));
+                    }
+                }
+                drop(drained);
+                let final_options = if let Some(current) = &current {
+                    ObjectOptions {
+                        versioned: true,
+                        version_id: Some(current.version_id.expect("current version").to_string()),
+                        suppress_read_repair: true,
+                        ..options.clone()
+                    }
+                } else {
+                    ObjectOptions {
+                        suppress_read_repair: true,
+                        ..options.clone()
+                    }
+                };
+                let mut reader = set
+                    .get_object_reader(&bucket, object, None, Default::default(), &final_options)
+                    .await
+                    .expect("full acknowledged successor/current body");
+                let mut actual = Vec::new();
+                reader
+                    .read_to_end(&mut actual)
+                    .await
+                    .expect("full body with incidental repair suppressed");
+                assert_eq!(actual, successor_body);
+                assert_eq!(
+                    reader.object_info.etag,
+                    if let Some(current) = &current {
+                        current.etag.clone()
+                    } else {
+                        ack.etag.clone()
+                    }
+                );
+                println!(
+                    "native_a09: geometry={disk_count}/{parity} mutation={mutation} foreground_ack_final_versions_parts_and_full_body_verified"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_copy_and_metadata_mutations_preserve_acknowledged_state_during_heal() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks_with_count};
+        use crate::object_api::{ShardIntegrityWriteMode, WriteCompletion};
+        use std::collections::HashMap;
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        for (disk_count, parity) in [(4, 2), (16, 4)] {
+            for mutation in ["copy-source", "copy-destination", "replace-metadata", "update-tags"] {
+                let (dirs, store) = isolated_store_over_temp_disks_with_count(disk_count).await;
+                init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+                let bucket = format!("copy-heal-fence-{disk_count}-{mutation}");
+                let source = "source/actual key.bin";
+                let destination = "destination/actual key.bin";
+                let control = "unrelated/control.bin";
+                store
+                    .make_bucket(&bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("isolated copy bucket");
+                let options = ObjectOptions {
+                    write_completion: WriteCompletion::TailDrained,
+                    shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
+                    ..Default::default()
+                };
+                let source_body = vec![0x31; 1024 * 1024 + 113];
+                let destination_body = vec![0x42; 1024 * 1024 + 137];
+                let control_body = vec![0x53; 1024 * 1024 + 157];
+                let mut seed_acks = HashMap::new();
+                for (key, body, role) in [
+                    (source, &source_body, "source"),
+                    (destination, &destination_body, "destination"),
+                    (control, &control_body, "control"),
+                ] {
+                    let mut opts = options.clone();
+                    opts.user_defined = HashMap::from([
+                        ("content-type".to_owned(), format!("application/{role}")),
+                        ("x-amz-meta-role".to_owned(), role.to_owned()),
+                    ]);
+                    let ack = store
+                        .put_object(&bucket, key, &mut PutObjReader::from_vec(body.clone()), &opts)
+                        .await
+                        .expect("ACK complete external fixture");
+                    seed_acks.insert(key, ack);
+                }
+                let set = store.pools[0].disk_set[0].clone();
+                let disks = set.disk_inventory().await;
+                let first_disk = disks[0].as_ref().expect("online first physical member");
+                let original_destination = first_disk
+                    .read_version("", &bucket, destination, "", &ReadOptions::default())
+                    .await
+                    .expect("independent original COPY destination generation");
+                let original_destination_dir = original_destination
+                    .data_dir
+                    .expect("original destination external generation");
+                let heal_key = if mutation == "copy-source" { source } else { destination };
+                let old = first_disk
+                    .read_version("", &bucket, heal_key, "", &ReadOptions::default())
+                    .await
+                    .expect("old healed generation metadata");
+                assert_eq!((old.erasure.data_blocks, old.erasure.parity_blocks), (disk_count - parity, parity));
+                assert!(!old.inline_data());
+                let old_dir = old.data_dir.expect("external healed generation");
+                let original_parts = futures::future::join_all(dirs.iter().map(|dir| {
+                    tokio::fs::read(
+                        dir.path()
+                            .join(&bucket)
+                            .join(heal_key)
+                            .join(old_dir.to_string())
+                            .join("part.1"),
+                    )
+                }))
+                .await
+                .into_iter()
+                .map(|v| v.expect("original same-role part"))
+                .collect::<Vec<_>>();
+                let missing = dirs[0]
+                    .path()
+                    .join(&bucket)
+                    .join(heal_key)
+                    .join(old_dir.to_string())
+                    .join("part.1");
+                tokio::fs::remove_file(&missing)
+                    .await
+                    .expect("inject one real missing external shard");
+                let (pause, arrived, release) = ReadRepairPauseScope::install(&bucket, heal_key);
+                let heal_set = set.clone();
+                let heal_bucket = bucket.clone();
+                let heal = tokio::spawn(async move {
+                    heal_set
+                        .heal_object(
+                            &heal_bucket,
+                            heal_key,
+                            "",
+                            &HealOpts {
+                                read_repair: true,
+                                scan_mode: HealScanMode::Deep,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(30), arrived.notified())
+                    .await
+                    .expect("actual copy/metadata Heal reconstruction reaches final rename");
+                assert!(!heal.is_finished() && !missing.exists());
+                println!(
+                    "native_g06: geometry={disk_count}/{parity} mutation={mutation} real_reconstruction_paused_before_final_rename"
+                );
+                let ack = if matches!(mutation, "copy-source" | "copy-destination") {
+                    // Keep the COPY source read from supplying a second repair;
+                    // the separately paused production Heal owns this oracle.
+                    let read_options = ObjectOptions {
+                        suppress_read_repair: true,
+                        ..options.clone()
+                    };
+                    let reader = store
+                        .get_object_reader(&bucket, source, None, Default::default(), &read_options)
+                        .await
+                        .expect("actual COPY source reader");
+                    let mut info = reader.object_info.clone();
+                    let size = info.get_actual_size().expect("COPY source logical size");
+                    assert_eq!(size, source_body.len() as i64);
+                    let hash = rustfs_rio::HashReader::from_stream(reader.stream, size, size, None, None, false)
+                        .expect("actual streamed COPY source");
+                    info.put_object_reader = Some(PutObjReader::new(hash));
+                    let ack = tokio::time::timeout(
+                        Duration::from_secs(30),
+                        store.copy_object(&bucket, source, &bucket, destination, &mut info, &read_options, &options),
+                    )
+                    .await
+                    .expect("COPY ACK before paused Heal release")
+                    .expect("production cross-key COPY ACK");
+                    assert_eq!(ack.etag, seed_acks[source].etag);
+                    ack
+                } else if mutation == "replace-metadata" {
+                    let mut info = store
+                        .get_object_info(&bucket, destination, &options)
+                        .await
+                        .expect("self-COPY source metadata");
+                    info.metadata_only = true;
+                    info.user_defined = Arc::new(HashMap::from([
+                        ("content-type".to_owned(), "application/replaced".to_owned()),
+                        ("x-amz-meta-race".to_owned(), "metadata-replaced".to_owned()),
+                    ]));
+                    tokio::time::timeout(
+                        Duration::from_secs(30),
+                        store.copy_object(&bucket, destination, &bucket, destination, &mut info, &options, &options),
+                    )
+                    .await
+                    .expect("self metadata COPY ACK before Heal release")
+                    .expect("production self-COPY metadata ACK")
+                } else {
+                    tokio::time::timeout(
+                        Duration::from_secs(30),
+                        store.put_object_tags(&bucket, destination, "race=updated&nonce=g06", &options),
+                    )
+                    .await
+                    .expect("tag update ACK before Heal release")
+                    .expect("production tag update ACK")
+                };
+                assert!(ack.etag.as_ref().is_some_and(|v| !v.is_empty()));
+                let namespace = set.new_ns_lock(&bucket, destination).await.expect("COPY/mutation namespace");
+                let drained = namespace
+                    .get_write_lock(Duration::from_secs(30))
+                    .await
+                    .expect("foreground physical tails drain");
+                let mut acknowledged = Vec::new();
+                for key in [source, destination, control] {
+                    let current = first_disk
+                        .read_version("", &bucket, key, "", &ReadOptions::default())
+                        .await
+                        .expect("foreground committed metadata");
+                    let data_dir = current.data_dir.expect("external foreground generation");
+                    let mut members = Vec::new();
+                    for dir in &dirs {
+                        let root = dir.path().join(&bucket).join(key);
+                        let meta = tokio::fs::read(root.join(STORAGE_FORMAT_FILE))
+                            .await
+                            .expect("foreground metadata bytes");
+                        let part_path = root.join(data_dir.to_string()).join("part.1");
+                        let part = if part_path.exists() {
+                            Some(tokio::fs::read(part_path).await.expect("foreground part bytes"))
+                        } else {
+                            None
+                        };
+                        members.push((meta, part));
+                    }
+                    acknowledged.push((key, data_dir, members));
+                }
+                if matches!(mutation, "copy-source" | "copy-destination") {
+                    assert_ne!(acknowledged[1].1, original_destination_dir);
+                    assert!(dirs.iter().all(|dir| {
+                        !dir.path()
+                            .join(&bucket)
+                            .join(destination)
+                            .join(original_destination_dir.to_string())
+                            .exists()
+                    }));
+                }
+                if mutation != "copy-destination" {
+                    assert_eq!(acknowledged.iter().find(|row| row.0 == heal_key).expect("healed key").1, old_dir);
+                    assert!(!missing.exists(), "foreground metadata/source read must not supply the missing repair");
+                }
+                drop(drained);
+                assert!(!heal.is_finished());
+                println!(
+                    "native_g06: geometry={disk_count}/{parity} mutation={mutation} foreground_ack_and_all_physical_tails_verified_before_release"
+                );
+                release.notify_one();
+                let (_, error) = tokio::time::timeout(Duration::from_secs(30), heal)
+                    .await
+                    .expect("copy/metadata Heal exits its fence")
+                    .expect("Heal joins")
+                    .expect("actual Heal result");
+                assert_eq!(
+                    error,
+                    if mutation == "copy-source" {
+                        None
+                    } else {
+                        Some(DiskError::Timeout)
+                    }
+                );
+                drop(pause);
+                for (key, data_dir, members) in &acknowledged {
+                    for (slot, dir) in dirs.iter().enumerate() {
+                        let root = dir.path().join(&bucket).join(key);
+                        let metadata = tokio::fs::read(root.join(STORAGE_FORMAT_FILE))
+                            .await
+                            .expect("metadata after Heal release");
+                        if *key != heal_key || mutation != "copy-source" {
+                            assert_eq!(metadata, members[slot].0, "stale Heal must preserve foreground metadata exactly");
+                        }
+                        let part_path = root.join(data_dir.to_string()).join("part.1");
+                        match &members[slot].1 {
+                            Some(expected) => {
+                                assert_eq!(tokio::fs::read(part_path).await.expect("acknowledged part survives Heal"), *expected)
+                            }
+                            None if mutation == "copy-source" => assert_eq!(
+                                tokio::fs::read(part_path)
+                                    .await
+                                    .expect("real source Heal rebuilds before any GET"),
+                                original_parts[slot]
+                            ),
+                            None => assert!(!part_path.exists(), "stale Heal cannot publish its obsolete staged part"),
+                        }
+                    }
+                }
+                if matches!(mutation, "replace-metadata" | "update-tags") {
+                    let (_, error) = set
+                        .heal_object(
+                            &bucket,
+                            destination,
+                            "",
+                            &HealOpts {
+                                scan_mode: HealScanMode::Deep,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("independent current-metadata Heal after stale refusal");
+                    assert_eq!(error, None);
+                    for (slot, dir) in dirs.iter().enumerate() {
+                        assert_eq!(
+                            tokio::fs::read(
+                                dir.path()
+                                    .join(&bucket)
+                                    .join(destination)
+                                    .join(old_dir.to_string())
+                                    .join("part.1")
+                            )
+                            .await
+                            .expect("fresh Heal rebuilds original data with acknowledged new metadata"),
+                            original_parts[slot]
+                        );
+                    }
+                }
+                for (key, expected) in [
+                    (source, &source_body),
+                    (
+                        destination,
+                        if matches!(mutation, "copy-source" | "copy-destination") {
+                            &source_body
+                        } else {
+                            &destination_body
+                        },
+                    ),
+                    (control, &control_body),
+                ] {
+                    let mut reader = store
+                        .get_object_reader(&bucket, key, None, Default::default(), &options)
+                        .await
+                        .expect("full final COPY/mutation/control read");
+                    let mut body = Vec::new();
+                    reader
+                        .stream
+                        .read_to_end(&mut body)
+                        .await
+                        .expect("read complete acknowledged body");
+                    assert_eq!(&body, expected);
+                    if !(key == destination && mutation == "replace-metadata") {
+                        let role =
+                            if key == source || key == destination && matches!(mutation, "copy-source" | "copy-destination") {
+                                "source"
+                            } else if key == destination {
+                                "destination"
+                            } else {
+                                "control"
+                            };
+                        assert_eq!(reader.object_info.user_defined.get("x-amz-meta-role").map(String::as_str), Some(role));
+                        assert_eq!(reader.object_info.user_defined.get("content-type"), Some(&format!("application/{role}")));
+                    }
+                    if key == destination && mutation == "replace-metadata" {
+                        let metadata = reader.object_info.user_defined.as_ref();
+                        assert_eq!(metadata.get("x-amz-meta-race").map(String::as_str), Some("metadata-replaced"));
+                        assert_eq!(metadata.get("content-type").map(String::as_str), Some("application/replaced"));
+                        assert!(!metadata.contains_key("x-amz-meta-role"));
+                    }
+                }
+                for key in [source, destination, control] {
+                    let expected = if key == destination && mutation == "update-tags" {
+                        "race=updated&nonce=g06"
+                    } else {
+                        ""
+                    };
+                    assert_eq!(
+                        store
+                            .get_object_tags(&bucket, key, &options)
+                            .await
+                            .expect("exact acknowledged and control tags after Heal"),
+                        expected
+                    );
+                }
+                println!(
+                    "native_g06: geometry={disk_count}/{parity} mutation={mutation} exact_copy_metadata_tags_generations_and_full_bodies_verified"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn read_repair_commit_aborts_when_object_changes_before_final_rename() {
         let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
         let bucket = "read-repair-stale-commit";
