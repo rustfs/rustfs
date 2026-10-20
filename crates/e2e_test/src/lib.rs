@@ -189,6 +189,9 @@ mod conditional_delete_objects_test;
 #[cfg(test)]
 mod delete_authorization_test;
 
+#[cfg(test)]
+mod table_location_authorization_test;
+
 // Regression test for signed DELETE Object?versionId requests without Content-Length.
 #[cfg(test)]
 mod delete_object_no_content_length_test;
