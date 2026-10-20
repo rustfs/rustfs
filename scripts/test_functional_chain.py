@@ -35,6 +35,8 @@ class RaceNativeToolsWorkflowTests(unittest.TestCase):
                      (g01, 'heal.race-versioned-put', 'heal.race-version-delete')]
         reviewed += [('8380466f3a27c3c3ef4115084178a0ab99a78f32', case) for case in
                      (g01, 'heal.race-versioned-put', 'heal.race-version-delete', 'heal.race-markers-and-batch-delete')]
+        reviewed += [('757b751482bb970bc321e92059690a7698554358', case) for case in
+                     ('heal.admin-nolock-safety', 'heal.race-copy-and-metadata-update')]
         for source, case in reviewed:
             cases += [(False, 2, 1, None, source, case), (True, 2, 1, None, source, case),
                       (True, 0, 0, 'true', source, case)]
@@ -57,19 +59,20 @@ class RaceNativeToolsWorkflowTests(unittest.TestCase):
     def test_race_actual_admission_requires_native_and_runtime_before_exporting_directory(self):
         shell = self.chain_shell_step('Verify exact-source race native and runtime evidence')
         for case in ('heal.race-unversioned-overwrite', 'heal.race-versioned-put', 'heal.race-version-delete',
-                     'heal.race-markers-and-batch-delete'):
+                     'heal.race-markers-and-batch-delete', 'heal.admin-nolock-safety', 'heal.race-copy-and-metadata-update'):
             for native_exit, runtime in [(0, 0), (42, 0), (0, 42), (0, 'missing'), (0, 'collector-only')]:
                 with self.subTest(case=case, native_exit=native_exit, runtime=runtime), tempfile.TemporaryDirectory() as name:
                     root = Path(name)
                     env = self.fixture(root, new_helper=True)
                     directory = root / 'auto-testing/scripts/validation_heal'
+                    runtime_driver = 'nolock.py' if case == 'heal.admin-nolock-safety' else 'race.py'
                     (directory / 'race_native_evidence.py').write_text(
                         'import os,sys\nprint("{}")\nsys.exit(int(os.environ["VERIFY_EXIT"]))\n')
                     if runtime == 'collector-only':
-                        (directory / 'race.py').write_text(
+                        (directory / runtime_driver).write_text(
                             'import argparse\np=argparse.ArgumentParser()\np.add_argument("--rc-bin", required=True)\np.parse_args()\n')
                     elif runtime != 'missing':
-                        (directory / 'race.py').write_text(
+                        (directory / runtime_driver).write_text(
                             'import json,os,pathlib,sys\n'
                             'assert not pathlib.Path(os.environ["GITHUB_ENV"]).exists()\n'
                             'assert sys.argv[1] == "preflight"\n'
@@ -99,6 +102,8 @@ class RaceNativeToolsWorkflowTests(unittest.TestCase):
                         workflow.index('Run selected canonical validation case'))
         self.assertIn("steps.race_native.outputs.required == 'true'", workflow)
         self.assertIn("inputs.validation_case == 'heal.race-markers-and-batch-delete'", workflow)
+        self.assertIn("inputs.validation_case == 'heal.admin-nolock-safety'", workflow)
+        self.assertIn("inputs.validation_case == 'heal.race-copy-and-metadata-update'", workflow)
 
     def shell_step(self, name):
         from check_test_wiring import yaml_block
