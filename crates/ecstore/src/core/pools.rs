@@ -8790,7 +8790,18 @@ impl PoolMeta {
             });
         }
 
+        new_meta.reindex_pool_ids();
         new_meta
+    }
+
+    fn pool_ids_are_indexed(&self) -> bool {
+        self.pools.iter().enumerate().all(|(idx, pool)| pool.id == idx)
+    }
+
+    fn reindex_pool_ids(&mut self) {
+        for (idx, pool) in self.pools.iter_mut().enumerate() {
+            pool.id = idx;
+        }
     }
 
     pub fn is_suspended(&self, idx: usize) -> bool {
@@ -10065,7 +10076,10 @@ impl PoolMeta {
             specified_pools.insert(pool.endpoints.cmd_line.clone(), idx);
         }
 
-        let mut update = false;
+        // Pool ids are positional metadata. A completed pool can be removed from
+        // the launch configuration, so an existing status may retain the old id
+        // even when its command line still matches the current topology.
+        let mut update = !self.pool_ids_are_indexed();
 
         // Determine whether the selected pool should be removed from the retired list.
         for k in specified_pools.keys() {
@@ -27199,6 +27213,7 @@ mod pools_tests {
         validate_durable_ilm_record,
     };
     use crate::bucket::metadata_sys;
+    use crate::core::sets::make_local_two_set_sets_for_pool_with_ctx;
     use crate::data_movement;
     use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE, endpoint::Endpoint};
     use crate::error::{Error, StorageError};
@@ -27260,6 +27275,70 @@ mod pools_tests {
 
     fn noop_decommission_list_callback() -> ListCallback {
         Arc::new(|_| Box::pin(async {}))
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_reindexes_ids_after_pool_removal_and_expansion() {
+        let ctx = Arc::new(InstanceContext::new());
+        let (_removed_dirs, removed_pool) = make_local_two_set_sets_for_pool_with_ctx(Arc::clone(&ctx), 0).await;
+        let (_surviving_dirs, surviving_pool) = make_local_two_set_sets_for_pool_with_ctx(Arc::clone(&ctx), 1).await;
+        let (_added_dirs, added_pool) = make_local_two_set_sets_for_pool_with_ctx(ctx, 2).await;
+
+        let stale = PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![
+                PoolStatus {
+                    id: 0,
+                    cmd_line: removed_pool.endpoints.cmd_line.clone(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: Some(PoolDecommissionInfo {
+                        complete: true,
+                        ..Default::default()
+                    }),
+                },
+                PoolStatus {
+                    id: 1,
+                    cmd_line: surviving_pool.endpoints.cmd_line.clone(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: None,
+                },
+            ],
+            dont_save: false,
+        };
+
+        assert!(
+            stale
+                .validate(vec![Arc::clone(&surviving_pool)])
+                .expect("stale pool metadata should validate as a repairable topology update"),
+            "removing a completed pool must trigger startup metadata repair"
+        );
+
+        let repaired = PoolMeta::new(std::slice::from_ref(&surviving_pool), &stale);
+        assert_eq!(repaired.pools[0].id, 0);
+        let mut persisted = repaired.clone();
+        merge_pool_meta_updates_for_save(&mut persisted, &repaired, &[0], "pool metadata save")
+            .expect("reindexed pool metadata should remain writable");
+
+        let expanded = PoolMeta::new(&[Arc::clone(&surviving_pool), Arc::clone(&added_pool)], &repaired);
+        assert_eq!(expanded.pools.iter().map(|pool| pool.id).collect::<Vec<_>>(), [0, 1]);
+
+        let already_corrupt = PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![PoolStatus {
+                id: 1,
+                cmd_line: expanded.pools[0].cmd_line.clone(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: None,
+            }],
+            dont_save: false,
+        };
+        assert!(
+            already_corrupt
+                .validate(vec![Arc::clone(&surviving_pool)])
+                .expect("an already persisted stale id should remain repairable on restart"),
+            "pool id validation must detect stale ids even when the topology is unchanged"
+        );
     }
 
     fn decommission_worker_test_store(pool_meta: PoolMeta, cancelers: Vec<Option<DecommissionCanceler>>) -> Arc<ECStore> {
