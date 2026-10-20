@@ -13,13 +13,14 @@
 // limitations under the License.
 
 use super::harness::{
-    DistCluster, DistLayout, TestResult, enable_versioning, put_bucket_replication, put_object, quota_stats_current_usage,
-    quota_stats_on_every_node, retrying_put, set_bucket_quota, set_remote_target, unique_bucket, wait_for_ready,
-    wait_for_replicated_bytes, wait_until,
+    DistCluster, DistLayout, TestResult, cluster_admin_ok, enable_versioning, put_bucket_replication, put_object,
+    quota_stats_current_usage, quota_stats_on_every_node, retrying_put, set_bucket_quota, set_remote_target, unique_bucket,
+    wait_for_ready, wait_for_replicated_bytes, wait_until,
 };
-use crate::common::{FAST_DATA_USAGE_SCANNER_ENV, init_logging};
+use crate::common::{FAST_DATA_USAGE_SCANNER_ENV, admin_request, init_logging};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
+use http::{Method, StatusCode};
 use std::time::Duration;
 
 async fn wait_for_replication_status(
@@ -106,6 +107,137 @@ async fn four_node_bucket_replication_converges_to_peer_cluster() -> TestResult 
     wait_for_ready(&target.cluster).await?;
     wait_for_replicated_bytes(&target.client(2)?, &target_bucket, outage_key, &outage_body, Duration::from_secs(90)).await?;
     wait_for_replication_status(&source_client, &source_bucket, outage_key, &["COMPLETED"], Duration::from_secs(45)).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn four_node_quota_changes_refresh_peers_before_response() -> TestResult {
+    init_logging();
+    let mut dist = DistCluster::start(DistLayout::FourByFour).await?;
+    let bucket = unique_bucket("quota-refresh");
+    dist.create_bucket(&bucket).await?;
+    let native_path = format!("/rustfs/admin/v3/quota/{bucket}");
+    let compat_set = format!("/rustfs/admin/v3/set-bucket-quota?bucket={bucket}");
+    let compat_get = format!("/rustfs/admin/v3/get-bucket-quota?bucket={bucket}");
+
+    // Warm every node's no-quota cache. The compatibility GET does not
+    // depend on a scanner usage snapshot for this newly created bucket.
+    for node in &dist.cluster.nodes {
+        let (status, body) = admin_request(
+            &node.url,
+            Method::GET,
+            &compat_get,
+            None,
+            &dist.cluster.access_key,
+            &dist.cluster.secret_key,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body)?["quota"], 0);
+    }
+    wait_until(
+        Duration::from_secs(30),
+        || async {
+            let (status, body) = admin_request(
+                &dist.cluster.nodes[0].url,
+                Method::PUT,
+                &native_path,
+                Some(serde_json::json!({"quota": 8192, "quota_type": "HARD"}).to_string()),
+                &dist.cluster.access_key,
+                &dist.cluster.secret_key,
+            )
+            .await?;
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                return Ok(false);
+            }
+            assert_eq!(status, StatusCode::OK, "{body}");
+            Ok(true)
+        },
+        "quota fleet capability ready",
+    )
+    .await?;
+
+    for (method, path, payload, expected) in [
+        (Method::GET, native_path.as_str(), None, Some(8192_u64)),
+        (
+            Method::PUT,
+            native_path.as_str(),
+            Some(serde_json::json!({"quota": 4096, "quota_type": "HARD"})),
+            Some(4096),
+        ),
+        (Method::DELETE, native_path.as_str(), None, None),
+        (
+            Method::PUT,
+            compat_set.as_str(),
+            Some(serde_json::json!({"quota": 16384, "quotatype": "hard", "reservation_protocol": 2})),
+            Some(16384),
+        ),
+        (
+            Method::PUT,
+            compat_set.as_str(),
+            Some(serde_json::json!({"quota": 0, "quotatype": "hard"})),
+            None,
+        ),
+    ] {
+        if method != Method::GET {
+            cluster_admin_ok(&dist.cluster, method, path, payload.map(|value| value.to_string())).await?;
+        }
+        // No polling: a successful mutation waits for healthy peers to reload.
+        for (index, node) in dist.cluster.nodes.iter().enumerate() {
+            let (status, body) = admin_request(
+                &node.url,
+                Method::GET,
+                &compat_get,
+                None,
+                &dist.cluster.access_key,
+                &dist.cluster.secret_key,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::OK, "node {index}: {body}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body)?["quota"],
+                expected.unwrap_or(0),
+                "node {index} kept stale quota metadata",
+            );
+            if expected.is_some() {
+                let (status, body) = admin_request(
+                    &node.url,
+                    Method::GET,
+                    &native_path,
+                    None,
+                    &dist.cluster.access_key,
+                    &dist.cluster.secret_key,
+                )
+                .await?;
+                assert_eq!(status, StatusCode::OK, "node {index}: {body}");
+                assert_eq!(serde_json::from_str::<serde_json::Value>(&body)?["quota"].as_u64(), expected);
+            }
+        }
+    }
+
+    cluster_admin_ok(
+        &dist.cluster,
+        Method::PUT,
+        &native_path,
+        Some(serde_json::json!({"quota": 8192, "quota_type": "HARD"}).to_string()),
+    )
+    .await?;
+    dist.cluster.stop_node(3)?;
+    // An unreachable peer cannot turn an already committed clear into a failure.
+    cluster_admin_ok(&dist.cluster, Method::DELETE, &native_path, None).await?;
+    for node in dist.cluster.nodes.iter().take(3) {
+        let (status, body) = admin_request(
+            &node.url,
+            Method::GET,
+            &compat_get,
+            None,
+            &dist.cluster.access_key,
+            &dist.cluster.secret_key,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body)?["quota"], 0);
+    }
     Ok(())
 }
 

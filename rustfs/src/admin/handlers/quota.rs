@@ -17,7 +17,10 @@
 use crate::admin::auth::{validate_admin_request, validate_admin_request_with_bucket};
 use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{current_bucket_metadata_handle, current_object_store_handle};
+use crate::admin::runtime_sources::{
+    AppContext, app_context_from_req, current_bucket_metadata_handle, current_notification_system_for_context,
+    current_object_store_handle,
+};
 use crate::admin::storage_api::bucket::metadata_sys::{self, BucketMetadataSys};
 use crate::admin::storage_api::bucket::quota::checker::{QuotaChecker, record_reservation_protocol_migration};
 use crate::admin::storage_api::bucket::quota::{
@@ -44,6 +47,30 @@ use url::form_urlencoded;
 const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_QUOTA: &str = "quota";
 const EVENT_ADMIN_QUOTA_STATE: &str = "admin_quota_state";
+
+async fn notify_quota_metadata_reload(context: Option<Arc<AppContext>>, bucket: String, action: &'static str) {
+    let Some(notification_sys) = current_notification_system_for_context(context.as_deref()) else {
+        return;
+    };
+    // The metadata transaction has committed and released its locks. Await
+    // healthy peers, but keep the reload running if the request is cancelled.
+    // Failed peers converge through the periodic metadata refresh.
+    let _ = tokio::spawn(async move {
+        if let Err(error) = notification_sys.load_bucket_metadata(&bucket).await {
+            warn!(
+                event = EVENT_ADMIN_QUOTA_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_QUOTA,
+                state = "peer_metadata_reload_failed",
+                action,
+                bucket = %bucket,
+                error = %error,
+                "admin quota state"
+            );
+        }
+    })
+    .await;
+}
 
 #[derive(Debug, Deserialize)]
 pub struct SetBucketQuotaRequest {
@@ -445,6 +472,8 @@ impl Operation for SetBucketQuotaHandler {
         }
         .map_err(ApiError::from)?;
 
+        notify_quota_metadata_reload(app_context_from_req(&req), bucket.clone(), "set_bucket_quota").await;
+
         if let Err(err) = site_replication_bucket_meta_hook(SRBucketMeta {
             bucket: bucket.clone(),
             r#type: "quota-config".to_string(),
@@ -622,6 +651,8 @@ impl Operation for ClearBucketQuotaHandler {
             .set_quota_config_if_incarnation(&bucket, quota.clone(), expected_incarnation_id)
             .await
             .map_err(|e| s3_error!(InternalError, "failed to clear quota: {}", e))?;
+
+        notify_quota_metadata_reload(app_context_from_req(&req), bucket.clone(), "clear_bucket_quota").await;
 
         if let Err(err) = site_replication_bucket_meta_hook(SRBucketMeta {
             bucket: bucket.clone(),
