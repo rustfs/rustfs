@@ -200,7 +200,8 @@ mod decommission_lock_order_tests {
     use crate::core::pools::{
         DECOMMISSION_CAPACITY_TARGET_LOCK_PREFIX, DecommissionCapacityLockOrderBarrier, DecommissionCapacityOwner,
         DecommissionErasureLayout, DecommissionPoolCapacityInfo, DecommissionTestFaultGuard, POOL_META_NAME,
-        decommission_capacity_mutation_id, set_decommission_capacity_info_overrides_for_test,
+        decommission_capacity_mutation_id, decommission_target_gate_busy_error,
+        set_decommission_capacity_info_overrides_for_test,
     };
     use crate::data_movement;
     use crate::disk::RUSTFS_META_BUCKET;
@@ -1033,15 +1034,26 @@ mod decommission_lock_order_tests {
         start_over_budget_routine_decommission(store, bucket, 45 << 20).await;
         let barrier = stale_target_barrier(store);
         let _fault = pause_object_target_gate_acquire(Arc::clone(&barrier), bucket.to_string(), anchor.to_string(), 1);
-        let held_at_subject = async {
-            store.pools[1]
-                .get_object_info(bucket, anchor, &ObjectOptions::default())
-                .await
-                .expect("the anchor must be on target 1 before the subject is held");
-            assert_key_not_yet_migrated(store, bucket, subject).await;
-        };
-        run_routine_while_target_1_changes(store, &barrier, 1, 6 << 20, true, held_at_subject).await;
+        run_routine_while_target_1_changes(
+            store,
+            &barrier,
+            1,
+            6 << 20,
+            true,
+            assert_held_at_subject(store, bucket, anchor, subject),
+        )
+        .await;
         assert_source_key_migrated_to_target_2(store, bucket, subject).await;
+    }
+
+    /// The pause holds the subject, not the anchor: the anchor is already on
+    /// target 1 and the subject on neither target.
+    async fn assert_held_at_subject(store: &Arc<crate::store::ECStore>, bucket: &str, anchor: &str, subject: &str) {
+        store.pools[1]
+            .get_object_info(bucket, anchor, &ObjectOptions::default())
+            .await
+            .expect("the anchor must be on target 1 before the subject is held");
+        assert_key_not_yet_migrated(store, bucket, subject).await;
     }
 
     #[test]
@@ -1101,19 +1113,28 @@ mod decommission_lock_order_tests {
             let _fault = pause_object_target_gate_acquire(Arc::clone(&barrier), bucket.clone(), anchor.to_string(), 1);
             let routine = spawn_decommission_routine(&store, 1);
             barrier.wait_until_target_gate_acquire_paused().await;
+            assert_held_at_subject(&store, &bucket, anchor, &subject).await;
             commit_other_mutation_on_target_1(&store, 6 << 20).await;
             assert_target_1_over_budget(&store).await;
             barrier.release_target_gate_acquire();
             // The source cleanup of a migrated transitioned version leaves a
-            // tier free version behind, so the routine ends at its post-check
-            // even without contention (rustfs/backlog#2873). Pin only that the
-            // tiered copy was placed again instead of failing.
-            let _ = routine.await.expect("the decommission routine task should join");
+            // tier free version behind, so the routine fails its post-check
+            // even without contention (rustfs/backlog#2873, defect D). Once
+            // that is fixed this flips: expect the routine to complete.
+            let err = routine
+                .await
+                .expect("the decommission routine task should join")
+                .expect_err("the post-check fails while the tier free version is left behind");
+            assert!(
+                err.to_string().contains("post-check failed") && err.to_string().contains("were found in bucket"),
+                "{err}"
+            );
             let local = store.pool_meta.read().await;
             let info = local.pools[0]
                 .decommission
                 .as_ref()
                 .expect("the decommission state should remain present");
+            assert!(info.failed, "the post-check failure marks the decommission failed");
             assert_eq!(info.items_decommission_failed, 0);
             assert!(info.capacity_blocked_reason.is_none(), "{:?}", info.capacity_blocked_reason);
             drop(local);
@@ -1179,6 +1200,7 @@ mod decommission_lock_order_tests {
             // persisting its intent there, so the free version's admission
             // meets an intent conflict; hold its retry as well.
             barrier.wait_until_target_gate_acquire_paused().await;
+            assert_held_at_subject(&store, &bucket, anchor, &subject).await;
             let owner = decommission_capacity_owner(&*store.pool_meta.read().await).with_mutation_id(uuid::Uuid::new_v4());
             store
                 .run_decommission_capacity_admitted_mutation(1, Some(owner), Some(1 << 20), || async {
@@ -1193,6 +1215,7 @@ mod decommission_lock_order_tests {
 
             // The retry finds the intent resolved.
             barrier.wait_until_target_gate_acquire_paused().await;
+            assert_held_at_subject(&store, &bucket, anchor, &subject).await;
             edit_target_1_ledger(&store, |reservation| {
                 let target = reservation
                     .targets
@@ -1341,6 +1364,37 @@ mod decommission_lock_order_tests {
             // leaves 4 MiB, under the object's 8 MiB peak, while target 1 stays
             // within its temporary-copy budget.
             commit_other_mutation_on_target_1(&store, 44 << 20).await;
+
+            run_routine_to_a_deferral_pause(
+                &store,
+                1,
+                "target pool 1 no longer fits the selected mutation: source pool 0 reservation estimate is exhausted",
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_pause_names_a_stale_selection_over_a_later_busy_gate() {
+        run_large_stack_async_test("decommission-deferral-cause-priority", || async {
+            let (_temp_dirs, store, bucket) = new_stale_target_store("deferral-cause-priority").await;
+            let pinned = "a-pinned-large.bin";
+            put_source_object(&store, &bucket, pinned, vec![0x34; 4 << 20]).await;
+            // In the same set and after the pinned object, so with one entry
+            // at a time its deferral settles last in the replay.
+            let busy = source_key_after(&store, pinned, "busy");
+            put_source_object(&store, &bucket, &busy, b"deferred on a busy gate".to_vec()).await;
+            start_over_budget_routine_decommission(&store, &bucket, 0).await;
+            copy_source_object_to_target_1(&store, &bucket, pinned).await;
+            commit_other_mutation_on_target_1(&store, 44 << 20).await;
+            let _fault = DecommissionTestFaultGuard::install_with_error(
+                Arc::new({
+                    let busy = busy.clone();
+                    move |stage, _, object, _, success| stage == "migrate_object" && object == busy && success
+                }),
+                Some(Arc::new(|_, _, _| decommission_target_gate_busy_error(2))),
+            );
 
             run_routine_to_a_deferral_pause(
                 &store,

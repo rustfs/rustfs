@@ -1079,6 +1079,12 @@ pub(crate) fn is_decommission_capacity_target_gate_busy(err: &Error) -> bool {
     decommission_capacity_target_gate_busy_index(err).is_some()
 }
 
+pub(crate) fn decommission_target_gate_busy_error(target_pool_index: usize) -> Error {
+    decommission_capacity_blocked_error(format!(
+        "{DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_PREFIX}{target_pool_index}{DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_SUFFIX}"
+    ))
+}
+
 /// The target pool of a failure that only shows the mutation's target
 /// selection went stale: the pool went over a temporary-copy budget, or no
 /// longer fits the mutation it was selected for.
@@ -4894,24 +4900,39 @@ fn resolve_decommission_listing_worker_result(
     worker_result.map_err(|err| Error::other(format!("decommission listing worker {set_idx} task join error: {err}")))?
 }
 
+/// Keep the deferral cause the pause reason should name. A stale target
+/// selection outranks transient contention such as a busy gate: it does not
+/// clear by waiting, so it is what an operator has to act on, whichever entry
+/// of the set finished last.
+fn record_decommission_deferral_cause(recorded: &mut Option<(bool, String)>, err: &Error) {
+    let stale = matches!(
+        classify_decommission_capacity_failure(err),
+        DecommissionCapacityFailure::StaleTargetSelection { .. }
+    );
+    if recorded.as_ref().is_none_or(|(recorded_stale, _)| stale || !recorded_stale) {
+        *recorded = Some((stale, err.to_string()));
+    }
+}
+
 /// A bucket set may only finish once every deferred entry has been resolved.
 ///
 /// The deferred round is the last chance for a contended entry; leaving one
 /// unresolved would mark the bucket done and drop the object. This is reported
 /// as a capacity failure so the pool takes the existing durable-pause path
-/// instead of a terminal failure. The pause reason carries the cause of the
-/// last deferral, which would otherwise only appear in the logs.
+/// instead of a terminal failure. The pause reason carries the cause of a
+/// remaining deferral (see `record_decommission_deferral_cause`), which would
+/// otherwise only appear in the logs.
 fn ensure_decommission_deferred_drained(
     bucket: &str,
     set_idx: usize,
     deferred_remaining: usize,
-    last_deferral: Option<&str>,
+    deferral_cause: Option<&str>,
 ) -> Result<()> {
     if deferred_remaining == 0 {
         return Ok(());
     }
-    let cause = last_deferral
-        .map(|cause| format!("; last deferral: {cause}"))
+    let cause = deferral_cause
+        .map(|cause| format!("; deferral cause: {cause}"))
         .unwrap_or_default();
     Err(decommission_capacity_blocked_error(format!(
         "decommission bucket {bucket} set {set_idx} finished with {deferred_remaining} deferred entries remaining{cause}"
@@ -11952,9 +11973,7 @@ impl ECStore {
         {
             Ok(guard) => Ok(guard),
             Err(rustfs_lock::LockError::Timeout { .. } | rustfs_lock::LockError::AlreadyLocked { .. }) => {
-                Err(decommission_capacity_blocked_error(format!(
-                    "{DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_PREFIX}{target_pool_index}{DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_SUFFIX}"
-                )))
+                Err(decommission_target_gate_busy_error(target_pool_index))
             }
             Err(rustfs_lock::LockError::QuorumNotReached { required, achieved }) => Err(Error::NamespaceLockQuorumUnavailable {
                 mode: "write",
@@ -15606,7 +15625,7 @@ impl ECStore {
         // bucket must not be reported complete while a deferred entry remains.
         let deferred_entries = std::mem::take(&mut *deferred.lock().await);
         let deferred_remaining = Arc::new(AtomicUsize::new(0));
-        let last_deferral = Arc::new(std::sync::Mutex::new(None::<String>));
+        let deferral_cause = Arc::new(std::sync::Mutex::new(None::<(bool, String)>));
         if !deferred_entries.is_empty() {
             // The replay keeps the set's own worker bound: a whole-bucket
             // deferral must not spawn one task per object.
@@ -15623,7 +15642,7 @@ impl ECStore {
                     let entry_budget = entry_budget.clone();
                     let entry_error = entry_error.clone();
                     let deferred_remaining = Arc::clone(&deferred_remaining);
-                    let last_deferral = Arc::clone(&last_deferral);
+                    let deferral_cause = Arc::clone(&deferral_cause);
                     async move {
                         let outcome = this
                             .replay_deferred_decommission_entry(
@@ -15645,7 +15664,10 @@ impl ECStore {
                             .await;
                         if let Ok(DecommissionEntryOutcome::Deferred(err)) = outcome {
                             deferred_remaining.fetch_add(1, Ordering::Relaxed);
-                            *last_deferral.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(err.to_string());
+                            record_decommission_deferral_cause(
+                                &mut deferral_cause.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+                                &err,
+                            );
                         }
                     }
                 })
@@ -15657,8 +15679,12 @@ impl ECStore {
         let deferred_remaining = deferred_remaining.load(Ordering::Relaxed);
         // A set must not report success while an entry is still deferred: the
         // bucket would be marked done and the object silently dropped.
-        let last_deferral = last_deferral.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-        ensure_decommission_deferred_drained(bi.name.as_str(), set_idx, deferred_remaining, last_deferral.as_deref())
+        let deferral_cause = deferral_cause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .map(|(_, cause)| cause);
+        ensure_decommission_deferred_drained(bi.name.as_str(), set_idx, deferred_remaining, deferral_cause.as_deref())
     }
 
     async fn track_decommission_entry_progress_stage(
@@ -25179,6 +25205,27 @@ mod tests {
         }
     }
 
+    /// A stale target selection stays the named cause whichever order the
+    /// set's deferrals settle in; transient causes replace each other.
+    #[test]
+    fn decommission_deferral_cause_prefers_a_stale_target_selection() {
+        let stale = decommission_target_no_longer_fits_error(1, "source pool 0 reservation estimate is exhausted");
+        let busy = decommission_target_gate_busy_error(2);
+        let conflict =
+            decommission_capacity_blocked_error("source pool 0 target pool 2 has an unresolved target capacity intent");
+        let named = |errors: &[&Error]| {
+            let mut recorded = None;
+            for err in errors {
+                record_decommission_deferral_cause(&mut recorded, err);
+            }
+            recorded.map(|(_, cause)| cause)
+        };
+        assert_eq!(named(&[&stale, &busy]), Some(stale.to_string()));
+        assert_eq!(named(&[&busy, &stale]), Some(stale.to_string()));
+        assert_eq!(named(&[&busy, &conflict]), Some(conflict.to_string()));
+        assert_eq!(named(&[]), None);
+    }
+
     /// A set that still holds a deferred entry must not report success.
     #[test]
     fn decommission_deferred_drain_invariant_rejects_unresolved_entries() {
@@ -25191,7 +25238,7 @@ mod tests {
         assert!(message.contains('2'), "{message}");
         assert!(message.contains('3'), "{message}");
         assert!(
-            message.contains("last deferral: target pool 1 no longer fits"),
+            message.contains("deferral cause: target pool 1 no longer fits"),
             "the pause must name its cause: {message}"
         );
     }
