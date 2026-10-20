@@ -333,6 +333,29 @@ pub fn validate_outbound_url(url: &Url) -> Result<(), OutboundUrlError> {
     })
 }
 
+/// Apply the literal URL guard while allowing private storage endpoints.
+///
+/// Known metadata services in IPv6 ULA space remain forbidden. This does not
+/// resolve DNS or consult either outbound-origin or replication-loopback settings.
+pub fn validate_outbound_url_allow_private(url: &Url) -> Result<(), OutboundUrlError> {
+    match validate_outbound_url(url) {
+        Err(
+            err @ OutboundUrlError::ForbiddenHost {
+                reason: "private address",
+                ..
+            },
+        ) => {
+            let ip = normalized_host(url).and_then(|host| host.parse::<IpAddr>().ok());
+            if ip.is_some_and(|ip| !is_metadata_endpoint(ip)) {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        }
+        result => result,
+    }
+}
+
 fn validate_http_url_shape(url: &Url) -> Result<(), OutboundPolicyError> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err(OutboundPolicyError::UnsupportedScheme {
@@ -549,7 +572,10 @@ fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutboundPolicy, OutboundUrlError, find_outbound_dns_policy_rejection, validate_outbound_url};
+    use super::{
+        OutboundPolicy, OutboundUrlError, find_outbound_dns_policy_rejection, validate_outbound_url,
+        validate_outbound_url_allow_private,
+    };
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use url::Url;
@@ -558,6 +584,64 @@ mod tests {
     fn validate_outbound_url_allows_public_hostname() {
         let url = Url::parse("https://example.com/webhook").expect("public URL should parse");
         assert!(validate_outbound_url(&url).is_ok());
+    }
+
+    #[test]
+    fn private_storage_endpoints_are_allowed_without_relaxing_the_global_guard() {
+        for endpoint in [
+            "http://10.0.0.1:9000",
+            "http://172.16.0.1:9000",
+            "https://192.168.10.200:9443",
+            "http://[fd12:3456::1]:9000",
+            "http://[::ffff:192.168.10.200]:9000",
+            "http://[::192.168.10.200]:9000",
+        ] {
+            let url = Url::parse(endpoint).expect("private endpoint should parse");
+            assert!(validate_outbound_url_allow_private(&url).is_ok(), "{endpoint}");
+            assert!(validate_outbound_url(&url).is_err(), "global guard must still reject {endpoint}");
+        }
+    }
+
+    #[test]
+    fn private_storage_exception_preserves_forbidden_endpoints() {
+        for endpoint in [
+            "http://localhost:9000",
+            "http://localhost.:9000",
+            "http://127.0.0.1:9000",
+            "http://[::1]:9000",
+            "http://[::ffff:127.0.0.1]:9000",
+            "http://169.254.1.1:9000",
+            "http://[fe80::1]:9000",
+            "http://0.0.0.0:9000",
+            "http://[::]:9000",
+            "http://169.254.169.254",
+            "http://[::ffff:169.254.169.254]",
+            "http://[::169.254.169.254]",
+            "http://[fd00:ec2::254]",
+            "http://[fd00:ec2::23]",
+            "http://[fd20:ce::254]",
+            "rustfs://",
+        ] {
+            let url = Url::parse(endpoint).expect("forbidden endpoint should parse");
+            let original = validate_outbound_url(&url).expect_err("original guard must reject the fixture");
+            assert_eq!(
+                validate_outbound_url_allow_private(&url).expect_err("private exception must retain the rejection"),
+                original,
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_storage_exception_preserves_public_endpoints() {
+        for endpoint in [
+            "https://tier.example.com:9443",
+            "https://8.8.8.8",
+            "https://[2606:4700:4700::1111]",
+        ] {
+            let url = Url::parse(endpoint).expect("public endpoint should parse");
+            assert!(validate_outbound_url_allow_private(&url).is_ok(), "{endpoint}");
+        }
     }
 
     #[test]
