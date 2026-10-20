@@ -1453,6 +1453,24 @@ impl DefaultBucketUsecase {
     )]
     pub async fn execute_create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
         rustfs_io_metrics::s3_http_metrics::observe_s3_http_operation(S3Operation::CreateBucket);
+        if let Some(location) = req
+            .input
+            .create_bucket_configuration
+            .as_ref()
+            .and_then(|config| config.location_constraint.as_ref())
+            .map(BucketLocationConstraint::as_str)
+            .filter(|location| !location.is_empty())
+        {
+            let location = if location == "EU" { "eu-west-1" } else { location };
+            let region = self.global_region();
+            if location != region.as_ref().map_or(RUSTFS_REGION, Region::as_str) {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidLocationConstraint,
+                    "The specified location constraint does not match this server's region.",
+                ));
+            }
+        }
+
         let usecase = self.clone();
         await_bucket_usecase_on_fresh_task("bucket creation", move |mutation_permit| async move {
             usecase.execute_create_bucket_inner(req, mutation_permit).await
@@ -1675,13 +1693,11 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        if let Some(region) = self.global_region() {
-            return Ok(S3Response::new(GetBucketLocationOutput {
-                location_constraint: Some(BucketLocationConstraint::from(region.to_string())),
-            }));
-        }
-
-        Ok(S3Response::new(GetBucketLocationOutput::default()))
+        let location_constraint = self
+            .global_region()
+            .filter(|region| region.as_str() != RUSTFS_REGION)
+            .map(|region| BucketLocationConstraint::from(region.to_string()));
+        Ok(S3Response::new(GetBucketLocationOutput { location_constraint }))
     }
 
     #[instrument(level = "debug", skip(self))]
