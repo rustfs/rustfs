@@ -19409,6 +19409,99 @@ mod transition_upload_integrity_tests {
         assert_eq!(backend.exact_remove_count(), 0);
     }
 
+    /// The skip is decided per version: of two transitioned versions of one
+    /// key, only the one reported as transferred leaves no free version. The
+    /// directory object is listed as `dir/`, while the cleanup deletes its
+    /// encoded key, so the match must not depend on the version's name.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn data_movement_cleanup_skips_the_free_version_per_transferred_version() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        for (bucket, object) in [
+            ("data-movement-cleanup-per-version", "object.bin"),
+            ("data-movement-cleanup-directory", "dir/"),
+        ] {
+            for disk in &disk_stores {
+                disk.make_volume(bucket).await.expect("bucket volume should be created");
+            }
+            let disk_object = rustfs_utils::path::encode_dir_object(object);
+            let mut version_ids = Vec::new();
+            for body in [
+                b"first transitioned version".as_slice(),
+                b"second transitioned version".as_slice(),
+            ] {
+                let original = set_disks
+                    .put_object(
+                        bucket,
+                        &disk_object,
+                        &mut PutObjReader::from_vec(body.repeat(64)),
+                        &ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("source version should be written");
+                let mut opts = transition_options(&original, tier_name.clone());
+                opts.versioned = true;
+                set_disks
+                    .transition_object(bucket, &disk_object, &opts)
+                    .await
+                    .expect("transition should commit");
+                version_ids.push(original.version_id);
+            }
+            let expected = set_disks
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("source versions should be readable")
+                .expect("source versions should exist");
+            assert_eq!(expected.versions.len(), 2);
+            let version = |version_id| {
+                expected
+                    .versions
+                    .iter()
+                    .find(|version| version.version_id == version_id)
+                    .cloned()
+                    .expect("each written version should be loaded")
+            };
+            let (moved, kept) = (version(version_ids[0]), version(version_ids[1]));
+            assert_eq!(moved.transition_status, TRANSITION_COMPLETE);
+            assert_eq!(kept.transition_status, TRANSITION_COMPLETE);
+            assert_ne!(moved.transitioned_objname, kept.transitioned_objname);
+
+            crate::data_movement::cleanup_source_entry_if_unchanged(
+                Arc::clone(&set_disks),
+                bucket,
+                object,
+                &expected,
+                &[],
+                &[crate::data_movement::source_cleanup_version_identity(&moved)],
+                crate::data_movement::SourceCleanupBucketFence::default(),
+                "test_data_movement",
+            )
+            .await
+            .expect("source cleanup should succeed");
+
+            let left = set_disks
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("source versions should be readable")
+                .map(|versions| versions.versions)
+                .unwrap_or_default();
+            assert_eq!(left.len(), 1, "only the untransferred version keeps a free version: {left:?}");
+            let free = &left[0];
+            assert!(free.tier_free_version());
+            assert_eq!(free.transitioned_objname, kept.transitioned_objname);
+            assert_eq!(free.transition_version_id, kept.transition_version_id);
+            for remote in [&moved.transitioned_objname, &kept.transitioned_objname] {
+                assert!(backend.contains(remote).await, "source cleanup never deletes the remote object itself");
+            }
+        }
+        assert_eq!(backend.remove_count().await, 0);
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn partial_remote_acceptance_cleans_exact_candidate_and_preserves_source() {

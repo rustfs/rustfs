@@ -1108,37 +1108,7 @@ mod decommission_lock_order_tests {
             put_source_object(&store, &bucket, anchor, b"anchor".to_vec()).await;
             let subject = source_key_after(&store, anchor, "tiered");
             let _tier = seed_source_transitioned_object(&store, &bucket, &subject, false).await;
-            start_over_budget_routine_decommission(&store, &bucket, 45 << 20).await;
-            let barrier = stale_target_barrier(&store);
-            let _fault = pause_object_target_gate_acquire(Arc::clone(&barrier), bucket.clone(), anchor.to_string(), 1);
-            let routine = spawn_decommission_routine(&store, 1);
-            barrier.wait_until_target_gate_acquire_paused().await;
-            assert_held_at_subject(&store, &bucket, anchor, &subject).await;
-            commit_other_mutation_on_target_1(&store, 6 << 20).await;
-            assert_target_1_over_budget(&store).await;
-            barrier.release_target_gate_acquire();
-            // The source cleanup of a migrated transitioned version leaves a
-            // tier free version behind, so the routine fails its post-check
-            // even without contention (rustfs/backlog#2873, defect D). Once
-            // that is fixed this flips: expect the routine to complete.
-            let err = routine
-                .await
-                .expect("the decommission routine task should join")
-                .expect_err("the post-check fails while the tier free version is left behind");
-            assert!(
-                err.to_string().contains("post-check failed") && err.to_string().contains("were found in bucket"),
-                "{err}"
-            );
-            let local = store.pool_meta.read().await;
-            let info = local.pools[0]
-                .decommission
-                .as_ref()
-                .expect("the decommission state should remain present");
-            assert!(info.failed, "the post-check failure marks the decommission failed");
-            assert_eq!(info.items_decommission_failed, 0);
-            assert!(info.capacity_blocked_reason.is_none(), "{:?}", info.capacity_blocked_reason);
-            drop(local);
-            assert_source_key_migrated_to_target_2(&store, &bucket, &subject).await;
+            run_stale_subject_case(&store, &bucket, anchor, &subject).await;
         });
     }
 
@@ -1543,29 +1513,20 @@ mod decommission_lock_order_tests {
             assert!(backend.contains(&remote_object).await, "the transition must upload the remote object");
 
             let layout = DecommissionErasureLayout { data: 1, parity: 0 };
-            set_decommission_capacity_info_overrides_for_test(
-                store.id,
-                vec![vec![
+            start_routine_decommission_with_capacity(
+                &store,
+                &bucket,
+                vec![
                     DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64 << 20, 64 << 20),
                     DecommissionPoolCapacityInfo::for_test(1, layout, 100 << 20, 100 << 20, 0),
                     DecommissionPoolCapacityInfo::for_test(2, layout, 1 << 30, 1 << 30, 0),
-                ]],
-            );
-            store
-                .save_current_pool_meta_for_decommission_start(
-                    &[0],
-                    vec![crate::core::pools::DecomBucketInfo {
-                        name: bucket.clone(),
-                        prefix: String::new(),
-                    }],
-                )
+                ],
+                0,
+            )
+            .await;
+            spawn_decommission_routine(&store, 1)
                 .await
-                .expect("activate the decommission");
-            let canceler = crate::core::pools::DecommissionCanceler::new(CancellationToken::new());
-            store.decommission_cancelers.write().await[0] = Some(canceler.clone());
-            store
-                .do_decommission_in_routine(canceler, 0, Arc::new(tokio::sync::Semaphore::new(1)))
-                .await
+                .expect("the decommission routine task should join")
                 .expect("the decommission of a transitioned object should pass its post-check");
             let local = store.pool_meta.read().await;
             let info = local.pools[0]
@@ -1645,6 +1606,265 @@ mod decommission_lock_order_tests {
                 .await
                 .expect("drain the migrated version");
             assert_eq!(body, payload);
+        });
+    }
+
+    async fn exact_versions(
+        store: &Arc<crate::store::ECStore>,
+        pool_index: usize,
+        bucket: &str,
+        object: &str,
+    ) -> Vec<rustfs_filemeta::FileInfo> {
+        store.pools[pool_index]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("the pool versions should decode")
+            .map(|versions| versions.versions)
+            .unwrap_or_default()
+    }
+
+    /// Write a version to pool 0 and transition it to `tier_name`.
+    async fn put_transitioned_source_version(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        tier_name: &str,
+        versioned: bool,
+        mod_time: Option<time::OffsetDateTime>,
+    ) -> crate::object_api::ObjectInfo {
+        let written = store.pools[0]
+            .put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(format!("source bytes of {object}").into_bytes()),
+                &ObjectOptions {
+                    versioned,
+                    mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write the transitioned source");
+        store.pools[0]
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    versioned,
+                    version_id: written.version_id.map(|version| version.to_string()),
+                    transition: crate::bucket::lifecycle::lifecycle::TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: written.etag.clone().expect("the transitioned source should have an ETag"),
+                        ..Default::default()
+                    },
+                    mod_time: written.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("transition the source before the decommission");
+        written
+    }
+
+    async fn start_transitioned_entry_decommission(store: &Arc<crate::store::ECStore>, bucket: &str) {
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        start_routine_decommission_with_capacity(
+            store,
+            bucket,
+            vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64 << 20, 64 << 20),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 100 << 20, 100 << 20, 0),
+                DecommissionPoolCapacityInfo::for_test(2, layout, 1 << 30, 1 << 30, 0),
+            ],
+            0,
+        )
+        .await;
+    }
+
+    fn assert_same_remote_tuple(actual: &rustfs_filemeta::FileInfo, expected: &rustfs_filemeta::FileInfo) {
+        assert_eq!(actual.transition_tier, expected.transition_tier);
+        assert_eq!(actual.transitioned_objname, expected.transitioned_objname);
+        assert_eq!(actual.transition_version_id, expected.transition_version_id);
+    }
+
+    /// A newer unversioned object written to the target replaces a restored
+    /// null source instead of receiving a copy of it. The source's remote
+    /// object is then referenced nowhere, so the source cleanup must keep a
+    /// tier free version to delete it (rustfs/backlog#2873, defect D).
+    #[test]
+    #[serial_test::serial]
+    fn decommission_keeps_a_free_version_for_a_restored_null_version_superseded_on_target() {
+        run_large_stack_async_test("decommission-superseded-restored-null-version", || async {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("superseded-restored");
+            let object = "restored.bin";
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create the unversioned bucket");
+            let tier_name = format!("DECOMTIER{}", &uuid::Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+            let backend = register_mock_tier(&store.pools[0].instance_ctx().tier_config_mgr(), &tier_name).await;
+            put_transitioned_source_version(&store, &bucket, object, &tier_name, false, None).await;
+            Arc::clone(&store)
+                .restore_transitioned_object(
+                    &bucket,
+                    object,
+                    &ObjectOptions {
+                        transition: crate::bucket::lifecycle::lifecycle::TransitionOptions {
+                            restore_request: s3s::dto::RestoreRequest {
+                                days: Some(1),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("restore the transitioned source");
+            let source_versions = exact_versions(&store, 0, &bucket, object).await;
+            assert_eq!(source_versions.len(), 1);
+            let source = source_versions[0].clone();
+            assert!(source.version_id.is_none(), "the source must be a null version");
+            assert!(!source.is_remote(), "a restored source keeps its local copy");
+            let newer = b"written to the target after the source".to_vec();
+            store.pools[1]
+                .put_object(&bucket, object, &mut PutObjReader::from_vec(newer.clone()), &ObjectOptions::default())
+                .await
+                .expect("write a newer null version on the target");
+
+            start_transitioned_entry_decommission(&store, &bucket).await;
+            store
+                .decommission_entry_for_test_with_bucket_incarnation(
+                    0,
+                    MetaCacheEntry {
+                        name: object.to_string(),
+                        ..Default::default()
+                    },
+                    bucket.clone(),
+                    store.pools[0].get_disks_by_key(object),
+                )
+                .await
+                .expect("the superseded entry should finish");
+
+            let left = exact_versions(&store, 0, &bucket, object).await;
+            assert_eq!(left.len(), 1, "the source must keep one tier free version: {left:?}");
+            assert!(left[0].tier_free_version());
+            assert_same_remote_tuple(&left[0], &source);
+            let target = exact_versions(&store, 1, &bucket, object).await;
+            assert_eq!(target.len(), 1, "the target keeps only its newer version: {target:?}");
+            assert!(target[0].transition_status.is_empty(), "the newer version references no remote object");
+            assert!(exact_versions(&store, 2, &bucket, object).await.is_empty());
+            let mut reader = store.pools[1]
+                .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("the newer target version should be readable");
+            let mut body = Vec::new();
+            reader.stream.read_to_end(&mut body).await.expect("drain the newer version");
+            assert_eq!(body, newer);
+            assert!(backend.contains(&source.transitioned_objname).await);
+            assert_eq!(backend.remove_count().await, 0);
+        });
+    }
+
+    /// Of two transitioned versions in one entry, lifecycle expires the
+    /// noncurrent one while its queued expiry has not run yet, and the current
+    /// one moves. The source cleanup removes both, but only the expired
+    /// version keeps a tier free version: it is the only owner of that remote
+    /// object, while the target copy owns the other (rustfs/backlog#2873).
+    #[test]
+    #[serial_test::serial]
+    fn decommission_keeps_a_free_version_only_for_the_expired_version_of_an_entry() {
+        run_large_stack_async_test("decommission-expired-and-moved-versions", || async {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("expired-and-moved");
+            let object = "versions.bin";
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        versioning_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create the versioned bucket");
+            let tier_name = format!("DECOMTIER{}", &uuid::Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+            let backend = register_mock_tier(&store.pools[0].instance_ctx().tier_config_mgr(), &tier_name).await;
+            let now = time::OffsetDateTime::now_utc();
+            let expired =
+                put_transitioned_source_version(&store, &bucket, object, &tier_name, true, Some(now - time::Duration::days(10)))
+                    .await;
+            let moved =
+                put_transitioned_source_version(&store, &bucket, object, &tier_name, true, Some(now - time::Duration::days(5)))
+                    .await;
+            let source_versions = exact_versions(&store, 0, &bucket, object).await;
+            assert_eq!(source_versions.len(), 2);
+            let source = |version_id| {
+                source_versions
+                    .iter()
+                    .find(|version| version.version_id == version_id)
+                    .cloned()
+                    .expect("each written version should be loaded")
+            };
+            let (expired, moved) = (source(expired.version_id), source(moved.version_id));
+            assert_ne!(expired.transitioned_objname, moved.transitioned_objname);
+            let lifecycle = s3s::dto::BucketLifecycleConfiguration {
+                expiry_updated_at: None,
+                rules: vec![s3s::dto::LifecycleRule {
+                    status: s3s::dto::ExpirationStatus::from_static(s3s::dto::ExpirationStatus::ENABLED),
+                    expiration: None,
+                    abort_incomplete_multipart_upload: None,
+                    del_marker_expiration: None,
+                    filter: None,
+                    id: Some("expire-noncurrent".to_string()),
+                    noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                        noncurrent_days: Some(1),
+                        newer_noncurrent_versions: None,
+                    }),
+                    noncurrent_version_transitions: None,
+                    prefix: None,
+                    transitions: None,
+                }],
+            };
+
+            start_transitioned_entry_decommission(&store, &bucket).await;
+            let expiry_queue = crate::bucket::lifecycle::bucket_lifecycle_ops::HeldExpiryQueue::hold().await;
+            let result = store
+                .decommission_entry_for_test_with_lifecycle(
+                    0,
+                    MetaCacheEntry {
+                        name: object.to_string(),
+                        ..Default::default()
+                    },
+                    bucket.clone(),
+                    store.pools[0].get_disks_by_key(object),
+                    Some(lifecycle),
+                )
+                .await;
+            let pending_expiries = expiry_queue.pending_tasks().await;
+            expiry_queue.release().await;
+            result.expect("the entry should finish");
+            assert_eq!(pending_expiries, 1, "the noncurrent version's expiry must stay queued");
+
+            let left = exact_versions(&store, 0, &bucket, object).await;
+            assert_eq!(left.len(), 1, "only the expired version keeps a tier free version: {left:?}");
+            assert!(left[0].tier_free_version());
+            assert_same_remote_tuple(&left[0], &expired);
+            let mut owners = Vec::new();
+            for target_pool_index in [1, 2] {
+                owners.extend(exact_versions(&store, target_pool_index, &bucket, object).await);
+            }
+            assert_eq!(owners.len(), 1, "only the current version moves: {owners:?}");
+            assert!(!owners[0].tier_free_version());
+            assert_eq!(owners[0].version_id, moved.version_id);
+            assert_same_remote_tuple(&owners[0], &moved);
+            for remote in [&expired.transitioned_objname, &moved.transitioned_objname] {
+                assert!(backend.contains(remote).await, "no remote object may be deleted by the move");
+            }
+            assert_eq!(backend.remove_count().await, 0);
         });
     }
 
