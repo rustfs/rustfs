@@ -1480,6 +1480,174 @@ mod decommission_lock_order_tests {
         });
     }
 
+    /// A transitioned version moves to a target pool as tier metadata, so the
+    /// target copy becomes the live owner of the remote object. Removing the
+    /// version from the source must not append a tier free version there: it
+    /// would fail the post-check and claim a remote object the target still
+    /// reads (rustfs/backlog#2873, defect D).
+    #[test]
+    #[serial_test::serial]
+    fn decommission_of_a_transitioned_object_completes_without_a_source_free_version() {
+        run_large_stack_async_test("decommission-transitioned-source-cleanup", || async {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("transitioned-cleanup");
+            let object = "transitioned.bin";
+            let payload = b"transitioned source bytes".to_vec();
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create the transitioned bucket");
+            let tier_name = format!("DECOMTIER{}", &uuid::Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+            let backend = register_mock_tier(&store.pools[0].instance_ctx().tier_config_mgr(), &tier_name).await;
+            let source = store.pools[0]
+                .put_object(
+                    &bucket,
+                    object,
+                    &mut PutObjReader::from_vec(payload.clone()),
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write the transitioned source");
+            store.pools[0]
+                .transition_object(
+                    &bucket,
+                    object,
+                    &ObjectOptions {
+                        versioned: true,
+                        version_id: source.version_id.map(|version| version.to_string()),
+                        transition: crate::bucket::lifecycle::lifecycle::TransitionOptions {
+                            status: TRANSITION_PENDING.to_string(),
+                            tier: tier_name.clone(),
+                            etag: source.etag.clone().expect("the transitioned source should have an ETag"),
+                            ..Default::default()
+                        },
+                        mod_time: source.mod_time,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("transition the source before the decommission");
+            let source_versions = store.pools[0]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(&bucket, object)
+                .await
+                .expect("the source versions should decode")
+                .expect("the transitioned source should exist");
+            assert_eq!(source_versions.versions.len(), 1);
+            let source_version = source_versions.versions[0].clone();
+            assert_eq!(source_version.transition_status, rustfs_filemeta::TRANSITION_COMPLETE);
+            let remote_object = source_version.transitioned_objname.clone();
+            assert!(backend.contains(&remote_object).await, "the transition must upload the remote object");
+
+            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+            set_decommission_capacity_info_overrides_for_test(
+                store.id,
+                vec![vec![
+                    DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64 << 20, 64 << 20),
+                    DecommissionPoolCapacityInfo::for_test(1, layout, 100 << 20, 100 << 20, 0),
+                    DecommissionPoolCapacityInfo::for_test(2, layout, 1 << 30, 1 << 30, 0),
+                ]],
+            );
+            store
+                .save_current_pool_meta_for_decommission_start(
+                    &[0],
+                    vec![crate::core::pools::DecomBucketInfo {
+                        name: bucket.clone(),
+                        prefix: String::new(),
+                    }],
+                )
+                .await
+                .expect("activate the decommission");
+            let canceler = crate::core::pools::DecommissionCanceler::new(CancellationToken::new());
+            store.decommission_cancelers.write().await[0] = Some(canceler.clone());
+            store
+                .do_decommission_in_routine(canceler, 0, Arc::new(tokio::sync::Semaphore::new(1)))
+                .await
+                .expect("the decommission of a transitioned object should pass its post-check");
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert!(
+                info.complete && !info.failed && !info.canceled,
+                "complete={}, failed={}, canceled={}",
+                info.complete,
+                info.failed,
+                info.canceled
+            );
+            assert_eq!(info.items_decommission_failed, 0);
+            drop(local);
+
+            let left = store.pools[0]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(&bucket, object)
+                .await
+                .expect("the source versions should decode");
+            assert!(
+                left.as_ref().is_none_or(|versions| versions.versions.is_empty()),
+                "the source must keep neither the version nor a tier free version: {:?}",
+                left.map(|versions| versions.versions)
+            );
+
+            let mut owners = Vec::new();
+            for target_pool_index in [1, 2] {
+                if let Some(versions) = store.pools[target_pool_index]
+                    .get_disks_by_key(object)
+                    .load_file_info_versions_exact(&bucket, object)
+                    .await
+                    .expect("the target versions should decode")
+                    .filter(|versions| !versions.versions.is_empty())
+                {
+                    owners.push((target_pool_index, versions));
+                }
+            }
+            assert_eq!(owners.len(), 1, "exactly one target pool must own the migrated version");
+            let (target_pool_index, target_versions) = owners.pop().expect("one owner");
+            assert_eq!(
+                target_versions.versions.len(),
+                1,
+                "the target must hold the version and no tier free version: {:?}",
+                target_versions.versions
+            );
+            let moved = &target_versions.versions[0];
+            assert!(!moved.tier_free_version());
+            assert_eq!(moved.version_id, source_version.version_id);
+            assert_eq!(moved.transition_status, rustfs_filemeta::TRANSITION_COMPLETE);
+            assert_eq!(moved.transition_tier, tier_name);
+            assert_eq!(moved.transitioned_objname, remote_object);
+            assert_eq!(moved.transition_version_id, source_version.transition_version_id);
+
+            assert!(backend.contains(&remote_object).await, "the target still reads the remote object");
+            assert_eq!(backend.remove_count().await, 0, "no remote delete may be issued");
+            assert_eq!(backend.exact_remove_count(), 0, "no remote delete may be issued");
+            let mut reader = store.pools[target_pool_index]
+                .get_object_reader(
+                    &bucket,
+                    object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        versioned: true,
+                        version_id: source_version.version_id.map(|version| version.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("the migrated version should be readable from its tier");
+            let mut body = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("drain the migrated version");
+            assert_eq!(body, payload);
+        });
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn no_active_external_commit_probe_blocks_decommission_activation_until_commit_owns_it() {

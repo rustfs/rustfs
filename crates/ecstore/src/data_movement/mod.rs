@@ -1128,6 +1128,42 @@ pub(crate) fn source_cleanup_version_identity(version: &FileInfo) -> SourceClean
     }
 }
 
+/// Source versions whose transitioned remote object a committed data-movement
+/// copy now references from the target pool.
+///
+/// Removing a transitioned version from xl.meta normally appends a tier free
+/// version that owns the remote delete. After a move the target copy is the
+/// live reference to that remote object, so the source must not get an owner
+/// of its own: it would fail the decommission post-check and could only be
+/// consumed once the target copy is gone. A version that did not move, such
+/// as one lifecycle expired during the move, keeps its free version.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct TransferredTierVersions(Arc<[SourceCleanupVersionIdentity]>);
+
+impl TransferredTierVersions {
+    fn new(versions: &[SourceCleanupVersionIdentity]) -> Option<Self> {
+        (!versions.is_empty()).then(|| Self(versions.iter().cloned().map(Self::without_name).collect()))
+    }
+
+    // Every version of one cleanup belongs to the same key, but the mover and
+    // the delete name a directory object differently.
+    fn without_name(mut identity: SourceCleanupVersionIdentity) -> SourceCleanupVersionIdentity {
+        identity.name.clear();
+        identity
+    }
+
+    pub(crate) fn contains(&self, version: &FileInfo) -> bool {
+        self.0.contains(&Self::without_name(source_cleanup_version_identity(version)))
+    }
+}
+
+impl std::fmt::Debug for TransferredTierVersions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TransferredTierVersions").field(&self.0.len()).finish()
+    }
+}
+
 fn source_cleanup_versions_match_with_allowed_missing(
     expected: &FileInfoVersions,
     current: &FileInfoVersions,
@@ -1357,12 +1393,16 @@ async fn pause_source_cleanup_before_delete(bucket: &str, object: &str) {
     }
 }
 
+/// `transferred_tier_versions` lists the transitioned versions whose copy
+/// committed on a target pool; see [`TransferredTierVersions`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn cleanup_source_entry_if_unchanged(
     set: Arc<SetDisks>,
     bucket: &str,
     object: &str,
     expected: &FileInfoVersions,
     allowed_missing: &[SourceCleanupVersionIdentity],
+    transferred_tier_versions: &[SourceCleanupVersionIdentity],
     bucket_fence: SourceCleanupBucketFence<'_>,
     op_label: &str,
 ) -> std::result::Result<ObjectInfo, SourceCleanupError> {
@@ -1408,6 +1448,7 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
         delete_prefix: true,
         delete_prefix_object: true,
         data_movement: true,
+        data_movement_transferred_tier_versions: TransferredTierVersions::new(transferred_tier_versions),
         no_lock: true,
         expected_bucket_incarnation_id: bucket_fence.expected_incarnation_id,
         ..Default::default()

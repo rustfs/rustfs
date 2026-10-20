@@ -283,6 +283,7 @@ impl ECStore {
         let mut expired: usize = 0;
         let mut cleanup_preflight_allowed_missing = Vec::new();
         let mut cleanup_preflight_vanished = Vec::new();
+        let mut cleanup_transferred_tier_versions = Vec::new();
         let mut stats_updates = Vec::with_capacity(fivs.versions.len());
         for version in fivs.versions.iter() {
             ensure_rebalance_entry_active(&cancel)?;
@@ -476,6 +477,9 @@ impl ECStore {
             if should_count_rebalance_version_complete(&result) {
                 rebalanced += 1;
             }
+            if result.moved && version.transition_status == rustfs_filemeta::TRANSITION_COMPLETE {
+                cleanup_transferred_tier_versions.push(data_movement::source_cleanup_version_identity(version));
+            }
         }
 
         if should_cleanup_rebalance_source_entry(rebalanced, fivs.versions.len(), expired) {
@@ -500,6 +504,7 @@ impl ECStore {
                         entry.name.as_str(),
                         &cleanup_expected,
                         &cleanup_preflight_allowed_missing,
+                        &cleanup_transferred_tier_versions,
                         data_movement::SourceCleanupBucketFence {
                             expected_incarnation_id: bucket_configs.bucket_incarnation_id,
                             lifecycle_guard: bucket_incarnation_fence
@@ -1759,6 +1764,148 @@ mod tests {
         let fixture = NullVersionRebalance::new(NullVersionTop::NewerVersion).await;
         assert_eq!(fixture.run_entry().await, RebalanceEntryOutcome::Completed);
         fixture.assert_moved().await;
+    }
+
+    /// A transitioned version moves as tier metadata, so its target copy owns
+    /// the remote object. Cleaning up the source must not append a tier free
+    /// version there (rustfs/backlog#2873, defect D).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_rebalance_of_a_transitioned_version_leaves_no_source_free_version() {
+        const REBALANCE_ID: &str = "rebalance-transitioned-source-cleanup";
+        let (_temp_dirs, store, _peer) = crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
+        let bucket = "rebalance-transitioned";
+        let object = "transitioned.bin";
+        // An active run blocks the data-usage publication bucket creation needs.
+        Box::pin(store.make_bucket(bucket, &MakeBucketOptions::default()))
+            .await
+            .expect("create bucket");
+        let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
+        let rebalance_meta = active_rebalance_meta(REBALANCE_ID);
+        rebalance_meta
+            .save(Arc::clone(&store.pools[0]))
+            .await
+            .expect("persist the active rebalance run");
+        *store.rebalance_meta.write().await = Some(rebalance_meta);
+        let tier_name = format!("REBALTIER{}", &uuid::Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = crate::services::tier::test_util::register_mock_tier(&store.tier_config_mgr(), &tier_name).await;
+        let payload = b"transitioned before the rebalance".to_vec();
+        let source_set = store.pools[0].get_disks_by_key(object);
+        let source = Box::pin(source_set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(payload.clone()),
+            &ObjectOptions {
+                versioned: true,
+                expected_bucket_incarnation_id: Some(incarnation),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("seed the source version");
+        Box::pin(store.pools[0].transition_object(
+            bucket,
+            object,
+            &ObjectOptions {
+                versioned: true,
+                version_id: source.version_id.map(|version| version.to_string()),
+                transition: crate::bucket::lifecycle::lifecycle::TransitionOptions {
+                    status: crate::bucket::lifecycle::lifecycle::TRANSITION_PENDING.to_string(),
+                    tier: tier_name.clone(),
+                    etag: source.etag.clone().expect("the source should have an ETag"),
+                    ..Default::default()
+                },
+                mod_time: source.mod_time,
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("transition the source before the rebalance");
+        let seeded = source_set
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("read seeded versions")
+            .expect("the transitioned source must exist");
+        assert_eq!(seeded.versions.len(), 1);
+        let source_version = seeded.versions[0].clone();
+        assert_eq!(source_version.transition_status, TRANSITION_COMPLETE);
+        let remote_object = source_version.transitioned_objname.clone();
+        assert!(
+            backend.metadata(&remote_object).await.is_some(),
+            "the transition must upload the remote object"
+        );
+
+        let entry = metacache_entry_from_source(&source_set, bucket, object).await;
+        let outcome = Box::pin(Arc::clone(&store).rebalance_entry(
+            RebalanceEntryTarget {
+                bucket: bucket.to_string(),
+                pool_index: 0,
+            },
+            entry,
+            Arc::clone(&source_set),
+            Arc::new(RebalanceBucketConfigs {
+                bucket_incarnation_id: Some(incarnation),
+                ..Default::default()
+            }),
+            Arc::from(REBALANCE_ID),
+            CancellationToken::new(),
+        ))
+        .await
+        .expect("rebalance entry");
+        assert_eq!(outcome, RebalanceEntryOutcome::Completed);
+
+        let left = source_set
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("read source versions");
+        assert!(
+            left.as_ref().is_none_or(|versions| versions.versions.is_empty()),
+            "the source must keep neither the version nor a tier free version: {:?}",
+            left.map(|versions| versions.versions)
+        );
+        let target = store.pools[1]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("read target versions")
+            .expect("the version must reach the target pool");
+        assert_eq!(
+            target.versions.len(),
+            1,
+            "the target must hold the version and no tier free version: {:?}",
+            target.versions
+        );
+        let moved = &target.versions[0];
+        assert!(!moved.tier_free_version());
+        assert_eq!(moved.version_id, source_version.version_id);
+        assert_eq!(moved.transition_status, TRANSITION_COMPLETE);
+        assert_eq!(moved.transition_tier, tier_name);
+        assert_eq!(moved.transitioned_objname, remote_object);
+        assert_eq!(moved.transition_version_id, source_version.transition_version_id);
+
+        assert!(
+            backend.metadata(&remote_object).await.is_some(),
+            "the target still reads the remote object"
+        );
+        assert_eq!(backend.remove_count().await, 0, "no remote delete may be issued");
+        assert_eq!(backend.exact_remove_count(), 0, "no remote delete may be issued");
+        let mut reader = store.pools[1]
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: source_version.version_id.map(|version| version.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the moved version should be readable from its tier");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("drain the moved version");
+        assert_eq!(body, payload);
     }
 
     /// A version the mover reports as not found while it still exists must not

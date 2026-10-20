@@ -16155,6 +16155,7 @@ impl ECStore {
             SCANNER_PAUSE_BACKLOG_PATH,
             expected,
             &[],
+            &[],
             data_movement::SourceCleanupBucketFence {
                 expected_incarnation_id: None,
                 lifecycle_guard: None,
@@ -16491,6 +16492,7 @@ impl ECStore {
         let mut free_version_disposition = DecommissionFreeVersionDisposition::default();
         let mut cleanup_preflight_allowed_missing = Vec::new();
         let mut cleanup_preflight_vanished = Vec::new();
+        let mut cleanup_transferred_tier_versions = Vec::new();
         let mut entry_blocked = false;
 
         for version in fivs.versions.iter() {
@@ -17243,6 +17245,9 @@ impl ECStore {
 
             if should_count_decommission_version_complete(ignore, cleanup_ignored, failure) {
                 decommissioned += 1;
+                if version.transition_status == rustfs_filemeta::TRANSITION_COMPLETE {
+                    cleanup_transferred_tier_versions.push(data_movement::source_cleanup_version_identity(version));
+                }
             }
         }
 
@@ -17305,6 +17310,7 @@ impl ECStore {
                         entry.name.as_str(),
                         &cleanup_expected,
                         &cleanup_preflight_allowed_missing,
+                        &cleanup_transferred_tier_versions,
                         data_movement::SourceCleanupBucketFence {
                             expected_incarnation_id: expected_bucket_incarnation_id,
                             lifecycle_guard: bucket_incarnation_fence
@@ -19829,6 +19835,7 @@ impl ECStore {
             RUSTFS_META_BUCKET,
             path,
             &source_versions,
+            &[],
             &[],
             data_movement::SourceCleanupBucketFence::default(),
             "decommission durable ILM final sweep",
