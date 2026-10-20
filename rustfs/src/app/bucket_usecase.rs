@@ -1406,11 +1406,12 @@ where
     MakeFuture: FnOnce(OwnedSemaphorePermit) -> F + Send + 'static,
 {
     let (mutation_permit, in_flight) = admission.acquire(operation).await?;
+    let api_operation = rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context();
     tokio::spawn(
-        async move {
+        rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(api_operation, async move {
             let _in_flight = in_flight;
             make_future(mutation_permit).await
-        }
+        })
         .in_current_span(),
     )
     .await
@@ -1451,6 +1452,7 @@ impl DefaultBucketUsecase {
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
     pub async fn execute_create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
+        rustfs_io_metrics::s3_http_metrics::observe_s3_http_operation(S3Operation::CreateBucket);
         let usecase = self.clone();
         await_bucket_usecase_on_fresh_task("bucket creation", move |mutation_permit| async move {
             usecase.execute_create_bucket_inner(req, mutation_permit).await
@@ -1556,6 +1558,7 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_delete_bucket(&self, req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
+        rustfs_io_metrics::s3_http_metrics::observe_s3_http_operation(S3Operation::DeleteBucket);
         let usecase = self.clone();
         await_bucket_usecase_on_fresh_task("bucket deletion", move |mutation_permit| async move {
             let _mutation_permit = mutation_permit;
@@ -3359,6 +3362,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bucket_usecase_task_preserves_http_operation_context() {
+        use rustfs_io_metrics::s3_http_metrics::{S3HttpRequestGuard, current_s3_http_operation_name, observe_s3_http_operation};
+
+        for operation in [S3Operation::CreateBucket, S3Operation::DeleteBucket] {
+            for fail in [false, true] {
+                let mut request = S3HttpRequestGuard::new("PUT");
+                request.in_scope(|| observe_s3_http_operation(operation));
+                let admission = Arc::new(BucketOperationAdmission::new(1, 1));
+                let mut task = Box::pin(await_bucket_usecase_on_fresh_task_with_admission(
+                    "test bucket operation",
+                    admission.clone(),
+                    move |_permit| async move {
+                        assert_eq!(current_s3_http_operation_name(), Some(operation.as_str()));
+                        tokio::task::yield_now().await;
+                        assert_eq!(current_s3_http_operation_name(), Some(operation.as_str()));
+                        if fail {
+                            Err(S3Error::with_message(S3ErrorCode::InternalError, "test failure"))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                ));
+                let result = std::future::poll_fn(|cx| request.in_scope(|| task.as_mut().poll(cx))).await;
+                assert_eq!(result.is_err(), fail);
+                assert_eq!(request.in_scope(current_s3_http_operation_name), Some(operation.as_str()));
+                assert_eq!(current_s3_http_operation_name(), None);
+                assert_eq!(admission.active.available_permits(), 1);
+                assert_eq!(admission.in_flight.available_permits(), 2);
+            }
+        }
+
+        let internal = await_bucket_usecase_on_fresh_task_with_admission(
+            "internal bucket operation",
+            Arc::new(BucketOperationAdmission::new(1, 1)),
+            |_permit| async { Ok(current_s3_http_operation_name()) },
+        )
+        .await
+        .expect("internal task should complete");
+        assert_eq!(internal, None, "internal work must not inherit a previous request");
+    }
+
+    #[tokio::test]
     async fn bucket_usecase_task_finishes_post_commit_hooks_after_parent_cancellation() {
         let admission = Arc::new(BucketOperationAdmission::new(1, 1));
         let committed = Arc::new(Notify::new());
@@ -3371,18 +3416,29 @@ mod tests {
         let release_hook_for_task = release_hook.clone();
         let finished_for_task = finished.clone();
         let hook_ran_for_task = hook_ran.clone();
-        let parent = tokio::spawn(await_bucket_usecase_on_fresh_task_with_admission(
+        let parent_task = await_bucket_usecase_on_fresh_task_with_admission(
             "test bucket operation",
             admission.clone(),
             move |mutation_permit| async move {
                 drop(mutation_permit);
                 committed_for_task.notify_one();
                 release_hook_for_task.notified().await;
+                assert_eq!(
+                    rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(),
+                    Some("s3:CreateBucket"),
+                    "the detached hook retains attribution after the parent is cancelled"
+                );
                 hook_ran_for_task.store(true, Ordering::SeqCst);
                 finished_for_task.notify_one();
                 Ok(())
             },
-        ));
+        );
+        let parent = tokio::spawn(async move {
+            let mut request = rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard::new("PUT");
+            request.in_scope(|| rustfs_io_metrics::s3_http_metrics::observe_s3_http_operation(S3Operation::CreateBucket));
+            let mut parent_task = Box::pin(parent_task);
+            std::future::poll_fn(|cx| request.in_scope(|| parent_task.as_mut().poll(cx))).await
+        });
         committed_wait.await;
 
         parent.abort();
@@ -4351,8 +4407,16 @@ mod tests {
         let req = build_request(input, Method::PUT);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = Box::pin(usecase.execute_create_bucket(req)).await.unwrap_err();
+        let mut request = rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard::new("PUT");
+        let mut call = Box::pin(usecase.execute_create_bucket(req));
+        let err = std::future::poll_fn(|cx| request.in_scope(|| call.as_mut().poll(cx)))
+            .await
+            .expect_err("an uninitialized store must fail");
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(
+            request.in_scope(rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name),
+            Some("s3:CreateBucket")
+        );
     }
 
     #[tokio::test]
@@ -4365,8 +4429,16 @@ mod tests {
         let req = build_request(input, Method::DELETE);
         let usecase = DefaultBucketUsecase::without_context();
 
-        let err = usecase.execute_delete_bucket(req).await.unwrap_err();
+        let mut request = rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard::new("DELETE");
+        let mut call = Box::pin(usecase.execute_delete_bucket(req));
+        let err = std::future::poll_fn(|cx| request.in_scope(|| call.as_mut().poll(cx)))
+            .await
+            .expect_err("an uninitialized store must fail");
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(
+            request.in_scope(rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name),
+            Some("s3:DeleteBucket")
+        );
     }
 
     #[tokio::test]
