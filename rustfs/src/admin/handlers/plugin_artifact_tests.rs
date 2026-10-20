@@ -1309,3 +1309,176 @@ async fn artifact_inventory_handler_requires_request_context_and_independent_act
     fixture.absent(&fixture.seal_path()).await;
     fixture.absent(&fixture.repair_seal_path()).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn artifact_delete_handler_enforces_scope_seals_and_exact_version() {
+    let fixture = Fixture::new(prefix()).await;
+    let key = format!("{}image.bin", fixture.prefix);
+    let first = fixture.put(&key, 0xA5).await.expect("first real version");
+    let second = fixture.put(&key, 0xBB).await.expect("second real version");
+    let request = fixture.retire(&key, first);
+    for principal in [None, Some(USER), Some(ROOT)] {
+        assert_eq!(
+            DeleteVersion
+                .call(fixture.request(&request, principal), Params::new())
+                .await
+                .expect_err("A03GC2_INVARIANT old seal/retire authority cannot delete")
+                .code(),
+            &s3s::S3ErrorCode::AccessDenied,
+        );
+    }
+    let policy = Policy::parse_config(
+        &serde_json::to_vec(&json!({
+            "Version":"2012-10-17", "Statement":[{
+                "Effect":"Allow", "Action":"admin:DeletePluginArtifactVersion",
+                "Resource":format!("arn:aws:s3:::{BUCKET}/{key}")
+            }]
+        }))
+        .expect("delete policy bytes"),
+    )
+    .expect("independent delete policy");
+    const CLEANUP: &str = "artifact-cleanup";
+    fixture
+        .user(CLEANUP, Some(vec![format!("arn:aws:s3:::{BUCKET}/{key}")]))
+        .await;
+    fixture
+        .iam
+        .set_policy(CLEANUP, policy)
+        .await
+        .expect("grant exact key delete authority");
+    assert!(
+        DeleteVersion
+            .call(fixture.request(&request, Some(CLEANUP)), Params::new())
+            .await
+            .is_err(),
+        "A03GC2_INVARIANT unsealed attempt is protected"
+    );
+    receipt(Seal.call(fixture.request(&fixture.seal(), Some(USER)), Params::new()).await).await;
+    assert!(
+        DeleteVersion
+            .call(fixture.request(&request, Some(CLEANUP)), Params::new())
+            .await
+            .is_err(),
+        "A03GC2_INVARIANT PUT seal alone cannot authorize deletion"
+    );
+    receipt(
+        SealWrites
+            .call(fixture.request(&fixture.seal(), Some(USER)), Params::new())
+            .await,
+    )
+    .await;
+    let mut wrong_identity = request.clone();
+    wrong_identity["target"]["bucket_incarnation"] = json!(Uuid::new_v4());
+    assert!(
+        DeleteVersion
+            .call(fixture.request(&wrong_identity, Some(CLEANUP)), Params::new())
+            .await
+            .is_err(),
+        "A03GC2_INVARIANT incarnation mismatch cannot delete"
+    );
+    let outside_scope = fixture.retire(&format!("{}other.bin", fixture.prefix), first);
+    assert_eq!(
+        DeleteVersion
+            .call(fixture.request(&outside_scope, Some(CLEANUP)), Params::new())
+            .await
+            .expect_err("A03GC2_INVARIANT exact object IAM scope")
+            .code(),
+        &s3s::S3ErrorCode::AccessDenied
+    );
+    for _ in 0..2 {
+        let deleted = receipt(
+            DeleteVersion
+                .call(fixture.request(&request, Some(CLEANUP)), Params::new())
+                .await,
+        )
+        .await;
+        assert_eq!(
+            deleted,
+            json!({"version":1,"target":fixture.target(),"object":key,
+            "version_id":first,"exact_version_deleted":true}),
+            "A03GC2_INVARIANT exact retry receipt"
+        );
+    }
+    let absent = fixture
+        .store
+        .get_object_reader(
+            BUCKET,
+            &key,
+            None,
+            Default::default(),
+            &StorageObjectOptions {
+                version_id: Some(first.to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(absent, Err(Error::VersionNotFound(_, _, _)) | Err(Error::FileVersionNotFound)),
+        "A03GC2_INVARIANT real exact version is absent"
+    );
+    let mut preserved = fixture
+        .store
+        .get_object_reader(
+            BUCKET,
+            &key,
+            None,
+            Default::default(),
+            &StorageObjectOptions {
+                version_id: Some(second.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("A03GC2_INVARIANT other exact version survives");
+    let mut bytes = Vec::new();
+    preserved.stream.read_to_end(&mut bytes).await.expect("surviving bytes");
+    assert_eq!(bytes, vec![0xBB; 273]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn artifact_delete_inspect_negotiates_without_changing_v1() {
+    let fixture = Fixture::new(prefix()).await;
+    let policy = Policy::parse_config(
+        &serde_json::to_vec(&json!({
+            "Version":"2012-10-17", "Statement":[{
+                "Effect":"Allow", "Action":"admin:GetPluginArtifactBucket",
+                "Resource":format!("arn:aws:s3:::{BUCKET}")
+            }]
+        }))
+        .expect("inspector policy bytes"),
+    )
+    .expect("inspector policy");
+    fixture.iam.set_policy(USER, policy).await.expect("grant inspect authority");
+    for version in [1, 2] {
+        let request = json!({"version":version,"bucket":BUCKET,"base_prefix":"outputs/"});
+        let observed = receipt(Inspect.call(fixture.request(&request, Some(USER)), Params::new()).await).await;
+        let mut expected = json!({"version":version,"bucket":BUCKET,"base_prefix":"outputs/",
+            "bucket_incarnation":fixture.incarnation,"versioning_enabled":true});
+        if version == 2 {
+            expected["exact_delete_supported"] = json!(true);
+        }
+        assert_eq!(observed, expected, "A03GC2_INVARIANT explicit capability negotiation");
+    }
+    for version in [0, 3] {
+        let request = json!({"version":version,"bucket":BUCKET,"base_prefix":"outputs/"});
+        assert_eq!(
+            Inspect
+                .call(fixture.request(&request, Some(USER)), Params::new())
+                .await
+                .expect_err("unsupported version")
+                .code(),
+            &s3s::S3ErrorCode::InvalidRequest
+        );
+    }
+    let request = json!({"version":2,"bucket":BUCKET,"base_prefix":"outputs/"});
+    assert_eq!(
+        Create
+            .call(fixture.request(&request, Some(USER)), Params::new())
+            .await
+            .expect_err("create remains version 1")
+            .code(),
+        &s3s::S3ErrorCode::InvalidRequest
+    );
+}

@@ -800,3 +800,36 @@ and expiration of the outer handler deadline DeadlineExceeded.
 Client protocol, signature or membership failures are errors, regardless of
 previous partial output. No public admin route, Controller persistence, deletion,
 GC permission or saved scan session is introduced by this layer.
+
+## Exact-version cleanup
+
+`POST /rustfs/admin/v3/plugin-artifacts/delete-version` accepts the same strict
+version-1 exact target as `retire-version`: `target` contains `bucket`,
+`bucket_incarnation` and the canonical `attempt_prefix`; `object` and non-nil
+`version_id` select one exact version. Its independent
+`admin:DeletePluginArtifactVersion` permission is scoped to the exact object
+resource. Grant it only to the cleanup controller, separately from upload,
+inventory, sealing and verification identities.
+
+The storage operation checks the incarnation under its lifecycle owner and
+requires both ordinary PUT and repair seals. It preserves the normal Object
+Lock checks. A successful response echoes the target, object and version and
+sets `exact_version_deleted: true` under the normal RustFS quorum deletion
+semantics. This is not proof of physical erasure from every offline disk; retain
+the permanent seals and deletion ledger. Retrying the same identity after an unknown
+response is safe. A missing bucket, changed incarnation, missing seal, permission
+failure or unavailable storage is not a successful deletion receipt. Ordinary
+S3 DELETE remains prohibited for managed buckets.
+
+This endpoint executes an already authorized cleanup decision; it does not
+establish absence of publication references or backups. The runner must commit
+its eligibility decision and exact deletion intent before invoking it. Initial
+support is restricted to configured local disks; remote/distributed layouts
+reject rather than bypass their managed-write receiver protections.
+
+Before enabling cleanup, request bucket inspection with `version: 2`. It returns
+the existing identity fields and `exact_delete_supported`; the Controller must
+require `true`. The ordinary `version: 1` inspection response is unchanged, and
+bucket creation still accepts only version 1. The capability check is read-only
+and uses `admin:GetPluginArtifactBucket`. Every later deletion rechecks its
+identity and fences, regardless of this startup observation.

@@ -5294,6 +5294,8 @@ impl ECStore {
             None
         } else if let Some(owner) = lifecycle_owner {
             Some(Arc::new(owner))
+        } else if let Some(target) = opts.artifact_delete_target.as_ref() {
+            Some(target.lifecycle())
         } else if opts.delete_prefix && opts.bucket_lifecycle_lock_fence.is_some() {
             return Err(Error::other("recursive delete requires its owned bucket lifecycle guard"));
         } else if opts.delete_prefix {
@@ -5301,7 +5303,9 @@ impl ECStore {
         } else {
             Some(Arc::new(self.acquire_bucket_lifecycle_read_lock(bucket).await?))
         };
-        if !is_meta_bucketname(bucket) {
+        if let Some(target) = opts.artifact_delete_target.as_ref() {
+            target.validate(self, bucket, object, &opts)?;
+        } else if !is_meta_bucketname(bucket) {
             let metadata = metadata_sys::get_bucket_incarnation_metadata_in(&self.ctx, bucket).await?;
             if opts
                 .expected_bucket_incarnation_id

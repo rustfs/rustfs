@@ -11,18 +11,537 @@ use crate::{
     object_api::{ObjectOptions, PutObjReader, WriteCompletion},
     storage_api_contracts::{
         bucket::{BucketOperations as _, MakeBucketOptions},
-        object::ObjectIO as _,
+        namespace::NamespaceLocking as _,
+        object::{ObjectIO as _, ObjectOperations as _},
     },
     store::ECStore,
 };
 use std::{path::PathBuf, sync::Arc, time::Duration};
+use tokio::io::AsyncReadExt as _;
 use uuid::Uuid;
 
 const DEADLINE: Duration = Duration::from_secs(30);
 const BUCKET: &str = "artifact-writes-seal";
 
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_exact_delete_preserves_other_versions_and_retries_absence() {
+    run_large_stack_async_test("artifact-exact-delete", || async {
+        let root = tempfile::tempdir().expect("exact delete root");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(root.path(), "artifact-exact-delete", &[4])).await;
+        assert!(store.supports_artifact_exact_delete().await, "local fixture supports typed deletion");
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let incarnation = create_bucket(&store, BUCKET, true).await;
+        let attempt = prefix();
+        let object = format!("{attempt}image.png");
+        let retained = put(&store, BUCKET, &object)
+            .await
+            .expect("retained version")
+            .version_id
+            .expect("versioned PUT");
+        let deleted = put(&store, BUCKET, &object)
+            .await
+            .expect("orphan version")
+            .version_id
+            .expect("versioned PUT");
+        store
+            .clone()
+            .seal_artifact_attempt_writes(BUCKET, incarnation, &attempt)
+            .await
+            .expect("combined drain");
+        crate::data_usage::seed_bucket_usage_memory_for_test(BUCKET, 2 * 1024 * 1024).await;
+        store
+            .clone()
+            .delete_artifact_object_version(BUCKET, incarnation, &attempt, &object, deleted)
+            .await
+            .expect("ARTIFACT_EXACT_DELETE: real managed deletion");
+        let mut displayed = rustfs_data_usage::DataUsageInfo::default();
+        crate::data_usage::apply_bucket_usage_memory_overlay(&mut displayed).await;
+        assert_eq!(
+            displayed.bucket_sizes.get(BUCKET),
+            Some(&(1024 * 1024)),
+            "ARTIFACT_EXACT_DELETE: committed delete applies one usage delta"
+        );
+        assert_eq!(
+            crate::data_usage::get_bucket_usage_memory(BUCKET).await,
+            Some(2 * 1024 * 1024),
+            "ARTIFACT_EXACT_DELETE: quota keeps its pending-negative reservation until scanner confirmation"
+        );
+        let exact = |version: Uuid| ObjectOptions {
+            version_id: Some(version.to_string()),
+            suppress_read_repair: true,
+            ..Default::default()
+        };
+        assert!(
+            store.get_object_info(BUCKET, &object, &exact(deleted)).await.is_err(),
+            "ARTIFACT_EXACT_DELETE: deleted exact version is absent"
+        );
+        assert!(
+            store.get_object_info(BUCKET, &object, &exact(retained)).await.is_ok(),
+            "ARTIFACT_EXACT_DELETE: another version remains readable"
+        );
+        let mut reader = store
+            .get_object_reader(BUCKET, &object, None, Default::default(), &exact(retained))
+            .await
+            .expect("retained exact-version GET after deletion");
+        let mut body = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("retained bytes after deletion");
+        drop(reader);
+        assert_eq!(body, vec![0xA5; 1024 * 1024], "ARTIFACT_EXACT_DELETE: retained exact bytes are unchanged");
+        store
+            .clone()
+            .delete_artifact_object_version(BUCKET, incarnation, &attempt, &object, deleted)
+            .await
+            .expect("ARTIFACT_EXACT_DELETE: same-identity absence is retryable");
+        let mut displayed = rustfs_data_usage::DataUsageInfo::default();
+        crate::data_usage::apply_bucket_usage_memory_overlay(&mut displayed).await;
+        assert_eq!(
+            displayed.bucket_sizes.get(BUCKET),
+            Some(&(1024 * 1024)),
+            "ARTIFACT_EXACT_DELETE: strict absence retry cannot subtract twice"
+        );
+        assert!(
+            store.delete_object(BUCKET, &object, exact(retained)).await.is_err(),
+            "ARTIFACT_EXACT_DELETE: ordinary S3 delete remains rejected"
+        );
+        ctx.update_erasure_type(crate::layout::endpoints::SetupType::DistErasure)
+            .await;
+        assert!(!store.supports_artifact_exact_delete().await, "distributed capability is unavailable");
+        assert!(
+            store
+                .clone()
+                .delete_artifact_object_version(BUCKET, incarnation, &attempt, &object, retained)
+                .await
+                .is_err(),
+            "ARTIFACT_EXACT_DELETE: distributed mutation rejects before deletion"
+        );
+        ctx.update_erasure_type(crate::layout::endpoints::SetupType::Erasure).await;
+        assert!(store.get_object_info(BUCKET, &object, &exact(retained)).await.is_ok());
+        store
+            .clone()
+            .delete_artifact_object_version(BUCKET, incarnation, &attempt, &object, retained)
+            .await
+            .expect("ARTIFACT_EXACT_DELETE: last-version deletion");
+        assert!(
+            store.get_object_info(BUCKET, &object, &exact(retained)).await.is_err(),
+            "ARTIFACT_EXACT_DELETE: the final exact version is absent"
+        );
+        shutdown.cancel();
+    });
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_exact_delete_requires_complete_seal_and_exact_identity() {
+    run_large_stack_async_test("artifact-exact-delete-fences", || async {
+        let root = tempfile::tempdir().expect("exact delete fences root");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(root.path(), "artifact-exact-delete-fences", &[4])).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let incarnation = create_bucket(&store, BUCKET, true).await;
+        let attempt = prefix();
+        let object = format!("{attempt}image.png");
+        let version = put(&store, BUCKET, &object)
+            .await
+            .expect("real object")
+            .version_id
+            .expect("versioned PUT");
+        assert!(
+            store
+                .clone()
+                .delete_artifact_object_version(BUCKET, incarnation, &attempt, &object, version)
+                .await
+                .is_err(),
+            "ARTIFACT_EXACT_DELETE_SEAL: unsealed attempt is protected"
+        );
+        store
+            .clone()
+            .seal_artifact_attempt_puts(BUCKET, incarnation, &attempt)
+            .await
+            .expect("PUT seal only");
+        assert!(
+            store
+                .clone()
+                .delete_artifact_object_version(BUCKET, incarnation, &attempt, &object, version)
+                .await
+                .is_err(),
+            "ARTIFACT_EXACT_DELETE_SEAL: repair domain is still open"
+        );
+        store
+            .clone()
+            .seal_artifact_attempt_writes(BUCKET, incarnation, &attempt)
+            .await
+            .expect("combined seal");
+        for (expected, path, key, id) in [
+            (Uuid::new_v4(), attempt.clone(), object.clone(), version),
+            (incarnation, attempt.clone(), object.clone(), Uuid::nil()),
+            (incarnation, prefix(), object.clone(), version),
+            (incarnation, attempt.clone(), attempt.clone(), version),
+        ] {
+            assert!(
+                store
+                    .clone()
+                    .delete_artifact_object_version(BUCKET, expected, &path, &key, id)
+                    .await
+                    .is_err(),
+                "ARTIFACT_EXACT_DELETE_IDENTITY: malformed or changed identity rejects"
+            );
+        }
+        assert!(
+            store
+                .clone()
+                .delete_artifact_object_version("missing-managed-bucket", incarnation, &attempt, &object, version)
+                .await
+                .is_err(),
+            "ARTIFACT_EXACT_DELETE_IDENTITY: missing bucket is not confirmed absence"
+        );
+        assert!(
+            store
+                .get_object_info(
+                    BUCKET,
+                    &object,
+                    &ObjectOptions {
+                        version_id: Some(version.to_string()),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_ok(),
+            "ARTIFACT_EXACT_DELETE_IDENTITY: rejected requests preserve data"
+        );
+        shutdown.cancel();
+    });
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_exact_delete_directory_marker_retries_exact_absence() {
+    run_large_stack_async_test("artifact-exact-delete-directory", || async {
+        let root = tempfile::tempdir().expect("directory delete root");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(root.path(), "artifact-exact-delete-directory", &[4])).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let incarnation = create_bucket(&store, BUCKET, true).await;
+        let attempt = prefix();
+        let object = format!("{attempt}directory/");
+        let version = store
+            .put_object(
+                BUCKET,
+                &object,
+                &mut PutObjReader::from_vec(Vec::new()),
+                &ObjectOptions {
+                    versioned: true,
+                    write_completion: WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("real directory marker")
+            .version_id
+            .expect("versioned directory marker");
+        store
+            .clone()
+            .seal_artifact_attempt_writes(BUCKET, incarnation, &attempt)
+            .await
+            .expect("combined directory marker seal");
+        store
+            .clone()
+            .delete_artifact_object_version(BUCKET, incarnation, &attempt, &object, version)
+            .await
+            .expect("ARTIFACT_EXACT_DELETE_DIRECTORY: first exact deletion");
+        let retry = store
+            .clone()
+            .delete_artifact_object_version(BUCKET, incarnation, &attempt, &object, version)
+            .await;
+        assert!(
+            retry.is_ok(),
+            "ARTIFACT_EXACT_DELETE_DIRECTORY: same directory identity retries absence: {retry:?}"
+        );
+        shutdown.cancel();
+    });
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_exact_delete_waits_for_its_exact_object_namespace_owner() {
+    use crate::store::DeleteAfterObjectLockSnapshotBarrier;
+    run_large_stack_async_test("artifact-exact-delete-object-lock", || async {
+        let root = tempfile::tempdir().expect("object lock delete root");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(root.path(), "artifact-exact-delete-object-lock", &[4])).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let incarnation = create_bucket(&store, BUCKET, true).await;
+        let attempt = prefix();
+        let object = format!("{attempt}image.png");
+        put(&store, BUCKET, &object).await.expect("other exact version");
+        let version = put(&store, BUCKET, &object)
+            .await
+            .expect("target exact version")
+            .version_id
+            .expect("versioned target");
+        store
+            .clone()
+            .seal_artifact_attempt_writes(BUCKET, incarnation, &attempt)
+            .await
+            .expect("combined seal");
+        let namespace = store.new_ns_lock(BUCKET, &object).await.expect("exact object namespace");
+        let reader = namespace.get_read_lock(DEADLINE).await.expect("real exact-object read owner");
+        let barrier = DeleteAfterObjectLockSnapshotBarrier::install(BUCKET);
+        let worker_store = store.clone();
+        let worker_object = object.clone();
+        let mut worker = tokio::spawn(async move {
+            worker_store
+                .delete_artifact_object_version(BUCKET, incarnation, &attempt, &worker_object, version)
+                .await
+        });
+        tokio::time::timeout(DEADLINE, barrier.wait_until_paused())
+            .await
+            .expect("delete owns fresh policy snapshot before object lock");
+        barrier.release();
+        let premature = tokio::time::timeout(Duration::from_secs(1), &mut worker).await;
+        assert!(
+            premature.is_err(),
+            "ARTIFACT_EXACT_DELETE_OBJECT_LOCK: seal owners cannot replace the exact object owner: {premature:?}"
+        );
+        drop(reader);
+        tokio::time::timeout(DEADLINE, worker)
+            .await
+            .expect("delete resumes after exact reader releases")
+            .expect("delete joins")
+            .expect("delete with real exact-object owner succeeds");
+        assert!(
+            barrier.namespace_acquired(),
+            "ARTIFACT_EXACT_DELETE_OBJECT_LOCK: normal DELETE acquired its exact owner"
+        );
+        shutdown.cancel();
+    });
+}
+
 fn prefix() -> String {
     format!("outputs/74656e616e74/{}/{}/", Uuid::new_v4(), Uuid::new_v4())
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_exact_delete_keeps_object_lock_retention() {
+    run_large_stack_async_test("artifact-exact-delete-retention", || async {
+        let root = tempfile::tempdir().expect("retained artifact root");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(root.path(), "artifact-exact-delete-retention", &[4])).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(
+                BUCKET,
+                &MakeBucketOptions {
+                    artifact_base_prefix: Some("outputs/".to_owned()),
+                    versioning_enabled: true,
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("managed Object Lock bucket");
+        let incarnation = store.bucket_incarnation_id(BUCKET).await.expect("retained bucket identity");
+        let attempt = prefix();
+        let object = format!("{attempt}retained.png");
+        let version = store
+            .put_object(
+                BUCKET,
+                &object,
+                &mut PutObjReader::from_vec(vec![1; 4096]),
+                &ObjectOptions {
+                    versioned: true,
+                    user_defined: std::collections::HashMap::from([
+                        ("x-amz-object-lock-mode".to_owned(), "COMPLIANCE".to_owned()),
+                        ("x-amz-object-lock-retain-until-date".to_owned(), "2999-01-01T00:00:00Z".to_owned()),
+                    ]),
+                    write_completion: WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("retained exact version")
+            .version_id
+            .expect("versioned PUT");
+        store
+            .clone()
+            .seal_artifact_attempt_writes(BUCKET, incarnation, &attempt)
+            .await
+            .expect("combined seal");
+        assert!(
+            store
+                .clone()
+                .delete_artifact_object_version(BUCKET, incarnation, &attempt, &object, version)
+                .await
+                .is_err(),
+            "ARTIFACT_EXACT_DELETE_RETENTION: typed cleanup cannot bypass compliance"
+        );
+        assert!(
+            store
+                .get_object_info(
+                    BUCKET,
+                    &object,
+                    &ObjectOptions {
+                        version_id: Some(version.to_string()),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_ok(),
+            "ARTIFACT_EXACT_DELETE_RETENTION: retained version stays readable"
+        );
+        shutdown.cancel();
+    });
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_exact_delete_cancel_keeps_incarnation_owner_until_completion() {
+    use crate::{storage_api_contracts::bucket::DeleteBucketOptions, store::DeleteAfterObjectLockSnapshotBarrier};
+    run_large_stack_async_test("artifact-exact-delete-cancel", || async {
+        let root = tempfile::tempdir().expect("cancelled delete root");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(root.path(), "artifact-exact-delete-cancel", &[4])).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let incarnation = create_bucket(&store, BUCKET, true).await;
+        let attempt = prefix();
+        let object = format!("{attempt}image.png");
+        let version = put(&store, BUCKET, &object)
+            .await
+            .expect("real exact object")
+            .version_id
+            .expect("versioned PUT");
+        store
+            .clone()
+            .seal_artifact_attempt_writes(BUCKET, incarnation, &attempt)
+            .await
+            .expect("combined seal");
+        let barrier = DeleteAfterObjectLockSnapshotBarrier::install(BUCKET);
+        let worker_store = store.clone();
+        let worker_attempt = attempt.clone();
+        let worker_object = object.clone();
+        let worker = tokio::spawn(async move {
+            worker_store
+                .delete_artifact_object_version(BUCKET, incarnation, &worker_attempt, &worker_object, version)
+                .await
+        });
+        tokio::time::timeout(DEADLINE, barrier.wait_until_paused())
+            .await
+            .expect("real delete owns its metadata snapshot");
+        worker.abort();
+        assert!(worker.await.expect_err("HTTP waiter cancelled").is_cancelled());
+        let deleting_store = store.clone();
+        let mut delete_bucket = tokio::spawn(async move {
+            deleting_store
+                .delete_bucket(
+                    BUCKET,
+                    &DeleteBucketOptions {
+                        force: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut delete_bucket)
+                .await
+                .is_err(),
+            "ARTIFACT_EXACT_DELETE_CANCEL: cancellation must not release the lifecycle owner"
+        );
+        barrier.release();
+        tokio::time::timeout(DEADLINE, delete_bucket)
+            .await
+            .expect("delete owner eventually drains")
+            .expect("bucket worker joins")
+            .expect("bucket deletion after owned operation");
+        let replacement = create_bucket(&store, BUCKET, true).await;
+        assert_ne!(replacement, incarnation, "recreated bucket gets a new incarnation");
+        assert!(
+            store
+                .clone()
+                .delete_artifact_object_version(BUCKET, incarnation, &attempt, &object, version)
+                .await
+                .is_err(),
+            "ARTIFACT_EXACT_DELETE_CANCEL: old identity cannot acknowledge a replacement bucket"
+        );
+        shutdown.cancel();
+    });
+}
+
+#[test]
+#[serial_test::serial(storage_class_env)]
+fn artifact_exact_delete_reconfirms_real_physical_writer_drain() {
+    run_large_stack_async_test("artifact-exact-delete-drain", || async {
+        let root = tempfile::tempdir().expect("delete drain root");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(root.path(), "artifact-exact-delete-drain", &[4])).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let incarnation = create_bucket(&store, BUCKET, true).await;
+        let attempt = prefix();
+        let object = format!("{attempt}image.png");
+        let version = put(&store, BUCKET, &object)
+            .await
+            .expect("real object")
+            .version_id
+            .expect("versioned PUT");
+        let receiver_key = key(&store, incarnation, &attempt).await;
+        let members = disks(&store).await;
+        let Disk::Local(local) = members[0].as_ref() else { panic!("local fixture") };
+        let tail = local
+            .acquire_artifact_put_lease(receiver_key)
+            .await
+            .expect("real earlier writer owner");
+        // Persist the two logical records while an earlier receiver still owns
+        // its tail: records alone must not authorize physical deletion.
+        for repair in [false, true] {
+            let mut fact = serde_json::json!({"bucket": BUCKET,"incarnation_id":incarnation,"base_prefix":"outputs/","attempt_prefix":attempt});
+            fact[if repair { "format_version" } else { "version" }] = 1.into();
+            let path = if repair {
+                artifact_repair_seal_record_path(BUCKET, incarnation, &attempt)
+            } else {
+                artifact_put_seal_record_path(BUCKET, incarnation, &attempt)
+            };
+            com::save_config(store.clone(), &path, serde_json::to_vec(&fact).expect("valid logical seal"))
+                .await
+                .expect("actual persisted seal");
+        }
+        let worker_store = store.clone();
+        let worker_attempt = attempt.clone();
+        let worker_object = object.clone();
+        let worker = tokio::spawn(async move {
+            worker_store
+                .delete_artifact_object_version(BUCKET, incarnation, &worker_attempt, &worker_object, version)
+                .await
+        });
+        wait_marker(&marker(&members[0], receiver_key, false)).await;
+        assert!(!worker.is_finished(), "ARTIFACT_EXACT_DELETE_DRAIN: physical tail prevents confirmation");
+        drop(tail);
+        tokio::time::timeout(DEADLINE, worker)
+            .await
+            .expect("physical owner drains")
+            .expect("delete joins")
+            .expect("delete follows physical closure");
+        assert!(
+            store
+                .get_object_info(
+                    BUCKET,
+                    &object,
+                    &ObjectOptions {
+                        version_id: Some(version.to_string()),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_err(),
+            "ARTIFACT_EXACT_DELETE_DRAIN: exact deletion completes after drain"
+        );
+        shutdown.cancel();
+    });
 }
 
 async fn create_bucket(store: &ECStore, name: &str, managed: bool) -> Uuid {

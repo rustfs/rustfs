@@ -101,7 +101,7 @@ impl ECStore {
         })).await.map_err(|_| Error::other("artifact inventory deadline exceeded"))?
     }
 
-    async fn inventory_artifact_record(&self, bucket: &str, expected: Uuid, prefix: &str) -> Result<PutSealRecord> {
+    pub(super) async fn inventory_artifact_record(&self, bucket: &str, expected: Uuid, prefix: &str) -> Result<PutSealRecord> {
         use crate::bucket::metadata::BUCKET_INCARNATION_FILE;
         use crate::config::com::read_config_observation;
         if expected.is_nil()

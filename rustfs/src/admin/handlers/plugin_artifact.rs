@@ -30,8 +30,9 @@ struct BucketIdentityRequest {
 }
 
 impl BucketIdentityRequest {
-    fn validate(&self) -> S3Result<()> {
-        if self.version != 1
+    fn validate(&self, max_version: u32) -> S3Result<()> {
+        if self.version == 0
+            || self.version > max_version
             || crate::storage::ecstore_bucket::utils::check_valid_bucket_name_strict(&self.bucket).is_err()
             || !crate::admin::storage_api::contract::bucket::valid_artifact_base_prefix(&self.base_prefix)
         {
@@ -48,6 +49,8 @@ struct BucketIdentityReceipt {
     base_prefix: String,
     bucket_incarnation: Uuid,
     versioning_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exact_delete_supported: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -85,14 +88,14 @@ struct SealRequest {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RetireRequest {
+struct ExactVersionRequest {
     version: u32,
     target: AttemptIdentity,
     object: String,
     version_id: Uuid,
 }
 
-impl RetireRequest {
+impl ExactVersionRequest {
     fn validate(&self) -> S3Result<()> {
         self.target.validate()?;
         if self.version != 1
@@ -129,6 +132,15 @@ struct WritesSealReceipt {
     ordinary_put_sealed: bool,
     attempt_repairs_sealed: bool,
     all_writes_sealed: bool,
+}
+
+#[derive(Serialize)]
+struct DeletionReceipt {
+    version: u32,
+    target: AttemptIdentity,
+    object: String,
+    version_id: Uuid,
+    exact_version_deleted: bool,
 }
 
 #[derive(Serialize)]
@@ -206,6 +218,11 @@ pub fn register_plugin_artifact_routes(router: &mut S3Router<AdminOperation>) ->
         &format!("{ADMIN_PREFIX}/v3/plugin-artifacts/retire-version"),
         AdminOperation(&Retire),
     )?;
+    router.insert(
+        Method::POST,
+        &format!("{ADMIN_PREFIX}/v3/plugin-artifacts/delete-version"),
+        AdminOperation(&DeleteVersion),
+    )?;
     Ok(())
 }
 
@@ -215,7 +232,7 @@ impl Operation for Create {
     async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         require_builtin_authorization().await?;
         let input: BucketIdentityRequest = request_body(&mut req).await?;
-        input.validate()?;
+        input.validate(1)?;
         let store = request_store(&req)?;
         owner_for_resource(
             &req,
@@ -239,6 +256,7 @@ impl Operation for Create {
             base_prefix: input.base_prefix,
             bucket_incarnation: incarnation,
             versioning_enabled: true,
+            exact_delete_supported: None,
         })
     }
 }
@@ -249,7 +267,7 @@ impl Operation for Inspect {
     async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         require_builtin_authorization().await?;
         let input: BucketIdentityRequest = request_body(&mut req).await?;
-        input.validate()?;
+        input.validate(2)?;
         let store = request_store(&req)?;
         owner_for_resource(
             &req,
@@ -257,17 +275,23 @@ impl Operation for Inspect {
             AdminResourceScope::bucket(&input.bucket),
         )
         .await?;
+        let exact_delete_supported = if input.version == 2 {
+            Some(store.supports_artifact_exact_delete().await)
+        } else {
+            None
+        };
         let incarnation =
             tokio::time::timeout(Duration::from_secs(30), store.inspect_artifact_bucket(&input.bucket, &input.base_prefix))
                 .await
                 .map_err(|_| unconfirmed())?
                 .map_err(|_| unconfirmed())?;
         response(&BucketIdentityReceipt {
-            version: 1,
+            version: input.version,
             bucket: input.bucket,
             base_prefix: input.base_prefix,
             bucket_incarnation: incarnation,
             versioning_enabled: true,
+            exact_delete_supported,
         })
     }
 }
@@ -383,7 +407,7 @@ struct Retire;
 impl Operation for Retire {
     async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         require_builtin_authorization().await?;
-        let input: RetireRequest = request_body(&mut req).await?;
+        let input: ExactVersionRequest = request_body(&mut req).await?;
         input.validate()?;
         let store = request_store(&req)?;
         owner_for_resource(
@@ -411,6 +435,43 @@ impl Operation for Retire {
             object: input.object,
             version_id: input.version_id,
             exact_version_repair_retired: true,
+        })
+    }
+}
+
+struct DeleteVersion;
+#[async_trait::async_trait]
+impl Operation for DeleteVersion {
+    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        require_builtin_authorization().await?;
+        let input: ExactVersionRequest = request_body(&mut req).await?;
+        input.validate()?;
+        let store = request_store(&req)?;
+        owner_for_resource(
+            &req,
+            AdminAction::DeletePluginArtifactVersionAction,
+            AdminResourceScope::bucket_object(&input.target.bucket, &input.object),
+        )
+        .await?;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            store.delete_artifact_object_version(
+                &input.target.bucket,
+                input.target.bucket_incarnation,
+                &input.target.attempt_prefix,
+                &input.object,
+                input.version_id,
+            ),
+        )
+        .await
+        .map_err(|_| unconfirmed())?
+        .map_err(|_| unconfirmed())?;
+        response(&DeletionReceipt {
+            version: 1,
+            target: input.target,
+            object: input.object,
+            version_id: input.version_id,
+            exact_version_deleted: true,
         })
     }
 }
@@ -449,7 +510,7 @@ mod tests {
         );
         let valid = json!({"version":1,"target":request.target,
             "object":format!("{}image.png",request.target.attempt_prefix),"version_id":Uuid::new_v4()});
-        serde_json::from_value::<RetireRequest>(valid.clone())
+        serde_json::from_value::<ExactVersionRequest>(valid.clone())
             .expect("retire request")
             .validate()
             .expect("valid version");
@@ -461,7 +522,7 @@ mod tests {
             let mut bad = valid.clone();
             bad[key] = value;
             assert!(
-                serde_json::from_value::<RetireRequest>(bad)
+                serde_json::from_value::<ExactVersionRequest>(bad)
                     .expect("well-formed request")
                     .validate()
                     .is_err()
@@ -504,6 +565,7 @@ mod tests {
             "seal-attempt",
             "seal-repairs",
             "retire-version",
+            "delete-version",
             "inventory",
         ] {
             assert!(router.contains_route(Method::POST, &format!("{ADMIN_PREFIX}/v3/plugin-artifacts/{path}")));

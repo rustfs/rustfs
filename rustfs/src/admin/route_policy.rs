@@ -23,6 +23,7 @@ const SEAL_PLUGIN_ARTIFACT: AdminActionRef = AdminActionRef::new("SealPluginArti
 const SEAL_PLUGIN_ARTIFACT_REPAIRS: AdminActionRef = AdminActionRef::new("SealPluginArtifactRepairsAction");
 const SEAL_PLUGIN_ARTIFACT_WRITES: AdminActionRef = AdminActionRef::new("SealPluginArtifactWritesAction");
 const INVENTORY_PLUGIN_ARTIFACT: AdminActionRef = AdminActionRef::new("InventoryPluginArtifactAttemptAction");
+const DELETE_PLUGIN_ARTIFACT: AdminActionRef = AdminActionRef::new("DeletePluginArtifactVersionAction");
 const RETIRE_PLUGIN_ARTIFACT: AdminActionRef = AdminActionRef::new("RetirePluginArtifactVersionAction");
 const ALL_ADMIN: AdminActionRef = AdminActionRef::new("AllAdminActions");
 const ADD_USER_TO_GROUP: AdminActionRef = AdminActionRef::new("AddUserToGroupAdminAction");
@@ -712,6 +713,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HttpMethod::Post,
         "/rustfs/admin/v3/plugin-artifacts/retire-version",
         RETIRE_PLUGIN_ARTIFACT,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-artifacts/delete-version",
+        DELETE_PLUGIN_ARTIFACT,
         RouteRiskLevel::High,
     ),
     admin(
@@ -2521,6 +2528,20 @@ mod tests {
             (HttpMethod::Post, "/rustfs/admin/v3/kms/keys/untag"),
         ] {
             assert_not_action(method, path, SERVER_INFO);
+        }
+    }
+
+    #[test]
+    fn artifact_delete_route_policy_requires_independent_action() {
+        let route = "/rustfs/admin/v3/plugin-artifacts/delete-version";
+        assert_action(HttpMethod::Post, route, DELETE_PLUGIN_ARTIFACT);
+        for action in [
+            INVENTORY_PLUGIN_ARTIFACT,
+            RETIRE_PLUGIN_ARTIFACT,
+            SEAL_PLUGIN_ARTIFACT_WRITES,
+            SERVER_INFO,
+        ] {
+            assert_not_action(HttpMethod::Post, route, action);
         }
     }
 

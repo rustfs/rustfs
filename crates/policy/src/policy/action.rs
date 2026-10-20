@@ -584,6 +584,8 @@ pub enum AdminAction {
     InventoryPluginArtifactAttemptAction,
     #[strum(serialize = "admin:RetirePluginArtifactVersion")]
     RetirePluginArtifactVersionAction,
+    #[strum(serialize = "admin:DeletePluginArtifactVersion")]
+    DeletePluginArtifactVersionAction,
     #[strum(serialize = "admin:SubmitPluginJob")]
     SubmitPluginJobAction,
     #[strum(serialize = "admin:GetPluginRun")]
@@ -641,6 +643,7 @@ impl AdminAction {
                 | Self::SealPluginArtifactWritesAction
                 | Self::InventoryPluginArtifactAttemptAction
                 | Self::RetirePluginArtifactVersionAction
+                | Self::DeletePluginArtifactVersionAction
         )
     }
 
@@ -762,6 +765,7 @@ impl AdminAction {
                 | AdminAction::SealPluginArtifactWritesAction
                 | AdminAction::InventoryPluginArtifactAttemptAction
                 | AdminAction::RetirePluginArtifactVersionAction
+                | AdminAction::DeletePluginArtifactVersionAction
                 | AdminAction::SubmitPluginJobAction
                 | AdminAction::GetPluginRunAction
                 | AdminAction::CancelPluginRunAction
@@ -1156,6 +1160,14 @@ mod tests {
         assert_eq!(set_action, AdminAction::SetTableMetadataLocationAction);
         assert!(get_action.is_valid());
         assert!(set_action.is_valid());
+    }
+
+    #[test]
+    fn artifact_delete_requires_resource_scoped_admin_action() {
+        let action = AdminAction::try_from("admin:DeletePluginArtifactVersion")
+            .expect("A03GC2_INVARIANT dedicated delete action is recognized");
+        assert!(action.is_valid());
+        assert!(action.is_artifact_resource_scoped(), "A03GC2_INVARIANT explicit object scope");
     }
 
     #[test]

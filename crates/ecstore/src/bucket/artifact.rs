@@ -15,7 +15,10 @@
 //! Persistent artifact attempt fences and exact-version repair retirement.
 //! These records do not authorize object deletion or establish GC eligibility.
 
+mod delete;
 pub mod inventory;
+#[doc(hidden)]
+pub use delete::ArtifactDeleteTarget;
 
 use super::versioning::VersioningApi as _;
 use super::{metadata::BucketMetadata, metadata_sys};

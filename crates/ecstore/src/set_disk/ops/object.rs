@@ -8724,12 +8724,23 @@ impl SetDisks {
     async fn prepare_public_delete(
         &self,
         bucket: &str,
+        object: Option<&str>,
         opts: &ObjectOptions,
     ) -> Result<(ObjectOptions, Option<Arc<crate::store::BucketIncarnationFenceGuard>>)> {
         if is_meta_bucketname(bucket) {
             return Ok((opts.clone(), None));
         }
         let store = metadata_sys::object_store_in(&self.ctx).await?;
+        if let Some(target) = opts.artifact_delete_target.as_ref() {
+            let object = object.ok_or_else(|| Error::other("managed deletion requires one exact object"))?;
+            target.validate(&store, bucket, object, opts)?;
+            if !opts.object_lock_config_snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.owns_bucket_lifecycle_fence(store.id, bucket, opts.expected_bucket_incarnation_id.unwrap_or_default())
+            }) {
+                return Err(Error::other("managed deletion requires its owned Object Lock snapshot"));
+            }
+            return Ok((opts.clone(), None));
+        }
         let mut admission = opts.clone();
         // Direct callers may supply an unscoped Object Lock policy snapshot.
         // Keep its policy, but acquire a real lifecycle owner independently.
@@ -9515,7 +9526,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
     }
     #[tracing::instrument(skip(self))]
     async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
-        let (opts, _lifecycle) = self.prepare_public_delete(bucket, &ObjectOptions::default()).await?;
+        let (opts, _lifecycle) = self.prepare_public_delete(bucket, None, &ObjectOptions::default()).await?;
         let source_bucket_incarnation_id = if is_meta_bucketname(bucket) {
             None
         } else {
@@ -9558,7 +9569,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
         // Admit before object locks and before a disk can stage a rollback.
-        let (opts, _lifecycle) = match self.prepare_public_delete(bucket, &opts).await {
+        let (opts, _lifecycle) = match self.prepare_public_delete(bucket, None, &opts).await {
             Ok(admitted) => admitted,
             Err(error) => {
                 let message = error.to_string();
@@ -10548,7 +10559,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self, opts))]
     async fn delete_object(&self, bucket: &str, object: &str, mut opts: ObjectOptions) -> Result<ObjectInfo> {
-        let (admitted, _lifecycle) = self.prepare_public_delete(bucket, &opts).await?;
+        let (admitted, _lifecycle) = self.prepare_public_delete(bucket, Some(object), &opts).await?;
         opts = admitted;
         let _scope_outcome_guard = opts
             .scanner_publication_commit_scope

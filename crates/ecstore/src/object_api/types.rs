@@ -988,6 +988,9 @@ pub struct ObjectOptions {
     /// Ordinary ECStore PUT target bound to its bucket's immutable artifact namespace.
     #[doc(hidden)]
     pub artifact_put_target: Option<Arc<crate::bucket::artifact::ArtifactPutTarget>>,
+    /// Owned, non-serializable authority for one fully sealed managed version.
+    #[doc(hidden)]
+    pub artifact_delete_target: Option<Arc<crate::bucket::artifact::ArtifactDeleteTarget>>,
     /// In-process delete ownership for late filesystem completion. Never
     /// serialized or copied into object metadata.
     #[doc(hidden)]
