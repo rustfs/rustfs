@@ -71,11 +71,12 @@ pub(crate) use storage_api::{
     head_prefix_consumer, helper_consumer, init_background_replication, init_bucket_metadata_sys, init_ecstore_config,
     init_local_disks_with_instance_ctx, init_lock_clients, is_err_bucket_not_found, is_err_object_not_found,
     is_err_version_not_found, is_valid_storage_class, options_consumer, prewarm_local_disk_id_map_with_instance_ctx, read_config,
-    record_replication_proxy, rpc_consumer, runtime_sources_consumer, s3_api_consumer, serialize, table_catalog_path_hash,
-    to_s3s_etag, topology_snapshot_from_endpoint_pools_with_capabilities, try_migrate_bucket_metadata, try_migrate_iam_config,
+    record_replication_proxy, rpc_consumer, runtime_sources_consumer, s3_api_consumer, table_catalog_path_hash, to_s3s_etag,
+    topology_snapshot_from_endpoint_pools_with_capabilities, try_migrate_bucket_metadata, try_migrate_iam_config,
     try_migrate_server_config, update_bucket_metadata_config, update_bucket_metadata_config_if_incarnation,
     validate_website_configuration, verify_rpc_signature, wrap_reader,
 };
+pub(crate) use storage_api::{persisted_from_s3s, persisted_to_s3s, tagging_from_s3s, tagging_to_s3s};
 
 #[cfg(test)]
 #[allow(unused_imports)]

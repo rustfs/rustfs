@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration;
-use s3s::dto::ObjectLockConfiguration;
+use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
 use time::OffsetDateTime;
 use uuid::Uuid;
 

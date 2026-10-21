@@ -13109,10 +13109,7 @@ mod tests {
         let requested_until = now + Duration::from_secs(60 * 60 * 24);
 
         let mut user_defined = HashMap::new();
-        user_defined.insert(
-            metadata_keys::OBJECT_LOCK_MODE.to_string(),
-            s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
-        );
+        user_defined.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string());
         user_defined.insert(
             metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
             existing_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
@@ -13124,7 +13121,7 @@ mod tests {
         };
         let opts = ObjectOptions {
             object_lock_retention: Some(crate::storage_api_contracts::object::ObjectLockRetentionOptions {
-                mode: Some(s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string()),
+                mode: Some("COMPLIANCE".to_string()),
                 retain_until: Some(requested_until),
                 bypass_governance: true,
             }),
@@ -13144,10 +13141,7 @@ mod tests {
         let requested_until = now + Duration::from_secs(60 * 60 * 24);
 
         let mut user_defined = HashMap::new();
-        user_defined.insert(
-            metadata_keys::OBJECT_LOCK_MODE.to_string(),
-            s3s::dto::ObjectLockRetentionMode::GOVERNANCE.to_string(),
-        );
+        user_defined.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), "GOVERNANCE".to_string());
         user_defined.insert(
             metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
             existing_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
@@ -13159,7 +13153,7 @@ mod tests {
         };
         let opts = ObjectOptions {
             object_lock_retention: Some(crate::storage_api_contracts::object::ObjectLockRetentionOptions {
-                mode: Some(s3s::dto::ObjectLockRetentionMode::GOVERNANCE.to_string()),
+                mode: Some("GOVERNANCE".to_string()),
                 retain_until: Some(requested_until),
                 bypass_governance: true,
             }),
@@ -13174,10 +13168,7 @@ mod tests {
     async fn test_check_object_lock_delete_blocks_compliance_version_delete() {
         let retain_until = OffsetDateTime::now_utc() + Duration::from_secs(60 * 60 * 24 * 60);
         let mut user_defined = HashMap::new();
-        user_defined.insert(
-            metadata_keys::OBJECT_LOCK_MODE.to_string(),
-            s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
-        );
+        user_defined.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string());
         user_defined.insert(
             metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
             retain_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
@@ -13219,10 +13210,7 @@ mod tests {
             },
             restore_expires: Some(restore_expiry),
             user_defined: Arc::new(HashMap::from([
-                (
-                    metadata_keys::OBJECT_LOCK_MODE.to_string(),
-                    s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
-                ),
+                (metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string()),
                 (
                     metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
                     retain_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
@@ -13293,10 +13281,7 @@ mod tests {
     async fn test_check_object_lock_delete_allows_versioned_delete_marker_creation() {
         let retain_until = OffsetDateTime::now_utc() + Duration::from_secs(60 * 60 * 24 * 60);
         let mut user_defined = HashMap::new();
-        user_defined.insert(
-            metadata_keys::OBJECT_LOCK_MODE.to_string(),
-            s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
-        );
+        user_defined.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string());
         user_defined.insert(
             metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
             retain_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
@@ -13321,10 +13306,7 @@ mod tests {
     fn governance_retained_obj_info() -> ObjectInfo {
         let retain_until = OffsetDateTime::now_utc() + Duration::from_secs(60 * 60 * 24 * 60);
         let mut user_defined = HashMap::new();
-        user_defined.insert(
-            metadata_keys::OBJECT_LOCK_MODE.to_string(),
-            s3s::dto::ObjectLockRetentionMode::GOVERNANCE.to_string(),
-        );
+        user_defined.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), "GOVERNANCE".to_string());
         user_defined.insert(
             metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
             retain_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
@@ -13374,10 +13356,7 @@ mod tests {
     async fn test_check_object_lock_delete_blocks_replicated_compliance_version_purge() {
         let retain_until = OffsetDateTime::now_utc() + Duration::from_secs(60 * 60 * 24 * 60);
         let mut user_defined = HashMap::new();
-        user_defined.insert(
-            metadata_keys::OBJECT_LOCK_MODE.to_string(),
-            s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
-        );
+        user_defined.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string());
         user_defined.insert(
             metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
             retain_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
@@ -13432,11 +13411,11 @@ mod tests {
 
     #[test]
     fn test_object_lock_delete_check_required_keeps_object_lock_config_buckets() {
-        use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
+        use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
 
         let mut bm = crate::bucket::metadata::BucketMetadata::new("lock-config-bucket");
         bm.object_lock_config = Some(ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             ..Default::default()
         });
         assert!(object_lock_delete_check_required(Some(&bm)));
@@ -16341,8 +16320,8 @@ mod tests {
         // otherwise `from_file_info` never synthesizes the null version id and
         // the branch under test is not reached.
         let suspended = crate::bucket::replication::DeleteReplicationConfigSnapshot::from_configs_for_test(
-            s3s::dto::VersioningConfiguration {
-                status: Some(s3s::dto::BucketVersioningStatus::from_static(s3s::dto::BucketVersioningStatus::SUSPENDED)),
+            rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
+                status: Some("Suspended".to_owned()),
                 ..Default::default()
             },
             None,

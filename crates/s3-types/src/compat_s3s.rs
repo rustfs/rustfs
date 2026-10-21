@@ -33,7 +33,7 @@
 //! in the PR rather than hidden; the edge whitelist of T0.6
 //! (rustfs/backlog#2741) is expected to list this file explicitly.
 
-use crate::{Body, S3Error, S3ErrorCode};
+use crate::{Body, Region, S3Error, S3ErrorCode};
 use std::borrow::Cow;
 use std::fmt;
 
@@ -49,6 +49,26 @@ impl From<legacy_s3s::Body> for Body {
 impl From<Body> for legacy_s3s::Body {
     fn from(body: Body) -> Self {
         Self::http_body(body)
+    }
+}
+
+// Both region types validate the same grammar (`[a-z0-9-]+`), so a value that
+// exists on one side always exists on the other.
+impl From<Region> for legacy_s3s::region::Region {
+    fn from(region: Region) -> Self {
+        match Self::new(region.into_boxed_str()) {
+            Ok(region) => region,
+            Err(invalid) => unreachable!("rustfs_s3_types::Region and s3s::region::Region share one grammar: {invalid}"),
+        }
+    }
+}
+
+impl From<legacy_s3s::region::Region> for Region {
+    fn from(region: legacy_s3s::region::Region) -> Self {
+        match Self::new(region.into_boxed_str()) {
+            Ok(region) => region,
+            Err(invalid) => unreachable!("s3s::region::Region and rustfs_s3_types::Region share one grammar: {invalid}"),
+        }
     }
 }
 

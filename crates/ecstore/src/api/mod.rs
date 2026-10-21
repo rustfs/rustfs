@@ -227,7 +227,7 @@ pub mod bucket {
     }
 
     pub mod object_lock {
-        pub use crate::bucket::object_lock::{ObjectLockApi, ObjectLockStatusExt};
+        pub use crate::bucket::object_lock::ObjectLockApi;
 
         pub mod types {
             pub use crate::bucket::object_lock::types::{
@@ -350,7 +350,7 @@ pub mod capacity {
 }
 
 pub mod object_api_utils {
-    pub use crate::object_api::object_api_utils::{ObjReaderFn, PutObjReader, get_raw_etag, new_getobjectreader, to_s3s_etag};
+    pub use crate::object_api::object_api_utils::{ObjReaderFn, PutObjReader, get_raw_etag, new_getobjectreader};
 }
 
 pub mod cluster {

@@ -168,7 +168,7 @@ use rustfs_utils::http::headers::{
 #[cfg(test)]
 use rustfs_utils::http::headers::{AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID};
 use rustfs_utils::path::path_join_buf;
-use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, SSEKMSKeyId, ServerSideEncryptionByDefault};
+use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, SSEKMSKeyId};
 use s3s::header::{
     X_AMZ_SERVER_SIDE_ENCRYPTION, X_AMZ_SERVER_SIDE_ENCRYPTION_AWS_KMS_KEY_ID, X_AMZ_SERVER_SIDE_ENCRYPTION_CONTEXT,
     X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
@@ -223,7 +223,9 @@ pub struct SseConfiguration {
 /// becomes unreadable. PutBucketEncryption refuses unknown algorithms, so this
 /// is reachable only through a configuration stored before that check or
 /// through hand-edited bucket metadata (backlog#1826).
-pub(crate) fn bucket_default_write_sse(sse: &ServerSideEncryptionByDefault) -> ServerSideEncryption {
+pub(crate) fn bucket_default_write_sse(
+    sse: &rustfs_gateway_types::persistence::PersistedEncryptionByDefault,
+) -> ServerSideEncryption {
     match sse.sse_algorithm.as_str() {
         "AES256" => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
         "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),

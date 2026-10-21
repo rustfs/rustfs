@@ -50,7 +50,7 @@ use crate::object_api::ObjectEncryptionResolver;
 use crate::services::event_notification::EventNotifier;
 use crate::services::tier::tier::TierConfigMgr;
 use rustfs_lock::{GlobalLockManager, get_global_lock_manager};
-use s3s::region::Region;
+use rustfs_s3_types::Region;
 use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc, OnceLock,

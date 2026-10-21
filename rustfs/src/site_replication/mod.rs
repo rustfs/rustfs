@@ -56,7 +56,7 @@ use crate::runtime_sources::{
     current_deployment_id, current_endpoints_handle, current_iam_handle, current_object_store_handle, current_region,
 };
 use crate::storage_api::site_replication::s3::{
-    Body, BucketVersioningStatus, PersistedLifecycleConfiguration, PersistedLifecycleRule, PersistedOptionalReplicationStatus,
+    Body, PersistedLifecycleConfiguration, PersistedLifecycleRule, PersistedOptionalReplicationStatus,
     PersistedReplicationConfiguration, PersistedReplicationDestination, PersistedReplicationRule, PersistedReplicationStatus,
     PersistedSourceSelectionCriteria, S3Response, Status, VersioningConfiguration,
 };

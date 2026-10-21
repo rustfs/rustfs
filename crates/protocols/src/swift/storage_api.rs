@@ -24,8 +24,8 @@ pub(crate) use rustfs_ecstore::api::error::Result as SwiftStorageResult;
 use rustfs_ecstore::api::notification::get_global_notification_sys;
 pub(crate) use rustfs_ecstore::api::runtime::object_store_handle as resolve_swift_object_store_handle;
 use rustfs_ecstore::api::storage::ECStore as SwiftStore;
+use rustfs_gateway_types::cors_tagging::PersistedTagging as Tagging;
 use rustfs_storage_api as storage_contracts;
-use s3s::dto::Tagging;
 
 use super::{SwiftError, SwiftResult};
 

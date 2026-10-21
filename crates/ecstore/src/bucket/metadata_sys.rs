@@ -30,14 +30,18 @@ use crate::storage_api_contracts::heal::HealOperations as _;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use crate::store::{ECStore, await_bucket_namespace_operation};
 use futures::future::join_all;
-use rustfs_gateway_types::persistence::{PersistedLifecycleConfiguration, PersistedReplicationConfiguration};
+use rustfs_gateway_types::cors_tagging::{PersistedCorsConfiguration as CORSConfiguration, PersistedTagging as Tagging};
+use rustfs_gateway_types::persistence::{
+    PersistedAccelerateConfiguration as AccelerateConfiguration,
+    PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
+    PersistedBucketLoggingStatus as BucketLoggingStatus, PersistedLifecycleConfiguration,
+    PersistedNotificationConfiguration as NotificationConfiguration, PersistedObjectLockConfiguration as ObjectLockConfiguration,
+    PersistedPublicAccessBlockConfiguration as PublicAccessBlockConfiguration, PersistedReplicationConfiguration,
+    PersistedRequestPaymentConfiguration as RequestPaymentConfiguration,
+    PersistedVersioningConfiguration as VersioningConfiguration, PersistedWebsiteConfiguration as WebsiteConfiguration,
+};
 use rustfs_heal_contracts::heal_channel::HealOpts;
 use rustfs_policy::policy::BucketPolicy;
-use s3s::dto::{
-    AccelerateConfiguration, BucketLoggingStatus, CORSConfiguration, NotificationConfiguration, ObjectLockConfiguration,
-    ObjectLockEnabled, ObjectLockRetentionMode, PublicAccessBlockConfiguration, RequestPaymentConfiguration,
-    ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration, WebsiteConfiguration,
-};
 use std::collections::HashSet;
 use std::time::Duration;
 use std::{
@@ -168,7 +172,7 @@ pub(crate) fn object_lock_config_state_from_authoritative_metadata(bm: &BucketMe
     if bm.lock_enabled {
         return Ok(ObjectLockConfigState::Configured {
             config: ObjectLockConfiguration {
-                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+                object_lock_enabled: Some("Enabled".to_owned()),
                 rule: None,
             },
             updated_at: bm.object_lock_config_updated_at,
@@ -212,17 +216,10 @@ pub(crate) fn configured_object_lock_state_for_tests(
 ) -> ObjectLockConfigState {
     ObjectLockConfigState::Configured {
         config: ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
-            rule: Some(s3s::dto::ObjectLockRule {
-                default_retention: Some(s3s::dto::DefaultRetention {
-                    mode: Some(s3s::dto::ObjectLockRetentionMode::from_static(match mode {
-                        crate::bucket::object_lock::types::RetentionMode::Governance => {
-                            s3s::dto::ObjectLockRetentionMode::GOVERNANCE
-                        }
-                        crate::bucket::object_lock::types::RetentionMode::Compliance => {
-                            s3s::dto::ObjectLockRetentionMode::COMPLIANCE
-                        }
-                    })),
+            object_lock_enabled: Some("Enabled".to_owned()),
+            rule: Some(rustfs_gateway_types::persistence::PersistedObjectLockRule {
+                default_retention: Some(rustfs_gateway_types::persistence::PersistedDefaultRetention {
+                    mode: Some(mode.as_str().to_owned()),
                     days: Some(days),
                     years: None,
                 }),
@@ -233,7 +230,7 @@ pub(crate) fn configured_object_lock_state_for_tests(
 }
 
 fn validate_authoritative_object_lock_config(config: &ObjectLockConfiguration) -> Result<()> {
-    if config.object_lock_enabled.as_ref().map(ObjectLockEnabled::as_str) != Some(ObjectLockEnabled::ENABLED) {
+    if config.object_lock_enabled.as_deref() != Some("Enabled") {
         return Err(Error::other("persisted bucket Object Lock enabled state is invalid"));
     }
 
@@ -246,7 +243,7 @@ fn validate_authoritative_object_lock_config(config: &ObjectLockConfiguration) -
     if !retention
         .mode
         .as_ref()
-        .is_some_and(|mode| matches!(mode.as_str(), ObjectLockRetentionMode::COMPLIANCE | ObjectLockRetentionMode::GOVERNANCE))
+        .is_some_and(|mode| matches!(mode.as_str(), "COMPLIANCE" | "GOVERNANCE"))
     {
         return Err(Error::other("persisted bucket Object Lock retention mode is invalid"));
     }
@@ -3668,7 +3665,7 @@ mod tests {
         let mut versioned = BucketMetadata::new("authoritative-versioned");
         versioned.versioning_config_xml = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
         versioned.versioning_config = Some(VersioningConfiguration {
-            status: Some(s3s::dto::BucketVersioningStatus::from_static(s3s::dto::BucketVersioningStatus::ENABLED)),
+            status: Some("Enabled".to_owned()),
             ..Default::default()
         });
         sys.set("authoritative-versioned".to_string(), Arc::new(versioned)).await;
@@ -3791,25 +3788,24 @@ mod tests {
         else {
             panic!("legacy lock-enabled metadata must remain configured");
         };
-        assert_eq!(
-            config.object_lock_enabled.as_ref().map(|value| value.as_str()),
-            Some(ObjectLockEnabled::ENABLED)
-        );
+        assert_eq!(config.object_lock_enabled.as_deref(), Some("Enabled"));
         assert!(config.rule.is_none());
     }
 
     #[test]
     fn authoritative_object_lock_state_rejects_invalid_retention_periods() {
-        use s3s::dto::{DefaultRetention, ObjectLockRule};
+        use rustfs_gateway_types::persistence::{
+            PersistedDefaultRetention as DefaultRetention, PersistedObjectLockRule as ObjectLockRule,
+        };
 
         for (days, years) in [(Some(0), None), (Some(-1), None), (Some(1), Some(1)), (None, None)] {
             let mut metadata = BucketMetadata::new("invalid-object-lock");
             metadata.object_lock_config = Some(ObjectLockConfiguration {
-                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+                object_lock_enabled: Some("Enabled".to_owned()),
                 rule: Some(ObjectLockRule {
                     default_retention: Some(DefaultRetention {
                         days,
-                        mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+                        mode: Some("COMPLIANCE".to_owned()),
                         years,
                     }),
                 }),
@@ -3824,9 +3820,11 @@ mod tests {
 
     #[test]
     fn authoritative_object_lock_state_rejects_invalid_enabled_mode_and_rule() {
-        use s3s::dto::{DefaultRetention, ObjectLockRule};
+        use rustfs_gateway_types::persistence::{
+            PersistedDefaultRetention as DefaultRetention, PersistedObjectLockRule as ObjectLockRule,
+        };
 
-        for enabled in [None, Some(ObjectLockEnabled::from("Disabled".to_string()))] {
+        for enabled in [None, Some("Disabled".to_string())] {
             let mut metadata = BucketMetadata::new("invalid-object-lock-enabled");
             metadata.lock_enabled = true;
             metadata.object_lock_config = Some(ObjectLockConfiguration {
@@ -3838,11 +3836,11 @@ mod tests {
 
         let mut invalid_mode = BucketMetadata::new("invalid-object-lock-mode");
         invalid_mode.object_lock_config = Some(ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: Some(ObjectLockRule {
                 default_retention: Some(DefaultRetention {
                     days: Some(1),
-                    mode: Some(ObjectLockRetentionMode::from("invalid".to_string())),
+                    mode: Some("invalid".to_string()),
                     years: None,
                 }),
             }),
@@ -3851,7 +3849,7 @@ mod tests {
 
         let mut missing_retention = BucketMetadata::new("missing-object-lock-retention");
         missing_retention.object_lock_config = Some(ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: Some(ObjectLockRule { default_retention: None }),
         });
         assert!(object_lock_config_state_from_authoritative_metadata(&missing_retention).is_err());
@@ -3861,7 +3859,7 @@ mod tests {
     fn object_lock_ever_enabled_marker_survives_config_removal() {
         let mut metadata = BucketMetadata::new("lock-config-removed");
         let config = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: None,
         };
         metadata
@@ -3879,10 +3877,7 @@ mod tests {
         else {
             panic!("an ever-enabled bucket must remain Object Lock configured");
         };
-        assert_eq!(
-            config.object_lock_enabled.as_ref().map(ObjectLockEnabled::as_str),
-            Some(ObjectLockEnabled::ENABLED)
-        );
+        assert_eq!(config.object_lock_enabled.as_deref(), Some("Enabled"));
     }
 
     #[tokio::test]
@@ -3898,7 +3893,7 @@ mod tests {
 
         let node = Arc::new(RwLock::new(BucketMetadataSys::new(ecstore.clone())));
         let config = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: None,
         };
         update_with_sys(
@@ -4879,7 +4874,7 @@ mod tests {
     #[tokio::test]
     async fn update_config_with_persists_tagging_rewrite_across_disk_reload() {
         use crate::bucket::metadata::BUCKET_TAGGING_CONFIG;
-        use s3s::dto::Tag;
+        use rustfs_gateway_types::cors_tagging::PersistedTag as Tag;
 
         let (dirs, ecstore) = isolated_store_over_temp_disks().await;
 
@@ -5043,7 +5038,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_update_config_with_calls_do_not_lose_writes() {
         use crate::bucket::metadata::BUCKET_TAGGING_CONFIG;
-        use s3s::dto::Tag;
+        use rustfs_gateway_types::cors_tagging::PersistedTag as Tag;
 
         let (dirs, ecstore) = isolated_store_over_temp_disks().await;
         let sys = Arc::new(RwLock::new(BucketMetadataSys::new(ecstore)));
@@ -5143,7 +5138,7 @@ mod tests {
         let mut persisted = BucketMetadata::new("reload-bucket");
         persisted.policy_config_json = b"persisted-marker".to_vec();
         let lock_config = ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: None,
         };
         persisted
@@ -5422,7 +5417,7 @@ mod tests {
     #[serial]
     async fn bucket_delete_waits_for_config_mutation_fence() {
         use crate::bucket::metadata::BUCKET_TAGGING_CONFIG;
-        use s3s::dto::Tag;
+        use rustfs_gateway_types::cors_tagging::PersistedTag as Tag;
 
         let (_dirs, store) = isolated_store_over_temp_disks().await;
         init_bucket_metadata_sys(store.clone(), Vec::new()).await;

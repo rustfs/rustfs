@@ -37,21 +37,30 @@
 
 mod storage_api;
 
+use rustfs_gateway_types::cors_tagging::{
+    PersistedCorsConfiguration as CORSConfiguration, PersistedCorsRule as CORSRule, PersistedTag as Tag,
+    PersistedTagging as Tagging,
+};
 use rustfs_gateway_types::dto::{Status, StorageClass};
 use rustfs_gateway_types::persistence::{
-    PersistedAbortIncompleteMultipartUpload, PersistedDelMarkerExpiration, PersistedLifecycleAnd,
+    PersistedAbortIncompleteMultipartUpload, PersistedAccelerateConfiguration as AccelerateConfiguration,
+    PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
+    PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedBucketLoggingStatus as BucketLoggingStatus,
+    PersistedDefaultRetention as DefaultRetention, PersistedDelMarkerExpiration,
+    PersistedEncryptionByDefault as ServerSideEncryptionByDefault, PersistedErrorDocument as ErrorDocument,
+    PersistedFilterRule as FilterRule, PersistedIndexDocument as IndexDocument, PersistedLifecycleAnd,
     PersistedLifecycleConfiguration, PersistedLifecycleExpiration, PersistedLifecycleFilter, PersistedLifecycleRule,
-    PersistedLifecycleTag, PersistedNoncurrentVersionExpiration, PersistedOptionalReplicationStatus, PersistedReplicationAnd,
+    PersistedLifecycleTag, PersistedLoggingEnabled as LoggingEnabled, PersistedNoncurrentVersionExpiration,
+    PersistedNotificationConfiguration as NotificationConfiguration,
+    PersistedNotificationConfigurationFilter as NotificationConfigurationFilter,
+    PersistedObjectLockConfiguration as ObjectLockConfiguration, PersistedObjectLockRule as ObjectLockRule,
+    PersistedOptionalReplicationStatus, PersistedPublicAccessBlockConfiguration as PublicAccessBlockConfiguration,
+    PersistedQueueConfiguration as QueueConfiguration, PersistedRedirect as Redirect, PersistedReplicationAnd,
     PersistedReplicationConfiguration, PersistedReplicationDestination, PersistedReplicationFilter, PersistedReplicationRule,
-    PersistedReplicationStatus, PersistedReplicationTag, PersistedSourceSelectionCriteria, PersistedTransition,
-};
-use s3s::dto::{
-    AccelerateConfiguration, BucketAccelerateStatus, BucketLoggingStatus, BucketVersioningStatus, CORSConfiguration, CORSRule,
-    Condition, DefaultRetention, ErrorDocument, Event, ExcludedPrefix, FilterRule, FilterRuleName, IndexDocument, LoggingEnabled,
-    NotificationConfiguration, NotificationConfigurationFilter, ObjectLockConfiguration, ObjectLockEnabled,
-    ObjectLockRetentionMode, ObjectLockRule, Payer, PublicAccessBlockConfiguration, QueueConfiguration, Redirect,
-    RequestPaymentConfiguration, RoutingRule, S3KeyFilter, ServerSideEncryption, ServerSideEncryptionByDefault,
-    ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Tagging, VersioningConfiguration, WebsiteConfiguration,
+    PersistedReplicationStatus, PersistedReplicationTag, PersistedRequestPaymentConfiguration as RequestPaymentConfiguration,
+    PersistedRoutingRule as RoutingRule, PersistedRoutingRuleCondition as Condition, PersistedS3KeyFilter as S3KeyFilter,
+    PersistedSourceSelectionCriteria, PersistedTransition, PersistedVersioningConfiguration as VersioningConfiguration,
+    PersistedWebsiteConfiguration as WebsiteConfiguration,
 };
 use std::path::{Path, PathBuf};
 use storage_api::bucket_config_codec::{BucketConfigXml, deserialize, serialize};
@@ -173,14 +182,11 @@ mod rustfs_values {
     pub(super) fn notification() -> NotificationConfiguration {
         NotificationConfiguration {
             queue_configurations: Some(vec![QueueConfiguration {
-                events: vec![
-                    Event::from("s3:ObjectCreated:*".to_owned()),
-                    Event::from("s3:ObjectRemoved:*".to_owned()),
-                ],
+                events: vec!["s3:ObjectCreated:*".to_owned(), "s3:ObjectRemoved:*".to_owned()],
                 filter: Some(NotificationConfigurationFilter {
                     key: Some(S3KeyFilter {
                         filter_rules: Some(vec![FilterRule {
-                            name: Some(FilterRuleName::from_static(FilterRuleName::PREFIX)),
+                            name: Some("prefix".to_owned()),
                             value: Some("uploads/".to_owned()),
                         }]),
                     }),
@@ -251,11 +257,11 @@ mod rustfs_values {
 
     pub(super) fn object_lock() -> ObjectLockConfiguration {
         ObjectLockConfiguration {
-            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            object_lock_enabled: Some("Enabled".to_owned()),
             rule: Some(ObjectLockRule {
                 default_retention: Some(DefaultRetention {
                     days: Some(30),
-                    mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
+                    mode: Some("GOVERNANCE".to_owned()),
                     years: None,
                 }),
             }),
@@ -265,16 +271,9 @@ mod rustfs_values {
     pub(super) fn versioning() -> VersioningConfiguration {
         VersioningConfiguration {
             exclude_folders: Some(true),
-            excluded_prefixes: Some(vec![
-                ExcludedPrefix {
-                    prefix: Some("tmp/".to_owned()),
-                },
-                ExcludedPrefix {
-                    prefix: Some("cache/".to_owned()),
-                },
-            ]),
+            excluded_prefixes: Some(vec![Some("tmp/".to_owned()), Some("cache/".to_owned())]),
             mfa_delete: None,
-            status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+            status: Some("Enabled".to_owned()),
         }
     }
 
@@ -283,7 +282,7 @@ mod rustfs_values {
             rules: vec![ServerSideEncryptionRule {
                 apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
                     kms_master_key_id: Some("rustfs-bucket-key".to_owned()),
-                    sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                    sse_algorithm: "aws:kms".to_owned(),
                 }),
                 blocked_encryption_types: None,
                 bucket_key_enabled: Some(false),
@@ -390,13 +389,13 @@ mod rustfs_values {
 
     pub(super) fn accelerate() -> AccelerateConfiguration {
         AccelerateConfiguration {
-            status: Some(BucketAccelerateStatus::from_static(BucketAccelerateStatus::SUSPENDED)),
+            status: Some("Suspended".to_owned()),
         }
     }
 
     pub(super) fn request_payment() -> RequestPaymentConfiguration {
         RequestPaymentConfiguration {
-            payer: Payer::from_static(Payer::BUCKET_OWNER),
+            payer: "BucketOwner".to_owned(),
         }
     }
 

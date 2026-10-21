@@ -615,7 +615,7 @@ fn retry_bucket_metadata_is_redundant(item: &SRBucketMeta) -> bool {
             deserialize::<VersioningConfiguration>(&decode_bucket_meta_wire_value(raw)).is_ok_and(|config| {
                 config
                     == VersioningConfiguration {
-                        status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                        status: Some("Enabled".to_owned()),
                         ..Default::default()
                     }
             })
@@ -1859,7 +1859,7 @@ pub(crate) async fn ensure_site_replication_bucket_setup_with_runtime_for_incarn
 
 pub(crate) fn bucket_versioning_xml() -> S3Result<Vec<u8>> {
     let config = VersioningConfiguration {
-        status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+        status: Some("Enabled".to_owned()),
         ..Default::default()
     };
     serialize(&config).map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize versioning failed: {e}")))

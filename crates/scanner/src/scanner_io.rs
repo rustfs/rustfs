@@ -31,13 +31,15 @@ use rustfs_data_usage::{BucketTargetUsageInfo, BucketUsageInfo, observed_data_us
 use rustfs_filemeta::FileMeta;
 use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration as BucketLifecycleConfiguration;
 use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
+use rustfs_gateway_types::persistence::{
+    PersistedObjectLockConfiguration as ObjectLockConfiguration, PersistedVersioningConfiguration as VersioningConfiguration,
+};
 use rustfs_heal_contracts::heal_channel::HealScanMode;
 use rustfs_lock::{LockError, NamespaceLockGuard};
 use rustfs_scanner_metrics::metrics::{
     Metric, Metrics, emit_scan_bucket_drive_complete, emit_scan_bucket_drive_partial, global_metrics,
 };
 use rustfs_utils::path::path_join_buf;
-use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -797,7 +799,7 @@ fn object_lock_config_enabled(config: &ObjectLockConfiguration) -> bool {
     config
         .object_lock_enabled
         .as_ref()
-        .is_some_and(|enabled| enabled.as_str() == ObjectLockEnabled::ENABLED)
+        .is_some_and(|enabled| enabled == "Enabled")
 }
 
 pub struct ScannerBucketScanPlan {

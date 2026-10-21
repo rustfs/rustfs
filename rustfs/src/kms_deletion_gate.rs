@@ -31,8 +31,8 @@ use crate::runtime_sources::current_object_store_handle;
 use crate::storage_api::kms::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage_api::kms::{ECStore, StorageError, get_bucket_sse_config};
 use async_trait::async_trait;
+use rustfs_gateway_types::persistence::PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration;
 use rustfs_kms::{DeletionReferenceChecker, KeyImpactReport, KeyReference, KeyReferenceKind};
-use s3s::dto::ServerSideEncryptionConfiguration;
 use std::sync::Arc;
 use tracing::warn;
 
@@ -174,14 +174,16 @@ fn sse_config_references_key(config: &ServerSideEncryptionConfiguration, key_id:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_gateway_types::persistence::{
+        PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
+    };
     use rustfs_kms::ReferenceCompleteness;
-    use s3s::dto::{ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionRule};
 
     fn sse_kms_config(key_id: Option<&str>) -> ServerSideEncryptionConfiguration {
         ServerSideEncryptionConfiguration {
             rules: vec![ServerSideEncryptionRule {
                 apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
-                    sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                    sse_algorithm: "aws:kms".to_owned(),
                     kms_master_key_id: key_id.map(str::to_string),
                 }),
                 blocked_encryption_types: None,

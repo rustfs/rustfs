@@ -250,26 +250,6 @@ fn resolve_sizes(object_infos: &[ObjectInfo]) -> Vec<SizeResolution> {
     object_infos.iter().map(resolve_size).collect()
 }
 
-fn persisted_object_lock_config(
-    config: &ObjectLockConfiguration,
-) -> rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
-    rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
-        object_lock_enabled: config.object_lock_enabled.as_ref().map(|value| value.as_str().to_owned()),
-        rule: config
-            .rule
-            .as_ref()
-            .map(|rule| rustfs_gateway_types::persistence::PersistedObjectLockRule {
-                default_retention: rule.default_retention.as_ref().map(|retention| {
-                    rustfs_gateway_types::persistence::PersistedDefaultRetention {
-                        mode: retention.mode.as_ref().map(|value| value.as_str().to_owned()),
-                        days: retention.days,
-                        years: retention.years,
-                    }
-                }),
-            }),
-    }
-}
-
 fn lifecycle_rule_has_size_filter(lifecycle: &BucketLifecycleConfiguration, rule_id: &str) -> bool {
     let filter_has_size = |filter: &LifecycleRuleFilter| {
         filter.object_size_greater_than.is_some()
@@ -730,7 +710,6 @@ impl ScannerItem {
             .map(crate::ecstore_object_opts_from_object_info)
             .collect::<Vec<ObjectOpts>>();
 
-        let lock_retention = lock_retention.map(|config| Arc::new(persisted_object_lock_config(&config)));
         let events = match Evaluator::new(lifecycle.clone())
             .with_lock_retention(lock_retention)
             .with_replication_config(scanner_replication_config_for_lifecycle_eval(self.replication.clone()))
@@ -1353,35 +1332,6 @@ pub(super) async fn contains_erasure_part_file(path: &str) -> Result<bool, Scann
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn persisted_object_lock_config_preserves_evaluator_retention_fields() {
-        for years in [None, Some(4)] {
-            let config = ObjectLockConfiguration {
-                object_lock_enabled: Some(s3s::dto::ObjectLockEnabled::from_static(s3s::dto::ObjectLockEnabled::ENABLED)),
-                rule: Some(s3s::dto::ObjectLockRule {
-                    default_retention: Some(s3s::dto::DefaultRetention {
-                        mode: Some(s3s::dto::ObjectLockRetentionMode::from_static(
-                            s3s::dto::ObjectLockRetentionMode::COMPLIANCE,
-                        )),
-                        days: Some(30),
-                        years,
-                    }),
-                }),
-            };
-
-            let converted = persisted_object_lock_config(&config);
-            let retention = converted
-                .rule
-                .and_then(|rule| rule.default_retention)
-                .expect("default retention should be preserved");
-
-            assert_eq!(converted.object_lock_enabled.as_deref(), Some("Enabled"));
-            assert_eq!(retention.mode.as_deref(), Some("COMPLIANCE"));
-            assert_eq!(retention.days, Some(30));
-            assert_eq!(retention.years, years);
-        }
-    }
 
     fn scanner_item_with_prefix(prefix: &str) -> ScannerItem {
         ScannerItem {

@@ -195,9 +195,9 @@ pub(crate) trait AdminVersioningConfigExt {
     fn enabled(&self) -> bool;
 }
 
-impl AdminVersioningConfigExt for s3s::dto::VersioningConfiguration {
+impl AdminVersioningConfigExt for rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
     fn enabled(&self) -> bool {
-        <s3s::dto::VersioningConfiguration as ecstore_bucket::versioning::VersioningApi>::enabled(self)
+        <rustfs_gateway_types::persistence::PersistedVersioningConfiguration as ecstore_bucket::versioning::VersioningApi>::enabled(self)
     }
 }
 
@@ -205,9 +205,9 @@ pub(crate) trait AdminObjectLockConfigExt {
     fn enabled(&self) -> bool;
 }
 
-impl AdminObjectLockConfigExt for s3s::dto::ObjectLockConfiguration {
+impl AdminObjectLockConfigExt for rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
     fn enabled(&self) -> bool {
-        <s3s::dto::ObjectLockConfiguration as ecstore_bucket::object_lock::ObjectLockApi>::enabled(self)
+        <rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ecstore_bucket::object_lock::ObjectLockApi>::enabled(self)
     }
 }
 
@@ -329,8 +329,11 @@ pub(crate) mod metadata_sys {
     pub(crate) use super::ecstore_bucket::metadata_sys::ConfigWriteLockProbe;
     use std::sync::Arc;
 
+    use rustfs_gateway_types::persistence::{
+        PersistedBucketEncryptionConfiguration as ServerSideEncryptionConfiguration,
+        PersistedObjectLockConfiguration as ObjectLockConfiguration, PersistedVersioningConfiguration as VersioningConfiguration,
+    };
     use rustfs_policy::policy::BucketPolicy;
-    use s3s::dto::{ObjectLockConfiguration, ServerSideEncryptionConfiguration, VersioningConfiguration};
     use time::OffsetDateTime;
 
     use super::Result;

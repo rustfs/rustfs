@@ -51,7 +51,7 @@ use crate::auth::get_request_auth_type_with_query;
 use crate::auth::is_request_presigned_signature_v4_with_query;
 use crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi as _;
 use crate::storage::storage_api::options_consumer::StorageObjectOptions as ObjectOptions;
-use s3s::dto::VersioningConfiguration;
+use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
 
 /// Test-only counter of versioning-config fetches, used to pin that batch
 /// handlers resolve the configuration once per request, not once per key
@@ -1186,6 +1186,7 @@ mod tests {
     use temp_env;
 
     use super::super::StorageError;
+    use super::VersioningConfiguration;
     use super::{
         ENV_REJECT_ARCHIVE_CONTENT_ENCODING, ReplicationStatusType, SUPPORTED_HEADERS, copy_dst_opts, copy_src_opts, del_opts,
         del_opts_with_versioning, detect_content_type_from_object_name, extract_metadata, extract_metadata_from_mime,
@@ -1203,7 +1204,6 @@ mod tests {
         SUFFIX_SOURCE_VERSION_ID, header_compat::RUSTFS_ENCRYPTION_PREFIX, insert_header,
     };
     use s3s::S3ErrorCode;
-    use s3s::dto::{BucketVersioningStatus, ExcludedPrefix, VersioningConfiguration};
     use std::collections::HashMap;
     use uuid::Uuid;
 
@@ -1329,10 +1329,8 @@ mod tests {
     #[test]
     fn test_del_opts_treats_excluded_prefix_as_unversioned() {
         let versioning = VersioningConfiguration {
-            status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
-            excluded_prefixes: Some(vec![ExcludedPrefix {
-                prefix: Some("archive/".to_string()),
-            }]),
+            status: Some("Enabled".to_owned()),
+            excluded_prefixes: Some(vec![Some("archive/".to_string())]),
             ..Default::default()
         };
 

@@ -6603,7 +6603,7 @@ mod tests {
                             &ObjectOptions {
                                 eval_metadata: Some(HashMap::from([(
                                     rustfs_filemeta::metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(),
-                                    s3s::dto::ObjectLockLegalHoldStatus::OFF.to_string(),
+                                    "OFF".to_string(),
                                 )])),
                                 ..target_version_opts.clone()
                             },
@@ -6657,8 +6657,8 @@ mod tests {
                         .format(&time::format_description::well_known::Rfc3339)
                         .expect("retain-until date should format");
                     for (object, mode) in [
-                        ("compliance-target.bin", s3s::dto::ObjectLockRetentionMode::COMPLIANCE),
-                        ("governance-target.bin", s3s::dto::ObjectLockRetentionMode::GOVERNANCE),
+                        ("compliance-target.bin", "COMPLIANCE"),
+                        ("governance-target.bin", "GOVERNANCE"),
                     ] {
                         let retained_metadata = HashMap::from([
                             (rustfs_filemeta::metadata_keys::OBJECT_LOCK_MODE.to_string(), mode.to_string()),
@@ -9006,8 +9006,8 @@ mod tests {
 
         let delete_config_snapshot =
             Arc::new(crate::bucket::replication::DeleteReplicationConfigSnapshot::from_configs_for_test(
-                s3s::dto::VersioningConfiguration {
-                    status: Some(s3s::dto::BucketVersioningStatus::from_static(s3s::dto::BucketVersioningStatus::ENABLED)),
+                rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
+                    status: Some("Enabled".to_owned()),
                     ..Default::default()
                 },
                 None,
@@ -9168,8 +9168,8 @@ mod tests {
 
         let delete_config_snapshot =
             Arc::new(crate::bucket::replication::DeleteReplicationConfigSnapshot::from_configs_for_test(
-                s3s::dto::VersioningConfiguration {
-                    status: Some(s3s::dto::BucketVersioningStatus::from_static(s3s::dto::BucketVersioningStatus::SUSPENDED)),
+                rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
+                    status: Some("Suspended".to_owned()),
                     ..Default::default()
                 },
                 None,
@@ -17865,10 +17865,7 @@ mod tests {
                 &mut reader,
                 &ObjectOptions {
                     user_defined: HashMap::from([
-                        (
-                            rustfs_filemeta::metadata_keys::OBJECT_LOCK_MODE.to_string(),
-                            s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
-                        ),
+                        (rustfs_filemeta::metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string()),
                         (
                             rustfs_filemeta::metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
                             "2099-01-01T00:00:00Z".to_string(),

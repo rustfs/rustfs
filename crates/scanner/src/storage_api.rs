@@ -29,8 +29,9 @@ pub(crate) use rustfs_gateway_types::persistence::{
     PersistedLifecycleConfiguration as EcstoreBucketLifecycleConfiguration,
     PersistedLifecycleFilter as EcstoreLifecycleRuleFilter,
 };
-pub(crate) use s3s::dto::{
-    ObjectLockConfiguration as EcstoreObjectLockConfiguration, VersioningConfiguration as EcstoreVersioningConfiguration,
+pub(crate) use rustfs_gateway_types::persistence::{
+    PersistedObjectLockConfiguration as EcstoreObjectLockConfiguration,
+    PersistedVersioningConfiguration as EcstoreVersioningConfiguration,
 };
 
 pub(crate) use rustfs_ecstore::api::data_usage::{

@@ -12783,8 +12783,8 @@ mod replication_quota_safety_tests {
         let suspended_opts = ObjectOptions {
             version_suspended: true,
             delete_replication_config_snapshot: Some(Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
-                s3s::dto::VersioningConfiguration {
-                    status: Some(s3s::dto::BucketVersioningStatus::from_static(s3s::dto::BucketVersioningStatus::SUSPENDED)),
+                rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
+                    status: Some("Suspended".to_owned()),
                     ..Default::default()
                 },
                 None,
@@ -13417,11 +13417,11 @@ mod replication_lww_tests {
 
     fn default_retention_snapshot(mode: &'static str) -> Arc<ObjectLockConfigSnapshot> {
         Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::Configured {
-            config: s3s::dto::ObjectLockConfiguration {
-                object_lock_enabled: Some(s3s::dto::ObjectLockEnabled::from_static(s3s::dto::ObjectLockEnabled::ENABLED)),
-                rule: Some(s3s::dto::ObjectLockRule {
-                    default_retention: Some(s3s::dto::DefaultRetention {
-                        mode: Some(s3s::dto::ObjectLockRetentionMode::from_static(mode)),
+            config: rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+                object_lock_enabled: Some("Enabled".to_owned()),
+                rule: Some(rustfs_gateway_types::persistence::PersistedObjectLockRule {
+                    default_retention: Some(rustfs_gateway_types::persistence::PersistedDefaultRetention {
+                        mode: Some(mode.to_owned()),
                         days: Some(1),
                         years: None,
                     }),
@@ -13438,10 +13438,7 @@ mod replication_lww_tests {
     /// timestamp the write passes and LWW judges it.
     #[tokio::test]
     async fn inbound_without_retention_timestamp_stays_rejected_under_bucket_default_retention() {
-        for mode in [
-            s3s::dto::ObjectLockRetentionMode::COMPLIANCE,
-            s3s::dto::ObjectLockRetentionMode::GOVERNANCE,
-        ] {
+        for mode in ["COMPLIANCE", "GOVERNANCE"] {
             let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
             let bucket = "lww-locked-default-retention";
             let object = "object";
@@ -23107,29 +23104,20 @@ mod put_object_tmp_cleanup_tests {
             (
                 "compliance",
                 HashMap::from([
-                    (
-                        metadata_keys::OBJECT_LOCK_MODE.to_string(),
-                        s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
-                    ),
+                    (metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string()),
                     (metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), retain_until.clone()),
                 ]),
             ),
             (
                 "governance",
                 HashMap::from([
-                    (
-                        metadata_keys::OBJECT_LOCK_MODE.to_string(),
-                        s3s::dto::ObjectLockRetentionMode::GOVERNANCE.to_string(),
-                    ),
+                    (metadata_keys::OBJECT_LOCK_MODE.to_string(), "GOVERNANCE".to_string()),
                     (metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(), retain_until),
                 ]),
             ),
             (
                 "legal-hold",
-                HashMap::from([(
-                    metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(),
-                    s3s::dto::ObjectLockLegalHoldStatus::ON.to_string(),
-                )]),
+                HashMap::from([(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string())]),
             ),
         ];
 
@@ -23330,13 +23318,11 @@ mod put_object_tmp_cleanup_tests {
             .expect("versioned PUT should return a version ID")
             .to_string();
         let default_compliance = ObjectLockConfigState::Configured {
-            config: s3s::dto::ObjectLockConfiguration {
-                object_lock_enabled: Some(s3s::dto::ObjectLockEnabled::from_static(s3s::dto::ObjectLockEnabled::ENABLED)),
-                rule: Some(s3s::dto::ObjectLockRule {
-                    default_retention: Some(s3s::dto::DefaultRetention {
-                        mode: Some(s3s::dto::ObjectLockRetentionMode::from_static(
-                            s3s::dto::ObjectLockRetentionMode::COMPLIANCE,
-                        )),
+            config: rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
+                object_lock_enabled: Some("Enabled".to_owned()),
+                rule: Some(rustfs_gateway_types::persistence::PersistedObjectLockRule {
+                    default_retention: Some(rustfs_gateway_types::persistence::PersistedDefaultRetention {
+                        mode: Some("COMPLIANCE".to_owned()),
                         days: Some(1),
                         years: None,
                     }),
@@ -23496,10 +23482,7 @@ mod put_object_tmp_cleanup_tests {
                 &ObjectOptions {
                     version_id: Some(destination_version.clone()),
                     versioned: true,
-                    eval_metadata: Some(HashMap::from([(
-                        metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(),
-                        s3s::dto::ObjectLockLegalHoldStatus::ON.to_string(),
-                    )])),
+                    eval_metadata: Some(HashMap::from([(metadata_keys::OBJECT_LOCK_LEGAL_HOLD.to_string(), "ON".to_string())])),
                     ..Default::default()
                 },
             )
@@ -24394,7 +24377,7 @@ mod delete_objects_lock_gating_tests {
 
     #[tokio::test]
     async fn delete_objects_derives_per_object_versioning_from_the_request_snapshot() {
-        use s3s::dto::{BucketVersioningStatus, ExcludedPrefix, VersioningConfiguration};
+        use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
 
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "batch-versioning-snapshot-bucket";
@@ -24406,10 +24389,8 @@ mod delete_objects_lock_gating_tests {
         put_plain_object(&set_disks, bucket, "archive/unversioned-object").await;
         let snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
             VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
-                excluded_prefixes: Some(vec![ExcludedPrefix {
-                    prefix: Some("archive/".to_string()),
-                }]),
+                status: Some("Enabled".to_owned()),
+                excluded_prefixes: Some(vec![Some("archive/".to_string())]),
                 ..Default::default()
             },
             None,
@@ -24456,12 +24437,12 @@ mod delete_objects_lock_gating_tests {
     #[tokio::test]
     async fn batch_version_delete_uses_tags_read_under_the_delete_lock() {
         use rustfs_gateway_types::dto::Status;
+        use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
         use rustfs_gateway_types::persistence::{
             PersistedReplicationConfiguration, PersistedReplicationDestination, PersistedReplicationFilter,
             PersistedReplicationRule, PersistedReplicationStatus, PersistedReplicationTag,
         };
         use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
-        use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
 
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "batch-delete-locked-tags";
@@ -24497,7 +24478,7 @@ mod delete_objects_lock_gating_tests {
 
         let snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
             VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                status: Some("Enabled".to_owned()),
                 ..Default::default()
             },
             Some(PersistedReplicationConfiguration {
@@ -24562,11 +24543,11 @@ mod delete_objects_lock_gating_tests {
     #[serial]
     async fn lifecycle_delete_all_history_records_exact_replication_purge() {
         use rustfs_gateway_types::dto::Status;
+        use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
         use rustfs_gateway_types::persistence::{
             PersistedReplicationConfiguration, PersistedReplicationDestination, PersistedReplicationRule,
             PersistedReplicationStatus,
         };
-        use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
 
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "lifecycle-delete-all-replication";
@@ -24607,7 +24588,7 @@ mod delete_objects_lock_gating_tests {
 
         let snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
             VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                status: Some("Enabled".to_owned()),
                 ..Default::default()
             },
             Some(PersistedReplicationConfiguration {
@@ -24670,11 +24651,11 @@ mod delete_objects_lock_gating_tests {
     #[tokio::test]
     async fn synthetic_directory_delete_uses_decoded_prefix_and_marker_switch() {
         use rustfs_gateway_types::dto::Status;
+        use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
         use rustfs_gateway_types::persistence::{
             PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
             PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationStatus,
         };
-        use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
 
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "batch-directory-replication";
@@ -24687,7 +24668,7 @@ mod delete_objects_lock_gating_tests {
 
         let snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(
             VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                status: Some("Enabled".to_owned()),
                 ..Default::default()
             },
             Some(PersistedReplicationConfiguration {
@@ -24843,10 +24824,7 @@ mod delete_objects_lock_gating_tests {
         // stat and the #4297 rejection.
         let retain_until = OffsetDateTime::now_utc() + Duration::from_secs(60 * 60 * 24 * 30);
         let mut user_defined = HashMap::new();
-        user_defined.insert(
-            metadata_keys::OBJECT_LOCK_MODE.to_string(),
-            s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
-        );
+        user_defined.insert(metadata_keys::OBJECT_LOCK_MODE.to_string(), "COMPLIANCE".to_string());
         user_defined.insert(
             metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
             retain_until

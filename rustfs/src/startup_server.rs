@@ -234,7 +234,7 @@ pub(crate) async fn init_embedded_startup_listen_context(
         // The instance context is per-server, so region publication cannot
         // panic on a second embedded server; the process still has one region
         // for legacy ambient readers.
-        instance_ctx.set_region(region);
+        instance_ctx.set_region(region.into());
     }
 
     startup_runtime_sources::publish_server_port(server_addr.port());

@@ -24,11 +24,12 @@ use async_trait::async_trait;
 use http::header::CONTENT_TYPE;
 use http::header::HOST;
 use http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, Uri};
+use rustfs_gateway_types::persistence::{PersistedErrorDocument, PersistedRoutingRule as RoutingRule};
 use rustfs_policy::policy::action::{Action, S3Action};
 use s3s::access::S3Access;
 use s3s::dto::{
     ETagCondition, EncodingType, GetObjectInput, GetObjectOutput, HeadObjectInput, ListObjectVersionsInput, ListObjectsV2Input,
-    Range, RoutingRule, Timestamp, TimestampFormat,
+    Range, Timestamp, TimestampFormat,
 };
 use s3s::host::{MultiDomain, S3Host};
 use s3s::route::S3Route;
@@ -189,7 +190,7 @@ async fn call_website(
         return website_redirect(
             &req,
             redirect.host_name.as_str(),
-            redirect.protocol.as_ref().map(|protocol| protocol.as_str()),
+            redirect.protocol.as_deref(),
             &target.key,
             StatusCode::MOVED_PERMANENTLY,
             website_scheme,
@@ -483,7 +484,7 @@ async fn website_error_with_document(
     req: &S3Request<Body>,
     server_ctx: &Arc<ServerContextSlot>,
     bucket: &str,
-    error_document: Option<&s3s::dto::ErrorDocument>,
+    error_document: Option<&PersistedErrorDocument>,
     status: http::StatusCode,
 ) -> S3Result<S3Response<Body>> {
     let Some(error_document) = error_document else {
@@ -614,7 +615,7 @@ fn website_rule_redirect(
     website_redirect(
         req,
         redirect.host_name.as_deref().unwrap_or_default(),
-        redirect.protocol.as_ref().map(|protocol| protocol.as_str()),
+        redirect.protocol.as_deref(),
         &key,
         status,
         website_scheme,
@@ -877,7 +878,10 @@ mod tests {
     };
     use http::header::HOST;
     use http::{Extensions, HeaderMap, Method, StatusCode, Uri};
-    use s3s::dto::{Condition, EncodingType, Redirect, RoutingRule};
+    use rustfs_gateway_types::persistence::{
+        PersistedRedirect as Redirect, PersistedRoutingRule as RoutingRule, PersistedRoutingRuleCondition as Condition,
+    };
+    use s3s::dto::EncodingType;
     use s3s::host::MultiDomain;
     use s3s::{Body, S3Request};
 

@@ -48,10 +48,7 @@ pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use s3s::config::{S3Config, StaticConfigProvider};
     #[cfg(test)]
-    pub(crate) use s3s::dto::{
-        BucketVersioningStatus, GetObjectInput, HeadObjectInput, ListObjectsV2Input, ListObjectsV2Output,
-        ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule, VersioningConfiguration,
-    };
+    pub(crate) use s3s::dto::{GetObjectInput, HeadObjectInput, ListObjectsV2Input, ListObjectsV2Output};
     #[cfg(test)]
     pub(crate) use s3s::dto::{ListObjectsInput, StreamingBlob, UploadPartInput, UploadPartOutput};
     #[cfg(test)]
@@ -305,9 +302,9 @@ pub(crate) mod bucket {
         fn enabled(&self) -> bool;
     }
 
-    impl ObjectLockConfigExt for s3s::dto::ObjectLockConfiguration {
+    impl ObjectLockConfigExt for rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
         fn enabled(&self) -> bool {
-            <s3s::dto::ObjectLockConfiguration as crate::storage::storage_api::ecstore_bucket::object_lock::ObjectLockApi>::enabled(self)
+            <rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as crate::storage::storage_api::ecstore_bucket::object_lock::ObjectLockApi>::enabled(self)
         }
     }
 
@@ -316,15 +313,15 @@ pub(crate) mod bucket {
         fn suspended(&self) -> bool;
     }
 
-    impl VersioningConfigExt for s3s::dto::VersioningConfiguration {
+    impl VersioningConfigExt for rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
         fn enabled(&self) -> bool {
-            <s3s::dto::VersioningConfiguration as crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi>::enabled(
+            <rustfs_gateway_types::persistence::PersistedVersioningConfiguration as crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi>::enabled(
                 self,
             )
         }
 
         fn suspended(&self) -> bool {
-            <s3s::dto::VersioningConfiguration as crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi>::suspended(self)
+            <rustfs_gateway_types::persistence::PersistedVersioningConfiguration as crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi>::suspended(self)
         }
     }
 
@@ -848,29 +845,11 @@ pub(crate) mod bucket {
 
             pub(crate) async fn validate_lifecycle_config(
                 lc: &rustfs_gateway_types::persistence::PersistedLifecycleConfiguration,
-                lock_config: &s3s::dto::ObjectLockConfiguration,
+                lock_config: &rustfs_gateway_types::persistence::PersistedObjectLockConfiguration,
             ) -> Result<(), std::io::Error> {
                 use crate::storage::storage_api::ecstore_bucket::lifecycle::lifecycle::Lifecycle as _;
 
-                let lock_config = rustfs_gateway_types::persistence::PersistedObjectLockConfiguration {
-                    object_lock_enabled: lock_config
-                        .object_lock_enabled
-                        .as_ref()
-                        .map(|value| value.as_str().to_owned()),
-                    rule: lock_config
-                        .rule
-                        .as_ref()
-                        .map(|rule| rustfs_gateway_types::persistence::PersistedObjectLockRule {
-                            default_retention: rule.default_retention.as_ref().map(|retention| {
-                                rustfs_gateway_types::persistence::PersistedDefaultRetention {
-                                    mode: retention.mode.as_ref().map(|value| value.as_str().to_owned()),
-                                    days: retention.days,
-                                    years: retention.years,
-                                }
-                            }),
-                        }),
-                };
-                lc.validate(&lock_config).await
+                lc.validate(lock_config).await
             }
 
             /// The `std::io::ErrorKind` [`validate_lifecycle_config`] uses for a
@@ -927,12 +906,12 @@ pub(crate) mod bucket {
     pub(crate) mod metadata_sys {
         use std::sync::Arc;
 
-        use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration;
-        use rustfs_policy::policy::BucketPolicy;
-        use s3s::dto::{
-            CORSConfiguration, NotificationConfiguration, ObjectLockConfiguration, PublicAccessBlockConfiguration,
-            ServerSideEncryptionConfiguration, Tagging,
+        use rustfs_gateway_types::cors_tagging::{PersistedCorsConfiguration, PersistedTagging};
+        use rustfs_gateway_types::persistence::{
+            PersistedBucketEncryptionConfiguration, PersistedLifecycleConfiguration, PersistedNotificationConfiguration,
+            PersistedObjectLockConfiguration, PersistedPublicAccessBlockConfiguration,
         };
+        use rustfs_policy::policy::BucketPolicy;
         use time::OffsetDateTime;
         use tokio::sync::RwLock;
 
@@ -986,7 +965,7 @@ pub(crate) mod bucket {
 
         pub(crate) async fn get_cors_config(
             bucket: &str,
-        ) -> Result<(CORSConfiguration, OffsetDateTime), crate::storage::storage_api::StorageError> {
+        ) -> Result<(PersistedCorsConfiguration, OffsetDateTime), crate::storage::storage_api::StorageError> {
             crate::storage::storage_api::ecstore_bucket::metadata_sys::get_cors_config(bucket).await
         }
 
@@ -1002,19 +981,20 @@ pub(crate) mod bucket {
 
         pub(crate) async fn get_notification_config(
             bucket: &str,
-        ) -> Result<Option<NotificationConfiguration>, crate::storage::storage_api::StorageError> {
+        ) -> Result<Option<PersistedNotificationConfiguration>, crate::storage::storage_api::StorageError> {
             crate::storage::storage_api::ecstore_bucket::metadata_sys::get_notification_config(bucket).await
         }
 
         pub(crate) async fn get_object_lock_config(
             bucket: &str,
-        ) -> Result<(ObjectLockConfiguration, OffsetDateTime), crate::storage::storage_api::StorageError> {
+        ) -> Result<(PersistedObjectLockConfiguration, OffsetDateTime), crate::storage::storage_api::StorageError> {
             crate::storage::storage_api::ecstore_bucket::metadata_sys::get_object_lock_config(bucket).await
         }
 
         pub(crate) async fn get_public_access_block_config(
             bucket: &str,
-        ) -> Result<(PublicAccessBlockConfiguration, OffsetDateTime), crate::storage::storage_api::StorageError> {
+        ) -> Result<(PersistedPublicAccessBlockConfiguration, OffsetDateTime), crate::storage::storage_api::StorageError>
+        {
             crate::storage::storage_api::ecstore_bucket::metadata_sys::get_public_access_block_config(bucket).await
         }
 
@@ -1029,13 +1009,13 @@ pub(crate) mod bucket {
 
         pub(crate) async fn get_sse_config(
             bucket: &str,
-        ) -> Result<(ServerSideEncryptionConfiguration, OffsetDateTime), crate::storage::storage_api::StorageError> {
+        ) -> Result<(PersistedBucketEncryptionConfiguration, OffsetDateTime), crate::storage::storage_api::StorageError> {
             crate::storage::storage_api::ecstore_bucket::metadata_sys::get_sse_config(bucket).await
         }
 
         pub(crate) async fn get_tagging_config(
             bucket: &str,
-        ) -> Result<(Tagging, OffsetDateTime), crate::storage::storage_api::StorageError> {
+        ) -> Result<(PersistedTagging, OffsetDateTime), crate::storage::storage_api::StorageError> {
             crate::storage::storage_api::ecstore_bucket::metadata_sys::get_tagging_config(bucket).await
         }
 
@@ -1466,7 +1446,7 @@ pub(crate) mod bucket {
 
     pub(crate) mod tagging {
         pub(crate) fn decode_tags(tags: &str) -> Vec<s3s::dto::Tag> {
-            crate::storage::storage_api::ecstore_bucket::tagging::decode_tags(tags)
+            crate::storage::storage_api::decode_tags(tags)
         }
     }
 

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration as BucketLifecycleConfiguration;
-use s3s::dto::ObjectLockConfiguration;
+use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
 use serde::{Deserialize, Serialize, ser::SerializeMap};
 use sha2::{Digest, Sha256};
 use std::{
@@ -614,7 +614,7 @@ pub struct DataUsageCacheInfo {
     pub scan_coverage_receipt: Option<DataUsageScanCoverageReceipt>,
     #[serde(default)]
     pub pending_heals: Vec<PendingScannerHeal>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::object_lock_cache::deserialize")]
     pub object_lock: Option<Arc<ObjectLockConfiguration>>,
     #[serde(default)]
     pub leader_epoch: u64,
@@ -718,7 +718,7 @@ impl Serialize for DataUsageCacheInfo {
             state.serialize_entry("scan_coverage_receipt", receipt)?;
         }
         state.serialize_entry("pending_heals", &self.pending_heals)?;
-        state.serialize_entry("object_lock", &self.object_lock)?;
+        state.serialize_entry("object_lock", &crate::object_lock_cache::ObjectLockCache(&self.object_lock))?;
         state.serialize_entry("source", &self.source)?;
         state.serialize_entry("snapshot_complete", &self.snapshot_complete)?;
         state.serialize_entry("scan_plan_digest", &self.scan_plan_digest)?;

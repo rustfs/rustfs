@@ -125,7 +125,9 @@ pub(crate) mod kms {
 
     /// Bucket SSE configuration for the KMS deletion reference gate;
     /// `Err(StorageError::ConfigNotFound)` when the bucket has none.
-    pub(crate) async fn get_bucket_sse_config(bucket: &str) -> Result<s3s::dto::ServerSideEncryptionConfiguration, StorageError> {
+    pub(crate) async fn get_bucket_sse_config(
+        bucket: &str,
+    ) -> Result<rustfs_gateway_types::persistence::PersistedBucketEncryptionConfiguration, StorageError> {
         crate::storage::storage_api::ecstore_bucket::metadata_sys::get_sse_config(bucket)
             .await
             .map(|(config, _)| config)
@@ -350,6 +352,7 @@ pub(crate) mod site_replication {
     /// itself stays off the direct s3s surface (s3s footprint ratchet).
     pub(crate) mod s3 {
         pub(crate) use rustfs_gateway_types::dto::Status;
+        pub(crate) use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
         pub(crate) use rustfs_gateway_types::persistence::{
             PersistedLifecycleConfiguration, PersistedLifecycleRule, PersistedOptionalReplicationStatus,
             PersistedReplicationConfiguration, PersistedReplicationDestination, PersistedReplicationRule,
@@ -357,7 +360,6 @@ pub(crate) mod site_replication {
         };
         #[cfg(test)]
         pub(crate) use rustfs_gateway_types::persistence::{PersistedLifecycleExpiration, PersistedTransition};
-        pub(crate) use s3s::dto::{BucketVersioningStatus, VersioningConfiguration};
         pub(crate) use s3s::{Body, S3Response};
     }
 }
@@ -401,6 +403,14 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod init {
+        /// Renders a persisted notification configuration as the DTO the notify
+        /// runtime still consumes (rustfs/backlog#2745).
+        pub(crate) fn notification_config_to_s3s(
+            config: &rustfs_gateway_types::persistence::PersistedNotificationConfiguration,
+        ) -> s3s::S3Result<s3s::dto::NotificationConfiguration> {
+            crate::storage::storage_api::persisted_to_s3s(config)
+        }
+
         pub(crate) use crate::storage::storage_api::ecstore_bucket::config_parse_mode::validate_bucket_config_parse_mode_env;
         pub(crate) use crate::storage::storage_api::{
             get_bucket_notification_config, process_lambda_configurations, process_queue_configurations,

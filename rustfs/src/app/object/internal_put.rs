@@ -791,9 +791,8 @@ impl DefaultObjectUsecase {
 mod tests {
     use super::*;
     use crate::app::storage_api::s3::{
-        BucketVersioningStatus, PersistedOptionalReplicationStatus, PersistedReplicationConfiguration,
-        PersistedReplicationDestination, PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag, Status,
-        VersioningConfiguration,
+        PersistedOptionalReplicationStatus, PersistedReplicationConfiguration, PersistedReplicationDestination,
+        PersistedReplicationFilter, PersistedReplicationRule, PersistedReplicationTag, Status,
     };
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::app::storage_api::test::{get_global_bucket_metadata_sys, set_bucket_metadata};
@@ -884,8 +883,8 @@ mod tests {
         };
         let mut metadata = (*metadata).clone();
         metadata.versioning_config_xml = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
-        metadata.versioning_config = Some(VersioningConfiguration {
-            status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+        metadata.versioning_config = Some(rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
+            status: Some("Enabled".to_owned()),
             ..Default::default()
         });
 

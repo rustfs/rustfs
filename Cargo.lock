@@ -9999,7 +9999,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-stream"
 version = "0.2.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=e88c711213b4ea8dffd9e51fb84d20c5c899a996#e88c711213b4ea8dffd9e51fb84d20c5c899a996"
+source = "git+https://github.com/rustfs/gateway.git?rev=21283e874c2381bab611e9347acbc5b92e9e2b3c#21283e874c2381bab611e9347acbc5b92e9e2b3c"
 dependencies = [
  "bitflags 2.13.2",
  "bytes",
@@ -10010,7 +10010,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-types"
 version = "0.32.0+aws.2026-10-02"
-source = "git+https://github.com/rustfs/gateway.git?rev=e88c711213b4ea8dffd9e51fb84d20c5c899a996#e88c711213b4ea8dffd9e51fb84d20c5c899a996"
+source = "git+https://github.com/rustfs/gateway.git?rev=21283e874c2381bab611e9347acbc5b92e9e2b3c#21283e874c2381bab611e9347acbc5b92e9e2b3c"
 dependencies = [
  "bytes",
  "crc-fast",
@@ -10031,7 +10031,7 @@ dependencies = [
 [[package]]
 name = "rustfs-gateway-xml"
 version = "0.4.0"
-source = "git+https://github.com/rustfs/gateway.git?rev=e88c711213b4ea8dffd9e51fb84d20c5c899a996#e88c711213b4ea8dffd9e51fb84d20c5c899a996"
+source = "git+https://github.com/rustfs/gateway.git?rev=21283e874c2381bab611e9347acbc5b92e9e2b3c#21283e874c2381bab611e9347acbc5b92e9e2b3c"
 dependencies = [
  "quick-xml 0.41.0",
 ]
@@ -10594,6 +10594,7 @@ dependencies = [
  "rustfs-config",
  "rustfs-credentials",
  "rustfs-ecstore",
+ "rustfs-gateway-types",
  "rustfs-iam",
  "rustfs-keystone",
  "rustfs-policy",

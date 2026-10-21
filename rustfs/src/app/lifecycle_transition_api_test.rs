@@ -178,17 +178,23 @@ async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
 
 async fn suspend_test_bucket(bucket: &str) {
     DefaultBucketUsecase::from_global()
-        .execute_put_bucket_versioning(build_request(
-            PutBucketVersioningInput::builder()
-                .bucket(bucket.to_string())
-                .versioning_configuration(VersioningConfiguration {
-                    status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED)),
-                    ..Default::default()
-                })
-                .build()
-                .expect("suspended versioning request should build"),
-            Method::PUT,
-        ))
+        .execute_put_bucket_versioning(
+            build_request(
+                PutBucketVersioningInput::builder()
+                    .bucket(bucket.to_string())
+                    .versioning_configuration(VersioningConfiguration {
+                        status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED)),
+                        ..Default::default()
+                    })
+                    .build()
+                    .expect("suspended versioning request should build"),
+                Method::PUT,
+            ),
+            Ok(rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
+                status: Some("Suspended".to_owned()),
+                ..Default::default()
+            }),
+        )
         .await
         .expect("bucket versioning should be suspended");
 }
@@ -3156,8 +3162,8 @@ async fn install_delete_replication_config(
     };
 
     metadata.versioning_config_xml = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
-    metadata.versioning_config = Some(VersioningConfiguration {
-        status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+    metadata.versioning_config = Some(rustfs_gateway_types::persistence::PersistedVersioningConfiguration {
+        status: Some("Enabled".to_owned()),
         ..Default::default()
     });
     let filter = required_tag.map(|(key, value)| PersistedReplicationFilter {
