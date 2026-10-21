@@ -1047,6 +1047,86 @@ mod decommission_lock_order_tests {
         });
     }
 
+    /// A source cleanup that keeps losing quorum through the replay pauses the
+    /// decommission instead of failing it, with a reason that names source
+    /// cleanup rather than target capacity, and leaves the source in place.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_pauses_on_persistent_cleanup_quorum_failure_as_source_cleanup() {
+        run_large_stack_async_test("decommission-cleanup-quorum-pause", || async {
+            let (_temp_dirs, store, bucket) = new_stale_target_store("cleanup-quorum-pause").await;
+            let object = "cleanup-quorum-pause.bin";
+            put_source_object(&store, &bucket, object, b"source cleanup never regains quorum".to_vec()).await;
+
+            let cleanup_calls = Arc::new(AtomicUsize::new(0));
+            let _fault = DecommissionTestFaultGuard::install_with_error(
+                Arc::new({
+                    let cleanup_calls = Arc::clone(&cleanup_calls);
+                    let bucket = bucket.clone();
+                    move |stage, entry_bucket, entry_object, _, _| {
+                        let hit = stage == "source_cleanup" && entry_bucket == bucket && entry_object == object;
+                        if hit {
+                            cleanup_calls.fetch_add(1, Ordering::AcqRel);
+                        }
+                        hit
+                    }
+                }),
+                Some(Arc::new(|_, _, _| crate::error::Error::ErasureWriteQuorum)),
+            );
+
+            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+            start_routine_decommission_with_capacity(
+                &store,
+                &bucket,
+                vec![
+                    DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64 << 20, 64 << 20),
+                    DecommissionPoolCapacityInfo::for_test(1, layout, 1 << 30, 1 << 30, 0),
+                    DecommissionPoolCapacityInfo::for_test(2, layout, 1 << 30, 1 << 30, 0),
+                ],
+                0,
+            )
+            .await;
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the decommission routine task should join")
+                .expect("a paused decommission routine returns without an error");
+
+            assert_eq!(
+                cleanup_calls.load(Ordering::Acquire),
+                2 * crate::core::pools::DECOMMISSION_SOURCE_CLEANUP_QUORUM_MAX_ATTEMPTS,
+                "the first pass and the replay each exhaust their in-place retries"
+            );
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert!(
+                !info.complete && !info.failed && !info.canceled,
+                "a persistent cleanup failure must pause, not finish or fail: complete={}, failed={}, canceled={}",
+                info.complete,
+                info.failed,
+                info.canceled
+            );
+            assert!(info.is_source_cleanup_blocked(), "{:?}", info.capacity_blocked_reason);
+            let reason = info.capacity_blocked_reason.as_deref().unwrap_or_default();
+            assert!(reason.contains("decommission cleanup_delete_object failed for"), "{reason}");
+            assert!(!reason.contains("free drive threshold"), "{reason}");
+            assert!(info.queued_buckets.contains(&bucket), "the bucket must not be marked done: {info:?}");
+            drop(local);
+
+            let source = store.pools[0]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(&bucket, object)
+                .await
+                .expect("the source versions should decode");
+            assert!(
+                source.is_some_and(|versions| !versions.versions.is_empty()),
+                "the source must stay in place while cleanup cannot commit"
+            );
+        });
+    }
+
     #[test]
     #[serial_test::serial]
     fn decommission_reselects_a_target_that_no_longer_fits_after_selection() {

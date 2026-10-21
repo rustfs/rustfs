@@ -92,11 +92,10 @@ When decommission metadata is present, `decommissionInfo` includes:
 - progress counters: `objectsDecommissioned`, `objectsDecommissionedFailed`, `bytesDecommissioned`, and `bytesDecommissionedFailed`;
 - current location: `bucket`, `prefix`, and `object`;
 - queue/history lists: `queuedBuckets` and `decommissionedBuckets`;
-- `waitingReason`: `capacity` while the pool is paused on target capacity,
-  `queued` for queued entries, and `waiting_for_worker` when metadata exists but
-  no worker has started;
-- `capacityBlockedReason`: the persisted detail for the active capacity pause,
-  absent once the pause clears.
+- `waitingReason`: `capacity` while the pool is paused on target capacity, `source_cleanup` while it is paused because deleting the source of already-copied entries kept losing quorum, `queued` for queued entries, and `waiting_for_worker` when metadata exists but no worker has started;
+- `capacityBlockedReason`: the persisted detail for the active pause, absent once the pause clears. A source cleanup pause stores a reason that starts with `source cleanup blocked` and names the cleanup error.
+
+`source_cleanup` is an additive value. It is derived from the persisted reason text, and `pool.bin` is unchanged, so an older node reading the same `pool.bin` reports such a pause as `capacity` with the same `capacityBlockedReason`. That is compatible: both nodes agree the pool is paused and show the same detail.
 
 A capacity pause is reported ahead of the worker states so operators can tell
 "contending but progressing" from "genuinely out of target capacity". The existing `pool.bin` layout is unchanged;

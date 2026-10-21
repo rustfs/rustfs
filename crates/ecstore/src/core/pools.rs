@@ -185,6 +185,10 @@ const DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY: std::time::Duration = std::time::
 /// In-place attempts for a source cleanup quorum failure before the entry is
 /// deferred to the end of the round.
 pub(crate) const DECOMMISSION_SOURCE_CLEANUP_QUORUM_MAX_ATTEMPTS: usize = 3;
+/// Fixed part of the wait before in-place cleanup retry `n`: `n` times this.
+/// Drive reconnects and health-check blips last seconds, so jitter alone
+/// (which may be near zero) would rarely ride one out.
+const DECOMMISSION_SOURCE_CLEANUP_QUORUM_RETRY_FLOOR: std::time::Duration = std::time::Duration::from_secs(1);
 pub(crate) const DECOMMISSION_VERSION_COPY_ATTEMPTS: usize = 3;
 const DECOMMISSION_COPY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 const DECOMMISSION_CAPACITY_GATE_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(100);
@@ -5062,11 +5066,17 @@ fn ensure_decommission_deferred_drained(
 /// pause keeps only its own message; the capacity wording of the carrier error
 /// would misreport it.
 fn decommission_pause_reason(err: &Error) -> String {
+    source_cleanup_blocked_message(err).map_or_else(|| err.to_string(), str::to_owned)
+}
+
+/// The source cleanup pause message of `err`, seen through stage wrappers the
+/// same way `is_decommission_capacity_blocked_error` sees through them.
+fn source_cleanup_blocked_message(err: &Error) -> Option<&str> {
     match err {
         Error::DecommissionCapacityBlocked { message } if message.starts_with(DECOMMISSION_SOURCE_CLEANUP_BLOCKED) => {
-            message.clone()
+            Some(message.as_str())
         }
-        _ => err.to_string(),
+        _ => data_movement::data_movement_stage_source(err).and_then(source_cleanup_blocked_message),
     }
 }
 
@@ -5116,6 +5126,13 @@ fn decommission_retry_backoff_delay(base: std::time::Duration, attempt: usize) -
     }
     let ceiling_millis = u64::try_from(ceiling.as_millis()).unwrap_or(u64::MAX);
     std::time::Duration::from_millis(rand::rng().random_range(0..=ceiling_millis))
+}
+
+/// Wait before the 1-based in-place source cleanup retry `attempt`: a fixed
+/// floor of `attempt` seconds plus the usual source-cleanup jitter on top.
+fn decommission_source_cleanup_quorum_retry_delay(attempt: usize) -> std::time::Duration {
+    let floor = DECOMMISSION_SOURCE_CLEANUP_QUORUM_RETRY_FLOOR.saturating_mul(u32::try_from(attempt).unwrap_or(u32::MAX));
+    floor.saturating_add(decommission_retry_backoff_delay(DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY, attempt))
 }
 
 /// Backoff for retries that wait on another mutation's target capacity gate.
@@ -16505,10 +16522,7 @@ impl ECStore {
                             .is_some_and(is_decommission_source_cleanup_retryable_error)
                     {
                         source_cleanup_quorum_attempt += 1;
-                        let retry_delay = decommission_retry_backoff_delay(
-                            DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY,
-                            source_cleanup_quorum_attempt,
-                        );
+                        let retry_delay = decommission_source_cleanup_quorum_retry_delay(source_cleanup_quorum_attempt);
                         warn!(
                             event = EVENT_DECOMMISSION_ENTRY,
                             component = LOG_COMPONENT_ECSTORE,
@@ -32193,6 +32207,38 @@ mod pools_tests {
             err.to_string()
                 .contains("decommission cleanup_delete_object failed for bucket-a/obj.txt")
         );
+    }
+
+    #[test]
+    fn decommission_source_cleanup_quorum_retry_waits_at_least_its_floor() {
+        for _ in 0..64 {
+            let first = super::decommission_source_cleanup_quorum_retry_delay(1);
+            assert!(
+                first >= std::time::Duration::from_secs(1) && first <= std::time::Duration::from_millis(1_100),
+                "{first:?}"
+            );
+            let second = super::decommission_source_cleanup_quorum_retry_delay(2);
+            assert!(
+                second >= std::time::Duration::from_secs(2) && second <= std::time::Duration::from_millis(2_200),
+                "{second:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decommission_source_cleanup_pause_reason_sees_through_stage_wrappers() {
+        let blocked = super::ensure_decommission_deferred_drained(
+            "bucket-a",
+            0,
+            1,
+            Some("source cleanup blocked: decommission cleanup_delete_object failed for bucket-a/obj.txt: erasure write quorum"),
+        )
+        .expect_err("an undrained cleanup deferral pauses");
+        let wrapped = data_movement::data_movement_stage_error_for_test("decommission", "bucket", "bucket-a", "", blocked);
+        assert!(is_decommission_capacity_blocked_error(&wrapped));
+        let reason = super::decommission_pause_reason(&wrapped);
+        assert!(reason.starts_with(super::DECOMMISSION_SOURCE_CLEANUP_BLOCKED), "{reason}");
+        assert!(!reason.contains("free drive threshold"), "{reason}");
     }
 
     #[test]
