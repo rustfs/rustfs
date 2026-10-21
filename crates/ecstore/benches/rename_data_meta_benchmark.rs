@@ -67,6 +67,10 @@ fn bench_rename_data_meta_path(c: &mut Criterion) {
             .and_then(|v| v.header.version_id)
             .unwrap_or(Uuid::nil());
 
+        group.bench_with_input(BenchmarkId::new("find_unshared_data_dir", version_count), &version_count, |b, _| {
+            b.iter(|| black_box(seeded.find_unshared_data_dir_for_version(black_box(Some(replace_version_id)))));
+        });
+
         group.bench_with_input(BenchmarkId::new("read_modify_write", version_count), &version_count, |b, _| {
             b.iter(|| {
                 let mut xlmeta = FileMeta::load(black_box(&dst_buf)).expect("load dst meta");

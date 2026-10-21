@@ -307,13 +307,6 @@ struct FileInfoDecodeOptions {
     include_part_checksums: bool,
 }
 
-fn has_tier_fv_key(metadata: &HashMap<String, String>) -> bool {
-    metadata.keys().any(|key| {
-        rustfs_utils::http::strip_internal_prefix_preserving_case(key)
-            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(rustfs_utils::http::SUFFIX_TIER_FV_ID))
-    })
-}
-
 impl FileMeta {
     pub fn new() -> Self {
         Self {
@@ -510,7 +503,7 @@ impl FileMeta {
         if fi.version_id.is_some_and(|id| !id.is_nil()) {
             return Ok(None);
         }
-        let legacy_id = if has_tier_fv_key(&fi.metadata) {
+        let legacy_id = if contains_key_str(&fi.metadata, rustfs_utils::http::SUFFIX_TIER_FV_ID) {
             Some(Uuid::parse_str(
                 get_consistent_str(&fi.metadata, SUFFIX_TIER_FV_ID).ok_or(Error::FileCorrupt)?,
             )?)
@@ -603,7 +596,7 @@ impl FileMeta {
     }
 
     fn add_version_inner(&mut self, mut fi: FileInfo) -> Result<()> {
-        if has_tier_fv_key(&fi.metadata) {
+        if contains_key_str(&fi.metadata, rustfs_utils::http::SUFFIX_TIER_FV_ID) {
             rustfs_utils::http::remove_str(&mut fi.metadata, rustfs_utils::http::SUFFIX_TIER_FV_ID);
         }
         // empty version_id means "null" (versioning disabled/suspended)

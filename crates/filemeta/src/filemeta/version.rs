@@ -708,7 +708,7 @@ impl FileMetaVersion {
         write_quorum_from_erasure(data_blocks, parity_blocks)
     }
 
-    /// Fast zero-allocation scanner for `V2Obj` slices. Returning `Ok` guarantees
+    /// Fast borrowed scanner for `V2Obj` slices. Returning `Ok` guarantees
     /// `FileMetaVersion::try_from` would succeed with the identical summary fields;
     /// any non-`V2Obj` or invalid input returns `Err` so callers fall back to `try_from`.
     pub(super) fn inspect_v2_object_slice(buf: &[u8]) -> Result<V2ObjectSliceSummary> {
@@ -6544,6 +6544,85 @@ mod tests {
 
         assert_eq!(decoded, stat);
         assert!(decoded.mod_time.is_none(), "absent mod_time must not become Some(UNIX_EPOCH)");
+    }
+
+    #[test]
+    fn inspect_v2_object_slice_matches_full_decoder_for_historical_and_mutated_records() {
+        fn assert_summary(bytes: &[u8]) {
+            let Ok(summary) = FileMetaVersion::inspect_v2_object_slice(bytes) else {
+                return;
+            };
+            let decoded = FileMetaVersion::try_from(bytes).expect("an accepted scan must fully decode");
+            let object = decoded.object.as_ref().expect("an accepted scan must be an object");
+            let transition_complete = get_bytes(&object.meta_sys, SUFFIX_TRANSITION_STATUS)
+                .is_some_and(|status| status == TRANSITION_COMPLETE.as_bytes());
+            let physical_dir =
+                if object.inlinedata() || (transition_complete && !crate::is_restored_object_on_disk(&object.meta_user)) {
+                    None
+                } else {
+                    object.data_dir
+                };
+            assert_eq!(summary.version_id, decoded.get_version_id());
+            assert_eq!(summary.data_dir, decoded.get_data_dir());
+            assert_eq!(summary.physical_data_dir, physical_dir);
+            assert_eq!(summary.transition_complete, transition_complete);
+            assert_eq!(
+                summary.has_reconciled_transition,
+                contains_key_bytes(&object.meta_sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID)
+                    && contains_key_bytes(&object.meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE)
+            );
+        }
+
+        let fixtures = [
+            crate::test_data::create_minio_small_object_xlmeta().expect("MinIO inline fixture"),
+            crate::test_data::create_minio_large_object_xlmeta().expect("MinIO physical fixture"),
+            crate::test_data::create_minio_versioned_object_xlmeta().expect("MinIO versioned fixture"),
+            crate::test_data::create_legacy_v1_object_xlmeta().expect("legacy V1 fixture"),
+            crate::test_data::create_issue_2288_legacy_xlmeta().expect("legacy xl.meta fixture"),
+            crate::test_data::create_issue_2265_legacy_meta_v2_object_xlmeta().expect("legacy V2 fixture"),
+        ];
+        let mut fast_objects = 0;
+        for raw in fixtures {
+            let metadata = FileMeta::load(&raw).expect("load historical fixture");
+            for version in metadata.versions {
+                let decoded = version.parse_version_meta().expect("decode historical version");
+                assert_eq!(
+                    FileMetaVersion::decode_data_dir_from_meta(&version.meta).expect("historical data directory"),
+                    decoded.get_data_dir()
+                );
+                if FileMetaVersion::inspect_v2_object_slice(&version.meta).is_ok() {
+                    fast_objects += 1;
+                }
+                assert_summary(&version.meta);
+            }
+        }
+        assert!(fast_objects > 0, "foreign fixtures must exercise the fast scanner");
+
+        let mut object = signed_object();
+        insert_bytes(&mut object.meta_sys, SUFFIX_TRANSITION_STATUS, TRANSITION_COMPLETE.as_bytes().to_vec());
+        insert_bytes(&mut object.meta_sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID, vec![b'a'; 64]);
+        insert_bytes(&mut object.meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE, b"exact".to_vec());
+        object.meta_user.insert(
+            metadata_keys::RESTORE.to_string(),
+            "ongoing-request=\"false\", expiry-date=\"9999-01-01T00:00:00Z\"".to_string(),
+        );
+        let bytes = FileMetaVersion {
+            version_type: VersionType::Object,
+            object: Some(object),
+            ..Default::default()
+        }
+        .marshal_msg()
+        .expect("encode mutation seed");
+        for end in 0..bytes.len() {
+            assert!(FileMetaVersion::inspect_v2_object_slice(&bytes[..end]).is_err(), "truncated at {end}");
+        }
+        for index in 0..bytes.len() {
+            for replacement in [0, 0x7f, 0xc0, 0xc1, 0xc2, 0xff] {
+                let mut mutated = bytes.clone();
+                mutated[index] = replacement;
+                assert_summary(&mutated);
+            }
+        }
     }
 
     #[test]
