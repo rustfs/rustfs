@@ -75,8 +75,18 @@ where
     F::Output: Send + 'static,
 {
     // Capture before spawning; detached transactions outlive their request waiter.
-    let context = rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context();
-    tokio::spawn(rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(context, future))
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let future = crate::cluster::rpc::runtime_sources::with_read_version_diagnostic_context(
+        crate::cluster::rpc::runtime_sources::ReadVersionDiagnosticContext::capture(),
+        rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::ConfigTask,
+        future,
+    );
+    #[cfg(not(feature = "diagnostic-read-version-caller"))]
+    let future = rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(
+        rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context(),
+        future,
+    );
+    tokio::spawn(future)
 }
 
 /// Runs one complete server-config transaction while holding both the local
@@ -2928,6 +2938,110 @@ mod tests {
         finished_rx.await.expect("detached transaction finished");
         assert_eq!(admission.available_permits(), 1);
         assert_eq!(current_s3_http_operation_name(), None);
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn diagnostic_config_tasks_preserve_first_owner_across_nested_spawns() {
+        use crate::cluster::rpc::runtime_sources::{
+            current_read_version_entry_source, current_read_version_request_caller, with_read_version_entry,
+            with_read_version_request_caller,
+        };
+        use rustfs_io_metrics::internode_metrics::{ReadVersionEntrySource, ReadVersionRequestCaller};
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, current_s3_http_operation_name, observe_s3_http_operation,
+            with_s3_http_operation_context,
+        };
+
+        let mut request = S3HttpRequestGuard::new("PUT");
+        let operation = request.in_scope(|| {
+            observe_s3_http_operation(rustfs_s3_ops::S3Operation::CreateBucket);
+            current_s3_http_operation_context().expect("captured bucket operation")
+        });
+        let task = with_s3_http_operation_context(Some(operation), async {
+            with_read_version_request_caller(ReadVersionRequestCaller::Object, async {
+                with_read_version_entry(ReadVersionEntrySource::TierConfigReload, async {
+                    super::spawn_config_task(async {
+                        assert_eq!(current_s3_http_operation_name(), Some("s3:CreateBucket"));
+                        assert_eq!(current_read_version_request_caller(), Some(ReadVersionRequestCaller::Object));
+                        assert_eq!(current_read_version_entry_source(), Some(ReadVersionEntrySource::TierConfigReload));
+                        with_read_version_entry(ReadVersionEntrySource::ConfigRead, async {
+                            super::spawn_config_task(async {
+                                assert_eq!(current_s3_http_operation_name(), Some("s3:CreateBucket"));
+                                assert_eq!(current_read_version_request_caller(), Some(ReadVersionRequestCaller::Object));
+                                assert_eq!(current_read_version_entry_source(), Some(ReadVersionEntrySource::TierConfigReload));
+                                Err::<(), _>("config failure")
+                            })
+                            .await
+                            .expect("nested config task joins")
+                        })
+                        .await
+                    })
+                })
+                .await
+            })
+            .await
+        })
+        .await;
+        drop(request);
+        assert_eq!(task.await.expect("config task joins"), Err("config failure"));
+        assert_eq!(current_s3_http_operation_name(), None);
+        assert_eq!(current_read_version_request_caller(), None);
+        assert_eq!(current_read_version_entry_source(), None);
+        super::spawn_config_task(async {
+            assert_eq!(current_s3_http_operation_name(), None);
+            assert_eq!(current_read_version_request_caller(), None);
+            assert_eq!(current_read_version_entry_source(), None, "internal work invents no entry owner");
+            with_read_version_entry(ReadVersionEntrySource::ConfigRead, async {
+                assert_eq!(current_read_version_entry_source(), Some(ReadVersionEntrySource::ConfigRead));
+            })
+            .await;
+        })
+        .await
+        .expect("unscoped config task joins");
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn diagnostic_config_tasks_keep_context_and_permit_after_waiter_drop() {
+        use crate::cluster::rpc::runtime_sources::{
+            current_read_version_entry_source, current_read_version_request_caller, with_read_version_entry,
+            with_read_version_request_caller,
+        };
+        use rustfs_io_metrics::internode_metrics::{ReadVersionEntrySource, ReadVersionRequestCaller};
+
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = admission.clone().acquire_owned().await.expect("config task permit");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let task = with_read_version_request_caller(ReadVersionRequestCaller::MetadataRead, async {
+            with_read_version_entry(ReadVersionEntrySource::ServerInfoPools, async {
+                super::spawn_config_task(async move {
+                    entered_tx.send(()).expect("waiter is present");
+                    release_rx.await.expect("config task may finish");
+                    let observed = (current_read_version_request_caller(), current_read_version_entry_source());
+                    drop(permit);
+                    finished_tx.send(observed).expect("completion observer is present");
+                })
+            })
+            .await
+        })
+        .await;
+        entered_rx.await.expect("config task started");
+        drop(task);
+        assert_eq!(admission.available_permits(), 0, "dropping the waiter keeps admission owned");
+        release_tx.send(()).expect("detached config task remains alive");
+        assert_eq!(
+            finished_rx.await.expect("detached config task completes"),
+            (
+                Some(ReadVersionRequestCaller::MetadataRead),
+                Some(ReadVersionEntrySource::ServerInfoPools)
+            )
+        );
+        assert_eq!(admission.available_permits(), 1);
+        assert_eq!(current_read_version_request_caller(), None);
+        assert_eq!(current_read_version_entry_source(), None);
     }
 
     #[test]
