@@ -195,7 +195,7 @@ fn proof_queue_keeps_every_incomplete_or_mismatched_identity() {
         },
         MrfVerifiedRepairEvent {
             delete_marker_purge: Some(different_purge),
-            ..event.clone()
+            ..event
         },
     ] {
         let mut anchors = vec![anchor.clone()];
