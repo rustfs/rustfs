@@ -212,6 +212,32 @@ mod canonical_outcome {
     }
 
     #[tokio::test]
+    async fn heal_storage_detail_survives_unverified_object_and_bucket_checks() {
+        let detail = rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL;
+        for bucket_scope in [false, true] {
+            for scan_mode in [HealScanMode::Normal, HealScanMode::Deep] {
+                let storage = Arc::new(MockStorage {
+                    object_heal_detail: Some(detail.to_owned()),
+                    ..Default::default()
+                });
+                let mut task = if bucket_scope {
+                    bucket_task(storage)
+                } else {
+                    HealTask::from_request(HealRequest::object("bucket-a".to_owned(), "object-a".to_owned(), None), storage)
+                };
+                task.options.scan_mode = scan_mode;
+                task.execute().await.expect("unverified processing completes");
+                let outcome = task.get_outcome().await;
+                assert!(outcome.counters.unknown > 0);
+                assert_eq!(outcome.counters.healed, 0);
+                assert!(outcome.objects.iter().all(|item| {
+                    item.disposition == HealObjectDisposition::Unknown && item.detail.as_deref() == Some(detail)
+                }));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn bucket_heal_records_matching_positive_storage_receipts() {
         let incarnation = Uuid::new_v4();
         let storage = Arc::new(MockStorage {
@@ -1518,6 +1544,7 @@ struct MockStorage {
     heal_object_outcome: Mutex<Option<MockHealObjectOutcome>>,
     heal_object_outcomes: Mutex<HashMap<String, VecDeque<MockHealObjectOutcome>>>,
     heal_object_receipts: Mutex<HashMap<String, VecDeque<HealObjectReceipt>>>,
+    object_heal_detail: Option<String>,
     bucket_incarnation_id: Mutex<Option<Uuid>>,
     bucket_incarnation_after_object_heal: Mutex<Option<Uuid>>,
     bucket_incarnation_after_listing: Mutex<Option<Uuid>>,
@@ -1734,7 +1761,7 @@ async fn cancelled_object_heal_rejects_matching_positive_storage_receipt() {
     };
     let accepted = task
         .record_verified_storage_receipt(
-            expected,
+            &expected,
             Some(object_receipt(
                 "object-a",
                 Some("version-a"),
@@ -2331,6 +2358,7 @@ impl HealStorageAPI for MockStorage {
         {
             item.resolved_version_id = Some(resolved_version_id);
         }
+        item.detail = self.object_heal_detail.clone().unwrap_or_default();
         Ok(HealStorageObjectResult { item, error, receipt })
     }
 

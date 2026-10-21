@@ -120,14 +120,14 @@ fn manager(env: &TestECStoreEnv) -> Arc<HealManager> {
     ))
 }
 
-async fn start(processor: &HealChannelProcessor, token: &str) {
+async fn start(processor: &HealChannelProcessor, token: &str, scan_mode: HealScanMode) {
     let receipt = processor
         .execute_start_request(HealChannelRequest {
             id: token.to_owned(),
             disk: Some("pool_0_set_0".to_owned()),
             pool_index: Some(0),
             set_index: Some(0),
-            scan_mode: Some(HealScanMode::Deep),
+            scan_mode: Some(scan_mode),
             recursive: Some(true),
             dry_run: Some(false),
             remove_corrupted: Some(false),
@@ -189,7 +189,7 @@ async fn mixed_contract(mode: ShardIntegrityWriteMode) {
     manager.start().await.expect("start manager");
     let processor = HealChannelProcessor::new(manager.clone());
     let token = uuid::Uuid::new_v4().to_string();
-    start(&processor, &token).await;
+    start(&processor, &token, HealScanMode::Deep).await;
     let value = terminal(&processor, &token).await;
     assert_eq!(value["summary"], "finished");
     assert_eq!(
@@ -228,6 +228,12 @@ async fn mixed_contract(mode: ShardIntegrityWriteMode) {
             .expect("incarnation UUID")
             .is_nil()
         );
+        if !protected {
+            assert_eq!(
+                receipt["detail"],
+                rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL
+            );
+        }
         assert_eq!(
             receipt["disposition"]["state"],
             if !protected {
@@ -249,6 +255,51 @@ async fn mixed_contract(mode: ShardIntegrityWriteMode) {
     assert_eq!(restored, value, "retain the complete wire response for the same token");
     assert_eq!(restarted.get_queue_length().await, 0);
     restarted.stop().await.expect("stop restarted manager");
+}
+
+#[test]
+#[serial]
+fn admin_selector_healthy_legacy_reason_survives_normal_and_deep_checks() {
+    run_async(|| async {
+        for mode in [ShardIntegrityWriteMode::Legacy, ShardIntegrityWriteMode::Protected] {
+            let root = tempfile::tempdir().expect("healthy selector fixture");
+            let env = TestECStoreEnv::builder().base_dir(root.path()).build().await;
+            let fixtures = seed(&env, 1, 0, mode).await;
+            let manager = manager(&env);
+            manager.start().await.expect("start manager");
+            let processor = HealChannelProcessor::new(manager.clone());
+            for scan_mode in [HealScanMode::Normal, HealScanMode::Deep] {
+                let token = uuid::Uuid::new_v4().to_string();
+                start(&processor, &token, scan_mode).await;
+                let value = terminal(&processor, &token).await;
+                let outcome = &value["outcome"];
+                let protected = mode == ShardIntegrityWriteMode::Protected;
+                assert_eq!(outcome["counters"]["processed"], 1);
+                assert_eq!(outcome["counters"]["healed"], 0);
+                assert_eq!(outcome["counters"]["unknown"], u64::from(!protected));
+                assert_eq!(outcome["counters"]["unchanged"], u64::from(protected));
+                let object = &outcome["objects"][0];
+                assert_eq!(
+                    object["disposition"]["state"],
+                    if !protected {
+                        "unknown"
+                    } else if scan_mode == HealScanMode::Deep {
+                        "verified_healthy"
+                    } else {
+                        "metadata_healthy"
+                    }
+                );
+                if !protected {
+                    assert_eq!(
+                        object["detail"],
+                        rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL
+                    );
+                }
+                verify_data(&env, &fixtures).await;
+            }
+            manager.stop().await.expect("stop manager");
+        }
+    });
 }
 
 #[test]
@@ -367,7 +418,7 @@ async fn crash_child(root: PathBuf, replay: bool) {
     let processor = HealChannelProcessor::new(manager.clone());
     if !replay {
         eprintln!("heal crash fixture: replay={replay}, stage=partial-progress");
-        start(&processor, token).await;
+        start(&processor, token, HealScanMode::Deep).await;
         loop {
             let value = query(&processor, token).await;
             assert_eq!(value["summary"], "running", "crash must precede terminal publication");
