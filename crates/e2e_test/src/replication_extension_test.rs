@@ -10109,6 +10109,45 @@ async fn test_scanner_compensates_existing_objects_across_write_paths() -> TestR
         .send()
         .await?;
 
+    // Multipart null-version cell: a one-part upload already carries a
+    // multipart ETag, so its replica travels the target's multipart path,
+    // whose completion must keep the null version too.
+    let multipart_null_key = "pre-versioning-null-multipart.txt";
+    let multipart_null_payload = "multipart null version payload";
+    let upload = source_client
+        .create_multipart_upload()
+        .bucket(source_bucket)
+        .key(multipart_null_key)
+        .send()
+        .await?;
+    let upload_id = upload.upload_id().ok_or("multipart upload id missing")?;
+    let part = source_client
+        .upload_part()
+        .bucket(source_bucket)
+        .key(multipart_null_key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(multipart_null_payload.as_bytes()))
+        .send()
+        .await?;
+    source_client
+        .complete_multipart_upload()
+        .bucket(source_bucket)
+        .key(multipart_null_key)
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .set_e_tag(part.e_tag().map(str::to_string))
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await?;
+
     enable_bucket_versioning(&source_env, source_bucket).await?;
     enable_bucket_versioning(&target_env, target_bucket).await?;
 
@@ -10193,19 +10232,22 @@ async fn test_scanner_compensates_existing_objects_across_write_paths() -> TestR
     wait_for_replicated_object(&target_client, target_bucket, copy_key, plain_payload).await?;
     wait_for_replicated_object(&target_client, target_bucket, member_key, std::str::from_utf8(member_payload)?).await?;
 
-    // The null version converges too, and keeps its identity: the replica is
-    // the target's null version, not a freshly minted one.
-    wait_for_replicated_object(&target_client, target_bucket, null_key, null_payload).await?;
-    let null_replica = target_client
-        .get_object()
-        .bucket(target_bucket)
-        .key(null_key)
-        .version_id("null")
-        .send()
-        .await?;
-    assert_eq!(null_replica.version_id(), Some("null"));
-    let null_replica_body = null_replica.body.collect().await?.into_bytes();
-    assert_eq!(null_replica_body.as_ref(), null_payload.as_bytes());
+    // The null versions converge too, and keep their identity whichever path
+    // carried them: each replica is the target's null version, not a freshly
+    // minted one.
+    for (key, payload) in [(null_key, null_payload), (multipart_null_key, multipart_null_payload)] {
+        wait_for_replicated_object(&target_client, target_bucket, key, payload).await?;
+        let null_replica = target_client
+            .get_object()
+            .bucket(target_bucket)
+            .key(key)
+            .version_id("null")
+            .send()
+            .await?;
+        assert_eq!(null_replica.version_id(), Some("null"), "{key} must replicate as the null version");
+        let null_replica_body = null_replica.body.collect().await?.into_bytes();
+        assert_eq!(null_replica_body.as_ref(), payload.as_bytes());
+    }
 
     Ok(())
 }

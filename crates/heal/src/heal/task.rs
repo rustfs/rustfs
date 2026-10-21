@@ -674,7 +674,7 @@ impl HealTask {
 
     pub(super) async fn record_verified_storage_receipt(
         &self,
-        expected: HealObjectIdentity,
+        expected: &HealObjectIdentity,
         receipt: Option<HealObjectReceipt>,
     ) -> bool {
         if self.options.dry_run || self.cancel_token.is_cancelled() {
@@ -683,7 +683,7 @@ impl HealTask {
         let Some(receipt) = receipt else {
             return false;
         };
-        if !receipt.verified_for(&expected) {
+        if !receipt.verified_for(expected) {
             return false;
         }
         let mut outcome = self.outcome.write().await;

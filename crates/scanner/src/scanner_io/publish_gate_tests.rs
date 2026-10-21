@@ -1629,3 +1629,6 @@ fn replication_execution_digest_is_canonical_and_tracks_statistics() {
         .failed_count = 1;
     assert_ne!(super::cache::scanner_replication_execution_digest(execution, &cache), digest);
 }
+
+#[path = "usage_candidate_metrics_tests.rs"]
+mod usage_candidate_metrics_tests;

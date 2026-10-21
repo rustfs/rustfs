@@ -83,6 +83,13 @@ threads-required = "num-test-threads"
 filter = '(package(rustfs-ecstore) & test(=core::pools_test::decommission_lock_order_tests::active_decommission_migration_does_not_invert_capacity_and_delete_object_tag_locks)) | (package(rustfs-heal) & test(=heal::mrf_queue::partial_write::tests::durable_retry_submission_error_keeps_checkpoint_and_uses_backoff))'
 threads-required = "num-test-threads"
 
+# These eight-disk decommission fixtures exercise concurrent retries,
+# free-version cleanup, and real capacity probes under production lock deadlines.
+# Reserve the run's capacity so unrelated IO cannot exhaust those budgets.
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & (test(/^store::init::tests::decommission_entry_(retries_source_changed_without_canceling_other_bucket|skips_cleanup_only_marker_when_free_version_is_present)$/) | test(=core::pools::tests::decommission_capacity_mutation_limits_prewrite_sampling_to_target))'
+threads-required = "num-test-threads"
+
 # This registration/backup lock probe uses an isolated eight-disk store.
 # Reserve capacity so sibling disk-heavy tests cannot consume its 2s
 # registration budget; retain the queued backup and deadlock assertions.
@@ -354,6 +361,13 @@ threads-required = "num-test-threads"
 # preserving the probes' internal concurrency, deadlines, and assertions.
 [[profile.ci.overrides]]
 filter = '(package(rustfs-ecstore) & test(=core::pools_test::decommission_lock_order_tests::active_decommission_migration_does_not_invert_capacity_and_delete_object_tag_locks)) | (package(rustfs-heal) & test(=heal::mrf_queue::partial_write::tests::durable_retry_submission_error_keeps_checkpoint_and_uses_backoff))'
+threads-required = "num-test-threads"
+
+# These eight-disk decommission fixtures exercise concurrent retries,
+# free-version cleanup, and real capacity probes under production lock deadlines.
+# Reserve the run's capacity so unrelated IO cannot exhaust those budgets.
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & (test(/^store::init::tests::decommission_entry_(retries_source_changed_without_canceling_other_bucket|skips_cleanup_only_marker_when_free_version_is_present)$/) | test(=core::pools::tests::decommission_capacity_mutation_limits_prewrite_sampling_to_target))'
 threads-required = "num-test-threads"
 
 # This registration/backup lock probe uses an isolated eight-disk store.

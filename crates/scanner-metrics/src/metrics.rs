@@ -13,6 +13,9 @@
 // limitations under the License.
 
 use crate::last_minute::{AccElem, LastMinuteLatency};
+use crate::usage_candidate::{
+    ScannerUsageCandidateCount, ScannerUsageCandidateKind, ScannerUsageCandidateOutcome, USAGE_CANDIDATE_COUNTER_SLOTS,
+};
 use chrono::{DateTime, Utc};
 use jiff::Timestamp;
 use rustfs_heal_contracts::heal_channel::HealScanMode;
@@ -1034,6 +1037,7 @@ pub struct Metrics {
     scanner_dirty_usage_last_clear_unix_secs: AtomicU64,
     scanner_dirty_usage_last_cycle_dirty_buckets: AtomicU64,
     scanner_dirty_usage_last_cycle_cleared_buckets: AtomicU64,
+    usage_candidates: [AtomicU64; USAGE_CANDIDATE_COUNTER_SLOTS],
     scanner_usage_last_save_unix_secs: AtomicU64,
     scanner_usage_last_durable_success_unix_secs: AtomicU64,
     scanner_usage_last_publication_unix_secs: AtomicU64,
@@ -1548,6 +1552,10 @@ pub struct ScannerMetricsReport {
     pub lifecycle_transition: ScannerLifecycleTransitionSnapshot,
     #[serde(default)]
     pub usage_freshness: ScannerUsageFreshnessSnapshot,
+    /// Process-lifetime candidate-construction results. Missing on older reports
+    /// means unobserved, not accepted or healthy. Publication is tracked separately.
+    #[serde(default)]
+    pub usage_candidates: Vec<ScannerUsageCandidateCount>,
     #[serde(default)]
     pub maintenance_control: ScannerMaintenanceControlSnapshot,
     #[serde(default)]
@@ -2165,6 +2173,7 @@ impl Metrics {
             scanner_dirty_usage_last_clear_unix_secs: AtomicU64::new(0),
             scanner_dirty_usage_last_cycle_dirty_buckets: AtomicU64::new(0),
             scanner_dirty_usage_last_cycle_cleared_buckets: AtomicU64::new(0),
+            usage_candidates: std::array::from_fn(|_| AtomicU64::new(0)),
             scanner_usage_last_save_unix_secs: AtomicU64::new(0),
             scanner_usage_last_durable_success_unix_secs: AtomicU64::new(0),
             scanner_usage_last_publication_unix_secs: AtomicU64::new(0),
@@ -2565,6 +2574,37 @@ impl Metrics {
             self.scanner_dirty_usage_last_clear_unix_secs
                 .store(unix_now_secs(), Ordering::Relaxed);
         }
+    }
+
+    /// Record exactly one normal return from a candidate builder. Accepted does
+    /// not mean published or durable. Like other scanner metrics, the local
+    /// report remains available when no OTEL recorder is installed.
+    pub fn record_usage_candidate(&self, kind: ScannerUsageCandidateKind, outcome: ScannerUsageCandidateOutcome) {
+        let slot = kind.index() * ScannerUsageCandidateOutcome::ALL.len() + outcome.index();
+        self.usage_candidates[slot].fetch_add(1, Ordering::Relaxed);
+        metrics::counter!(
+            "rustfs_scanner_usage_candidates_total",
+            "kind" => kind.as_label(),
+            "outcome" => outcome.as_label()
+        )
+        .increment(1);
+    }
+
+    /// Read the bounded counters without resetting them. Cells are loaded
+    /// independently and do not form a transactional snapshot.
+    pub fn usage_candidate_counts(&self) -> Vec<ScannerUsageCandidateCount> {
+        let mut counts = Vec::with_capacity(USAGE_CANDIDATE_COUNTER_SLOTS);
+        for kind in ScannerUsageCandidateKind::ALL {
+            for outcome in ScannerUsageCandidateOutcome::ALL {
+                let slot = kind.index() * ScannerUsageCandidateOutcome::ALL.len() + outcome.index();
+                counts.push(ScannerUsageCandidateCount {
+                    kind,
+                    outcome,
+                    count: self.usage_candidates[slot].load(Ordering::Relaxed),
+                });
+            }
+        }
+        counts
     }
 
     pub fn record_scanner_usage_save_result(&self, result: ScannerUsageSaveResult) {
@@ -3712,6 +3752,7 @@ impl Metrics {
             completed: self.scanner_transition_completed.load(Ordering::Relaxed),
             failed: self.scanner_transition_failed.load(Ordering::Relaxed),
         };
+        m.usage_candidates = self.usage_candidate_counts();
         let usage_save_result = ScannerUsageSaveResult::from_code(self.scanner_usage_last_save_result.load(Ordering::Relaxed));
         m.usage_freshness = ScannerUsageFreshnessSnapshot {
             dirty_pending_buckets: self.scanner_dirty_usage_pending_buckets.load(Ordering::Relaxed),
@@ -5713,5 +5754,72 @@ mod tests {
         assert_eq!(current.cycle_timeout_total, 1);
         assert_eq!(current.cycle_last_progress_age, 0);
         assert!(!current.leader_lease_without_progress);
+    }
+    #[tokio::test]
+    async fn usage_candidate_report_survives_disabled_export_and_preserves_legacy_unknown() {
+        let metrics = Metrics::new();
+        assert!(metrics.usage_candidate_counts().iter().all(|row| row.count == 0));
+        metrics::with_local_recorder(&metrics::NoopRecorder, || {
+            for kind in ScannerUsageCandidateKind::ALL {
+                for outcome in ScannerUsageCandidateOutcome::ALL {
+                    metrics.record_usage_candidate(kind, outcome);
+                }
+            }
+            metrics.record_usage_candidate(
+                ScannerUsageCandidateKind::Observational,
+                ScannerUsageCandidateOutcome::NoUsableSnapshots,
+            );
+        });
+        let report = metrics.report().await;
+        assert_eq!(report.usage_candidates.len(), 38);
+        for row in &report.usage_candidates {
+            let expected = if row.kind == ScannerUsageCandidateKind::Observational
+                && row.outcome == ScannerUsageCandidateOutcome::NoUsableSnapshots
+            {
+                2
+            } else {
+                1
+            };
+            assert_eq!(row.count, expected, "{row:?}");
+        }
+        let mut legacy = serde_json::to_value(&report).expect("serialize scanner report");
+        legacy
+            .as_object_mut()
+            .expect("scanner report object")
+            .remove("usage_candidates");
+        let legacy: ScannerMetricsReport = serde_json::from_value(legacy).expect("read a pre-candidate-metrics report");
+        assert!(
+            legacy.usage_candidates.is_empty(),
+            "missing telemetry must remain unknown, not a synthetic accepted bucket"
+        );
+        let roundtrip: ScannerMetricsReport =
+            serde_json::from_slice(&serde_json::to_vec(&report).expect("encode report")).expect("decode report");
+        assert_eq!(roundtrip.usage_candidates, report.usage_candidates);
+    }
+
+    #[test]
+    fn usage_candidate_buckets_preserve_concurrent_updates() {
+        let metrics = Arc::new(Metrics::new());
+        let threads = (0..4)
+            .map(|_| {
+                let metrics = metrics.clone();
+                std::thread::spawn(move || {
+                    metrics::with_local_recorder(&metrics::NoopRecorder, || {
+                        for _ in 0..1000 {
+                            metrics.record_usage_candidate(
+                                ScannerUsageCandidateKind::Completed,
+                                ScannerUsageCandidateOutcome::Merge,
+                            );
+                        }
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().expect("candidate counter thread");
+        }
+        let rows = metrics.usage_candidate_counts();
+        assert_eq!(rows.iter().map(|row| row.count).sum::<u64>(), 4000);
+        assert_eq!(rows.iter().find(|row| row.kind == ScannerUsageCandidateKind::Completed && row.outcome == ScannerUsageCandidateOutcome::Merge).expect("merge bucket").count, 4000);
     }
 }
