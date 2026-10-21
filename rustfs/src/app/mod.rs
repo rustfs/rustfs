@@ -27,6 +27,7 @@ pub(crate) mod object_traffic_health;
 pub mod object_usecase;
 pub(crate) mod runtime_sources;
 mod select_object;
+mod select_request;
 pub(crate) mod storage_api;
 pub(crate) mod table_list_isolation;
 pub(crate) mod trailer_adapter;

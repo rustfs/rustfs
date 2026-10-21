@@ -22,8 +22,8 @@ pub(crate) use crate::runtime_sources::{
     current_notification_system_for_context, current_object_data_cache_handle_for_context,
     current_object_store_handle_for_context,
 };
+use rustfs_s3select_api::request::SelectObjectContentInput;
 use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
-use s3s::dto::SelectObjectContentInput;
 use std::sync::Arc;
 #[cfg(test)]
 use tokio::sync::RwLock;

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::query::{Context, Query, ast::JsonSource};
+use crate::request::CompressionType;
 use crate::{
     QueryError, QueryResult, SelectInputMetrics, SelectObjectSnapshot,
     object_store::{EcObjectStore, is_json_document_input, legacy_json_source_from_input},
@@ -30,7 +31,6 @@ use datafusion::{
     prelude::SessionContext,
 };
 use parking_lot::Mutex;
-use s3s::dto::CompressionType;
 use std::sync::{
     Arc, Weak,
     atomic::{AtomicU8, Ordering},
@@ -453,7 +453,7 @@ impl SessionCtxFactory {
             .input_serialization
             .compression_type
             .as_ref()
-            .is_some_and(|compression| compression.as_str() != CompressionType::NONE);
+            .is_some_and(|compression| *compression != CompressionType::NONE);
         let metered_input_requires_single_file_scan =
             input_metrics.is_some() && context.input.request.input_serialization.parquet.is_none();
         let normalized_csv_requires_single_file_scan =
@@ -610,6 +610,10 @@ fn test_parquet_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::request::{
+        CsvInput, CsvOutput, ExpressionType, InputSerialization, JsonInput, JsonType, OutputSerialization, ParquetInput,
+        ScanRange, SelectObjectContentInput, SelectObjectContentRequest,
+    };
     use crate::storage_api::SelectPutObjReader;
     use crate::storage_api::object_store::ObjectIO as _;
     use datafusion::{
@@ -620,10 +624,6 @@ mod tests {
         execution::memory_pool::MemoryLimit,
     };
     use http::HeaderMap;
-    use s3s::dto::{
-        CSVInput, CSVOutput, ExpressionType, InputSerialization, JSONInput, JSONType, OutputSerialization, ParquetInput,
-        ScanRange, SelectObjectContentInput, SelectObjectContentRequest,
-    };
     use std::io::Write as _;
 
     fn test_context() -> Context {
@@ -637,13 +637,13 @@ mod tests {
                 sse_customer_key_md5: None,
                 request: SelectObjectContentRequest {
                     expression: "SELECT * FROM S3Object".to_string(),
-                    expression_type: ExpressionType::from_static("SQL"),
+                    expression_type: ExpressionType::from("SQL"),
                     input_serialization: InputSerialization {
-                        csv: Some(CSVInput::default()),
+                        csv: Some(CsvInput::default()),
                         ..Default::default()
                     },
                     output_serialization: OutputSerialization {
-                        csv: Some(CSVOutput::default()),
+                        csv: Some(CsvOutput::default()),
                         ..Default::default()
                     },
                     request_progress: None,
@@ -687,8 +687,8 @@ mod tests {
             input.key = OBJECT.to_string();
             input.request.expression = expression.to_string();
             input.request.input_serialization.csv = None;
-            input.request.input_serialization.json = Some(JSONInput {
-                type_: Some(JSONType::from_static(JSONType::DOCUMENT)),
+            input.request.input_serialization.json = Some(JsonInput {
+                r#type: Some(JsonType::DOCUMENT),
             });
         }
         env.make_bucket(bucket, false).await;
@@ -790,7 +790,7 @@ mod tests {
         let mut json_context = test_context();
         let json_request = &mut Arc::make_mut(&mut json_context.input).request;
         json_request.input_serialization.csv = None;
-        json_request.input_serialization.json = Some(JSONInput::default());
+        json_request.input_serialization.json = Some(JsonInput::default());
 
         for context in [&csv_context, &json_context] {
             let session = factory
@@ -838,7 +838,7 @@ mod tests {
             end: Some(0),
         });
         request.input_serialization.csv = None;
-        request.input_serialization.json = Some(JSONInput::default());
+        request.input_serialization.json = Some(JsonInput::default());
 
         let session = SessionCtxFactory::new(true)
             .with_target_partitions(2)
@@ -854,7 +854,7 @@ mod tests {
         let mut context = test_context();
         let request = &mut Arc::make_mut(&mut context.input).request;
         request.input_serialization.csv = None;
-        request.input_serialization.json = Some(JSONInput::default());
+        request.input_serialization.json = Some(JsonInput::default());
 
         let session = SessionCtxFactory::new(true)
             .with_target_partitions(2)
@@ -868,8 +868,7 @@ mod tests {
     #[tokio::test]
     async fn compressed_input_disables_file_repartitioning_without_metrics() {
         let mut context = test_context();
-        Arc::make_mut(&mut context.input).request.input_serialization.compression_type =
-            Some(CompressionType::from_static(CompressionType::GZIP));
+        Arc::make_mut(&mut context.input).request.input_serialization.compression_type = Some(CompressionType::GZIP);
 
         let session = SessionCtxFactory::new(true)
             .with_target_partitions(2)
@@ -885,8 +884,8 @@ mod tests {
         let mut context = test_context();
         let request = &mut Arc::make_mut(&mut context.input).request;
         request.input_serialization.csv = None;
-        request.input_serialization.json = Some(JSONInput {
-            type_: Some(JSONType::from_static(JSONType::DOCUMENT)),
+        request.input_serialization.json = Some(JsonInput {
+            r#type: Some(JsonType::DOCUMENT),
         });
 
         let session = SessionCtxFactory::new(true)

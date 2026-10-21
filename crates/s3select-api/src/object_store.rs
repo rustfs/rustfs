@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::request::{CompressionType, InputSerialization, ScanRange, SelectObjectContentInput};
+use crate::request::{
+    X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
+    X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
+};
 use crate::{
     PrepareSelectObjectSnapshotError, QueryError, SELECT_DEFAULT_READ_BUFFER_SIZE, SelectError, SelectGetObjectReader,
     SelectInputMetrics, SelectObjectOptions, SelectObjectSnapshot, SelectObjectSnapshotReadError, SelectStorageError,
@@ -52,11 +57,6 @@ use http::{HeaderMap, HeaderValue, header::HeaderName};
 use memchr::{memchr, memmem};
 use rustfs_common::DEFAULT_DELIMITER;
 use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
-use s3s::dto::{CompressionType, InputSerialization, ScanRange, SelectObjectContentInput};
-use s3s::header::{
-    X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
-    X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
-};
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
@@ -79,9 +79,10 @@ fn select_default_read_buffer_size_u64() -> u64 {
 
 fn compression_format(input: &InputSerialization) -> Result<Option<CompressionFormat>, SelectError> {
     match input.compression_type.as_ref().map(|value| value.as_str()) {
-        None | Some(CompressionType::NONE) => Ok(None),
-        Some(CompressionType::GZIP) => Ok(Some(CompressionFormat::Gzip)),
-        Some(CompressionType::BZIP2) => Ok(Some(CompressionFormat::Bzip2)),
+        None => Ok(None),
+        Some(value) if value == CompressionType::NONE.as_str() => Ok(None),
+        Some(value) if value == CompressionType::GZIP.as_str() => Ok(Some(CompressionFormat::Gzip)),
+        Some(value) if value == CompressionType::BZIP2.as_str() => Ok(Some(CompressionFormat::Bzip2)),
         Some(_) => Err(SelectError::InvalidCompressionFormat),
     }
 }
@@ -507,7 +508,7 @@ pub(crate) fn is_json_document_input(input: &SelectObjectContentInput) -> bool {
         .input_serialization
         .json
         .as_ref()
-        .and_then(|json| json.type_.as_ref())
+        .and_then(|json| json.r#type.as_ref())
         .is_some_and(|json_type| json_type.as_str() == "DOCUMENT")
 }
 
@@ -1399,6 +1400,14 @@ mod test {
     use crate::input_stream::{CompressionFormat, MAX_SELECT_RECORD_BYTES, compressed_input_reader, encode_compressed_fixture};
     use crate::query::ast::{JsonPathSegment, JsonSource};
     use crate::query::session::{QueryExecutionGuard, QueryExecutionOwner, QueryExecutionTracker};
+    use crate::request::{
+        CompressionType, CsvInput, CsvOutput, ExpressionType, FileHeaderInfo, InputSerialization, JsonInput, JsonOutput,
+        JsonType, OutputSerialization, ScanRange, SelectObjectContentInput, SelectObjectContentRequest,
+    };
+    use crate::request::{
+        X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
+        X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
+    };
     use crate::storage_api::SelectPutObjReader;
     use crate::storage_api::object_store::ObjectIO as _;
     use crate::{QueryError, SelectError, SelectInputMetrics, SelectStorageError};
@@ -1416,14 +1425,6 @@ mod test {
     use parking_lot::Mutex;
     use rustfs_s3_types::S3ErrorCode;
     use rustfs_test_utils::PutObjectCommitBarrier;
-    use s3s::dto::{
-        CSVInput, CSVOutput, CompressionType, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput, JSONOutput,
-        JSONType, OutputSerialization, ScanRange, SelectObjectContentInput, SelectObjectContentRequest,
-    };
-    use s3s::header::{
-        X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
-        X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
-    };
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -1515,13 +1516,13 @@ mod test {
             sse_customer_key_md5: None,
             request: SelectObjectContentRequest {
                 expression: "SELECT * FROM s3object".to_string(),
-                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                expression_type: ExpressionType::SQL,
                 input_serialization: InputSerialization {
-                    csv: Some(CSVInput::default()),
+                    csv: Some(CsvInput::default()),
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {
-                    csv: Some(CSVOutput::default()),
+                    csv: Some(CsvOutput::default()),
                     ..Default::default()
                 },
                 request_progress: None,
@@ -1540,15 +1541,15 @@ mod test {
             sse_customer_key_md5: None,
             request: SelectObjectContentRequest {
                 expression: expression.to_string(),
-                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                expression_type: ExpressionType::SQL,
                 input_serialization: InputSerialization {
-                    json: Some(JSONInput {
-                        type_: Some(JSONType::from_static(JSONType::DOCUMENT)),
+                    json: Some(JsonInput {
+                        r#type: Some(JsonType::DOCUMENT),
                     }),
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {
-                    csv: Some(CSVOutput::default()),
+                    csv: Some(CsvOutput::default()),
                     ..Default::default()
                 },
                 request_progress: None,
@@ -1600,16 +1601,14 @@ mod test {
         assert_eq!(pinned.json_source, expected);
     }
 
-    fn json_input(bucket: &str, object: &str, json_type: &'static str) -> Arc<SelectObjectContentInput> {
+    fn json_input(bucket: &str, object: &str, json_type: JsonType) -> Arc<SelectObjectContentInput> {
         let mut input = (*csv_input(bucket, object)).clone();
         input.request.input_serialization = InputSerialization {
-            json: Some(JSONInput {
-                type_: Some(JSONType::from_static(json_type)),
-            }),
+            json: Some(JsonInput { r#type: Some(json_type) }),
             ..Default::default()
         };
         input.request.output_serialization = OutputSerialization {
-            json: Some(JSONOutput::default()),
+            json: Some(JsonOutput::default()),
             ..Default::default()
         };
         Arc::new(input)
@@ -1961,9 +1960,9 @@ mod test {
                 sse_customer_key_md5: None,
                 request: SelectObjectContentRequest {
                     expression: "SELECT * FROM s3object".to_string(),
-                    expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                    expression_type: ExpressionType::SQL,
                     input_serialization: InputSerialization {
-                        csv: Some(CSVInput {
+                        csv: Some(CsvInput {
                             record_delimiter: Some(record_delimiter.to_string()),
                             file_header_info,
                             ..Default::default()
@@ -1971,7 +1970,7 @@ mod test {
                         ..Default::default()
                     },
                     output_serialization: OutputSerialization {
-                        csv: Some(CSVOutput::default()),
+                        csv: Some(CsvOutput::default()),
                         ..Default::default()
                     },
                     request_progress: None,
@@ -2025,13 +2024,13 @@ mod test {
             sse_customer_key_md5: Some("secret-customer-key-md5".to_string()),
             request: SelectObjectContentRequest {
                 expression: "SELECT * FROM s3object".to_string(),
-                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                expression_type: ExpressionType::SQL,
                 input_serialization: InputSerialization {
-                    csv: Some(CSVInput::default()),
+                    csv: Some(CsvInput::default()),
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {
-                    csv: Some(CSVOutput::default()),
+                    csv: Some(CsvOutput::default()),
                     ..Default::default()
                 },
                 request_progress: None,
@@ -2078,15 +2077,8 @@ mod test {
 
         let selected_start = i64::try_from(b"old_header,value\nskip_old,0\n".len()).expect("fixture offset should fit in i64");
         let snapshot = prepare_test_snapshot(BUCKET, OBJECT).await;
-        let store = scan_range_csv_store(
-            BUCKET,
-            OBJECT,
-            snapshot,
-            "\n",
-            Some(FileHeaderInfo::from_static(FileHeaderInfo::USE)),
-            selected_start,
-            selected_start,
-        );
+        let store =
+            scan_range_csv_store(BUCKET, OBJECT, snapshot, "\n", Some(FileHeaderInfo::USE), selected_start, selected_start);
         let commit_barrier = PutObjectCommitBarrier::before_namespace(BUCKET, OBJECT);
         let writer = tokio::spawn(async move {
             env.put_object_bytes(BUCKET, OBJECT, NEW_DATA.to_vec()).await;
@@ -2555,9 +2547,9 @@ mod test {
                 sse_customer_key_md5: None,
                 request: SelectObjectContentRequest {
                     expression: "SELECT * FROM s3object".to_string(),
-                    expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                    expression_type: ExpressionType::SQL,
                     input_serialization: InputSerialization {
-                        csv: Some(CSVInput {
+                        csv: Some(CsvInput {
                             record_delimiter: Some("aa".to_string()),
                             file_header_info,
                             ..Default::default()
@@ -2565,7 +2557,7 @@ mod test {
                         ..Default::default()
                     },
                     output_serialization: OutputSerialization {
-                        csv: Some(CSVOutput::default()),
+                        csv: Some(CsvOutput::default()),
                         ..Default::default()
                     },
                     request_progress: None,
@@ -2644,15 +2636,10 @@ mod test {
             .put_object(bucket, object, &mut reader, &Default::default())
             .await
             .expect("put ScanRange header snapshot fixture");
-        let result = make_store(
-            8,
-            8,
-            Some(FileHeaderInfo::from_static(FileHeaderInfo::USE)),
-            prepare_test_snapshot(bucket, object).await,
-        )
-        .get_opts(&Path::from(object), GetOptions::default())
-        .await
-        .expect("read ScanRange with a separate header read");
+        let result = make_store(8, 8, Some(FileHeaderInfo::USE), prepare_test_snapshot(bucket, object).await)
+            .get_opts(&Path::from(object), GetOptions::default())
+            .await
+            .expect("read ScanRange with a separate header read");
         let GetResultPayload::Stream(stream) = result.payload else {
             panic!("expected streaming ScanRange header payload");
         };
@@ -2743,16 +2730,16 @@ mod test {
             sse_customer_key_md5: None,
             request: SelectObjectContentRequest {
                 expression: "SELECT * FROM s3object".to_string(),
-                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                expression_type: ExpressionType::SQL,
                 input_serialization: InputSerialization {
-                    csv: Some(CSVInput {
+                    csv: Some(CsvInput {
                         record_delimiter: Some("aa".to_string()),
                         ..Default::default()
                     }),
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {
-                    csv: Some(CSVOutput::default()),
+                    csv: Some(CsvOutput::default()),
                     ..Default::default()
                 },
                 request_progress: None,
@@ -2839,9 +2826,9 @@ mod test {
             sse_customer_key_md5: None,
             request: SelectObjectContentRequest {
                 expression: "SELECT * FROM s3object".to_string(),
-                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                expression_type: ExpressionType::SQL,
                 input_serialization: InputSerialization {
-                    csv: Some(CSVInput {
+                    csv: Some(CsvInput {
                         field_delimiter: Some("\r\n".to_string()),
                         record_delimiter: Some("^Y".to_string()),
                         ..Default::default()
@@ -2849,7 +2836,7 @@ mod test {
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {
-                    csv: Some(CSVOutput::default()),
+                    csv: Some(CsvOutput::default()),
                     ..Default::default()
                 },
                 request_progress: None,
@@ -3056,13 +3043,11 @@ mod test {
                 .expect("write multiline CSV");
             let mut input = (*csv_input(BUCKET, object)).clone();
             let csv = input.request.input_serialization.csv.as_mut().expect("CSV input");
-            csv.file_header_info = Some(FileHeaderInfo::from_static(FileHeaderInfo::USE));
+            csv.file_header_info = Some(FileHeaderInfo::USE);
             csv.allow_quoted_record_delimiter = Some(true);
-            input.request.input_serialization.compression_type = compression.map(|format| {
-                CompressionType::from_static(match format {
-                    CompressionFormat::Gzip => CompressionType::GZIP,
-                    CompressionFormat::Bzip2 => CompressionType::BZIP2,
-                })
+            input.request.input_serialization.compression_type = compression.map(|format| match format {
+                CompressionFormat::Gzip => CompressionType::GZIP,
+                CompressionFormat::Bzip2 => CompressionType::BZIP2,
             });
             let metrics = Arc::new(SelectInputMetrics::default());
             let store = EcObjectStore::build_with_snapshot(
@@ -3125,13 +3110,11 @@ mod test {
                         .expect("write boundary fixture");
                     let mut input = (*csv_input(BUCKET, &object)).clone();
                     let csv = input.request.input_serialization.csv.as_mut().expect("CSV input");
-                    csv.file_header_info = Some(FileHeaderInfo::from_static(FileHeaderInfo::NONE));
+                    csv.file_header_info = Some(FileHeaderInfo::NONE);
                     csv.allow_quoted_record_delimiter = Some(true);
-                    input.request.input_serialization.compression_type = compression.map(|format| {
-                        CompressionType::from_static(match format {
-                            CompressionFormat::Gzip => CompressionType::GZIP,
-                            CompressionFormat::Bzip2 => CompressionType::BZIP2,
-                        })
+                    input.request.input_serialization.compression_type = compression.map(|format| match format {
+                        CompressionFormat::Gzip => CompressionType::GZIP,
+                        CompressionFormat::Bzip2 => CompressionType::BZIP2,
                     });
                     let metrics = Arc::new(SelectInputMetrics::default());
                     let store = EcObjectStore::build_with_snapshot(
@@ -3196,15 +3179,13 @@ mod test {
                 .expect("write Unicode CSV fixture");
             let mut input = (*csv_input(BUCKET, object)).clone();
             let csv = input.request.input_serialization.csv.as_mut().expect("CSV input");
-            csv.file_header_info = Some(FileHeaderInfo::from_static(FileHeaderInfo::USE));
+            csv.file_header_info = Some(FileHeaderInfo::USE);
             csv.quote_character = Some("ع".to_owned());
             csv.quote_escape_character = Some("\\".to_owned());
             csv.record_delimiter = Some("\n".to_owned());
-            input.request.input_serialization.compression_type = compression.map(|format| {
-                CompressionType::from_static(match format {
-                    CompressionFormat::Gzip => CompressionType::GZIP,
-                    CompressionFormat::Bzip2 => CompressionType::BZIP2,
-                })
+            input.request.input_serialization.compression_type = compression.map(|format| match format {
+                CompressionFormat::Gzip => CompressionType::GZIP,
+                CompressionFormat::Bzip2 => CompressionType::BZIP2,
             });
             let start = HEADER.len() + SKIP.len();
             if let Some(range_offset) = range_offset {
@@ -3266,7 +3247,7 @@ mod test {
             .expect("put compressed CSV fixture");
         let snapshot = prepare_test_snapshot(BUCKET, OBJECT).await;
         let mut input = (*csv_input(BUCKET, OBJECT)).clone();
-        input.request.input_serialization.compression_type = Some(CompressionType::from_static(CompressionType::GZIP));
+        input.request.input_serialization.compression_type = Some(CompressionType::GZIP);
         input.request.scan_range = Some(ScanRange {
             start: Some(0),
             end: None,
@@ -3299,7 +3280,7 @@ mod test {
         assert_eq!(store.reader_open_count.load(Ordering::SeqCst), 0);
 
         let mut scan_input = (*csv_input(BUCKET, OBJECT)).clone();
-        scan_input.request.input_serialization.compression_type = Some(CompressionType::from_static(CompressionType::GZIP));
+        scan_input.request.input_serialization.compression_type = Some(CompressionType::GZIP);
         scan_input.request.scan_range = Some(ScanRange {
             start: Some(1),
             end: None,
@@ -3364,7 +3345,7 @@ mod test {
             .expect("put compressed throughput fixture");
         let snapshot = prepare_test_snapshot(BUCKET, OBJECT).await;
         let mut input = (*csv_input(BUCKET, OBJECT)).clone();
-        input.request.input_serialization.compression_type = Some(CompressionType::from_static(CompressionType::GZIP));
+        input.request.input_serialization.compression_type = Some(CompressionType::GZIP);
         let metrics = Arc::new(SelectInputMetrics::default());
         let store = EcObjectStore::build_with_snapshot(
             Arc::new(input),
@@ -3452,8 +3433,8 @@ mod test {
         let env = crate::storage_api::select_test_ecstore_env().await;
         env.make_bucket(BUCKET, false).await;
         for (object, data, json_type) in [
-            (LINES_OBJECT, LINES_DATA, JSONType::LINES),
-            (DOCUMENT_OBJECT, DOCUMENT_DATA, JSONType::DOCUMENT),
+            (LINES_OBJECT, LINES_DATA, JsonType::LINES),
+            (DOCUMENT_OBJECT, DOCUMENT_DATA, JsonType::DOCUMENT),
         ] {
             let mut reader = SelectPutObjReader::from_vec(data.to_vec());
             env.ecstore
@@ -3462,13 +3443,13 @@ mod test {
                 .expect("put JSON input metrics fixture");
             let snapshot = prepare_test_snapshot(BUCKET, object).await;
             let input_metrics = Arc::new(SelectInputMetrics::default());
-            let memory_limit = if json_type == JSONType::DOCUMENT {
+            let memory_limit = if json_type == JsonType::DOCUMENT {
                 JSON_DOCUMENT_TEST_MEMORY_BYTES
             } else {
                 1024 * 1024
             };
             let store = EcObjectStore::build_with_snapshot(
-                json_input(BUCKET, object, json_type),
+                json_input(BUCKET, object, json_type.clone()),
                 Arc::new(GreedyMemoryPool::new(memory_limit)),
                 None,
                 Arc::clone(&input_metrics),
@@ -3516,7 +3497,7 @@ mod test {
             .csv
             .as_mut()
             .expect("CSV input")
-            .file_header_info = Some(FileHeaderInfo::from_static(FileHeaderInfo::USE));
+            .file_header_info = Some(FileHeaderInfo::USE);
         input.request.scan_range = Some(ScanRange {
             start: Some(i64::try_from(RECORD_START).expect("fixture offset should fit in i64")),
             end: Some(i64::try_from(RECORD_START).expect("fixture offset should fit in i64")),

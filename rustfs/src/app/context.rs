@@ -48,9 +48,9 @@ use rustfs_iam::{
 use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
 use rustfs_kms::{KmsServiceManager, ObjectEncryptionService};
 use rustfs_lock::LockClient;
+use rustfs_s3select_api::request::SelectObjectContentInput;
 use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
 use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
-use s3s::dto::SelectObjectContentInput;
 use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use tokio::sync::RwLock;
 
@@ -974,11 +974,11 @@ mod tests {
             sse_customer_algorithm: None,
             sse_customer_key: None,
             sse_customer_key_md5: None,
-            request: s3s::dto::SelectObjectContentRequest {
+            request: rustfs_s3select_api::request::SelectObjectContentRequest {
                 expression: "SELECT * FROM S3Object".to_string(),
-                expression_type: s3s::dto::ExpressionType::from_static("SQL"),
-                input_serialization: s3s::dto::InputSerialization::default(),
-                output_serialization: s3s::dto::OutputSerialization::default(),
+                expression_type: rustfs_s3select_api::request::ExpressionType::SQL,
+                input_serialization: rustfs_s3select_api::request::InputSerialization::default(),
+                output_serialization: rustfs_s3select_api::request::OutputSerialization::default(),
                 request_progress: None,
                 scan_range: None,
             },
