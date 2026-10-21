@@ -7241,6 +7241,140 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn data_movement_delete_marker_resume_repairs_read_quorum_only_target() {
+        use crate::disk::DiskAPI;
+        use tokio::io::AsyncReadExt;
+
+        let temp_dir = tempfile::tempdir().expect("create partial delete-marker target store");
+        let (_ctx, store, _shutdown) = Box::pin(without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "partial-marker-target",
+            &[4, 4],
+        )))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("dm-partial-marker-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create partial marker bucket");
+        let incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("fixture bucket incarnation");
+        for (object, marker_id, marker_incarnation) in [
+            ("legacy-marker", uuid::Uuid::new_v4(), None),
+            ("versioned-object", uuid::Uuid::new_v4(), Some(incarnation)),
+            ("legacy-null-marker", uuid::Uuid::nil(), None),
+            ("null-marker", uuid::Uuid::nil(), Some(incarnation)),
+        ] {
+            let marker_time = OffsetDateTime::now_utc();
+            let marker_opts = ObjectOptions {
+                versioned: !marker_id.is_nil(),
+                version_suspended: marker_id.is_nil(),
+                data_movement: true,
+                version_id: Some(marker_id.to_string()),
+                delete_marker: true,
+                mod_time: Some(marker_time),
+                expected_bucket_incarnation_id: marker_incarnation,
+                ..Default::default()
+            };
+            store.pools[0]
+                .delete_object(&bucket, object, marker_opts.clone())
+                .await
+                .expect("seed the source delete marker");
+            let old_version = uuid::Uuid::new_v4();
+            store.pools[1]
+                .put_object(
+                    &bucket,
+                    object,
+                    &mut PutObjReader::from_vec(b"historical target body".to_vec()),
+                    &ObjectOptions {
+                        versioned: true,
+                        version_id: Some(old_version.to_string()),
+                        mod_time: Some(marker_time - time::Duration::SECOND),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed older target metadata on all disks");
+            let source = store.pools[0]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(&bucket, object)
+                .await
+                .expect("read source marker metadata")
+                .expect("source marker must exist")
+                .versions
+                .into_iter()
+                .find(|version| version.version_id.unwrap_or_default() == marker_id)
+                .expect("find source delete marker");
+            let target_set = store.pools[1].get_disks_by_key(object);
+            for disk in target_set.disk_inventory().await.into_iter().flatten().take(2) {
+                disk.write_metadata("", &bucket, object, source.clone())
+                    .await
+                    .expect("seed a read-quorum-only target marker");
+            }
+            target_set
+                .get_object_info(&bucket, object, &marker_opts)
+                .await
+                .expect("the exact marker is visible at read quorum");
+            store
+                .delete_object(
+                    &bucket,
+                    object,
+                    ObjectOptions {
+                        data_movement: true,
+                        src_pool_idx: 0,
+                        ..marker_opts.clone()
+                    },
+                )
+                .await
+                .expect("resume the exact delete-marker copy");
+            for disk in target_set.disk_inventory().await.into_iter().flatten() {
+                let marker = disk
+                    .read_version("", &bucket, object, &marker_id.to_string(), &crate::disk::ReadOptions::default())
+                    .await
+                    .expect("resumed marker must be published on every healthy target disk");
+                assert!(marker.deleted);
+                assert_eq!(marker.delete_marker_incarnation(), marker_incarnation);
+            }
+            let latest = target_set
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect("latest lookup must resolve the resumed marker");
+            assert!(latest.delete_marker);
+            assert_eq!(latest.mod_time, Some(marker_time));
+            let mut historical = target_set
+                .get_object_reader(
+                    &bucket,
+                    object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        version_id: Some(old_version.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("marker repair must retain the target's older version");
+            let mut body = Vec::new();
+            historical
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("read older target body");
+            assert_eq!(body, b"historical target body");
+            let retained = store.pools[0]
+                .get_object_info(&bucket, object, &marker_opts)
+                .await
+                .expect("marker retry must retain the source");
+            assert!(retained.delete_marker);
+            assert_eq!(retained.version_id.unwrap_or_default(), marker_id);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn data_movement_delete_marker_retries_converge_safely() {
         let temp_dir = tempfile::tempdir().expect("create delete-marker data movement store dir");
         let (_ctx, store, _shutdown) =
