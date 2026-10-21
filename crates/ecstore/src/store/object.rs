@@ -8752,12 +8752,13 @@ mod tests {
                         .expect("initial metadata should exist"),
                 );
             }
-            {
-                let mut online = set.disks.write().await;
-                online[2] = None;
-                online[3] = None;
+            // Keep the handles attached so reconnects inherit the outage.
+            for disk in disks.iter().skip(2).flatten() {
+                disk.close().await.expect("stop offline disk health monitoring");
+                disk.force_offline_for_test();
             }
             for attempt in 1..=3 {
+                set.connect_disks().await;
                 let err = store
                     .handle_delete_object(bucket, object, opts.clone())
                     .await
@@ -8795,7 +8796,10 @@ mod tests {
                     }
                 }
             }
-            *set.disks.write().await = disks;
+            for disk in disks.iter().skip(2).flatten() {
+                disk.reset_health_for_store_init_retry();
+            }
+            set.connect_disks().await;
             if marker_copies != 0 {
                 continue;
             }
