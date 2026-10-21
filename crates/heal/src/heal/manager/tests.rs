@@ -1580,7 +1580,10 @@ fn unverified_legacy_notice_requires_the_exact_partial_write_target() {
         detail: Some("object was readable".to_string()),
         ..outcome
     };
-    assert!(super::scheduler::unverified_legacy_mrf_event_for_target(&target, &wrong_reason).is_none());
+    assert!(
+        super::scheduler::unverified_legacy_mrf_event_for_target(&target, &wrong_reason).is_some(),
+        "display wording does not qualify or disqualify an already typed result"
+    );
 }
 
 #[tokio::test]
@@ -1649,7 +1652,7 @@ async fn queued_non_mrf_diagnostic_cannot_pause_durable_legacy_repair() {
 }
 
 #[test]
-fn only_mrf_execution_can_pause_unverified_legacy() {
+fn only_typed_mrf_result_can_pause_unverified_legacy() {
     let (target, outcome) = unverified_legacy_fixture("legacy-held-source");
     let bucket = target.bucket.clone();
     let anchor = target.durable_anchor.as_ref().expect("durable fixture anchor");
@@ -1667,17 +1670,20 @@ fn only_mrf_execution_can_pause_unverified_legacy() {
             outcome: Some(Arc::new(canonical.clone())),
             ..completed_retention_fixture(SystemTime::now())
         };
-        for source in [
-            HealRequestSource::Admin,
-            HealRequestSource::Scanner,
-            HealRequestSource::Internal,
-            HealRequestSource::ReadRepair,
-            HealRequestSource::AutoHeal,
-            HealRequestSource::Mrf,
+        for result in [
+            Ok(()),
+            Err(Error::LegacyMrfUnverified {
+                target: "display only".to_owned(),
+            }),
+            Err(Error::TaskExecutionFailed {
+                message: "Missing exact storage proof for durable MRF repair display only".to_owned(),
+            }),
+            Err(Error::TaskCancelled),
+            Err(Error::TaskTimeout),
         ] {
-            super::scheduler::publish_unverified_legacy_mrf_events(std::slice::from_ref(&target), &completed, source);
+            super::scheduler::publish_unverified_legacy_mrf_events(std::slice::from_ref(&target), &completed, &result);
             let events = rustfs_common::mrf_channel::take_mrf_unverified_legacy_events_for(&bucket);
-            assert_eq!(events.len(), usize::from(source == HealRequestSource::Mrf));
+            assert_eq!(events.len(), usize::from(matches!(result, Err(Error::LegacyMrfUnverified { .. }))));
             if let Some(event) = events.first() {
                 assert_eq!(&event.anchor, anchor);
             }

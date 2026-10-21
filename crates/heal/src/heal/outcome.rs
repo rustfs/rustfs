@@ -276,18 +276,20 @@ pub fn legacy_wire_status<'a>(
     {
         return Err(HealOutcomeWireError::ContradictoryCompletion);
     }
-    let legacy_unverified = counters.unknown > 0
-        && wire
-            .get("objects")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|objects| {
-                objects.iter().any(|item| {
-                    item["disposition"]["state"].as_str() == Some("unknown")
-                        && item["detail"].as_str() == Some(LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL)
+    let legacy_unverified = || {
+        counters.unknown > 0
+            && wire
+                .get("objects")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|objects| {
+                    objects.iter().any(|item| {
+                        item["disposition"]["state"].as_str() == Some("unknown")
+                            && item["detail"].as_str() == Some(LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL)
+                    })
                 })
-            });
+    };
     let (adapted, detail) =
-        legacy_execution_status(summary, None, execution, &counters, first_failed_wire_object(wire), legacy_unverified);
+        legacy_execution_status(summary, None, execution, &counters, || first_failed_wire_object(wire), legacy_unverified);
     Ok((
         adapted,
         if adapted != summary || counters.unknown > 0 {
@@ -311,8 +313,8 @@ fn legacy_execution_status<'a>(
     detail: Option<String>,
     execution: HealExecutionOutcome,
     counters: &HealOutcomeCounters,
-    first_failure: Option<String>,
-    legacy_unverified: bool,
+    first_failure: impl FnOnce() -> Option<String>,
+    legacy_unverified: impl FnOnce() -> bool,
 ) -> (&'a str, Option<String>) {
     if summary != "finished" {
         return (summary, detail);
@@ -320,7 +322,7 @@ fn legacy_execution_status<'a>(
     match execution {
         HealExecutionOutcome::CompletedWithErrors => {
             let detail = format!("heal traversal completed with errors: {} failed objects", counters.failed);
-            ("stopped", Some(append_first_failure(detail, first_failure)))
+            ("stopped", Some(append_first_failure(detail, first_failure())))
         }
         HealExecutionOutcome::Aborted(reason) => {
             let reason = match reason {
@@ -335,7 +337,7 @@ fn legacy_execution_status<'a>(
                 "heal traversal completed; authoritative storage proof is unavailable for {} objects",
                 counters.unknown
             );
-            if legacy_unverified {
+            if legacy_unverified() {
                 detail.push_str(
                     "; legacy objects lack independent payload identity proof; online drives do not certify payload integrity",
                 );
@@ -351,17 +353,19 @@ fn legacy_execution_status<'a>(
 
 impl HealTaskOutcome {
     pub(crate) fn legacy_status<'a>(&self, summary: &'a str, detail: Option<String>) -> (&'a str, Option<String>) {
-        let legacy_unverified = self.counters.unknown > 0
-            && self.objects.iter().any(|item| {
-                item.disposition == HealObjectDisposition::Unknown
-                    && item.detail.as_deref() == Some(LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL)
-            });
+        let legacy_unverified = || {
+            self.counters.unknown > 0
+                && self.objects.iter().any(|item| {
+                    item.disposition == HealObjectDisposition::Unknown
+                        && item.detail.as_deref() == Some(LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL)
+                })
+        };
         legacy_execution_status(
             summary,
             detail,
             self.execution,
             &self.counters,
-            self.first_failed_object(),
+            || self.first_failed_object(),
             legacy_unverified,
         )
     }
@@ -706,6 +710,45 @@ mod canonical_outcome_tests {
             legacy_wire_status("finished", &wire, false),
             Err(HealOutcomeWireError::MissingFields)
         ));
+    }
+
+    #[test]
+    fn status_computes_only_the_selected_diagnostic() {
+        use std::cell::Cell;
+        for (summary, execution, unknown, expected_failure, expected_legacy) in [
+            ("running", HealExecutionOutcome::CompletedWithErrors, 1, 0, 0),
+            ("finished", HealExecutionOutcome::Running, 1, 0, 0),
+            ("finished", HealExecutionOutcome::Pending, 1, 0, 0),
+            ("finished", HealExecutionOutcome::Aborted(HealAbortReason::Cancelled), 1, 0, 0),
+            ("finished", HealExecutionOutcome::Completed, 0, 0, 0),
+            ("finished", HealExecutionOutcome::CompletedWithErrors, 1, 1, 0),
+            ("finished", HealExecutionOutcome::Completed, 1, 0, 1),
+        ] {
+            let failure_calls = Cell::new(0);
+            let legacy_calls = Cell::new(0);
+            let counters = HealOutcomeCounters {
+                unknown,
+                ..Default::default()
+            };
+            let _ = legacy_execution_status(
+                summary,
+                None,
+                execution,
+                &counters,
+                || {
+                    assert_eq!(expected_failure, 1, "irrelevant failure diagnostics must not run");
+                    failure_calls.set(failure_calls.get() + 1);
+                    Some("first failure".to_owned())
+                },
+                || {
+                    assert_eq!(expected_legacy, 1, "irrelevant legacy diagnostics must not run");
+                    legacy_calls.set(legacy_calls.get() + 1);
+                    true
+                },
+            );
+            assert_eq!(failure_calls.get(), expected_failure);
+            assert_eq!(legacy_calls.get(), expected_legacy);
+        }
     }
 
     #[test]

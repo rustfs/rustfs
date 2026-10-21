@@ -56,6 +56,10 @@ pub enum Error {
     #[error("Heal task execution failed: {message}")]
     TaskExecutionFailed { message: String },
 
+    /// Only the qualified MRF Deep check may produce this terminal result.
+    #[error("Heal task execution failed: Missing exact storage proof for durable MRF repair {target}")]
+    LegacyMrfUnverified { target: String },
+
     #[error("Replacement failure could not be persisted: {failure}; persistence error: {persistence}")]
     ReplacementFailurePersistence {
         #[source]
@@ -210,6 +214,7 @@ pub(crate) fn classify_heal_error(error: &Error) -> HealErrorClass {
         Error::ReplacementTargetNotReady(_) | Error::TransientSkip { .. } | Error::BucketDiscoveryIncomplete => {
             HealErrorClass::Transient
         }
+        Error::LegacyMrfUnverified { .. } => HealErrorClass::Permanent,
         Error::Storage(error) => classify_storage_error(error),
         Error::Disk(error) => classify_disk_error(error),
         Error::Io(error) => classify_io_error(error),
