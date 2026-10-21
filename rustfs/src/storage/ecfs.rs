@@ -84,7 +84,9 @@ async fn site_replication_gate_enabled() -> S3Result<bool> {
         SITE_REPLICATION_GATE_FORCE_ENABLED => return Ok(true),
         _ => {}
     }
-    crate::admin::handlers::site_replication::site_replication_enabled().await
+    crate::admin::handlers::site_replication::site_replication_enabled()
+        .await
+        .map_err(Into::into)
 }
 
 /// Remote site-replication peer deployment ids and the operator-rule contract
@@ -100,7 +102,9 @@ async fn site_replication_edit_context() -> S3Result<(std::collections::HashSet<
     if SITE_REPLICATION_GATE_TEST_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst) != 0 {
         return Ok((std::collections::HashSet::new(), OperatorRuleContract::Derived));
     }
-    crate::admin::handlers::site_replication::site_replication_edit_context().await
+    crate::admin::handlers::site_replication::site_replication_edit_context()
+        .await
+        .map_err(Into::into)
 }
 
 /// MinIO `ErrReplicationDenyEditError`.

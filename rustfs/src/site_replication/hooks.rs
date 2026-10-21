@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::storage_api::site_replication::parse_lifecycle_date;
+use rustfs_s3_types::s3_error;
 
 pub(crate) const SITE_REPLICATION_PEER_BUCKET_OPS_PATH: &str = "/rustfs/admin/v3/site-replication/peer/bucket-ops";
 

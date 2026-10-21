@@ -603,7 +603,7 @@ fn error_chain_has_hyper_body_eof(err: &(dyn std::error::Error + 'static)) -> bo
     error_chain_find(err, |error| is_hyper_body_eof(error).then_some(())).is_some()
 }
 
-impl From<ApiError> for S3Error {
+impl From<ApiError> for rustfs_s3_types::S3Error {
     fn from(err: ApiError) -> Self {
         let status = custom_error_status(&err.code);
         // A typed lock acquisition timeout is transient contention. Keep its
@@ -615,7 +615,7 @@ impl From<ApiError> for S3Error {
                 })
                 .is_some()
             });
-        let mut s3e = S3Error::with_message(err.code, err.message);
+        let mut s3e = rustfs_s3_types::S3Error::with_message(err.code.into(), err.message);
         if lock_timeout {
             let mut headers = http::HeaderMap::new();
             headers.insert(http::header::RETRY_AFTER, http::HeaderValue::from_static("1"));
@@ -628,6 +628,16 @@ impl From<ApiError> for S3Error {
             s3e.set_source(source);
         }
         s3e
+    }
+}
+
+/// The s3s error for the legacy edge: the conversion above carried across
+/// with `From`, which yields field for field what the s3s constructor builds
+/// (code, message, explicit status, the cause itself), so both error types
+/// come from one mapping.
+impl From<ApiError> for S3Error {
+    fn from(err: ApiError) -> Self {
+        rustfs_s3_types::S3Error::from(err).into()
     }
 }
 

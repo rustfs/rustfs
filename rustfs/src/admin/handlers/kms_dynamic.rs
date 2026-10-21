@@ -37,7 +37,8 @@ use rustfs_kms::{
     StartKmsResponse, StopKmsResponse,
 };
 use rustfs_policy::policy::action::{Action, KmsAction};
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use rustfs_s3_types::{S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::sync::Arc;

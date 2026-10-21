@@ -360,7 +360,7 @@ pub(crate) mod site_replication {
         };
         #[cfg(test)]
         pub(crate) use rustfs_gateway_types::persistence::{PersistedLifecycleExpiration, PersistedTransition};
-        pub(crate) use s3s::{Body, S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
+        pub(crate) use s3s::{Body, S3Response};
     }
 }
 

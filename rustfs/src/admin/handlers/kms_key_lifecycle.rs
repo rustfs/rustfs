@@ -30,7 +30,8 @@ use rustfs_kms::{
     types::{DescribeKeyRequest, KeyMetadata, OperationContext},
 };
 use rustfs_policy::policy::action::{Action, KmsAction};
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use rustfs_s3_types::{S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, warn};

@@ -50,12 +50,13 @@ use rand::RngExt;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_utils::{
     MaskedAccessKey, base64_decode_url_safe_no_pad, base64_encode_url_safe_no_pad,
     crypto::hex_sha256,
     http::{AMZ_REQUEST_ID, REQUEST_ID_HEADER},
 };
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;

@@ -26,8 +26,9 @@ use crate::server::ADMIN_PREFIX;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 
 const JSON_CONTENT_TYPE: &str = "application/json";
 const DEFAULT_MAX_ENTRIES: usize = 1000;
@@ -100,7 +101,7 @@ impl Operation for BucketPrefixUsageHandler {
 mod tests {
     use super::{BucketPrefixUsageHandler, DEFAULT_MAX_ENTRIES, MAX_ENTRIES_LIMIT, parse_usage_prefix_query};
     use crate::admin::router::Operation;
-    use s3s::S3Error;
+    use rustfs_s3_types::S3Error;
 
     fn query(raw: &str) -> Result<(String, usize), S3Error> {
         parse_usage_prefix_query(Some(raw))
@@ -128,7 +129,7 @@ mod tests {
             .call(req, matchit::Params::new())
             .await
             .expect_err("a request without credentials must be rejected");
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("get cred failed"));
     }
 

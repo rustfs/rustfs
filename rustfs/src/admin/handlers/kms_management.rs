@@ -26,8 +26,9 @@ use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_kms::KmsBackend;
 use rustfs_policy::policy::action::{Action, KmsAction};
+use rustfs_s3_types::{S3Result, s3_error};
 use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
@@ -425,7 +426,7 @@ mod tests {
         let err = authorize_kms_management_request(&req, kms_service_control_actions())
             .await
             .expect_err("a request without credentials must be rejected");
-        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("authentication required"));
     }
 

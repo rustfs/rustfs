@@ -23,7 +23,7 @@ use crate::admin::storage_api::config::{
 use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
 use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_config::server_config::Config;
-use s3s::{S3Error, S3Result, s3_error};
+use rustfs_s3_types::{S3Error, S3Result, s3_error};
 use tracing::warn;
 
 pub(crate) async fn load_server_config_from_store_for_context(context: Option<&AppContext>) -> S3Result<Config> {
