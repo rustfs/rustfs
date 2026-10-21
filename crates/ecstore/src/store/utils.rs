@@ -33,14 +33,14 @@ pub fn clean_metadata(metadata: &mut HashMap<String, String>) {
 }
 
 pub fn remove_standard_storage_class(metadata: &mut HashMap<String, String>) {
-    if metadata.get(metadata_keys::STORAGE_CLASS) == Some(&STANDARD.to_string()) {
+    if metadata.get(metadata_keys::STORAGE_CLASS).is_some_and(|v| v == STANDARD) {
         metadata.remove(metadata_keys::STORAGE_CLASS);
     }
 }
 
 pub fn clean_metadata_keys(metadata: &mut HashMap<String, String>, key_names: &[&str]) {
-    for key in key_names {
-        metadata.remove(key.to_owned());
+    for &key in key_names {
+        metadata.remove(key);
     }
 }
 

@@ -243,9 +243,13 @@ impl MetaCacheEntry {
             });
         }
 
-        let mut fm = FileMeta::new();
-        fm.unmarshal_msg(&self.metadata)?;
-        let mut versions = fm.get_file_info_versions(bucket, self.name.as_str(), false)?;
+        if let Some(fm) = &self.cached {
+            let mut versions = fm.get_file_info_versions(bucket, self.name.as_str(), false)?;
+            versions.free_versions.clear();
+            return Ok(versions);
+        }
+
+        let mut versions = FileMeta::decode_file_info_versions_from_buf(&self.metadata, bucket, self.name.as_str(), false)?;
         versions.free_versions.clear();
         Ok(versions)
     }
@@ -264,11 +268,14 @@ impl MetaCacheEntry {
             });
         }
 
-        let mut fm = FileMeta::new();
-        fm.unmarshal_msg(&self.metadata)?;
-        // `get_file_info_versions(..., false)` is the existing path that
-        // separates persisted tier free-version records into `free_versions`.
-        fm.get_file_info_versions(bucket, self.name.as_str(), false)
+        if let Some(fm) = &self.cached {
+            return fm.get_file_info_versions(bucket, self.name.as_str(), false);
+        }
+
+        // `decode_file_info_versions_from_buf(..., false)` separates persisted
+        // tier free-version records into `free_versions` without allocating an
+        // intermediate `FileMeta`.
+        FileMeta::decode_file_info_versions_from_buf(&self.metadata, bucket, self.name.as_str(), false)
     }
 
     pub fn matches(&self, other: Option<&MetaCacheEntry>, strict: bool) -> (Option<MetaCacheEntry>, bool) {
@@ -3417,5 +3424,188 @@ mod tests {
             reusable: false,
         };
         assert!(corrupt_crc_entry.is_latest_delete_marker());
+    }
+
+    #[test]
+    fn file_info_versions_and_borrowed_slice_decode_match_cached_and_full_decoders() {
+        let mut fm = FileMeta::load(&crate::test_data::create_realistic_object_xlmeta().expect("realistic xl.meta"))
+            .expect("load realistic xl.meta");
+        let mut obj = FileMetaVersion::try_from(fm.versions[0].meta.as_slice())
+            .expect("decode version")
+            .object
+            .expect("v2 object");
+        obj.meta_user.insert(
+            rustfs_utils::http::headers::AMZ_META_UNENCRYPTED_CONTENT_LENGTH.to_string(),
+            "128".to_string(),
+        );
+        obj.meta_user.insert(
+            rustfs_utils::http::headers::AMZ_META_UNENCRYPTED_CONTENT_MD5.to_string(),
+            "deadbeef".to_string(),
+        );
+        obj.meta_user
+            .insert(crate::metadata_keys::STORAGE_CLASS.to_string(), "STANDARD".to_string());
+        rustfs_utils::http::insert_bytes(&mut obj.meta_sys, rustfs_utils::http::SUFFIX_TIER_FV_MARKER, b"true".to_vec());
+        fm.versions[0] = FileMetaShallowVersion::try_from(FileMetaVersion {
+            version_type: VersionType::Object,
+            object: Some(obj),
+            write_version: 1,
+            ..Default::default()
+        })
+        .expect("re-encode object version");
+
+        let t1 = OffsetDateTime::from_unix_timestamp(1_705_312_100).expect("t1");
+        let mut free_meta_sys = HashMap::new();
+        rustfs_utils::http::insert_bytes(&mut free_meta_sys, rustfs_utils::http::SUFFIX_FREE_VERSION, Vec::new());
+        rustfs_utils::http::insert_bytes(&mut free_meta_sys, rustfs_utils::http::SUFFIX_TRANSITION_TIER, b"WARM".to_vec());
+        fm.versions.push(
+            FileMetaShallowVersion::try_from(FileMetaVersion {
+                version_type: VersionType::Delete,
+                delete_marker: Some(MetaDeleteMarker {
+                    version_id: Some(Uuid::from_u128(1)),
+                    mod_time: Some(t1),
+                    meta_sys: free_meta_sys,
+                }),
+                write_version: 1,
+                ..Default::default()
+            })
+            .expect("free version shallow"),
+        );
+
+        for sv in &fm.versions {
+            for all_parts in [true, false] {
+                let fast = sv.into_fileinfo("bucket", "object", all_parts).expect("borrowed decode");
+                let full = FileMetaVersion::try_from(sv.meta.as_slice())
+                    .expect("full try_from")
+                    .into_fileinfo("bucket", "object", all_parts)
+                    .expect("full into_fileinfo");
+                assert_eq!(fast, full);
+            }
+        }
+
+        let raw = fm.marshal_msg().expect("marshal multi-version xl.meta");
+        let cached_entry = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: Vec::new(),
+            cached: Some(fm),
+            reusable: false,
+        };
+        let uncached_entry = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: raw,
+            cached: None,
+            reusable: false,
+        };
+
+        let cached_fi = cached_entry.to_fileinfo("bucket").expect("cached to_fileinfo");
+        let uncached_fi = uncached_entry.to_fileinfo("bucket").expect("uncached to_fileinfo");
+        assert_eq!(cached_fi, uncached_fi);
+        assert_eq!(cached_fi.num_versions, 1);
+        assert!(!cached_fi.metadata.contains_key(crate::metadata_keys::STORAGE_CLASS));
+        assert!(!rustfs_utils::http::contains_key_str(
+            &cached_fi.metadata,
+            rustfs_utils::http::SUFFIX_TIER_FV_MARKER
+        ));
+
+        let cached_versions = cached_entry.file_info_versions("bucket").expect("cached versions");
+        let uncached_versions = uncached_entry.file_info_versions("bucket").expect("uncached versions");
+        assert_eq!(cached_versions.versions, uncached_versions.versions);
+        assert!(cached_versions.free_versions.is_empty());
+        assert_eq!(cached_versions.versions[0].num_versions, 1);
+
+        let cached_with_free = cached_entry
+            .file_info_versions_with_free_versions("bucket")
+            .expect("cached versions with free");
+        let uncached_with_free = uncached_entry
+            .file_info_versions_with_free_versions("bucket")
+            .expect("uncached versions with free");
+        assert_eq!(cached_with_free.versions, uncached_with_free.versions);
+        assert_eq!(cached_with_free.free_versions, uncached_with_free.free_versions);
+        assert_eq!(cached_with_free.free_versions.len(), 1);
+        assert_eq!(cached_with_free.free_versions[0].num_versions, 1);
+
+        let empty_fm = FileMeta::new();
+        let empty_raw = empty_fm.marshal_msg().expect("marshal empty xl.meta");
+        let empty_cached = MetaCacheEntry {
+            name: "empty".to_string(),
+            metadata: Vec::new(),
+            cached: Some(empty_fm),
+            reusable: false,
+        }
+        .file_info_versions("bucket")
+        .expect("empty cached versions");
+        let empty_uncached = MetaCacheEntry {
+            name: "empty".to_string(),
+            metadata: empty_raw,
+            cached: None,
+            reusable: false,
+        }
+        .file_info_versions("bucket")
+        .expect("empty uncached versions");
+        assert_eq!(empty_cached.versions, empty_uncached.versions);
+        assert_eq!(empty_cached.versions[0].num_versions, 1);
+
+        // Verify fallback cases (legacy V1Obj, >64 MetaSys keys, rmp_serde legacy format)
+        // and the 't'-prefixed internal key branches (`tier-free-marker` dropped,
+        // `tier-free-versionID` preserved, `transitioned-versionID` normalized).
+        let v1_fm = FileMeta::load(&crate::test_data::create_legacy_v1_object_xlmeta().expect("v1 xl.meta")).expect("load v1");
+        assert_eq!(
+            v1_fm.versions[0].into_fileinfo("bucket", "object", true).expect("v1 fast"),
+            FileMetaVersion::try_from(v1_fm.versions[0].meta.as_slice())
+                .expect("v1 try_from")
+                .into_fileinfo("bucket", "object", true)
+                .expect("v1 full"),
+        );
+
+        let mut large_obj = FileMetaVersion::try_from(cached_entry.cached.as_ref().expect("cached").versions[0].meta.as_slice())
+            .expect("decode obj")
+            .object
+            .expect("v2 obj");
+        for i in 0..65 {
+            large_obj.meta_sys.insert(format!("x-rustfs-internal-custom-{i}"), vec![b'v']);
+        }
+        large_obj
+            .meta_sys
+            .insert("X-Rustfs-Internal-Tier-Free-Marker".to_string(), b"1".to_vec());
+        rustfs_utils::http::insert_bytes(&mut large_obj.meta_sys, rustfs_utils::http::SUFFIX_TIER_FV_ID, b"keep-id".to_vec());
+        rustfs_utils::http::insert_bytes(
+            &mut large_obj.meta_sys,
+            rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_ID,
+            b"null".to_vec(),
+        );
+        rustfs_utils::http::insert_bytes(
+            &mut large_obj.meta_sys,
+            rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_STATE,
+            b"suspended-null".to_vec(),
+        );
+        let large_ver = FileMetaVersion {
+            version_type: VersionType::Object,
+            object: Some(large_obj),
+            write_version: 1,
+            ..Default::default()
+        };
+        let native_large_sv = FileMetaShallowVersion::try_from(large_ver.clone()).expect("native >64 MetaSys shallow");
+        assert_eq!(
+            native_large_sv
+                .into_fileinfo("bucket", "object", true)
+                .expect("native >64 fallback"),
+            FileMetaVersion::try_from(native_large_sv.meta.as_slice())
+                .expect("native >64 try_from")
+                .into_fileinfo("bucket", "object", true)
+                .expect("native >64 full"),
+        );
+        let rmp_legacy_bytes = rmp_serde::to_vec_named(&large_ver).expect("rmp_serde named");
+        let rmp_legacy_fi = FileMetaShallowVersion {
+            header: large_ver.header(),
+            meta: rmp_legacy_bytes,
+        }
+        .into_fileinfo("bucket", "object", true)
+        .expect("rmp_serde fallback");
+        assert!(rmp_legacy_fi.uses_legacy_checksum);
+        assert!(!rmp_legacy_fi.metadata.contains_key("X-Rustfs-Internal-Tier-Free-Marker"));
+        assert!(rustfs_utils::http::contains_key_str(
+            &rmp_legacy_fi.metadata,
+            rustfs_utils::http::SUFFIX_TIER_FV_ID
+        ));
+        assert_eq!(rmp_legacy_fi.transition_version.as_deref(), Some("null"));
     }
 }
