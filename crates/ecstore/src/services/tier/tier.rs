@@ -17832,7 +17832,10 @@ mod tests {
                             TierConfigMgr::update_candidate_with_config_lock(
                                 &manager,
                                 store,
-                                TierCandidateMutation::Remove("COLD-A".to_string(), true),
+                                // Non-force removal still validates the remote driver before
+                                // entering reference proof; force removal intentionally skips
+                                // that construction so an invalid endpoint can be removed.
+                                TierCandidateMutation::Remove("COLD-A".to_string(), false),
                             ),
                         ),
                     ),
