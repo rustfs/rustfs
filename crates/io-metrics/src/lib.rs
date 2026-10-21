@@ -516,6 +516,7 @@ pub mod s3_http_metrics;
 pub mod sampler;
 pub mod system_path_metrics;
 pub mod timeout_metrics;
+pub mod walk_metrics;
 
 pub use autotuner::{AutoTuner, TunerConfig, TuningResult};
 
