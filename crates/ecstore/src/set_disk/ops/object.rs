@@ -27057,3 +27057,6 @@ mod delete_recovery_inventory_tests {
         assert!(errors.iter().all(Option::is_none), "DELETE result must remain successful: {errors:?}");
     }
 }
+
+#[cfg(all(test, feature = "test-util"))]
+mod data_movement_prefix_cleanup_tests;

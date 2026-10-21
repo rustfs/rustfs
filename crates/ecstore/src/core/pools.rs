@@ -3496,10 +3496,26 @@ fn resolve_decommission_entry_cleanup_delete_result<T>(result: Result<T>, bucket
     match result {
         Ok(_) => Ok(()),
         Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => Ok(()),
-        Err(err) => Err(Error::other(format!(
-            "decommission cleanup_delete_object failed for {bucket}/{object_name}: {err}"
-        ))),
+        Err(err) => Err(data_movement::data_movement_context_error(
+            format!("decommission cleanup_delete_object failed for {bucket}/{object_name}: {err}"),
+            DecommissionSourceCleanupFailure(err),
+        )),
     }
+}
+
+/// The storage error of a failed source cleanup, kept typed so the entry
+/// failure policy can tell a retryable cleanup failure from a terminal one.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct DecommissionSourceCleanupFailure(Error);
+
+/// A quorum failure while deleting the source of an already copied entry
+/// leaves the source in place: an uncommitted delete transaction is settled by
+/// delete recovery, and the entry's next attempt re-verifies the source before
+/// it cleans up again. Retrying is safe, so it must not fail the pool.
+fn is_decommission_source_cleanup_retryable_error(err: &Error) -> bool {
+    data_movement::data_movement_stage_source_as::<DecommissionSourceCleanupFailure>(err)
+        .is_some_and(|failure| failure.0.is_quorum_error())
 }
 
 fn resolve_decommission_entry_reload_result(result: Result<()>, bucket: &str, object_name: &str) -> Result<()> {
@@ -5301,9 +5317,14 @@ enum DecommissionEntryOutcome {
 /// so the entry is deferred to the end of the round instead of failing the
 /// bucket. Benign contention means the mutation is no longer needed (the object
 /// or version disappeared, or a competing mutation already superseded it): the
-/// entry is done and must not be counted as a failure or escalated. Every other
-/// failure stays terminal.
+/// entry is done and must not be counted as a failure or escalated. A quorum
+/// failure of the source cleanup is deferred too: the copied source is still
+/// in place and the next attempt cleans it up again. Every other failure stays
+/// terminal.
 fn resolve_decommission_entry_failure(err: Error) -> Result<DecommissionEntryOutcome> {
+    if is_decommission_source_cleanup_retryable_error(&err) {
+        return Ok(DecommissionEntryOutcome::Deferred(err));
+    }
     match classify_decommission_capacity_failure(&err) {
         DecommissionCapacityFailure::TargetGateBusy { .. }
         | DecommissionCapacityFailure::IntentConflict
@@ -32074,6 +32095,67 @@ mod pools_tests {
             .expect_err("cleanup delete failure should be wrapped with explicit context");
         assert!(
             err.to_string()
+                .contains("decommission cleanup_delete_object failed for bucket-a/obj.txt")
+        );
+    }
+
+    #[test]
+    fn decommission_source_cleanup_quorum_failure_defers_the_entry() {
+        for quorum in [
+            Error::ErasureWriteQuorum,
+            Error::ErasureReadQuorum,
+            Error::InsufficientWriteQuorum("bucket-a".to_string(), "obj.txt".to_string()),
+        ] {
+            let err = resolve_decommission_entry_cleanup_delete_result::<()>(Err(quorum), "bucket-a", "obj.txt")
+                .expect_err("cleanup quorum failure should surface");
+            assert!(
+                err.to_string()
+                    .contains("decommission cleanup_delete_object failed for bucket-a/obj.txt")
+            );
+            assert!(
+                matches!(
+                    super::resolve_decommission_entry_failure(err),
+                    Ok(super::DecommissionEntryOutcome::Deferred(_))
+                ),
+                "a retryable source cleanup failure must not fail the pool"
+            );
+        }
+
+        let terminal = resolve_decommission_entry_cleanup_delete_result::<()>(Err(Error::SlowDown), "bucket-a", "obj.txt")
+            .expect_err("cleanup failure should surface");
+        assert!(
+            super::resolve_decommission_entry_failure(terminal).is_err(),
+            "a non-quorum cleanup failure stays terminal"
+        );
+        assert!(
+            super::resolve_decommission_entry_failure(Error::ErasureWriteQuorum).is_err(),
+            "a quorum failure outside source cleanup stays terminal"
+        );
+        for stage in ["put_object", "put_object_part", "complete_multipart_upload"] {
+            let copy = data_movement::data_movement_stage_error_for_test(
+                "decommission_object",
+                stage,
+                "bucket-a",
+                "obj.txt",
+                Error::ErasureWriteQuorum,
+            );
+            assert!(
+                super::resolve_decommission_entry_failure(copy).is_err(),
+                "a quorum failure while copying or committing the target ({stage}) stays terminal"
+            );
+        }
+
+        // A deferral that persists through the round pauses the pool with the
+        // cleanup cause; the bucket is never reported complete.
+        let deferred =
+            resolve_decommission_entry_cleanup_delete_result::<()>(Err(Error::ErasureWriteQuorum), "bucket-a", "obj.txt")
+                .expect_err("cleanup quorum failure should surface");
+        let undrained = super::ensure_decommission_deferred_drained("bucket-a", 0, 1, Some(&deferred.to_string()))
+            .expect_err("an undrained cleanup deferral must not complete the bucket");
+        assert!(is_decommission_capacity_blocked_error(&undrained));
+        assert!(
+            undrained
+                .to_string()
                 .contains("decommission cleanup_delete_object failed for bucket-a/obj.txt")
         );
     }
