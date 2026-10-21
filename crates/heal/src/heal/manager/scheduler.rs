@@ -460,7 +460,7 @@ impl HealManager {
                             release_mrf_repair_notice_targets(&notice_targets);
                         }
                         publish_verified_mrf_repair_events(&notice_targets, &completed_status_for_verified_events);
-                        publish_unverified_legacy_mrf_events(&notice_targets, &completed_status_for_verified_events);
+                        publish_unverified_legacy_mrf_events(&notice_targets, &completed_status_for_verified_events, task.source);
                         // update statistics
                         let mut stats = statistics_clone.write().await;
                         match completed_status {
@@ -968,10 +968,17 @@ pub(super) fn unverified_legacy_mrf_event_for_target(
     Some(rustfs_common::mrf_channel::MrfUnverifiedLegacyEvent { anchor: anchor.clone() })
 }
 
-pub(super) fn publish_unverified_legacy_mrf_events(targets: &[MrfRepairNoticeTarget], completed: &CompletedHealStatus) {
+pub(super) fn publish_unverified_legacy_mrf_events(
+    targets: &[MrfRepairNoticeTarget],
+    completed: &CompletedHealStatus,
+    source: HealRequestSource,
+) {
     use crate::heal::outcome::HealExecutionOutcome;
 
-    if !matches!(completed.status, HealTaskStatus::Completed | HealTaskStatus::Failed { .. }) {
+    // Only the MRF executor applies the deep, zero-repair, all-drives-healthy
+    // checks. A merged owner's diagnostic detail does not carry that authority.
+    if source != HealRequestSource::Mrf || !matches!(completed.status, HealTaskStatus::Completed | HealTaskStatus::Failed { .. })
+    {
         return;
     }
     let Some(outcome) = completed.outcome.as_ref() else {
