@@ -22399,6 +22399,213 @@ mod test {
     }
 
     #[tokio::test]
+    async fn read_listing_metadata_bytes_covers_large_envelope_versions_and_non_recursive_walk_coexistence() {
+        use rustfs_filemeta::MetacacheReader;
+        use std::io::Cursor;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create temp dir");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+        fs::create_dir_all(&bucket_dir).await.expect("create bucket dir");
+
+        // 1. Directory target for read_listing_metadata_bytes_std -> Err(DiskError::FileNotFound) on Unix.
+        #[cfg(unix)]
+        {
+            let dir_handle = std::fs::File::open(&bucket_dir);
+            assert!(matches!(
+                read_listing_metadata_bytes_std(dir_handle),
+                Err(ReadAllError::Disk(DiskError::FileNotFound))
+            ));
+        }
+
+        // 2. Empty 0-byte xl.meta -> Ok((empty, modtime)).
+        let empty_path = bucket_dir.join("empty-xl-meta");
+        fs::write(&empty_path, b"").await.expect("write empty file");
+        let (empty_bytes, _) = read_listing_metadata_bytes_std(std::fs::File::open(&empty_path))
+            .ok()
+            .expect("0-byte file must return empty vec");
+        assert!(empty_bytes.is_empty());
+
+        // 3. Large metadata envelope (> 4 KiB LISTING_META_INITIAL_READ_BYTES) + trailing 32 KiB inline data.
+        // Verifies the second `take` read (`want > bytes.len() && bytes.len() == initial`) reads the exact
+        // metadata + CRC envelope without reading the trailing inline payload, and matches `read_xl_meta_no_data_sync`.
+        let mut large_meta = FileMeta::default();
+        for idx in 1..=48_u128 {
+            let mut fi = FileInfo::new("large-meta-obj", 2, 2);
+            fi.version_id = Some(Uuid::from_u128(idx));
+            fi.size = 128;
+            fi.mod_time =
+                Some(OffsetDateTime::from_unix_timestamp(1_700_000_000 + i64::try_from(idx).expect("small idx")).expect("ts"));
+            fi.metadata.insert("x-amz-meta-padding".to_string(), "p".repeat(120));
+            if idx == 1 {
+                fi.data = Some(Bytes::from(vec![b'x'; 32 * 1024]));
+                fi.set_inline_data();
+            }
+            large_meta.add_version(fi).expect("add version to large meta");
+        }
+        let full_large = large_meta.marshal_msg().expect("marshal large meta");
+        let expected_envelope =
+            read_xl_meta_no_data_sync(&mut Cursor::new(&full_large), full_large.len()).expect("sync reference envelope");
+        assert!(
+            expected_envelope.len() > LISTING_META_INITIAL_READ_BYTES,
+            "metadata envelope ({}) must exceed 4 KiB initial read to exercise continuation read",
+            expected_envelope.len()
+        );
+        assert!(full_large.len() >= expected_envelope.len() + 32 * 1024);
+
+        let large_obj_dir = bucket_dir.join("large-meta-obj");
+        fs::create_dir_all(&large_obj_dir).await.expect("create large-meta-obj dir");
+        fs::write(large_obj_dir.join(STORAGE_FORMAT_FILE), &full_large)
+            .await
+            .expect("write large xl.meta");
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("utf8 path")).expect("parse endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        let large_read = disk
+            .read_listing_metadata(bucket, "large-meta-obj")
+            .await
+            .expect("read large listing metadata");
+        assert_eq!(
+            large_read.bytes, expected_envelope,
+            "read_listing_metadata must match read_xl_meta_no_data_sync byte-for-byte on >4KiB envelopes"
+        );
+        let decoded_large = large_read.file_meta.expect("large metadata must decode");
+        assert_eq!(decoded_large.versions.len(), 48);
+        assert!(decoded_large.data.as_slice().is_empty());
+
+        // 4. Legacy v1.0 (> 4 KiB whole-file continuation), v1.1 (minor < 2, no CRC),
+        // v1.2 (minor == 2, 5-byte CRC retained), and truncated header (want > size fallback).
+        let mut v10_buf = b"XL2 ".to_vec();
+        v10_buf.extend_from_slice(&1u16.to_le_bytes());
+        v10_buf.extend_from_slice(&0u16.to_le_bytes());
+        v10_buf.extend_from_slice(&[0xaa; 5000]);
+        let v10_path = bucket_dir.join("v10-meta");
+        fs::write(&v10_path, &v10_buf).await.expect("write v1.0 file");
+        let (v10_got, _) = read_listing_metadata_bytes_std(std::fs::File::open(&v10_path))
+            .ok()
+            .expect("read v1.0");
+        assert_eq!(v10_got, v10_buf, "v1.0 >4KiB must read full file via continuation");
+
+        let mut v11_buf = b"XL2 ".to_vec();
+        v11_buf.extend_from_slice(&1u16.to_le_bytes());
+        v11_buf.extend_from_slice(&1u16.to_le_bytes());
+        v11_buf.push(0xc6);
+        v11_buf.extend_from_slice(&10u32.to_be_bytes());
+        v11_buf.extend_from_slice(&[0xbb; 10]);
+        v11_buf.extend_from_slice(&[0xcc; 20]); // trailing bytes stripped without 5-byte CRC
+        let v11_path = bucket_dir.join("v11-meta");
+        fs::write(&v11_path, &v11_buf).await.expect("write v1.1 file");
+        let (v11_got, _) = read_listing_metadata_bytes_std(std::fs::File::open(&v11_path))
+            .ok()
+            .expect("read v1.1");
+        assert_eq!(v11_got, &v11_buf[..8 + 5 + 10]);
+
+        let mut v12_buf = b"XL2 ".to_vec();
+        v12_buf.extend_from_slice(&1u16.to_le_bytes());
+        v12_buf.extend_from_slice(&2u16.to_le_bytes());
+        v12_buf.push(0xc6);
+        v12_buf.extend_from_slice(&10u32.to_be_bytes());
+        v12_buf.extend_from_slice(&[0xbb; 10]);
+        v12_buf.extend_from_slice(&[0xc1; 5]); // 5-byte CRC trailer retained at minor == 2 boundary
+        v12_buf.extend_from_slice(&[0xcc; 20]); // trailing inline bytes stripped
+        let v12_path = bucket_dir.join("v12-meta");
+        fs::write(&v12_path, &v12_buf).await.expect("write v1.2 file");
+        let (v12_got, _) = read_listing_metadata_bytes_std(std::fs::File::open(&v12_path))
+            .ok()
+            .expect("read v1.2");
+        assert_eq!(v12_got, &v12_buf[..8 + 5 + 10 + 5]);
+
+        let mut claimed_oversize = b"XL2 ".to_vec();
+        claimed_oversize.extend_from_slice(&1u16.to_le_bytes());
+        claimed_oversize.extend_from_slice(&3u16.to_le_bytes());
+        claimed_oversize.push(0xc6);
+        claimed_oversize.extend_from_slice(&99_999u32.to_be_bytes());
+        claimed_oversize.extend_from_slice(&[0xdd; 16]);
+        let oversize_path = bucket_dir.join("oversize-meta");
+        fs::write(&oversize_path, &claimed_oversize)
+            .await
+            .expect("write oversize claim file");
+        let (oversize_got, _) = read_listing_metadata_bytes_std(std::fs::File::open(&oversize_path))
+            .ok()
+            .expect("read oversize claim");
+        assert_eq!(oversize_got, claimed_oversize);
+
+        // 5. Non-recursive walk_dir (`opts.recursive == false`) uses `read_listing_metadata` to
+        // strip trailing inline payload bytes and preserve exact metadata envelopes while emitting
+        // `parent` and `parent/` when a real child object coexists alongside a data_dir.
+        let walk_bucket = "walk-nonrec-bucket";
+        let walk_bucket_dir = dir.path().join(walk_bucket);
+        let data_dir = Uuid::from_u128(0xdead_beef);
+        let make_obj_meta = |name: &str| {
+            let mut fm = FileMeta::default();
+            let mut fi = FileInfo::new(name, 1, 1);
+            fi.version_id = Some(Uuid::from_u128(1));
+            fi.data_dir = Some(data_dir);
+            fi.size = 16;
+            fi.mod_time = Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("ts"));
+            fi.data = Some(Bytes::from(vec![b'a'; 16 * 1024]));
+            fi.set_inline_data();
+            fm.add_version(fi).expect("add version");
+            fm.marshal_msg().expect("marshal")
+        };
+
+        let leaf_full = make_obj_meta("leaf");
+        let leaf_expected =
+            read_xl_meta_no_data_sync(&mut Cursor::new(&leaf_full), leaf_full.len()).expect("expected leaf envelope");
+        let parent_full = make_obj_meta("parent");
+        let parent_expected =
+            read_xl_meta_no_data_sync(&mut Cursor::new(&parent_full), parent_full.len()).expect("expected parent envelope");
+
+        // Leaf object with only its own data_dir (no child objects).
+        let leaf_dir = walk_bucket_dir.join("leaf").join(data_dir.to_string());
+        fs::create_dir_all(&leaf_dir).await.expect("create leaf data_dir");
+        fs::write(walk_bucket_dir.join("leaf").join(STORAGE_FORMAT_FILE), &leaf_full)
+            .await
+            .expect("write leaf xl.meta");
+
+        // Parent object that also has a nested child object `parent/child` alongside its data_dir.
+        let parent_data_dir = walk_bucket_dir.join("parent").join(data_dir.to_string());
+        let child_dir = walk_bucket_dir.join("parent").join("child");
+        fs::create_dir_all(&parent_data_dir).await.expect("create parent data_dir");
+        fs::create_dir_all(&child_dir).await.expect("create child dir");
+        fs::write(walk_bucket_dir.join("parent").join(STORAGE_FORMAT_FILE), &parent_full)
+            .await
+            .expect("write parent xl.meta");
+        fs::write(child_dir.join(STORAGE_FORMAT_FILE), make_obj_meta("parent/child"))
+            .await
+            .expect("write child xl.meta");
+
+        let (reader, mut writer) = tokio::io::duplex(64 * 1024);
+        let walk_opts = WalkDirOptions {
+            bucket: walk_bucket.to_string(),
+            base_dir: String::new(),
+            recursive: false,
+            ..Default::default()
+        };
+        disk.walk_dir(walk_opts, &mut writer)
+            .await
+            .expect("non-recursive walk_dir must succeed");
+        drop(writer);
+        let entries = MetacacheReader::new(reader)
+            .read_all()
+            .await
+            .expect("read non-recursive metacache stream");
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].name, "leaf");
+        assert_eq!(entries[0].metadata, leaf_expected);
+        assert_eq!(FileMeta::load(&entries[0].metadata).expect("decode leaf").versions.len(), 1);
+
+        assert_eq!(entries[1].name, "parent");
+        assert_eq!(entries[1].metadata, parent_expected);
+        assert_eq!(FileMeta::load(&entries[1].metadata).expect("decode parent").versions.len(), 1);
+
+        assert_eq!(entries[2].name, "parent/");
+        assert!(entries[2].is_dir());
+    }
+
+    #[tokio::test]
     async fn test_scan_dir_includes_nested_object_dirs() {
         use rustfs_filemeta::MetacacheReader;
         use tempfile::tempdir;
