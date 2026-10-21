@@ -14,6 +14,16 @@ If you are debugging a listing that returns *fewer* keys than the bucket holds,
 read [Listing truncation and the walk stall budget](#listing-truncation-and-the-walk-stall-budget)
 first — that is the case this document exists for.
 
+## Idle local drives
+
+`RUSTFS_DRIVE_ACTIVE_MONITORING=false` also suppresses the endpoint monitor's
+periodic `format.json` check for an attached local drive whose cached identity
+still matches and whose runtime health is Online. Request paths retain their
+format validation and one-second cache freshness. A removed or replaced drive
+may therefore remain undetected until real I/O reaches it. Missing slots,
+invalidated identities, unhealthy drives, and remote endpoints still get probed
+for recovery. Scanner, heal, and other background services have separate controls.
+
 ## Background: what these timeouts bound
 
 Every foreground drive operation carries a liveness budget so a hung disk fails
