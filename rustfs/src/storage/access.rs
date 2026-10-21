@@ -884,7 +884,7 @@ fn authorization_conditions<T>(
     req: &S3Request<T>,
     cred: &rustfs_credentials::Credentials,
     version_id: Option<&str>,
-    region: Option<s3s::region::Region>,
+    location_constraint: Option<String>,
     remote_addr: Option<std::net::SocketAddr>,
     client_info: Option<&ClientInfo>,
     action: Action,
@@ -893,7 +893,7 @@ fn authorization_conditions<T>(
         &req.headers,
         cred,
         version_id,
-        region,
+        None,
         remote_addr,
         req.uri.query(),
         client_info,
@@ -908,6 +908,11 @@ fn authorization_conditions<T>(
     }
     if internal_object_authorization {
         return Ok(conditions);
+    }
+    if action == Action::S3Action(S3Action::CreateBucketAction)
+        && let Some(location) = location_constraint
+    {
+        conditions.insert("LocationConstraint".to_string(), vec![location]);
     }
     merge_list_bucket_query_conditions(action, req.uri.query(), &mut conditions);
     merge_request_object_tag_conditions(action, &req.headers, &mut conditions)?;
@@ -947,6 +952,17 @@ pub(crate) fn set_requested_object_lock_retain_until<T>(req: &mut S3Request<T>, 
             req.extensions.remove::<RequestedObjectLockRetainUntil>();
         }
     }
+}
+
+/// Keep the XML value literal for IAM; endpoint aliases are resolved later.
+fn requested_bucket_location_constraint(input: &CreateBucketInput) -> Option<String> {
+    input
+        .create_bucket_configuration
+        .as_ref()
+        .and_then(|configuration| configuration.location_constraint.as_ref())
+        .map(BucketLocationConstraint::as_str)
+        .filter(|location| !location.is_empty())
+        .map(str::to_owned)
 }
 
 fn set_requested_object_lock_retention(req: &mut S3Request<PutObjectRetentionInput>) {
@@ -1305,6 +1321,14 @@ impl DenialContext<'_> {
 
 /// Authorizes the request based on the action and credentials.
 pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
+    authorize_request_with_location_constraint(req, action, None).await
+}
+
+async fn authorize_request_with_location_constraint<T>(
+    req: &mut S3Request<T>,
+    action: Action,
+    location_constraint: Option<String>,
+) -> S3Result<()> {
     let internal_object_authorization = req.extensions.get::<InternalObjectAuthorization>().is_some();
     let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
     let req_info = req_info_ref(req)?;
@@ -1330,7 +1354,8 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         let default_claims = HashMap::new();
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
         let client_info = req.extensions.get::<ClientInfo>();
-        let mut conditions = authorization_conditions(req, cred, version_id.as_deref(), None, remote_addr, client_info, action)?;
+        let mut conditions =
+            authorization_conditions(req, cred, version_id.as_deref(), location_constraint, remote_addr, client_info, action)?;
 
         let action_args = Args {
             account: &cred.access_key,
@@ -1506,7 +1531,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
             req,
             &default_cred,
             version_id.as_deref(),
-            req.region.clone(),
+            location_constraint,
             remote_addr,
             client_info,
             action,
@@ -1930,15 +1955,8 @@ async fn prepare_table_data_plane_list_access<T>(req: &mut S3Request<T>, bucket:
     let client_info = req.extensions.get::<ClientInfo>();
     let default_cred = rustfs_credentials::Credentials::default();
     let condition_cred = cred.as_ref().unwrap_or(&default_cred);
-    let conditions = authorization_conditions(
-        req,
-        condition_cred,
-        None,
-        req.region.clone(),
-        remote_addr,
-        client_info,
-        Action::S3Action(action),
-    )?;
+    let conditions =
+        authorization_conditions(req, condition_cred, None, None, remote_addr, client_info, Action::S3Action(action))?;
     let iam_store = cred.as_ref().map(|_| request_iam_store(req)).transpose()?;
     let store = table_catalog_store_for_data_plane(req)?;
     let tables = crate::table_catalog::TableCatalogStore::list_all_tables(&store, bucket)
@@ -2218,10 +2236,10 @@ impl S3Access for FS {
 
         let request_context = cx.extensions_mut().get::<RequestContext>().cloned();
 
-        let region = app_context
-            .as_deref()
-            .and_then(|context| context.region().get())
-            .or_else(runtime_sources::current_region);
+        let region = match app_context.as_deref() {
+            Some(context) => context.region().get(),
+            None => runtime_sources::current_region(),
+        };
 
         let req_info = ReqInfo {
             cred,
@@ -2292,7 +2310,9 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::CreateBucketAction)).await?;
+        let location_constraint = requested_bucket_location_constraint(&req.input);
+        authorize_request_with_location_constraint(req, Action::S3Action(S3Action::CreateBucketAction), location_constraint)
+            .await?;
 
         if req.input.object_lock_enabled_for_bucket.is_some_and(|v| v) {
             authorize_request(req, Action::S3Action(S3Action::PutBucketObjectLockConfigurationAction)).await?;
@@ -3554,7 +3574,10 @@ mod tests {
         table_data_plane_content_mutation, table_data_plane_resource_for_request, table_publication_guard_error,
         validate_post_object_success_controls, versioned_read_action, versioned_tagging_action,
     };
-    use super::{remaining_retention_days, set_requested_object_lock_retain_until, set_requested_object_lock_retention};
+    use super::{
+        remaining_retention_days, requested_bucket_location_constraint, set_requested_object_lock_retain_until,
+        set_requested_object_lock_retention,
+    };
     use crate::auth::OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION;
     use crate::error::ApiError;
     use crate::storage::storage_api::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
@@ -4591,6 +4614,80 @@ mod tests {
                         "bucket {effect}, expected={expected}, actual={actual:?}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn create_bucket_location_constraint_conditions_use_only_xml() {
+        let configuration = |region: &str| CreateBucketConfiguration {
+            location_constraint: Some(BucketLocationConstraint::from(region.to_owned())),
+            ..Default::default()
+        };
+        for (configuration, expected) in [
+            (None, None),
+            (Some(CreateBucketConfiguration::default()), None),
+            (Some(configuration("")), None),
+            (Some(configuration("eu-west-1")), Some("eu-west-1")),
+            (Some(configuration("EU")), Some("EU")),
+            (Some(configuration("tenant-region-1")), Some("tenant-region-1")),
+        ] {
+            let mut req = build_request(
+                CreateBucketInput {
+                    bucket: "location-policy-bucket".to_string(),
+                    create_bucket_configuration: configuration,
+                    ..Default::default()
+                },
+                Method::PUT,
+            );
+            req.region = Some("us-east-1".parse().expect("signing region"));
+            req.uri = Uri::from_static("/location-policy-bucket?LocationConstraint=forged&s3%3ALocationConstraint=forged");
+            req.headers.insert("locationconstraint", HeaderValue::from_static("forged"));
+            let credentials = rustfs_credentials::Credentials {
+                claims: Some(
+                    [
+                        ("LocationConstraint".to_string(), serde_json::json!("forged")),
+                        ("ldapLocationConstraint".to_string(), serde_json::json!("forged")),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..Default::default()
+            };
+            let location = requested_bucket_location_constraint(&req.input);
+            let conditions = authorization_conditions(
+                &req,
+                &credentials,
+                None,
+                location,
+                None,
+                None,
+                Action::S3Action(S3Action::CreateBucketAction),
+            )
+            .expect("CreateBucket conditions");
+            assert_eq!(
+                conditions
+                    .get("LocationConstraint")
+                    .and_then(|values| values.first())
+                    .map(String::as_str),
+                expected,
+            );
+            for action in [
+                S3Action::PutBucketObjectLockConfigurationAction,
+                S3Action::PutBucketVersioningAction,
+                S3Action::GetObjectAction,
+            ] {
+                let conditions = authorization_conditions(
+                    &req,
+                    &credentials,
+                    None,
+                    expected.map(str::to_owned),
+                    None,
+                    None,
+                    Action::S3Action(action),
+                )
+                .expect("non-CreateBucket conditions");
+                assert!(!conditions.contains_key("LocationConstraint"), "{action:?}");
             }
         }
     }

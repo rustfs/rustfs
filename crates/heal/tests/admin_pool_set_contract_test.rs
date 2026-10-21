@@ -310,7 +310,11 @@ fn admin_selector_survives_sigkill_with_original_scope_and_receipts() {
             "{}",
             std::fs::read_to_string(root.path().join("prepare.log")).expect("prepare log")
         );
-        assert!(Instant::now() < deadline, "child never acknowledged partial work");
+        assert!(
+            Instant::now() < deadline,
+            "child never acknowledged partial work: {}",
+            std::fs::read_to_string(root.path().join("prepare.log")).expect("prepare log")
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     first.0.kill().expect("SIGKILL the interrupted executor");
@@ -328,28 +332,41 @@ fn admin_selector_survives_sigkill_with_original_scope_and_receipts() {
             );
             break;
         }
-        assert!(Instant::now() < deadline, "replay child did not complete");
+        assert!(
+            Instant::now() < deadline,
+            "replay child did not complete: {}",
+            std::fs::read_to_string(root.path().join("replay.log")).expect("replay log")
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
 }
 
 #[cfg(unix)]
 async fn crash_child(root: PathBuf, replay: bool) {
+    // Several objects preserve a partial traversal without exhausting the
+    // process deadline on repeated durable shard writes and checkpoint syncs.
+    const OBJECT_COUNT: usize = 8;
+    let expected_processed = u64::try_from(OBJECT_COUNT).expect("fixture object count fits u64");
+    eprintln!("heal crash fixture: replay={replay}, stage=bootstrap");
     let env = TestECStoreEnv::builder().base_dir(root.join("disks")).build().await;
     let token = "dff22383-67ee-4d8b-ae8a-dc6d8276c974";
     if !replay {
-        let fixtures = seed(&env, 64, 64, ShardIntegrityWriteMode::Protected).await;
+        eprintln!("heal crash fixture: replay={replay}, stage=seed");
+        let fixtures = seed(&env, OBJECT_COUNT, OBJECT_COUNT, ShardIntegrityWriteMode::Protected).await;
         std::fs::write(root.join("objects.json"), serde_json::to_vec(&fixtures).expect("fixture manifest"))
             .expect("persist fixture manifest");
     } else {
+        eprintln!("heal crash fixture: replay={replay}, stage=scope-control");
         env.make_bucket("created-after-crash", false).await;
         env.put_object_bytes("created-after-crash", "outside-original-scope", body())
             .await;
     }
     let manager = manager(&env);
+    eprintln!("heal crash fixture: replay={replay}, stage=start-manager");
     manager.start().await.expect("start durable owner");
     let processor = HealChannelProcessor::new(manager.clone());
     if !replay {
+        eprintln!("heal crash fixture: replay={replay}, stage=partial-progress");
         start(&processor, token).await;
         loop {
             let value = query(&processor, token).await;
@@ -357,7 +374,7 @@ async fn crash_child(root: PathBuf, replay: bool) {
             if let Some(processed) = value["outcome"]["counters"]["processed"].as_u64()
                 && processed > 0
             {
-                assert!(processed < 64, "crash must interrupt a partial traversal");
+                assert!(processed < expected_processed, "crash must interrupt a partial traversal");
                 // The parent may kill us as soon as the final path exists.
                 let mut acknowledged = tempfile::NamedTempFile::new_in(&root).expect("acknowledgement staging file");
                 serde_json::to_writer(acknowledged.as_file_mut(), &value["outcome"]).expect("write acknowledged outcome");
@@ -374,17 +391,19 @@ async fn crash_child(root: PathBuf, replay: bool) {
             tokio::task::yield_now().await;
         }
     }
+    eprintln!("heal crash fixture: replay={replay}, stage=terminal");
     let value = terminal(&processor, token).await;
+    eprintln!("heal crash fixture: replay={replay}, stage=verify-receipts");
     assert_eq!(value["summary"], "finished");
     assert_eq!(value["outcome"]["coverage"], "complete");
-    assert_eq!(value["outcome"]["counters"]["processed"], 64);
+    assert_eq!(value["outcome"]["counters"]["processed"], expected_processed);
     let counters = &value["outcome"]["counters"];
     assert_eq!(
         counters["healed"].as_u64().expect("healed count") + counters["unchanged"].as_u64().expect("healthy count"),
-        64
+        expected_processed
     );
     let receipts = value["outcome"]["objects"].as_array().expect("resumed receipts");
-    assert_eq!(receipts.len(), 64);
+    assert_eq!(receipts.len(), OBJECT_COUNT);
     assert!(receipts.iter().all(|item| item["identity"]["bucket"] == BUCKET));
     let acknowledged: Value = serde_json::from_slice(&std::fs::read(root.join("acknowledged.json")).expect("acknowledged bytes"))
         .expect("acknowledged JSON");
@@ -406,6 +425,9 @@ async fn crash_child(root: PathBuf, replay: bool) {
             acknowledged["objects"][0]["identity"]["bucketIncarnationId"]
         );
     }
+    eprintln!("heal crash fixture: replay={replay}, stage=verify-data");
     verify_data(&env, &fixtures).await;
+    eprintln!("heal crash fixture: replay={replay}, stage=stop-manager");
     manager.stop().await.expect("stop recovered manager");
+    eprintln!("heal crash fixture: replay={replay}, stage=completed");
 }

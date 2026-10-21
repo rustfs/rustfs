@@ -242,6 +242,7 @@ async fn assert_coordinator_partial_progress(resume_mixed_plan: bool, fail_cycle
         ScannerCycleScheduling {
             requires_full_scan: true,
             service_cohort: None,
+            scope_fallback: None,
         },
     )
     .await;
@@ -310,6 +311,7 @@ async fn assert_coordinator_partial_progress(resume_mixed_plan: bool, fail_cycle
                 ScannerCycleScheduling {
                     requires_full_scan: true,
                     service_cohort: None,
+                    scope_fallback: None,
                 },
             ),
         )
@@ -347,6 +349,7 @@ async fn assert_coordinator_partial_progress(resume_mixed_plan: bool, fail_cycle
             ScannerCycleScheduling {
                 requires_full_scan: true,
                 service_cohort: None,
+                scope_fallback: None,
             },
         )
         .await;
@@ -412,6 +415,7 @@ async fn assert_coordinator_partial_progress(resume_mixed_plan: bool, fail_cycle
             ScannerCycleScheduling {
                 requires_full_scan: true,
                 service_cohort: None,
+                scope_fallback: None,
             },
         )
         .await;
@@ -487,6 +491,7 @@ async fn assert_coordinator_partial_progress(resume_mixed_plan: bool, fail_cycle
             ScannerCycleScheduling {
                 requires_full_scan: true,
                 service_cohort: None,
+                scope_fallback: None,
             },
         )
         .await;

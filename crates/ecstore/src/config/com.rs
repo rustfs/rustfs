@@ -69,6 +69,16 @@ fn config_task_join_error(operation: &'static str, error: tokio::task::JoinError
     Error::other(format!("{operation} task {outcome}"))
 }
 
+fn spawn_config_task<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    // Capture before spawning; detached transactions outlive their request waiter.
+    let context = rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context();
+    tokio::spawn(rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(context, future))
+}
+
 /// Runs one complete server-config transaction while holding both the local
 /// process guard and the distributed namespace write lock for `config.json`.
 /// The operation must use the corresponding no-lock read/save functions.
@@ -78,7 +88,7 @@ where
     Fut: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::spawn(async move {
+    spawn_config_task(async move {
         // Lock order: SERVER_CONFIG_LOCK -> transaction lock -> object lock.
         let _local_guard = SERVER_CONFIG_LOCK.write().await;
         let transaction_lock = server_config_transaction_lock_path();
@@ -101,7 +111,7 @@ where
     Fut: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::spawn(async move {
+    spawn_config_task(async move {
         // Lock order: SERVER_CONFIG_LOCK -> transaction lock -> object lock.
         let _local_guard = SERVER_CONFIG_LOCK.read().await;
         let transaction_lock = server_config_transaction_lock_path();
@@ -123,7 +133,7 @@ where
     Fut: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::spawn(async move {
+    spawn_config_task(async move {
         let namespace_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &object).await?;
         let write_guard = crate::object_api::WriteCommitGuard::acquire(&namespace_lock, get_lock_acquire_timeout()).await?;
         Ok(operation(write_guard.clone()).await)
@@ -140,7 +150,7 @@ where
     Fut: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::spawn(async move {
+    spawn_config_task(async move {
         let namespace_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &object).await?;
         let _read_guard = namespace_lock.get_read_lock(get_lock_acquire_timeout()).await?;
         Ok(operation().await)
@@ -2865,6 +2875,59 @@ mod tests {
         let rendered = config_task_join_error("server config write", join_error).to_string();
         assert!(rendered.contains("panicked"));
         assert!(!rendered.contains("do-not-expose-payload"));
+    }
+
+    #[tokio::test]
+    async fn config_tasks_preserve_operation_across_nested_spawns() {
+        use rustfs_io_metrics::s3_http_metrics::{S3HttpRequestGuard, current_s3_http_operation_name, observe_s3_http_operation};
+        let mut request = S3HttpRequestGuard::new("PUT");
+        let child = request.in_scope(|| {
+            observe_s3_http_operation(rustfs_s3_ops::S3Operation::CreateBucket);
+            super::spawn_config_task(async {
+                assert_eq!(current_s3_http_operation_name(), Some("s3:CreateBucket"));
+                super::spawn_config_task(async { current_s3_http_operation_name() })
+                    .await
+                    .expect("nested transaction task completes")
+            })
+        });
+        drop(request);
+        assert_eq!(child.await.expect("transaction task completes"), Some("s3:CreateBucket"));
+        assert_eq!(current_s3_http_operation_name(), None);
+        assert_eq!(
+            super::spawn_config_task(async { current_s3_http_operation_name() })
+                .await
+                .expect("internal transaction task completes"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn config_tasks_finish_after_the_waiter_drops() {
+        use rustfs_io_metrics::s3_http_metrics::{S3HttpRequestGuard, current_s3_http_operation_name, observe_s3_http_operation};
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = admission.clone().acquire_owned().await.expect("admission permit");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let mut request = S3HttpRequestGuard::new("DELETE");
+        let child = request.in_scope(|| {
+            observe_s3_http_operation(rustfs_s3_ops::S3Operation::DeleteBucket);
+            super::spawn_config_task(async move {
+                entered_tx.send(()).expect("waiter is still present");
+                release_rx.await.expect("transaction may finish");
+                assert_eq!(current_s3_http_operation_name(), Some("s3:DeleteBucket"));
+                drop(permit);
+                finished_tx.send(()).expect("completion observer is still present");
+            })
+        });
+        entered_rx.await.expect("transaction started");
+        drop(child);
+        drop(request);
+        assert_eq!(admission.available_permits(), 0);
+        release_tx.send(()).expect("detached transaction remains alive");
+        finished_rx.await.expect("detached transaction finished");
+        assert_eq!(admission.available_permits(), 1);
+        assert_eq!(current_s3_http_operation_name(), None);
     }
 
     #[test]

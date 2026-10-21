@@ -9588,6 +9588,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             } else {
                 (ObjectInfo::default(), FileInfo::default(), None)
             };
+            // A quorum-resolved marker returns not-found with a populated name.
+            // Only missing metadata needs recovery; unrelated legacy residue or
+            // an offline disk must not block a new marker write at quorum.
             if gerr
                 .as_ref()
                 .is_some_and(|error| is_err_object_not_found(error) || is_err_version_not_found(error))
@@ -9596,6 +9599,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 && !opts.replication_request
                 && opts.http_preconditions.is_none()
                 && !guarded
+                && goi.name.is_empty()
             {
                 let recovery = self
                     .recover_delete_key(
@@ -10644,6 +10648,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // disk array, so the object-derived quorum here is unused.
         let (mut goi, mut authoritative_file_info, _write_quorum, mut gerr) =
             self.get_object_info_fileinfo_and_quorum(bucket, object, &opts).await;
+        // A quorum-resolved marker returns not-found with a populated name.
+        // Only missing metadata needs recovery; unrelated legacy residue or
+        // an offline disk must not block a new marker write at quorum.
         if gerr
             .as_ref()
             .is_some_and(|error| is_err_object_not_found(error) || is_err_version_not_found(error))
@@ -10651,6 +10658,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             && !opts.data_movement
             && !opts.replication_request
             && opts.http_preconditions.is_none()
+            && goi.name.is_empty()
         {
             if let Some(expected) = opts.expected_bucket_incarnation_id {
                 self.validate_bucket_incarnation(bucket, expected, &opts).await?;
@@ -27049,3 +27057,6 @@ mod delete_recovery_inventory_tests {
         assert!(errors.iter().all(Option::is_none), "DELETE result must remain successful: {errors:?}");
     }
 }
+
+#[cfg(all(test, feature = "test-util"))]
+mod data_movement_prefix_cleanup_tests;
