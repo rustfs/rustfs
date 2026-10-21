@@ -15,6 +15,8 @@
 // #730: data-movement migration keeps staged cleanup helpers until copy paths converge.
 
 pub(crate) mod backpressure;
+#[cfg(feature = "e2e-test-hooks")]
+pub(crate) mod e2e_barrier;
 pub(crate) mod scanner_backlog;
 
 use crate::core::pools::{DecommissionCapacityOwner, decommission_capacity_mutation_id};
@@ -1444,6 +1446,10 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
 
     #[cfg(any(test, feature = "test-util"))]
     pause_source_cleanup_before_delete(bucket, object).await;
+    #[cfg(feature = "e2e-test-hooks")]
+    e2e_barrier::wait(op_label, bucket, object, e2e_barrier::STAGE_BEFORE_SOURCE_CLEANUP)
+        .await
+        .map_err(|err| SourceCleanupError::Storage(Error::from(err)))?;
 
     let mut opts = ObjectOptions {
         delete_prefix: true,
@@ -1969,6 +1975,23 @@ async fn migrate_object_inner(
                 };
             }
 
+            #[cfg(feature = "e2e-test-hooks")]
+            e2e_barrier::wait(
+                op_label,
+                bucket.as_str(),
+                object_info.name.as_str(),
+                e2e_barrier::STAGE_BEFORE_TARGET_COMMIT,
+            )
+            .await
+            .map_err(|err| {
+                data_movement_stage_error(
+                    op_label,
+                    "complete_multipart_upload",
+                    bucket.as_str(),
+                    object_info.name.as_str(),
+                    Error::from(err),
+                )
+            })?;
             let mut complete_multipart_opts =
                 data_movement_complete_multipart_opts(&object_info, pool_idx, preserve_part_checksums).map_err(|err| {
                     data_movement_stage_error(

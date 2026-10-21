@@ -19114,6 +19114,15 @@ impl ECStore {
         // The local durable transition is now fenced. Release the writer
         // before any peer RPC; remote reload must not block scanner admission.
         drop(_movement_guard);
+        #[cfg(feature = "e2e-test-hooks")]
+        data_movement::e2e_barrier::wait(
+            "decommission_start",
+            RUSTFS_META_BUCKET,
+            POOL_META_NAME,
+            data_movement::e2e_barrier::STAGE_AFTER_RESPONSIBILITY_PERSISTED,
+        )
+        .await
+        .map_err(Error::from)?;
 
         #[cfg(test)]
         pause_decommission_start_for_test(self.id, DecommissionStartPausePoint::PeerReload).await;
