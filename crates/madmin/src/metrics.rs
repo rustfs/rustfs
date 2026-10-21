@@ -325,6 +325,14 @@ pub struct ScannerUsageFreshnessSnapshot {
     pub last_guardrail_veto_unix_secs: u64,
     #[serde(rename = "last_guardrail_veto_reason", default)]
     pub last_guardrail_veto_reason: String,
+    /// Cycles eligible for a dirty-bucket scope that walked the whole
+    /// namespace instead; the reason names the scope precondition that failed.
+    #[serde(rename = "scope_fallback_total", default)]
+    pub scope_fallback_total: u64,
+    #[serde(rename = "last_scope_fallback_unix_secs", default)]
+    pub last_scope_fallback_unix_secs: u64,
+    #[serde(rename = "last_scope_fallback_reason", default)]
+    pub last_scope_fallback_reason: String,
     #[serde(rename = "disk_io_budget_wait_events", default)]
     pub disk_io_budget_wait_events: u64,
     #[serde(rename = "disk_io_budget_wait_millis", default)]
@@ -369,6 +377,11 @@ impl ScannerUsageFreshnessSnapshot {
         if other.last_guardrail_veto_unix_secs > self.last_guardrail_veto_unix_secs {
             self.last_guardrail_veto_unix_secs = other.last_guardrail_veto_unix_secs;
             self.last_guardrail_veto_reason = other.last_guardrail_veto_reason.clone();
+        }
+        self.scope_fallback_total = self.scope_fallback_total.saturating_add(other.scope_fallback_total);
+        if other.last_scope_fallback_unix_secs > self.last_scope_fallback_unix_secs {
+            self.last_scope_fallback_unix_secs = other.last_scope_fallback_unix_secs;
+            self.last_scope_fallback_reason = other.last_scope_fallback_reason.clone();
         }
         if other_deferred_state_at > self_deferred_state_at {
             self.deferred_pending = other.deferred_pending;
@@ -1773,6 +1786,26 @@ mod tests {
         assert_eq!(legacy.guardrail_veto_total, 0);
         assert_eq!(legacy.last_guardrail_veto_unix_secs, 0);
         assert!(legacy.last_guardrail_veto_reason.is_empty());
+        assert_eq!(legacy.scope_fallback_total, 0);
+        assert_eq!(legacy.last_scope_fallback_unix_secs, 0);
+        assert!(legacy.last_scope_fallback_reason.is_empty());
+
+        let mut fallbacks = ScannerUsageFreshnessSnapshot::default();
+        fallbacks.merge(&ScannerUsageFreshnessSnapshot {
+            scope_fallback_total: 3,
+            last_scope_fallback_unix_secs: 40,
+            last_scope_fallback_reason: "dirty_bucket_overflow".to_string(),
+            ..Default::default()
+        });
+        fallbacks.merge(&ScannerUsageFreshnessSnapshot {
+            scope_fallback_total: 1,
+            last_scope_fallback_unix_secs: 25,
+            last_scope_fallback_reason: "baseline_unavailable".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(fallbacks.scope_fallback_total, 4);
+        assert_eq!(fallbacks.last_scope_fallback_unix_secs, 40);
+        assert_eq!(fallbacks.last_scope_fallback_reason, "dirty_bucket_overflow");
 
         let mut vetoes = ScannerUsageFreshnessSnapshot::default();
         vetoes.merge(&ScannerUsageFreshnessSnapshot {
