@@ -20,7 +20,7 @@ use crate::site_replication::identity::{
 use crate::site_replication::state_lock::{SITE_REPLICATION_STATE_PATH, with_site_replication_state_lock_on};
 use crate::storage::storage_api::{read_config_no_lock, save_config_no_lock};
 use rustfs_madmin::PeerInfo;
-use s3s::{S3Error, S3ErrorCode, S3Result};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use serde_json::{Map, Value};
 use tracing::info;
 

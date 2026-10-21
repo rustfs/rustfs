@@ -36,9 +36,10 @@ use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_lock::{LockLeaseInfo, LockMode, LockType, ObjectKey, get_global_lock_manager};
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{S3Error, S3Result, s3_error};
 use s3s::header::CONTENT_TYPE;
 use s3s::stream::{ByteStream, DynByteStream};
-use s3s::{Body, S3Error, S3Request, S3Response, S3Result, StdError, s3_error};
+use s3s::{Body, S3Request, S3Response, StdError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -1193,7 +1194,7 @@ fn query_values(uri: &Uri, key: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use http::{Extensions, Uri};
-    use s3s::S3ErrorCode;
+    use rustfs_s3_types::S3ErrorCode;
 
     fn build_request(method: Method, uri: &'static str) -> S3Request<Body> {
         S3Request {

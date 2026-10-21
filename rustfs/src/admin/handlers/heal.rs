@@ -39,9 +39,10 @@ use rustfs_heal_contracts::heal_channel::{
     HealAdmissionReceipt, HealChannelPriority, HealChannelRequest, HealOpts, HealRequestSource, HealScanMode,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{S3Result, s3_error};
 use rustfs_scanner::scanner::{BackgroundHealInfo, read_background_heal_info};
 use s3s::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
@@ -478,7 +479,7 @@ fn aggregate_cluster_heal_status(snapshots: Vec<NodeHealStatusSnapshot>) -> Clus
     }
 }
 
-fn cluster_heal_status_unavailable(reason: &str) -> s3s::S3Error {
+fn cluster_heal_status_unavailable(reason: &str) -> rustfs_s3_types::S3Error {
     warn!(
         event = EVENT_ADMIN_REQUEST_FAILED,
         component = LOG_COMPONENT_ADMIN_API,
@@ -862,7 +863,7 @@ async fn read_cluster_replacement_recovery_status(
     ))
 }
 
-fn cluster_heal_control_unavailable(reason: &str) -> s3s::S3Error {
+fn cluster_heal_control_unavailable(reason: &str) -> rustfs_s3_types::S3Error {
     warn!(
         event = EVENT_ADMIN_REQUEST_FAILED,
         component = LOG_COMPONENT_ADMIN_API,
@@ -1099,7 +1100,7 @@ async fn submit_cluster_heal_start(
     }
 }
 
-fn reject_heal_admission(result: rustfs_heal_contracts::heal_channel::HealAdmissionResult) -> s3s::S3Error {
+fn reject_heal_admission(result: rustfs_heal_contracts::heal_channel::HealAdmissionResult) -> rustfs_s3_types::S3Error {
     use rustfs_heal_contracts::heal_channel::{HealAdmissionDropReason, HealAdmissionResult};
 
     match result {
@@ -1298,8 +1299,8 @@ fn heal_channel_response_status(
             ..Default::default()
         });
     }
-    Err(s3s::S3Error::with_message(
-        s3s::S3ErrorCode::InternalError,
+    Err(rustfs_s3_types::S3Error::with_message(
+        rustfs_s3_types::S3ErrorCode::InternalError,
         "invalid heal status payload or unsupported summary",
     ))
 }
@@ -1719,7 +1720,7 @@ struct MrfLegacyResponsibilityActionResponse {
     durable_responsibility_retained: bool,
 }
 
-fn map_mrf_lifecycle_control_error(error: rustfs_heal::heal::mrf_queue::MrfLifecycleControlError) -> s3s::S3Error {
+fn map_mrf_lifecycle_control_error(error: rustfs_heal::heal::mrf_queue::MrfLifecycleControlError) -> rustfs_s3_types::S3Error {
     use rustfs_heal::heal::mrf_queue::MrfLifecycleControlError;
     match error {
         MrfLifecycleControlError::Unavailable | MrfLifecycleControlError::Persistence => {
@@ -1957,11 +1958,9 @@ mod tests {
     use rustfs_heal_contracts::heal_channel::{
         HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealOpts, HealRequestSource, HealScanMode,
     };
+    use rustfs_s3_types::S3ErrorCode;
     use rustfs_scanner::scanner::BackgroundHealInfo;
-    use s3s::{
-        S3ErrorCode,
-        header::{CONTENT_LENGTH, CONTENT_TYPE},
-    };
+    use s3s::header::{CONTENT_LENGTH, CONTENT_TYPE};
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, Ordering};
     use uuid::Uuid;
@@ -2054,7 +2053,7 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio::time::Duration;
 
-    fn parse_registered_heal_request(uri: &Uri) -> s3s::S3Result<HealInitParams> {
+    fn parse_registered_heal_request(uri: &Uri) -> rustfs_s3_types::S3Result<HealInitParams> {
         let mut registered = super::S3Router::new(false);
         super::register_heal_route(&mut registered).expect("register production Heal routes");
         let mut router = Router::new();
@@ -2172,12 +2171,12 @@ mod tests {
                     .check_access(&mut req)
                     .await
                     .expect_err("router must require a signature");
-                assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+                assert_eq!(err.code(), &S3ErrorCode::AccessDenied.into());
                 let err = router
                     .call(req)
                     .await
                     .expect_err("handler must independently require authentication");
-                assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+                assert_eq!(err.code(), &S3ErrorCode::InvalidRequest.into());
                 assert!(err.to_string().contains("authentication required"));
             }
         }

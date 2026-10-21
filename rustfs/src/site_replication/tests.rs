@@ -19,6 +19,7 @@
 //! on both sides rather than coupling the two test modules.
 
 use super::*;
+use rustfs_s3_types::s3_error;
 
 use super::identity::site_identity_key;
 use crate::storage_api::site_replication::merge_incoming_replication_config;

@@ -20,9 +20,10 @@ use http::StatusCode;
 use http::{HeaderMap, HeaderValue};
 use hyper::Method;
 use matchit::Params;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result};
 use rustfs_tls_runtime::{OutboundOnlySnapshotArgs, TlsConsumerStatusItem, TlsDebugStatusResponse, TlsRuntimeStatusSnapshot};
 use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use s3s::{Body, S3Request, S3Response};
 
 pub fn register_tls_debug_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -101,8 +102,9 @@ mod tests {
     use http::{Extensions, HeaderMap, Uri};
     use hyper::Method;
     use matchit::Params;
+    use rustfs_s3_types::S3ErrorCode;
     use rustfs_tls_runtime::{OutboundOnlySnapshotArgs, TlsConsumerStatusItem, TlsRuntimeStatusSnapshot};
-    use s3s::{Body, S3ErrorCode, S3Request};
+    use s3s::{Body, S3Request};
 
     fn build_tls_status_request() -> S3Request<Body> {
         S3Request {
