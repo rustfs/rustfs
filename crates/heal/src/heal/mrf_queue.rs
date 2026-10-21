@@ -139,7 +139,7 @@ pub async fn recheck_legacy_responsibility(
 
 pub async fn refresh_legacy_responsibility(
     responsibility_id: Uuid,
-    expected_bucket_incarnation_id: Uuid,
+    expected_bucket_incarnation_id: Option<Uuid>,
 ) -> Result<(), MrfLifecycleControlError> {
     let sender = GLOBAL_MRF_LIFECYCLE_SENDER
         .get()
@@ -181,7 +181,7 @@ enum MrfLifecycleCommand {
     },
     Refresh {
         responsibility_id: Uuid,
-        expected_bucket_incarnation_id: Uuid,
+        expected_bucket_incarnation_id: Option<Uuid>,
         response: tokio::sync::oneshot::Sender<Result<(), MrfLifecycleControlError>>,
     },
     AcceptUnverifiedRisk {
@@ -1012,7 +1012,7 @@ impl MrfRuntime {
     fn list_unverified_legacy(&self, after: Option<Uuid>, limit: usize) -> MrfLegacyResponsibilitySnapshot {
         let (responsibilities, next_cursor) = self.partial_writes.list_unverified_legacy(after, limit);
         MrfLegacyResponsibilitySnapshot {
-            contract_version: 1,
+            contract_version: 2,
             node_local: true,
             checkpoint_owner: self.runtime_checkpoint.map(|(owner, _)| owner),
             checkpoint_sequence: self.runtime_checkpoint.map(|(_, sequence)| sequence),
@@ -1085,20 +1085,25 @@ impl MrfRuntime {
         &mut self,
         manager: &HealManager,
         responsibility_id: Uuid,
-        expected_bucket_incarnation_id: Uuid,
+        expected_bucket_incarnation_id: Option<Uuid>,
     ) -> Result<(), MrfLifecycleControlError> {
         let (intent, state, source_incarnation) = self
             .partial_writes
             .intent_for_responsibility(responsibility_id)
             .ok_or(MrfLifecycleControlError::StaleGeneration)?;
-        if state.bucket_incarnation_id() != Some(expected_bucket_incarnation_id) {
+        if state.bucket_incarnation_id() != expected_bucket_incarnation_id {
+            return Err(MrfLifecycleControlError::StaleGeneration);
+        }
+        if expected_bucket_incarnation_id.is_none()
+            && (source_incarnation.is_some() || !matches!(state, partial_write::ResponsibilityState::Active))
+        {
             return Err(MrfLifecycleControlError::StaleGeneration);
         }
         let anchor = manager
             .durable_mrf_repair_anchor(&intent)
             .await
             .ok_or(MrfLifecycleControlError::IncarnationChanged)?;
-        if anchor.bucket_incarnation_id == expected_bucket_incarnation_id {
+        if Some(anchor.bucket_incarnation_id) == expected_bucket_incarnation_id {
             return Ok(());
         }
         let previous_acceptance = self.partial_writes.last_operator_acceptance(responsibility_id);
