@@ -2012,7 +2012,7 @@ impl TargetClient {
             .head_object()
             .bucket(bucket)
             .key(object)
-            .set_version_id(version_id)
+            .set_version_id(resolve_read_api_version_id(version_id))
             .customize()
             .map_request(move |mut req| {
                 for (k, v) in headers.clone().into_iter() {
@@ -4166,6 +4166,34 @@ mod tests {
         assert!(
             !request_uris[1].contains("versionId="),
             "delete marker creation must omit the target versionId query: {}",
+            request_uris[1]
+        );
+    }
+
+    /// The worker's convergence HEAD addresses a source null version (nil
+    /// UUID) as `versionId=null`, the spelling every S3 target understands,
+    /// like the proxy and audit reads do.
+    #[tokio::test]
+    async fn head_object_addresses_nil_source_version_as_null() {
+        let (client, request_uris) = recording_target_client();
+        let versioned = Uuid::new_v4().to_string();
+        // Only the request URI matters here; the canned empty response may or
+        // may not parse as a HEAD result.
+        let _ = client
+            .head_object("target-bucket", "object", Some(Uuid::nil().to_string()))
+            .await;
+        let _ = client.head_object("target-bucket", "object", Some(versioned.clone())).await;
+
+        let request_uris = request_uris.lock().expect("recorded request lock should not be poisoned");
+        assert_eq!(request_uris.len(), 2);
+        assert!(
+            request_uris[0].contains("versionId=null") && !request_uris[0].contains(&Uuid::nil().to_string()),
+            "a nil source version must be addressed as the null version: {}",
+            request_uris[0]
+        );
+        assert!(
+            request_uris[1].contains(&format!("versionId={versioned}")),
+            "a concrete source version must pass through unchanged: {}",
             request_uris[1]
         );
     }

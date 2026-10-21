@@ -2838,7 +2838,17 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, SUFFIX_RESTORE_OPERATION_ID);
             rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, SUFFIX_RESTORE_WORKER_LOCK);
         }
-        if opts.versioned {
+        // A versioned create stages a concrete version unless the request
+        // named the null version (`versionId=null`), whose nil id reads back
+        // as absent. Authorized inbound replication uses that to land the
+        // source's null version, so its completion keeps the null version,
+        // exactly like the single-PUT path (rustfs/rustfs#8747). Any other
+        // completion in a versioned bucket gets a concrete version.
+        let replicated_null_version = fi.version_id.is_none_or(|version_id| version_id.is_nil())
+            && (opts.replication_request || opts.delete_marker_replication_status() == ReplicationStatusType::Replica);
+        if opts.versioned && replicated_null_version {
+            fi.version_id = Some(Uuid::nil());
+        } else if opts.versioned {
             fi.version_id = Some(
                 fi.version_id
                     .filter(|version_id| !version_id.is_nil())
@@ -10228,6 +10238,59 @@ mod tests {
                 .expect("completed version should be addressable by exact version id");
 
             assert_eq!(current.version_id, Some(version_id));
+        }
+
+        /// Inbound replication of a source null version stages the nil version
+        /// id requested by `versionId=null`; completing it in a versioned bucket
+        /// must keep the null version instead of minting a new one, exactly
+        /// like the single-PUT path (rustfs/rustfs#8747).
+        #[tokio::test]
+        #[serial]
+        async fn complete_multipart_upload_keeps_replicated_null_version() {
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "multipart-replicated-null-bucket";
+            let object = "object";
+            let body = b"replicated null multipart body";
+            make_bucket_on_all(&disk_stores, bucket).await;
+            let create_opts = ObjectOptions {
+                versioned: true,
+                version_id: Some(Uuid::nil().to_string()),
+                replication_request: true,
+                ..Default::default()
+            };
+
+            let (upload_id, parts) = stage_upload_with_create_opts(&set_disks, bucket, object, body, &create_opts).await;
+            let complete_opts = ObjectOptions {
+                versioned: true,
+                replication_request: true,
+                ..Default::default()
+            };
+
+            let completed = set_disks
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload_id, parts, &complete_opts)
+                .await
+                .expect("replicated null multipart completion should succeed");
+            assert_eq!(
+                completed.version_id,
+                Some(Uuid::nil()),
+                "replicated completion must publish the source's null version"
+            );
+
+            let current = set_disks
+                .get_object_info(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        versioned: true,
+                        version_id: Some(Uuid::nil().to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("the replica should be addressable as the null version");
+            assert_eq!(current.version_id, Some(Uuid::nil()));
+            assert_eq!(current.size, i64::try_from(body.len()).expect("body length fits i64"));
         }
 
         #[tokio::test]
