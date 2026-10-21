@@ -137,6 +137,26 @@ Mutations after that point are the next cycle's work. This is what makes
 termination possible under continuous writes: the termination condition is
 "no grey bucket in the start snapshot", not "no mutation anywhere".
 
+The start snapshot is read after the bucket listing, not before it. The
+listing window is the gap between the listing cutoff (the dirty-usage
+generation read before `list_bucket_for_scanner`) and that read; under
+sustained writes some bucket is almost always written inside it, so the
+scope cannot require the whole dirty map to be quiet across the listing.
+`snapshot_dirty_usage_buckets_after_listing` keeps every entry recorded at or
+before the cutoff and every later entry for a listed bucket. The only entries
+it leaves out are buckets the listing did not return that became dirty after
+the cutoff: the walk cannot visit them, certification compares generations
+against the snapshot and so never clears them, and
+`pending_dirty_usage_buckets` reports them, so the next cycle lists and
+selects them. A scoped walk therefore needs only `covers_listed_pending`: no
+dirty entry was removed or overwritten by replay during the listing. A
+removal in the window may be a certification against a publication newer
+than the baseline the cycle loaded, and scoping would then reuse a stale
+baseline value for that bucket, so a removal still makes the cycle a full
+walk. The strict `covers_all_pending` (nothing moved at all) keeps gating
+segment-reuse evidence, which binds to an unchanged generation window; a
+cycle admitted only by the weaker rule walks its dirty buckets whole.
+
 Usage is a sum, not a reachability fixed point. A certified bucket's value
 plus an uncertified bucket's last certified value is a valid snapshot, so the
 collector does not need a globally consistent heap to publish. This is why a
@@ -359,7 +379,7 @@ not tuning advice.
 |---|---|
 | Grey buckets are rescanned next cycle | A scoped cycle walks at most a configured number of buckets and objects. Grey buckets beyond that are ordered by waiting age, oldest first, so every bucket is walked within a bounded number of cycles. New names never reorder ahead of an older waiter. |
 | `Status` hits are not namespace activity | A `Status` hit costs one atomic OR on the writeback path and no scanner work. It never triggers a dirty-usage wake. A replication resync therefore adds nothing to scanner load beyond the full walk the cycle already performs. |
-| A `Complete` cycle with pending buckets is a baseline | When the pending set is the whole namespace (a mass write, a disk loss), the next cycle is declared a full sweep explicitly and uses the existing superseded retry backoff schedule. A full sweep is never run under the scoped cycle's wake cadence. |
+| A `Complete` cycle with pending buckets is a baseline | A cycle eligible for a dirty-bucket scope that walks the whole namespace instead (more dirty buckets than one scoped cycle may select, no usable baseline, a dirty entry removed during the listing, unverifiable peer dirty usage) is paced while dirty buckets remain after it: the next cycle waits on the capped retry schedule (5 s doubling) clamped to the configured cycle interval, with the dirty-usage wake disabled and cluster activity deferred. A full sweep is therefore never run under the scoped cycle's wake cadence, and a namespace that stays unscopable is still walked at the ordinary cycle cadence rather than starved. The paced timer wake still requests a scope, and any non-fallback cycle resets the schedule. |
 | Bounded remark | At most one remark pass per cycle, inside the remaining budget. |
 | Old-generation sweep every `M` cycles | The sweep is checkpointed and resumes; it does not restart on a `Namespace` hit. A hit only demotes the bucket to young for the following cycle. |
 | Pacer raises walkers and lowers sleep | CPU and I/O ceilings are absolute. Foreground admission backoff cannot be undercut. Walker count never exceeds the ceiling-derived maximum even when the target is missed. |
@@ -482,15 +502,27 @@ condition before merging.
   dirty map holds the shaded pending buckets, and the published pending list
   also names buckets whose walk stopped early), the attributed guardrail veto
   (`guardrail_veto_total`, `last_guardrail_veto_unix_secs`,
-  `last_guardrail_veto_reason` as `<field>@<host>`), plus the pacer target,
+  `last_guardrail_veto_reason` as `<field>@<host>`), the scope fallback
+  (`scope_fallback_total`, `last_scope_fallback_unix_secs`,
+  `last_scope_fallback_reason`, one of `dirty_snapshot_incomplete`,
+  `dirty_generation_exhausted`, `dirty_bucket_overflow`,
+  `no_listed_dirty_buckets`, `baseline_unavailable`,
+  `peer_scope_unavailable`), plus the pacer target,
   achieved rate, and whether a ceiling is binding. The console marks usage
   stale only for that count or for a guardrail veto.
 - `last_cycle_result` reports `success`, its existing label for a completed
   cycle, for a cycle with pending buckets; `superseded` is reserved for
   guardrail vetoes and the phase-2 peer fallback and should be rare.
-- The superseded retry schedule applies only to guardrail vetoes and to
-  explicit full sweeps. A `Complete` cycle with pending buckets uses the
-  ordinary dirty-usage wake and the next cycle is scoped to the pending set.
+- The superseded retry schedule applies only to guardrail vetoes. A
+  `Complete` scoped cycle with pending buckets uses the ordinary dirty-usage
+  wake and the next cycle is scoped to the pending set. While dirty buckets
+  remain after a full-namespace scope fallback, the next cycle uses the
+  capped retry schedule clamped to the cycle interval (see
+  [Boundedness constraints](#boundedness-constraints)), and the fallback
+  logs `scoped_scan_fallback` with its reason. Cycles that must walk
+  everything regardless (lifecycle or replication rules, deep scans, the
+  first cycle after leadership) are not scope fallbacks and are not
+  reported as such.
 - `rustfs_cluster_usage_objects_snapshot_converged` keeps its meaning.
 
 ## Delivery
