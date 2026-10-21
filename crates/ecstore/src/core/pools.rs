@@ -4143,8 +4143,8 @@ fn runs_decommission(pool: &PoolStatus) -> bool {
 
 /// Returns whether `persisted` withdraws a decommission that `current` still
 /// runs: it has no decommission state, as a clear or the rollback of a fresh
-/// start writes, or it is a terminal record newer than `current`, as the
-/// rollback of a retry restores. Checked against the record read under the
+/// start writes, or it is a terminal record written after `current`'s
+/// generation began, as the rollback of a retry restores. Checked against the record read under the
 /// pool metadata lock before a worker writes, so the worker stops instead of
 /// keeping that stale view alive.
 fn withdraws_running_decommission(current: &PoolStatus, persisted: &PoolStatus) -> bool {
@@ -4154,9 +4154,20 @@ fn withdraws_running_decommission(current: &PoolStatus, persisted: &PoolStatus) 
     match persisted.decommission.as_ref().filter(|info| info.has_decommission_state()) {
         None => true,
         Some(info) => {
-            !is_decommission_active(info.complete, info.failed, info.canceled) && persisted.last_update > current.last_update
+            !is_decommission_active(info.complete, info.failed, info.canceled)
+                && persisted.last_update > running_decommission_generation(current)
         }
     }
+}
+
+/// The generation a running decommission belongs to: its start time, or for a
+/// queued entry the update that queued it. Unlike `last_update`, a local write
+/// that was rejected cannot move it.
+fn running_decommission_generation(pool: &PoolStatus) -> OffsetDateTime {
+    pool.decommission
+        .as_ref()
+        .and_then(|info| info.start_time)
+        .unwrap_or(pool.last_update)
 }
 
 fn pool_decommission_movement_snapshot(
@@ -13920,10 +13931,47 @@ impl ECStore {
     }
 
     async fn save_current_pool_meta(&self, indices: &[usize]) -> Result<()> {
+        self.save_current_pool_meta_checked(indices, None).await
+    }
+
+    /// Saves pool `idx` like `save_current_pool_meta`, unless the record read
+    /// under the pool metadata lock withdrew the decommission that `running`
+    /// (this node's view before the change) was running. A withdrawn worker's
+    /// terminal mark carries no generation of its own, so this is checked here
+    /// rather than by the merge; the persisted record is adopted instead.
+    async fn save_current_pool_meta_unless_withdrawn(&self, idx: usize, running: Option<PoolStatus>) -> Result<()> {
+        match running {
+            Some(running) => self.save_current_pool_meta_checked(&[idx], Some((idx, running))).await,
+            None => self.save_current_pool_meta(&[idx]).await,
+        }
+    }
+
+    async fn save_current_pool_meta_checked(&self, indices: &[usize], running: Option<(usize, PoolStatus)>) -> Result<()> {
         let mut save_guard = self.pool_meta_save_gate.lock().await;
         let (pool_meta_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "pool metadata save failed")
             .await?;
+        if let Some((idx, running)) = running.as_ref()
+            && snapshot
+                .pools
+                .get(*idx)
+                .is_some_and(|persisted| withdraws_running_decommission(running, persisted))
+        {
+            let mut pool_meta = self.pool_meta.write().await;
+            ensure_pool_meta_write_fence(&pool_meta_guard, "pool metadata save failed")?;
+            publish_pool_meta_updates(&mut pool_meta, &snapshot, &[*idx]);
+            drop(pool_meta);
+            self.ctx.advance_data_movement_operation_epoch();
+            warn!(
+                event = EVENT_DECOMMISSION_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = *idx,
+                state = "withdrawn",
+                "Decommission terminal mark skipped because pool metadata withdrew it"
+            );
+            return Err(Error::OperationCanceled);
+        }
         {
             let pool_meta = self.pool_meta.read().await;
             merge_pool_meta_updates_for_save(&mut snapshot, &pool_meta, indices, "pool metadata save failed")?;
@@ -13956,10 +14004,11 @@ impl ECStore {
         generation: OffsetDateTime,
         entry: DecommissionUnresolvedEntry,
     ) -> Result<()> {
-        {
+        let (previous, recorded) = {
             let rebalance_meta = self.rebalance_meta.read().await.clone();
             let mut pool_meta = self.pool_meta.write().await;
             ensure_decommission_ledger_persistence_supported(&pool_meta)?;
+            let previous = pool_meta.pools.get(idx).cloned();
             record_decommission_unresolved_entry(
                 &mut pool_meta,
                 idx,
@@ -13968,10 +14017,23 @@ impl ECStore {
                 OffsetDateTime::now_utc(),
                 rebalance_meta.as_ref(),
             )?;
+            (previous, pool_meta.pools.get(idx).cloned())
+        };
+        if let Err(err) = self.save_current_pool_meta(&[idx]).await {
+            // Undo the unsaved entry unless something else replaced the record
+            // meanwhile, so a rejected save leaves no local-only state behind.
+            let mut pool_meta = self.pool_meta.write().await;
+            if let (Some(previous), Some(recorded)) = (previous, recorded)
+                && pool_meta
+                    .pools
+                    .get(idx)
+                    .is_some_and(|current| PersistedPoolStatus::from(current) == PersistedPoolStatus::from(&recorded))
+            {
+                pool_meta.pools[idx] = previous;
+            }
+            return Err(Error::other(format!("decommission unresolved entry ledger save failed: {err}")));
         }
-        self.save_current_pool_meta(&[idx])
-            .await
-            .map_err(|err| Error::other(format!("decommission unresolved entry ledger save failed: {err}")))
+        Ok(())
     }
 
     async fn save_decommission_progress_checkpoint(&self, idx: usize, generation: OffsetDateTime) -> Result<bool> {
@@ -14124,7 +14186,7 @@ impl ECStore {
         Ok(true)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) async fn save_current_pool_meta_for_decommission_start(
         &self,
         indices: &[usize],
@@ -18384,7 +18446,8 @@ impl ECStore {
     }
 
     async fn decommission_failed_with_owner(&self, idx: usize, owner: Option<&DecommissionCanceler>) -> Result<()> {
-        self.decommission_failed_with_owner_and_save(idx, owner, self.save_current_pool_meta(&[idx]))
+        let running = self.pool_meta.read().await.pools.get(idx).cloned();
+        self.decommission_failed_with_owner_and_save(idx, owner, self.save_current_pool_meta_unless_withdrawn(idx, running))
             .await
     }
 
@@ -18427,7 +18490,10 @@ impl ECStore {
         };
 
         if should_reload_pool_meta && let Err(err) = save_pool_meta.await {
-            if let Some(previous_pool_meta) = previous_pool_meta {
+            // A withdrawn decommission already adopted the persisted record.
+            if !matches!(err, Error::OperationCanceled)
+                && let Some(previous_pool_meta) = previous_pool_meta
+            {
                 let mut pool_meta = self.pool_meta.write().await;
                 rollback_decommission_pool_meta(&mut pool_meta, &previous_pool_meta, &[idx]);
             }
@@ -21778,22 +21844,6 @@ mod tests {
             assert!(err.to_string().contains("superseded this generation"), "{err}");
             assert_pool_zero_at_baseline(&store, "after the peer's stale write").await;
 
-            // A worker that fails, for example on a bucket completion, must not
-            // leave a failed record behind either: terminal records carry no
-            // start_time.
-            peer.decommission_failed_with_owner(0, None)
-                .await
-                .expect_err("a withdrawn decommission must not be marked failed");
-            assert_pool_zero_at_baseline(&store, "after the peer's failure mark").await;
-            {
-                // Restore the running view the failure mark may have reset.
-                let mut pool_meta = peer.pool_meta.write().await;
-                if let Some(info) = pool_meta.pools[0].decommission.as_mut() {
-                    info.failed = false;
-                    info.start_time = Some(generation);
-                }
-            }
-
             // Its progress checkpoint stops it and adopts the rolled back record.
             let err = peer
                 .save_decommission_progress_checkpoint_at(0, generation, OffsetDateTime::now_utc())
@@ -21805,6 +21855,24 @@ mod tests {
                 "the peer must adopt the rolled back record"
             );
             assert_pool_zero_at_baseline(&store, "after the peer's checkpoint").await;
+
+            // A worker that fails, for example on a bucket completion, must not
+            // leave a failed record behind either: terminal records carry no
+            // start_time.
+            {
+                let mut pool_meta = peer.pool_meta.write().await;
+                pool_meta.pools[0].decommission = Some(PoolDecommissionInfo {
+                    start_time: Some(generation),
+                    ..Default::default()
+                });
+            }
+            let err = peer
+                .decommission_failed_with_owner(0, None)
+                .await
+                .expect_err("a withdrawn decommission must not be marked failed");
+            assert!(matches!(err, Error::OperationCanceled), "{err:?}");
+            assert!(local_decommission_state(&*peer.pool_meta.read().await).is_none());
+            assert_pool_zero_at_baseline(&store, "after the peer's failure mark").await;
             rx.cancel();
         });
     }
@@ -21844,80 +21912,110 @@ mod tests {
         });
     }
 
+    fn test_unresolved_entry(object: &str, generation: OffsetDateTime) -> DecommissionUnresolvedEntry {
+        DecommissionUnresolvedEntry {
+            bucket: "bucket".to_string(),
+            object: object.to_string(),
+            pool_index: 0,
+            set_index: 0,
+            source_generation: generation,
+            candidate_count: 1,
+            disk_error_count: 0,
+            observed_at: OffsetDateTime::now_utc(),
+            reason: "test".to_string(),
+        }
+    }
+
+    async fn persisted_pool_zero(store: &ECStore) -> PersistedPoolStatus {
+        let persisted = load_pool_meta_replicas(store.pools.clone(), true)
+            .await
+            .expect("pool metadata should be readable");
+        PersistedPoolStatus::from(&persisted.meta.pools[0])
+    }
+
+    /// Fails a first attempt on pool 0 with one unresolved entry, then runs a
+    /// retry start that the peer reloads before the leader rolls it back.
+    /// Returns the retry generation and the record the rollback restored.
+    async fn roll_back_a_retry_seen_by_a_peer(store: &Arc<ECStore>, peer: &ECStore) -> (OffsetDateTime, PersistedPoolStatus) {
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("the first attempt should start");
+        let first = store
+            .active_decommission_generation(0)
+            .await
+            .expect("the first attempt should be active");
+        store
+            .persist_decommission_unresolved_entry(0, first, test_unresolved_entry("object", first))
+            .await
+            .expect("the unresolved entry should persist");
+        store
+            .decommission_failed_with_owner(0, None)
+            .await
+            .expect("the first attempt should fail");
+        let failed = persisted_pool_zero(store).await;
+        assert!(
+            failed
+                .decommission
+                .as_ref()
+                .is_some_and(|info| info.failed && info.start_time.is_none()),
+            "{failed:?}"
+        );
+
+        let rx = CancellationToken::new();
+        let (start, reload) = start_paused_before_failing_reload(store, &rx).await;
+        peer.reload_pool_meta().await.expect("the peer should reload the retry");
+        let generation = local_decommission_state(&*peer.pool_meta.read().await)
+            .filter(|info| !info.failed)
+            .and_then(|info| info.start_time)
+            .expect("the peer should see the retry generation");
+
+        let message = finish_start_with_failed_reload(start, &reload).await;
+        assert!(message.contains("decommission start rollback succeeded"), "{message}");
+        rx.cancel();
+        let restored = persisted_pool_zero(store).await;
+        assert_eq!(
+            restored.decommission.as_ref().map(|info| (info.failed, info.start_time)),
+            failed.decommission.as_ref().map(|info| (info.failed, info.start_time)),
+            "the rollback must restore the failed record"
+        );
+        (generation, restored)
+    }
+
+    fn peer_adopted_failed_record(pool_meta: &PoolMeta) -> bool {
+        local_decommission_state(pool_meta).is_some_and(|info| info.failed)
+    }
+
     #[test]
     #[serial_test::serial]
     fn decommission_retry_rollback_fences_a_peer_worker_that_started_before_it() {
         run_decommission_start_test("decommission_retry_rollback_fences_a_peer_worker_that_started_before_it", || async {
             let (_temp_dirs, store, peer) = startable_decommission_store().await;
+            let (generation, restored) = roll_back_a_retry_seen_by_a_peer(&store, &peer).await;
 
-            // An earlier attempt failed with one unresolved entry, so the next
-            // start is a retry and its rollback restores that failed record.
-            store
-                .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            // The peer's worker records an unresolved entry; the save is
+            // rejected and must not leave the entry or a newer last_update in
+            // the peer's memory.
+            peer.persist_decommission_unresolved_entry(0, generation, test_unresolved_entry("later", generation))
                 .await
-                .expect("the first attempt should start");
-            let first = store
-                .active_decommission_generation(0)
-                .await
-                .expect("the first attempt should be active");
-            store
-                .persist_decommission_unresolved_entry(
-                    0,
-                    first,
-                    DecommissionUnresolvedEntry {
-                        bucket: "bucket".to_string(),
-                        object: "object".to_string(),
-                        pool_index: 0,
-                        set_index: 0,
-                        source_generation: first,
-                        candidate_count: 1,
-                        disk_error_count: 0,
-                        observed_at: OffsetDateTime::now_utc(),
-                        reason: "test".to_string(),
-                    },
-                )
-                .await
-                .expect("the unresolved entry should persist");
-            store
-                .decommission_failed_with_owner(0, None)
-                .await
-                .expect("the first attempt should fail");
-            let is_failed_baseline = |selection: &PoolMetaSelection| {
-                persisted_decommission(selection)
-                    .is_some_and(|info| info.failed && info.start_time.is_none() && info.unresolved_entries.len() == 1)
-            };
-            assert!(is_failed_baseline(
-                &load_pool_meta_replicas(store.pools.clone(), true)
-                    .await
-                    .expect("pool metadata should be readable")
-            ));
+                .expect_err("a peer must not record entries for a rolled back retry");
+            assert!(
+                local_decommission_state(&*peer.pool_meta.read().await)
+                    .is_some_and(|info| !info.failed && info.unresolved_entries.len() == 1),
+                "a rejected save must leave the peer's view as it was"
+            );
 
-            let rx = CancellationToken::new();
-            let (start, reload) = start_paused_before_failing_reload(&store, &rx).await;
-            peer.reload_pool_meta().await.expect("the peer should reload the retry");
-            let generation = local_decommission_state(&*peer.pool_meta.read().await)
-                .filter(|info| !info.failed)
-                .and_then(|info| info.start_time)
-                .expect("the peer should see the retry generation");
-
-            let message = finish_start_with_failed_reload(start, &reload).await;
-            assert!(message.contains("decommission start rollback succeeded"), "{message}");
-            assert!(is_failed_baseline(
-                &load_pool_meta_replicas(store.pools.clone(), true)
-                    .await
-                    .expect("pool metadata should be readable")
-            ));
-
-            // The peer's worker checkpoints after the rollback.
+            // Its next checkpoint stops it and adopts the restored record.
             let err = peer
                 .save_decommission_progress_checkpoint_at(0, generation, OffsetDateTime::now_utc() + Duration::seconds(31))
                 .await
                 .expect_err("a peer must not checkpoint a rolled back retry");
             assert!(matches!(err, Error::OperationCanceled), "{err:?}");
             assert!(
-                local_decommission_state(&*peer.pool_meta.read().await).is_some_and(|info| info.failed),
+                peer_adopted_failed_record(&*peer.pool_meta.read().await),
                 "the peer must adopt the restored failed record"
             );
+            assert_eq!(persisted_pool_zero(&store).await, restored);
 
             // Nor can a direct write of that generation reactivate it.
             {
@@ -21933,12 +22031,100 @@ mod tests {
                 .await
                 .expect_err("a write of the rolled back retry must not reactivate the pool");
             assert!(err.to_string().contains("superseded this generation"), "{err}");
-            assert!(is_failed_baseline(
-                &load_pool_meta_replicas(store.pools.clone(), true)
+            assert_eq!(persisted_pool_zero(&store).await, restored);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_retry_rollback_keeps_the_restored_record_against_a_peer_failure_mark() {
+        run_decommission_start_test(
+            "decommission_retry_rollback_keeps_the_restored_record_against_a_peer_failure_mark",
+            || async {
+                let (_temp_dirs, store, peer) = startable_decommission_store().await;
+                let (generation, restored) = roll_back_a_retry_seen_by_a_peer(&store, &peer).await;
+
+                // A bucket fails after its entry could not be recorded, and the
+                // worker marks the decommission failed.
+                peer.persist_decommission_unresolved_entry(0, generation, test_unresolved_entry("later", generation))
                     .await
-                    .expect("pool metadata should be readable")
-            ));
-            rx.cancel();
+                    .expect_err("a peer must not record entries for a rolled back retry");
+                let err = peer
+                    .decommission_failed_with_owner(0, None)
+                    .await
+                    .expect_err("a peer must not mark a rolled back retry failed");
+                assert!(matches!(err, Error::OperationCanceled), "{err:?}");
+                assert_eq!(
+                    persisted_pool_zero(&store).await,
+                    restored,
+                    "pool.bin must keep the exact record the rollback restored"
+                );
+                assert!(
+                    peer_adopted_failed_record(&*peer.pool_meta.read().await),
+                    "the peer must adopt the restored failed record"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_retry_rollback_withdraws_a_peer_bucket_completion() {
+        run_decommission_start_test("decommission_retry_rollback_withdraws_a_peer_bucket_completion", || async {
+            let (_temp_dirs, store, peer) = startable_decommission_store().await;
+            let (generation, restored) = roll_back_a_retry_seen_by_a_peer(&store, &peer).await;
+
+            let bucket = DecomBucketInfo {
+                name: "bucket".to_string(),
+                prefix: String::new(),
+            };
+            let err = peer
+                .mark_decommission_bucket_done_and_save(0, generation, &bucket)
+                .await
+                .expect_err("a peer must not complete a bucket of a rolled back retry");
+            assert!(matches!(err, Error::OperationCanceled), "{err:?}");
+            assert!(
+                peer_adopted_failed_record(&*peer.pool_meta.read().await),
+                "the peer must adopt the restored failed record"
+            );
+            assert_eq!(persisted_pool_zero(&store).await, restored);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_checkpoint_stops_a_worker_whose_generation_was_replaced() {
+        run_decommission_start_test("decommission_checkpoint_stops_a_worker_whose_generation_was_replaced", || async {
+            let (_temp_dirs, store, peer) = startable_decommission_store().await;
+            store
+                .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+                .await
+                .expect("the start should persist");
+            peer.reload_pool_meta().await.expect("the peer should reload the start");
+            let generation = local_decommission_state(&*peer.pool_meta.read().await)
+                .and_then(|info| info.start_time)
+                .expect("the peer should see the generation");
+
+            // A later start replaced the active record; it is still active, so
+            // nothing withdrew it, but it belongs to another generation.
+            {
+                let mut pool_meta = store.pool_meta.write().await;
+                let later = OffsetDateTime::now_utc() + Duration::seconds(1);
+                pool_meta.pools[0].last_update = later;
+                if let Some(info) = pool_meta.pools[0].decommission.as_mut() {
+                    info.start_time = Some(later);
+                }
+            }
+            store
+                .save_current_pool_meta_for_test(&[0])
+                .await
+                .expect("the later start should persist");
+
+            let err = peer
+                .save_decommission_progress_checkpoint_at(0, generation, OffsetDateTime::now_utc() + Duration::seconds(31))
+                .await
+                .expect_err("a worker of a replaced generation must stop at its checkpoint");
+            assert!(matches!(err, Error::OperationCanceled), "{err:?}");
         });
     }
 
@@ -30975,6 +31161,11 @@ mod pools_tests {
             ..Default::default()
         });
         assert!(withdraws_running_decommission(&current.pools[0], &restored.pools[0]));
+        // The running generation, not a last_update a rejected local write
+        // may have raised, decides it.
+        let mut raised = running.clone();
+        raised.pools[0].last_update = generation + Duration::seconds(2);
+        assert!(withdraws_running_decommission(&raised.pools[0], &restored.pools[0]));
         assert!(!merge_pool_status_refresh(&mut current, restored, &[true]));
         assert!(current.pools[0].decommission.as_ref().is_some_and(|info| !info.failed));
 
