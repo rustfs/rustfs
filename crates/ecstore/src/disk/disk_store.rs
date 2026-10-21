@@ -1582,6 +1582,16 @@ impl LocalDiskWrapper {
         self.disk.clone()
     }
 
+    /// Only suppresses idle monitoring; request paths still validate the format on disk.
+    pub(crate) async fn can_skip_background_probe(&self) -> bool {
+        if self.runtime_state() != RuntimeDriveHealthState::Online {
+            return false;
+        }
+        let observed = self.disk.format_info.read().await.id;
+        let expected = *self.disk_id.read().await;
+        observed.is_some_and(|id| !id.is_nil()) && observed == expected
+    }
+
     #[cfg(test)]
     pub(crate) fn background_io_admissions_for_tests(&self) -> usize {
         self.io_admission.background_admissions_for_tests()
