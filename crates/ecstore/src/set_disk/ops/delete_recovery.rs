@@ -42,9 +42,28 @@ pub(crate) mod test_hooks {
     type Hook = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 
     static BEFORE_GC_FINALIZE: Mutex<Vec<(String, String, Hook)>> = Mutex::new(Vec::new());
+    static CLEANUP_ATTEMPTS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+    pub(super) fn record_cleanup_attempt(bucket: &str, object: &str) {
+        CLEANUP_ATTEMPTS
+            .lock()
+            .expect("cleanup attempts")
+            .push((bucket.to_owned(), object.to_owned()));
+    }
+
+    /// Inline cleanup attempts made by `publish_delete_commit` for this key.
+    pub(crate) fn cleanup_attempts(bucket: &str, object: &str) -> usize {
+        CLEANUP_ATTEMPTS
+            .lock()
+            .expect("cleanup attempts")
+            .iter()
+            .filter(|(attempt_bucket, attempt_object)| attempt_bucket == bucket && attempt_object == object)
+            .count()
+    }
 
     /// Runs `hook` once, after the key-wide GC inspection and before its
-    /// finalization, the next time `bucket/object` reaches that point.
+    /// finalization, the next time `bucket/object` reaches that point. Hooks
+    /// for the same key run in registration order.
     pub(crate) fn before_gc_finalize(bucket: &str, object: &str, hook: Hook) {
         BEFORE_GC_FINALIZE
             .lock()
@@ -58,7 +77,7 @@ pub(crate) mod test_hooks {
             hooks
                 .iter()
                 .position(|(hook_bucket, hook_object, _)| hook_bucket == bucket && hook_object == object)
-                .map(|index| hooks.swap_remove(index).2)
+                .map(|index| hooks.remove(index).2)
         };
         if let Some(hook) = hook {
             hook().await;
@@ -400,6 +419,8 @@ impl SetDisks {
         let ticket = context.recovery_ticket.clone();
         let mut attempt = 1;
         let cleanup = loop {
+            #[cfg(test)]
+            test_hooks::record_cleanup_attempt(bucket, object);
             match self.recover_delete_key(bucket, object, context.clone()).await {
                 // A stale settlement fingerprint only means the snapshot raced
                 // another writer; each attempt re-inspects every participant.
@@ -2761,5 +2782,153 @@ mod tests {
             .delete_bucket(bucket, &DeleteBucketOptions::default())
             .await
             .expect("an emptied bucket is deletable without background recovery");
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("captured logs").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct PublishedCleanup {
+        attempts: usize,
+        gc_reached: usize,
+        proof_retained: bool,
+        hint_pending: bool,
+        logs: String,
+    }
+
+    /// Publishes a certified delete while the first `stale_attempts` inline
+    /// cleanup attempts each find a fresh change of this key's own evidence
+    /// between GC inspection and finalization.
+    async fn published_cleanup(bucket: &str, stale_attempts: usize, lose_fence_after_first: bool) -> PublishedCleanup {
+        use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let (dirs, store, disks) = fixture(bucket).await;
+        put(&store, bucket, &vec![61; 4096], false).await;
+        let transaction = applied(&store, &disks, bucket, None, disks.len()).await;
+        let set = &store.pools[0].disk_set[0];
+        let key = crate::store::delete_recovery_runtime::DeleteRecoveryKey {
+            pool: 0,
+            set: 0,
+            bucket: bucket.to_owned(),
+            object: "object".to_owned(),
+            incarnation: None,
+        };
+        let ticket = set.ctx.delete_recovery_hints().register(key.clone());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let fence_armed = Arc::new(AtomicBool::new(false));
+        let root = dirs[0].path().join(bucket).join("object");
+        for stale in 0..=stale_attempts {
+            let attempts = attempts.clone();
+            let fence_armed = fence_armed.clone();
+            let root = root.clone();
+            test_hooks::before_gc_finalize(
+                bucket,
+                "object",
+                Arc::new(move || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    if stale < stale_attempts {
+                        // A root file is this key's own evidence.
+                        std::fs::write(root.join(format!("stale-{attempt}")), b"x").expect("change own evidence");
+                        if lose_fence_after_first {
+                            fence_armed.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    Box::pin(async {})
+                }),
+            );
+        }
+        // Once armed, the fence survives this attempt's per-drive settlements
+        // and is lost before the retry decision.
+        let settlements = AtomicIsize::new(isize::try_from(disks.len()).expect("drive count"));
+        let can_commit = || !fence_armed.load(Ordering::SeqCst) || settlements.fetch_sub(1, Ordering::SeqCst) > 0;
+        let logs = CapturedLogs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .without_time(),
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let _callsite_pin = crate::test_tracing::pin_callsite_interest_for_test();
+        set.publish_delete_commit(
+            bucket,
+            "object",
+            transaction,
+            &set.disk_inventory().await,
+            set.set_drive_count / 2 + 1,
+            DeleteRecoveryContext {
+                recovery_ticket: ticket,
+                ..DeleteRecoveryContext::new(None, &can_commit)
+            },
+        )
+        .await
+        .expect("a certified decision reports success regardless of cleanup");
+        let mut proof_retained = false;
+        for disk in &disks {
+            proof_retained |= !disk
+                .discover_delete_transactions(bucket, Some("object"), None, 128)
+                .await
+                .expect("discover delete proof")
+                .transactions
+                .is_empty();
+        }
+        let logs = String::from_utf8(logs.0.lock().expect("captured logs").clone()).expect("UTF-8 logs");
+        PublishedCleanup {
+            attempts: test_hooks::cleanup_attempts(bucket, "object"),
+            gc_reached: attempts.load(Ordering::SeqCst),
+            proof_retained,
+            hint_pending: set.ctx.delete_recovery_hints().is_pending(&key),
+            logs,
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_published_cleanup_retries_stale_fingerprint() {
+        let outcome = published_cleanup("recover-cleanup-retry", 1, false).await;
+        assert_eq!(outcome.attempts, 2, "the stale attempt is retried from a fresh inspection");
+        assert_eq!(outcome.gc_reached, 2);
+        assert!(!outcome.proof_retained, "the retry finalizes the decision");
+        assert!(!outcome.hint_pending, "a converged key acknowledges its hint");
+        assert!(!outcome.logs.contains(EVENT_DELETE_RECOVERY_CLEANUP_DEFERRED), "{}", outcome.logs);
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_published_cleanup_retry_is_bounded() {
+        let outcome = published_cleanup("recover-cleanup-bounded", PUBLISHED_CLEANUP_ATTEMPTS, false).await;
+        assert_eq!(outcome.attempts, PUBLISHED_CLEANUP_ATTEMPTS);
+        assert_eq!(outcome.gc_reached, PUBLISHED_CLEANUP_ATTEMPTS, "every attempt met a stale snapshot");
+        assert!(outcome.proof_retained, "the decision proof remains for background recovery");
+        assert!(outcome.hint_pending, "unfinished cleanup keeps its hint");
+        assert!(
+            outcome.logs.contains(EVENT_DELETE_RECOVERY_CLEANUP_DEFERRED) && outcome.logs.contains("outdated XL meta"),
+            "deferred cleanup must be visible: {}",
+            outcome.logs
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_published_cleanup_does_not_retry_after_fence_loss() {
+        let outcome = published_cleanup("recover-cleanup-fence-lost", 1, true).await;
+        assert_eq!(outcome.attempts, 1, "a lost fence stops further attempts");
+        assert_eq!(outcome.gc_reached, 1);
+        assert!(outcome.proof_retained);
+        assert!(outcome.hint_pending);
+        assert!(
+            outcome.logs.contains(EVENT_DELETE_RECOVERY_CLEANUP_DEFERRED) && outcome.logs.contains("outdated XL meta"),
+            "the stale snapshot, not a retry under a lost fence, is reported: {}",
+            outcome.logs
+        );
     }
 }

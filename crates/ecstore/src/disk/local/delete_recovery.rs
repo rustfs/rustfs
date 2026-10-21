@@ -746,7 +746,9 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
                 return Err(DiskError::InvalidPath);
             }
             let name = entry.file_name().into_string().map_err(|_| DiskError::FileCorrupt)?;
-            let id = Uuid::parse_str(&name).ok();
+            // Protocol directories always use the canonical hyphenated form;
+            // `parse_str` also accepts simple, braced and URN spellings.
+            let id = Uuid::parse_str(&name).ok().filter(|id| name == id.hyphenated().to_string());
             if kind.is_dir() && id.is_none() {
                 // A non-UUID directory is only a prefix of independent child
                 // keys, which settle under their own exact-key locks and may
@@ -3348,10 +3350,16 @@ mod tests {
         // directory as a prefix. Its delete removes `object/child/` under its
         // own exact-key lock, so it can vanish (or appear) between this key's
         // inspection and settlement.
-        for child_appears in [false, true] {
+        // A content-addressed child key may look like a UUID in a spelling
+        // that this protocol never writes.
+        let names = ["child".to_owned(), Uuid::new_v4().simple().to_string()];
+        for (child_appears, name) in [false, true]
+            .into_iter()
+            .flat_map(|appears| names.iter().map(move |name| (appears, name)))
+        {
             let (_temp, disk, _info, _original) = fixture().await;
             let root = disk.io_get_object_path("recovery", "object").expect("object path");
-            let child = root.join("child");
+            let child = root.join(name);
             if !child_appears {
                 std::fs::create_dir_all(&child).expect("create child key prefix");
                 std::fs::write(child.join(STORAGE_FORMAT_FILE), b"child").expect("write child key metadata");
@@ -3404,6 +3412,72 @@ mod tests {
             assert_eq!(root.exists(), child_appears, "only a live child key may keep the prefix directory");
             if child_appears {
                 assert_eq!(std::fs::read(child.join(STORAGE_FORMAT_FILE)).expect("child key survives"), b"child");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_fingerprint_still_rejects_own_evidence_changes() {
+        #[derive(Clone, Copy, Debug)]
+        enum Change {
+            RootFile,
+            DataDirPart,
+            DataDir,
+        }
+        for change in [Change::RootFile, Change::DataDirPart, Change::DataDir] {
+            for finalize in [false, true] {
+                let (_temp, disk, _info, _original) = fixture().await;
+                let root = disk.io_get_object_path("recovery", "object").expect("object path");
+                // An unreferenced data dir that exists before inspection.
+                let data_dir = root.join(Uuid::new_v4().to_string());
+                std::fs::create_dir(&data_dir).expect("create data dir");
+                let transaction = Uuid::new_v4();
+                let mut observed = apply(&disk, transaction).await;
+                if finalize {
+                    let committed = disk
+                        .settle_delete_transaction(
+                            "recovery",
+                            "object",
+                            transaction,
+                            observed.fingerprint,
+                            DeleteRecoveryAction::PublishCommit,
+                        )
+                        .await
+                        .expect("durable set decision");
+                    let finished = disk
+                        .settle_delete_transaction(
+                            "recovery",
+                            "object",
+                            transaction,
+                            committed.fingerprint,
+                            DeleteRecoveryAction::FinishCommit,
+                        )
+                        .await
+                        .expect("physical cleanup");
+                    assert_eq!(finished.state, DeleteRecoveryState::CommitFinished);
+                    observed = disk
+                        .inspect_delete_transaction("recovery", "object", transaction)
+                        .await
+                        .expect("GC inspection");
+                }
+                match change {
+                    Change::RootFile => std::fs::write(root.join("part.1"), b"x").expect("write root file"),
+                    Change::DataDirPart => std::fs::write(data_dir.join("part.1"), b"x").expect("write data dir part"),
+                    Change::DataDir => std::fs::create_dir(root.join(Uuid::new_v4().to_string())).expect("create data dir"),
+                }
+                let action = if finalize {
+                    DeleteRecoveryAction::FinalizeCommit
+                } else {
+                    DeleteRecoveryAction::PublishCommit
+                };
+                assert_eq!(
+                    disk.settle_delete_transaction("recovery", "object", transaction, observed.fingerprint, action)
+                        .await
+                        .expect_err("a change of this key's own evidence must invalidate the snapshot"),
+                    DiskError::OutdatedXLMeta,
+                    "{change:?} before {}",
+                    if finalize { "FinalizeCommit" } else { "PublishCommit" }
+                );
             }
         }
     }
