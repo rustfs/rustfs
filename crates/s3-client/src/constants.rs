@@ -34,3 +34,17 @@ pub const UNSIGNED_PAYLOAD_TRAILER: &str = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
 
 pub const ISO8601_DATEFORMAT: &[FormatItem<'_>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]Z");
+
+// S3 response and request headers this client reads or writes.
+pub const X_AMZ_BYPASS_GOVERNANCE_RETENTION: http::HeaderName =
+    http::HeaderName::from_static("x-amz-bypass-governance-retention");
+pub const X_AMZ_DELETE_MARKER: http::HeaderName = http::HeaderName::from_static("x-amz-delete-marker");
+pub const X_AMZ_EXPIRATION: http::HeaderName = http::HeaderName::from_static("x-amz-expiration");
+pub const X_AMZ_OBJECT_LOCK_LEGAL_HOLD: http::HeaderName = http::HeaderName::from_static("x-amz-object-lock-legal-hold");
+pub const X_AMZ_OBJECT_LOCK_MODE: http::HeaderName = http::HeaderName::from_static("x-amz-object-lock-mode");
+pub const X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE: http::HeaderName =
+    http::HeaderName::from_static("x-amz-object-lock-retain-until-date");
+pub const X_AMZ_REPLICATION_STATUS: http::HeaderName = http::HeaderName::from_static("x-amz-replication-status");
+pub const X_AMZ_STORAGE_CLASS: http::HeaderName = http::HeaderName::from_static("x-amz-storage-class");
+pub const X_AMZ_VERSION_ID: http::HeaderName = http::HeaderName::from_static("x-amz-version-id");
+pub const X_AMZ_WEBSITE_REDIRECT_LOCATION: http::HeaderName = http::HeaderName::from_static("x-amz-website-redirect-location");

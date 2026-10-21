@@ -19,6 +19,7 @@
 #![allow(clippy::all)]
 
 use crate::bucket_cache::BucketLocationCache;
+use crate::remote_error_code::RemoteErrorCode;
 use crate::{
     api_error_response::ErrorResponse,
     api_error_response::{err_invalid_argument, http_resp_to_error_response, to_error_response},
@@ -50,6 +51,7 @@ use md5::Digest;
 use md5::Md5;
 use rand::{Rng, RngExt};
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
+use rustfs_gateway_types::dto::{Owner, ReplicationStatus};
 use rustfs_rio::HashReader;
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::{
@@ -62,9 +64,6 @@ use rustfs_utils::{
 };
 use rustls_pki_types::PrivateKeyDer;
 use rustls_pki_types::pem::PemObject;
-use s3s::S3ErrorCode;
-use s3s::dto::Owner;
-use s3s::dto::ReplicationStatus;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::error::Error as StdError;
@@ -769,7 +768,7 @@ impl TransitionClient {
                 http_resp_to_error_response(resp_status, &h, body_vec, &metadata.bucket_name, &metadata.object_name);
             let routing_region = parsed_error.region;
             let code = match parsed_error.code {
-                S3ErrorCode::Custom(_) => S3ErrorCode::ResponseInterrupted,
+                code if code.is_custom() => RemoteErrorCode::RESPONSE_INTERRUPTED,
                 code => code,
             };
             let err_response = ErrorResponse {
@@ -783,11 +782,11 @@ impl TransitionClient {
 
             if self.region == "" {
                 return match err_response.code {
-                    S3ErrorCode::AuthorizationHeaderMalformed | S3ErrorCode::InvalidArgument /*S3ErrorCode::InvalidRegion*/ => {
+                    RemoteErrorCode::AUTHORIZATION_HEADER_MALFORMED | RemoteErrorCode::INVALID_ARGUMENT /*RemoteErrorCode::INVALID_REGION*/ => {
                         //break;
                         Err(std::io::Error::other(err_response))
                     }
-                    S3ErrorCode::AccessDenied => {
+                    RemoteErrorCode::ACCESS_DENIED => {
                         if routing_region.is_empty() {
                             return Err(std::io::Error::other(err_response));
                         }
@@ -1339,7 +1338,7 @@ pub struct ObjectInfo {
 }
 
 fn replication_status_default() -> ReplicationStatus {
-    ReplicationStatus::from_static(ReplicationStatus::PENDING)
+    ReplicationStatus::PENDING
 }
 
 impl Default for ObjectInfo {
@@ -1359,7 +1358,7 @@ impl Default for ObjectInfo {
             is_latest: false,
             is_delete_marker: false,
             version_id: None,
-            replication_status: ReplicationStatus::from_static(ReplicationStatus::PENDING),
+            replication_status: ReplicationStatus::PENDING,
             replication_ready: false,
             expiration: OffsetDateTime::now_utc(),
             expiration_rule_id: "".to_string(),
@@ -1594,13 +1593,13 @@ pub fn to_object_info_for_provider(
     // Get replication status
     let replication_status = {
         let status_str = get_header("x-amz-replication-status");
-        ReplicationStatus::from_static(match status_str.as_str() {
+        match status_str.as_str() {
             "COMPLETE" => ReplicationStatus::COMPLETE,
             "PENDING" => ReplicationStatus::PENDING,
             "FAILED" => ReplicationStatus::FAILED,
             "REPLICA" => ReplicationStatus::REPLICA,
             _ => ReplicationStatus::PENDING,
-        })
+        }
     };
 
     // Extract expiration rule ID and time (simplified)

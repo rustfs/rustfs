@@ -18,7 +18,7 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use s3s::dto::Owner;
+use rustfs_gateway_types::dto::Owner;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use time::OffsetDateTime;

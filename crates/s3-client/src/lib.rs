@@ -35,6 +35,7 @@ pub mod checksum;
 pub mod constants;
 pub mod credentials;
 pub mod provider_versions;
+pub mod remote_error_code;
 pub mod runtime_sources;
 pub mod signer_error;
 pub mod transition_api;
