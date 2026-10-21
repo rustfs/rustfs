@@ -712,6 +712,15 @@ impl FileMeta {
     /// Apply a disk deletion batch while compacting inline payloads only once.
     /// Missing non-marker requests retain the disk layer's idempotent semantics.
     pub fn delete_versions(&mut self, requests: &[FileInfo]) -> Result<Vec<Option<Uuid>>> {
+        let index = inline_data::BatchDeleteIndex::new(self, requests);
+        self.delete_versions_with_index(requests, index)
+    }
+
+    fn delete_versions_with_index(
+        &mut self,
+        requests: &[FileInfo],
+        mut index: Option<inline_data::BatchDeleteIndex>,
+    ) -> Result<Vec<Option<Uuid>>> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
@@ -733,7 +742,20 @@ impl FileMeta {
                     inline_keys.contains(vid.hyphenated().encode_lower(&mut uuid_buf).as_bytes())
                 }
             };
-            match self.delete_version_inner(request, Some(has_inline_data)) {
+            let indexed = index
+                .as_mut()
+                .map(|index| index.delete(&self.versions, request, has_inline_data));
+            let result = match indexed {
+                Some(Ok(inline_data::IndexedDelete::Applied(dir))) => Ok(dir),
+                Some(Err(error)) => Err(error),
+                _ => {
+                    if let Some(index) = index.take() {
+                        index.finish(&mut self.versions);
+                    }
+                    self.delete_version_inner(request, Some(has_inline_data))
+                }
+            };
+            match result {
                 Ok(data_dir) => {
                     if let Some(dir) = data_dir {
                         for key in [request.version_id.unwrap_or_default(), dir] {
@@ -751,6 +773,9 @@ impl FileMeta {
                     break;
                 }
             }
+        }
+        if let Some(index) = index {
+            index.finish(&mut self.versions);
         }
         self.data.remove_keys(&removed_keys)?;
         if let Some(err) = failure {
