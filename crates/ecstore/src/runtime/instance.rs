@@ -335,6 +335,9 @@ impl InstanceContext {
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        // Capture before spawning: Tokio tasks do not inherit request task-locals.
+        let context = rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context();
+        let mutation = rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(context, mutation);
         self.detached_mutations.spawn(mutation.in_current_span()).await
     }
 
@@ -1032,6 +1035,78 @@ mod tests {
         release_tx.send(()).expect("the detached mutation should still be waiting");
         assert!(ctx.wait_for_detached_mutations(std::time::Duration::from_secs(5)).await);
         assert!(finished.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn detached_mutations_keep_operation_and_guards_after_caller_drops() {
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, current_s3_http_operation_name, with_s3_http_operation_context,
+        };
+
+        let mut request = S3HttpRequestGuard::new("DELETE");
+        let operation = request.in_scope(|| {
+            rustfs_io_metrics::s3_http_metrics::observe_s3_http_operation(rustfs_s3_ops::S3Operation::DeleteObject);
+            current_s3_http_operation_context().expect("delete operation was captured")
+        });
+        for parent in [Some(operation), None] {
+            let ctx = InstanceContext::new();
+            let gate = Arc::new(RwLock::new(()));
+            let guard = gate.clone().read_owned().await;
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let expected = parent.map(|_| "s3:DeleteObject");
+            let mut caller = Box::pin(with_s3_http_operation_context(
+                parent,
+                ctx.run_detached_mutation(async move {
+                    release_rx.await.expect("release detached mutation");
+                    result_tx
+                        .send(current_s3_http_operation_name())
+                        .expect("report detached operation");
+                    drop(guard);
+                }),
+            ));
+            assert!(futures::poll!(caller.as_mut()).is_pending());
+            drop(caller);
+            assert_eq!(current_s3_http_operation_name(), None, "parent scope was restored");
+            assert_eq!(ctx.detached_mutation_count(), 1);
+            assert!(gate.try_write().is_err(), "mutation retains the owned guard after caller cancellation");
+            release_tx.send(()).expect("detached mutation is still alive");
+            assert_eq!(result_rx.await.expect("detached operation result"), expected);
+            assert!(ctx.wait_for_detached_mutations(std::time::Duration::from_secs(5)).await);
+            assert!(gate.try_write().is_ok(), "completion releases the mutation guard");
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_mutation_captures_operation_when_polled_and_keeps_results() {
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, current_s3_http_operation_name, observe_s3_http_operation,
+            with_s3_http_operation_context,
+        };
+
+        let mut request = S3HttpRequestGuard::new("PUT");
+        let operation = request.in_scope(|| {
+            observe_s3_http_operation(rustfs_s3_ops::S3Operation::PutObject);
+            current_s3_http_operation_context().expect("PUT operation context")
+        });
+        let ctx = InstanceContext::new();
+        let mutation = ctx.run_detached_mutation(async { (current_s3_http_operation_name(), Err::<(), _>("mutation failure")) });
+        let result = with_s3_http_operation_context(Some(operation), mutation)
+            .await
+            .expect("mutation task completes");
+        assert_eq!(result, (Some("s3:PutObject"), Err("mutation failure")));
+        assert_eq!(current_s3_http_operation_name(), None);
+
+        let mutation = request.in_scope(|| ctx.run_detached_mutation(async { current_s3_http_operation_name() }));
+        assert_eq!(mutation.await.expect("unscoped poll completes"), None);
+
+        let failure =
+            with_s3_http_operation_context(Some(operation), ctx.run_detached_mutation(async { panic!("mutation panic") }))
+                .await
+                .expect_err("child panic remains a join failure");
+        assert!(failure.is_panic());
+        assert_eq!(current_s3_http_operation_name(), None);
+        assert!(ctx.wait_for_detached_mutations(std::time::Duration::from_secs(5)).await);
     }
 
     // A fresh context (before any update) reflects the initial all-false state.
