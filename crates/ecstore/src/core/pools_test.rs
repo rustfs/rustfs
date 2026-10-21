@@ -947,6 +947,186 @@ mod decommission_lock_order_tests {
         );
     }
 
+    /// A source cleanup that keeps losing quorum through its in-place retries
+    /// is deferred, replayed at the end of the round and completed. The source
+    /// is removed, the bucket finishes, and the entry's version is counted once
+    /// even though the replay walks it again.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_defers_cleanup_quorum_failure_and_completes_on_replay() {
+        run_large_stack_async_test("decommission-cleanup-quorum-replay", || async {
+            let (_temp_dirs, store, bucket) = new_stale_target_store("cleanup-quorum-replay").await;
+            let object = "cleanup-quorum.bin";
+            // Large enough that the small `.rustfs.sys` objects the routine also
+            // moves cannot account for a second count of it.
+            let object_size = 1 << 20;
+            put_source_object(&store, &bucket, object, vec![0x5c; object_size]).await;
+
+            // Every in-place attempt of the first pass fails; the replay succeeds.
+            let failing_calls = crate::core::pools::DECOMMISSION_SOURCE_CLEANUP_QUORUM_MAX_ATTEMPTS;
+            let cleanup_calls = Arc::new(AtomicUsize::new(0));
+            let _fault = DecommissionTestFaultGuard::install_with_error(
+                Arc::new({
+                    let cleanup_calls = Arc::clone(&cleanup_calls);
+                    let bucket = bucket.clone();
+                    move |stage, entry_bucket, entry_object, _, _| {
+                        stage == "source_cleanup"
+                            && entry_bucket == bucket
+                            && entry_object == object
+                            && cleanup_calls.fetch_add(1, Ordering::AcqRel) < failing_calls
+                    }
+                }),
+                Some(Arc::new(|_, _, _| crate::error::Error::ErasureWriteQuorum)),
+            );
+
+            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+            start_routine_decommission_with_capacity(
+                &store,
+                &bucket,
+                vec![
+                    DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64 << 20, 64 << 20),
+                    DecommissionPoolCapacityInfo::for_test(1, layout, 1 << 30, 1 << 30, 0),
+                    DecommissionPoolCapacityInfo::for_test(2, layout, 1 << 30, 1 << 30, 0),
+                ],
+                0,
+            )
+            .await;
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the decommission routine task should join")
+                .expect("the decommission routine should return");
+
+            assert_eq!(
+                cleanup_calls.load(Ordering::Acquire),
+                failing_calls + 1,
+                "the first pass exhausts its in-place retries and the replay cleans up once"
+            );
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert!(
+                info.complete && !info.failed && !info.canceled && info.capacity_blocked_reason.is_none(),
+                "a deferred cleanup that succeeds on replay must complete the decommission: complete={}, failed={}, canceled={}, blocked_reason={:?}",
+                info.complete,
+                info.failed,
+                info.canceled,
+                info.capacity_blocked_reason
+            );
+            assert!(!info.queued_buckets.contains(&bucket), "the bucket must be popped: {info:?}");
+            assert!(
+                info.bytes_done >= object_size && info.bytes_done < 2 * object_size,
+                "the replay must not count the version again: bytes_done={}",
+                info.bytes_done
+            );
+            assert_eq!(info.items_decommission_failed, 0);
+            drop(local);
+
+            let source = store.pools[0]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(&bucket, object)
+                .await
+                .expect("the source versions should decode");
+            assert!(
+                source.is_none_or(|versions| versions.versions.is_empty()),
+                "the replayed cleanup must remove the source"
+            );
+            let mut on_targets = 0;
+            for target_pool_index in [1, 2] {
+                let target = store.pools[target_pool_index]
+                    .get_disks_by_key(object)
+                    .load_file_info_versions_exact(&bucket, object)
+                    .await
+                    .expect("the target versions should decode");
+                if target.is_some_and(|versions| !versions.versions.is_empty()) {
+                    on_targets += 1;
+                }
+            }
+            assert_eq!(on_targets, 1, "the object must live on exactly one target pool");
+        });
+    }
+
+    /// A source cleanup that keeps losing quorum through the replay pauses the
+    /// decommission instead of failing it, with a reason that names source
+    /// cleanup rather than target capacity, and leaves the source in place.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_pauses_on_persistent_cleanup_quorum_failure_as_source_cleanup() {
+        run_large_stack_async_test("decommission-cleanup-quorum-pause", || async {
+            let (_temp_dirs, store, bucket) = new_stale_target_store("cleanup-quorum-pause").await;
+            let object = "cleanup-quorum-pause.bin";
+            put_source_object(&store, &bucket, object, b"source cleanup never regains quorum".to_vec()).await;
+
+            let cleanup_calls = Arc::new(AtomicUsize::new(0));
+            let _fault = DecommissionTestFaultGuard::install_with_error(
+                Arc::new({
+                    let cleanup_calls = Arc::clone(&cleanup_calls);
+                    let bucket = bucket.clone();
+                    move |stage, entry_bucket, entry_object, _, _| {
+                        let hit = stage == "source_cleanup" && entry_bucket == bucket && entry_object == object;
+                        if hit {
+                            cleanup_calls.fetch_add(1, Ordering::AcqRel);
+                        }
+                        hit
+                    }
+                }),
+                Some(Arc::new(|_, _, _| crate::error::Error::ErasureWriteQuorum)),
+            );
+
+            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+            start_routine_decommission_with_capacity(
+                &store,
+                &bucket,
+                vec![
+                    DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64 << 20, 64 << 20),
+                    DecommissionPoolCapacityInfo::for_test(1, layout, 1 << 30, 1 << 30, 0),
+                    DecommissionPoolCapacityInfo::for_test(2, layout, 1 << 30, 1 << 30, 0),
+                ],
+                0,
+            )
+            .await;
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the decommission routine task should join")
+                .expect("a paused decommission routine returns without an error");
+
+            assert_eq!(
+                cleanup_calls.load(Ordering::Acquire),
+                2 * crate::core::pools::DECOMMISSION_SOURCE_CLEANUP_QUORUM_MAX_ATTEMPTS,
+                "the first pass and the replay each exhaust their in-place retries"
+            );
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert!(
+                !info.complete && !info.failed && !info.canceled,
+                "a persistent cleanup failure must pause, not finish or fail: complete={}, failed={}, canceled={}",
+                info.complete,
+                info.failed,
+                info.canceled
+            );
+            assert!(info.is_source_cleanup_blocked(), "{:?}", info.capacity_blocked_reason);
+            let reason = info.capacity_blocked_reason.as_deref().unwrap_or_default();
+            assert!(reason.contains("decommission cleanup_delete_object failed for"), "{reason}");
+            assert!(!reason.contains("free drive threshold"), "{reason}");
+            assert!(info.queued_buckets.contains(&bucket), "the bucket must not be marked done: {info:?}");
+            drop(local);
+
+            let source = store.pools[0]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(&bucket, object)
+                .await
+                .expect("the source versions should decode");
+            assert!(
+                source.is_some_and(|versions| !versions.versions.is_empty()),
+                "the source must stay in place while cleanup cannot commit"
+            );
+        });
+    }
+
     #[test]
     #[serial_test::serial]
     fn decommission_reselects_a_target_that_no_longer_fits_after_selection() {
