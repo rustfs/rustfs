@@ -1011,15 +1011,16 @@ impl MrfRuntime {
 
     fn list_unverified_legacy(&self, after: Option<Uuid>, limit: usize) -> MrfLegacyResponsibilitySnapshot {
         let (responsibilities, next_cursor) = self.partial_writes.list_unverified_legacy(after, limit);
+        let lifecycle = self.partial_writes.lifecycle_summary();
         MrfLegacyResponsibilitySnapshot {
             contract_version: 2,
             node_local: true,
             checkpoint_owner: self.runtime_checkpoint.map(|(owner, _)| owner),
             checkpoint_sequence: self.runtime_checkpoint.map(|(_, sequence)| sequence),
-            held_count: self.partial_writes.unverified_legacy_count(),
-            legacy_generation_unknown_count: self.partial_writes.legacy_generation_unknown_count(),
-            bucket_incarnation_changed_count: self.partial_writes.bucket_incarnation_changed_count(),
-            operator_accepted_count: self.partial_writes.operator_accepted_unverified_count(),
+            held_count: lifecycle.held_count,
+            legacy_generation_unknown_count: lifecycle.legacy_generation_unknown_count,
+            bucket_incarnation_changed_count: lifecycle.bucket_incarnation_changed_count,
+            operator_accepted_count: lifecycle.operator_accepted_count,
             responsibilities,
             next_cursor,
         }
@@ -1420,28 +1421,23 @@ impl MrfRuntime {
     fn publish_metrics(&self) {
         gauge!("rustfs_heal_mrf_queue_depth").set(metric_f64(self.queue.depth() + self.partial_writes.depth()));
         gauge!("rustfs_heal_mrf_queue_bytes").set(metric_f64(self.queue.bytes() + self.partial_writes.bytes()));
-        let held = self.partial_writes.unverified_legacy_count();
-        gauge!("rustfs_heal_mrf_unverified_legacy").set(metric_f64(held));
-        gauge!("rustfs_heal_mrf_legacy_generation_unknown")
-            .set(metric_f64(self.partial_writes.legacy_generation_unknown_count()));
-        gauge!("rustfs_heal_mrf_bucket_incarnation_changed")
-            .set(metric_f64(self.partial_writes.bucket_incarnation_changed_count()));
-        gauge!("rustfs_heal_mrf_operator_accepted_unverified")
-            .set(metric_f64(self.partial_writes.operator_accepted_unverified_count()));
+        let lifecycle = self.partial_writes.lifecycle_summary();
+        gauge!("rustfs_heal_mrf_unverified_legacy").set(metric_f64(lifecycle.held_count));
+        gauge!("rustfs_heal_mrf_legacy_generation_unknown").set(metric_f64(lifecycle.legacy_generation_unknown_count));
+        gauge!("rustfs_heal_mrf_bucket_incarnation_changed").set(metric_f64(lifecycle.bucket_incarnation_changed_count));
+        gauge!("rustfs_heal_mrf_operator_accepted_unverified").set(metric_f64(lifecycle.operator_accepted_count));
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or_default();
-        let oldest_age_seconds = self
-            .partial_writes
-            .oldest_unverified_legacy_enqueued_at_ms()
+        let oldest_age_seconds = lifecycle
+            .oldest_unverified_legacy_enqueued_at_ms
             .map(|held_since_ms| now_ms.saturating_sub(held_since_ms) / 1_000)
             .unwrap_or_default();
         gauge!("rustfs_heal_mrf_unverified_legacy_oldest_age_seconds")
             .set(metric_f64(usize::try_from(oldest_age_seconds).unwrap_or(usize::MAX)));
-        let oldest_operator_accepted_age_seconds = self
-            .partial_writes
-            .oldest_operator_accepted_at_ms()
+        let oldest_operator_accepted_age_seconds = lifecycle
+            .oldest_operator_accepted_at_ms
             .map(|accepted_at_ms| now_ms.saturating_sub(accepted_at_ms) / 1_000)
             .unwrap_or_default();
         gauge!("rustfs_heal_mrf_operator_accepted_unverified_oldest_age_seconds")
