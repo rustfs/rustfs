@@ -84,6 +84,8 @@ pub use replication_queue_boundary::{
 };
 pub use replication_resync_boundary::ResyncStatusType;
 pub use replication_resync_boundary::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
+#[cfg(test)]
+pub(crate) use replication_resyncer::read_source_delete_marker;
 pub use replication_scanner_bridge::ReplicationScannerBridge;
 pub use replication_state::{ReplicationStats, RuntimeReplicationTargetBacklog};
 pub use replication_stats_boundary::{BucketReplicationStat, BucketReplicationStats, BucketStats, InQueueMetric, XferStats};
