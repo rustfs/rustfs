@@ -99,11 +99,19 @@ impl From<DecommissionMultipartTargetProofError> for Error {
 /// is a different object. A different version id is a different object. A null
 /// version has one slot per key, so a null target with another modification
 /// time replaced whatever was there: a newer unversioned write that superseded
-/// the source, or an object the staged copy never reached. Either way the
+/// the source, or an object the staged copy never reached. In those cases the
 /// staged copy holds no bytes on the target. `false` means the exact staged
 /// identity is published and owned, so its pending intent stays for the commit
 /// to charge. A versioned target with the staged version id but another
 /// modification time cannot be told apart and fails closed.
+///
+/// Known residual: a metadata-only self-copy (CopyObject with REPLACE) keeps
+/// an object's data and only moves its modification time. If the staged copy
+/// was already published but not yet charged (an adopted completion, or a
+/// pending intent left by an ambiguous commit) and is then rewritten that way,
+/// this cleanup releases its marker and one object's bytes stay uncharged. That
+/// is a bounded estimate error with no data loss; failing closed here instead
+/// stalled the decommission for good, so no fence is added for it.
 fn decommission_multipart_target_clear_pending(opts: &ObjectOptions, target: Option<&ObjectInfo>) -> Result<bool> {
     let expected_mod_time = opts.mod_time.ok_or(DecommissionMultipartTargetProofError::MissingModTime)?;
     let expected_version_id = opts

@@ -2194,6 +2194,75 @@ mod decommission_lock_order_tests {
         });
     }
 
+    /// The target already holds a null object with the multipart source's
+    /// exact identity but without the data-movement ownership proof. The copy
+    /// cannot publish over it, and its cleanup cannot tell whether that object
+    /// is the staged copy. That identity-proof failure must fail the
+    /// decommission with an accurate error, not pause it as a capacity block
+    /// that only a restart could leave (rustfs/backlog#2873).
+    #[test]
+    #[serial_test::serial]
+    fn decommission_fails_instead_of_pausing_on_an_unowned_exact_multipart_target() {
+        run_large_stack_async_test("decommission-unowned-exact-multipart-target", || async {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("unowned-exact-multipart");
+            let object = "multipart.bin";
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create the unversioned bucket");
+            let written = put_source_multipart_object(&store, &bucket, object).await;
+            let unowned = b"same identity, written without a data movement".to_vec();
+            store.pools[1]
+                .put_object(
+                    &bucket,
+                    object,
+                    &mut PutObjReader::from_vec(unowned.clone()),
+                    &ObjectOptions {
+                        mod_time: written.mod_time,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write the unowned exact-identity object on the target");
+            let target = exact_versions(&store, 1, &bucket, object).await;
+            assert_eq!(target.len(), 1);
+            assert!(target[0].version_id.is_none());
+            assert_eq!(target[0].mod_time, written.mod_time, "the target must carry the staged identity");
+
+            start_transitioned_entry_decommission(&store, &bucket).await;
+            let _ = spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the decommission routine task should join");
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert!(
+                info.failed && !info.complete && info.capacity_blocked_reason.is_none(),
+                "an identity-proof failure must fail the decommission, not pause it as a capacity block: complete={}, failed={}, blocked_reason={:?}",
+                info.complete,
+                info.failed,
+                info.capacity_blocked_reason
+            );
+            drop(local);
+
+            assert_eq!(exact_versions(&store, 0, &bucket, object).await.len(), 1, "the source must stay in place");
+            let mut reader = store.pools[1]
+                .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("the unowned target object should stay readable");
+            let mut body = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("drain the unowned target object");
+            assert_eq!(body, unowned);
+        });
+    }
+
     #[test]
     #[serial_test::serial]
     fn decommission_finishes_a_multipart_null_version_superseded_on_target() {
