@@ -8801,7 +8801,7 @@ impl PoolMeta {
         }
     }
 
-    pub fn new(pools: &[Arc<Sets>], prev_meta: &PoolMeta) -> Self {
+    pub fn new(pools: &[Arc<Sets>], prev_meta: &PoolMeta) -> Result<Self> {
         let mut new_meta = Self {
             version: if prev_meta.version == POOL_META_GENERATION_VERSION || pool_meta_v3_writer_enabled() {
                 POOL_META_GENERATION_VERSION
@@ -8814,30 +8814,128 @@ impl PoolMeta {
             ..Default::default()
         };
 
+        let mut new_pool_indices = HashMap::with_capacity(pools.len());
         for (idx, pool) in pools.iter().enumerate() {
-            let mut skip = false;
-
-            for current_pool in prev_meta.pools.iter() {
-                if current_pool.cmd_line == pool.endpoints.cmd_line {
-                    new_meta.pools.push(current_pool.clone());
-                    skip = true;
-                    break;
+            new_pool_indices.entry(pool.endpoints.cmd_line.as_str()).or_insert(idx);
+        }
+        let mut previous_pool_cmd_lines = HashMap::with_capacity(prev_meta.pools.len());
+        for pool in &prev_meta.pools {
+            match previous_pool_cmd_lines.entry(pool.id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(pool.cmd_line.as_str()));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.insert(None);
                 }
             }
+        }
+        let remap_pool_index = |pool_index: usize| {
+            previous_pool_cmd_lines
+                .get(&pool_index)
+                .copied()
+                .flatten()
+                .and_then(|cmd_line| new_pool_indices.get(cmd_line).copied())
+        };
 
-            if skip {
+        for (idx, pool) in pools.iter().enumerate() {
+            let Some(current_pool) = prev_meta
+                .pools
+                .iter()
+                .find(|current_pool| current_pool.cmd_line == pool.endpoints.cmd_line)
+            else {
+                new_meta.pools.push(PoolStatus {
+                    cmd_line: pool.endpoints.cmd_line.clone(),
+                    id: idx,
+                    last_update: OffsetDateTime::now_utc(),
+                    decommission: None,
+                });
                 continue;
-            }
+            };
 
-            new_meta.pools.push(PoolStatus {
-                cmd_line: pool.endpoints.cmd_line.clone(),
-                id: idx,
-                last_update: OffsetDateTime::now_utc(),
-                decommission: None,
-            });
+            let mut retained_pool = current_pool.clone();
+            if let Some(info) = retained_pool.decommission.as_mut() {
+                for entry in &mut info.unresolved_entries {
+                    if remap_pool_index(entry.pool_index) != Some(idx) {
+                        return Err(Error::InvalidArgument(
+                            "pool-metadata".into(),
+                            "rebuild".into(),
+                            format!("cannot reindex unresolved decommission entry for pool {:?}", current_pool.cmd_line),
+                        ));
+                    }
+                    entry.pool_index = idx;
+                }
+
+                if let Some(reservation) = info.capacity_reservation.as_mut() {
+                    if remap_pool_index(reservation.source_pool_index) != Some(idx) {
+                        return Err(Error::InvalidArgument(
+                            "pool-metadata".into(),
+                            "rebuild".into(),
+                            format!(
+                                "found a decommission capacity reservation owned by another pool for {:?}",
+                                current_pool.cmd_line
+                            ),
+                        ));
+                    }
+                    reservation.source_pool_index = idx;
+
+                    let reservation_active = reservation.active();
+                    let mut missing_target = false;
+                    for target in &mut reservation.targets {
+                        if let Some(target_pool_index) = remap_pool_index(target.pool_index) {
+                            target.pool_index = target_pool_index;
+                        } else {
+                            missing_target = true;
+                            if reservation_active {
+                                return Err(Error::InvalidArgument(
+                                    "pool-metadata".into(),
+                                    "rebuild".into(),
+                                    format!(
+                                        "cannot remove target pool {} from an active decommission capacity reservation owned by {:?}",
+                                        target.pool_index, current_pool.cmd_line
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    if missing_target {
+                        info.capacity_reservation = None;
+                    }
+                }
+            }
+            new_meta.pools.push(retained_pool);
         }
 
-        new_meta
+        for pool in &prev_meta.pools {
+            if new_pool_indices.contains_key(pool.cmd_line.as_str()) {
+                continue;
+            }
+            if pool.decommission.as_ref().is_some_and(|info| {
+                !info.unresolved_entries.is_empty()
+                    || info
+                        .capacity_reservation
+                        .as_ref()
+                        .is_some_and(DecommissionCapacityReservation::active)
+            }) {
+                return Err(Error::InvalidArgument(
+                    "pool-metadata".into(),
+                    "rebuild".into(),
+                    format!("cannot remove pool {:?} while decommission recovery state is active", pool.cmd_line),
+                ));
+            }
+        }
+
+        new_meta.reindex_pool_ids();
+        Ok(new_meta)
+    }
+
+    fn pool_ids_are_indexed(&self) -> bool {
+        self.pools.iter().enumerate().all(|(idx, pool)| pool.id == idx)
+    }
+
+    fn reindex_pool_ids(&mut self) {
+        for (idx, pool) in self.pools.iter_mut().enumerate() {
+            pool.id = idx;
+        }
     }
 
     pub fn is_suspended(&self, idx: usize) -> bool {
@@ -10112,7 +10210,10 @@ impl PoolMeta {
             specified_pools.insert(pool.endpoints.cmd_line.clone(), idx);
         }
 
-        let mut update = false;
+        // Pool ids are positional metadata. A completed pool can be removed from
+        // the launch configuration, so an existing status may retain the old id
+        // even when its command line still matches the current topology.
+        let mut update = !self.pool_ids_are_indexed();
 
         // Determine whether the selected pool should be removed from the retired list.
         for k in specified_pools.keys() {
@@ -27272,6 +27373,7 @@ mod pools_tests {
         validate_durable_ilm_record,
     };
     use crate::bucket::metadata_sys;
+    use crate::core::sets::make_local_two_set_sets_for_pool_with_ctx;
     use crate::data_movement;
     use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE, endpoint::Endpoint};
     use crate::error::{Error, StorageError};
@@ -27333,6 +27435,237 @@ mod pools_tests {
 
     fn noop_decommission_list_callback() -> ListCallback {
         Arc::new(|_| Box::pin(async {}))
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_reindexes_ids_after_pool_removal_and_expansion() {
+        let ctx = Arc::new(InstanceContext::new());
+        let (_removed_dirs, mut removed_pool) = make_local_two_set_sets_for_pool_with_ctx(Arc::clone(&ctx), 0).await;
+        let (_surviving_dirs, mut surviving_pool) = make_local_two_set_sets_for_pool_with_ctx(Arc::clone(&ctx), 1).await;
+        let (_added_dirs, mut added_pool) = make_local_two_set_sets_for_pool_with_ctx(ctx, 2).await;
+        Arc::get_mut(&mut removed_pool).unwrap().endpoints.cmd_line = "pool-0".to_string();
+        Arc::get_mut(&mut surviving_pool).unwrap().endpoints.cmd_line = "pool-1".to_string();
+        Arc::get_mut(&mut added_pool).unwrap().endpoints.cmd_line = "pool-2".to_string();
+
+        let stale = PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![
+                PoolStatus {
+                    id: 0,
+                    cmd_line: removed_pool.endpoints.cmd_line.clone(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: Some(PoolDecommissionInfo {
+                        complete: true,
+                        ..Default::default()
+                    }),
+                },
+                PoolStatus {
+                    id: 1,
+                    cmd_line: surviving_pool.endpoints.cmd_line.clone(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: None,
+                },
+            ],
+            dont_save: false,
+        };
+
+        assert!(
+            stale
+                .validate(vec![Arc::clone(&surviving_pool)])
+                .expect("stale pool metadata should validate as a repairable topology update"),
+            "removing a completed pool must trigger startup metadata repair"
+        );
+
+        let repaired = PoolMeta::new(std::slice::from_ref(&surviving_pool), &stale).expect("pool metadata should be rebuilt");
+        assert_eq!(repaired.pools[0].id, 0);
+        let mut persisted = repaired.clone();
+        merge_pool_meta_updates_for_save(&mut persisted, &repaired, &[0], "pool metadata save")
+            .expect("reindexed pool metadata should remain writable");
+
+        let expanded = PoolMeta::new(&[Arc::clone(&surviving_pool), Arc::clone(&added_pool)], &repaired)
+            .expect("expanded pool metadata should be rebuilt");
+        assert_eq!(expanded.pools.iter().map(|pool| pool.id).collect::<Vec<_>>(), [0, 1]);
+
+        let already_corrupt = PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![PoolStatus {
+                id: 1,
+                cmd_line: expanded.pools[0].cmd_line.clone(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: None,
+            }],
+            dont_save: false,
+        };
+        assert!(
+            already_corrupt
+                .validate(vec![Arc::clone(&surviving_pool)])
+                .expect("an already persisted stale id should remain repairable on restart"),
+            "pool id validation must detect stale ids even when the topology is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_reindexes_released_reservations_after_pool_removal() {
+        let ctx = Arc::new(InstanceContext::new());
+        let (_removed_dirs, mut removed_pool) = make_local_two_set_sets_for_pool_with_ctx(Arc::clone(&ctx), 0).await;
+        let (_source_dirs, mut source_pool) = make_local_two_set_sets_for_pool_with_ctx(Arc::clone(&ctx), 1).await;
+        let (_target_dirs, mut target_pool) = make_local_two_set_sets_for_pool_with_ctx(ctx, 2).await;
+        Arc::get_mut(&mut removed_pool).unwrap().endpoints.cmd_line = "pool-0".to_string();
+        Arc::get_mut(&mut source_pool).unwrap().endpoints.cmd_line = "pool-1".to_string();
+        Arc::get_mut(&mut target_pool).unwrap().endpoints.cmd_line = "pool-2".to_string();
+        let pools = [removed_pool, Arc::clone(&source_pool), Arc::clone(&target_pool)];
+        let remaining_pools = [source_pool, target_pool];
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+
+        for removed_pool_free in [0, 200] {
+            let capacity = [
+                DecommissionPoolCapacityInfo::for_test(0, layout, removed_pool_free, removed_pool_free + 10, 10),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 200, 210, 10),
+                DecommissionPoolCapacityInfo::for_test(2, layout, 200, 200, 0),
+            ];
+            let mut meta = PoolMeta::new(&pools, &PoolMeta::default()).expect("initial pool metadata should be built");
+            meta.version = POOL_META_VERSION;
+            for (source, terminal) in [
+                (1, PoolMeta::decommission_cancel as fn(&mut PoolMeta, usize) -> bool),
+                (0, PoolMeta::decommission_complete),
+            ] {
+                ensure_decommission_start_pool_states(&meta, &[source]).expect("the source should pass production admission");
+                meta.decommission(source, capacity[source].space).unwrap();
+                let generation = next_decommission_capacity_generation(&meta).unwrap();
+                reserve_decommission_start_target_capacity(
+                    &mut meta,
+                    &[source],
+                    &capacity,
+                    uuid::Uuid::new_v4(),
+                    generation,
+                    OffsetDateTime::now_utc(),
+                    DECOMMISSION_CAPACITY_MODEL_VERSION,
+                )
+                .expect("the source should reserve target capacity");
+                if source == 1 {
+                    let source_generation = meta.pools[source]
+                        .decommission
+                        .as_ref()
+                        .and_then(|info| info.start_time)
+                        .expect("decommission start should establish a source generation");
+                    assert!(
+                        record_decommission_unresolved_entry(
+                            &mut meta,
+                            source,
+                            source_generation,
+                            DecommissionUnresolvedEntry {
+                                bucket: "test-bucket".to_string(),
+                                object: "test-object".to_string(),
+                                pool_index: source,
+                                set_index: 0,
+                                source_generation,
+                                candidate_count: 1,
+                                disk_error_count: 0,
+                                observed_at: OffsetDateTime::now_utc(),
+                                reason: "test fixture".to_string(),
+                            },
+                            OffsetDateTime::now_utc(),
+                            None,
+                        )
+                        .expect("unresolved entry should be recorded through the production path")
+                    );
+                }
+                assert!(terminal(&mut meta, source));
+            }
+
+            let mut before_restart = PoolMeta::default();
+            before_restart
+                .load_from_config_data(meta.encode_config_data_for_test().unwrap())
+                .expect("terminal reservations must decode before topology reconstruction");
+            assert!(before_restart.validate(remaining_pools.to_vec()).unwrap());
+            let rebuilt = PoolMeta::new(&remaining_pools, &before_restart).expect("pool metadata should be rebuilt");
+            let mut restored = PoolMeta::default();
+            restored
+                .load_from_config_data(rebuilt.encode_config_data_for_test().unwrap())
+                .expect("reindexed terminal reservations must decode after topology reconstruction");
+            assert_eq!(restored.pools.iter().map(|pool| pool.id).collect::<Vec<_>>(), [0, 1]);
+            assert!(!restored.validate(remaining_pools.to_vec()).unwrap());
+            assert_eq!(restored.pools[0].last_update, before_restart.pools[1].last_update);
+            let retained = restored.pools[0].decommission.as_ref().unwrap();
+            assert!(retained.canceled);
+            assert_eq!(retained.unresolved_entries.len(), 1);
+            assert_eq!(retained.unresolved_entries[0].pool_index, 0);
+            let mut expected = before_restart.pools[1]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.clone())
+                .expect("cancellation should retain a released reservation");
+            assert!(!expected.active());
+            assert_eq!(expected.targets.len(), 1);
+            if removed_pool_free == 0 {
+                assert_eq!(expected.targets[0].pool_index, 2);
+                expected.source_pool_index = 0;
+                expected.targets[0].pool_index = 1;
+                assert_eq!(retained.capacity_reservation.as_ref(), Some(&expected));
+            } else {
+                assert_eq!(expected.targets[0].pool_index, 0);
+                assert!(retained.capacity_reservation.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_reindex_rejects_removing_pools_with_active_reservations() {
+        let ctx = Arc::new(InstanceContext::new());
+        let (_removed_dirs, mut removed_pool) = make_local_two_set_sets_for_pool_with_ctx(Arc::clone(&ctx), 0).await;
+        let (_source_dirs, mut source_pool) = make_local_two_set_sets_for_pool_with_ctx(Arc::clone(&ctx), 1).await;
+        let (_target_dirs, mut target_pool) = make_local_two_set_sets_for_pool_with_ctx(ctx, 2).await;
+        Arc::get_mut(&mut removed_pool).unwrap().endpoints.cmd_line = "pool-0".to_string();
+        Arc::get_mut(&mut source_pool).unwrap().endpoints.cmd_line = "pool-1".to_string();
+        Arc::get_mut(&mut target_pool).unwrap().endpoints.cmd_line = "pool-2".to_string();
+        let pools = [removed_pool, source_pool, target_pool];
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let capacity = [
+            DecommissionPoolCapacityInfo::for_test(0, layout, 200, 210, 10),
+            DecommissionPoolCapacityInfo::for_test(1, layout, 200, 210, 10),
+            DecommissionPoolCapacityInfo::for_test(2, layout, 0, 10, 10),
+        ];
+        let mut meta = PoolMeta::new(&pools, &PoolMeta::default()).expect("initial pool metadata should be built");
+        meta.version = POOL_META_VERSION;
+        ensure_decommission_start_pool_states(&meta, &[1]).expect("the source should pass production admission");
+        meta.decommission(1, capacity[1].space).unwrap();
+        let generation = next_decommission_capacity_generation(&meta).unwrap();
+        reserve_decommission_start_target_capacity(
+            &mut meta,
+            &[1],
+            &capacity,
+            uuid::Uuid::new_v4(),
+            generation,
+            OffsetDateTime::now_utc(),
+            DECOMMISSION_CAPACITY_MODEL_VERSION,
+        )
+        .expect("the source should reserve target capacity");
+        assert_eq!(
+            meta.pools[1]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .and_then(|reservation| reservation.targets.first())
+                .map(|target| target.pool_index),
+            Some(0),
+            "the fixture should reserve capacity in the pool that will be removed"
+        );
+
+        assert!(
+            PoolMeta::new(&[Arc::clone(&pools[0]), Arc::clone(&pools[2])], &meta)
+                .expect_err("an active reservation owner cannot be removed")
+                .to_string()
+                .contains("cannot remove pool")
+        );
+        assert!(
+            PoolMeta::new(&[Arc::clone(&pools[1]), Arc::clone(&pools[2])], &meta)
+                .expect_err("an active reservation cannot lose its target pool")
+                .to_string()
+                .contains("cannot remove target pool")
+        );
     }
 
     fn decommission_worker_test_store(pool_meta: PoolMeta, cancelers: Vec<Option<DecommissionCanceler>>) -> Arc<ECStore> {

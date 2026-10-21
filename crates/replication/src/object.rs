@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::filemeta::{ReplicationAction, ReplicationType};
+use crate::filemeta::{NULL_VERSION_ID, ReplicationAction, ReplicationType};
 use crate::http::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_TAGGING,
     AMZ_WEBSITE_REDIRECT_LOCATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, EXPIRES,
@@ -148,7 +148,24 @@ pub fn target_is_newer_than_source_null_version(
     target
         .last_modified
         .is_some_and(|target_mod_time| target_mod_time > source.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH))
-        && source.version_id.is_none()
+        && is_null_version_id(source.version_id.as_deref())
+}
+
+/// Whether a version id names the null version: absent, empty, the S3
+/// literal `null`, or the nil UUID a versioned bucket stores it as.
+fn is_null_version_id(version_id: Option<&str>) -> bool {
+    version_id.is_none_or(|version_id| {
+        let version_id = version_id.trim();
+        version_id.is_empty()
+            || version_id.eq_ignore_ascii_case(NULL_VERSION_ID)
+            || uuid::Uuid::parse_str(version_id).is_ok_and(|uuid| uuid.is_nil())
+    })
+}
+
+/// Version identity comparison that treats every spelling of the null
+/// version as the same version.
+fn same_version_id(source: Option<&str>, target: Option<&str>) -> bool {
+    source == target || (is_null_version_id(source) && is_null_version_id(target))
 }
 
 pub fn replication_action_for_target(
@@ -161,7 +178,7 @@ pub fn replication_action_for_target(
     }
 
     if source.etag.map(trim_etag) != target.etag.map(trim_etag)
-        || source.version_id.as_deref() != target.version_id
+        || !same_version_id(source.version_id.as_deref(), target.version_id)
         || source.actual_size != target.content_length
         || source.delete_marker != target.delete_marker
         || source.mod_time != target.last_modified
@@ -498,6 +515,72 @@ mod tests {
         assert_eq!(
             replication_action_for_target(&source, &target, ReplicationType::ExistingObject),
             ReplicationAction::None
+        );
+    }
+
+    /// A versioned bucket's null version reaches the comparison as the nil
+    /// UUID (rustfs/rustfs#8747); it is the same null version the newer-target
+    /// guard protects.
+    #[test]
+    fn target_newer_null_version_guard_recognizes_nil_uuid_source() {
+        let source_metadata = HashMap::new();
+        let target_metadata = HashMap::new();
+        let source = ReplicationSourceObject {
+            version_id: Some(uuid::Uuid::nil().to_string()),
+            ..source_object(&source_metadata)
+        };
+        let target = ReplicationTargetObject {
+            last_modified: Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(20)),
+            version_id: Some("null"),
+            ..target_object(&target_metadata)
+        };
+
+        assert!(target_is_newer_than_source_null_version(&source, &target));
+        assert_eq!(
+            replication_action_for_target(&source, &target, ReplicationType::ExistingObject),
+            ReplicationAction::None
+        );
+
+        let versioned_source = ReplicationSourceObject {
+            version_id: Some(uuid::Uuid::from_u128(7).to_string()),
+            ..source_object(&source_metadata)
+        };
+        assert!(!target_is_newer_than_source_null_version(&versioned_source, &target));
+    }
+
+    /// The source names the null version by the nil UUID while a target
+    /// reports it as `"null"` (or not at all when unversioned): an already
+    /// replicated null version must compare equal instead of being re-sent.
+    #[test]
+    fn replication_action_treats_nil_uuid_and_null_target_as_same_version() {
+        let source_metadata = HashMap::new();
+        let target_metadata = HashMap::new();
+        let source = ReplicationSourceObject {
+            version_id: Some(uuid::Uuid::nil().to_string()),
+            user_tags: "",
+            ..source_object(&source_metadata)
+        };
+        for target_version in [Some("null"), Some("NULL"), None] {
+            let target = ReplicationTargetObject {
+                version_id: target_version,
+                tag_count: 0,
+                ..target_object(&target_metadata)
+            };
+            assert_eq!(
+                replication_action_for_target(&source, &target, ReplicationType::ExistingObject),
+                ReplicationAction::None,
+                "null version reported as {target_version:?} must match the nil UUID source"
+            );
+        }
+
+        let target = ReplicationTargetObject {
+            version_id: Some("other-version"),
+            tag_count: 0,
+            ..target_object(&target_metadata)
+        };
+        assert_eq!(
+            replication_action_for_target(&source, &target, ReplicationType::ExistingObject),
+            ReplicationAction::All
         );
     }
 

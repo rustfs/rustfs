@@ -277,7 +277,10 @@ where
         };
     }
 
-    if version.is_remote() {
+    // A tier free version carries no transition status and reads as a delete
+    // marker, but it owns the remote object of a removed transitioned version:
+    // move it as tier metadata, never as a delete marker that drops the owner.
+    if version.is_remote() || version.tier_free_version() {
         if let Err(err) = set
             .move_remote_version_for_migration(
                 &bucket,

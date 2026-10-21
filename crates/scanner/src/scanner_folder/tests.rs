@@ -803,7 +803,7 @@ fn test_should_account_replication_stats_only_for_live_object_versions() {
 
 #[tokio::test]
 #[serial]
-async fn test_heal_replication_only_queues_pending_null_deletes() {
+async fn test_heal_replication_skips_only_unversioned_data_versions() {
     async fn replication_skipped_count() -> u64 {
         global_metrics()
             .report()
@@ -832,18 +832,39 @@ async fn test_heal_replication_only_queues_pending_null_deletes() {
         heal_bitrot: false,
         debug: false,
     };
-    let null_object = ObjectInfo {
+    // An unversioned listing carries no version id: nothing can be replicated
+    // from it, so it never reaches replication admission.
+    let unversioned_object = ObjectInfo {
         bucket: "bucket".to_string(),
         name: "object".to_string(),
-        version_id: Some(Uuid::nil()),
+        version_id: None,
         mod_time: Some(OffsetDateTime::now_utc()),
         ..Default::default()
     };
     let mut size_summary = SizeSummary::default();
     let before = replication_skipped_count().await;
 
+    item.heal_replication(&unversioned_object, &mut size_summary).await;
+    assert_eq!(
+        replication_skipped_count().await,
+        before,
+        "an unversioned data version must not reach replication admission"
+    );
+
+    // A versioned bucket lists its null version (written before versioning
+    // was enabled) as the nil UUID; it is an existing object like any other
+    // and must reach admission (rustfs/rustfs#8747). Without rules the
+    // admission records it as skipped.
+    let null_object = ObjectInfo {
+        version_id: Some(Uuid::nil()),
+        ..unversioned_object
+    };
     item.heal_replication(&null_object, &mut size_summary).await;
-    assert_eq!(replication_skipped_count().await, before);
+    assert_eq!(
+        replication_skipped_count().await,
+        before + 1,
+        "a versioned null data version must reach replication admission"
+    );
 
     item.heal_replication(
         &ObjectInfo {
@@ -853,7 +874,7 @@ async fn test_heal_replication_only_queues_pending_null_deletes() {
         &mut size_summary,
     )
     .await;
-    assert_eq!(replication_skipped_count().await, before + 1);
+    assert_eq!(replication_skipped_count().await, before + 2);
 }
 
 #[tokio::test]

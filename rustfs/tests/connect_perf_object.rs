@@ -831,8 +831,17 @@ async fn real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put_bod
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
         Err(err) => panic!("find free port: {err}"),
     };
+    // This functional probe keeps production deadlines while avoiding the
+    // shared CI disk's fsync latency when Linux shared memory is available.
+    let storage = if cfg!(target_os = "linux") && Path::new("/dev/shm").is_dir() {
+        tempfile::tempdir_in("/dev/shm")
+    } else {
+        tempfile::tempdir()
+    }
+    .expect("isolated object fixture storage");
     let server = RustFSServerBuilder::new()
         .address(format!("127.0.0.1:{port}"))
+        .volume(storage.path().to_str().expect("object fixture storage path"))
         .access_key("object-perf-access")
         .secret_key("object-perf-secret")
         .build()
@@ -968,6 +977,8 @@ async fn real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put_bod
         .expect("public key")
         .verify(&signed, &signature)
         .expect("valid ES256 signature");
+
+    server.shutdown().await;
 }
 
 fn write_credential(path: &Path, value: &str) {
