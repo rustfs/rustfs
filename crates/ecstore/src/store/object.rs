@@ -8752,7 +8752,7 @@ mod tests {
                         .expect("initial metadata should exist"),
                 );
             }
-            // Keep the handles attached so reconnects inherit the outage.
+            // Keep the health-offline handles in the set instead of exposing empty slots.
             for disk in disks.iter().skip(2).flatten() {
                 disk.close().await.expect("stop offline disk health monitoring");
                 disk.force_offline_for_test();
