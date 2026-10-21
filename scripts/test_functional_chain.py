@@ -36,7 +36,7 @@ class RaceNativeToolsWorkflowTests(unittest.TestCase):
         reviewed += [('8380466f3a27c3c3ef4115084178a0ab99a78f32', case) for case in
                      (g01, 'heal.race-versioned-put', 'heal.race-version-delete', 'heal.race-markers-and-batch-delete')]
         reviewed += [('757b751482bb970bc321e92059690a7698554358', case) for case in
-                     ('heal.admin-nolock-safety', 'heal.race-copy-and-metadata-update')]
+                     ('heal.admin-nolock-safety', 'heal.race-copy-and-metadata-update', 'heal.race-multipart-complete-abort')]
         for source, case in reviewed:
             cases += [(False, 2, 1, None, source, case), (True, 2, 1, None, source, case),
                       (True, 0, 0, 'true', source, case)]
@@ -59,7 +59,8 @@ class RaceNativeToolsWorkflowTests(unittest.TestCase):
     def test_race_actual_admission_requires_native_and_runtime_before_exporting_directory(self):
         shell = self.chain_shell_step('Verify exact-source race native and runtime evidence')
         for case in ('heal.race-unversioned-overwrite', 'heal.race-versioned-put', 'heal.race-version-delete',
-                     'heal.race-markers-and-batch-delete', 'heal.admin-nolock-safety', 'heal.race-copy-and-metadata-update'):
+                     'heal.race-markers-and-batch-delete', 'heal.race-multipart-complete-abort',
+                     'heal.admin-nolock-safety', 'heal.race-copy-and-metadata-update'):
             for native_exit, runtime in [(0, 0), (42, 0), (0, 42), (0, 'missing'), (0, 'collector-only')]:
                 with self.subTest(case=case, native_exit=native_exit, runtime=runtime), tempfile.TemporaryDirectory() as name:
                     root = Path(name)
@@ -104,6 +105,8 @@ class RaceNativeToolsWorkflowTests(unittest.TestCase):
         self.assertIn("inputs.validation_case == 'heal.race-markers-and-batch-delete'", workflow)
         self.assertIn("inputs.validation_case == 'heal.admin-nolock-safety'", workflow)
         self.assertIn("inputs.validation_case == 'heal.race-copy-and-metadata-update'", workflow)
+        selection = workflow.split('      - name: Select exact-source race native evidence\n', 1)[1].split('\n        env:', 1)[0]
+        self.assertIn("inputs.validation_case == 'heal.race-multipart-complete-abort'", selection)
 
     def shell_step(self, name):
         from check_test_wiring import yaml_block
