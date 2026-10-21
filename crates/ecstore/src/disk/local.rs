@@ -6283,12 +6283,34 @@ impl LocalDisk {
             return Ok(());
         }
         let path = trash.join(name);
-        let result = if entry.file_type().await?.is_dir() {
-            fs::remove_dir_all(path).await
-        } else {
-            fs::remove_file(path).await
-        };
+        let result = async {
+            if entry.file_type().await?.is_dir() {
+                fs::remove_dir_all(&path).await
+            } else {
+                fs::remove_file(&path).await
+            }
+        }
+        .await;
         match result {
+            // Windows can report ERROR_ACCESS_DENIED while another remover
+            // still holds the deleted entry open. Allow up to 150 ms for that
+            // deletion to settle, but only explicit absence proves completion.
+            #[cfg(windows)]
+            Err(err) if err.raw_os_error() == Some(5) => {
+                for delay_ms in [0, 10, 20, 40, 80] {
+                    if delay_ms != 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                    // Do not follow links or treat a failed probe as absence.
+                    if fs::symlink_metadata(&path)
+                        .await
+                        .is_err_and(|probe| probe.kind() == ErrorKind::NotFound)
+                    {
+                        return Ok(());
+                    }
+                }
+                Err(err.into())
+            }
             Err(err) if err.kind() != ErrorKind::NotFound => Err(err.into()),
             _ => Ok(()),
         }
@@ -14333,6 +14355,109 @@ mod test {
             std::fs::read(moved.join("payload")).expect("read preserved payload"),
             b"unchanged payload"
         );
+    }
+
+    #[cfg(windows)]
+    mod windows_trash_cleanup {
+        use super::*;
+
+        async fn read_trash_entry(trash: &Path) -> fs::DirEntry {
+            fs::read_dir(trash)
+                .await
+                .expect("open the fixture trash directory")
+                .next_entry()
+                .await
+                .expect("read the fixture trash entry")
+                .expect("the fixture has one trash entry")
+        }
+
+        #[tokio::test]
+        async fn issue_8734_concurrent_deletes_are_idempotent() {
+            let root = tempfile::tempdir().expect("create isolated trash fixture");
+            let trash = LocalDisk::meta_path(root.path(), RUSTFS_META_TMP_DELETED_BUCKET);
+            fs::create_dir_all(&trash).await.expect("create trash directory");
+
+            // Both cleaners enumerate the same entry before either starts deleting.
+            // Exercise real Windows deletion races, without synthesizing OS errors.
+            for round in 0..32 {
+                let target = trash.join(Uuid::new_v4().to_string());
+                for part in 0..16 {
+                    let child = target.join(part.to_string());
+                    fs::create_dir_all(&child).await.expect("create object data directory");
+                    fs::write(child.join("part.1"), b"trash payload")
+                        .await
+                        .expect("write object data");
+                }
+                let first = read_trash_entry(&trash).await;
+                let second = read_trash_entry(&trash).await;
+                let (first_result, second_result) = tokio::join!(
+                    LocalDisk::cleanup_trash_entry(first, &trash),
+                    LocalDisk::cleanup_trash_entry(second, &trash),
+                );
+
+                let missing = fs::symlink_metadata(&target)
+                    .await
+                    .expect_err("the concurrent cleaners must have removed the target");
+                assert_eq!(missing.kind(), ErrorKind::NotFound, "absence must not be a failed permission probe");
+                assert!(
+                    first_result.is_ok() && second_result.is_ok(),
+                    "issue #8734: target is gone but cleanup failed in round {round}: \
+                     first={first_result:?}, second={second_result:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn already_missing_entry_is_successful() {
+            let root = tempfile::tempdir().expect("create isolated trash fixture");
+            let trash = LocalDisk::meta_path(root.path(), RUSTFS_META_TMP_DELETED_BUCKET);
+            let target = trash.join(Uuid::new_v4().to_string());
+            fs::create_dir_all(&target).await.expect("create trash entry");
+            let entry = read_trash_entry(&trash).await;
+            fs::remove_dir(&target).await.expect("delete the entry after enumeration");
+
+            LocalDisk::cleanup_trash_entry(entry, &trash)
+                .await
+                .expect("an entry deleted before cleanup must be a successful no-op");
+            assert_eq!(
+                fs::symlink_metadata(&target)
+                    .await
+                    .expect_err("cleanup must not recreate the deleted entry")
+                    .kind(),
+                ErrorKind::NotFound
+            );
+        }
+
+        #[tokio::test]
+        async fn locked_file_deletion_error_is_preserved() {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::{Foundation::ERROR_SHARING_VIOLATION, Storage::FileSystem::FILE_SHARE_READ};
+
+            let root = tempfile::tempdir().expect("create isolated trash fixture");
+            let trash = LocalDisk::meta_path(root.path(), RUSTFS_META_TMP_DELETED_BUCKET);
+            fs::create_dir_all(&trash).await.expect("create trash directory");
+            let target = trash.join(Uuid::new_v4().to_string());
+            fs::write(&target, b"retained payload").await.expect("write trash file");
+            let guard = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&target)
+                .expect("hold the trash file without delete sharing");
+
+            let result =
+                LocalDisk::cleanup_deleted_objects(root.path().to_path_buf(), &crate::disk::cleanup_runtime::GcBudget::default())
+                    .await;
+            // Release the handle before assertions so TempDir can clean up even
+            // if a future implementation incorrectly swallows the deletion error.
+            drop(guard);
+            let error = result.expect_err("a surviving locked file must still report a deletion failure");
+            let sharing_violation = i32::try_from(ERROR_SHARING_VIOLATION).expect("Windows error code fits i32");
+            assert!(
+                matches!(&error, DiskError::Io(source) if source.raw_os_error() == Some(sharing_violation)),
+                "preserve the real Windows sharing-violation error: {error:?}"
+            );
+            assert_eq!(fs::read(&target).await.expect("read surviving trash file"), b"retained payload");
+        }
     }
 
     #[tokio::test]
