@@ -276,8 +276,8 @@ enumset = "1.1.14"
 faster-hex = "1.0.0"
 flate2 = "1.1.10"
 glob = "0.3.4"
-google-cloud-storage = "1.20.0"
-google-cloud-auth = "1.17.0"
+google-cloud-storage = "1.21.0"
+google-cloud-auth = "1.18.0"
 hashbrown = { version = "0.17.1" }
 # Base32 for RFC 6238 TOTP shared secrets (RFC 4648 unpadded, the alphabet
 # every authenticator app expects). Already in the graph transitively.
@@ -368,7 +368,7 @@ opentelemetry-proto = { version = "0.33.1", default-features = false, features =
 opentelemetry_sdk = { version = "0.33.1" }
 opentelemetry-semantic-conventions = { version = "0.33.1" }
 opentelemetry-stdout = { version = "0.33.1" }
-pyroscope = { version = "2.1.2" }
+pyroscope = { version = "2.1.3" }
 
 # FTP and SFTP
 libunftp = { version = "0.23.1" }
@@ -382,7 +382,7 @@ russh-sftp = "3.0.1"
 dav-server = "0.11.0"
 
 # Performance Analysis and Memory Profiling
-rustfs-mimalloc = { version = "0.7.0" }
+rustfs-mimalloc = { version = "0.7.1" }
 # Preserve Unicode focus filters until rustfs/backlog#2302 is resolved.
 hotpath = { version = "0.28.7", default-features = false }
 # Snapshot testing for output format regression detection
