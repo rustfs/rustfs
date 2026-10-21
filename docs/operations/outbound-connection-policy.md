@@ -1,14 +1,14 @@
 # Outbound Connection Policy
 
 **Use this when:** a webhook, audit target, OIDC provider, or object-lambda endpoint on a private or container network (Compose service names, `host.docker.internal`, RFC 1918 addresses) is not being reached, or you need to know which server-initiated connections RustFS restricts and how to allowlist one.
-**Source of truth:** `crates/utils/src/egress.rs` (`OutboundPolicy`, `OutboundDnsResolver`, `validate_outbound_url`, `ENV_OUTBOUND_ALLOW_ORIGINS`).
+**Source of truth:** `crates/utils/src/egress.rs` (`OutboundPolicy`, `OutboundDnsResolver`, `validate_outbound_url`, `validate_outbound_url_allow_private`, `ENV_OUTBOUND_ALLOW_ORIGINS`).
 
 RustFS validates every operator-configured outbound destination to close a server-side request forgery (SSRF) class. Two layers exist:
 
 | Layer | What it checks | Escape hatch |
 | --- | --- | --- |
-| Literal URL check (`validate_outbound_url`) | Scheme is `http`/`https`; the host is not `localhost` or a loopback, private, shared, reserved, link-local, unspecified, or metadata address (IPv4-mapped and embedded IPv6 forms are classified by the embedded IPv4) | None |
-| Full policy (`OutboundPolicy` + `OutboundDnsResolver`) | The literal check, plus re-validation of every address DNS returns on each new connection, so a hostname cannot be rebound to a restricted address after it was accepted | `RUSTFS_OUTBOUND_ALLOW_ORIGINS` for the loopback, private, shared, and reserved classes |
+| Literal URL check (`validate_outbound_url`) | Host is not `localhost`, loopback, private, link-local, unspecified, or `169.254.169.254`; IPv4-mapped and IPv4-compatible IPv6 literals are classified by the embedded IPv4 | None |
+| Full policy (`OutboundPolicy` + `OutboundDnsResolver`) | HTTP(S) URL without embedded credentials; additional shared, reserved, and known metadata address checks, plus re-validation of DNS answers on each new connection | `RUSTFS_OUTBOUND_ALLOW_ORIGINS` for the loopback, private, shared, and reserved classes |
 
 ## Which subsystem uses which layer
 
@@ -21,10 +21,15 @@ RustFS validates every operator-configured outbound destination to close a serve
 | Bucket replication targets | Literal check, relaxed | Private addresses are always allowed; loopback only with `RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET=true` (`crates/ecstore/src/bucket/remote_s3_client.rs` `validate_remote_endpoint`, shared with on-demand migration sources) |
 | On-demand migration sources | Literal check, relaxed | Same guard and same escape hatch as replication targets (see below) |
 | Site replication peers | Literal check | `rustfs/src/site_replication/mod.rs` |
-| Tiering warm backends (S3, MinIO, RustFS, Azure, GCS, Aliyun, Tencent, Huawei, R2) | Literal check | `crates/ecstore/src/services/tier/warm_backend.rs` `validate_endpoint`; the RustFS provider adds a debug-only, env-gated loopback exception for e2e tests |
+| Self-hosted tiering warm backends (S3, MinIO, RustFS) | Literal check, relaxed | `validate_outbound_url_allow_private` allows private storage addresses except known IPv6 metadata addresses; RustFS retains its own debug-only loopback exception |
+| Cloud tiering warm backends (Azure, GCS, Aliyun, Tencent, Huawei, R2) | Literal check | `crates/ecstore/src/services/tier/warm_backend.rs` `validate_endpoint`; Wasabi additionally requires its canonical provider endpoint before using the S3 constructor |
 | Keystone `auth_url` | Literal check | `crates/keystone/src/config.rs` |
 
 The allowlist affects only the "Full policy" rows. A literal-check subsystem rejects a hostname that is itself a restricted IP literal, does not re-check what a hostname resolves to, and cannot be widened by `RUSTFS_OUTBOUND_ALLOW_ORIGINS`.
+
+S3, MinIO, and RustFS tiers accept RFC 1918 and ordinary IPv6 ULA addresses without an environment switch. The private-address exception retains the literal guard's other rejections and does not allow the known IPv6 metadata endpoints `fd00:ec2::254`, `fd00:ec2::23`, or `fd20:ce::254`. It does not add DNS filtering or change the other subsystems' policies. `RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET` has no effect on tiers. RustFS's `RUSTFS_TIER_RUSTFS_ALLOW_LOOPBACK_ENDPOINT` remains a debug-build-only exception; release builds reject literal loopback endpoints.
+
+The same tier endpoint check runs when constructing a driver from an existing configuration. Keep the original tier name and endpoint when recovering an upgrade that blocked a private IP; changing them can break existing destination bindings. Restoring the connection does not repair missing legacy cleanup metadata. See [tier free-version recovery](tier-ilm-debugging.md#free-version-recovery-controls).
 
 On-demand migration sources share the replication egress guard exactly: the source endpoint an operator saves through `PUT /rustfs/admin/v3/on-demand-migration/{bucket}` goes through the same `validate_remote_endpoint` in `crates/ecstore/src/bucket/remote_s3_client.rs`, so private addresses are accepted (a source on the same private network is the normal migration case), loopback is refused unless `RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET=true`, and metadata, link-local and unspecified addresses stay blocked. The variable is named for replication because it is one switch over one shared guard; setting it for a single-host migration also relaxes loopback for replication targets, so prefer a real hostname or private address for the source and keep the switch for lab and e2e hosts. `RUSTFS_OUTBOUND_ALLOW_ORIGINS` does not apply here. Two migration-specific rules sit on top of the endpoint guard and are enforced by the config validator, not by the egress layer: a source that names this bucket on this deployment is rejected as a self-reference, and a source matching one of the bucket's own replication targets is rejected as a replication loop. See [on-demand-migration.md](on-demand-migration.md).
 
