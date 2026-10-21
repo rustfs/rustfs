@@ -92,13 +92,13 @@ fn usage_candidate_metrics_classify_completed_first_rejection_without_reordering
     let sources = HashSet::from([source]);
     let buckets = vec!["bucket".to_string()];
     let cache = completed_root_cache("bucket", 1, 10, source);
-    completed_outcome(&[cache.clone()], &buckets, &sources, Outcome::Accepted, true, false);
+    completed_outcome(std::slice::from_ref(&cache), &buckets, &sources, Outcome::Accepted, true, false);
     // The same input also has generation/root defects. The original inventory gate wins.
     let mut broken = cache.clone();
     broken.info.next_cycle = 2;
     broken.cache.clear();
     completed_outcome(&[broken], &buckets, &sources, Outcome::InventoryIncomplete, false, true);
-    completed_outcome(&[cache.clone()], &buckets, &sources, Outcome::PublishGate, true, true);
+    completed_outcome(std::slice::from_ref(&cache), &buckets, &sources, Outcome::PublishGate, true, true);
     let mut broken = cache.clone();
     broken.info.snapshot_complete = false;
     completed_outcome(&[broken], &buckets, &sources, Outcome::IncompleteSets, true, false);
@@ -106,7 +106,7 @@ fn usage_candidate_metrics_classify_completed_first_rejection_without_reordering
     broken.info.next_cycle = 2;
     completed_outcome(&[broken], &buckets, &sources, Outcome::GenerationMismatch, true, false);
     completed_outcome(
-        &[cache.clone()],
+        std::slice::from_ref(&cache),
         &["bucket".to_string(), "bucket".to_string()],
         &sources,
         Outcome::InvalidInventory,
@@ -146,7 +146,7 @@ fn usage_candidate_metrics_classify_observational_rejections_and_keep_partial_ac
     let mut broken = cache.clone();
     broken.info.source = None;
     observed(&[broken], &sources, Outcome::MissingSource);
-    observed(&[cache.clone()], &HashSet::from([source2]), Outcome::SourceMembership);
+    observed(std::slice::from_ref(&cache), &HashSet::from([source2]), Outcome::SourceMembership);
     observed(&[cache.clone(), cache.clone()], &sources, Outcome::SourceMembership);
     observed(&[], &sources, Outcome::NoUsableSnapshots);
     let mut stale = cache.clone();
@@ -172,7 +172,7 @@ fn usage_candidate_metrics_classify_observational_rejections_and_keep_partial_ac
     let mut one = completed_root_cache("bucket", 0, 10, source2);
     one.cache.get_mut(&hash_path("bucket").key()).expect("bucket entry").objects = 1;
     observed(&[max, one], &HashSet::from([source, source2]), Outcome::Merge);
-    let candidate = observed(&[cache.clone()], &sources, Outcome::Accepted)
+    let candidate = observed(std::slice::from_ref(&cache), &sources, Outcome::Accepted)
         .expect("observational candidate")
         .0;
     assert_eq!(candidate.objects_total_count, 1);
