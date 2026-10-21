@@ -8809,20 +8809,25 @@ impl PoolMeta {
             if let Some(info) = retained_pool.decommission.as_mut() {
                 for entry in &mut info.unresolved_entries {
                     if remap_pool_index(entry.pool_index) != Some(idx) {
-                        return Err(Error::other(format!(
-                            "pool metadata rebuild cannot reindex unresolved decommission entry for pool {:?}",
-                            current_pool.cmd_line
-                        )));
+                        return Err(Error::InvalidArgument(
+                            "pool-metadata".into(),
+                            "rebuild".into(),
+                            format!("cannot reindex unresolved decommission entry for pool {:?}", current_pool.cmd_line),
+                        ));
                     }
                     entry.pool_index = idx;
                 }
 
                 if let Some(reservation) = info.capacity_reservation.as_mut() {
                     if remap_pool_index(reservation.source_pool_index) != Some(idx) {
-                        return Err(Error::other(format!(
-                            "pool metadata rebuild found a decommission capacity reservation owned by another pool for {:?}",
-                            current_pool.cmd_line
-                        )));
+                        return Err(Error::InvalidArgument(
+                            "pool-metadata".into(),
+                            "rebuild".into(),
+                            format!(
+                                "found a decommission capacity reservation owned by another pool for {:?}",
+                                current_pool.cmd_line
+                            ),
+                        ));
                     }
                     reservation.source_pool_index = idx;
 
@@ -8834,10 +8839,14 @@ impl PoolMeta {
                         } else {
                             missing_target = true;
                             if reservation_active {
-                                return Err(Error::other(format!(
-                                    "pool metadata rebuild cannot remove target pool {} from an active decommission capacity reservation owned by {:?}",
-                                    target.pool_index, current_pool.cmd_line
-                                )));
+                                return Err(Error::InvalidArgument(
+                                    "pool-metadata".into(),
+                                    "rebuild".into(),
+                                    format!(
+                                        "cannot remove target pool {} from an active decommission capacity reservation owned by {:?}",
+                                        target.pool_index, current_pool.cmd_line
+                                    ),
+                                ));
                             }
                         }
                     }
@@ -8860,10 +8869,11 @@ impl PoolMeta {
                         .as_ref()
                         .is_some_and(DecommissionCapacityReservation::active)
             }) {
-                return Err(Error::other(format!(
-                    "pool metadata rebuild cannot remove pool {:?} while decommission recovery state is active",
-                    pool.cmd_line
-                )));
+                return Err(Error::InvalidArgument(
+                    "pool-metadata".into(),
+                    "rebuild".into(),
+                    format!("cannot remove pool {:?} while decommission recovery state is active", pool.cmd_line),
+                ));
             }
         }
 
