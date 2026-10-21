@@ -28,6 +28,7 @@ mod input_stream;
 mod metrics;
 pub mod object_store;
 pub mod query;
+pub mod request;
 pub mod server;
 mod storage_api;
 pub use csv_input::csv_input_requires_normalization;

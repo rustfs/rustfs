@@ -10,7 +10,7 @@
 # intentionally removed. Regenerate with:
 #   scripts/check_test_count_ratchet.sh --update
 e2e_test	908	18
-rustfs	5710	63
+rustfs	5712	63
 rustfs-audit	70	0
 rustfs-checksums	26	0
 rustfs-common	25	0
@@ -48,7 +48,7 @@ rustfs-rio-v2	34	6
 rustfs-s3-client	69	0
 rustfs-s3-ops	8	0
 rustfs-s3-types	99	0
-rustfs-s3select-api	206	0
+rustfs-s3select-api	207	0
 rustfs-s3select-query	189	2
 rustfs-scanner	1018	20
 rustfs-scanner-metrics	81	0

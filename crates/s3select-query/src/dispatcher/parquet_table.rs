@@ -37,11 +37,11 @@ use datafusion::{
     physical_plan::ExecutionPlan,
 };
 use futures::{FutureExt, TryFutureExt, future::BoxFuture};
+use rustfs_s3select_api::request::SelectObjectContentInput;
 use rustfs_s3select_api::{
     QueryResult,
     object_store::{SelectScanRange, scan_range_from_bounds},
 };
-use s3s::dto::SelectObjectContentInput;
 
 #[derive(Clone)]
 pub struct ParquetSelectTable {
@@ -232,8 +232,8 @@ mod tests {
         prelude::SessionContext,
     };
     use rustfs_s3select_api::SelectError;
-    use s3s::dto::{
-        CSVOutput, ExpressionType, InputSerialization, OutputSerialization, ParquetInput, ScanRange, SelectObjectContentRequest,
+    use rustfs_s3select_api::request::{
+        CsvOutput, ExpressionType, InputSerialization, OutputSerialization, ParquetInput, ScanRange, SelectObjectContentRequest,
     };
     use std::{
         fs::File,
@@ -345,13 +345,13 @@ mod tests {
             sse_customer_key_md5: None,
             request: SelectObjectContentRequest {
                 expression: "SELECT * FROM S3Object".to_string(),
-                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                expression_type: ExpressionType::SQL,
                 input_serialization: InputSerialization {
                     parquet: Some(ParquetInput::default()),
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {
-                    csv: Some(CSVOutput::default()),
+                    csv: Some(CsvOutput::default()),
                     ..Default::default()
                 },
                 request_progress: None,

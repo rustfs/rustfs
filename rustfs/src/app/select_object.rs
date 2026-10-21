@@ -9,6 +9,7 @@ use super::storage_api::select_object::{
 };
 use crate::app::runtime_sources::current_s3select_db;
 use crate::error::ApiError;
+use crate::storage::s3_compat::select::select_input_from_s3s;
 use bytes::{Bytes, BytesMut};
 use datafusion::arrow::{
     array::{Array, ListLikeArray, MapArray, cast::AsArray},
@@ -124,8 +125,11 @@ pub async fn execute_select_object_content(
     log_select_request_summary(&input, &validation);
     let query_timeout = s3_select_query_timeout();
     let query_deadline = Instant::now() + query_timeout;
+    let engine_input = Arc::new(select_input_from_s3s(input.clone()).map_err(|err| {
+        S3Error::with_message(S3ErrorCode::InternalError, format!("convert the SelectObjectContent request: {err}"))
+    })?);
     let input = Arc::new(input);
-    let db = timeout_at(query_deadline, current_s3select_db((*input).clone(), false))
+    let db = timeout_at(query_deadline, current_s3select_db((*engine_input).clone(), false))
         .await
         .map_err(|_| select_query_timeout_error(query_timeout.as_secs()))?
         .map_err(map_query_error_to_s3)?;
@@ -143,7 +147,7 @@ pub async fn execute_select_object_content(
     }
     let snapshot = Arc::new(snapshot);
     let query =
-        Query::new_with_snapshot(Context { input: input.clone() }, input.request.expression.clone(), Arc::clone(&snapshot));
+        Query::new_with_snapshot(Context { input: engine_input }, input.request.expression.clone(), Arc::clone(&snapshot));
     let query_handle = timeout_at(query_deadline, db.execute_admitted(&query, admission))
         .await
         .map_err(|_| select_query_timeout_error(query_timeout.as_secs()))?
@@ -607,7 +611,12 @@ fn validate_select_request(headers: &http::HeaderMap, input: &mut SelectObjectCo
     normalize_input_serialization(&mut input.request.input_serialization)?;
     let compressed_input = is_compressed_input(&input.request.input_serialization);
     if compressed_input
-        && input.request.scan_range.as_ref().is_some_and(is_noop_scan_range)
+        && input.request.scan_range.as_ref().is_some_and(|range| {
+            is_noop_scan_range(&rustfs_s3select_api::request::ScanRange {
+                start: range.start,
+                end: range.end,
+            })
+        })
         && !input
             .request
             .input_serialization
