@@ -681,6 +681,11 @@ pub struct FileMetaVersion {
     pub uses_legacy_checksum: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static V2_OBJECT_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct V2ObjectSliceSummary {
     pub version_id: Option<Uuid>,
@@ -712,6 +717,8 @@ impl FileMetaVersion {
     /// `FileMetaVersion::try_from` would succeed with the identical summary fields;
     /// any non-`V2Obj` or invalid input returns `Err` so callers fall back to `try_from`.
     pub(super) fn inspect_v2_object_slice(buf: &[u8]) -> Result<V2ObjectSliceSummary> {
+        #[cfg(test)]
+        V2_OBJECT_SCAN_COUNT.with(|count| count.set(count.get() + 1));
         #[derive(Default)]
         struct RawV2Scan<'a> {
             has_object: bool,

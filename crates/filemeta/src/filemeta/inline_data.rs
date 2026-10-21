@@ -486,6 +486,11 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(decode(&actual), decode(&expected));
+        assert_eq!(
+            actual.versions.iter().map(|version| &version.header).collect::<Vec<_>>(),
+            expected.versions.iter().map(|version| &version.header).collect::<Vec<_>>(),
+            "version identities and deterministic signatures must agree"
+        );
         assert_eq!(actual.data, expected.data, "retained inline bytes and ordering must be identical");
     }
 
@@ -827,6 +832,27 @@ mod tests {
     }
 
     #[test]
+    fn indexed_physical_batches_decode_each_version_once() {
+        use super::super::version::V2_OBJECT_SCAN_COUNT;
+
+        let (original, requests) = indexed_batch_fixture(0, false);
+        let versions = original.versions.len();
+        let mut scalar = original.clone();
+        V2_OBJECT_SCAN_COUNT.with(|count| count.set(0));
+        let expected = scalar.delete_versions_with_index(&requests, None).expect("scalar batch");
+        let scalar_scans = V2_OBJECT_SCAN_COUNT.with(std::cell::Cell::get);
+        let mut indexed = original;
+        V2_OBJECT_SCAN_COUNT.with(|count| count.set(0));
+        let actual = indexed.delete_versions(&requests).expect("indexed batch");
+        let indexed_scans = V2_OBJECT_SCAN_COUNT.with(std::cell::Cell::get);
+        assert_eq!(actual, expected);
+        assert_eq!(indexed, scalar);
+        assert_eq!(scalar_scans, versions * (versions + 1) / 2);
+        assert_eq!(indexed_scans, versions, "a batch must not re-decode retained siblings");
+        println!("V2 scans for {versions} versions: scalar={scalar_scans}, indexed={indexed_scans}");
+    }
+
+    #[test]
     fn indexed_batches_decline_ambiguous_headers_and_nonordinary_requests() {
         let (original, requests) = indexed_batch_fixture(0, false);
         let mut duplicate = original.clone();
@@ -837,10 +863,31 @@ mod tests {
         absent_id.versions[0].header.version_id = None;
         assert!(BatchDeleteIndex::new(&absent_id, &requests).is_none());
         assert_indexed_matches_scalar(&absent_id, &requests);
-        let mut complex = requests.clone();
-        complex[0].expire_restored = true;
-        assert!(BatchDeleteIndex::new(&original, &complex).is_none());
-        assert_indexed_matches_scalar(&original, &complex);
+        let mut marker = requests[0].clone();
+        marker.deleted = true;
+        marker.mod_time = Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_700_000_000));
+        let mut retained = requests[0].clone();
+        retained.mark_deleted = true;
+        let mut restored = requests[0].clone();
+        restored.expire_restored = true;
+        let mut transition = requests[0].clone();
+        transition.transition_status = TRANSITION_COMPLETE.to_string();
+        let mut free_version = requests[0].clone();
+        free_version.set_tier_free_version();
+        let mut pending = requests[0].clone();
+        pending.replication_state_internal = Some(ReplicationState {
+            version_purge_status_internal: Some("target=PENDING;".into()),
+            purge_targets: version_purge_statuses_map("target=PENDING;"),
+            ..Default::default()
+        });
+        for operation in [marker, retained, restored, transition, free_version, pending] {
+            let mut complex = requests.clone();
+            complex[0] = operation;
+            assert!(BatchDeleteIndex::new(&original, &complex).is_none());
+            // State changes re-encode unordered maps; their semantic and
+            // signature contract is covered by the canonical sequential oracle.
+            assert_batch_matches_sequential(&original, &complex);
+        }
 
         let mut corrupt_inline = original;
         corrupt_inline.data.update(&[1, 0x81, 0xa1, b'x', 0xc4, 255]);
