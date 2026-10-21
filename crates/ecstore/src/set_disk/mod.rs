@@ -7689,18 +7689,25 @@ fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
     format!("{}-{}", etag_hex, parts.len())
 }
 
-fn completed_multipart_object_part(part_num: usize, ext_part: &ObjectPartInfo) -> ObjectPartInfo {
-    ObjectPartInfo {
-        etag: ext_part.etag.clone(),
-        number: part_num,
-        size: ext_part.size,
-        mod_time: ext_part.mod_time,
-        actual_size: ext_part.actual_size,
-        index: ext_part.index.clone(),
-        checksums: ext_part.checksums.clone(),
-        integrity: ext_part.integrity.clone(),
-        ..Default::default()
+fn prepare_complete_multipart_parts(fi: &mut FileInfo, parts: Vec<ObjectPartInfo>) -> Vec<usize> {
+    // Preserve legacy cleanup ordering, including replacement-only manifests.
+    let capacity = fi.parts.len() + parts.len();
+    let mut staged_part_numbers = Vec::with_capacity(capacity);
+    staged_part_numbers.extend(fi.parts.iter().map(|part| part.number));
+    let mut seen = HashSet::with_capacity(capacity);
+    seen.extend(staged_part_numbers.iter().copied());
+    let mut inserted = false;
+    for part in &parts {
+        if seen.insert(part.number) {
+            staged_part_numbers.push(part.number);
+            inserted = true;
+        }
     }
+    if inserted {
+        staged_part_numbers.sort_unstable();
+    }
+    fi.parts = parts;
+    staged_part_numbers
 }
 
 fn complete_part_checksum(part: &CompletePart, checksum_type: rustfs_rio::ChecksumType) -> Option<Option<String>> {
@@ -9336,30 +9343,61 @@ mod tests {
     }
 
     #[test]
-    fn test_completed_multipart_object_part_preserves_checksums() {
+    fn prepare_complete_multipart_parts_preserves_metadata_and_cleanup_order() {
         let checksums = HashMap::from([
-            (rustfs_rio::ChecksumType::CRC32.to_string(), "crc32-value".to_string()),
-            (rustfs_rio::ChecksumType::CRC32C.to_string(), "crc32c-value".to_string()),
+            (rustfs_rio::ChecksumType::CRC32.to_string(), "crc32-value".to_owned()),
+            (rustfs_rio::ChecksumType::CRC32C.to_string(), "crc32c-value".to_owned()),
         ]);
-        let ext_part = ObjectPartInfo {
+        let part = ObjectPartInfo {
             number: 7,
-            etag: "etag-7".to_string(),
+            etag: "etag-7".to_owned(),
             size: 123,
             actual_size: 456,
             mod_time: Some(OffsetDateTime::UNIX_EPOCH),
             index: Some(Bytes::from_static(&[1, 2, 3])),
-            checksums: Some(checksums.clone()),
+            checksums: Some(checksums),
+            integrity: Some(
+                rustfs_filemeta::shard_integrity::PartIntegrity::new(
+                    rustfs_filemeta::shard_integrity::IntegrityLayout::new(2, 2, 1024 * 1024, false).expect("valid layout"),
+                    7,
+                )
+                .expect("valid integrity"),
+            ),
             ..Default::default()
         };
-
-        let completed = completed_multipart_object_part(7, &ext_part);
-
-        assert_eq!(completed.number, 7);
-        assert_eq!(completed.etag, ext_part.etag);
-        assert_eq!(completed.size, ext_part.size);
-        assert_eq!(completed.actual_size, ext_part.actual_size);
-        assert_eq!(completed.index, ext_part.index);
-        assert_eq!(completed.checksums, Some(checksums));
+        let incoming = vec![part.clone()];
+        let pointer = incoming.as_ptr();
+        let mut fi = FileInfo {
+            parts: vec![
+                ObjectPartInfo {
+                    number: 9,
+                    ..Default::default()
+                },
+                ObjectPartInfo {
+                    number: 7,
+                    etag: "stale".to_owned(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(prepare_complete_multipart_parts(&mut fi, incoming), vec![9, 7]);
+        assert_eq!(fi.parts, vec![part.clone()]);
+        assert_eq!(fi.parts.as_ptr(), pointer, "move the existing allocation");
+        let mut fi = FileInfo {
+            parts: vec![
+                ObjectPartInfo {
+                    number: 9,
+                    ..Default::default()
+                },
+                ObjectPartInfo {
+                    number: 1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(prepare_complete_multipart_parts(&mut fi, vec![part]), vec![1, 7, 9]);
     }
 
     #[test]

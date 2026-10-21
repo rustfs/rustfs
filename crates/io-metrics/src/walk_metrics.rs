@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Remote directory-walk activity. Scratch bytes describe Rust buffer capacity,
+//! Directory-walk activity. Remote scratch bytes describe Rust buffer capacity,
 //! not resident memory or allocator-retained pages. No bucket, key, or peer labels.
 //! Read/written totals cover metadata payload, exclude transport framing, and are
 //! batched until the logical walk ends (including error/cancellation). Gauges
@@ -110,6 +110,71 @@ impl Drop for RemoteWalkGuard {
             inner.written_bytes.increment(inner.written);
             inner.active.decrement(1.0);
             counter!("rustfs_remote_walk_completed_total", "outcome" => inner.outcome).increment(1);
+            inner.duration.record(inner.started.elapsed().as_secs_f64());
+        }
+    }
+}
+
+/// One local walk through the disk-health wrapper, including admission and
+/// downstream backpressure. This is separate from a caller's remote walk.
+/// Written bytes count metadata payload accepted by the downstream writer,
+/// including prefixes before error or cancellation; they are not physical disk
+/// I/O. Byte totals and duration are emitted when the walk ends, so their rates
+/// can lag a long-running walk. Metric families are not an atomic snapshot.
+#[derive(Default)]
+#[must_use = "keep this guard alive for the logical local walk"]
+pub struct LocalWalkGuard {
+    inner: Option<LocalObservation>,
+}
+
+struct LocalObservation {
+    active: Gauge,
+    written_bytes: Counter,
+    written: u64,
+    outcome: &'static str,
+    started: Instant,
+    duration: Histogram,
+}
+
+impl LocalWalkGuard {
+    pub fn start() -> Self {
+        if !crate::metrics_enabled() {
+            return Self::default();
+        }
+        counter!("rustfs_local_walk_started_total").increment(1);
+        let active = gauge!("rustfs_local_walk_active");
+        active.increment(1.0);
+        Self {
+            inner: Some(LocalObservation {
+                active,
+                written_bytes: counter!("rustfs_local_walk_written_bytes_total"),
+                written: 0,
+                outcome: "cancelled",
+                started: Instant::now(),
+                duration: histogram!("rustfs_local_walk_duration_seconds"),
+            }),
+        }
+    }
+
+    pub fn written(&mut self, bytes: usize) {
+        if let Some(inner) = &mut self.inner {
+            inner.written = inner.written.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        }
+    }
+
+    pub fn finish(&mut self, success: bool) {
+        if let Some(inner) = &mut self.inner {
+            inner.outcome = if success { "ok" } else { "error" };
+        }
+    }
+}
+
+impl Drop for LocalWalkGuard {
+    fn drop(&mut self) {
+        if let Some(inner) = &self.inner {
+            inner.written_bytes.increment(inner.written);
+            inner.active.decrement(1.0);
+            counter!("rustfs_local_walk_completed_total", "outcome" => inner.outcome).increment(1);
             inner.duration.record(inner.started.elapsed().as_secs_f64());
         }
     }
@@ -243,6 +308,78 @@ mod tests {
             walk.read(9);
             walk.written(4);
             walk.finish(false);
+        });
+        assert!(snapshotter.snapshot().into_vec().is_empty());
+    }
+
+    #[test]
+    fn local_walks_balance_outcomes_and_partial_bytes_after_gate_change() {
+        let _lock = METRICS_FLAG_LOCK.lock().expect("metrics gate lock");
+        let _restore = RestoreMetricsGate(crate::metrics_enabled());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            crate::set_metrics_enabled(true);
+            let mut success = LocalWalkGuard::start();
+            let mut error = LocalWalkGuard::start();
+            let mut cancelled = LocalWalkGuard::start();
+            success.written(10);
+            success.finish(true);
+            error.written(7);
+            error.finish(false);
+            cancelled.written(3);
+            crate::set_metrics_enabled(false);
+            drop((success, error, cancelled));
+        });
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(gauge_value(&rows, "rustfs_local_walk_active"), Some(0.0));
+        assert_eq!(counter_total(&rows, "rustfs_local_walk_started_total"), Some(3));
+        assert_eq!(counter_total(&rows, "rustfs_local_walk_written_bytes_total"), Some(20));
+        assert_eq!(histogram_samples(&rows, "rustfs_local_walk_duration_seconds").len(), 3);
+        for outcome in ["ok", "error", "cancelled"] {
+            assert!(
+                rows.iter().any(|(key, _, _, value)| {
+                    key.key().name() == "rustfs_local_walk_completed_total"
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "outcome" && label.value() == outcome)
+                        && matches!(value, DebugValue::Counter(1))
+                }),
+                "missing exact local completion for {outcome}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_walk_active_includes_a_pending_walk() {
+        let _lock = METRICS_FLAG_LOCK.lock().expect("metrics gate lock");
+        let _restore = RestoreMetricsGate(crate::metrics_enabled());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            crate::set_metrics_enabled(true);
+            let _first = LocalWalkGuard::start();
+            let _second = LocalWalkGuard::start();
+            let rows = snapshotter.snapshot().into_vec();
+            assert_eq!(gauge_value(&rows, "rustfs_local_walk_active"), Some(2.0));
+            assert_eq!(counter_total(&rows, "rustfs_local_walk_completed_total"), None);
+        });
+    }
+
+    #[test]
+    fn disabled_local_walk_remains_disabled_after_gate_change() {
+        let _lock = METRICS_FLAG_LOCK.lock().expect("metrics gate lock");
+        let _restore = RestoreMetricsGate(crate::metrics_enabled());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            crate::set_metrics_enabled(false);
+            let mut walk = LocalWalkGuard::start();
+            crate::set_metrics_enabled(true);
+            walk.written(7);
+            walk.finish(true);
+            drop(walk);
         });
         assert!(snapshotter.snapshot().into_vec().is_empty());
     }

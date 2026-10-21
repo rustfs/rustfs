@@ -30,8 +30,8 @@ use tokio::io::AsyncReadExt;
 mod storage_api;
 use storage_api::endpoint_index::{EndpointServerPools, Endpoints, init_local_disks};
 use storage_api::integration::{
-    DiskAPI, DiskError, DiskStore, EcstoreStorageError, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader,
-    RUSTFS_META_BUCKET, ReadOptions,
+    BucketOperations, DeleteBucketOptions, DiskAPI, DiskError, DiskStore, EcstoreStorageError, ObjectIO, ObjectOperations,
+    ObjectOptions, PutObjReader, RUSTFS_META_BUCKET, ReadOptions,
 };
 
 const SNAPSHOT_LIMIT: usize = 64 * 1024 * 1024;
@@ -131,6 +131,10 @@ async fn legacy_unbound_generation_is_parked_and_requires_explicit_risk_acceptan
         )
         .await
         .expect("old-format intent should still be durably admitted");
+        env.ecstore
+            .delete_bucket("unbound-lifecycle", &DeleteBucketOptions::default())
+            .await
+            .expect("delete the legacy intent's bucket through the supported lifecycle");
 
         assert!(
             wait_until(|| async {
@@ -152,7 +156,9 @@ async fn legacy_unbound_generation_is_parked_and_requires_explicit_risk_acceptan
             .iter()
             .find(|item| item.bucket == "unbound-lifecycle" && item.object == "legacy.bin")
             .expect("visible generation-unknown entry");
-        assert_eq!(entry.status, "legacy_generation_unknown");
+        assert_eq!(entry.status, "legacy_generation_unobserved");
+        assert_eq!(entry.bucket_incarnation_id, None);
+        assert_eq!(snapshot.contract_version, 2);
         assert!(entry.source_bucket_incarnation_id.is_none());
         assert!(
             snapshot_contains("legacy.bin").await,
@@ -164,13 +170,42 @@ async fn legacy_unbound_generation_is_parked_and_requires_explicit_risk_acceptan
             "unbound old intent must not be sent to the current bucket generation"
         );
 
+        assert!(
+            matches!(
+                mrf_queue::refresh_legacy_responsibility(entry.responsibility_id, None).await,
+                Err(rustfs_heal::heal::mrf_queue::MrfLifecycleControlError::IncarnationChanged)
+            ),
+            "an absent bucket is not retirement proof"
+        );
+        assert!(snapshot_contains("legacy.bin").await, "failed observation must retain the durable intent");
+        env.make_bucket("unbound-lifecycle", false).await;
+        mrf_queue::refresh_legacy_responsibility(entry.responsibility_id, None)
+            .await
+            .expect("explicit refresh may observe a recreated bucket without binding the old source");
+        let refreshed = mrf_queue::list_legacy_responsibilities(None, 8)
+            .await
+            .expect("read refreshed observation");
+        let refreshed = refreshed
+            .responsibilities
+            .iter()
+            .find(|row| row.responsibility_id == entry.responsibility_id)
+            .expect("refresh must preserve the responsibility ID");
+        assert_eq!(refreshed.status, "legacy_generation_unknown");
+        assert_eq!(refreshed.source_bucket_incarnation_id, None);
+        let observed = refreshed
+            .bucket_incarnation_id
+            .expect("refresh records a real current identity");
         assert!(matches!(
-            mrf_queue::recheck_legacy_responsibility(entry.responsibility_id, entry.bucket_incarnation_id).await,
+            mrf_queue::refresh_legacy_responsibility(entry.responsibility_id, None).await,
+            Err(rustfs_heal::heal::mrf_queue::MrfLifecycleControlError::StaleGeneration)
+        ));
+        assert!(matches!(
+            mrf_queue::recheck_legacy_responsibility(entry.responsibility_id, observed).await,
             Err(rustfs_heal::heal::mrf_queue::MrfLifecycleControlError::InvalidAction(_))
         ));
         mrf_queue::accept_unverified_legacy_risk(mrf_queue::MrfLegacyRiskAcceptanceRequest {
             responsibility_id: entry.responsibility_id,
-            expected_bucket_incarnation_id: entry.bucket_incarnation_id,
+            expected_bucket_incarnation_id: observed,
             acknowledge_unknown_source_incarnation: true,
             acknowledge_incarnation_mismatch: false,
             actor: "integration-test-operator".to_string(),
@@ -975,7 +1010,9 @@ async fn partial_write_sigkill_replay_scenario(protected: bool) {
             "the producer-bound bucket generation must survive journal replay"
         );
         let responsibility_id = held.responsibility_id;
-        let bucket_incarnation_id = held.bucket_incarnation_id;
+        let bucket_incarnation_id = held
+            .bucket_incarnation_id
+            .expect("source-bound hold must retain its observed identity");
         let request_id = uuid::Uuid::new_v4();
         mrf_queue::accept_unverified_legacy_risk(mrf_queue::MrfLegacyRiskAcceptanceRequest {
             responsibility_id,

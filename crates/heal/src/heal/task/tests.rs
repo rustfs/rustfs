@@ -212,6 +212,32 @@ mod canonical_outcome {
     }
 
     #[tokio::test]
+    async fn heal_storage_detail_survives_unverified_object_and_bucket_checks() {
+        let detail = rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL;
+        for bucket_scope in [false, true] {
+            for scan_mode in [HealScanMode::Normal, HealScanMode::Deep] {
+                let storage = Arc::new(MockStorage {
+                    object_heal_detail: Some(detail.to_owned()),
+                    ..Default::default()
+                });
+                let mut task = if bucket_scope {
+                    bucket_task(storage)
+                } else {
+                    HealTask::from_request(HealRequest::object("bucket-a".to_owned(), "object-a".to_owned(), None), storage)
+                };
+                task.options.scan_mode = scan_mode;
+                task.execute().await.expect("unverified processing completes");
+                let outcome = task.get_outcome().await;
+                assert!(outcome.counters.unknown > 0);
+                assert_eq!(outcome.counters.healed, 0);
+                assert!(outcome.objects.iter().all(|item| {
+                    item.disposition == HealObjectDisposition::Unknown && item.detail.as_deref() == Some(detail)
+                }));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn bucket_heal_records_matching_positive_storage_receipts() {
         let incarnation = Uuid::new_v4();
         let storage = Arc::new(MockStorage {
@@ -1518,6 +1544,8 @@ struct MockStorage {
     heal_object_outcome: Mutex<Option<MockHealObjectOutcome>>,
     heal_object_outcomes: Mutex<HashMap<String, VecDeque<MockHealObjectOutcome>>>,
     heal_object_receipts: Mutex<HashMap<String, VecDeque<HealObjectReceipt>>>,
+    object_heal_detail: Option<String>,
+    object_heal_item: Option<HealResultItem>,
     bucket_incarnation_id: Mutex<Option<Uuid>>,
     bucket_incarnation_after_object_heal: Mutex<Option<Uuid>>,
     bucket_incarnation_after_listing: Mutex<Option<Uuid>>,
@@ -1734,7 +1762,7 @@ async fn cancelled_object_heal_rejects_matching_positive_storage_receipt() {
     };
     let accepted = task
         .record_verified_storage_receipt(
-            expected,
+            &expected,
             Some(object_receipt(
                 "object-a",
                 Some("version-a"),
@@ -2331,6 +2359,10 @@ impl HealStorageAPI for MockStorage {
         {
             item.resolved_version_id = Some(resolved_version_id);
         }
+        item.detail = self.object_heal_detail.clone().unwrap_or_default();
+        if let Some(override_item) = &self.object_heal_item {
+            item = override_item.clone();
+        }
         Ok(HealStorageObjectResult { item, error, receipt })
     }
 
@@ -2832,6 +2864,120 @@ async fn read_repair_object_heal_sets_read_repair_option() {
     assert_eq!(opts.len(), 1);
     assert!(opts[0].read_repair);
     assert!(!opts[0].no_lock);
+}
+
+fn healthy_legacy_heal_item() -> HealResultItem {
+    use rustfs_madmin::heal_commands::{HealDriveInfo, Infos};
+    let drives = vec![HealDriveInfo {
+        state: "ok".to_owned(),
+        ..Default::default()
+    }];
+    HealResultItem {
+        legacy_identity_unverified: true,
+        detail: rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL.to_owned(),
+        before: Infos { drives: drives.clone() },
+        after: Infos { drives },
+        ..Default::default()
+    }
+}
+
+fn mrf_task_for_item(object: &str, item: HealResultItem) -> (HealTask, Arc<MockStorage>) {
+    let incarnation = Uuid::new_v4();
+    let storage = Arc::new(MockStorage {
+        bucket_incarnation_id: Mutex::new(Some(incarnation)),
+        object_heal_item: Some(item),
+        ..Default::default()
+    });
+    let mut request = HealRequest::object("bucket-a".to_owned(), object.to_owned(), None);
+    request.source = HealRequestSource::Mrf;
+    request.expected_mrf_bucket_incarnation_id = Some(incarnation);
+    (HealTask::from_request(request, storage.clone()), storage)
+}
+
+#[tokio::test]
+async fn mrf_legacy_object_names_cannot_change_retry_classification() {
+    for object in [
+        "ordinary",
+        "timed out",
+        "network error",
+        "file not found",
+        "lock acquisition timeout",
+    ] {
+        let (task, _) = mrf_task_for_item(object, healthy_legacy_heal_item());
+        let error = task.execute().await.expect_err("proofless legacy check remains unverified");
+        assert!(
+            !error.is_recoverable_heal(),
+            "object name must not schedule a repeated deep check: {object}"
+        );
+        assert!(!error.is_object_absent());
+        assert!(matches!(error, Error::LegacyMrfUnverified { .. }));
+        assert_eq!(
+            error.to_string(),
+            format!("Heal task execution failed: Missing exact storage proof for durable MRF repair bucket-a/{object}")
+        );
+    }
+}
+
+#[tokio::test]
+async fn mrf_legacy_pause_requires_storage_owned_healthy_deep_result() {
+    for case in [
+        "qualified",
+        "text_only",
+        "repaired",
+        "empty",
+        "unhealthy",
+        "unaligned",
+        "receipt",
+        "storage_error",
+        "dry_run",
+    ] {
+        let mut item = healthy_legacy_heal_item();
+        match case {
+            "qualified" => item.detail = "updated diagnostic wording".to_owned(),
+            "text_only" => item.legacy_identity_unverified = false,
+            "repaired" => item.before.drives[0].state = "missing".to_owned(),
+            "empty" => {
+                item.before.drives.clear();
+                item.after.drives.clear();
+            }
+            "unhealthy" => {
+                item.before.drives[0].state = "missing".to_owned();
+                item.after.drives[0].state = "missing".to_owned();
+            }
+            "unaligned" => item.before.drives.clear(),
+            _ => {}
+        }
+        let (mut task, storage) = mrf_task_for_item("object", item);
+        if case == "receipt" {
+            storage.heal_object_receipts.lock().expect("receipt fixture").insert(
+                "object".to_owned(),
+                VecDeque::from([object_receipt(
+                    "object",
+                    None,
+                    HealObjectDisposition::Repaired,
+                    Uuid::new_v4(),
+                )]),
+            );
+        }
+        if case == "storage_error" {
+            *storage.heal_object_outcome.lock().expect("storage error fixture") = Some(MockHealObjectOutcome::OkWithReadQuorum);
+        }
+        task.options.dry_run = case == "dry_run";
+        let error = task
+            .execute()
+            .await
+            .expect_err("legacy result cannot discharge a durable responsibility");
+        assert_eq!(matches!(error, Error::LegacyMrfUnverified { .. }), case == "qualified", "case={case}");
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.counters.healed, 0);
+        if case == "qualified" {
+            assert_eq!(outcome.counters.unknown, 1);
+            assert_eq!(outcome.objects[0].detail.as_deref(), Some("updated diagnostic wording"));
+            let opts = storage.object_heal_opts.lock().expect("storage options");
+            assert_eq!(opts.len(), 1);
+            assert_eq!(opts[0].scan_mode, HealScanMode::Deep);
+        }
+    }
 }
 
 #[tokio::test]

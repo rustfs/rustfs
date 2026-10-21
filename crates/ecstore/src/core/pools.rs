@@ -11515,7 +11515,7 @@ type DecommissionCapacityInfoOverrides =
 #[cfg(any(test, feature = "test-util"))]
 static DECOMMISSION_CAPACITY_INFO_OVERRIDES: std::sync::OnceLock<DecommissionCapacityInfoOverrides> = std::sync::OnceLock::new();
 
-/// Queues capacity snapshots consumed in order by `get_decommission_all_pool_capacity_infos`;
+/// Queues capacity snapshots consumed in order by decommission capacity sampling;
 /// the final snapshot is retained and replayed for every subsequent sample, so tests never
 /// fall back to the host's real disk statistics once an override is installed.
 #[cfg(any(test, feature = "test-util"))]
@@ -12288,10 +12288,7 @@ impl Drop for LifecycleDataMovementMutationBarrier {
 }
 
 #[cfg(test)]
-async fn pause_lifecycle_data_movement_mutation(bucket: &str, object: &str, has_run_fence_signal: bool) {
-    if !has_run_fence_signal {
-        return;
-    }
+async fn pause_lifecycle_data_movement_mutation(bucket: &str, object: &str) {
     let barrier = LIFECYCLE_DATA_MOVEMENT_MUTATION_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
@@ -12368,7 +12365,7 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
         }
         action if lifecycle_action_removes_data_movement_version(action) => {
             #[cfg(test)]
-            pause_lifecycle_data_movement_mutation(bucket, &version.name, lock_lost_signal.is_some()).await;
+            pause_lifecycle_data_movement_mutation(bucket, &version.name).await;
             if lifecycle_delete_all_versions_blocked_by_replication(store.clone(), bucket, &object_info.name, action).await? {
                 return Ok(false);
             }
@@ -12376,6 +12373,43 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
                 || match lock_lost_signal {
                     Some(signal) => {
                         apply_expiry_rule_for_data_movement(store, &event, event_source, &object_info, Some(signal)).await
+                    }
+                    // The source cleanup removes an expired version whether or
+                    // not its expiry ran. For a transitioned version, only an
+                    // applied expiry leaves the tier free version on the source
+                    // before that cleanup, so the entry moves it to a target
+                    // instead of leaving it behind for the post-check.
+                    None if !object_info.transitioned_object.status.is_empty() => {
+                        // A delete-all is a prefix delete that takes the bucket
+                        // lifecycle write lock, which the lifecycle read lock
+                        // held here and by the entry would block until timeout.
+                        let delete_all = action.delete_all();
+                        #[cfg(test)]
+                        let injected =
+                            decommission_test_wrap_result("lifecycle_expiry_apply", bucket, &version.name, 1, Ok(())).is_err();
+                        #[cfg(not(test))]
+                        let injected = false;
+                        if delete_all
+                            || injected
+                            || !apply_expiry_rule_for_data_movement(store, &event, event_source, &object_info, None).await
+                        {
+                            // The version is still live, so it moves like any
+                            // other version and lifecycle expires it on the
+                            // target.
+                            warn!(
+                                event = EVENT_DECOMMISSION_ENTRY,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_POOLS,
+                                state = "lifecycle_expiry_deferred",
+                                bucket = %bucket,
+                                object = %version.name,
+                                action = ?action,
+                                reason = if delete_all { "delete_all_needs_bucket_write_lock" } else { "not_applied" },
+                                "Data movement deferred a transitioned version's lifecycle expiry; moving the version"
+                            );
+                            return Ok(false);
+                        }
+                        true
                     }
                     None => apply_expiry_rule_in(store, &event, event_source, &object_info).await,
                 };
@@ -13656,16 +13690,17 @@ impl ECStore {
                 .lock_lost_signal()
         };
 
-        let capacity_infos = if pending_added > 0 {
-            self.get_decommission_all_pool_capacity_infos().await?
+        // Intent persistence changes disk usage. Refresh the target baseline,
+        // while admission and finalization retain their global reservation checks.
+        let before_free = if pending_added > 0 {
+            self.get_decommission_prewrite_free_capacity(target_pool_index).await?
         } else {
             capacity_infos
+                .iter()
+                .find(|capacity| capacity.pool_index == target_pool_index)
+                .map(|capacity| capacity.physical_free)
+                .ok_or_else(|| decommission_capacity_blocked_error("target capacity snapshot is missing before mutation"))?
         };
-        let before_free = capacity_infos
-            .iter()
-            .find(|capacity| capacity.pool_index == target_pool_index)
-            .map(|capacity| capacity.physical_free)
-            .ok_or_else(|| decommission_capacity_blocked_error("target capacity snapshot is missing before mutation"))?;
 
         let result = operation.take().expect("capacity-admitted operation should run once")(capacity_lease).await;
         let clear_pending_on_temporary_release = result.as_ref().ok().is_some_and(&clear_pending_on_temporary_release);
@@ -14729,6 +14764,21 @@ impl ECStore {
         } else {
             Err(invalid_decommission_pool_index_error(self.pools.len(), idx))
         }
+    }
+
+    async fn get_decommission_prewrite_free_capacity(&self, target_pool_index: usize) -> Result<usize> {
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(capacity_infos) = take_decommission_capacity_info_override_for_test(self.id) {
+            return capacity_infos
+                .iter()
+                .find(|capacity| capacity.pool_index == target_pool_index)
+                .map(|capacity| capacity.physical_free)
+                .ok_or_else(|| decommission_capacity_blocked_error("target capacity snapshot is missing before mutation"));
+        }
+
+        self.get_decommission_pool_capacity_info(target_pool_index, false)
+            .await
+            .map(|capacity| capacity.physical_free)
     }
 
     async fn get_decommission_all_pool_capacity_infos(&self) -> Result<Vec<DecommissionPoolCapacityInfo>> {
@@ -24724,6 +24774,104 @@ mod tests {
                 .as_ref()
                 .is_some_and(DecommissionCapacityReservation::active)
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_capacity_mutation_limits_prewrite_sampling_to_target() {
+        let (_temp_dirs, store, _other_store) =
+            crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
+        start_leftover_intent_test_decommission(&store, Vec::new(), DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION).await;
+        DECOMMISSION_CAPACITY_INFO_OVERRIDES
+            .get()
+            .expect("activation should install capacity snapshots")
+            .lock()
+            .expect("capacity overrides should not be poisoned")
+            .remove(&store.id)
+            .expect("use real disk probes for the mutation");
+        let owner = leftover_intent_test_owner(&store, uuid::Uuid::new_v4()).await;
+        let disk_info_calls = async || {
+            let mut pools = Vec::new();
+            for pool in &store.pools {
+                let mut counts = Vec::new();
+                for set in &pool.disk_set {
+                    for disk in set.disk_inventory().await.into_iter().flatten() {
+                        counts.push(
+                            disk.metrics_snapshot()
+                                .expect("fixture disks must expose local metrics")
+                                .api_calls
+                                .get("disk_info")
+                                .copied()
+                                .unwrap_or_default(),
+                        );
+                    }
+                }
+                pools.push(counts);
+            }
+            pools
+        };
+        let before = disk_info_calls().await;
+        store
+            .run_decommission_capacity_admitted_mutation(1, Some(owner), Some(16), || async { Ok(()) })
+            .await
+            .expect("the capacity-accounted mutation should commit");
+        let after = disk_info_calls().await;
+        for (pool_index, (before, after)) in before.iter().zip(&after).enumerate() {
+            assert!(!before.is_empty(), "pool {pool_index} must have real disks");
+            assert_eq!(before.len(), after.len());
+            let expected = if pool_index == 1 { 3 } else { 2 };
+            for (disk_index, (before, after)) in before.iter().zip(after).enumerate() {
+                assert_eq!(
+                    after - before,
+                    expected,
+                    "pool {pool_index} disk {disk_index}: admission/finalization check every pool; prewrite checks only the target"
+                );
+            }
+        }
+        let target = leftover_intent_test_target(&store, 1).await;
+        assert_eq!(target.pending_mutation_id, None, "the durable intent must be settled");
+        assert_eq!(target.consumed_physical_bytes, 16);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_prewrite_sampling_preserves_override_order_and_missing_target_error() {
+        let (_temp_dirs, store, _other_store) =
+            crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![
+                vec![DecommissionPoolCapacityInfo::for_test(1, layout, 70, 100, 30)],
+                vec![DecommissionPoolCapacityInfo::for_test(1, layout, 40, 100, 60)],
+                vec![DecommissionPoolCapacityInfo::for_test(0, layout, 90, 100, 10)],
+            ],
+        );
+        assert_eq!(
+            store
+                .get_decommission_prewrite_free_capacity(1)
+                .await
+                .expect("first injected sample"),
+            70
+        );
+        assert_eq!(
+            store
+                .get_decommission_prewrite_free_capacity(1)
+                .await
+                .expect("second injected sample"),
+            40
+        );
+        for _ in 0..2 {
+            let error = store
+                .get_decommission_prewrite_free_capacity(1)
+                .await
+                .expect_err("missing injected target must not fall back to host capacity");
+            assert!(matches!(
+                error,
+                Error::DecommissionCapacityBlocked { message }
+                    if message == "target capacity snapshot is missing before mutation"
+            ));
+        }
     }
 
     async fn start_leftover_intent_test_decommission(

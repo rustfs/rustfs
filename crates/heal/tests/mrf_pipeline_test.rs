@@ -315,9 +315,9 @@ fn committed_checkpoint_matches_on_all_disks(disk_paths: &[PathBuf], sequence: u
 async fn assert_legacy_responsibilities_parked(
     disk_paths: &[PathBuf],
     expected_records: &[&[u8]],
-    observed_bucket_incarnation_id: uuid::Uuid,
+    current_bucket_incarnation_id: uuid::Uuid,
 ) {
-    assert!(!observed_bucket_incarnation_id.is_nil(), "the observed bucket generation must be real");
+    assert!(!current_bucket_incarnation_id.is_nil(), "the fixture current generation must be real");
     let checkpoint = mrf_queue::snapshot::inspect_local_committed_snapshot(rustfs_config::DEFAULT_HEAL_MRF_JOURNAL_MAX_BYTES)
         .await
         .expect("inspect the committed legacy responsibility checkpoint")
@@ -384,12 +384,11 @@ async fn assert_legacy_responsibilities_parked(
             Some(&serde_json::Value::Null),
             "replay must not fabricate operator authorization"
         );
-        assert_eq!(record["state"]["state"], "legacy_generation_unknown");
         assert_eq!(
-            record["state"]["observed_bucket_incarnation_id"],
-            observed_bucket_incarnation_id.to_string()
+            record["state"],
+            serde_json::json!({"state": "active"}),
+            "the source-unbound hold must preserve the old disk state without inventing an observation"
         );
-        assert!(record["state"]["detected_at_ms"].as_u64().is_some_and(|time| time > 0));
     }
 }
 
