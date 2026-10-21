@@ -10085,10 +10085,9 @@ async fn build_scanner_compensation_pair(
 /// P1-20: objects that already exist when a rule with
 /// ExistingObjectReplication=Enabled arrives are compensated by the scanner's
 /// existing-object resync pass, whatever wrote them — plain PUT, CopyObject,
-/// or Snowball auto-extract. The pinned exception is a null-version object
-/// (written before the bucket became versioned): the scanner heal gate skips
-/// nil-version objects entirely (`scanner_folder.rs` heal_replication), so it
-/// must NEVER be compensated.
+/// or Snowball auto-extract. That includes a null-version object written
+/// before the bucket became versioned (rustfs/rustfs#8747): it is compensated
+/// like any other existing object and lands as the target's null version.
 #[tokio::test]
 async fn test_scanner_compensates_existing_objects_across_write_paths() -> TestResult {
     init_logging();
@@ -10098,14 +10097,15 @@ async fn test_scanner_compensates_existing_objects_across_write_paths() -> TestR
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
 
-    // Null-version cell: PUT before versioning; the object keeps the nil
-    // version id forever.
+    // Null-version cell: PUT before versioning; the object keeps the null
+    // version forever.
     let null_key = "pre-versioning-null.txt";
+    let null_payload = "null version payload";
     source_client
         .put_object()
         .bucket(source_bucket)
         .key(null_key)
-        .body(ByteStream::from_static(b"null version payload"))
+        .body(ByteStream::from_static(null_payload.as_bytes()))
         .send()
         .await?;
 
@@ -10193,9 +10193,19 @@ async fn test_scanner_compensates_existing_objects_across_write_paths() -> TestR
     wait_for_replicated_object(&target_client, target_bucket, copy_key, plain_payload).await?;
     wait_for_replicated_object(&target_client, target_bucket, member_key, std::str::from_utf8(member_payload)?).await?;
 
-    // Null-version contract: with every sibling compensated (scanner proven
-    // live), the nil-version object must stay absent across further cycles.
-    assert_replication_key_absent(&target_client, target_bucket, null_key, Duration::from_secs(6)).await?;
+    // The null version converges too, and keeps its identity: the replica is
+    // the target's null version, not a freshly minted one.
+    wait_for_replicated_object(&target_client, target_bucket, null_key, null_payload).await?;
+    let null_replica = target_client
+        .get_object()
+        .bucket(target_bucket)
+        .key(null_key)
+        .version_id("null")
+        .send()
+        .await?;
+    assert_eq!(null_replica.version_id(), Some("null"));
+    let null_replica_body = null_replica.body.collect().await?.into_bytes();
+    assert_eq!(null_replica_body.as_ref(), null_payload.as_bytes());
 
     Ok(())
 }

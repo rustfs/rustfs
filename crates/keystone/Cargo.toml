@@ -71,7 +71,6 @@ url = { workspace = true }
 # Middleware dependencies
 tower = { workspace = true, features = ["timeout"] }
 http = { workspace = true }
-hyper = { workspace = true, features = ["server", "http2", "http1"] }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true, features = ["serde"] }
@@ -80,7 +79,6 @@ futures = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "fs", "macros", "rt", "time"] }
 tower = { workspace = true, features = ["util", "timeout"] }
-hyper = { workspace = true, features = ["server", "http2", "http1"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 temp-env = { workspace = true }
 

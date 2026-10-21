@@ -2475,19 +2475,8 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
     if dobj.delete_object.delete_marker
         && let Some(delete_marker_version_id) = dobj.delete_object.delete_marker_version_id
     {
-        let source_marker_state = storage
-            .get_object_info(
-                &bucket,
-                &dobj.delete_object.object_name,
-                &ObjectOptions {
-                    version_id: Some(delete_marker_version_id.to_string()),
-                    versioned: ReplicationVersioningStore::prefix_enabled(&bucket, &dobj.delete_object.object_name).await,
-                    version_suspended: ReplicationVersioningStore::prefix_suspended(&bucket, &dobj.delete_object.object_name)
-                        .await,
-                    ..Default::default()
-                },
-            )
-            .await;
+        let source_marker_state =
+            read_source_delete_marker(&*storage, &bucket, &dobj.delete_object.object_name, delete_marker_version_id).await;
 
         match source_marker_state {
             Ok(info) if info.delete_marker && info.version_id == Some(delete_marker_version_id) => {}
@@ -2858,14 +2847,18 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
     )
 }
 
-async fn source_delete_marker_missing<S: EcstoreObjectOperations>(
+/// Reads the source version addressed by `delete_marker_version_id` so a
+/// delete-marker replication can confirm the marker still exists. Plain
+/// `get_object_info` rejects explicit marker version reads on multi-pool
+/// stores with `MethodNotAllowed`, which would fail every marker (rustfs#8746).
+pub(crate) async fn read_source_delete_marker<S: EcstoreObjectOperations>(
     storage: &S,
     bucket: &str,
     object_name: &str,
     delete_marker_version_id: Uuid,
-) -> bool {
-    match storage
-        .get_object_info(
+) -> Result<ObjectInfo> {
+    storage
+        .get_object_info_for_delete(
             bucket,
             object_name,
             &ObjectOptions {
@@ -2876,7 +2869,15 @@ async fn source_delete_marker_missing<S: EcstoreObjectOperations>(
             },
         )
         .await
-    {
+}
+
+async fn source_delete_marker_missing<S: EcstoreObjectOperations>(
+    storage: &S,
+    bucket: &str,
+    object_name: &str,
+    delete_marker_version_id: Uuid,
+) -> bool {
+    match read_source_delete_marker(storage, bucket, object_name, delete_marker_version_id).await {
         Ok(info) => !info.delete_marker || info.version_id != Some(delete_marker_version_id),
         Err(err) => is_err_object_not_found(&err) || is_err_version_not_found(&err),
     }

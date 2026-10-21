@@ -80,7 +80,7 @@ impl DiscoverySession {
                 if let Some((object, id)) = bound {
                     let transaction =
                         if [PREPARED, STORAGE_FORMAT_FILE_BACKUP, DELETE_QUORUM_COMMITTED_FILE].contains(&name.as_str()) {
-                            Uuid::parse_str(id).ok().filter(|id| !id.is_nil())
+                            canonical_uuid(id).filter(|id| !id.is_nil())
                         } else {
                             [
                                 DELETE_DATA_DIR_MARKER_PREFIX,
@@ -130,7 +130,7 @@ impl DiscoverySession {
                     }
                 }
             } else {
-                if self.object.is_some() && (!parent.is_empty() || !Uuid::parse_str(&name).is_ok_and(|id| !id.is_nil())) {
+                if self.object.is_some() && (!parent.is_empty() || !canonical_uuid(&name).is_some_and(|id| !id.is_nil())) {
                     continue;
                 }
                 // A valid 1024-byte key can exceed 256 one-byte path
@@ -578,7 +578,7 @@ fn explicit_delete_plan(
                 let entry = entry.map_err(to_file_error)?;
                 let kind = entry.file_type().map_err(to_file_error)?;
                 let name = entry.file_name().into_string().map_err(|_| DiskError::FileCorrupt)?;
-                if kind.is_dir() && Uuid::parse_str(&name).is_ok_and(|id| referenced.contains(&id)) {
+                if kind.is_dir() && canonical_uuid(&name).is_some_and(|id| referenced.contains(&id)) {
                     candidates.push(entry.path());
                 } else if kind.is_file()
                     && [
@@ -609,7 +609,7 @@ fn explicit_delete_plan(
             for entry in entries {
                 let entry = entry.map_err(to_file_error)?;
                 let name = entry.file_name().into_string().map_err(|_| DiskError::FileCorrupt)?;
-                let Some(id) = Uuid::parse_str(&name).ok().filter(|id| !id.is_nil()) else {
+                let Some(id) = canonical_uuid(&name).filter(|id| !id.is_nil()) else {
                     continue;
                 };
                 if !entry.file_type().map_err(to_file_error)?.is_dir() {
@@ -660,6 +660,13 @@ fn explicit_delete_plan(
     }
     data_dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     Ok(Some(ExplicitDeletePlan { data_dirs, proof_files }))
+}
+
+/// Protocol directories always use the canonical hyphenated spelling;
+/// `Uuid::parse_str` also accepts simple, braced and URN forms, which can only
+/// name independent child keys here.
+fn canonical_uuid(name: &str) -> Option<Uuid> {
+    Uuid::parse_str(name).ok().filter(|id| name == id.hyphenated().to_string())
 }
 
 fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Result<DeleteRecoveryInspection> {
@@ -746,8 +753,15 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
                 return Err(DiskError::InvalidPath);
             }
             let name = entry.file_name().into_string().map_err(|_| DiskError::FileCorrupt)?;
+            let id = canonical_uuid(&name);
+            if kind.is_dir() && id.is_none() {
+                // A non-UUID directory is only a prefix of independent child
+                // keys, which settle under their own exact-key locks and may
+                // vanish or appear concurrently. Settlement never touches it.
+                continue;
+            }
             descriptions.push((name.clone(), kind.is_dir(), entry.metadata().map_err(to_file_error)?.len()));
-            if kind.is_dir() && Uuid::parse_str(&name).is_ok_and(|id| !id.is_nil()) {
+            if kind.is_dir() && id.is_some_and(|id| !id.is_nil()) {
                 for child in std::fs::read_dir(entry.path()).map_err(to_file_error)? {
                     let child = child.map_err(to_file_error)?;
                     let kind = child.file_type().map_err(to_file_error)?;
@@ -768,7 +782,7 @@ fn inspection(root: &Path, volume: &str, object: &str, transaction: Uuid) -> Res
                     {
                         any_marker = true;
                     }
-                    let staged_id = Uuid::parse_str(&child_name).ok();
+                    let staged_id = canonical_uuid(&child_name);
                     let known_staged = kind.is_dir()
                         && staged_id.is_some_and(|dir| {
                             journal.as_ref().is_some_and(|journal| journal.data_dirs.contains(&dir))
@@ -3333,6 +3347,208 @@ mod tests {
             .expect("finalize after coordinator convergence proof");
         assert_eq!(settled.state, DeleteRecoveryState::Absent);
         assert!(!disk.io_get_object_path("recovery", "object").expect("object path").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_fingerprint_ignores_prefix_child_keys() {
+        // `object/child` is an independent key that only shares this key's
+        // directory as a prefix. Its delete removes `object/child/` under its
+        // own exact-key lock, so it can vanish (or appear) between this key's
+        // inspection and settlement.
+        // A content-addressed child key may look like a UUID in a spelling
+        // that this protocol never writes.
+        let names = ["child".to_owned(), Uuid::new_v4().simple().to_string()];
+        for (child_appears, name) in [false, true]
+            .into_iter()
+            .flat_map(|appears| names.iter().map(move |name| (appears, name)))
+        {
+            let (_temp, disk, _info, _original) = fixture().await;
+            let root = disk.io_get_object_path("recovery", "object").expect("object path");
+            let child = root.join(name);
+            if !child_appears {
+                std::fs::create_dir_all(&child).expect("create child key prefix");
+                std::fs::write(child.join(STORAGE_FORMAT_FILE), b"child").expect("write child key metadata");
+            }
+            let transaction = Uuid::new_v4();
+            let applied = apply(&disk, transaction).await;
+            let committed = disk
+                .settle_delete_transaction(
+                    "recovery",
+                    "object",
+                    transaction,
+                    applied.fingerprint,
+                    DeleteRecoveryAction::PublishCommit,
+                )
+                .await
+                .expect("durable set decision");
+            let finished = disk
+                .settle_delete_transaction(
+                    "recovery",
+                    "object",
+                    transaction,
+                    committed.fingerprint,
+                    DeleteRecoveryAction::FinishCommit,
+                )
+                .await
+                .expect("physical cleanup");
+            assert_eq!(finished.state, DeleteRecoveryState::CommitFinished);
+            let observed = disk
+                .inspect_delete_transaction("recovery", "object", transaction)
+                .await
+                .expect("GC inspection");
+            if child_appears {
+                std::fs::create_dir_all(&child).expect("create child key prefix");
+                std::fs::write(child.join(STORAGE_FORMAT_FILE), b"child").expect("write child key metadata");
+            } else {
+                std::fs::remove_dir_all(&child).expect("concurrent child key delete");
+            }
+            let settled = disk
+                .settle_delete_transaction(
+                    "recovery",
+                    "object",
+                    transaction,
+                    observed.fingerprint,
+                    DeleteRecoveryAction::FinalizeCommit,
+                )
+                .await
+                .expect("a child key change is not a change of this key's protocol evidence");
+            assert_eq!(settled.state, DeleteRecoveryState::Absent);
+            assert!(!root.join(transaction.to_string()).exists(), "transaction proof must be finalized");
+            assert_eq!(root.exists(), child_appears, "only a live child key may keep the prefix directory");
+            if child_appears {
+                assert_eq!(std::fs::read(child.join(STORAGE_FORMAT_FILE)).expect("child key survives"), b"child");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_settlement_ignores_non_canonical_data_dir_spelling() {
+        // `object/<simple hex>` names a child key, even when it spells a data
+        // dir referenced by this key's metadata.
+        for legacy in [false, true] {
+            let (_temp, disk, _info, _original) = fixture().await;
+            let root = disk.io_get_object_path("recovery", "object").expect("object path");
+            let data_dir = Uuid::new_v4();
+            let metadata = test_meta(test_file_info("object", Uuid::nil(), Some(data_dir), None));
+            let alias = root.join(data_dir.simple().to_string());
+            let transaction = Uuid::new_v4();
+            if legacy {
+                legacy_fixture(&disk, &metadata, transaction).await;
+                std::fs::create_dir(&alias).expect("create child key prefix");
+                let state = disk
+                    .inspect_delete_transaction("recovery", "object", transaction)
+                    .await
+                    .expect("inspect legacy residue");
+                assert_eq!(state.state, DeleteRecoveryState::LegacyAmbiguous);
+                assert!(state.explicit_delete_safe);
+                let cleared = disk
+                    .settle_delete_transaction(
+                        "recovery",
+                        "object",
+                        transaction,
+                        state.fingerprint,
+                        DeleteRecoveryAction::DiscardLegacy,
+                    )
+                    .await
+                    .expect("discard legacy residue");
+                assert_eq!(cleared.state, DeleteRecoveryState::Absent);
+            } else {
+                std::fs::write(root.join(STORAGE_FORMAT_FILE), &metadata).expect("write data dir metadata");
+                std::fs::create_dir(root.join(data_dir.to_string())).expect("create data dir");
+                std::fs::write(root.join(data_dir.to_string()).join("part.1"), b"x").expect("write part");
+                std::fs::create_dir(&alias).expect("create child key prefix");
+                let applied = apply(&disk, transaction).await;
+                let committed = disk
+                    .settle_delete_transaction(
+                        "recovery",
+                        "object",
+                        transaction,
+                        applied.fingerprint,
+                        DeleteRecoveryAction::PublishCommit,
+                    )
+                    .await
+                    .expect("durable set decision");
+                let finished = disk
+                    .settle_delete_transaction(
+                        "recovery",
+                        "object",
+                        transaction,
+                        committed.fingerprint,
+                        DeleteRecoveryAction::FinishCommit,
+                    )
+                    .await
+                    .expect("physical cleanup");
+                assert_eq!(finished.state, DeleteRecoveryState::CommitFinished);
+                assert!(!root.join(data_dir.to_string()).exists(), "the canonical data dir is deleted");
+            }
+            assert!(alias.is_dir(), "legacy={legacy}: a non-canonical spelling is not this key's data dir");
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_fingerprint_still_rejects_own_evidence_changes() {
+        #[derive(Clone, Copy, Debug)]
+        enum Change {
+            RootFile,
+            DataDirPart,
+            DataDir,
+        }
+        for change in [Change::RootFile, Change::DataDirPart, Change::DataDir] {
+            for finalize in [false, true] {
+                let (_temp, disk, _info, _original) = fixture().await;
+                let root = disk.io_get_object_path("recovery", "object").expect("object path");
+                // An unreferenced data dir that exists before inspection.
+                let data_dir = root.join(Uuid::new_v4().to_string());
+                std::fs::create_dir(&data_dir).expect("create data dir");
+                let transaction = Uuid::new_v4();
+                let mut observed = apply(&disk, transaction).await;
+                if finalize {
+                    let committed = disk
+                        .settle_delete_transaction(
+                            "recovery",
+                            "object",
+                            transaction,
+                            observed.fingerprint,
+                            DeleteRecoveryAction::PublishCommit,
+                        )
+                        .await
+                        .expect("durable set decision");
+                    let finished = disk
+                        .settle_delete_transaction(
+                            "recovery",
+                            "object",
+                            transaction,
+                            committed.fingerprint,
+                            DeleteRecoveryAction::FinishCommit,
+                        )
+                        .await
+                        .expect("physical cleanup");
+                    assert_eq!(finished.state, DeleteRecoveryState::CommitFinished);
+                    observed = disk
+                        .inspect_delete_transaction("recovery", "object", transaction)
+                        .await
+                        .expect("GC inspection");
+                }
+                match change {
+                    Change::RootFile => std::fs::write(root.join("part.1"), b"x").expect("write root file"),
+                    Change::DataDirPart => std::fs::write(data_dir.join("part.1"), b"x").expect("write data dir part"),
+                    Change::DataDir => std::fs::create_dir(root.join(Uuid::new_v4().to_string())).expect("create data dir"),
+                }
+                let action = if finalize {
+                    DeleteRecoveryAction::FinalizeCommit
+                } else {
+                    DeleteRecoveryAction::PublishCommit
+                };
+                assert_eq!(
+                    disk.settle_delete_transaction("recovery", "object", transaction, observed.fingerprint, action)
+                        .await
+                        .expect_err("a change of this key's own evidence must invalidate the snapshot"),
+                    DiskError::OutdatedXLMeta,
+                    "{change:?} before {}",
+                    if finalize { "FinalizeCommit" } else { "PublishCommit" }
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -11177,6 +11177,95 @@ mod test {
     }
 
     #[test]
+    fn agreed_listing_entry_covers_quorum_corrupt_and_free_version_branches() {
+        let t1 = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("t1");
+        let t2 = time::OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("t2");
+        let obj_entry = test_object_meta_entry_with_erasure_versions("object", &[(t1, "etag", 2, 2)]);
+
+        // 1. enforce_write_quorum = false immediately resolves without inspecting quorum or metadata.
+        let strict_resolver = list_metadata_resolution_params("bucket".to_string(), 4, 4, false, 0);
+        assert!(matches!(
+            resolve_agreed_listing_entry(obj_entry.clone(), 1, strict_resolver.clone(), false),
+            ListingEntryResolution::Resolved(_)
+        ));
+
+        // 2. Directory entry resolves when reader_disks >= dir_quorum and rejects below dir_quorum.
+        let dir_entry = test_dir_meta_entry("prefix/");
+        assert!(matches!(
+            resolve_agreed_listing_entry(dir_entry.clone(), 4, strict_resolver.clone(), true),
+            ListingEntryResolution::Resolved(_)
+        ));
+        assert!(matches!(
+            resolve_agreed_listing_entry(dir_entry, 3, strict_resolver.clone(), true),
+            ListingEntryResolution::Rejected
+        ));
+
+        // 3. reader_disks < obj_quorum rejects before decoding xl.meta.
+        assert!(matches!(
+            resolve_agreed_listing_entry(obj_entry, 3, strict_resolver, true),
+            ListingEntryResolution::Rejected
+        ));
+
+        // 4. Corrupt xl.meta resolves when obj_quorum <= 1 and rejects when obj_quorum > 1.
+        let corrupt_entry = MetaCacheEntry {
+            name: "corrupt".to_string(),
+            metadata: b"not-valid-xl-meta".to_vec(),
+            cached: None,
+            reusable: false,
+        };
+        let q1_resolver = list_metadata_resolution_params("bucket".to_string(), 1, 1, false, 0);
+        assert!(matches!(
+            resolve_agreed_listing_entry(corrupt_entry.clone(), 1, q1_resolver, true),
+            ListingEntryResolution::Resolved(_)
+        ));
+        let q2_resolver = list_metadata_resolution_params("bucket".to_string(), 2, 2, false, 0);
+        assert!(matches!(
+            resolve_agreed_listing_entry(corrupt_entry, 2, q2_resolver.clone(), true),
+            ListingEntryResolution::Rejected
+        ));
+
+        // 5. Latest version is a tier free-version record (`first.header.free_version() == true`),
+        // followed by a committed object version: the fast-path at index 0 is skipped because
+        // index 0 is a free version, and the loop selects the free version + first object version.
+        let mut transitioned = test_transitioned_meta_entry("transitioned-obj", "remote-key", true);
+        let mut fm = transitioned.cached.take().expect("cached transitioned meta");
+        let older_obj = test_object_meta_entry_with_erasure_versions(
+            "transitioned-obj",
+            &[(t1 - time::Duration::seconds(10), "older-etag", 2, 2)],
+        );
+        fm.versions.extend(older_obj.cached.expect("older cached").versions);
+        // Ensure free-version record is at index 0 (newest).
+        fm.versions[0].header.mod_time = Some(t2);
+        assert!(fm.versions[0].header.free_version());
+        transitioned.metadata = fm.marshal_msg().expect("marshal free+object versions");
+        transitioned.cached = None;
+
+        // With reader_disks = 2, the index-0 free version satisfies quorum 2, so without the
+        // `!first.header.free_version()` guard the fast-path would falsely resolve; instead
+        // the loop inspects the 2+2 object version (write quorum 3) and requests a supplement.
+        assert!(matches!(
+            resolve_agreed_listing_entry(transitioned.clone(), 2, q2_resolver.clone(), true),
+            ListingEntryResolution::NeedsSupplement(_, Some(_))
+        ));
+
+        let ListingEntryResolution::Resolved(resolved) = resolve_agreed_listing_entry(transitioned, 3, q2_resolver.clone(), true)
+        else {
+            panic!("expected Resolved for free-version + committed object");
+        };
+        let info = resolved.to_fileinfo("bucket").expect("decode resolved entry");
+        assert_eq!(info.metadata.get("etag").map(String::as_str), Some("older-etag"));
+
+        // 6. Only a free-version record exists (`selected_object_versions == 0` when `requested_versions == 1`):
+        // `selected_versions` has length == `cached.versions.len()`, so `resolve_agreed_listing_entry` returns Resolved.
+        let mut free_only = test_transitioned_meta_entry("free-only-obj", "remote-key", true);
+        free_only.cached = None;
+        assert!(matches!(
+            resolve_agreed_listing_entry(free_only, 3, q2_resolver, true),
+            ListingEntryResolution::Resolved(_)
+        ));
+    }
+
+    #[test]
     fn cached_entry_supplement_check_honors_write_quorum_slack() {
         let mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
         let mut entry = test_object_meta_entry_with_erasure_versions("object", &[(mod_time, "etag", 2, 2)]);
