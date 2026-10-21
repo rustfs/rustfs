@@ -4646,15 +4646,17 @@ mod tests {
             req.region = Some("us-east-1".parse().expect("signing region"));
             req.uri = Uri::from_static("/location-policy-bucket?LocationConstraint=forged&s3%3ALocationConstraint=forged");
             req.headers.insert("locationconstraint", HeaderValue::from_static("forged"));
-            let mut credentials = rustfs_credentials::Credentials::default();
-            credentials.claims = Some(
-                [
-                    ("LocationConstraint".to_string(), serde_json::json!("forged")),
-                    ("ldapLocationConstraint".to_string(), serde_json::json!("forged")),
-                ]
-                .into_iter()
-                .collect(),
-            );
+            let credentials = rustfs_credentials::Credentials {
+                claims: Some(
+                    [
+                        ("LocationConstraint".to_string(), serde_json::json!("forged")),
+                        ("ldapLocationConstraint".to_string(), serde_json::json!("forged")),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..Default::default()
+            };
             set_requested_bucket_location_constraint(&mut req);
             let location = req
                 .extensions
