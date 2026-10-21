@@ -59,7 +59,7 @@ use super::{
 };
 use crate::bucket::replication::{ReplicationState, ReplicationStatusType, replication_state_to_filemeta};
 use crate::data_movement;
-use crate::data_movement::SourceCleanupError;
+use crate::data_movement::{DataMovementCopy, SourceCleanupError};
 use crate::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::disk::error::DiskError;
@@ -286,7 +286,7 @@ async fn test_migrate_entry_version_remote_version_is_moved_without_transfer() {
             let transfer_count = transfer_count.clone();
             async move {
                 transfer_count.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                Ok(DataMovementCopy::Committed)
             }
         }
     };
@@ -332,7 +332,7 @@ async fn test_migrate_entry_version_remote_not_found_is_cleanup_ignored() {
             let transfer_count = transfer_count.clone();
             async move {
                 transfer_count.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                Ok(DataMovementCopy::Committed)
             }
         }
     };
@@ -361,6 +361,51 @@ async fn test_migrate_entry_version_remote_not_found_is_cleanup_ignored() {
     assert_eq!(backend.get_calls(), 0);
 }
 
+/// A tier free version reads as a delete marker with no transition status; it
+/// must still move as tier metadata so its remote owner reaches the target.
+#[tokio::test]
+async fn test_migrate_entry_version_moves_tier_free_version_as_remote_metadata() {
+    let backend = MigrationBackendSpy::new(None, None);
+    let mut version = FileInfo {
+        name: "object.bin".to_string(),
+        version_id: Some(uuid::Uuid::new_v4()),
+        deleted: true,
+        transition_tier: "WARM".to_string(),
+        transitioned_objname: "remote/object.bin".to_string(),
+        ..Default::default()
+    };
+    version.set_tier_free_version();
+    assert!(!version.is_remote());
+    let delete_marker_calls = Arc::new(AtomicUsize::new(0));
+    let delete_marker = {
+        let delete_marker_calls = delete_marker_calls.clone();
+        move |_: String, _: String, _: ObjectOptions| {
+            delete_marker_calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok::<_, Error>(ObjectInfo::default()) }
+        }
+    };
+
+    let result = migrate_entry_version(
+        &backend,
+        "bucket".to_string(),
+        0,
+        &version,
+        version.version_id.map(|v| v.to_string()),
+        Some(uuid::Uuid::new_v4()),
+        3,
+        false,
+        |_, _, _| async move { Ok(DataMovementCopy::Committed) },
+        delete_marker,
+    )
+    .await;
+
+    assert!(result.moved);
+    assert!(!result.failed);
+    assert_eq!(backend.move_remote_calls(), 1);
+    assert_eq!(delete_marker_calls.load(Ordering::SeqCst), 0, "a free version is no delete marker");
+    assert_eq!(backend.get_calls(), 0);
+}
+
 #[tokio::test]
 async fn test_migrate_entry_version_remote_overwrite_is_not_ignored() {
     let backend = MigrationBackendSpy::new(
@@ -372,7 +417,7 @@ async fn test_migrate_entry_version_remote_overwrite_is_not_ignored() {
         ))),
     );
     let version = version_remote();
-    let mut transfer = |_, _, _| async move { Ok(()) };
+    let mut transfer = |_, _, _| async move { Ok(DataMovementCopy::Committed) };
 
     let result = migrate_entry_version(
         &backend,
@@ -408,7 +453,7 @@ async fn test_migrate_entry_version_remote_failure_is_reported() {
             let transfer_count = transfer_count.clone();
             async move {
                 transfer_count.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                Ok(DataMovementCopy::Committed)
             }
         }
     };
@@ -441,7 +486,7 @@ async fn test_migrate_entry_version_remote_failure_is_reported() {
 async fn test_migrate_entry_version_deleted_version_routes_delete_through_store_and_moved() {
     let backend = MigrationBackendSpy::new(None, None);
     let version = version_deleted();
-    let mut transfer = |_, _, _| async move { Ok(()) };
+    let mut transfer = |_, _, _| async move { Ok(DataMovementCopy::Committed) };
     // The delete marker must be routed through the store closure (cross-pool routing), never
     // through the source SetDisks. Assert the closure is invoked and the source set is not.
     let delete_calls = Arc::new(AtomicUsize::new(0));
@@ -483,7 +528,7 @@ async fn test_migrate_entry_version_deleted_version_routes_delete_through_store_
 async fn test_migrate_entry_version_deleted_version_not_found_is_ignored() {
     let backend = MigrationBackendSpy::new(None, None);
     let version = version_deleted();
-    let mut transfer = |_, _, _| async move { Ok(()) };
+    let mut transfer = |_, _, _| async move { Ok(DataMovementCopy::Committed) };
     let delete_calls = Arc::new(AtomicUsize::new(0));
     let mut delete_marker = {
         let delete_calls = delete_calls.clone();
@@ -522,7 +567,7 @@ async fn test_migrate_entry_version_deleted_version_not_found_is_ignored() {
 async fn test_migrate_entry_version_deleted_version_overwrite_is_not_ignored() {
     let backend = MigrationBackendSpy::new(None, None);
     let version = version_deleted();
-    let mut transfer = |_, _, _| async move { Ok(()) };
+    let mut transfer = |_, _, _| async move { Ok(DataMovementCopy::Committed) };
     let delete_calls = Arc::new(AtomicUsize::new(0));
     let mut delete_marker = {
         let delete_calls = delete_calls.clone();
@@ -567,7 +612,7 @@ async fn test_migrate_entry_version_reader_not_found_is_ignored() {
     let backend =
         MigrationBackendSpy::new(Some(Err(Error::ObjectNotFound("bucket".to_string(), "object.bin".to_string()))), None);
     let version = version_normal();
-    let mut transfer = |_, _, _| async move { Ok(()) };
+    let mut transfer = |_, _, _| async move { Ok(DataMovementCopy::Committed) };
 
     let result = migrate_entry_version(
         &backend,
@@ -602,7 +647,7 @@ async fn test_migrate_entry_version_reader_retries_before_success() {
             let transfer_count = transfer_count.clone();
             async move {
                 transfer_count.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                Ok(DataMovementCopy::Committed)
             }
         }
     };
@@ -691,7 +736,7 @@ async fn test_migrate_entry_version_reader_fails_after_retries() {
             let transfer_count = transfer_count.clone();
             async move {
                 transfer_count.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                Ok(DataMovementCopy::Committed)
             }
         }
     };
@@ -730,7 +775,7 @@ async fn test_migrate_entry_version_zero_max_attempts_still_attempts_once() {
             let transfer_count = transfer_count.clone();
             async move {
                 transfer_count.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                Ok(DataMovementCopy::Committed)
             }
         }
     };
@@ -773,7 +818,7 @@ async fn test_migrate_entry_version_transfer_retries_before_success() {
                 if attempt == 0 {
                     return Err(Error::SlowDown);
                 }
-                Ok(())
+                Ok(DataMovementCopy::Committed)
             }
         }
     };
@@ -809,7 +854,9 @@ async fn test_migrate_entry_version_transfer_retries_before_success() {
     assert_eq!(transfer_count.load(Ordering::SeqCst), 2);
     assert_eq!(wait_count.load(Ordering::SeqCst), 1);
     let read_opts = backend.last_get_opts();
-    assert_eq!(read_opts.version_id.as_deref(), version.version_id.map(|id| id.to_string()).as_deref());
+    // `version_normal` is a null version; `None` would read the latest version.
+    assert!(version.version_id.is_none());
+    assert_eq!(read_opts.version_id, Some(uuid::Uuid::nil().to_string()));
     assert!(read_opts.no_lock);
     assert!(read_opts.data_movement);
     assert!(read_opts.raw_data_movement_read);
@@ -1000,7 +1047,7 @@ async fn test_migrate_entry_version_ignores_data_usage_cache_when_enabled() {
             let transfer_count = transfer_count.clone();
             async move {
                 transfer_count.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                Ok(DataMovementCopy::Committed)
             }
         }
     };
@@ -1043,7 +1090,7 @@ async fn test_migrate_entry_version_data_usage_cache_moves_when_ignore_disabled(
             let transfer_count = transfer_count.clone();
             async move {
                 transfer_count.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                Ok(DataMovementCopy::Committed)
             }
         }
     };
@@ -2184,7 +2231,7 @@ async fn test_rebalance_stage_wrapped_lock_timeout_retries_real_migration_loop()
             let attempt = attempts.fetch_add(1, Ordering::SeqCst);
             async move {
                 if succeeds_on_retry && attempt > 0 {
-                    return Ok(());
+                    return Ok(DataMovementCopy::Committed);
                 }
                 Err(data_movement::data_movement_stage_error_for_test(
                     "rebalance_object",
@@ -2453,7 +2500,7 @@ async fn test_migrate_entry_version_transfer_failure_reports_write_target_stage(
 #[tokio::test]
 async fn test_migrate_entry_version_reader_failure_reports_read_source_stage() {
     let backend = AlwaysFailGetBackend::new();
-    let mut transfer = |_, _, _| async { Ok(()) };
+    let mut transfer = |_, _, _| async { Ok(DataMovementCopy::Committed) };
     let version = version_normal();
 
     let result = migrate_entry_version(

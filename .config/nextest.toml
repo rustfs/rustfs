@@ -83,6 +83,13 @@ threads-required = "num-test-threads"
 filter = '(package(rustfs-ecstore) & test(=core::pools_test::decommission_lock_order_tests::active_decommission_migration_does_not_invert_capacity_and_delete_object_tag_locks)) | (package(rustfs-heal) & test(=heal::mrf_queue::partial_write::tests::durable_retry_submission_error_keeps_checkpoint_and_uses_backoff))'
 threads-required = "num-test-threads"
 
+# This registration/backup lock probe uses an isolated eight-disk store.
+# Reserve capacity so sibling disk-heavy tests cannot consume its 2s
+# registration budget; retain the queued backup and deadlock assertions.
+[[profile.default.overrides]]
+filter = 'package(rustfs) & test(=admin::handlers::table_catalog::tests::cold_strong_registration_completes_while_other_bucket_backup_waits)'
+threads-required = "num-test-threads"
+
 [[profile.default.overrides]]
 filter = 'package(rustfs-heal) & (binary(mrf_partial_write_test) | (binary(mrf_pipeline_test) & test(/^journal_replay_survives_/)) | test(=admin_selector_survives_sigkill_with_original_scope_and_receipts))'
 threads-required = "num-test-threads"
@@ -347,6 +354,13 @@ threads-required = "num-test-threads"
 # preserving the probes' internal concurrency, deadlines, and assertions.
 [[profile.ci.overrides]]
 filter = '(package(rustfs-ecstore) & test(=core::pools_test::decommission_lock_order_tests::active_decommission_migration_does_not_invert_capacity_and_delete_object_tag_locks)) | (package(rustfs-heal) & test(=heal::mrf_queue::partial_write::tests::durable_retry_submission_error_keeps_checkpoint_and_uses_backoff))'
+threads-required = "num-test-threads"
+
+# This registration/backup lock probe uses an isolated eight-disk store.
+# Reserve capacity so sibling disk-heavy tests cannot consume its 2s
+# registration budget; retain the queued backup and deadlock assertions.
+[[profile.ci.overrides]]
+filter = 'package(rustfs) & test(=admin::handlers::table_catalog::tests::cold_strong_registration_completes_while_other_bucket_backup_waits)'
 threads-required = "num-test-threads"
 
 [[profile.ci.overrides]]

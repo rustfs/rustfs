@@ -135,7 +135,7 @@ where
         return default_result(ScannerBucketScanScope::default());
     }
     if !resolution.requested_scope.is_default()
-        || !resolution.dirty_usage_snapshot.covers_all_pending
+        || !resolution.dirty_usage_snapshot.covers_listed_pending
         || resolution.dirty_usage_snapshot.generation == u64::MAX
         || resolution.dirty_usage_snapshot.buckets.len() > crate::SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES
     {
@@ -264,6 +264,32 @@ where
     ))
 }
 
+/// Runs once between the bucket listing and the dirty-usage snapshot, the
+/// window in which a write lands after the listing cutoff.
+#[cfg(test)]
+type BucketListingWindowHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+static BUCKET_LISTING_WINDOW_HOOK: StdMutex<Option<BucketListingWindowHook>> = StdMutex::new(None);
+
+#[cfg(test)]
+pub(super) fn set_bucket_listing_window_hook_for_tests(hook: impl FnOnce() + Send + 'static) {
+    *BUCKET_LISTING_WINDOW_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_bucket_listing_window_hook_for_tests() {
+    let hook = BUCKET_LISTING_WINDOW_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 #[cfg(test)]
 pub(super) async fn resolve_scanner_bucket_scan_scope_for_tests<S>(
     store: &S,
@@ -366,8 +392,10 @@ where
             ));
         }
     };
-    let dirty_generation_before_bucket_list = dirty_usage_generation();
+    let dirty_usage_cutoff = dirty_usage_listing_cutoff();
     let bucket_listing = store.list_bucket_for_scanner(&BucketOptions::default()).await?;
+    #[cfg(test)]
+    run_bucket_listing_window_hook_for_tests();
     let mut bucket_plan_complete = bucket_listing.topology_complete;
     let all_buckets = Arc::new(bucket_listing.buckets);
     let set_disks = store.all_set_disks();
@@ -400,24 +428,27 @@ where
     let checkpoint_coverage_digest =
         scanner_bucket_plan_digest(&all_buckets, crate::scanner::scanner_activity_coverage_digest(&activity_before));
     let execution_digest = scanner_bucket_work_digest(bucket_coverage_digest, scan_mode, requires_full_scan);
-    let dirty_usage_snapshot = Arc::new(snapshot_dirty_usage_buckets(&all_buckets, dirty_generation_before_bucket_list));
+    let dirty_usage_snapshot = Arc::new(snapshot_dirty_usage_buckets_after_listing(&all_buckets, dirty_usage_cutoff));
+    let baseline_proof = ScannerCacheBaselineProof {
+        authoritative_data: persisted_usage_baseline.as_ref(),
+        observed_candidate_data: observed_usage_candidate.as_ref(),
+        expected_sources: &expected_sources,
+        leader_epoch,
+        want_cycle,
+        scan_plan_digest: structural_scan_plan_digest,
+    };
+    let full_scan_required = requires_full_scan || scan_mode == HealScanMode::Deep;
+    let scope_eligible = !full_scan_required && scan_scope.is_default();
     let scope_resolution = resolve_scanner_bucket_scan_scope(
         store,
         distributed,
         ScannerBucketScopeResolution {
             requested_scope: scan_scope,
-            baseline_proof: ScannerCacheBaselineProof {
-                authoritative_data: persisted_usage_baseline.as_ref(),
-                observed_candidate_data: observed_usage_candidate.as_ref(),
-                expected_sources: &expected_sources,
-                leader_epoch,
-                want_cycle,
-                scan_plan_digest: structural_scan_plan_digest,
-            },
+            baseline_proof,
             activity_before: &activity_before,
             dirty_usage_snapshot: &dirty_usage_snapshot,
             all_buckets: &all_buckets,
-            requires_full_scan: requires_full_scan || scan_mode == HealScanMode::Deep,
+            requires_full_scan: full_scan_required,
             #[cfg(test)]
             test_peer_snapshots: None,
             #[cfg(test)]
@@ -428,6 +459,29 @@ where
     let remote_dirty_usage_acknowledgements = scope_resolution.remote_dirty_usage_acknowledgements;
     let distributed_segment_invalidation_evidence = scope_resolution.distributed_segment_invalidation_evidence;
     let scan_scope = scope_resolution.scope;
+    let scope_fallback = scanner_scope_fallback_reason(
+        scope_eligible,
+        &scan_scope,
+        &dirty_usage_snapshot,
+        &all_buckets,
+        baseline_proof,
+        distributed,
+    );
+    if let Some(reason) = scope_fallback {
+        global_metrics().record_scanner_scope_fallback(reason.as_str());
+        tracing::info!(
+            target: "rustfs::scanner::io",
+            event = EVENT_SCANNER_SET_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_IO,
+            state = "scoped_scan_fallback",
+            reason = reason.as_str(),
+            cycle = want_cycle,
+            dirty_buckets = dirty_usage_snapshot.buckets.len(),
+            bucket_count = all_buckets.len(),
+            "Scanner cycle walks every bucket because its dirty-bucket scope was not admitted"
+        );
+    }
     let segment_invalidation_proof = dirty_usage_producer_evidence(&dirty_usage_snapshot).segment_invalidation_proof();
     #[cfg(test)]
     if let Some(observer) = resolved_scope_observer {
@@ -506,6 +560,7 @@ where
             .with_remote_publication_lease_targets(remote_publication_lease_targets)
             .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
             .with_segment_reuse_activation_preflight(segment_reuse_activation_preflight)
+            .with_scope_fallback(scope_fallback)
             .with_publication_expectation(publication_expectation));
     }
 
@@ -881,5 +936,6 @@ where
         .with_failed_dirty_usage(!failed_buckets.is_empty())
         .with_pending_maintenance_work(pending_maintenance_work)
         .with_required_cycle_floor(required_cycle_floor)
+        .with_scope_fallback(scope_fallback)
         .with_publication_expectation(publication_expectation))
 }

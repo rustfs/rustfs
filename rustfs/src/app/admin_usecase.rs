@@ -16,8 +16,8 @@
 
 use super::storage_api::admin_usecase::admin::get_server_info;
 use super::storage_api::admin_usecase::capacity::{
-    DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus, RebalStatus, get_total_usable_capacity,
-    get_total_usable_capacity_free,
+    DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolMeta, PoolStatus, RebalStatus, RebalanceMeta,
+    get_total_usable_capacity, get_total_usable_capacity_free,
 };
 use super::storage_api::admin_usecase::contract::StorageAdminApi;
 use super::storage_api::admin_usecase::contract::bucket::{BucketOperations as _, BucketOptions};
@@ -46,6 +46,7 @@ pub type AdminUsecaseResult<T> = Result<T, ApiError>;
 
 /// `waitingReason` value reported while a pool is paused on target capacity.
 const DECOMMISSION_WAITING_REASON_CAPACITY: &str = "capacity";
+const DECOMMISSION_WAITING_REASON_SOURCE_CLEANUP: &str = "source_cleanup";
 
 pub const ADMIN_CLUSTER_SNAPSHOT_ROUTE: &str = "/rustfs/admin/v4/cluster/snapshot";
 pub const ADMIN_EXTENSIONS_CATALOG_ROUTE: &str = "/rustfs/admin/v4/extensions/catalog";
@@ -267,15 +268,15 @@ impl DefaultAdminUsecase {
         }
     }
 
-    async fn refresh_rebalance_status_snapshot(store: &ECStore) -> AdminUsecaseResult<()> {
-        store.refresh_rebalance_status_meta().await.map_err(|err| {
+    async fn rebalance_status_snapshot(store: &ECStore) -> AdminUsecaseResult<Option<RebalanceMeta>> {
+        store.rebalance_status_meta_snapshot().await.map_err(|err| {
             error!("refresh rebalance metadata for pool status failed: {:?}", err);
             ApiError::from(err)
         })
     }
 
-    async fn refresh_pool_status_snapshot(store: &ECStore) -> AdminUsecaseResult<()> {
-        store.refresh_pool_status_meta().await.map_err(|err| {
+    async fn pool_status_snapshot(store: &ECStore) -> AdminUsecaseResult<PoolMeta> {
+        store.pool_status_meta_snapshot().await.map_err(|err| {
             error!("refresh pool metadata for pool status failed: {:?}", err);
             ApiError::from(err)
         })
@@ -400,11 +401,11 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
         };
 
-        Self::refresh_pool_status_snapshot(store.as_ref()).await?;
+        let pool_meta = Self::pool_status_snapshot(store.as_ref()).await?;
 
         let mut pool_statuses = Vec::new();
         for (idx, _) in endpoints.as_ref().iter().enumerate() {
-            let state = store.status(idx).await.map_err(ApiError::from)?;
+            let state = store.status(&pool_meta, idx).await.map_err(ApiError::from)?;
             pool_statuses.push(state);
         }
 
@@ -416,10 +417,10 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
         let pool_statuses = self.execute_list_pool_statuses().await?;
-        Self::refresh_rebalance_status_snapshot(store.as_ref()).await?;
+        let rebalance_meta = Self::rebalance_status_snapshot(store.as_ref()).await?;
         let mut items = Vec::with_capacity(pool_statuses.len());
         for status in pool_statuses {
-            let rebalance_status = store.pool_rebalance_status(status.id).await;
+            let rebalance_status = ECStore::pool_rebalance_status(rebalance_meta.as_ref(), status.id);
             items.push(Self::pool_list_item_from_status(status, rebalance_status));
         }
         Ok(items)
@@ -455,10 +456,10 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
 
-        Self::refresh_pool_status_snapshot(store.as_ref()).await?;
-        let status = store.status(idx).await.map_err(ApiError::from)?;
-        Self::refresh_rebalance_status_snapshot(store.as_ref()).await?;
-        let rebalance_status = store.pool_rebalance_status(idx).await;
+        let pool_meta = Self::pool_status_snapshot(store.as_ref()).await?;
+        let status = store.status(&pool_meta, idx).await.map_err(ApiError::from)?;
+        let rebalance_meta = Self::rebalance_status_snapshot(store.as_ref()).await?;
+        let rebalance_status = ECStore::pool_rebalance_status(rebalance_meta.as_ref(), idx);
         Ok(Self::pool_list_item_from_status(status, rebalance_status))
     }
 
@@ -473,10 +474,10 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
         }
         let pool_statuses = self.execute_list_pool_statuses().await?;
-        Self::refresh_rebalance_status_snapshot(store.as_ref()).await?;
+        let rebalance_meta = Self::rebalance_status_snapshot(store.as_ref()).await?;
         let mut pools = Vec::with_capacity(pool_statuses.len());
         for status in pool_statuses {
-            let rebalance_status = store.pool_rebalance_status(status.id).await;
+            let rebalance_status = ECStore::pool_rebalance_status(rebalance_meta.as_ref(), status.id);
             pools.push(Self::decommission_pool_status_from_status(status, rebalance_status));
         }
         Ok(AdminDecommissionStatus { pools })
@@ -500,10 +501,10 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
 
-        Self::refresh_pool_status_snapshot(store.as_ref()).await?;
-        let status = store.status(idx).await.map_err(ApiError::from)?;
-        Self::refresh_rebalance_status_snapshot(store.as_ref()).await?;
-        let rebalance_status = store.pool_rebalance_status(idx).await;
+        let pool_meta = Self::pool_status_snapshot(store.as_ref()).await?;
+        let status = store.status(&pool_meta, idx).await.map_err(ApiError::from)?;
+        let rebalance_meta = Self::rebalance_status_snapshot(store.as_ref()).await?;
+        let rebalance_status = ECStore::pool_rebalance_status(rebalance_meta.as_ref(), idx);
         Ok(Self::decommission_pool_status_from_status(status, rebalance_status))
     }
 
@@ -640,6 +641,9 @@ impl DefaultAdminUsecase {
     fn decommission_waiting_reason(info: &PoolDecommissionInfo) -> Option<&'static str> {
         if !info.has_decommission_state() || info.complete || info.failed || info.canceled {
             return None;
+        }
+        if info.is_source_cleanup_blocked() {
+            return Some(DECOMMISSION_WAITING_REASON_SOURCE_CLEANUP);
         }
         if info.capacity_blocked_reason.is_some() {
             return Some(DECOMMISSION_WAITING_REASON_CAPACITY);
@@ -1039,6 +1043,33 @@ mod tests {
             value["decommissionInfo"]["capacityBlockedReason"],
             "target pool 1 target capacity mutation gate is busy"
         );
+    }
+
+    /// A pause caused by a source cleanup that kept failing is not a capacity
+    /// problem and must not be reported as one.
+    #[test]
+    fn admin_pool_list_item_exposes_decommission_source_cleanup_pause() {
+        let reason = "source cleanup blocked: decommission bucket b set 0 finished with 1 deferred entries remaining; \
+                      deferral cause: decommission cleanup_delete_object failed for b/o: erasure write quorum";
+        let item = DefaultAdminUsecase::pool_list_item_from_status(
+            PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                    total_size: 1_000,
+                    current_size: 500,
+                    capacity_blocked_reason: Some(reason.to_string()),
+                    ..Default::default()
+                }),
+            },
+            (RebalStatus::None, false),
+        );
+
+        let value = serde_json::to_value(item).expect("paused pool status should serialize");
+        assert_eq!(value["decommissionInfo"]["waitingReason"], "source_cleanup");
+        assert_eq!(value["decommissionInfo"]["capacityBlockedReason"], reason);
     }
 
     /// Once the pause clears, `waitingReason` must return to the worker states

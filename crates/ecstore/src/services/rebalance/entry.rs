@@ -254,8 +254,18 @@ impl ECStore {
             None => None,
         };
 
-        let mut fivs =
-            resolve_rebalance_file_info_versions_result(entry.file_info_versions(&bucket), bucket.as_str(), entry.name.as_str())?;
+        let mut fivs = resolve_rebalance_file_info_versions_result(
+            entry.file_info_versions_with_free_versions(&bucket),
+            bucket.as_str(),
+            entry.name.as_str(),
+        )?;
+        // Tier free versions own the remote objects of removed transitioned
+        // versions. They move with the entry like decommission moves them, and
+        // sit inline like the exact snapshot the source-cleanup preflight reads;
+        // left out, that preflight defers the entry forever.
+        let free_versions = std::mem::take(&mut fivs.free_versions);
+        fivs.versions.extend(free_versions);
+        let object_versions = fivs.versions.iter().filter(|version| !version.tier_free_version()).count();
 
         fivs.versions
             .sort_by_key(|v| (v.mod_time.is_none(), std::cmp::Reverse(v.mod_time)));
@@ -282,24 +292,33 @@ impl ECStore {
         let mut rebalanced: usize = 0;
         let mut expired: usize = 0;
         let mut cleanup_preflight_allowed_missing = Vec::new();
+        let mut cleanup_preflight_vanished = Vec::new();
+        let mut cleanup_transferred_tier_versions = Vec::new();
         let mut stats_updates = Vec::with_capacity(fivs.versions.len());
         for version in fivs.versions.iter() {
             ensure_rebalance_entry_active(&cancel)?;
-            run_guard.ensure_held("rebalance lifecycle mutation")?;
-            let lifecycle_result = crate::core::pools::should_skip_lifecycle_for_data_movement(
-                self.clone(),
-                &bucket,
-                version,
-                bucket_configs.lifecycle_config.as_ref(),
-                bucket_configs.object_lock_config.as_ref(),
-                true,
-                &crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Rebal,
-                lock_lost_signal.clone(),
-            )
-            .await;
-            ensure_rebalance_entry_active(&cancel)?;
-            run_guard.ensure_held("rebalance lifecycle mutation")?;
-            let expired_by_lifecycle = lifecycle_result?;
+            // A tier free version is not an object version: lifecycle rules and
+            // the delete-marker policy do not apply to it.
+            let tier_free_version = version.tier_free_version();
+            let expired_by_lifecycle = if tier_free_version {
+                false
+            } else {
+                run_guard.ensure_held("rebalance lifecycle mutation")?;
+                let lifecycle_result = crate::core::pools::should_skip_lifecycle_for_data_movement(
+                    self.clone(),
+                    &bucket,
+                    version,
+                    bucket_configs.lifecycle_config.as_ref(),
+                    bucket_configs.object_lock_config.as_ref(),
+                    true,
+                    &crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Rebal,
+                    lock_lost_signal.clone(),
+                )
+                .await;
+                ensure_rebalance_entry_active(&cancel)?;
+                run_guard.ensure_held("rebalance lifecycle mutation")?;
+                lifecycle_result?
+            };
             if expired_by_lifecycle {
                 expired += 1;
                 // The lifecycle expiry above physically deleted this version from the source set.
@@ -320,8 +339,10 @@ impl ECStore {
                 continue;
             }
 
-            let remaining_versions = fivs.versions.len() - expired;
-            if should_skip_rebalance_delete_marker(version, remaining_versions, bucket_configs.replication_config.is_some()) {
+            let remaining_versions = object_versions - expired;
+            if !tier_free_version
+                && should_skip_rebalance_delete_marker(version, remaining_versions, bucket_configs.replication_config.is_some())
+            {
                 rebalanced += 1;
                 debug!(
                     event = EVENT_REBALANCE_ENTRY,
@@ -386,6 +407,9 @@ impl ECStore {
             run_guard.ensure_held("rebalance version migration")?;
 
             if result.ignored {
+                if result.cleanup_ignored {
+                    cleanup_preflight_vanished.push(data_movement::source_cleanup_version_identity(version));
+                }
                 if should_count_rebalance_version_complete(&result) {
                     rebalanced += 1;
                 }
@@ -468,9 +492,19 @@ impl ECStore {
                 return Err(entry_err);
             }
 
-            stats_updates.push(version);
+            if tier_free_version {
+                // Like decommission, tolerate a free version the tier sweeper
+                // consumes from the source after its copy committed: the copy
+                // owns the same remote tuple, and it holds no pool data.
+                cleanup_preflight_allowed_missing.push(data_movement::source_cleanup_version_identity(version));
+            } else {
+                stats_updates.push(version);
+            }
             if should_count_rebalance_version_complete(&result) {
                 rebalanced += 1;
+            }
+            if result.moved && !result.superseded && version.transition_status == rustfs_filemeta::TRANSITION_COMPLETE {
+                cleanup_transferred_tier_versions.push(data_movement::source_cleanup_version_identity(version));
             }
         }
 
@@ -478,6 +512,7 @@ impl ECStore {
             if bucket_incarnation_fence.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
                 return Err(Error::other("rebalance bucket incarnation fence was lost before source cleanup"));
             }
+            let cleanup_expected = data_movement::source_cleanup_expected_without_vanished(&fivs, &cleanup_preflight_vanished);
             let cleanup_result = self
                 .finish_rebalance_entry_after_cleanup(
                     &RebalanceEntryCleanupContext {
@@ -493,8 +528,9 @@ impl ECStore {
                         set.clone(),
                         bucket.as_str(),
                         entry.name.as_str(),
-                        &fivs,
+                        &cleanup_expected,
                         &cleanup_preflight_allowed_missing,
+                        &cleanup_transferred_tier_versions,
                         data_movement::SourceCleanupBucketFence {
                             expected_incarnation_id: bucket_configs.bucket_incarnation_id,
                             lifecycle_guard: bucket_incarnation_fence
@@ -590,7 +626,7 @@ impl ECStore {
         rd: GetObjectReader,
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
-    ) -> Result<()> {
+    ) -> Result<data_movement::DataMovementCopy> {
         data_movement::migrate_object_with_lock_lost_signal(
             self,
             pool_idx,
@@ -996,7 +1032,9 @@ mod tests {
     use crate::storage_api_contracts::object::ObjectIO as _;
     use http::HeaderMap;
     use rustfs_filemeta::{FileInfo, FileMeta, ObjectPartInfo, TransitionVersionState};
-    use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule};
+    use s3s::dto::{
+        BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, NoncurrentVersionExpiration,
+    };
     use std::time::Duration as StdDuration;
     use time::OffsetDateTime;
     use tokio::io::AsyncReadExt;
@@ -1561,6 +1599,983 @@ mod tests {
         assert_eq!(stats.num_objects, 1);
         assert_eq!(stats.num_versions, 1);
         assert_eq!(stats.cleanup_warnings.count, 0);
+    }
+
+    /// What sits above the pre-versioning null version in the null-version
+    /// fixtures (backlog#2873).
+    #[derive(Clone, Copy, Debug)]
+    enum NullVersionTop {
+        DeleteMarker,
+        NewerVersion,
+    }
+
+    const NULL_VERSION_REBALANCE_ID: &str = "rebalance-null-version";
+
+    /// One rebalancing entry: a null version written before versioning was
+    /// enabled, with a delete marker or a newer version above it, on pool 0 of a
+    /// two-pool store with an active run.
+    struct NullVersionRebalance {
+        _temp_dirs: Vec<tempfile::TempDir>,
+        store: Arc<ECStore>,
+        bucket: &'static str,
+        object: &'static str,
+        incarnation: uuid::Uuid,
+        payload: Vec<u8>,
+        seeded: rustfs_filemeta::FileInfoVersions,
+        source_set: Arc<SetDisks>,
+    }
+
+    impl NullVersionRebalance {
+        async fn new(top: NullVersionTop) -> Self {
+            let (temp_dirs, store, _peer) =
+                crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = "rebalance-null-version";
+            let object = "pre-versioning.bin";
+            // An active run blocks the data-usage publication bucket creation needs.
+            Box::pin(store.make_bucket(bucket, &MakeBucketOptions::default()))
+                .await
+                .expect("create bucket");
+            let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
+            let rebalance_meta = active_rebalance_meta(NULL_VERSION_REBALANCE_ID);
+            rebalance_meta
+                .save(Arc::clone(&store.pools[0]))
+                .await
+                .expect("persist the active rebalance run");
+            *store.rebalance_meta.write().await = Some(rebalance_meta);
+            let payload = b"written before versioning was enabled".repeat(128);
+            let source_set = store.pools[0].get_disks_by_key(object);
+            Box::pin(source_set.put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(payload.clone()),
+                &ObjectOptions {
+                    expected_bucket_incarnation_id: Some(incarnation),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("seed null version");
+            let versioned = ObjectOptions {
+                versioned: true,
+                expected_bucket_incarnation_id: Some(incarnation),
+                ..Default::default()
+            };
+            match top {
+                NullVersionTop::DeleteMarker => {
+                    let marker = Box::pin(source_set.delete_object(bucket, object, versioned))
+                        .await
+                        .expect("seed delete marker over the null version");
+                    assert!(marker.delete_marker);
+                }
+                NullVersionTop::NewerVersion => {
+                    Box::pin(source_set.put_object(
+                        bucket,
+                        object,
+                        &mut PutObjReader::from_vec(b"written after versioning was enabled".to_vec()),
+                        &versioned,
+                    ))
+                    .await
+                    .expect("seed newer version over the null version");
+                }
+            }
+            let seeded = source_set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("read seeded versions")
+                .expect("seeded versions must exist");
+            assert_eq!(seeded.versions.len(), 2);
+            assert_eq!(seeded.versions[0].deleted, matches!(top, NullVersionTop::DeleteMarker));
+            assert!(seeded.versions[0].version_id.is_some(), "the latest version must have a real id");
+            assert!(seeded.versions[1].version_id.is_none(), "the oldest version must be the null version");
+            Self {
+                _temp_dirs: temp_dirs,
+                store,
+                bucket,
+                object,
+                incarnation,
+                payload,
+                seeded,
+                source_set,
+            }
+        }
+
+        async fn run_entry(&self) -> RebalanceEntryOutcome {
+            let entry = metacache_entry_from_source(&self.source_set, self.bucket, self.object).await;
+            Box::pin(Arc::clone(&self.store).rebalance_entry(
+                RebalanceEntryTarget {
+                    bucket: self.bucket.to_string(),
+                    pool_index: 0,
+                },
+                entry,
+                Arc::clone(&self.source_set),
+                Arc::new(RebalanceBucketConfigs {
+                    bucket_incarnation_id: Some(self.incarnation),
+                    ..Default::default()
+                }),
+                Arc::from(NULL_VERSION_REBALANCE_ID),
+                CancellationToken::new(),
+            ))
+            .await
+            .expect("rebalance entry")
+        }
+
+        async fn source_versions(&self) -> Option<rustfs_filemeta::FileInfoVersions> {
+            self.source_set
+                .load_file_info_versions_exact(self.bucket, self.object)
+                .await
+                .expect("read source versions")
+        }
+
+        /// Both versions are on the target with their identities, the null
+        /// version's content and SHA-256 are intact, and the source is gone.
+        async fn assert_moved(&self) {
+            let target = self.store.pools[1]
+                .get_disks_by_key(self.object)
+                .load_file_info_versions_exact(self.bucket, self.object)
+                .await
+                .expect("read target versions")
+                .expect("versions must reach the target pool");
+            assert_eq!(target.versions.len(), 2, "both versions must move");
+            assert_eq!(target.versions[0].version_id, self.seeded.versions[0].version_id);
+            assert_eq!(target.versions[0].deleted, self.seeded.versions[0].deleted);
+            assert!(target.versions[1].version_id.is_none(), "the null version must keep its null identity");
+            assert_eq!(target.versions[1].mod_time, self.seeded.versions[1].mod_time);
+
+            let mut reader = self.store.pools[1]
+                .get_object_reader(
+                    self.bucket,
+                    self.object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        version_id: Some(uuid::Uuid::nil().to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("the migrated null version must be readable");
+            let mut actual = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut actual)
+                .await
+                .expect("drain the migrated null version");
+            assert_eq!(
+                rustfs_utils::crypto::hex_sha256(&actual, str::to_owned),
+                rustfs_utils::crypto::hex_sha256(&self.payload, str::to_owned)
+            );
+            assert_eq!(actual, self.payload);
+            assert!(
+                self.source_versions().await.is_none(),
+                "the source entry must be removed only after both versions moved"
+            );
+        }
+    }
+
+    /// A pre-versioning null version hidden behind a delete marker must reach
+    /// the target pool intact before the source entry is removed (backlog#2873).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_rebalance_migrates_null_version_behind_delete_marker() {
+        let fixture = NullVersionRebalance::new(NullVersionTop::DeleteMarker).await;
+        assert_eq!(fixture.run_entry().await, RebalanceEntryOutcome::Completed);
+        fixture.assert_moved().await;
+    }
+
+    /// Overwriting after versioning was enabled leaves a newer version above
+    /// the null version. The old `None` read selected that newer version, the
+    /// target accepted it as an equivalent copy, and cleanup then deleted the
+    /// null version without ever reporting it as missing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_rebalance_migrates_null_version_behind_newer_version() {
+        let fixture = NullVersionRebalance::new(NullVersionTop::NewerVersion).await;
+        assert_eq!(fixture.run_entry().await, RebalanceEntryOutcome::Completed);
+        fixture.assert_moved().await;
+    }
+
+    /// Runs a case on a thread whose stack fits the transitioned copy path in
+    /// debug builds; libtest's 2 MiB default does not under plain `cargo test`.
+    fn run_large_stack_async_test<C, F>(name: &str, case: C)
+    where
+        C: FnOnce() -> F + Send + 'static,
+        F: std::future::Future<Output = ()> + 'static,
+    {
+        const STACK_SIZE: usize = if cfg!(debug_assertions) {
+            8 * rustfs_config::DEFAULT_THREAD_STACK_SIZE
+        } else if cfg!(target_os = "macos") {
+            2 * rustfs_config::DEFAULT_THREAD_STACK_SIZE
+        } else {
+            rustfs_config::DEFAULT_THREAD_STACK_SIZE
+        };
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .stack_size(STACK_SIZE)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .thread_stack_size(STACK_SIZE)
+                    .build()
+                    .expect("large-stack rebalance test runtime should build");
+                runtime.block_on(case());
+            })
+            .expect("large-stack rebalance test thread should spawn")
+            .join()
+            .expect("large-stack rebalance test thread should complete");
+    }
+
+    const TRANSITIONED_REBALANCE_ID: &str = "rebalance-transitioned-source-cleanup";
+
+    /// One transitioned source version on pool 0 of a two-pool store with an
+    /// active rebalance run. A restored source keeps its local copy, so the
+    /// rebalance moves it as data that keeps the transition tuple instead of
+    /// as tier metadata (rustfs/backlog#2873, defect D).
+    struct TransitionedRebalance {
+        _temp_dirs: Vec<tempfile::TempDir>,
+        store: Arc<ECStore>,
+        bucket: &'static str,
+        object: &'static str,
+        versioned: bool,
+        incarnation: uuid::Uuid,
+        payload: Vec<u8>,
+        source: FileInfo,
+        source_set: Arc<SetDisks>,
+        backend: crate::services::tier::test_util::MockWarmBackend,
+    }
+
+    impl TransitionedRebalance {
+        async fn new(versioned: bool, restored: bool) -> Self {
+            Self::with_source(versioned, restored, false).await
+        }
+
+        /// With `multipart`, the source is a two-part object, so the copy
+        /// settles on the multipart path rather than a single PUT.
+        async fn with_source(versioned: bool, restored: bool, multipart: bool) -> Self {
+            let (temp_dirs, store, _peer) =
+                crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = "rebalance-transitioned";
+            let object = "transitioned.bin";
+            // An active run blocks the data-usage publication bucket creation needs.
+            Box::pin(store.make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: versioned,
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("create bucket");
+            let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
+            let tier_name = format!("REBALTIER{}", &uuid::Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+            let backend = crate::services::tier::test_util::register_mock_tier(&store.tier_config_mgr(), &tier_name).await;
+            let source_set = store.pools[0].get_disks_by_key(object);
+            let write_opts = ObjectOptions {
+                versioned,
+                expected_bucket_incarnation_id: Some(incarnation),
+                ..Default::default()
+            };
+            let (payload, written) = if multipart {
+                // Set-level multipart writes with a bucket incarnation require
+                // the caller's lifecycle fence; stage these without one.
+                let write_opts = ObjectOptions {
+                    versioned,
+                    ..Default::default()
+                };
+                let parts = [vec![0x31; 5 << 20], vec![0x32; 1]];
+                let upload = Box::pin(source_set.new_multipart_upload(bucket, object, &write_opts))
+                    .await
+                    .expect("create the source multipart upload");
+                let mut completed = Vec::with_capacity(parts.len());
+                for (part_num, body) in (1..).zip(parts.iter()) {
+                    let part = Box::pin(source_set.put_object_part(
+                        bucket,
+                        object,
+                        &upload.upload_id,
+                        part_num,
+                        &mut PutObjReader::from_vec(body.clone()),
+                        &write_opts,
+                    ))
+                    .await
+                    .expect("stage the source part");
+                    completed.push(CompletePart {
+                        part_num: part.part_num,
+                        etag: part.etag,
+                        ..Default::default()
+                    });
+                }
+                let written = Box::pin(Arc::clone(&source_set).complete_multipart_upload(
+                    bucket,
+                    object,
+                    &upload.upload_id,
+                    completed,
+                    &write_opts,
+                ))
+                .await
+                .expect("complete the source multipart object");
+                (parts.concat(), written)
+            } else {
+                let payload = b"transitioned before the rebalance".to_vec();
+                let written =
+                    Box::pin(source_set.put_object(bucket, object, &mut PutObjReader::from_vec(payload.clone()), &write_opts))
+                        .await
+                        .expect("seed the source version");
+                (payload, written)
+            };
+            let version_id = written.version_id.map(|version| version.to_string());
+            Box::pin(store.pools[0].transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    versioned,
+                    version_id: version_id.clone(),
+                    transition: crate::bucket::lifecycle::lifecycle::TransitionOptions {
+                        status: crate::bucket::lifecycle::lifecycle::TRANSITION_PENDING.to_string(),
+                        tier: tier_name,
+                        etag: written.etag.clone().expect("the source should have an ETag"),
+                        ..Default::default()
+                    },
+                    mod_time: written.mod_time,
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("transition the source before the rebalance");
+            if restored {
+                Box::pin(Arc::clone(&store).restore_transitioned_object(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        versioned,
+                        version_id,
+                        transition: crate::bucket::lifecycle::lifecycle::TransitionOptions {
+                            restore_request: s3s::dto::RestoreRequest {
+                                days: Some(1),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                ))
+                .await
+                .expect("restore the transitioned source");
+            }
+            let rebalance_meta = active_rebalance_meta(TRANSITIONED_REBALANCE_ID);
+            rebalance_meta
+                .save(Arc::clone(&store.pools[0]))
+                .await
+                .expect("persist the active rebalance run");
+            *store.rebalance_meta.write().await = Some(rebalance_meta);
+
+            let seeded = source_set
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("read seeded versions")
+                .expect("the transitioned source must exist");
+            assert_eq!(seeded.versions.len(), 1);
+            let source = seeded.versions[0].clone();
+            assert_eq!(source.transition_status, TRANSITION_COMPLETE);
+            assert_eq!(source.version_id.is_some(), versioned);
+            assert_eq!(!source.is_remote(), restored, "a restored source keeps its local copy");
+            assert_eq!(source.parts.len() > 1, multipart, "unexpected source part layout: {:?}", source.parts);
+            assert!(
+                backend.metadata(&source.transitioned_objname).await.is_some(),
+                "the transition must upload the remote object"
+            );
+            Self {
+                _temp_dirs: temp_dirs,
+                store,
+                bucket,
+                object,
+                versioned,
+                incarnation,
+                payload,
+                source,
+                source_set,
+                backend,
+            }
+        }
+
+        async fn run_entry(&self) -> RebalanceEntryOutcome {
+            let entry = metacache_entry_from_source(&self.source_set, self.bucket, self.object).await;
+            self.run_entry_with(entry, None).await
+        }
+
+        async fn run_listed_entry(&self) -> RebalanceEntryOutcome {
+            self.run_entry_with(self.listed_entry().await, None).await
+        }
+
+        /// The entry on the raw xl.meta of a source disk, as a listing yields
+        /// it: re-encoding decoded versions would turn a tier free version into
+        /// a plain delete marker.
+        async fn listed_entry(&self) -> MetaCacheEntry {
+            use crate::disk::DiskAPI as _;
+            let (disks, _) = self.source_set.get_online_disks_with_healing(false).await;
+            let raw = disks
+                .first()
+                .expect("the source set should have an online disk")
+                .read_xl(self.bucket, self.object, false)
+                .await
+                .expect("read the source xl.meta");
+            MetaCacheEntry {
+                name: self.object.to_string(),
+                metadata: raw.buf,
+                cached: None,
+                reusable: false,
+            }
+        }
+
+        async fn run_entry_with(
+            &self,
+            entry: MetaCacheEntry,
+            lifecycle_config: Option<BucketLifecycleConfiguration>,
+        ) -> RebalanceEntryOutcome {
+            Box::pin(Arc::clone(&self.store).rebalance_entry(
+                RebalanceEntryTarget {
+                    bucket: self.bucket.to_string(),
+                    pool_index: 0,
+                },
+                entry,
+                Arc::clone(&self.source_set),
+                Arc::new(RebalanceBucketConfigs {
+                    bucket_incarnation_id: Some(self.incarnation),
+                    lifecycle_config,
+                    ..Default::default()
+                }),
+                Arc::from(TRANSITIONED_REBALANCE_ID),
+                CancellationToken::new(),
+            ))
+            .await
+            .expect("rebalance entry")
+        }
+
+        /// Writes another source version; `mod_time` backdates it.
+        async fn put_source_version(&self, payload: &[u8], mod_time: Option<OffsetDateTime>) -> crate::object_api::ObjectInfo {
+            Box::pin(self.source_set.put_object(
+                self.bucket,
+                self.object,
+                &mut PutObjReader::from_vec(payload.to_vec()),
+                &ObjectOptions {
+                    versioned: self.versioned,
+                    mod_time,
+                    expected_bucket_incarnation_id: Some(self.incarnation),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("write a source version")
+        }
+
+        /// Writes another source version and transitions it to the fixture tier.
+        async fn transition_source_version(&self, payload: &[u8]) -> Option<uuid::Uuid> {
+            let written = self.put_source_version(payload, None).await;
+            Box::pin(self.store.pools[0].transition_object(
+                self.bucket,
+                self.object,
+                &ObjectOptions {
+                    versioned: self.versioned,
+                    version_id: written.version_id.map(|version| version.to_string()),
+                    transition: crate::bucket::lifecycle::lifecycle::TransitionOptions {
+                        status: crate::bucket::lifecycle::lifecycle::TRANSITION_PENDING.to_string(),
+                        tier: self.source.transition_tier.clone(),
+                        etag: written.etag.clone().expect("the source should have an ETag"),
+                        ..Default::default()
+                    },
+                    mod_time: written.mod_time,
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("transition another source version");
+            written.version_id
+        }
+
+        /// Deletes a source version by id; a transitioned one leaves a tier
+        /// free version that owns its remote object.
+        async fn delete_source_version(&self, version_id: Option<uuid::Uuid>) {
+            Box::pin(self.source_set.delete_object(
+                self.bucket,
+                self.object,
+                ObjectOptions {
+                    versioned: self.versioned,
+                    version_id: version_id.map(|version| version.to_string()),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("delete a source version");
+        }
+
+        async fn write_source_delete_marker(&self) {
+            let marker = Box::pin(self.source_set.delete_object(
+                self.bucket,
+                self.object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("write a source delete marker");
+            assert!(marker.delete_marker);
+        }
+
+        async fn source_free_versions(&self) -> Vec<FileInfo> {
+            self.versions_on(0)
+                .await
+                .into_iter()
+                .filter(FileInfo::tier_free_version)
+                .collect()
+        }
+
+        /// Removes a tier free version from the source the way the tier
+        /// sweeper does once it has deleted the remote object.
+        async fn consume_free_version(set: &SetDisks, bucket: &str, object: &str, free: &FileInfo) {
+            let mut request = FileInfo {
+                name: object.to_string(),
+                version_id: free.version_id,
+                deleted: true,
+                ..Default::default()
+            };
+            request.set_tier_free_version();
+            set.delete_object_version(bucket, object, &request, false)
+                .await
+                .expect("consume the source tier free version");
+        }
+
+        /// Each free version reached the target with its remote tuple, next to
+        /// `other_versions` object versions, and the source holds nothing.
+        async fn assert_free_versions_moved(&self, free: &[FileInfo], other_versions: usize) {
+            let left = self.versions_on(0).await;
+            assert!(left.is_empty(), "the source must keep no version or tier free version: {left:?}");
+            let target = self.versions_on(1).await;
+            let target_free: Vec<_> = target.iter().filter(|version| version.tier_free_version()).collect();
+            assert_eq!(target_free.len(), free.len(), "the target must own every tier free version: {target:?}");
+            for version in free {
+                let moved = target_free
+                    .iter()
+                    .find(|moved| moved.version_id == version.version_id)
+                    .unwrap_or_else(|| panic!("free version {:?} must reach the target: {target:?}", version.version_id));
+                assert_eq!(moved.transition_tier, version.transition_tier);
+                assert_eq!(moved.transitioned_objname, version.transitioned_objname);
+                assert_eq!(moved.transition_version_id, version.transition_version_id);
+                assert_eq!(
+                    crate::services::tier::tier::tier_destination_id_from_metadata(&moved.metadata)
+                        .expect("the moved destination identity should decode"),
+                    crate::services::tier::tier::tier_destination_id_from_metadata(&version.metadata)
+                        .expect("the source destination identity should decode"),
+                );
+            }
+            assert_eq!(target.len(), free.len() + other_versions, "{target:?}");
+            self.assert_remote_object_kept().await;
+        }
+
+        async fn assert_version_readable_on_target(&self, version_id: Option<uuid::Uuid>, payload: &[u8]) {
+            let mut reader = self.store.pools[1]
+                .get_object_reader(
+                    self.bucket,
+                    self.object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        versioned: self.versioned,
+                        version_id: version_id.map(|version| version.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("the moved version should be readable");
+            let mut body = Vec::new();
+            reader.stream.read_to_end(&mut body).await.expect("drain the moved version");
+            assert_eq!(body, payload);
+        }
+
+        /// Versions the rebalance counted for the source pool.
+        async fn rebalanced_versions(&self) -> u64 {
+            self.store
+                .rebalance_meta
+                .read()
+                .await
+                .as_ref()
+                .expect("the rebalance run should be active")
+                .pool_stats[0]
+                .num_versions
+        }
+
+        async fn versions_on(&self, pool_index: usize) -> Vec<FileInfo> {
+            self.store.pools[pool_index]
+                .get_disks_by_key(self.object)
+                .load_file_info_versions_exact(self.bucket, self.object)
+                .await
+                .expect("read pool versions")
+                .map(|versions| versions.versions)
+                .unwrap_or_default()
+        }
+
+        fn assert_same_remote_tuple(&self, version: &FileInfo) {
+            assert_eq!(version.transition_tier, self.source.transition_tier);
+            assert_eq!(version.transitioned_objname, self.source.transitioned_objname);
+            assert_eq!(version.transition_version_id, self.source.transition_version_id);
+            assert_eq!(
+                crate::services::tier::tier::tier_destination_id_from_metadata(&version.metadata)
+                    .expect("the copy's destination identity should decode"),
+                crate::services::tier::tier::tier_destination_id_from_metadata(&self.source.metadata)
+                    .expect("the source destination identity should decode"),
+            );
+        }
+
+        async fn assert_remote_object_kept(&self) {
+            assert!(
+                self.backend.metadata(&self.source.transitioned_objname).await.is_some(),
+                "the remote object must stay in the tier"
+            );
+            assert_eq!(self.backend.remove_count().await, 0, "no remote delete may be issued");
+            assert_eq!(self.backend.exact_remove_count(), 0, "no remote delete may be issued");
+        }
+
+        /// The target owns the version and its remote object, and the source
+        /// keeps neither the version nor a tier free version.
+        async fn assert_moved(&self) {
+            let left = self.versions_on(0).await;
+            assert!(left.is_empty(), "the source must keep no version or tier free version: {left:?}");
+            let target = self.versions_on(1).await;
+            assert_eq!(target.len(), 1, "the target must hold the version and no tier free version: {target:?}");
+            let moved = &target[0];
+            assert!(!moved.tier_free_version());
+            assert_eq!(moved.version_id, self.source.version_id);
+            assert_eq!(moved.transition_status, TRANSITION_COMPLETE);
+            self.assert_same_remote_tuple(moved);
+            self.assert_remote_object_kept().await;
+
+            let mut reader = self.store.pools[1]
+                .get_object_reader(
+                    self.bucket,
+                    self.object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        versioned: self.versioned,
+                        version_id: self.source.version_id.map(|version| version.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("the moved version should be readable");
+            let mut body = Vec::new();
+            reader.stream.read_to_end(&mut body).await.expect("drain the moved version");
+            assert_eq!(body, self.payload);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn real_rebalance_of_a_transitioned_version_leaves_no_source_free_version() {
+        run_large_stack_async_test("rebalance-transitioned-version", || async {
+            let fixture = TransitionedRebalance::new(true, false).await;
+            assert_eq!(fixture.run_entry().await, RebalanceEntryOutcome::Completed);
+            fixture.assert_moved().await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn real_rebalance_of_a_transitioned_null_version_leaves_no_source_free_version() {
+        run_large_stack_async_test("rebalance-transitioned-null-version", || async {
+            let fixture = TransitionedRebalance::new(false, false).await;
+            assert_eq!(fixture.run_entry().await, RebalanceEntryOutcome::Completed);
+            fixture.assert_moved().await;
+        });
+    }
+
+    /// A restored source moves as data; the copy keeps its transition tuple,
+    /// so the target owns the remote object as well.
+    #[test]
+    #[serial_test::serial]
+    fn real_rebalance_of_a_restored_transitioned_version_moves_its_remote_owner() {
+        run_large_stack_async_test("rebalance-restored-transitioned-version", || async {
+            let fixture = TransitionedRebalance::new(true, true).await;
+            assert_eq!(fixture.run_entry().await, RebalanceEntryOutcome::Completed);
+            fixture.assert_moved().await;
+        });
+    }
+
+    /// A newer unversioned object written to the target replaces a restored
+    /// null source instead of receiving a copy of it. Nothing references the
+    /// source's remote object any more, so its source cleanup must keep a tier
+    /// free version to delete it.
+    async fn run_superseded_restored_null_version_case(multipart: bool) {
+        let fixture = TransitionedRebalance::with_source(false, true, multipart).await;
+        let newer = b"written to the target after the source".to_vec();
+        Box::pin(fixture.store.pools[1].get_disks_by_key(fixture.object).put_object(
+            fixture.bucket,
+            fixture.object,
+            &mut PutObjReader::from_vec(newer.clone()),
+            &ObjectOptions {
+                expected_bucket_incarnation_id: Some(fixture.incarnation),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("write a newer null version on the target");
+
+        assert_eq!(fixture.run_entry().await, RebalanceEntryOutcome::Completed);
+
+        let left = fixture.versions_on(0).await;
+        assert_eq!(left.len(), 1, "the source must keep one tier free version: {left:?}");
+        assert!(left[0].tier_free_version());
+        fixture.assert_same_remote_tuple(&left[0]);
+        let target = fixture.versions_on(1).await;
+        assert_eq!(target.len(), 1, "the target keeps only its newer version: {target:?}");
+        assert!(!target[0].tier_free_version());
+        assert!(target[0].transition_status.is_empty(), "the newer version references no remote object");
+        let mut reader = fixture.store.pools[1]
+            .get_object_reader(fixture.bucket, fixture.object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("the newer target version should be readable");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("drain the newer version");
+        assert_eq!(body, newer);
+        fixture.assert_remote_object_kept().await;
+
+        // The next pass moves that free version next to the newer null object.
+        // The fixture's tiny capacity lets a multipart copy reach the free
+        // space goal, so restart the run's stats first.
+        *fixture.store.rebalance_meta.write().await = Some(active_rebalance_meta(TRANSITIONED_REBALANCE_ID));
+        assert_eq!(fixture.run_listed_entry().await, RebalanceEntryOutcome::Completed);
+        fixture.assert_free_versions_moved(&left, 1).await;
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn real_rebalance_keeps_a_free_version_for_a_restored_null_version_superseded_on_target() {
+        run_large_stack_async_test("rebalance-superseded-restored-null-version", || {
+            run_superseded_restored_null_version_case(false)
+        });
+    }
+
+    /// The same superseded source as a multipart object settles on the
+    /// multipart copy path.
+    #[test]
+    #[serial_test::serial]
+    fn real_rebalance_keeps_a_free_version_for_a_restored_multipart_null_version_superseded_on_target() {
+        run_large_stack_async_test("rebalance-superseded-restored-multipart", || {
+            run_superseded_restored_null_version_case(true)
+        });
+    }
+
+    /// A rule that expires every noncurrent version at once.
+    fn noncurrent_expire_all_lifecycle() -> BucketLifecycleConfiguration {
+        BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("noncurrent-expire-all".to_string()),
+                noncurrent_version_expiration: Some(NoncurrentVersionExpiration {
+                    noncurrent_days: Some(0),
+                    newer_noncurrent_versions: None,
+                }),
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        }
+    }
+
+    /// Deleting a transitioned source version leaves a tier free version that
+    /// owns its remote object. The rebalance moves that owner to the target
+    /// with the rest of the entry and removes the source entry, neither
+    /// deferring it forever nor issuing a remote delete (rustfs/backlog#2873).
+    #[test]
+    #[serial_test::serial]
+    fn real_rebalance_moves_a_tier_free_version_only_entry() {
+        run_large_stack_async_test("rebalance-tier-free-version-only", || async {
+            let fixture = TransitionedRebalance::new(true, false).await;
+            fixture.delete_source_version(fixture.source.version_id).await;
+            let free = fixture.source_free_versions().await;
+            assert_eq!(free.len(), 1, "the delete must leave one tier free version");
+            fixture.assert_same_remote_tuple(&free[0]);
+
+            assert_eq!(fixture.run_listed_entry().await, RebalanceEntryOutcome::Completed);
+
+            fixture.assert_free_versions_moved(&free, 0).await;
+            assert_eq!(fixture.rebalanced_versions().await, 0, "a free version holds no pool data");
+        });
+    }
+
+    /// A noncurrent-expire-all rule would expire the free version if the
+    /// rebalance evaluated lifecycle on it; it must move instead, and only the
+    /// live version counts in the rebalance stats.
+    #[test]
+    #[serial_test::serial]
+    fn real_rebalance_moves_a_tier_free_version_beside_a_live_version() {
+        run_large_stack_async_test("rebalance-tier-free-version-with-live", || async {
+            let fixture = TransitionedRebalance::new(true, false).await;
+            let payload = b"live version beside the free version".to_vec();
+            let live = fixture.put_source_version(&payload, None).await;
+            fixture.delete_source_version(fixture.source.version_id).await;
+            let free = fixture.source_free_versions().await;
+            assert_eq!(free.len(), 1, "the delete must leave one tier free version");
+            assert_eq!(fixture.versions_on(0).await.len(), 2);
+
+            let entry = fixture.listed_entry().await;
+            assert_eq!(
+                fixture.run_entry_with(entry, Some(noncurrent_expire_all_lifecycle())).await,
+                RebalanceEntryOutcome::Completed
+            );
+
+            fixture.assert_free_versions_moved(&free, 1).await;
+            fixture.assert_version_readable_on_target(live.version_id, &payload).await;
+            assert_eq!(fixture.rebalanced_versions().await, 1, "only the live version counts");
+        });
+    }
+
+    /// A free version does not count toward the last-delete-marker rule: the
+    /// delete marker beside it is still the entry's last object version and is
+    /// dropped, while the free version moves.
+    #[test]
+    #[serial_test::serial]
+    fn real_rebalance_moves_a_tier_free_version_beside_a_delete_marker() {
+        run_large_stack_async_test("rebalance-tier-free-version-with-marker", || async {
+            let fixture = TransitionedRebalance::new(true, false).await;
+            fixture.write_source_delete_marker().await;
+            fixture.delete_source_version(fixture.source.version_id).await;
+            let free = fixture.source_free_versions().await;
+            assert_eq!(free.len(), 1, "the delete must leave one tier free version");
+            let seeded = fixture.versions_on(0).await;
+            assert_eq!(seeded.len(), 2, "{seeded:?}");
+            assert!(seeded.iter().any(|version| version.deleted && !version.tier_free_version()));
+
+            assert_eq!(fixture.run_listed_entry().await, RebalanceEntryOutcome::Completed);
+
+            fixture.assert_free_versions_moved(&free, 0).await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn real_rebalance_moves_every_tier_free_version_of_an_entry() {
+        run_large_stack_async_test("rebalance-tier-free-versions", || async {
+            let fixture = TransitionedRebalance::new(true, false).await;
+            let second = fixture.transition_source_version(b"second transitioned version").await;
+            fixture.delete_source_version(fixture.source.version_id).await;
+            fixture.delete_source_version(second).await;
+            let free = fixture.source_free_versions().await;
+            assert_eq!(free.len(), 2, "each delete must leave a tier free version");
+            assert_ne!(free[0].transitioned_objname, free[1].transitioned_objname);
+
+            assert_eq!(fixture.run_listed_entry().await, RebalanceEntryOutcome::Completed);
+
+            fixture.assert_free_versions_moved(&free, 0).await;
+        });
+    }
+
+    /// The tier sweeper may consume the source free version after its copy
+    /// committed on the target and before source cleanup; the entry still
+    /// completes in the same pass.
+    #[test]
+    #[serial_test::serial]
+    fn real_rebalance_completes_when_a_moved_free_version_is_consumed_before_cleanup() {
+        run_large_stack_async_test("rebalance-tier-free-version-consumed-after-copy", || async {
+            let fixture = TransitionedRebalance::new(true, false).await;
+            // Older than the free version, so it moves after it.
+            let payload = b"older live version".to_vec();
+            let backdated = OffsetDateTime::now_utc() - time::Duration::hours(1);
+            let live = fixture.put_source_version(&payload, Some(backdated)).await;
+            fixture.delete_source_version(fixture.source.version_id).await;
+            let free = fixture.source_free_versions().await;
+            assert_eq!(free.len(), 1, "the delete must leave one tier free version");
+            assert!(free[0].mod_time > live.mod_time, "the free version must move first");
+
+            let consumed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let fault: super::super::migration::RebalanceSourceReadFault = {
+                let consumed = Arc::clone(&consumed);
+                let store = Arc::clone(&fixture.store);
+                let set = Arc::clone(&fixture.source_set);
+                let (bucket, object, free) = (fixture.bucket, fixture.object, free[0].clone());
+                Arc::new(move |_, read| {
+                    if read != object || consumed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        return None;
+                    }
+                    let target_free = {
+                        let (store, set, free) = (Arc::clone(&store), Arc::clone(&set), free.clone());
+                        let handle = tokio::runtime::Handle::current();
+                        std::thread::spawn(move || {
+                            handle.block_on(async {
+                                let target = store.pools[1]
+                                    .get_disks_by_key(object)
+                                    .load_file_info_versions_exact(bucket, object)
+                                    .await
+                                    .expect("read target versions")
+                                    .map(|versions| versions.versions)
+                                    .unwrap_or_default();
+                                TransitionedRebalance::consume_free_version(&set, bucket, object, &free).await;
+                                target.iter().filter(|version| version.tier_free_version()).count()
+                            })
+                        })
+                        .join()
+                        .expect("consume the source free version")
+                    };
+                    assert_eq!(target_free, 1, "the free version must commit on the target first");
+                    None
+                })
+            };
+            let entry = fixture.listed_entry().await;
+            let outcome = super::super::migration::REBALANCE_SOURCE_READ_FAULT
+                .scope(fault, fixture.run_entry_with(entry, None))
+                .await;
+
+            assert_eq!(outcome, RebalanceEntryOutcome::Completed);
+            assert!(consumed.load(std::sync::atomic::Ordering::SeqCst));
+            fixture.assert_free_versions_moved(&free, 1).await;
+            fixture.assert_version_readable_on_target(live.version_id, &payload).await;
+        });
+    }
+
+    /// A free version consumed after the listing reads as not found; the
+    /// rebalance treats it as gone instead of failing the entry, and issues no
+    /// remote delete of its own.
+    #[test]
+    #[serial_test::serial]
+    fn real_rebalance_completes_when_a_listed_free_version_is_already_consumed() {
+        run_large_stack_async_test("rebalance-tier-free-version-consumed-before-move", || async {
+            let fixture = TransitionedRebalance::new(true, false).await;
+            fixture.delete_source_version(fixture.source.version_id).await;
+            let free = fixture.source_free_versions().await;
+            assert_eq!(free.len(), 1, "the delete must leave one tier free version");
+            let entry = fixture.listed_entry().await;
+            TransitionedRebalance::consume_free_version(&fixture.source_set, fixture.bucket, fixture.object, &free[0]).await;
+
+            assert_eq!(fixture.run_entry_with(entry, None).await, RebalanceEntryOutcome::Completed);
+
+            fixture.assert_free_versions_moved(&[], 0).await;
+        });
+    }
+
+    /// A version the mover reports as not found while it still exists must not
+    /// be deleted with the entry; cleanup is deferred and the source retained.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_rebalance_retains_source_when_null_version_read_reports_not_found() {
+        let fixture = NullVersionRebalance::new(NullVersionTop::DeleteMarker).await;
+        let object = fixture.object;
+        let fault: super::super::migration::RebalanceSourceReadFault = Arc::new(move |bucket, read| {
+            (read == object).then(|| Error::VersionNotFound(bucket.to_string(), read.to_string(), "null".to_string()))
+        });
+        let outcome = super::super::migration::REBALANCE_SOURCE_READ_FAULT
+            .scope(fault, fixture.run_entry())
+            .await;
+        let RebalanceEntryOutcome::Deferred { last_error } = outcome else {
+            panic!("cleanup must be deferred while the reported-missing version exists: {outcome:?}");
+        };
+        assert!(last_error.contains("source changed"), "{last_error}");
+        let source = fixture.source_versions().await.expect("the source entry must be retained");
+        assert_eq!(source.versions.len(), 2, "every source version must be retained");
+        assert!(source.versions[1].version_id.is_none());
     }
 
     #[tokio::test]

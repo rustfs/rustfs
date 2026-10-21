@@ -97,6 +97,25 @@ pub fn try_get_global_local_node_name() -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
+#[cfg(test)]
+mod node_identity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn local_node_name_nonblocking_read_recovers_after_writer_release() {
+        let previous = get_global_local_node_name().await;
+        let mut writer = GLOBAL_LOCAL_NODE_NAME.write().await;
+        *writer = "published-node".to_string();
+        let unavailable = try_get_global_local_node_name();
+        drop(writer);
+        let published = try_get_global_local_node_name();
+        set_global_local_node_name(&previous).await;
+
+        assert!(unavailable.is_none(), "a held writer must make the nonblocking getter unavailable");
+        assert_eq!(published.as_deref(), Some("published-node"));
+    }
+}
+
 /// Set the global RustFS address used for gRPC connections.
 ///
 /// # Arguments

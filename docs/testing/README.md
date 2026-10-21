@@ -30,6 +30,8 @@ The [scanner cache cost profile](scanner-cache-cost.md) separates clone, subtree
 
 The [Pool layout compatibility reference](pool-layout-compatibility.md) defines the topology and EC regression matrix for single-drive, single-node multi-drive, and multi-node expansion pools.
 
+The [Scanner/Heal topology protection gates](scanner-heal-topology-gates.md) map G-EXP, G-REB and G-DEC and their fault windows to the `scanner_heal_topology_` cases, their recorded inventory, and the basis of their timeouts.
+
 The [immutable validation candidate reference](validation-candidates.md) describes isolated package builds and exact candidate resolution for the current auto-testing fleet.
 
 ## Naming conventions

@@ -1601,6 +1601,7 @@ async fn assert_bootstrap_authority_during_pending_put(drives_per_set: usize) {
             ScannerCycleScheduling {
                 requires_full_scan: true,
                 service_cohort: None,
+                scope_fallback: None,
             },
         ),
     )
@@ -1688,6 +1689,7 @@ async fn assert_bootstrap_authority_during_pending_put(drives_per_set: usize) {
                     true,
                 ),
                 service_cohort: None,
+                scope_fallback: None,
             },
         ),
     )
@@ -8870,6 +8872,84 @@ fn superseded_retry_does_not_delay_required_maintenance() {
             "superseded cycle {consecutive_cycles} must preserve regular maintenance"
         );
     }
+}
+
+#[test]
+fn scope_fallback_retry_paces_full_walks_up_to_the_cycle_interval() {
+    let config = ScannerRuntimeConfig {
+        cycle_interval: Duration::from_secs(60),
+        ..Default::default()
+    };
+    let mut backoff = ScannerRetryBackoff::default();
+    assert_eq!(scanner_scope_fallback_retry_interval(backoff, &config), None);
+
+    // Repeated fallbacks back off from seconds and settle on the ordinary
+    // cadence: never back to back, never starved by the 30-minute cap.
+    for expected in [5, 10, 20, 40, 60, 60] {
+        backoff.record_retryable_cycle(true);
+        assert_eq!(
+            scanner_scope_fallback_retry_interval(backoff, &config),
+            Some(Duration::from_secs(expected))
+        );
+    }
+    for _ in 0..40 {
+        backoff.record_retryable_cycle(true);
+    }
+    assert_eq!(scanner_scope_fallback_retry_interval(backoff, &config), Some(config.cycle_interval));
+
+    // The wait disables the immediate dirty-usage wake and defers cluster
+    // activity, which is what keeps full walks from running back to back.
+    let generations = ScannerCycleObservedGenerations::for_wait(
+        &config,
+        scanner_scope_fallback_retry_interval(backoff, &config),
+        crate::scanner_io::dirty_usage_generation(),
+        crate::runtime_config::scanner_runtime_config_generation(),
+        crate::scanner_io::scanner_maintenance_generation(),
+    );
+    assert!(generations.dirty_usage.is_none());
+    assert!(generations.defer_cluster_activity);
+    // The paced timer wake still requests a scope, so a scoped cycle resumes
+    // as soon as one is admitted.
+    assert!(!ScannerMaintenanceFeatures::default().requires_full_scan(
+        Some(scanner_maintenance_generation()),
+        scanner_maintenance_generation(),
+        ScannerCycleWakeReason::Timer,
+        true,
+    ));
+
+    // A scoped (or otherwise non-fallback) cycle resets the schedule.
+    backoff.record_retryable_cycle(false);
+    assert_eq!(scanner_scope_fallback_retry_interval(backoff, &config), None);
+}
+
+#[test]
+fn scope_fallback_retry_preserves_explicit_and_fast_cycle_cadence() {
+    let mut backoff = ScannerRetryBackoff::default();
+    backoff.record_retryable_cycle(true);
+    for source in [
+        ScannerRuntimeConfigSource::Env,
+        ScannerRuntimeConfigSource::Config,
+        ScannerRuntimeConfigSource::ScannerCompatConfig,
+    ] {
+        let config = ScannerRuntimeConfig {
+            cycle_interval: Duration::from_secs(6 * 60 * 60),
+            cycle_interval_source: source,
+            ..Default::default()
+        };
+        assert_eq!(
+            scanner_scope_fallback_retry_interval(backoff, &config),
+            Some(config.cycle_interval),
+            "{source:?} cycle cadence is a duty-cycle floor for fallback walks"
+        );
+    }
+    let fastest = ScannerRuntimeConfig {
+        cycle_interval: Duration::from_secs(1),
+        ..Default::default()
+    };
+    for _ in 0..8 {
+        backoff.record_retryable_cycle(true);
+    }
+    assert_eq!(scanner_scope_fallback_retry_interval(backoff, &fastest), Some(Duration::from_secs(1)));
 }
 
 #[test]

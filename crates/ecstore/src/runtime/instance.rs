@@ -83,12 +83,16 @@ pub(crate) enum ScannerPublicationLeasePurpose {
     Observational,
 }
 
+/// Movement read admission granted with a publication lease. Lease-scoped
+/// target operations share it rather than queueing a second read on the gate.
+pub(crate) type ScannerPublicationLeasePermit = Arc<OwnedRwLockReadGuard<()>>;
+
 pub(crate) struct ScannerPublicationLeaseEntry {
     pub(crate) expires_at: Instant,
     pub(crate) movement_generation: u64,
     pub(crate) namespace_generation: Option<u64>,
     pub(crate) purpose: ScannerPublicationLeasePurpose,
-    pub(crate) _operation_guard: OwnedRwLockReadGuard<()>,
+    pub(crate) operation_guard: ScannerPublicationLeasePermit,
 }
 
 pub(crate) struct NamespaceCommitGuard {
@@ -213,6 +217,10 @@ pub struct InstanceContext {
     /// Readers are held across one publication commit; movement transitions
     /// take the writer at their durable state commit boundary.
     data_movement_operation_gate: Arc<RwLock<()>>,
+    /// Set while an operator decommission start runs on this instance. A
+    /// start runs detached from its caller, so this keeps abandoned requests
+    /// and their retries from stacking concurrent starts and preflight heals.
+    decommission_start_in_flight: AtomicBool,
     /// Remote scanner publication leases own a read guard until explicit
     /// release or bounded expiry.  Keeping the guard in storage-owned state
     /// makes a remote movement transition wait on the same fence as a local
@@ -286,6 +294,7 @@ impl InstanceContext {
             bucket_metadata_sys: std::sync::Mutex::new(None),
             background_cancel_token: OnceLock::new(),
             data_movement_operation_gate: Arc::new(RwLock::new(())),
+            decommission_start_in_flight: AtomicBool::new(false),
             scanner_publication_leases: Arc::new(Mutex::new(HashMap::new())),
             data_movement_operation_epoch: AtomicU64::new(0),
             data_movement_operation_epoch_exhausted: AtomicBool::new(false),
@@ -345,6 +354,22 @@ impl InstanceContext {
         Arc::clone(&self.data_movement_operation_gate)
     }
 
+    /// Claim the single decommission start slot; `false` when a start is
+    /// already running. Release it with [`Self::end_decommission_start`].
+    pub(crate) fn try_begin_decommission_start(&self) -> bool {
+        self.decommission_start_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn end_decommission_start(&self) {
+        self.decommission_start_in_flight.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn decommission_start_running(&self) -> bool {
+        self.decommission_start_in_flight.load(Ordering::Acquire)
+    }
+
     pub(crate) async fn install_scanner_publication_lease(
         &self,
         token: Uuid,
@@ -365,7 +390,7 @@ impl InstanceContext {
                 movement_generation,
                 namespace_generation,
                 purpose,
-                _operation_guard: operation_guard,
+                operation_guard: Arc::new(operation_guard),
             },
         );
         true
@@ -383,16 +408,35 @@ impl InstanceContext {
         &self,
         token: Uuid,
     ) -> Option<(u64, Option<u64>, ScannerPublicationLeasePurpose)> {
+        self.scanner_publication_lease_admission(token)
+            .await
+            .map(|(movement_generation, namespace_generation, purpose, _)| (movement_generation, namespace_generation, purpose))
+    }
+
+    /// Return the live lease's generations and purpose together with a share
+    /// of its movement read admission. The share keeps movement writers out
+    /// for as long as the caller holds it, even if the lease is released or
+    /// expires meanwhile, without queueing a new read behind a waiting writer.
+    pub(crate) async fn scanner_publication_lease_admission(
+        &self,
+        token: Uuid,
+    ) -> Option<(u64, Option<u64>, ScannerPublicationLeasePurpose, ScannerPublicationLeasePermit)> {
         let mut leases = self.scanner_publication_leases.lock().await;
         let now = Instant::now();
-        let (expires_at, movement_generation, namespace_generation, purpose) = leases
-            .get(&token)
-            .map(|entry| (entry.expires_at, entry.movement_generation, entry.namespace_generation, entry.purpose))?;
+        let (expires_at, movement_generation, namespace_generation, purpose, permit) = leases.get(&token).map(|entry| {
+            (
+                entry.expires_at,
+                entry.movement_generation,
+                entry.namespace_generation,
+                entry.purpose,
+                Arc::clone(&entry.operation_guard),
+            )
+        })?;
         if expires_at <= now {
             leases.remove(&token);
             return None;
         }
-        Some((movement_generation, namespace_generation, purpose))
+        Some((movement_generation, namespace_generation, purpose, permit))
     }
 
     pub(crate) async fn expire_scanner_publication_lease(&self, token: Uuid, expires_at: Instant) {

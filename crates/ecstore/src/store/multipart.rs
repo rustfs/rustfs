@@ -1062,8 +1062,11 @@ impl ECStore {
                         let mut lookup_opts = ObjectOptions {
                             versioned: delete_opts.versioned,
                             version_suspended: delete_opts.version_suspended,
-                            version_id: delete_opts.version_id.clone(),
-                            metadata_chg: delete_opts.version_id.is_some(),
+                            // The abort options keep an id-less null version as
+                            // `None` for the upload identity; the target proof
+                            // must still look up that exact version.
+                            version_id: Some(delete_opts.version_id.clone().unwrap_or_else(|| Uuid::nil().to_string())),
+                            metadata_chg: true,
                             no_lock: true,
                             ..Default::default()
                         };

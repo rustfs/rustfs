@@ -4103,7 +4103,7 @@ mod tests {
             .expect("quorum boundary object should be written");
         {
             let mut pool_meta = store.pool_meta.write().await;
-            let mut next = PoolMeta::new(&store.pools, &pool_meta);
+            let mut next = PoolMeta::new(&store.pools, &pool_meta).expect("pool metadata should be rebuilt");
             next.pools[1].decommission = Some(PoolDecommissionInfo {
                 start_time: Some(OffsetDateTime::UNIX_EPOCH),
                 ..Default::default()
@@ -4344,7 +4344,7 @@ mod tests {
             .await
             .expect_err("missing metadata must latch the format-heal write gate");
 
-        let pool_meta = PoolMeta::new(&store.pools, &PoolMeta::default());
+        let pool_meta = PoolMeta::new(&store.pools, &PoolMeta::default()).expect("initial pool metadata should be built");
         pool_meta
             .save_for_startup(store.pools.clone())
             .await
@@ -4395,12 +4395,27 @@ mod tests {
             .expect("the later pool should be healed despite the first pool error");
         assert_eq!(healed.erasure.this, recoverable_format.erasure.sets[0][2]);
 
-        let mut completed_meta = PoolMeta::new(&store.pools, &PoolMeta::default());
+        // A decommission persists its active attempt before it can complete.
+        let mut completed_meta =
+            PoolMeta::new(&store.pools, &PoolMeta::default()).expect("initial pool metadata should be built");
+        let started = OffsetDateTime::now_utc();
         for status in &mut completed_meta.pools {
+            status.last_update = started;
             status.decommission = Some(PoolDecommissionInfo {
-                complete: true,
+                start_time: Some(started),
                 ..Default::default()
             });
+        }
+        completed_meta
+            .save(store.pools.clone())
+            .await
+            .expect("active pool metadata should be persisted");
+        for status in &mut completed_meta.pools {
+            status.last_update = started + time::Duration::seconds(1);
+            if let Some(info) = status.decommission.as_mut() {
+                info.complete = true;
+                info.start_time = None;
+            }
         }
         completed_meta
             .save(store.pools.clone())

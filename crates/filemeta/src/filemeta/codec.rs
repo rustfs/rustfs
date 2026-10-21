@@ -276,6 +276,49 @@ impl FileMeta {
         Ok(i)
     }
 
+    pub(crate) fn matches_buf_strict(&self, buf: &[u8]) -> bool {
+        let Ok((meta, _inline_buf)) = Self::parse_validated_xl_envelope(buf) else {
+            return false;
+        };
+
+        if meta.is_empty() {
+            return self.versions.is_empty();
+        }
+
+        let Ok((versions_len, header_ver, _meta_ver, meta)) = Self::decode_validated_xl_headers(meta) else {
+            return false;
+        };
+
+        if versions_len != self.versions.len() {
+            return false;
+        }
+
+        let mut cur: Cursor<&[u8]> = Cursor::new(meta);
+        for s_version in &self.versions {
+            let Ok((o_header, _ver_meta)) = Self::read_next_shallow_slice(meta, &mut cur, header_ver) else {
+                return false;
+            };
+            if !Self::headers_match_strict(&s_version.header, &o_header) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    #[inline]
+    pub(crate) fn headers_match_strict(s_header: &FileMetaVersionHeader, o_header: &FileMetaVersionHeader) -> bool {
+        if s_header == o_header {
+            return true;
+        }
+        if s_header.has_ec() != o_header.has_ec() {
+            let (mut a, mut b) = (s_header.clone(), o_header.clone());
+            (a.ec_n, a.ec_m, b.ec_n, b.ec_m) = (0, 0, 0, 0);
+            return a == b;
+        }
+        false
+    }
+
     #[inline]
     pub(super) fn decode_validated_xl_headers(meta: &[u8]) -> Result<(usize, u8, u8, &[u8])> {
         let (versions_len, header_ver, meta_ver, meta) = Self::decode_xl_headers(meta).map_err(|e| {

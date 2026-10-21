@@ -991,6 +991,12 @@ pub struct ObjectOptions {
 
     pub data_movement: bool,
     pub raw_data_movement_read: bool,
+    /// Data-movement source cleanup only: transitioned source versions whose
+    /// committed target copy now references their remote object. Deleting one
+    /// of them appends no tier free version. Storage-owned; callers outside
+    /// `ecstore` must leave it unset.
+    #[doc(hidden)]
+    pub data_movement_transferred_tier_versions: Option<crate::data_movement::TransferredTierVersions>,
     /// Internal, in-memory protection context. Never populated from S3 metadata.
     /// None selects the rollout default only for a new write, not for a rewrite.
     #[doc(hidden)]
@@ -1170,6 +1176,7 @@ impl std::fmt::Debug for ObjectOptions {
             .field("scanner_publication_commit_scope", &self.scanner_publication_commit_scope)
             .field("data_movement", &self.data_movement)
             .field("raw_data_movement_read", &self.raw_data_movement_read)
+            .field("data_movement_transferred_tier_versions", &self.data_movement_transferred_tier_versions)
             .field("include_part_checksums", &self.include_part_checksums)
             .field("src_pool_idx", &self.src_pool_idx)
             .field("user_defined_count", &self.user_defined.len())

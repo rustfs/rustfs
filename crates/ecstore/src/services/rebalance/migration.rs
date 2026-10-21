@@ -1,5 +1,6 @@
 use super::worker::{is_transient_rebalance_error, rebalance_migration_retry_delay, sleep_rebalance_migration_retry};
 use crate::bucket::replication::replication_state_from_filemeta;
+use crate::data_movement::DataMovementCopy;
 use crate::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
@@ -15,6 +16,9 @@ use tokio::time::Duration;
 #[derive(Debug, Default, Clone)]
 pub(crate) struct MigrationVersionResult {
     pub moved: bool,
+    /// The copy found the source replaced by a newer unversioned object on the
+    /// target, which holds no copy of the source version.
+    pub superseded: bool,
     pub ignored: bool,
     pub cleanup_ignored: bool,
     pub failed: bool,
@@ -67,9 +71,9 @@ fn rebalance_remote_tiered_opts(
     }
 }
 
-pub(super) fn rebalance_object_migration_read_opts(version_id: Option<String>) -> ObjectOptions {
+pub(super) fn rebalance_object_migration_read_opts(version: &FileInfo) -> ObjectOptions {
     ObjectOptions {
-        version_id,
+        version_id: Some(crate::data_movement::data_movement_exact_version_id(version.version_id)),
         no_lock: true,
         data_movement: true,
         raw_data_movement_read: true,
@@ -97,6 +101,16 @@ pub(crate) trait MigrationBackend: Send + Sync {
         fi: &FileInfo,
         opts: &ObjectOptions,
     ) -> Result<()>;
+}
+
+/// Replaces a real source read with an injected error, for the object the
+/// closure selects.
+#[cfg(test)]
+pub(super) type RebalanceSourceReadFault = std::sync::Arc<dyn Fn(&str, &str) -> Option<Error> + Send + Sync>;
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static REBALANCE_SOURCE_READ_FAULT: RebalanceSourceReadFault;
 }
 
 pub(crate) struct RebalanceMigrationBackend<'a> {
@@ -129,6 +143,10 @@ impl MigrationBackend for RebalanceMigrationBackend<'_> {
         h: HeaderMap,
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
+        #[cfg(test)]
+        if let Ok(Some(err)) = REBALANCE_SOURCE_READ_FAULT.try_with(|fault| fault(bucket, object)) {
+            return Err(err);
+        }
         self.source.get_object_reader(bucket, object, range, h, opts).await
     }
 
@@ -163,7 +181,7 @@ pub(crate) async fn migrate_entry_version<Backend, F, Fut, D, DFut>(
 where
     Backend: MigrationBackend + ?Sized,
     F: FnMut(usize, String, GetObjectReader) -> Fut + Send,
-    Fut: Future<Output = Result<()>> + Send,
+    Fut: Future<Output = Result<DataMovementCopy>> + Send,
     D: FnMut(String, String, ObjectOptions) -> DFut + Send,
     DFut: Future<Output = Result<ObjectInfo>> + Send,
 {
@@ -200,7 +218,7 @@ pub(super) async fn migrate_entry_version_with_retry_wait<Backend, F, Fut, D, DF
 where
     Backend: MigrationBackend + ?Sized,
     F: FnMut(usize, String, GetObjectReader) -> Fut + Send,
-    Fut: Future<Output = Result<()>> + Send,
+    Fut: Future<Output = Result<DataMovementCopy>> + Send,
     D: FnMut(String, String, ObjectOptions) -> DFut + Send,
     DFut: Future<Output = Result<ObjectInfo>> + Send,
     W: FnMut(Duration) -> WFut + Send,
@@ -239,7 +257,7 @@ async fn migrate_entry_version_with_retry_wait_and_incarnation<Backend, F, Fut, 
 where
     Backend: MigrationBackend + ?Sized,
     F: FnMut(usize, String, GetObjectReader) -> Fut + Send,
-    Fut: Future<Output = Result<()>> + Send,
+    Fut: Future<Output = Result<DataMovementCopy>> + Send,
     D: FnMut(String, String, ObjectOptions) -> DFut + Send,
     DFut: Future<Output = Result<ObjectInfo>> + Send,
     W: FnMut(Duration) -> WFut + Send,
@@ -250,6 +268,7 @@ where
     if ignore_data_usage_cache && bucket == crate::disk::RUSTFS_META_BUCKET && version.name.contains(DATA_USAGE_CACHE_NAME) {
         return MigrationVersionResult {
             moved: false,
+            superseded: false,
             ignored: true,
             cleanup_ignored: false,
             failed: false,
@@ -258,7 +277,10 @@ where
         };
     }
 
-    if version.is_remote() {
+    // A tier free version carries no transition status and reads as a delete
+    // marker, but it owns the remote object of a removed transitioned version:
+    // move it as tier metadata, never as a delete marker that drops the owner.
+    if version.is_remote() || version.tier_free_version() {
         if let Err(err) = set
             .move_remote_version_for_migration(
                 &bucket,
@@ -271,6 +293,7 @@ where
             if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
                 return MigrationVersionResult {
                     moved: false,
+                    superseded: false,
                     ignored: true,
                     cleanup_ignored: true,
                     failed: false,
@@ -281,6 +304,7 @@ where
 
             return MigrationVersionResult {
                 moved: false,
+                superseded: false,
                 ignored: false,
                 cleanup_ignored: false,
                 failed: true,
@@ -291,6 +315,7 @@ where
 
         return MigrationVersionResult {
             moved: true,
+            superseded: false,
             ignored: false,
             cleanup_ignored: false,
             failed: false,
@@ -314,6 +339,7 @@ where
             if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
                 return MigrationVersionResult {
                     moved: false,
+                    superseded: false,
                     ignored: true,
                     cleanup_ignored: true,
                     failed: false,
@@ -324,6 +350,7 @@ where
 
             return MigrationVersionResult {
                 moved: false,
+                superseded: false,
                 ignored: false,
                 cleanup_ignored: false,
                 failed: true,
@@ -334,6 +361,7 @@ where
 
         return MigrationVersionResult {
             moved: true,
+            superseded: false,
             ignored: false,
             cleanup_ignored: false,
             failed: false,
@@ -350,7 +378,7 @@ where
                 &encode_dir_object(&version.name),
                 None,
                 HeaderMap::new(),
-                &rebalance_object_migration_read_opts(version_id.clone()),
+                &rebalance_object_migration_read_opts(version),
             )
             .await
         {
@@ -359,6 +387,7 @@ where
                 if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
                     return MigrationVersionResult {
                         moved: false,
+                        superseded: false,
                         ignored: true,
                         cleanup_ignored: true,
                         failed: false,
@@ -374,6 +403,7 @@ where
                 if attempt + 1 >= max_attempts || !is_transient_rebalance_error(err) {
                     return MigrationVersionResult {
                         moved: false,
+                        superseded: false,
                         ignored: false,
                         cleanup_ignored: false,
                         failed: true,
@@ -387,39 +417,45 @@ where
             }
         };
 
-        if let Err(err) = transfer(pool_index, bucket.clone(), rd).await {
-            if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
-                return MigrationVersionResult {
-                    moved: false,
-                    ignored: true,
-                    cleanup_ignored: true,
-                    failed: false,
-                    stage: Some("write_target"),
-                    error: None,
-                };
-            }
+        let copy = match transfer(pool_index, bucket.clone(), rd).await {
+            Ok(copy) => copy,
+            Err(err) => {
+                if is_err_object_not_found(&err) || is_err_version_not_found(&err) {
+                    return MigrationVersionResult {
+                        moved: false,
+                        superseded: false,
+                        ignored: true,
+                        cleanup_ignored: true,
+                        failed: false,
+                        stage: Some("write_target"),
+                        error: None,
+                    };
+                }
 
-            last_error = Some(err);
-            let Some(err) = last_error.as_ref() else {
+                last_error = Some(err);
+                let Some(err) = last_error.as_ref() else {
+                    continue;
+                };
+                if attempt + 1 >= max_attempts || !is_transient_rebalance_error(err) {
+                    return MigrationVersionResult {
+                        moved: false,
+                        superseded: false,
+                        ignored: false,
+                        cleanup_ignored: false,
+                        failed: true,
+                        stage: Some("write_target"),
+                        error: last_error,
+                    };
+                }
+
+                wait_retry(rebalance_migration_retry_delay(attempt, err)).await;
                 continue;
-            };
-            if attempt + 1 >= max_attempts || !is_transient_rebalance_error(err) {
-                return MigrationVersionResult {
-                    moved: false,
-                    ignored: false,
-                    cleanup_ignored: false,
-                    failed: true,
-                    stage: Some("write_target"),
-                    error: last_error,
-                };
             }
-
-            wait_retry(rebalance_migration_retry_delay(attempt, err)).await;
-            continue;
-        }
+        };
 
         return MigrationVersionResult {
             moved: true,
+            superseded: copy == DataMovementCopy::Superseded,
             ignored: false,
             cleanup_ignored: false,
             failed: false,
@@ -430,6 +466,7 @@ where
 
     MigrationVersionResult {
         moved: false,
+        superseded: false,
         ignored: false,
         cleanup_ignored: false,
         failed: true,

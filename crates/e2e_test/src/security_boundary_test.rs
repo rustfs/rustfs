@@ -245,11 +245,11 @@ async fn test_concurrent_object_operations() -> Result<(), Box<dyn Error + Send 
     Ok(())
 }
 
-/// Internal/private endpoints must be rejected as remote tier backends (SSRF)
+/// Loopback and metadata endpoints must be rejected as remote tier backends (SSRF)
 /// before RustFS opens a connection to them.
 ///
 /// This issues a real admin AddTier call (`PUT /rustfs/admin/v3/tier`) for each
-/// internal/private endpoint and requires the exact validation response. A
+/// restricted endpoint and requires the exact validation response. A
 /// loopback listener additionally proves the literal loopback case is rejected
 /// without an outbound connection; a generic connectivity failure is not
 /// sufficient evidence of SSRF protection.
@@ -267,6 +267,9 @@ async fn test_tiering_url_validation() -> Result<(), Box<dyn Error + Send + Sync
         ("http://localhost:8080", false),
         ("http://169.254.169.254", false), // cloud instance metadata endpoint
         ("http://[::1]:8080", false),
+        ("http://[fd00:ec2::254]", false),
+        ("http://[fd00:ec2::23]", false),
+        ("http://[fd20:ce::254]", false),
     ];
 
     for (endpoint, checks_connection_attempt) in internal_endpoints {

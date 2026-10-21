@@ -77,7 +77,10 @@ fn warehouse_object_prefix_from_location(
     normalize_warehouse_object_prefix(object_prefix, max_prefix_depth)
 }
 
-fn table_warehouse_object_prefix_from_location(table_bucket: &str, warehouse_location: &str) -> TableCatalogStoreResult<String> {
+pub(crate) fn table_warehouse_object_prefix_from_location(
+    table_bucket: &str,
+    warehouse_location: &str,
+) -> TableCatalogStoreResult<String> {
     warehouse_object_prefix_from_location(table_bucket, warehouse_location, Some(WAREHOUSE_INDEX_MAX_PREFIX_DEPTH))
 }
 

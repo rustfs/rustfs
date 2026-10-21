@@ -591,7 +591,7 @@ impl ECStore {
 
         let deployment_id = deployment_id.ok_or_else(|| Error::other("store init failed: deployment id is not initialized"))?;
         let peer_sys = S3PeerSys::new_with_instance_ctx(&endpoint_pools, instance_ctx.clone());
-        let mut pool_meta = PoolMeta::new(&pools, &PoolMeta::default());
+        let mut pool_meta = PoolMeta::new(&pools, &PoolMeta::default())?;
         pool_meta.dont_save = true;
         let elected_bootstrap_writer = pools
             .first()
@@ -682,7 +682,7 @@ impl ECStore {
         let endpoints = runtime_sources::endpoint_pools_or_default();
 
         let mut installed_pool_meta = if update {
-            PoolMeta::new(&self.pools, &meta)
+            PoolMeta::new(&self.pools, &meta)?
         } else {
             meta.clone()
         };
@@ -8395,6 +8395,307 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// Seed a versioned key with one data version and a newer delete marker on
+    /// the source pool, the shape whose delete marker takes the copy path.
+    async fn seed_decommission_delete_marker_key(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+    ) -> (uuid::Uuid, uuid::Uuid) {
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create the delete marker bucket");
+        let data_version = uuid::Uuid::new_v4();
+        let marker_version = uuid::Uuid::new_v4();
+        let base_time = OffsetDateTime::now_utc();
+        seed_decommission_source(
+            store,
+            bucket,
+            object,
+            b"delete marker data".to_vec(),
+            &ObjectOptions {
+                versioned: true,
+                version_id: Some(data_version.to_string()),
+                mod_time: Some(base_time),
+                ..Default::default()
+            },
+        )
+        .await;
+        store.pools[0]
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    version_id: Some(marker_version.to_string()),
+                    delete_marker: true,
+                    mod_time: Some(base_time + time::Duration::seconds(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed source delete marker");
+        (data_version, marker_version)
+    }
+
+    async fn assert_decommission_delete_marker_key_migrated(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        data_version: uuid::Uuid,
+        marker_version: uuid::Uuid,
+    ) {
+        let marker_opts = ObjectOptions {
+            versioned: true,
+            version_id: Some(marker_version.to_string()),
+            ..Default::default()
+        };
+        let data_opts = ObjectOptions {
+            versioned: true,
+            version_id: Some(data_version.to_string()),
+            ..Default::default()
+        };
+        let target_marker = store.pools[1]
+            .get_object_info(bucket, object, &marker_opts)
+            .await
+            .expect("target delete marker must exist");
+        assert!(target_marker.delete_marker);
+        assert_eq!(
+            read_decommission_target_body(store, bucket, object, &data_opts).await,
+            b"delete marker data"
+        );
+        assert_decommission_source_absent(store, bucket, object, &marker_opts).await;
+        assert_decommission_source_absent(store, bucket, object, &data_opts).await;
+    }
+
+    /// The Linux CI run of the S00 matrix: without any kill, the delete marker
+    /// copy found the target capacity gate busy. It must wait for the gate like
+    /// an ordinary object copy and complete once the gate is released.
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn decommission_delete_marker_copy_completes_after_waiting_for_a_busy_target_gate() {
+        let handle = std::thread::Builder::new()
+            .name("decommission_delete_marker_copy_with_busy_target_gate".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .build()
+                    .expect("test runtime should build");
+                runtime.block_on(async {
+                    let temp_dir = tempfile::tempdir().expect("create delete marker gate contention store dir");
+                    let (_ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store(
+                        temp_dir.path(),
+                        "decommission-delete-marker-gate-contention",
+                        &[4, 4],
+                    ))
+                    .await;
+                    crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+                    let bucket = format!("decom-marker-gate-{}", uuid::Uuid::new_v4());
+                    let object = "marker.bin";
+                    let (data_version, marker_version) = seed_decommission_delete_marker_key(&store, &bucket, object).await;
+                    mark_test_pool_decommissioning(&store, 0).await;
+                    let incarnation = Some(store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"));
+
+                    // Another writer holds the target pool's capacity gate.
+                    use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+                    let target_lock = store
+                        .new_ns_lock(
+                            crate::disk::RUSTFS_META_BUCKET,
+                            &format!("{}/1", crate::core::pools::DECOMMISSION_CAPACITY_TARGET_LOCK_PREFIX),
+                        )
+                        .await
+                        .expect("create the target capacity gate probe");
+                    let target_guard = target_lock
+                        .get_write_lock(std::time::Duration::from_secs(30))
+                        .await
+                        .expect("hold the target capacity gate");
+
+                    let entry = tokio::spawn({
+                        let store = Arc::clone(&store);
+                        let bucket = bucket.clone();
+                        async move {
+                            run_decommission_entry_retry_test(
+                                &store,
+                                CancellationToken::new(),
+                                &bucket,
+                                object,
+                                incarnation,
+                                Arc::new(AtomicUsize::new(0)),
+                            )
+                            .await
+                        }
+                    });
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    assert!(!entry.is_finished(), "the entry must wait while the target gate is held");
+                    drop(target_guard);
+                    entry
+                        .await
+                        .expect("the entry should join")
+                        .expect("the delete marker copy must complete once the target gate is released");
+
+                    assert_decommission_delete_marker_key_migrated(&store, &bucket, object, data_version, marker_version).await;
+                    shutdown.cancel();
+                });
+            })
+            .expect("spawn delete marker gate contention test thread");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    /// The S00 leader-kill run: both versions of a key were committed and
+    /// charged on the target, the source cleanup never ran, and on the retry a
+    /// concurrent mutation holds the target's pending slot between a failed
+    /// write and its own retry. The delete marker copy must not fail the entry
+    /// on that slot, and the entry completes once the slot is released.
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn decommission_delete_marker_copy_completes_while_another_mutation_holds_the_target_slot() {
+        let handle = std::thread::Builder::new()
+            .name("decommission_delete_marker_copy_with_foreign_pending_slot".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .build()
+                    .expect("test runtime should build");
+                runtime.block_on(async {
+                    let temp_dir = tempfile::tempdir().expect("create delete marker slot contention store dir");
+                    let (_ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store(
+                        temp_dir.path(),
+                        "decommission-delete-marker-slot-contention",
+                        &[4, 4],
+                    ))
+                    .await;
+                    crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+                    let bucket = format!("decom-marker-slot-{}", uuid::Uuid::new_v4());
+                    let object = "marker.bin";
+                    let (data_version, marker_version) = seed_decommission_delete_marker_key(&store, &bucket, object).await;
+                    mark_test_pool_decommissioning(&store, 0).await;
+                    let incarnation = Some(store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation"));
+
+                    // The first pass commits and charges both versions on the
+                    // target, then loses its fence before the source cleanup.
+                    let loss_hook = crate::store::object::DecommissionMutationFenceLossHook::install(
+                        &bucket,
+                        object,
+                        crate::store::object::DecommissionMutationFenceTestPhase::SourceCleanup,
+                    );
+                    let barrier = crate::data_movement::SourceCleanupDeleteBarrier::install(&bucket, object);
+                    let first_pass = tokio::spawn({
+                        let store = Arc::clone(&store);
+                        let bucket = bucket.clone();
+                        async move {
+                            run_decommission_entry_retry_test(
+                                &store,
+                                CancellationToken::new(),
+                                &bucket,
+                                object,
+                                incarnation,
+                                Arc::new(AtomicUsize::new(0)),
+                            )
+                            .await
+                        }
+                    });
+                    barrier.wait_until_paused().await;
+                    loss_hook.mark_lost();
+                    barrier.release();
+                    drop(barrier);
+                    let _ = first_pass.await.expect("the first pass should join");
+                    drop(loss_hook);
+                    let data_opts = ObjectOptions {
+                        versioned: true,
+                        version_id: Some(data_version.to_string()),
+                        ..Default::default()
+                    };
+                    store.pools[0]
+                        .get_object_info(&bucket, object, &data_opts)
+                        .await
+                        .expect("the lost source cleanup must retain the source");
+
+                    // Another mutation persisted its intent on the same target,
+                    // failed, and has not retried yet.
+                    let owner = {
+                        let pool_meta = store.pool_meta.read().await;
+                        let reservation = pool_meta.pools[0]
+                            .decommission
+                            .as_ref()
+                            .and_then(|info| info.capacity_reservation.as_ref())
+                            .expect("the decommission reservation should be active");
+                        crate::core::pools::DecommissionCapacityOwner {
+                            source_pool_index: 0,
+                            operation_id: reservation.operation_id,
+                            generation: reservation.generation,
+                            owner_nonce: reservation.owner_nonce,
+                            mutation_id: Some(uuid::Uuid::new_v4()),
+                        }
+                    };
+                    store
+                        .run_decommission_capacity_admitted_mutation_with_capacity_lease(1, Some(owner), Some(8), |_| async {
+                            Err::<(), _>(StorageError::other("the competing write failed after persisting its intent"))
+                        })
+                        .await
+                        .expect_err("the competing mutation must leave its intent pending");
+
+                    let retry = tokio::spawn({
+                        let store = Arc::clone(&store);
+                        let bucket = bucket.clone();
+                        async move {
+                            run_decommission_entry_retry_test(
+                                &store,
+                                CancellationToken::new(),
+                                &bucket,
+                                object,
+                                incarnation,
+                                Arc::new(AtomicUsize::new(0)),
+                            )
+                            .await
+                        }
+                    });
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    // The competing mutation retries and finalizes its intent,
+                    // waiting out the entry's own short target gate holds.
+                    let mut finalize_attempt = 0;
+                    loop {
+                        match store
+                            .run_decommission_capacity_admitted_mutation_with_capacity_lease(1, Some(owner), Some(8), |_| async {
+                                Ok(())
+                            })
+                            .await
+                        {
+                            Ok(()) => break,
+                            Err(err)
+                                if crate::core::pools::is_decommission_capacity_target_gate_busy(&err)
+                                    && finalize_attempt < 50 =>
+                            {
+                                finalize_attempt += 1;
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                            Err(err) => panic!("the competing mutation should finalize its own intent: {err:?}"),
+                        }
+                    }
+                    retry
+                        .await
+                        .expect("the retried entry should join")
+                        .expect("the entry must complete instead of failing on another mutation's pending slot");
+
+                    assert_decommission_delete_marker_key_migrated(&store, &bucket, object, data_version, marker_version).await;
+
+                    shutdown.cancel();
+                });
+            })
+            .expect("spawn delete marker slot contention test thread");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(storage_class_env)]
     async fn reverse_decommission_reuses_fixed_target_fence_for_put_and_multipart() {
@@ -8867,6 +9168,7 @@ mod tests {
                 &cleanup_object,
                 &expected_source_versions,
                 &[],
+                &[],
                 crate::data_movement::SourceCleanupBucketFence {
                     object_mutation_fence: Some(&mutation_fence),
                     ..Default::default()
@@ -8986,6 +9288,7 @@ mod tests {
                 &cleanup_bucket,
                 object,
                 &expected_source_versions,
+                &[],
                 &[],
                 crate::data_movement::SourceCleanupBucketFence {
                     object_mutation_fence: Some(&mutation_fence),
