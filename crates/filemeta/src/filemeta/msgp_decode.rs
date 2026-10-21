@@ -99,6 +99,41 @@ pub(crate) fn read_exact_vec<R: Read>(rd: &mut R, len: usize) -> Result<Vec<u8>>
     Ok(buf)
 }
 
+/// Borrows `len` bytes directly from a `Cursor<&[u8]>` without allocating or zero-filling,
+/// while enforcing the same [`MAX_MSGP_ELEMENT_SIZE`] and EOF bounds as [`read_exact_vec`].
+#[inline]
+pub(crate) fn read_slice<'a>(cur: &mut std::io::Cursor<&'a [u8]>, len: usize) -> Result<&'a [u8]> {
+    if len > MAX_MSGP_ELEMENT_SIZE {
+        return Err(Error::other(format!(
+            "corrupt msgpack element: length {len} exceeds the {MAX_MSGP_ELEMENT_SIZE} byte limit"
+        )));
+    }
+    let pos = usize::try_from(cur.position())
+        .map_err(|_| Error::from(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "cursor position overflow")))?;
+    let buf = *cur.get_ref();
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| Error::from(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "slice length overflow")))?;
+    let slice = buf
+        .get(pos..end)
+        .ok_or_else(|| Error::from(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "failed to fill whole buffer")))?;
+    cur.set_position(end as u64);
+    Ok(slice)
+}
+
+#[inline]
+pub(crate) fn read_str_slice<'a>(cur: &mut std::io::Cursor<&'a [u8]>) -> Result<&'a str> {
+    let len = rmp::decode::read_str_len(cur)? as usize;
+    let bytes = read_slice(cur, len)?;
+    std::str::from_utf8(bytes).map_err(|e| Error::FromUtf8(e.to_string()))
+}
+
+#[inline]
+pub(crate) fn read_bin_slice<'a>(cur: &mut std::io::Cursor<&'a [u8]>) -> Result<&'a [u8]> {
+    let len = rmp::decode::read_bin_len(cur)? as usize;
+    read_slice(cur, len)
+}
+
 /// Bounds a decoded collection count when it is used only as a
 /// pre-allocation hint. The decode loop still consumes exactly the decoded
 /// number of elements (a corrupt count fails with an EOF decode error once

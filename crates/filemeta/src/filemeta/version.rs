@@ -23,8 +23,8 @@
 //! legacy (rmp_serde) format. `try_from` falls back to rmp_serde when hand-written decode fails.
 
 use super::msgp_decode::{
-    prealloc_hint, read_exact_vec, read_nil_or_array_len, read_nil_or_map_len, read_nil_or_submap_len, read_small_str,
-    skip_msgp_value,
+    prealloc_hint, read_bin_slice, read_exact_vec, read_nil_or_array_len, read_nil_or_map_len, read_nil_or_submap_len,
+    read_slice, read_small_str, read_str_slice, skip_msgp_value,
 };
 use super::*;
 use crate::{ChecksumInfo, TransitionVersionState};
@@ -350,9 +350,20 @@ struct DerivedInternalMetadata<'a> {
 
 impl<'a> DerivedInternalMetadata<'a> {
     fn from_meta_sys(meta_sys: &'a HashMap<String, Vec<u8>>) -> Result<Self> {
+        Self::from_key_value_iter(meta_sys.iter().map(|(k, v)| (k.as_str(), v.as_slice())))
+    }
+
+    fn from_meta_sys_slices(meta_sys: &[(&'a str, &'a [u8])]) -> Result<Self> {
+        Self::from_key_value_iter(meta_sys.iter().copied())
+    }
+
+    fn from_key_value_iter<I>(iter: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = (&'a str, &'a [u8])>,
+    {
         let mut canonical = Self::default();
         let mut legacy = Self::default();
-        for (key, value) in meta_sys {
+        for (key, value) in iter {
             let Some(suffix) = rustfs_utils::http::strip_internal_prefix_preserving_case(key) else {
                 continue;
             };
@@ -392,10 +403,10 @@ impl<'a> DerivedInternalMetadata<'a> {
             } else {
                 legacy_slot
             };
-            if slot.is_some_and(|current| current != value.as_slice()) {
+            if slot.is_some_and(|current| current != value) {
                 return Err(Error::FileCorrupt);
             }
-            *slot = Some(value.as_slice());
+            *slot = Some(value);
         }
         fn merge_consistent<'a>(canonical: Option<&'a [u8]>, legacy: Option<&'a [u8]>) -> Result<Option<&'a [u8]>> {
             if let (Some(canonical), Some(legacy)) = (canonical, legacy)
@@ -604,8 +615,7 @@ impl FileMetaShallowVersion {
     }
 
     pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfo> {
-        self.parse_version_meta()?
-            .into_fileinfo_with_part_checksums(volume, path, all_parts, true)
+        FileMetaVersion::decode_fileinfo_from_slice(self.meta.as_slice(), volume, path, all_parts, true)
     }
 }
 
@@ -903,6 +913,21 @@ impl FileMetaVersion {
         self.to_fileinfo_with_part_checksums(volume, path, all_parts, true)
     }
 
+    pub(super) fn decode_fileinfo_from_slice(
+        value: &[u8],
+        volume: &str,
+        path: &str,
+        all_parts: bool,
+        include_part_checksums: bool,
+    ) -> Result<FileInfo> {
+        if all_parts && let Ok(mut borrowed) = BorrowedMetaObject::decode_version_slice(value) {
+            return borrowed.take_fileinfo_with_part_checksums(volume, path, include_part_checksums);
+        }
+
+        FileMetaVersion::try_from(value)
+            .and_then(|v| v.into_fileinfo_with_part_checksums(volume, path, all_parts, include_part_checksums))
+    }
+
     pub(super) fn into_fileinfo_with_part_checksums(
         self,
         volume: &str,
@@ -1010,6 +1035,309 @@ impl FileMetaVersion {
             VersionType::Object => self.object.as_ref().map(|obj| obj.inlinedata()).unwrap_or(false),
             VersionType::Legacy => false,
             _ => false,
+        }
+    }
+}
+
+#[derive(Default)]
+struct BorrowedMetaObject<'a> {
+    version_id: Option<Uuid>,
+    data_dir: Option<Uuid>,
+    erasure_algorithm: ErasureAlgo,
+    erasure_m: usize,
+    erasure_n: usize,
+    erasure_block_size: usize,
+    erasure_index: usize,
+    erasure_dist: Vec<usize>,
+    bitrot_checksum_algo: ChecksumAlgo,
+    parts: Vec<ObjectPartInfo>,
+    part_mask: u8,
+    size: i64,
+    mod_time: Option<OffsetDateTime>,
+    meta_sys: Vec<(&'a str, &'a [u8])>,
+    meta_user: HashMap<String, String>,
+    user_has_internal: bool,
+}
+
+fn read_opt_uuid_slice(cur: &mut std::io::Cursor<&[u8]>) -> Result<Option<Uuid>> {
+    let _ = rmp::decode::read_bin_len(cur)?;
+    let id = Uuid::from_slice(read_slice(cur, 16)?).map_err(Error::from)?;
+    Ok((!id.is_nil()).then_some(id))
+}
+
+impl<'a> BorrowedMetaObject<'a> {
+    const PART_NUMS: u8 = 1 << 0;
+    const PART_ETAGS: u8 = 1 << 1;
+    const PART_SIZES: u8 = 1 << 2;
+    const PART_ASIZES: u8 = 1 << 3;
+    const PART_IDX: u8 = 1 << 4;
+
+    fn mark_part_field(&mut self, bit: u8) -> Result<()> {
+        if self.part_mask & bit != 0 || (bit != Self::PART_NUMS && self.part_mask & Self::PART_NUMS == 0) {
+            return Err(Error::other("out-of-order or duplicate part field"));
+        }
+        self.part_mask |= bit;
+        Ok(())
+    }
+
+    fn decode_version_slice(buf: &'a [u8]) -> Result<Self> {
+        let mut cur = std::io::Cursor::new(buf);
+        let mut fields = rmp::decode::read_map_len(&mut cur)?;
+        let mut version_type = VersionType::Invalid;
+        let mut has_object = false;
+        let mut out = Self::default();
+
+        while fields > 0 {
+            fields -= 1;
+            match read_str_slice(&mut cur)? {
+                "Type" => version_type = VersionType::from_u8(rmp::decode::read_int::<i64, _>(&mut cur)? as u8),
+                "V2Obj" => {
+                    if let Some(obj_fields) = read_nil_or_submap_len(&mut cur)? {
+                        out = Self::default();
+                        out.decode_fields(&mut cur, obj_fields)?;
+                        has_object = true;
+                    } else {
+                        has_object = false;
+                    }
+                }
+                "V1Obj" | "DelObj" => return Err(Error::other("non-V2Obj uses full decoder")),
+                "v" => {
+                    if rmp::decode::read_int::<i64, _>(&mut cur)? < 0 {
+                        return Err(Error::other("negative write_version not supported"));
+                    }
+                }
+                _ => skip_msgp_value(&mut cur)?,
+            }
+        }
+
+        let parts_valid = out.parts.is_empty()
+            || (out.part_mask & (Self::PART_SIZES | Self::PART_ASIZES)) == (Self::PART_SIZES | Self::PART_ASIZES);
+        if version_type == VersionType::Object
+            && has_object
+            && parts_valid
+            && out.erasure_algorithm.valid()
+            && out.bitrot_checksum_algo.valid()
+            && out.mod_time.is_some()
+        {
+            Ok(out)
+        } else {
+            Err(Error::other("non-valid V2Obj uses full decoder"))
+        }
+    }
+
+    fn decode_fields(&mut self, cur: &mut std::io::Cursor<&'a [u8]>, mut fields: usize) -> Result<()> {
+        while fields > 0 {
+            fields -= 1;
+            match read_str_slice(cur)? {
+                "ID" => self.version_id = read_opt_uuid_slice(cur)?,
+                "DDir" => self.data_dir = read_opt_uuid_slice(cur)?,
+                "EcAlgo" => self.erasure_algorithm = ErasureAlgo::from_u8(rmp::decode::read_int::<i64, _>(cur)? as u8),
+                "EcM" => self.erasure_m = rmp::decode::read_int::<i64, _>(cur)? as usize,
+                "EcN" => self.erasure_n = rmp::decode::read_int::<i64, _>(cur)? as usize,
+                "EcBSize" => self.erasure_block_size = rmp::decode::read_int::<i64, _>(cur)? as usize,
+                "EcIndex" => self.erasure_index = rmp::decode::read_int::<i64, _>(cur)? as usize,
+                "EcDist" => {
+                    let len = rmp::decode::read_array_len(cur)? as usize;
+                    self.erasure_dist.clear();
+                    self.erasure_dist.reserve(prealloc_hint(len));
+                    for _ in 0..len {
+                        self.erasure_dist
+                            .push(usize::from(rmp::decode::read_int::<i64, _>(cur)? as u8));
+                    }
+                }
+                "CSumAlgo" => self.bitrot_checksum_algo = ChecksumAlgo::from_u8(rmp::decode::read_int::<i64, _>(cur)? as u8),
+                "PartNums" => {
+                    self.mark_part_field(Self::PART_NUMS)?;
+                    let len = rmp::decode::read_array_len(cur)? as usize;
+                    self.parts.reserve(prealloc_hint(len));
+                    for _ in 0..len {
+                        self.parts.push(ObjectPartInfo {
+                            etag: String::new(),
+                            number: rmp::decode::read_int::<i64, _>(cur)? as usize,
+                            size: 0,
+                            actual_size: 0,
+                            mod_time: None,
+                            index: None,
+                            checksums: None,
+                            error: None,
+                            integrity: None,
+                        });
+                    }
+                }
+                "PartETags" => {
+                    self.mark_part_field(Self::PART_ETAGS)?;
+                    if let Some(len) = read_nil_or_array_len(cur)?
+                        && len != 0
+                    {
+                        if len != self.parts.len() {
+                            return Err(Error::other("PartETags length mismatch"));
+                        }
+                        for part in &mut self.parts {
+                            part.etag = read_str_slice(cur)?.to_owned();
+                        }
+                    }
+                }
+                "PartSizes" => {
+                    self.mark_part_field(Self::PART_SIZES)?;
+                    if rmp::decode::read_array_len(cur)? as usize != self.parts.len() {
+                        return Err(Error::other("PartSizes length mismatch"));
+                    }
+                    for part in &mut self.parts {
+                        part.size = rmp::decode::read_int::<i64, _>(cur)? as usize;
+                    }
+                }
+                "PartASizes" => {
+                    self.mark_part_field(Self::PART_ASIZES)?;
+                    if read_nil_or_array_len(cur)?.unwrap_or(0) != self.parts.len() {
+                        return Err(Error::other("PartASizes length mismatch"));
+                    }
+                    for part in &mut self.parts {
+                        part.actual_size = rmp::decode::read_int(cur)?;
+                    }
+                }
+                "PartIdx" => {
+                    self.mark_part_field(Self::PART_IDX)?;
+                    let len = rmp::decode::read_array_len(cur)? as usize;
+                    if len != 0 {
+                        if len != self.parts.len() {
+                            return Err(Error::other("PartIdx length mismatch"));
+                        }
+                        for part in &mut self.parts {
+                            let b = read_bin_slice(cur)?;
+                            if !b.is_empty() {
+                                part.index = Some(Bytes::copy_from_slice(b));
+                            }
+                        }
+                    }
+                }
+                "Size" => self.size = rmp::decode::read_int(cur)?,
+                "MTime" => {
+                    let nanos: i64 = rmp::decode::read_int(cur)?;
+                    let time = OffsetDateTime::from_unix_timestamp_nanos(nanos as i128)?;
+                    self.mod_time = (time != OffsetDateTime::UNIX_EPOCH).then_some(time);
+                }
+                "MetaSys" => {
+                    let Some(len) = read_nil_or_map_len(cur)? else {
+                        self.meta_sys.clear();
+                        continue;
+                    };
+                    if len > 64 {
+                        return Err(Error::other("large MetaSys uses HashMap decoder"));
+                    }
+                    self.meta_sys.clear();
+                    self.meta_sys.reserve(len);
+                    for _ in 0..len {
+                        let k = read_str_slice(cur)?;
+                        let v = read_bin_slice(cur)?;
+                        if let Some(slot) = self.meta_sys.iter_mut().find(|(ek, _)| *ek == k) {
+                            slot.1 = v;
+                        } else {
+                            self.meta_sys.push((k, v));
+                        }
+                    }
+                }
+                "MetaUsr" => {
+                    let Some(len) = read_nil_or_map_len(cur)? else {
+                        self.meta_user.clear();
+                        self.user_has_internal = false;
+                        continue;
+                    };
+                    self.meta_user.clear();
+                    self.user_has_internal = false;
+                    let mut saw_non_standard_storage_class = false;
+                    self.meta_user.reserve(prealloc_hint(len.saturating_add(self.meta_sys.len())));
+                    for _ in 0..len {
+                        let k = read_str_slice(cur)?;
+                        let v = read_str_slice(cur)?;
+                        if k == AMZ_META_UNENCRYPTED_CONTENT_LENGTH || k == AMZ_META_UNENCRYPTED_CONTENT_MD5 {
+                            continue;
+                        }
+                        if k == metadata_keys::STORAGE_CLASS {
+                            if v == "STANDARD" {
+                                if saw_non_standard_storage_class {
+                                    self.meta_user.remove(metadata_keys::STORAGE_CLASS);
+                                    saw_non_standard_storage_class = false;
+                                }
+                                continue;
+                            }
+                            saw_non_standard_storage_class = true;
+                        }
+                        if !self.user_has_internal && is_internal_key(k) {
+                            self.user_has_internal = true;
+                        }
+                        self.meta_user.insert(k.to_owned(), v.to_owned());
+                    }
+                }
+                _ => skip_msgp_value(cur)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn take_fileinfo_with_part_checksums(&mut self, volume: &str, path: &str, include_part_checksums: bool) -> Result<FileInfo> {
+        let erasure = ErasureInfo {
+            algorithm: self.erasure_algorithm.as_str().to_owned(),
+            data_blocks: self.erasure_m,
+            parity_blocks: self.erasure_n,
+            block_size: self.erasure_block_size,
+            index: self.erasure_index,
+            distribution: std::mem::take(&mut self.erasure_dist),
+            checksums: Vec::new(),
+        };
+        let parts_len = self.parts.len();
+        MetaObject::finish_fileinfo_from_meta_sys(
+            volume,
+            path,
+            self.version_id.filter(|&vid| !vid.is_nil()),
+            self.data_dir,
+            self.mod_time,
+            self.size,
+            erasure,
+            std::mem::take(&mut self.parts),
+            parts_len,
+            parts_len,
+            |i, parts| (parts[i].number, parts[i].size),
+            std::mem::take(&mut self.meta_user),
+            self.user_has_internal,
+            MetaSysSource::Borrowed(&self.meta_sys),
+            true,
+            include_part_checksums,
+        )
+    }
+}
+
+enum MetaSysSource<'a> {
+    Borrowed(&'a [(&'a str, &'a [u8])]),
+    Owned(HashMap<String, Vec<u8>>),
+}
+
+enum MetaSysPair<'a> {
+    Borrowed(&'a str, &'a [u8]),
+    Owned(String, Vec<u8>),
+}
+
+impl MetaSysPair<'_> {
+    #[inline]
+    fn as_parts(&self) -> (&str, &[u8]) {
+        match self {
+            Self::Borrowed(k, v) => (k, v),
+            Self::Owned(k, v) => (k.as_str(), v.as_slice()),
+        }
+    }
+
+    #[inline]
+    fn into_key(self) -> String {
+        match self {
+            Self::Borrowed(k, _) => k.to_owned(),
+            Self::Owned(k, _) => k,
+        }
+    }
+
+    #[inline]
+    fn into_string_pair(self) -> (String, String) {
+        match self {
+            Self::Borrowed(k, v) => (k.to_owned(), std::str::from_utf8(v).map(str::to_owned).unwrap_or_default()),
+            Self::Owned(k, v) => (k, String::from_utf8(v).unwrap_or_default()),
         }
     }
 }
@@ -2583,7 +2911,6 @@ impl MetaObject {
     ) -> Result<FileInfo> {
         let version_id = self.version_id.filter(|&vid| !vid.is_nil());
         let meta_sys = std::mem::take(&mut self.meta_sys);
-        let derived_metadata = DerivedInternalMetadata::from_meta_sys(&meta_sys)?;
 
         let parts = if all_parts {
             let n = self.part_numbers.len();
@@ -2627,6 +2954,60 @@ impl MetaObject {
             metadata.remove(metadata_keys::STORAGE_CLASS);
         }
         let user_has_internal = metadata.keys().any(|k| is_internal_key(k));
+        let erasure = ErasureInfo {
+            algorithm: self.erasure_algorithm.as_str().to_owned(),
+            data_blocks: self.erasure_m,
+            parity_blocks: self.erasure_n,
+            block_size: self.erasure_block_size,
+            index: self.erasure_index,
+            distribution: self.erasure_dist.into_iter().map(usize::from).collect(),
+            ..Default::default()
+        };
+        let part_numbers = self.part_numbers;
+        let part_sizes = self.part_sizes;
+        Self::finish_fileinfo_from_meta_sys(
+            volume,
+            path,
+            version_id,
+            self.data_dir,
+            self.mod_time,
+            self.size,
+            erasure,
+            parts,
+            part_numbers.len(),
+            part_sizes.len(),
+            |i, _| (part_numbers[i], part_sizes[i]),
+            metadata,
+            user_has_internal,
+            MetaSysSource::Owned(meta_sys),
+            all_parts,
+            include_part_checksums,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_fileinfo_from_meta_sys(
+        volume: &str,
+        path: &str,
+        version_id: Option<Uuid>,
+        data_dir: Option<Uuid>,
+        mod_time: Option<OffsetDateTime>,
+        size: i64,
+        erasure: ErasureInfo,
+        parts: Vec<ObjectPartInfo>,
+        part_nums_len: usize,
+        part_sizes_len: usize,
+        part_num_and_size: impl Fn(usize, &[ObjectPartInfo]) -> (usize, usize),
+        mut metadata: HashMap<String, String>,
+        user_has_internal: bool,
+        meta_sys: MetaSysSource<'_>,
+        all_parts: bool,
+        include_part_checksums: bool,
+    ) -> Result<FileInfo> {
+        let derived_metadata = match &meta_sys {
+            MetaSysSource::Borrowed(s) => DerivedInternalMetadata::from_meta_sys_slices(s)?,
+            MetaSysSource::Owned(m) => DerivedInternalMetadata::from_meta_sys(m)?,
+        };
         let mut has_replication_candidate = user_has_internal;
         let mut has_part_checksums = user_has_internal || derived_metadata.part_checksums.is_some();
         let mut has_upload_integrity = user_has_internal;
@@ -2636,16 +3017,6 @@ impl MetaObject {
             .checksum
             .filter(|checksum| !checksum.is_empty())
             .map(Bytes::copy_from_slice);
-
-        let erasure = ErasureInfo {
-            algorithm: self.erasure_algorithm.to_string(),
-            data_blocks: self.erasure_m,
-            parity_blocks: self.erasure_n,
-            block_size: self.erasure_block_size,
-            index: self.erasure_index,
-            distribution: self.erasure_dist.into_iter().map(usize::from).collect(),
-            ..Default::default()
-        };
 
         let transition_status = derived_metadata
             .transition_status
@@ -2669,26 +3040,40 @@ impl MetaObject {
             .map(|v| String::from_utf8_lossy(v).to_string())
             .unwrap_or_default();
 
-        metadata.reserve(meta_sys.len());
-        for (k, v) in meta_sys {
-            if has_internal_suffix(&k, SUFFIX_TIER_FV_ID) || has_internal_suffix(&k, SUFFIX_TIER_FV_MARKER) {
-                continue;
+        metadata.reserve(match &meta_sys {
+            MetaSysSource::Borrowed(s) => s.len(),
+            MetaSysSource::Owned(m) => m.len(),
+        });
+        let mut fold_entry = |pair: MetaSysPair<'_>| {
+            let (k, v) = pair.as_parts();
+            if !k.is_ascii() && (has_internal_suffix(k, SUFFIX_TIER_FV_ID) || has_internal_suffix(k, SUFFIX_TIER_FV_MARKER)) {
+                return;
             }
-            let Some(suffix) = strip_internal_prefix_preserving_case(&k) else {
-                continue;
+            let Some(suffix) = strip_internal_prefix_preserving_case(k) else {
+                return;
             };
-            if suffix.eq_ignore_ascii_case(SUFFIX_TRANSITIONED_VERSION_ID) {
-                let val = transition_version_metadata_value(&v, transition_version.as_deref());
-                metadata.insert(k, val);
-                continue;
-            }
             if !k.is_ascii() {
+                if suffix.eq_ignore_ascii_case(SUFFIX_TRANSITIONED_VERSION_ID) {
+                    let val = transition_version_metadata_value(v, transition_version.as_deref());
+                    metadata.insert(pair.into_key(), val);
+                    return;
+                }
                 has_replication_candidate = true;
                 has_part_checksums = true;
                 has_upload_integrity = true;
                 has_shard_or_inline_integrity = true;
             } else {
                 match suffix.as_bytes().first().map(u8::to_ascii_lowercase) {
+                    Some(b't') => {
+                        if has_internal_suffix(k, SUFFIX_TIER_FV_ID) || suffix.eq_ignore_ascii_case(SUFFIX_TIER_FV_MARKER) {
+                            return;
+                        }
+                        if suffix.eq_ignore_ascii_case(SUFFIX_TRANSITIONED_VERSION_ID) {
+                            let val = transition_version_metadata_value(v, transition_version.as_deref());
+                            metadata.insert(pair.into_key(), val);
+                            return;
+                        }
+                    }
                     Some(b'p') => {
                         if suffix.eq_ignore_ascii_case(SUFFIX_PURGESTATUS) {
                             has_replication_candidate = true;
@@ -2709,7 +3094,20 @@ impl MetaObject {
                     _ => {}
                 }
             }
-            metadata.insert(k, String::from_utf8(v).unwrap_or_default());
+            let (k_str, v_str) = pair.into_string_pair();
+            metadata.insert(k_str, v_str);
+        };
+        match meta_sys {
+            MetaSysSource::Borrowed(s) => {
+                for &(k, v) in s {
+                    fold_entry(MetaSysPair::Borrowed(k, v));
+                }
+            }
+            MetaSysSource::Owned(m) => {
+                for (k, v) in m {
+                    fold_entry(MetaSysPair::Owned(k, v));
+                }
+            }
         }
 
         let replication_state_internal = if has_replication_candidate {
@@ -2734,12 +3132,12 @@ impl MetaObject {
         let mut file_info = FileInfo {
             version_id,
             erasure,
-            data_dir: self.data_dir,
-            mod_time: self.mod_time,
-            size: self.size,
+            data_dir,
+            mod_time,
+            size,
             name: path.to_string(),
             volume: volume.to_string(),
-            parts,
+            parts: if all_parts { parts } else { Vec::new() },
             metadata,
             replication_state_internal,
             deleted,
@@ -2755,7 +3153,7 @@ impl MetaObject {
         if all_parts && include_part_checksums && has_part_checksums {
             file_info.hydrate_data_movement_part_checksums()?;
         }
-        if !self.part_numbers.is_empty()
+        if part_nums_len != 0
             && has_upload_integrity
             && rustfs_utils::http::contains_key_str(&file_info.metadata, crate::shard_integrity::SUFFIX_UPLOAD_INTEGRITY)
         {
@@ -2765,18 +3163,19 @@ impl MetaObject {
             && let Some(commitments) = crate::shard_integrity::descriptor_from_metadata(&file_info.metadata)?
         {
             let layout = crate::shard_integrity::IntegrityLayout::new(
-                self.erasure_m,
-                self.erasure_n,
-                self.erasure_block_size,
+                file_info.erasure.data_blocks,
+                file_info.erasure.parity_blocks,
+                file_info.erasure.block_size,
                 file_info.uses_legacy_checksum,
             )?;
-            if commitments.len() != self.part_numbers.len() || commitments.len() != self.part_sizes.len() {
+            if commitments.len() != part_nums_len || commitments.len() != part_sizes_len {
                 return Err(Error::FileCorrupt);
             }
             for (i, commitment) in commitments.into_iter().enumerate() {
+                let (part_number, part_size) = part_num_and_size(i, &file_info.parts);
                 if commitment.layout != layout
-                    || usize::try_from(commitment.number).map_err(|_| Error::FileCorrupt)? != self.part_numbers[i]
-                    || usize::try_from(commitment.size).map_err(|_| Error::FileCorrupt)? != self.part_sizes[i]
+                    || usize::try_from(commitment.number).map_err(|_| Error::FileCorrupt)? != part_number
+                    || usize::try_from(commitment.size).map_err(|_| Error::FileCorrupt)? != part_size
                 {
                     return Err(Error::FileCorrupt);
                 }

@@ -1180,8 +1180,7 @@ impl FileMeta {
             found = true;
 
             found_fi = Some(
-                FileMetaVersion::try_from(ver_meta)
-                    .and_then(|v| v.into_fileinfo_with_part_checksums(volume, path, opts.all_parts, opts.include_part_checksums))
+                FileMetaVersion::decode_fileinfo_from_slice(ver_meta, volume, path, opts.all_parts, opts.include_part_checksums)
                     .and_then(|mut fi| {
                         fi.is_latest = is_latest;
 
@@ -1227,37 +1226,59 @@ impl FileMeta {
     }
 
     pub fn get_file_info_versions(&self, volume: &str, path: &str, include_free_versions: bool) -> Result<FileInfoVersions> {
-        let mut versions = self.into_file_info_versions(volume, path, true)?;
+        let versions = self.into_file_info_versions(volume, path, true)?;
+        Ok(Self::partition_free_versions(versions, include_free_versions))
+    }
 
-        let mut n = 0;
+    pub(crate) fn decode_file_info_versions_from_buf(
+        buf: &[u8],
+        volume: &str,
+        path: &str,
+        include_free_versions: bool,
+    ) -> Result<FileInfoVersions> {
+        let (meta, _inline_buf) = Self::parse_validated_xl_envelope(buf)?;
+        let (versions_len, header_ver, meta) = if meta.is_empty() {
+            (0, 0, meta)
+        } else {
+            let (versions_len, header_ver, _meta_ver, meta) = Self::decode_validated_xl_headers(meta)?;
+            (versions_len, header_ver, meta)
+        };
 
-        let mut versions_vec = Vec::new();
-
-        for fi in versions.versions.iter() {
-            if fi.tier_free_version() {
-                if !include_free_versions {
-                    versions.free_versions.push(fi.clone());
-                }
-            } else {
-                if !include_free_versions {
-                    versions_vec.push(fi.clone());
-                }
-                n += 1;
-            }
+        let mut versions = Vec::with_capacity(super::filemeta::msgp_decode::prealloc_hint(versions_len).max(1));
+        let mut cur = Cursor::new(meta);
+        for _ in 0..versions_len {
+            let (_header, ver_meta) = Self::read_next_shallow_slice(meta, &mut cur, header_ver)?;
+            let fi = FileMetaVersion::decode_fileinfo_from_slice(ver_meta, volume, path, true, true)?;
+            versions.push(fi);
         }
 
+        let versions = Self::finalize_file_info_versions(versions, volume, path);
+        Ok(Self::partition_free_versions(versions, include_free_versions))
+    }
+
+    fn partition_free_versions(mut versions: FileInfoVersions, include_free_versions: bool) -> FileInfoVersions {
         if !include_free_versions {
-            versions.versions = versions_vec;
+            if versions.versions.iter().any(FileInfo::tier_free_version) {
+                let mut versions_vec = Vec::with_capacity(versions.versions.len());
+                for fi in std::mem::take(&mut versions.versions) {
+                    if fi.tier_free_version() {
+                        versions.free_versions.push(fi);
+                    } else {
+                        versions_vec.push(fi);
+                    }
+                }
+                versions.versions = versions_vec;
+            }
 
-            for fi in versions.versions.iter_mut() {
+            let n = versions.versions.len();
+            for fi in &mut versions.versions {
                 fi.num_versions = n;
             }
-            for fi in versions.free_versions.iter_mut() {
+            for fi in &mut versions.free_versions {
                 fi.num_versions = n;
             }
         }
-
-        Ok(versions)
+        versions
     }
 
     pub fn get_all_file_info_versions(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfoVersions> {
@@ -1265,12 +1286,16 @@ impl FileMeta {
     }
 
     pub fn into_file_info_versions(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfoVersions> {
-        let mut versions = Vec::new();
+        let mut versions = Vec::with_capacity(self.versions.len().max(1));
         for version in self.versions.iter() {
             let fi = version.into_fileinfo(volume, path, all_parts)?;
             versions.push(fi);
         }
 
+        Ok(Self::finalize_file_info_versions(versions, volume, path))
+    }
+
+    fn finalize_file_info_versions(mut versions: Vec<FileInfo>, volume: &str, path: &str) -> FileInfoVersions {
         let num = versions.len();
         let mut prev_mod_time = None;
         for (i, fi) in versions.iter_mut().enumerate() {
@@ -1293,13 +1318,13 @@ impl FileMeta {
             });
         }
 
-        Ok(FileInfoVersions {
+        FileInfoVersions {
             volume: volume.to_string(),
             name: path.to_string(),
             latest_mod_time: versions[0].mod_time,
             versions,
             ..Default::default()
-        })
+        }
     }
 
     pub fn latest_mod_time(&self) -> Option<OffsetDateTime> {
