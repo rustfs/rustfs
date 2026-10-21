@@ -4121,7 +4121,21 @@ fn should_replace_pool_status_for_status_refresh(
         return true;
     };
 
-    !has_active_worker && persisted.last_update > current.last_update
+    persisted.last_update > current.last_update && (!has_active_worker || withdraws_running_decommission(current, persisted))
+}
+
+/// Returns whether a newer persisted record without decommission state, as a
+/// clear or a start rollback writes, withdraws a decommission that `current`
+/// still runs. A local worker must not keep that stale view alive.
+fn withdraws_running_decommission(current: &PoolStatus, persisted: &PoolStatus) -> bool {
+    current
+        .decommission
+        .as_ref()
+        .is_some_and(|info| info.has_decommission_state() && is_decommission_active(info.complete, info.failed, info.canceled))
+        && !persisted
+            .decommission
+            .as_ref()
+            .is_some_and(PoolDecommissionInfo::has_decommission_state)
 }
 
 fn pool_decommission_movement_snapshot(
@@ -4149,10 +4163,12 @@ pub(crate) fn pool_meta_movement_snapshot_changed(before: &PoolMeta, after: &Poo
 }
 
 /// Merges a persisted pool metadata snapshot into `current` monotonically:
-/// a pool entry is replaced only when no active worker covers it and the
-/// snapshot is strictly newer, so delayed snapshots never roll back local
-/// queued/terminal progressions. Returns whether any entry was replaced or
-/// appended.
+/// a pool entry is replaced only when the snapshot is strictly newer and no
+/// active worker covers it, so delayed snapshots never roll back local
+/// queued/terminal progressions. A newer record that withdrew the running
+/// decommission (a clear or a start rollback) replaces it even under an active
+/// worker, which then stops at its next generation check. Returns whether any
+/// entry was replaced or appended.
 pub(crate) fn merge_pool_status_refresh(current: &mut PoolMeta, persisted: PoolMeta, active_workers: &[bool]) -> bool {
     let observed_version = current.version.max(persisted.version);
     if persisted.pools.is_empty() {
@@ -4293,6 +4309,24 @@ fn merge_pool_meta_updates_for_save_releasing(
                 operation: operation.to_string(),
                 pool_index: idx,
                 reason: "a later decommission operation superseded this generation",
+            });
+        }
+        // Terminal records carry no start_time. Every attempt starts by
+        // persisting decommission state, so a terminal record written over a
+        // record without any comes from a worker whose decommission was
+        // withdrawn by a clear or a start rollback.
+        if current_pool.decommission.as_ref().is_some_and(|info| {
+            info.has_decommission_state() && !is_decommission_active(info.complete, info.failed, info.canceled)
+        }) && !persisted_pool
+            .decommission
+            .as_ref()
+            .is_some_and(PoolDecommissionInfo::has_decommission_state)
+        {
+            record_pool_meta_stale_write_rejection("withdrawn_decommission_terminal");
+            return Err(Error::StalePoolMetadataUpdate {
+                operation: operation.to_string(),
+                pool_index: idx,
+                reason: "a withdrawn decommission cannot be marked terminal",
             });
         }
         if current_pool.last_update < persisted_pool.last_update {
@@ -4760,43 +4794,89 @@ pub(crate) enum PoolActivationStartKind {
 
 /// Pending injected write conflicts for scoped pool metadata saves, keyed by
 /// the first pool. Each one fails a save attempt after its merge, before any
-/// write, so the save retries against a fresh read.
+/// write, so the save retries against a fresh read. `after_conflict` edits the
+/// read of the retry that follows, as a write landing between the attempts.
 #[cfg(test)]
-static POOL_META_SAVE_CONFLICTS_FOR_TEST: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, usize>>> =
+type PoolMetaReadEditForTest = Box<dyn FnOnce(&mut PoolMeta) + Send>;
+
+#[cfg(test)]
+#[derive(Default)]
+struct PoolMetaSaveConflictInjection {
+    remaining: usize,
+    after_conflict: Option<PoolMetaReadEditForTest>,
+    conflicted: bool,
+}
+
+#[cfg(test)]
+static POOL_META_SAVE_CONFLICTS_FOR_TEST: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, PoolMetaSaveConflictInjection>>> =
     std::sync::OnceLock::new();
 
 #[cfg(test)]
-pub(crate) fn inject_pool_meta_save_conflicts_for_test<S>(pool: &Arc<S>, conflicts: usize) {
+fn pool_meta_save_conflicts_for_test() -> std::sync::MutexGuard<'static, HashMap<usize, PoolMetaSaveConflictInjection>> {
     POOL_META_SAVE_CONFLICTS_FOR_TEST
         .get_or_init(Default::default)
         .lock()
         .expect("pool metadata save conflict injection should not be poisoned")
-        .insert(pool_activation_test_pool_key(pool), conflicts);
+}
+
+#[cfg(test)]
+pub(crate) fn inject_pool_meta_save_conflicts_for_test<S>(pool: &Arc<S>, conflicts: usize) {
+    pool_meta_save_conflicts_for_test().insert(
+        pool_activation_test_pool_key(pool),
+        PoolMetaSaveConflictInjection {
+            remaining: conflicts,
+            ..Default::default()
+        },
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn inject_pool_meta_save_conflict_then_edit_for_test<S>(
+    pool: &Arc<S>,
+    edit: impl FnOnce(&mut PoolMeta) + Send + 'static,
+) {
+    pool_meta_save_conflicts_for_test().insert(
+        pool_activation_test_pool_key(pool),
+        PoolMetaSaveConflictInjection {
+            remaining: 1,
+            after_conflict: Some(Box::new(edit)),
+            conflicted: false,
+        },
+    );
 }
 
 #[cfg(test)]
 pub(crate) fn remaining_pool_meta_save_conflicts_for_test<S>(pool: &Arc<S>) -> usize {
-    POOL_META_SAVE_CONFLICTS_FOR_TEST
-        .get_or_init(Default::default)
-        .lock()
-        .expect("pool metadata save conflict injection should not be poisoned")
+    pool_meta_save_conflicts_for_test()
         .get(&pool_activation_test_pool_key(pool))
-        .copied()
-        .unwrap_or(0)
+        .map_or(0, |injection| injection.remaining)
+}
+
+#[cfg(test)]
+pub(crate) fn clear_pool_meta_save_conflicts_for_test<S>(pool: &Arc<S>) {
+    pool_meta_save_conflicts_for_test().remove(&pool_activation_test_pool_key(pool));
 }
 
 #[cfg(test)]
 fn take_pool_meta_save_conflict_for_test<S>(pool: &Arc<S>) -> bool {
-    let mut conflicts = POOL_META_SAVE_CONFLICTS_FOR_TEST
-        .get_or_init(Default::default)
-        .lock()
-        .expect("pool metadata save conflict injection should not be poisoned");
-    match conflicts.get_mut(&pool_activation_test_pool_key(pool)) {
-        Some(remaining) if *remaining > 0 => {
-            *remaining -= 1;
+    match pool_meta_save_conflicts_for_test().get_mut(&pool_activation_test_pool_key(pool)) {
+        Some(injection) if injection.remaining > 0 => {
+            injection.remaining -= 1;
+            injection.conflicted = true;
             true
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+fn edit_pool_meta_read_after_conflict_for_test<S>(pool: &Arc<S>, meta: &mut PoolMeta) {
+    let edit = pool_meta_save_conflicts_for_test()
+        .get_mut(&pool_activation_test_pool_key(pool))
+        .filter(|injection| injection.conflicted)
+        .and_then(|injection| injection.after_conflict.take());
+    if let Some(edit) = edit {
+        edit(meta);
     }
 }
 
@@ -9457,6 +9537,14 @@ impl PoolMeta {
     {
         fence.ensure_held()?;
         let selection = load_pool_meta_replicas_observing(pools.clone(), true, write_state).await?;
+        #[cfg(test)]
+        let selection = {
+            let mut selection = selection;
+            if let Some(pool) = pools.first() {
+                edit_pool_meta_read_after_conflict_for_test(pool, &mut selection.meta);
+            }
+            selection
+        };
         write_state.observe_replicas(selection.replica_state);
         write_state.ensure_write_safe("pool metadata save failed")?;
         let mut bootstrap_generation_required = false;
@@ -13955,6 +14043,7 @@ impl ECStore {
         let (pool_meta_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "decommission bucket completion save failed")
             .await?;
+        self.ensure_decommission_not_withdrawn(&snapshot, idx).await?;
         ensure_decommission_generation(&snapshot, idx, generation)?;
         let rebalance_meta = self.rebalance_meta.read().await.clone();
         let checkpoint = {
@@ -17693,6 +17782,8 @@ impl ECStore {
                     }
                 }
                 Ok(false) => {}
+                // The decommission was withdrawn; stop instead of moving more entries.
+                Err(Error::OperationCanceled) => return Err(Error::OperationCanceled),
                 Err(err) => {
                     if let Some(err) = resolve_decommission_progress_save_result(Err(err)) {
                         warn!(
@@ -21669,6 +21760,22 @@ mod tests {
             assert!(err.to_string().contains("superseded this generation"), "{err}");
             assert_pool_zero_at_baseline(&store, "after the peer's stale write").await;
 
+            // A worker that fails, for example on a bucket completion, must not
+            // leave a failed record behind either: terminal records carry no
+            // start_time.
+            peer.decommission_failed_with_owner(0, None)
+                .await
+                .expect_err("a withdrawn decommission must not be marked failed");
+            assert_pool_zero_at_baseline(&store, "after the peer's failure mark").await;
+            {
+                // Restore the running view the failure mark may have reset.
+                let mut pool_meta = peer.pool_meta.write().await;
+                if let Some(info) = pool_meta.pools[0].decommission.as_mut() {
+                    info.failed = false;
+                    info.start_time = Some(generation);
+                }
+            }
+
             // Its progress checkpoint stops it and adopts the rolled back record.
             let err = peer
                 .save_decommission_progress_checkpoint_at(0, generation, OffsetDateTime::now_utc())
@@ -21728,10 +21835,46 @@ mod tests {
             inject_pool_meta_save_conflicts_for_test(&store.pools[0], 1);
             let message = finish_start_with_failed_reload(start, &reload).await;
             let remaining = remaining_pool_meta_save_conflicts_for_test(&store.pools[0]);
-            inject_pool_meta_save_conflicts_for_test(&store.pools[0], 0);
+            clear_pool_meta_save_conflicts_for_test(&store.pools[0]);
             assert_eq!(remaining, 0, "the rollback save must have hit the injected conflict");
             assert!(message.contains("decommission start rollback succeeded"), "{message}");
             assert_pool_zero_at_baseline(&store, "after a retried rollback").await;
+            rx.cancel();
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_start_rollback_rechecks_its_activation_after_a_write_conflict() {
+        run_decommission_start_test("decommission_start_rollback_rechecks_its_activation_after_a_write_conflict", || async {
+            let (_temp_dirs, store, _peer) = startable_decommission_store().await;
+            let rx = CancellationToken::new();
+            let (start, reload) = start_paused_before_failing_reload(&store, &rx).await;
+
+            // A worker checkpoint lands between the rollback's conflicted
+            // attempt and its retry; the retry must see it and give up.
+            inject_pool_meta_save_conflict_then_edit_for_test(&store.pools[0], |meta| {
+                let pool = &mut meta.pools[0];
+                pool.last_update += Duration::milliseconds(1);
+                if let Some(info) = pool.decommission.as_mut() {
+                    info.items_decommissioned += 1;
+                }
+            });
+            let message = finish_start_with_failed_reload(start, &reload).await;
+            let remaining = remaining_pool_meta_save_conflicts_for_test(&store.pools[0]);
+            clear_pool_meta_save_conflicts_for_test(&store.pools[0]);
+            assert_eq!(remaining, 0, "the rollback save must have hit the injected conflict");
+            assert!(
+                message.contains("rollback save failed") && message.contains("cannot be cleared"),
+                "{message}"
+            );
+            let persisted = load_pool_meta_replicas(store.pools.clone(), true)
+                .await
+                .expect("pool metadata should stay readable");
+            assert!(
+                persisted_decommission(&persisted).is_some_and(PoolDecommissionInfo::has_decommission_state),
+                "a rollback refused on its retry must leave the activation in place"
+            );
             rx.cancel();
         });
     }
@@ -30641,6 +30784,46 @@ mod pools_tests {
     }
 
     #[test]
+    fn test_pool_status_refresh_withdraws_a_decommission_under_an_active_worker() {
+        let generation = OffsetDateTime::from_unix_timestamp(2_000).expect("test timestamp should be valid");
+        let running = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: generation,
+                decommission: Some(PoolDecommissionInfo {
+                    start_time: Some(generation),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        // A newer checkpoint never replaces the active worker's own view.
+        let mut current = running.clone();
+        let mut checkpoint = running.clone();
+        checkpoint.pools[0].last_update = generation + Duration::seconds(1);
+        assert!(!merge_pool_status_refresh(&mut current, checkpoint, &[true]));
+        assert_eq!(current.pools[0].last_update, generation);
+
+        // A newer record that withdrew the decommission does.
+        let mut current = running.clone();
+        let mut withdrawn = running.clone();
+        withdrawn.pools[0].last_update = generation + Duration::seconds(1);
+        withdrawn.pools[0].decommission = None;
+        assert!(merge_pool_status_refresh(&mut current, withdrawn, &[true]));
+        assert!(current.pools[0].decommission.is_none());
+
+        // An older one does not.
+        let mut current = running.clone();
+        let mut stale = running;
+        stale.pools[0].last_update = generation - Duration::seconds(1);
+        stale.pools[0].decommission = None;
+        assert!(!merge_pool_status_refresh(&mut current, stale, &[true]));
+        assert!(current.pools[0].decommission.is_some());
+    }
+
+    #[test]
     fn test_pool_meta_save_merge_rejects_a_superseded_decommission_generation() {
         let generation = OffsetDateTime::from_unix_timestamp(2_000).expect("test timestamp should be valid");
         let cleared_at = generation + Duration::seconds(1);
@@ -30664,6 +30847,18 @@ mod pools_tests {
         let err = merge_pool_meta_updates_for_save(&mut persisted, &worker_write, &[0], "worker")
             .expect_err("a worker of a withdrawn generation must not reactivate the pool");
         assert!(err.to_string().contains("superseded this generation"), "{err}");
+        assert!(persisted.pools[0].decommission.is_none());
+
+        // Nor mark it terminal: failed and canceled records carry no start_time.
+        let mut failed = worker_write.clone();
+        if let Some(info) = failed.pools[0].decommission.as_mut() {
+            info.failed = true;
+            info.start_time = None;
+        }
+        let mut persisted = pool_with(cleared_at, None);
+        let err = merge_pool_meta_updates_for_save(&mut persisted, &failed, &[0], "worker")
+            .expect_err("a worker of a withdrawn generation must not mark the pool failed");
+        assert!(err.to_string().contains("cannot be marked terminal"), "{err}");
         assert!(persisted.pools[0].decommission.is_none());
 
         // A later start owns the pool.
