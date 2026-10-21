@@ -14004,11 +14004,11 @@ impl ECStore {
         generation: OffsetDateTime,
         entry: DecommissionUnresolvedEntry,
     ) -> Result<()> {
-        let (previous, recorded) = {
+        let (previous_update, recorded_update) = {
             let rebalance_meta = self.rebalance_meta.read().await.clone();
             let mut pool_meta = self.pool_meta.write().await;
             ensure_decommission_ledger_persistence_supported(&pool_meta)?;
-            let previous = pool_meta.pools.get(idx).cloned();
+            let previous_update = pool_meta.pools.get(idx).map(|pool| pool.last_update);
             record_decommission_unresolved_entry(
                 &mut pool_meta,
                 idx,
@@ -14017,19 +14017,18 @@ impl ECStore {
                 OffsetDateTime::now_utc(),
                 rebalance_meta.as_ref(),
             )?;
-            (previous, pool_meta.pools.get(idx).cloned())
+            (previous_update, pool_meta.pools.get(idx).map(|pool| pool.last_update))
         };
         if let Err(err) = self.save_current_pool_meta(&[idx]).await {
-            // Undo the unsaved entry unless something else replaced the record
-            // meanwhile, so a rejected save leaves no local-only state behind.
+            // Keep the entry: a later save, such as the failure mark, must still
+            // record it. Only undo the revision bump, so a rejected save cannot
+            // make this node's view look newer than what pool.bin holds.
             let mut pool_meta = self.pool_meta.write().await;
-            if let (Some(previous), Some(recorded)) = (previous, recorded)
-                && pool_meta
-                    .pools
-                    .get(idx)
-                    .is_some_and(|current| PersistedPoolStatus::from(current) == PersistedPoolStatus::from(&recorded))
+            if let (Some(previous_update), Some(recorded_update)) = (previous_update, recorded_update)
+                && let Some(pool) = pool_meta.pools.get_mut(idx)
+                && pool.last_update == recorded_update
             {
-                pool_meta.pools[idx] = previous;
+                pool.last_update = previous_update;
             }
             return Err(Error::other(format!("decommission unresolved entry ledger save failed: {err}")));
         }
@@ -21994,15 +21993,16 @@ mod tests {
             let (generation, restored) = roll_back_a_retry_seen_by_a_peer(&store, &peer).await;
 
             // The peer's worker records an unresolved entry; the save is
-            // rejected and must not leave the entry or a newer last_update in
-            // the peer's memory.
+            // rejected and must not leave a newer last_update in the peer's
+            // memory.
+            let update_before = peer.pool_meta.read().await.pools[0].last_update;
             peer.persist_decommission_unresolved_entry(0, generation, test_unresolved_entry("later", generation))
                 .await
                 .expect_err("a peer must not record entries for a rolled back retry");
-            assert!(
-                local_decommission_state(&*peer.pool_meta.read().await)
-                    .is_some_and(|info| !info.failed && info.unresolved_entries.len() == 1),
-                "a rejected save must leave the peer's view as it was"
+            assert_eq!(
+                peer.pool_meta.read().await.pools[0].last_update,
+                update_before,
+                "a rejected save must not raise the peer's last_update"
             );
 
             // Its next checkpoint stops it and adopts the restored record.
@@ -22032,6 +22032,45 @@ mod tests {
                 .expect_err("a write of the rolled back retry must not reactivate the pool");
             assert!(err.to_string().contains("superseded this generation"), "{err}");
             assert_eq!(persisted_pool_zero(&store).await, restored);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_failure_mark_keeps_an_entry_whose_own_save_failed() {
+        run_decommission_start_test("decommission_failure_mark_keeps_an_entry_whose_own_save_failed", || async {
+            let (_temp_dirs, store, _peer) = startable_decommission_store().await;
+            store
+                .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+                .await
+                .expect("the start should persist");
+            let generation = store
+                .active_decommission_generation(0)
+                .await
+                .expect("the decommission should be active");
+
+            // A transient failure (every write attempt conflicts) fails the
+            // entry's own save; the entry must survive for the failure mark.
+            inject_pool_meta_save_conflicts_for_test(&store.pools[0], POOL_META_CAS_MAX_ATTEMPTS);
+            let saved = store
+                .persist_decommission_unresolved_entry(0, generation, test_unresolved_entry("unreadable", generation))
+                .await;
+            let remaining = remaining_pool_meta_save_conflicts_for_test(&store.pools[0]);
+            clear_pool_meta_save_conflicts_for_test(&store.pools[0]);
+            saved.expect_err("the entry's own save should fail");
+            assert_eq!(remaining, 0, "every write attempt must have hit the injected conflict");
+
+            store
+                .decommission_failed_with_owner(0, None)
+                .await
+                .expect("the failure mark should persist");
+            let failed = persisted_pool_zero(&store).await;
+            let info = failed.decommission.as_ref().expect("the failed record should persist");
+            assert!(info.failed, "{failed:?}");
+            assert!(
+                info.unresolved_entries.iter().any(|entry| entry.object == "unreadable"),
+                "the failed record must keep the entry whose own save failed: {failed:?}"
+            );
         });
     }
 
