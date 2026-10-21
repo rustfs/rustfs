@@ -4746,7 +4746,8 @@ impl ECStore {
 
     /// Return metadata for DELETE preflight, including an explicitly addressed
     /// delete marker. GET/HEAD may also use this metadata-only lookup to enrich
-    /// an already failed read with marker headers, never to serve marker data.
+    /// an already failed read with marker headers, never to serve marker data;
+    /// delete-marker replication uses it to confirm the source marker.
     /// Normal reads must keep using `get_object_info`; authorization and Object
     /// Lock enforcement still belong to the caller and locked delete.
     #[instrument(level = "trace", skip_all)]
@@ -10008,6 +10009,63 @@ mod tests {
             .await
             .expect("create the bucket in both pools");
         (dirs, store)
+    }
+
+    // rustfs#8746: delete-marker replication confirms the source marker by
+    // version before sending; a multi-pool source must not reject that read.
+    async fn assert_replication_reads_source_delete_marker(pool_count: usize) {
+        let bucket = format!("replication-marker-read-{pool_count}");
+        let object = "deleted.bin";
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let mut dirs = Vec::new();
+        let mut sets = Vec::new();
+        for _ in 0..pool_count {
+            let (set_dirs, set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+            dirs.extend(set_dirs);
+            sets.push(set);
+        }
+        let store = Arc::new(new_prepared_reader_test_store_with_ctx(&sets, ctx).await);
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        store
+            .handle_make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create the versioned bucket in every pool");
+        let versioned = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        store
+            .put_object(&bucket, object, &mut PutObjReader::from_vec(b"replicated payload".to_vec()), &versioned)
+            .await
+            .expect("write the version the marker will hide");
+        let marker = store
+            .delete_object_with_tier_delete_journal(&bucket, object, versioned)
+            .await
+            .expect("an unversioned DELETE creates a delete marker");
+        assert!(marker.delete_marker);
+        let marker_version_id = marker.version_id.expect("delete marker version id");
+
+        let read = crate::bucket::replication::read_source_delete_marker(store.as_ref(), &bucket, object, marker_version_id)
+            .await
+            .unwrap_or_else(|err| panic!("{pool_count}-pool source must return its delete marker: {err:?}"));
+        assert!(read.delete_marker);
+        assert_eq!(read.version_id, Some(marker_version_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replication_reads_source_delete_marker_on_single_pool() {
+        assert_replication_reads_source_delete_marker(1).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replication_reads_source_delete_marker_on_multi_pool() {
+        assert_replication_reads_source_delete_marker(2).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
