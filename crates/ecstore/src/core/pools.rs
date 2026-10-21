@@ -12377,6 +12377,36 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
                     Some(signal) => {
                         apply_expiry_rule_for_data_movement(store, &event, event_source, &object_info, Some(signal)).await
                     }
+                    // The source cleanup removes an expired version whether or
+                    // not its expiry ran. For a transitioned version, only an
+                    // applied expiry leaves the tier free version on the source
+                    // before that cleanup, so the entry moves it to a target
+                    // instead of leaving it behind for the post-check.
+                    None if !object_info.transitioned_object.status.is_empty() => {
+                        #[cfg(test)]
+                        let injected =
+                            decommission_test_wrap_result("lifecycle_expiry_apply", bucket, &version.name, 1, Ok(())).is_err();
+                        #[cfg(not(test))]
+                        let injected = false;
+                        if injected || !apply_expiry_rule_for_data_movement(store, &event, event_source, &object_info, None).await
+                        {
+                            // The version is still live, so it moves like any
+                            // other version and lifecycle expires it on the
+                            // target.
+                            warn!(
+                                event = EVENT_DECOMMISSION_ENTRY,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_POOLS,
+                                state = "lifecycle_expiry_deferred",
+                                bucket = %bucket,
+                                object = %version.name,
+                                action = ?action,
+                                "Data movement could not apply a transitioned version's lifecycle expiry; moving the version"
+                            );
+                            return Ok(false);
+                        }
+                        true
+                    }
                     None => apply_expiry_rule_in(store, &event, event_source, &object_info).await,
                 };
             resolve_data_movement_lifecycle_expiry_result(action, apply_actions, applied)
