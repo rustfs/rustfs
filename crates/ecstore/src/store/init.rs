@@ -591,7 +591,7 @@ impl ECStore {
 
         let deployment_id = deployment_id.ok_or_else(|| Error::other("store init failed: deployment id is not initialized"))?;
         let peer_sys = S3PeerSys::new_with_instance_ctx(&endpoint_pools, instance_ctx.clone());
-        let mut pool_meta = PoolMeta::new(&pools, &PoolMeta::default());
+        let mut pool_meta = PoolMeta::new(&pools, &PoolMeta::default())?;
         pool_meta.dont_save = true;
         let elected_bootstrap_writer = pools
             .first()
@@ -682,7 +682,7 @@ impl ECStore {
         let endpoints = runtime_sources::endpoint_pools_or_default();
 
         let mut installed_pool_meta = if update {
-            PoolMeta::new(&self.pools, &meta)
+            PoolMeta::new(&self.pools, &meta)?
         } else {
             meta.clone()
         };

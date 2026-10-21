@@ -2631,7 +2631,7 @@ mod tests {
     #[serial_test::serial]
     async fn pool_meta_runtime_load_waits_for_multi_pool_commit_fence() {
         let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-load-fence", &[2, 2]).await;
-        let old = PoolMeta::new(&store.pools, &PoolMeta::default());
+        let old = PoolMeta::new(&store.pools, &PoolMeta::default()).expect("initial pool metadata should be built");
         old.save_for_startup(store.pools.clone())
             .await
             .expect("old V3 pool metadata should persist");

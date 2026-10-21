@@ -1463,6 +1463,24 @@ impl DefaultBucketUsecase {
     )]
     pub async fn execute_create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
         rustfs_io_metrics::s3_http_metrics::observe_s3_http_operation(S3Operation::CreateBucket);
+        if let Some(location) = req
+            .input
+            .create_bucket_configuration
+            .as_ref()
+            .and_then(|config| config.location_constraint.as_ref())
+            .map(BucketLocationConstraint::as_str)
+            .filter(|location| !location.is_empty())
+        {
+            let location = if location == "EU" { "eu-west-1" } else { location };
+            let region = self.global_region();
+            if location != region.as_ref().map_or(RUSTFS_REGION, Region::as_str) {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidLocationConstraint,
+                    "The specified location constraint does not match this server's region.",
+                ));
+            }
+        }
+
         // An existing bucket needs no mutation. Answer before the mutation queue and the
         // bucket's exclusive locks, which wait for every in-flight object write.
         if let Ok(req_info) = req_info_ref(&req)
@@ -1693,13 +1711,11 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        if let Some(region) = self.global_region() {
-            return Ok(S3Response::new(GetBucketLocationOutput {
-                location_constraint: Some(BucketLocationConstraint::from(region.to_string())),
-            }));
-        }
-
-        Ok(S3Response::new(GetBucketLocationOutput::default()))
+        let location_constraint = self
+            .global_region()
+            .filter(|region| region.as_str() != RUSTFS_REGION)
+            .map(|region| BucketLocationConstraint::from(region.to_string()));
+        Ok(S3Response::new(GetBucketLocationOutput { location_constraint }))
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -4437,37 +4453,96 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[test]
     #[serial_test::serial]
-    async fn execute_create_bucket_on_existing_bucket_does_not_wait_for_bucket_lifecycle_lock() {
-        let context = crate::app::gating_test_env::shared_gating_ambient().await;
-        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
-        let bucket = format!("create-existing-{}", uuid::Uuid::new_v4().simple());
-        store
-            .make_bucket(&bucket, &MakeBucketOptions::default())
-            .await
-            .expect("create bucket");
+    fn execute_create_bucket_on_existing_bucket_does_not_wait_for_bucket_lifecycle_lock() {
+        crate::app::gating_test_env::run_large_stack_test("create-existing-bucket", || async {
+            let context = crate::app::gating_test_env::shared_gating_ambient().await;
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let bucket = format!("create-existing-{}", uuid::Uuid::new_v4().simple());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
 
-        // Object writes hold this lock shared; holding it exclusively makes any wait on it visible.
-        let _lifecycle_guard = store
-            .lock_bucket_for_recursive_delete(&bucket)
-            .await
-            .expect("hold the bucket lifecycle lock");
+            // Object writes hold this lock shared; an exclusive guard exposes any lifecycle-lock wait.
+            let _lifecycle_guard = store
+                .lock_bucket_for_recursive_delete(&bucket)
+                .await
+                .expect("hold the bucket lifecycle lock");
+            let usecase = DefaultBucketUsecase::with_context(Some(context));
 
-        let input = CreateBucketInput::builder().bucket(bucket.clone()).build().unwrap();
-        let req = build_request_with_req_info(
-            input,
-            Method::PUT,
-            ReqInfo {
-                is_owner: true,
-                ..Default::default()
-            },
-        );
-        let usecase = DefaultBucketUsecase::with_context(Some(context));
-        tokio::time::timeout(Duration::from_secs(2), usecase.execute_create_bucket(req))
-            .await
-            .expect("CreateBucket on an existing bucket must not wait for the bucket lifecycle lock")
-            .expect("the owner recreating a bucket in us-east-1 gets the idempotent success");
+            for (is_owner, location, expected_error) in [
+                (true, None, None),
+                (false, None, Some(S3ErrorCode::BucketAlreadyExists)),
+                (true, Some("ap-south-1"), Some(S3ErrorCode::InvalidLocationConstraint)),
+            ] {
+                let input = CreateBucketInput {
+                    bucket: bucket.clone(),
+                    create_bucket_configuration: location.map(|location| s3s::dto::CreateBucketConfiguration {
+                        location_constraint: Some(BucketLocationConstraint::from(location.to_string())),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let req = build_request_with_req_info(
+                    input,
+                    Method::PUT,
+                    ReqInfo {
+                        is_owner,
+                        ..Default::default()
+                    },
+                );
+                let result = tokio::time::timeout(Duration::from_secs(2), usecase.execute_create_bucket(req))
+                    .await
+                    .expect("CreateBucket on an existing bucket must not wait for the bucket lifecycle lock");
+                match expected_error {
+                    Some(code) => assert_eq!(result.expect_err("duplicate or invalid request must fail").code(), &code),
+                    None => {
+                        result.expect("the owner recreating a bucket in us-east-1 gets the idempotent success");
+                    }
+                }
+            }
+
+            let req = build_request(
+                CreateBucketInput {
+                    bucket,
+                    ..Default::default()
+                },
+                Method::PUT,
+            );
+            let err = tokio::time::timeout(Duration::from_secs(2), usecase.execute_create_bucket(req))
+                .await
+                .expect("missing request info must fail before storage mutation")
+                .expect_err("an existing bucket must not bypass request-info validation");
+            assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn execute_create_bucket_creates_missing_bucket() {
+        crate::app::gating_test_env::run_large_stack_test("create-missing-bucket", || async {
+            let context = crate::app::gating_test_env::shared_gating_ambient().await;
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let bucket = format!("create-missing-{}", uuid::Uuid::new_v4().simple());
+            let input = CreateBucketInput::builder().bucket(bucket.clone()).build().unwrap();
+            let req = build_request_with_req_info(
+                input,
+                Method::PUT,
+                ReqInfo {
+                    is_owner: true,
+                    ..Default::default()
+                },
+            );
+            let usecase = DefaultBucketUsecase::with_context(Some(context));
+            usecase.execute_create_bucket(req).await.expect("create a missing bucket");
+            let info = store
+                .get_bucket_info(&bucket, &BucketOptions::default())
+                .await
+                .expect("the missing-bucket lookup must fall through to real creation");
+            assert_eq!(info.name, bucket);
+        });
     }
 
     #[tokio::test]
