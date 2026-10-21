@@ -6224,6 +6224,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multipart_transaction_recovery_accepts_missing_directories_but_requires_read_quorum() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let part_path = "empty-upload/data/";
+        set_disks
+            .recover_part_transactions(part_path, 2, 3)
+            .await
+            .expect("an upload without parts has no transactions to recover");
+
+        {
+            let mut disks = set_disks.disks.write().await;
+            disks[2] = None;
+            disks[3] = None;
+        }
+        set_disks
+            .recover_part_transactions(part_path, 2, 3)
+            .await
+            .expect("missing directories at the exact read quorum prove there are no transactions");
+
+        set_disks.disks.write().await[1] = None;
+        assert_eq!(
+            set_disks.recover_part_transactions(part_path, 2, 3).await,
+            Err(DiskError::ErasureReadQuorum),
+            "one missing directory must not hide three offline disks"
+        );
+
+        disk_stores[1]
+            .write_all(RUSTFS_META_MULTIPART_BUCKET, "empty-upload/data", Bytes::from_static(b"not a directory"))
+            .await
+            .expect("place a file where the part directory should be");
+        set_disks.disks.write().await[1] = Some(disk_stores[1].clone());
+        assert_eq!(
+            set_disks.recover_part_transactions(part_path, 2, 3).await,
+            Err(DiskError::ErasureReadQuorum),
+            "a corrupt directory path must not count as an empty-directory observation"
+        );
+    }
+
+    #[tokio::test]
     async fn complete_multipart_upload_recovers_interrupted_part_retry() {
         use tokio::io::AsyncReadExt as _;
 
