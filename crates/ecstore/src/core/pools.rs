@@ -182,6 +182,9 @@ const DECOMMISSION_CAPACITY_INTENT_CONFLICT_MAX_ATTEMPTS: usize = 12;
 // divergent authority still reaches a terminal, attributable failure.
 const DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS: usize = 12;
 const DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+/// In-place attempts for a source cleanup quorum failure before the entry is
+/// deferred to the end of the round.
+pub(crate) const DECOMMISSION_SOURCE_CLEANUP_QUORUM_MAX_ATTEMPTS: usize = 3;
 pub(crate) const DECOMMISSION_VERSION_COPY_ATTEMPTS: usize = 3;
 const DECOMMISSION_COPY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 const DECOMMISSION_CAPACITY_GATE_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(100);
@@ -4995,17 +4998,31 @@ fn resolve_decommission_listing_worker_result(
     worker_result.map_err(|err| Error::other(format!("decommission listing worker {set_idx} task join error: {err}")))?
 }
 
+/// Prefix of a pause reason caused by source cleanup rather than target
+/// capacity; see [`PoolDecommissionInfo::is_source_cleanup_blocked`].
+pub(crate) const DECOMMISSION_SOURCE_CLEANUP_BLOCKED: &str = "source cleanup blocked";
+
 /// Keep the deferral cause the pause reason should name. A stale target
-/// selection outranks transient contention such as a busy gate: it does not
-/// clear by waiting, so it is what an operator has to act on, whichever entry
-/// of the set finished last.
+/// selection or a source cleanup that kept failing outranks transient
+/// contention such as a busy gate: neither clears by waiting, so it is what an
+/// operator has to act on, whichever entry of the set finished last.
 fn record_decommission_deferral_cause(recorded: &mut Option<(bool, String)>, err: &Error) {
-    let stale = matches!(
-        classify_decommission_capacity_failure(err),
-        DecommissionCapacityFailure::StaleTargetSelection { .. }
-    );
-    if recorded.as_ref().is_none_or(|(recorded_stale, _)| stale || !recorded_stale) {
-        *recorded = Some((stale, err.to_string()));
+    let source_cleanup = is_decommission_source_cleanup_retryable_error(err);
+    let durable = source_cleanup
+        || matches!(
+            classify_decommission_capacity_failure(err),
+            DecommissionCapacityFailure::StaleTargetSelection { .. }
+        );
+    if recorded
+        .as_ref()
+        .is_none_or(|(recorded_durable, _)| durable || !recorded_durable)
+    {
+        let cause = if source_cleanup {
+            format!("{DECOMMISSION_SOURCE_CLEANUP_BLOCKED}: {err}")
+        } else {
+            err.to_string()
+        };
+        *recorded = Some((durable, cause));
     }
 }
 
@@ -5026,12 +5043,31 @@ fn ensure_decommission_deferred_drained(
     if deferred_remaining == 0 {
         return Ok(());
     }
+    let remaining =
+        format!("decommission bucket {bucket} set {set_idx} finished with {deferred_remaining} deferred entries remaining");
+    // A source cleanup pause leads with its own label so the persisted reason
+    // does not read as a target capacity problem.
+    if let Some(cause) = deferral_cause.and_then(|cause| cause.strip_prefix(DECOMMISSION_SOURCE_CLEANUP_BLOCKED)) {
+        return Err(decommission_capacity_blocked_error(format!(
+            "{DECOMMISSION_SOURCE_CLEANUP_BLOCKED}: {remaining}; deferral cause{cause}"
+        )));
+    }
     let cause = deferral_cause
         .map(|cause| format!("; deferral cause: {cause}"))
         .unwrap_or_default();
-    Err(decommission_capacity_blocked_error(format!(
-        "decommission bucket {bucket} set {set_idx} finished with {deferred_remaining} deferred entries remaining{cause}"
-    )))
+    Err(decommission_capacity_blocked_error(format!("{remaining}{cause}")))
+}
+
+/// The reason persisted for a durable decommission pause. A source cleanup
+/// pause keeps only its own message; the capacity wording of the carrier error
+/// would misreport it.
+fn decommission_pause_reason(err: &Error) -> String {
+    match err {
+        Error::DecommissionCapacityBlocked { message } if message.starts_with(DECOMMISSION_SOURCE_CLEANUP_BLOCKED) => {
+            message.clone()
+        }
+        _ => err.to_string(),
+    }
 }
 
 fn decommission_entry_budget_acquire_error(err: impl Display) -> Error {
@@ -5297,6 +5333,10 @@ enum DecommissionEntryAttemptOutcome {
 struct DeferredDecommissionEntry {
     name: String,
     attempts: usize,
+    /// Versions whose progress was already counted. A deferral after the
+    /// copy (source cleanup) has counted every version; the replay must not
+    /// count them again.
+    counted_versions: HashSet<(Option<uuid::Uuid>, bool)>,
 }
 
 /// Terminal result of a decommission entry pass.
@@ -10960,6 +11000,14 @@ struct DecommissionProgressCheckpoint {
 }
 
 impl PoolDecommissionInfo {
+    /// Whether the durable pause was caused by a source cleanup that kept
+    /// failing rather than by target capacity.
+    pub fn is_source_cleanup_blocked(&self) -> bool {
+        self.capacity_blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with(DECOMMISSION_SOURCE_CLEANUP_BLOCKED))
+    }
+
     pub fn has_decommission_state(&self) -> bool {
         self.complete
             || self.failed
@@ -15189,7 +15237,7 @@ impl ECStore {
         let (pool_meta_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "decommission capacity pause failed")
             .await?;
-        snapshot.mark_decommission_capacity_blocked(idx, err.to_string(), OffsetDateTime::now_utc())?;
+        snapshot.mark_decommission_capacity_blocked(idx, decommission_pause_reason(err), OffsetDateTime::now_utc())?;
         let outcome = snapshot
             .save_no_lock_armed(
                 self.pools.clone(),
@@ -15482,6 +15530,7 @@ impl ECStore {
             }
             let object_name = entry.name.clone();
             let mut attempts = 0;
+            let mut counted_versions = HashSet::new();
 
             if entry_error.lock().await.is_some() {
                 drop(queue_permit);
@@ -15557,6 +15606,7 @@ impl ECStore {
                     expected_bucket_incarnation_id,
                     Arc::clone(&source_changed_exhaustions),
                     &mut attempts,
+                    &mut counted_versions,
                 )
                 .await;
             drop(entry_budget_permit);
@@ -15568,12 +15618,14 @@ impl ECStore {
                     // listing drain waits for the full budget to return, and the
                     // listing has already finished for this round.
                     drop(queue_permit);
-                    // Only the name and attempt count are retained. A contention streak
-                    // would otherwise pin one metadata buffer per object, and the
-                    // replay reloads the versions it needs from disk anyway.
+                    // Only the name, attempt count and counted version ids are
+                    // retained. A contention streak would otherwise pin one
+                    // metadata buffer per object, and the replay reloads the
+                    // versions it needs from disk anyway.
                     deferred.lock().await.push(DeferredDecommissionEntry {
                         name: object_name,
                         attempts,
+                        counted_versions,
                     });
                     info!(
                         event = EVENT_DECOMMISSION_ENTRY,
@@ -15697,6 +15749,7 @@ impl ECStore {
                 expected_bucket_incarnation_id,
                 source_changed_exhaustions,
                 &mut deferred_entry.attempts,
+                &mut deferred_entry.counted_versions,
             )
             .await;
         drop(entry_budget_permit);
@@ -16370,13 +16423,13 @@ impl ECStore {
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         source_changed_exhaustions: Arc<AtomicUsize>,
         attempts: &mut usize,
+        counted_versions: &mut HashSet<(Option<uuid::Uuid>, bool)>,
     ) -> Result<DecommissionEntryOutcome> {
-        let mut counted_versions = HashSet::new();
-
         for entry_attempt in 1..=DECOMMISSION_ENTRY_MAX_ATTEMPTS {
             let attempt_result = {
                 let mut conflict_attempt = 0;
                 let mut scanner_backlog_handoff_attempt = 0;
+                let mut source_cleanup_quorum_attempt = 0;
                 loop {
                     let result = self
                         .decommission_entry_attempt(
@@ -16393,7 +16446,7 @@ impl ECStore {
                             entry_attempt,
                             scanner_backlog_handoff_attempt,
                             source_changed_exhaustions.as_ref(),
-                            &mut counted_versions,
+                            counted_versions,
                             attempts,
                         )
                         .await;
@@ -16436,6 +16489,38 @@ impl ECStore {
                             max_attempts = DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS,
                             retry_delay_ms = retry_delay.as_millis(),
                             "Decommission scanner pause backlog handoff conflict; retrying entry"
+                        );
+                        if wait_decommission_retry_backoff(&rx, retry_delay).await {
+                            decommission_cancel_signal_result(rx.is_cancelled())?;
+                        }
+                        continue;
+                    }
+                    // A quorum blip while deleting the copied source is retried
+                    // in place first; only a failure that outlasts this budget
+                    // is deferred to the end of the round.
+                    if source_cleanup_quorum_attempt + 1 < DECOMMISSION_SOURCE_CLEANUP_QUORUM_MAX_ATTEMPTS
+                        && result
+                            .as_ref()
+                            .err()
+                            .is_some_and(is_decommission_source_cleanup_retryable_error)
+                    {
+                        source_cleanup_quorum_attempt += 1;
+                        let retry_delay = decommission_retry_backoff_delay(
+                            DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY,
+                            source_cleanup_quorum_attempt,
+                        );
+                        warn!(
+                            event = EVENT_DECOMMISSION_ENTRY,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_POOLS,
+                            state = "source_cleanup_quorum_retry",
+                            pool_index = idx,
+                            bucket = %bucket,
+                            object = %entry.name,
+                            attempt = source_cleanup_quorum_attempt,
+                            max_attempts = DECOMMISSION_SOURCE_CLEANUP_QUORUM_MAX_ATTEMPTS,
+                            retry_delay_ms = retry_delay.as_millis(),
+                            "Decommission source cleanup lost quorum; retrying entry"
                         );
                         if wait_decommission_retry_backoff(&rx, retry_delay).await {
                             decommission_cancel_signal_result(rx.is_cancelled())?;
@@ -17479,6 +17564,11 @@ impl ECStore {
             let cleanup_expected = data_movement::source_cleanup_expected_without_vanished(&fivs, &cleanup_preflight_vanished);
             let cleanup_result = self
                 .run_guarded_decommission_side_effect(&rx, &operation_gate, || async {
+                    // Injected before the delete, so a test fault leaves the
+                    // source exactly as a failed cleanup would.
+                    #[cfg(test)]
+                    decommission_test_wrap_result("source_cleanup", bucket.as_str(), entry.name.as_str(), entry_attempt, Ok(()))
+                        .map_err(data_movement::SourceCleanupError::Storage)?;
                     data_movement::cleanup_source_entry_if_unchanged(
                         set.clone(),
                         bucket.as_str(),
@@ -17728,6 +17818,7 @@ impl ECStore {
                 expected_bucket_incarnation_id,
                 source_changed_exhaustions,
                 &mut 0,
+                &mut HashSet::new(),
             )
             .await,
         )
@@ -17774,6 +17865,7 @@ impl ECStore {
                 expected_bucket_incarnation_id,
                 Arc::new(AtomicUsize::new(0)),
                 &mut 0,
+                &mut HashSet::new(),
             )
             .await,
         )
@@ -25407,6 +25499,7 @@ mod tests {
             DeferredDecommissionEntry {
                 name: object.into(),
                 attempts: 2,
+                counted_versions: HashSet::new(),
             },
             bucket.into(),
             source_set.clone(),
@@ -25464,6 +25557,7 @@ mod tests {
             Some(incarnation),
             Arc::new(AtomicUsize::new(0)),
             &mut attempts,
+            &mut HashSet::new(),
         ))
         .await
         .expect("retry migration");
@@ -25595,6 +25689,7 @@ mod tests {
                 Some(self.incarnation),
                 Arc::clone(&exhaustions),
                 &mut 0,
+                &mut HashSet::new(),
             ))
             .await
             .expect("decommission entry");
@@ -25841,6 +25936,7 @@ mod tests {
         let mut deferred = DeferredDecommissionEntry {
             name: "object".into(),
             attempts,
+            counted_versions: HashSet::new(),
         };
         record_decommission_object_attempt(&mut deferred.attempts);
         assert_eq!(deferred.attempts, 3);
@@ -32150,13 +32246,21 @@ mod pools_tests {
         let deferred =
             resolve_decommission_entry_cleanup_delete_result::<()>(Err(Error::ErasureWriteQuorum), "bucket-a", "obj.txt")
                 .expect_err("cleanup quorum failure should surface");
-        let undrained = super::ensure_decommission_deferred_drained("bucket-a", 0, 1, Some(&deferred.to_string()))
+        let mut cause = None;
+        super::record_decommission_deferral_cause(&mut cause, &deferred);
+        let (_, cause) = cause.expect("a cleanup deferral records its cause");
+        let undrained = super::ensure_decommission_deferred_drained("bucket-a", 0, 1, Some(&cause))
             .expect_err("an undrained cleanup deferral must not complete the bucket");
         assert!(is_decommission_capacity_blocked_error(&undrained));
+        let reason = super::decommission_pause_reason(&undrained);
+        assert!(reason.starts_with(super::DECOMMISSION_SOURCE_CLEANUP_BLOCKED), "{reason}");
         assert!(
-            undrained
-                .to_string()
-                .contains("decommission cleanup_delete_object failed for bucket-a/obj.txt")
+            reason.contains("decommission cleanup_delete_object failed for bucket-a/obj.txt"),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains("free drive threshold"),
+            "a cleanup pause is not a capacity problem: {reason}"
         );
     }
 

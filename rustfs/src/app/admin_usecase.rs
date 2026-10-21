@@ -46,6 +46,7 @@ pub type AdminUsecaseResult<T> = Result<T, ApiError>;
 
 /// `waitingReason` value reported while a pool is paused on target capacity.
 const DECOMMISSION_WAITING_REASON_CAPACITY: &str = "capacity";
+const DECOMMISSION_WAITING_REASON_SOURCE_CLEANUP: &str = "source_cleanup";
 
 pub const ADMIN_CLUSTER_SNAPSHOT_ROUTE: &str = "/rustfs/admin/v4/cluster/snapshot";
 pub const ADMIN_EXTENSIONS_CATALOG_ROUTE: &str = "/rustfs/admin/v4/extensions/catalog";
@@ -641,6 +642,9 @@ impl DefaultAdminUsecase {
         if !info.has_decommission_state() || info.complete || info.failed || info.canceled {
             return None;
         }
+        if info.is_source_cleanup_blocked() {
+            return Some(DECOMMISSION_WAITING_REASON_SOURCE_CLEANUP);
+        }
         if info.capacity_blocked_reason.is_some() {
             return Some(DECOMMISSION_WAITING_REASON_CAPACITY);
         }
@@ -1039,6 +1043,33 @@ mod tests {
             value["decommissionInfo"]["capacityBlockedReason"],
             "target pool 1 target capacity mutation gate is busy"
         );
+    }
+
+    /// A pause caused by a source cleanup that kept failing is not a capacity
+    /// problem and must not be reported as one.
+    #[test]
+    fn admin_pool_list_item_exposes_decommission_source_cleanup_pause() {
+        let reason = "source cleanup blocked: decommission bucket b set 0 finished with 1 deferred entries remaining; \
+                      deferral cause: decommission cleanup_delete_object failed for b/o: erasure write quorum";
+        let item = DefaultAdminUsecase::pool_list_item_from_status(
+            PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                    total_size: 1_000,
+                    current_size: 500,
+                    capacity_blocked_reason: Some(reason.to_string()),
+                    ..Default::default()
+                }),
+            },
+            (RebalStatus::None, false),
+        );
+
+        let value = serde_json::to_value(item).expect("paused pool status should serialize");
+        assert_eq!(value["decommissionInfo"]["waitingReason"], "source_cleanup");
+        assert_eq!(value["decommissionInfo"]["capacityBlockedReason"], reason);
     }
 
     /// Once the pause clears, `waitingReason` must return to the worker states
