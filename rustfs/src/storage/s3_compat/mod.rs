@@ -21,4 +21,3 @@
 mod envelope;
 pub(crate) mod lifecycle;
 pub(crate) mod replication;
-pub(crate) mod select;

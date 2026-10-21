@@ -8,8 +8,8 @@ use super::storage_api::select_object::{
     validate_ssec_for_read,
 };
 use crate::app::runtime_sources::current_s3select_db;
+use crate::app::select_request::select_input_from_s3s;
 use crate::error::ApiError;
-use crate::storage::s3_compat::select::select_input_from_s3s;
 use bytes::{Bytes, BytesMut};
 use datafusion::arrow::{
     array::{Array, ListLikeArray, MapArray, cast::AsArray},
