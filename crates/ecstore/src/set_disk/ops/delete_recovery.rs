@@ -2828,7 +2828,9 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let fence_armed = Arc::new(AtomicBool::new(false));
         let root = dirs[0].path().join(bucket).join("object");
-        for stale in 0..=stale_attempts {
+        // One hook per attempt: the stale ones, then one more that observes a
+        // retry when the bound allows it.
+        for stale in 0..stale_attempts + usize::from(!lose_fence_after_first && stale_attempts < PUBLISHED_CLEANUP_ATTEMPTS) {
             let attempts = attempts.clone();
             let fence_armed = fence_armed.clone();
             let root = root.clone();
