@@ -1460,6 +1460,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
         self.handle_get_object_info(bucket, object, opts).await
     }
 
+    async fn get_object_info_for_delete(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        ECStore::get_object_info_for_delete(self, bucket, object, opts).await
+    }
+
     async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
         self.handle_verify_object_integrity(bucket, object, opts).await
     }

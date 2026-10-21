@@ -442,6 +442,18 @@ pub trait ObjectOperations: Send + Sync + fmt::Debug {
         object: &str,
         opts: &Self::ObjectOptions,
     ) -> Result<Self::ObjectInfo, Self::Error>;
+    /// Metadata lookup that also returns an explicitly addressed delete
+    /// marker instead of rejecting the version read. A single erasure set
+    /// already answers `get_object_info` that way; multi-pool stores override
+    /// this because their `get_object_info` rejects marker version reads.
+    async fn get_object_info_for_delete(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &Self::ObjectOptions,
+    ) -> Result<Self::ObjectInfo, Self::Error> {
+        self.get_object_info(bucket, object, opts).await
+    }
     async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &Self::ObjectOptions) -> Result<(), Self::Error>;
     async fn copy_object(
         &self,
