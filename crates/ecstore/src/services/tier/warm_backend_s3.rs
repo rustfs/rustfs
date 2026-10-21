@@ -28,6 +28,8 @@ use crate::services::tier::{
     },
 };
 use http::HeaderMap;
+use rustfs_gateway_types::dto::Status as BucketVersioningStatus;
+use rustfs_s3_client::remote_error_code::RemoteErrorCode;
 use rustfs_s3_client::{
     api_error_response::to_error_response,
     api_get_options::GetObjectOptions,
@@ -42,7 +44,6 @@ use rustfs_s3_client::{
 };
 use rustfs_utils::egress::validate_outbound_url;
 use rustfs_utils::path::SLASH_SEPARATOR;
-use s3s::{S3ErrorCode, dto::BucketVersioningStatus};
 
 pub struct WarmBackendS3 {
     pub client: Arc<TransitionClient>,
@@ -61,8 +62,8 @@ enum RemoteBucketVersioning {
 
 fn remote_bucket_versioning_from_status(status: Option<&str>) -> Result<RemoteBucketVersioning, std::io::Error> {
     Ok(match status {
-        Some(BucketVersioningStatus::ENABLED) => RemoteBucketVersioning::Enabled,
-        Some(BucketVersioningStatus::SUSPENDED) => RemoteBucketVersioning::Suspended,
+        Some(status) if status == BucketVersioningStatus::ENABLED.as_str() => RemoteBucketVersioning::Enabled,
+        Some(status) if status == BucketVersioningStatus::SUSPENDED.as_str() => RemoteBucketVersioning::Suspended,
         Some(status) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -236,7 +237,7 @@ impl WarmBackendS3 {
             }
             Err(err) => {
                 let response = to_error_response(&err);
-                if response.code == S3ErrorCode::NoSuchKey {
+                if response.code == RemoteErrorCode::NO_SUCH_KEY {
                     Ok(TransitionCandidateProbe::Missing)
                 } else {
                     Err(err)
@@ -323,7 +324,7 @@ impl WarmBackendS3 {
             }
             Err(err) => {
                 let response = to_error_response(&err);
-                if response.code == S3ErrorCode::NoSuchKey {
+                if response.code == RemoteErrorCode::NO_SUCH_KEY {
                     Ok(TransitionCandidateProbe::Missing)
                 } else {
                     Err(err)
@@ -668,7 +669,7 @@ mod tests {
             .probe_transition_candidate("forbidden-probe")
             .await
             .expect_err("an authorization failure must not be mistaken for a missing key");
-        assert_eq!(to_error_response(&err).code, S3ErrorCode::AccessDenied);
+        assert_eq!(to_error_response(&err).code, RemoteErrorCode::ACCESS_DENIED);
         assert_eq!(
             backend
                 .probe_transition_candidate("delete-marker-hidden")
@@ -1046,11 +1047,13 @@ mod tests {
             RemoteBucketVersioning::Disabled
         );
         assert_eq!(
-            remote_bucket_versioning_from_status(Some(BucketVersioningStatus::ENABLED)).expect("enabled status should parse"),
+            remote_bucket_versioning_from_status(Some(BucketVersioningStatus::ENABLED.as_str()))
+                .expect("enabled status should parse"),
             RemoteBucketVersioning::Enabled
         );
         assert_eq!(
-            remote_bucket_versioning_from_status(Some(BucketVersioningStatus::SUSPENDED)).expect("suspended status should parse"),
+            remote_bucket_versioning_from_status(Some(BucketVersioningStatus::SUSPENDED.as_str()))
+                .expect("suspended status should parse"),
             RemoteBucketVersioning::Suspended
         );
         let err = remote_bucket_versioning_from_status(Some("UnexpectedStatus"))

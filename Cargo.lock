@@ -10761,6 +10761,7 @@ dependencies = [
  "rand 0.10.3",
  "rustfs-checksums",
  "rustfs-config",
+ "rustfs-gateway-types",
  "rustfs-rio",
  "rustfs-s3-types",
  "rustfs-signer",
