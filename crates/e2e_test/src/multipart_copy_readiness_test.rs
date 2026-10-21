@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Harbor / Docker Distribution multipart staging to CopyObject regressions.
+//! Multipart completion validation, staging preservation, and CopyObject readiness.
 
 use crate::common::{RustFSTestEnvironment, init_logging};
 use aws_sdk_s3::error::ProvideErrorMetadata;
@@ -37,6 +37,132 @@ fn list_contains_key(output: &aws_sdk_s3::operation::list_objects_v2::ListObject
         .contents()
         .iter()
         .any(|object| object.key().is_some_and(|candidate| candidate == key))
+}
+
+#[tokio::test]
+async fn multipart_complete_invalid_etag_returns_400_and_preserves_retry() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+    let client = env.create_s3_client();
+    let bucket = "multipart-invalid-etag";
+    let key = "object";
+    env.create_test_bucket(bucket).await?;
+    let original = b"original object";
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(original))
+        .send()
+        .await?;
+    let upload = client.create_multipart_upload().bucket(bucket).key(key).send().await?;
+    let upload_id = upload.upload_id().ok_or("missing upload id")?;
+    let payload = b"completed multipart payload";
+    let mut uploaded_etag = None;
+
+    // The first case reproduces #8771's Create -> Complete sequence without UploadPart.
+    for (upload_first, part_number, etag) in [
+        (false, 1, Some("unknown-etag")),
+        (true, 1, Some("unknown-etag")),
+        (true, 1, Some("\"unknown-etag\"")),
+        (true, 1, Some("00000000000000000000000000000000")),
+        (true, 1, None),
+        (true, 2, Some("unknown-etag")),
+    ] {
+        if upload_first && uploaded_etag.is_none() {
+            let part = client
+                .upload_part()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(1)
+                .body(ByteStream::from_static(payload))
+                .send()
+                .await?;
+            uploaded_etag = Some(part.e_tag().ok_or("missing part ETag")?.to_owned());
+        }
+        let error = client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .part_number(part_number)
+                            .set_e_tag(etag.map(str::to_owned))
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .expect_err("missing or mismatched parts must not complete the upload");
+        assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(400), "{error:?}");
+        assert_eq!(
+            error.as_service_error().and_then(ProvideErrorMetadata::code),
+            Some("InvalidPart"),
+            "{error:?}"
+        );
+
+        let staged = client
+            .list_parts()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await?;
+        assert_eq!(staged.parts().len(), usize::from(uploaded_etag.is_some()));
+        if let Some(etag) = uploaded_etag.as_deref() {
+            assert_eq!(staged.parts()[0].part_number(), Some(1));
+            assert_eq!(staged.parts()[0].e_tag(), Some(etag));
+        }
+        let current = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await?
+            .body
+            .collect()
+            .await?
+            .into_bytes();
+        assert_eq!(current.as_ref(), original, "rejected completion must preserve the original object");
+    }
+
+    let etag = uploaded_etag.ok_or("part was not uploaded")?;
+    // Accept the unquoted value, then replay with the quoted UploadPart response.
+    for etag in [etag.trim_matches('"'), etag.as_str()] {
+        client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(CompletedPart::builder().part_number(1).e_tag(etag).build())
+                    .build(),
+            )
+            .send()
+            .await?;
+    }
+    let current = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await?
+        .body
+        .collect()
+        .await?
+        .into_bytes();
+    assert_eq!(current.as_ref(), payload, "a valid retry must publish the exact uploaded bytes");
+    client.delete_object().bucket(bucket).key(key).send().await?;
+    env.delete_test_bucket(bucket).await?;
+    env.stop_server();
+    Ok(())
 }
 
 async fn upload_one_part_mpu(
