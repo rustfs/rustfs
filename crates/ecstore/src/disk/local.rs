@@ -9777,18 +9777,39 @@ fn rename_data_versions_signature(meta: &FileMeta) -> Option<Vec<u8>> {
 /// size field decodes independently of the inline data, so the vote carries
 /// the same value healthy disks report, and skipping the lookup's inline
 /// bytes clone keeps the observation allocation-light.
-fn observe_old_current_size(dst_meta_existed: bool, xlmeta: &FileMeta) -> Option<OldCurrentSize> {
+fn observe_old_current(
+    dst_meta_existed: bool,
+    dst_meta_unparsable: bool,
+    xlmeta: &FileMeta,
+    volume: &str,
+    path: &str,
+    version_id: Uuid,
+) -> (Option<OldCurrentSize>, bool, Option<FileInfo>) {
+    if dst_meta_existed && dst_meta_unparsable {
+        return (None, false, None);
+    }
     if !dst_meta_existed {
-        return Some(OldCurrentSize::Absent);
+        return (Some(OldCurrentSize::Absent), true, None);
     }
     if xlmeta.versions.is_empty() {
-        return Some(OldCurrentSize::Present(0));
+        return (Some(OldCurrentSize::Present(0)), false, None);
     }
-    match xlmeta.into_fileinfo("", "", "", false, false, true) {
-        Ok(fi) => Some(OldCurrentSize::Present(fi.size)),
-        Err(rustfs_filemeta::Error::FileNotFound) => Some(OldCurrentSize::Absent),
-        Err(_) => None,
+    match xlmeta.into_fileinfo(volume, path, "", false, false, true) {
+        Ok(old_current) => {
+            let size = Some(OldCurrentSize::Present(old_current.size));
+            let source = (old_current.version_id.unwrap_or_default() == version_id
+                && old_current.transition_status == rustfs_filemeta::TRANSITION_COMPLETE)
+                .then_some(old_current);
+            (size, true, source)
+        }
+        Err(rustfs_filemeta::Error::FileNotFound) => (Some(OldCurrentSize::Absent), false, None),
+        Err(_) => (None, false, None),
     }
+}
+
+#[cfg(test)]
+fn observe_old_current_size(dst_meta_existed: bool, xlmeta: &FileMeta) -> Option<OldCurrentSize> {
+    observe_old_current(dst_meta_existed, false, xlmeta, "", "", Uuid::nil()).0
 }
 
 fn is_root_path(path: impl AsRef<Path>) -> bool {

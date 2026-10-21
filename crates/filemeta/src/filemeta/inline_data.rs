@@ -14,11 +14,14 @@
 
 use super::*;
 use rustfs_utils::http::{SUFFIX_TRANSITION_STATUS, get_bytes};
-use std::collections::HashSet;
 
 fn physical_data_dir(version: &FileMetaShallowVersion) -> Result<Option<Uuid>> {
     if version.header.version_type != VersionType::Object {
         return Ok(None);
+    }
+
+    if let Ok(summary) = FileMetaVersion::inspect_v2_object_slice(&version.meta) {
+        return Ok(summary.physical_data_dir);
     }
 
     let version = FileMetaVersion::try_from(version.meta.as_slice())?;
@@ -43,41 +46,27 @@ fn physical_data_dir(version: &FileMetaShallowVersion) -> Result<Option<Uuid>> {
 impl FileMeta {
     pub fn find_unshared_data_dir_for_version(&self, version_id: Option<Uuid>) -> Option<Uuid> {
         let vid = version_id.unwrap_or_default();
-        let mut target_data_dir = None;
-        let mut target_selected = false;
-        let mut other_data_dirs = HashSet::new();
+        let (target_idx, target_version) = self
+            .versions
+            .iter()
+            .enumerate()
+            .find(|(_, v)| v.header.version_type == VersionType::Object && v.header.version_id.unwrap_or_default() == vid)?;
+        let target_data_dir = physical_data_dir(target_version).ok()??;
 
-        for version in self.versions.iter().filter(|v| v.header.version_type == VersionType::Object) {
-            let is_target_version = version.header.version_id.unwrap_or_default() == vid;
-            let dir = match physical_data_dir(version) {
-                Ok(dir) => dir,
-                Err(_) => return None,
-            };
-
-            if is_target_version {
-                if target_selected {
-                    continue;
-                }
-
-                target_selected = true;
-                target_data_dir = dir;
-                if let Some(dir) = target_data_dir
-                    && other_data_dirs.contains(&dir)
-                {
-                    return None;
-                }
+        for (idx, version) in self.versions.iter().enumerate() {
+            if idx == target_idx || version.header.version_type != VersionType::Object {
                 continue;
             }
-
-            if let Some(dir) = dir {
-                if target_data_dir == Some(dir) {
+            match physical_data_dir(version) {
+                Ok(Some(dir)) if version.header.version_id.unwrap_or_default() != vid && dir == target_data_dir => {
                     return None;
                 }
-                other_data_dirs.insert(dir);
+                Ok(_) => {}
+                Err(_) => return None,
             }
         }
 
-        target_data_dir
+        Some(target_data_dir)
     }
 
     pub fn shard_data_dir_count(&self, vid: &Option<Uuid>, data_dir: &Option<Uuid>) -> usize {
@@ -102,11 +91,10 @@ impl FileMeta {
     }
 
     pub fn get_data_dirs(&self) -> Result<Vec<Option<Uuid>>> {
-        let mut data_dirs = Vec::new();
+        let mut data_dirs = Vec::with_capacity(self.versions.len());
         for version in &self.versions {
             if version.header.version_type == VersionType::Object {
-                let ver = FileMetaVersion::try_from(version.meta.as_slice())?;
-                data_dirs.push(ver.get_data_dir());
+                data_dirs.push(FileMetaVersion::decode_data_dir_from_meta(&version.meta)?);
             }
         }
         Ok(data_dirs)
@@ -114,7 +102,7 @@ impl FileMeta {
 
     /// Count shared data directories
     pub fn shared_data_dir_count(&self, version_id: Option<Uuid>, data_dir: Option<Uuid>) -> usize {
-        self.shared_data_dir_count_with_inline_data(version_id, data_dir, None)
+        self.shared_data_dir_count_with_inline_data(version_id, data_dir, None, false)
     }
 
     pub(super) fn shared_data_dir_count_with_inline_data(
@@ -122,6 +110,7 @@ impl FileMeta {
         version_id: Option<Uuid>,
         data_dir: Option<Uuid>,
         has_inline_data: Option<bool>,
+        stop_on_first: bool,
     ) -> usize {
         let vid = version_id.unwrap_or_default();
         let Some(data_dir) = data_dir else {
@@ -142,7 +131,12 @@ impl FileMeta {
             .filter(|v| v.header.version_type == VersionType::Object && v.header.version_id != Some(vid))
         {
             match physical_data_dir(version) {
-                Ok(Some(dir)) if dir == data_dir => count += 1,
+                Ok(Some(dir)) if dir == data_dir => {
+                    count += 1;
+                    if stop_on_first {
+                        return count;
+                    }
+                }
                 Ok(_) => {}
                 Err(_) => return 1,
             }
@@ -493,5 +487,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn find_unshared_data_dir_and_shared_count_fail_closed_on_corrupt_sibling() {
+        let target_version = Uuid::new_v4();
+        let target_data_dir = Uuid::new_v4();
+        let mut meta = FileMeta::new();
+        meta.add_version(make_plain_file_info(target_version, target_data_dir))
+            .expect("seed target version");
+        meta.versions.push(FileMetaShallowVersion {
+            header: FileMetaVersionHeader {
+                version_id: Some(Uuid::new_v4()),
+                version_type: VersionType::Object,
+                ..Default::default()
+            },
+            meta: vec![0x81, 0xa4, b'V', b'2', b'O', b'b'],
+        });
+
+        assert_eq!(meta.find_unshared_data_dir_for_version(Some(target_version)), None);
+        assert_eq!(meta.shared_data_dir_count(Some(target_version), Some(target_data_dir)), 1);
     }
 }
