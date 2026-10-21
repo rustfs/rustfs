@@ -12288,10 +12288,7 @@ impl Drop for LifecycleDataMovementMutationBarrier {
 }
 
 #[cfg(test)]
-async fn pause_lifecycle_data_movement_mutation(bucket: &str, object: &str, has_run_fence_signal: bool) {
-    if !has_run_fence_signal {
-        return;
-    }
+async fn pause_lifecycle_data_movement_mutation(bucket: &str, object: &str) {
     let barrier = LIFECYCLE_DATA_MOVEMENT_MUTATION_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
@@ -12368,7 +12365,7 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
         }
         action if lifecycle_action_removes_data_movement_version(action) => {
             #[cfg(test)]
-            pause_lifecycle_data_movement_mutation(bucket, &version.name, lock_lost_signal.is_some()).await;
+            pause_lifecycle_data_movement_mutation(bucket, &version.name).await;
             if lifecycle_delete_all_versions_blocked_by_replication(store.clone(), bucket, &object_info.name, action).await? {
                 return Ok(false);
             }
@@ -12383,12 +12380,18 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
                     // before that cleanup, so the entry moves it to a target
                     // instead of leaving it behind for the post-check.
                     None if !object_info.transitioned_object.status.is_empty() => {
+                        // A delete-all is a prefix delete that takes the bucket
+                        // lifecycle write lock, which the lifecycle read lock
+                        // held here and by the entry would block until timeout.
+                        let delete_all = action.delete_all();
                         #[cfg(test)]
                         let injected =
                             decommission_test_wrap_result("lifecycle_expiry_apply", bucket, &version.name, 1, Ok(())).is_err();
                         #[cfg(not(test))]
                         let injected = false;
-                        if injected || !apply_expiry_rule_for_data_movement(store, &event, event_source, &object_info, None).await
+                        if delete_all
+                            || injected
+                            || !apply_expiry_rule_for_data_movement(store, &event, event_source, &object_info, None).await
                         {
                             // The version is still live, so it moves like any
                             // other version and lifecycle expires it on the
@@ -12401,7 +12404,8 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
                                 bucket = %bucket,
                                 object = %version.name,
                                 action = ?action,
-                                "Data movement could not apply a transitioned version's lifecycle expiry; moving the version"
+                                reason = if delete_all { "delete_all_needs_bucket_write_lock" } else { "not_applied" },
+                                "Data movement deferred a transitioned version's lifecycle expiry; moving the version"
                             );
                             return Ok(false);
                         }

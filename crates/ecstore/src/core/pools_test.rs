@@ -2282,22 +2282,264 @@ mod decommission_lock_order_tests {
             assert_eq!(info.items_decommission_failed, 0);
             drop(local);
 
-            assert!(exact_versions(store, 0, bucket, case.object).await.is_empty());
-            let mut moved = Vec::new();
+            assert_versions_moved_live(store, bucket, case.object, &case.backend, &[&case.expired, &case.moved]).await;
+        });
+    }
+
+    /// The source holds nothing, and the target pools hold every source
+    /// version as a live version with its own remote tuple. No tier free
+    /// version was created and no remote object was deleted.
+    async fn assert_versions_moved_live(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        backend: &crate::services::tier::test_util::MockWarmBackend,
+        sources: &[&rustfs_filemeta::FileInfo],
+    ) {
+        let left = exact_versions(store, 0, bucket, object).await;
+        assert!(left.is_empty(), "the source must keep nothing: {left:?}");
+        let mut moved = Vec::new();
+        for target_pool_index in [1, 2] {
+            moved.extend(exact_versions(store, target_pool_index, bucket, object).await);
+        }
+        assert!(moved.iter().all(|version| !version.tier_free_version()), "{moved:?}");
+        assert_eq!(moved.len(), sources.len(), "every version moves as a version: {moved:?}");
+        for source in sources {
+            let copy = moved
+                .iter()
+                .find(|version| version.version_id == source.version_id)
+                .expect("each source version should move");
+            assert_same_remote_tuple(copy, source);
+            assert!(backend.contains(&source.transitioned_objname).await);
+        }
+        assert_eq!(backend.remove_count().await, 0);
+    }
+
+    /// An ExpiredObjectAllVersions rule expires a transitioned version with a
+    /// prefix delete that needs the bucket lifecycle write lock. Applying it
+    /// inline would wait on the entry's own lifecycle read lock until the
+    /// lock timeout, and block every write in the bucket meanwhile. The
+    /// version moves live instead, without waiting for that lock.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_moves_a_transitioned_version_expired_by_a_delete_all_rule_without_stalling() {
+        run_large_stack_async_test("decommission-delete-all-transitioned", || async {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("delete-all-transitioned");
+            let object = "all-versions.bin";
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        versioning_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create the versioned bucket");
+            let tier_name = format!("DECOMTIER{}", &uuid::Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+            let backend = register_mock_tier(&store.pools[0].instance_ctx().tier_config_mgr(), &tier_name).await;
+            let now = time::OffsetDateTime::now_utc();
+            put_transitioned_source_version(&store, &bucket, object, &tier_name, true, Some(now - time::Duration::days(10)))
+                .await;
+            let source = exact_versions(&store, 0, &bucket, object).await;
+            assert_eq!(source.len(), 1);
+            let lifecycle_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+  <Rule>
+    <ID>expire-all-versions</ID>
+    <Status>Enabled</Status>
+    <Filter>
+      <Prefix></Prefix>
+    </Filter>
+    <Expiration>
+      <Days>1</Days>
+      <ExpiredObjectAllVersions>true</ExpiredObjectAllVersions>
+    </Expiration>
+  </Rule>
+</LifecycleConfiguration>"#;
+            crate::bucket::metadata_sys::update_in(
+                &store.ctx,
+                &bucket,
+                crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG,
+                lifecycle_xml.as_bytes().to_vec(),
+            )
+            .await
+            .expect("store the delete-all expiration rule");
+            let lifecycle = crate::bucket::lifecycle::get_expiry_configs(&store, &bucket)
+                .await
+                .expect("the bucket lifecycle configuration should load")
+                .lifecycle
+                .map(|config| (*config).clone())
+                .expect("the bucket should have a lifecycle configuration");
+
+            start_transitioned_entry_decommission(&store, &bucket).await;
+            let started = std::time::Instant::now();
+            store
+                .decommission_entry_for_test_with_lifecycle(
+                    0,
+                    MetaCacheEntry {
+                        name: object.to_string(),
+                        ..Default::default()
+                    },
+                    bucket.clone(),
+                    store.pools[0].get_disks_by_key(object),
+                    Some(lifecycle),
+                )
+                .await
+                .expect("the entry should finish");
+            let elapsed = started.elapsed();
+            // The lock timeout is 5 seconds by default.
+            assert!(
+                elapsed < Duration::from_secs(4),
+                "the entry must not wait for the bucket lifecycle write lock: {elapsed:?}"
+            );
+
+            assert_versions_moved_live(&store, &bucket, object, &backend, &[&source[0]]).await;
+        });
+    }
+
+    /// The version is deleted between the entry's inventory and its lifecycle
+    /// expiry, so the expiry is genuinely not applied. The entry does not
+    /// fail: its retry moves the tier free version that the delete left.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_moves_the_free_version_left_when_the_expired_version_was_deleted_first() {
+        run_large_stack_async_test("decommission-expired-version-deleted-first", || async {
+            let case = put_expired_and_moved_transitioned_versions("expired-deleted-first").await;
+            let (store, bucket, object) = (&case.store, &case.bucket, case.object);
+            let lifecycle = crate::bucket::lifecycle::get_expiry_configs(store, bucket)
+                .await
+                .expect("the bucket lifecycle configuration should load")
+                .lifecycle
+                .map(|config| (*config).clone())
+                .expect("the bucket should have a lifecycle configuration");
+
+            start_transitioned_entry_decommission(store, bucket).await;
+            let expiry_queue = crate::bucket::lifecycle::bucket_lifecycle_ops::HeldExpiryQueue::hold().await;
+            let barrier = crate::core::pools::LifecycleDataMovementMutationBarrier::install(bucket, object);
+            let entry = tokio::spawn({
+                let (store, bucket) = (Arc::clone(store), bucket.clone());
+                async move {
+                    store
+                        .decommission_entry_for_test_with_lifecycle(
+                            0,
+                            MetaCacheEntry {
+                                name: object.to_string(),
+                                ..Default::default()
+                            },
+                            bucket,
+                            store.pools[0].get_disks_by_key(object),
+                            Some(lifecycle),
+                        )
+                        .await
+                }
+            });
+            barrier.wait_until_paused().await;
+            // A client deletes the expired version first, so the expiry no
+            // longer finds it. That delete leaves the version's tier free
+            // version on the source.
+            store.pools[0]
+                .delete_object(
+                    bucket,
+                    object,
+                    ObjectOptions {
+                        versioned: true,
+                        version_id: case.expired.version_id.map(|version_id| version_id.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("delete the expired version");
+            barrier.release();
+            drop(barrier);
+            let result = entry.await.expect("the entry task should join");
+            expiry_queue.release().await;
+            result.expect("an expiry that was not applied must not fail the entry");
+
+            assert_expired_version_owner_moved(&case).await;
+        });
+    }
+
+    /// The free-version worker consumes the expired version's free version
+    /// as soon as the inline expiry creates it, before the entry moves it.
+    /// The entry then finishes without it, and the remote object is deleted
+    /// once.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_finishes_when_the_free_version_worker_consumes_the_expired_version_first() {
+        run_large_stack_async_test("decommission-expired-free-version-consumed", || async {
+            let case = put_expired_and_moved_transitioned_versions("expired-consumed").await;
+            let (store, bucket, object) = (&case.store, &case.bucket, case.object);
+            let lifecycle = crate::bucket::lifecycle::get_expiry_configs(store, bucket)
+                .await
+                .expect("the bucket lifecycle configuration should load")
+                .lifecycle
+                .map(|config| (*config).clone())
+                .expect("the bucket should have a lifecycle configuration");
+
+            start_transitioned_entry_decommission(store, bucket).await;
+            let expiry_queue = crate::bucket::lifecycle::bucket_lifecycle_ops::HeldExpiryQueue::hold().await;
+            let consumed = Arc::new(AtomicUsize::new(0));
+            let _hook = crate::core::pools::DecommissionCleanupMutationGuard::install(Arc::new({
+                let (store, consumed) = (Arc::clone(store), Arc::clone(&consumed));
+                move |bucket: &str, object: &str, _attempt: usize| {
+                    let (store, consumed, bucket, object) =
+                        (Arc::clone(&store), Arc::clone(&consumed), bucket.to_string(), object.to_string());
+                    Box::pin(async move {
+                        for free_version in exact_versions(&store, 0, &bucket, &object)
+                            .await
+                            .into_iter()
+                            .filter(|version| version.tier_free_version())
+                        {
+                            let owner =
+                                crate::object_api::ObjectInfo::from_file_info(&free_version, &bucket, &free_version.name, true);
+                            if crate::bucket::lifecycle::bucket_lifecycle_ops::cleanup_free_version_exact(
+                                Arc::clone(&store),
+                                &owner,
+                                &CancellationToken::new(),
+                            )
+                            .await
+                            .expect("the worker should consume the source free version")
+                            {
+                                consumed.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                    })
+                }
+            }));
+            let result = store
+                .decommission_entry_for_test_with_lifecycle(
+                    0,
+                    MetaCacheEntry {
+                        name: object.to_string(),
+                        ..Default::default()
+                    },
+                    bucket.clone(),
+                    store.pools[0].get_disks_by_key(object),
+                    Some(lifecycle),
+                )
+                .await;
+            expiry_queue.release().await;
+            result.expect("the entry should finish");
+            assert_eq!(
+                consumed.load(Ordering::SeqCst),
+                1,
+                "the worker consumes the expired version's free version"
+            );
+
+            let left = exact_versions(store, 0, bucket, object).await;
+            assert!(left.is_empty(), "the source must keep nothing: {left:?}");
+            let mut owners = Vec::new();
             for target_pool_index in [1, 2] {
-                moved.extend(exact_versions(store, target_pool_index, bucket, case.object).await);
+                owners.extend(exact_versions(store, target_pool_index, bucket, object).await);
             }
-            assert_eq!(moved.len(), 2, "both versions move as versions: {moved:?}");
-            assert!(moved.iter().all(|version| !version.tier_free_version()));
-            for source in [&case.expired, &case.moved] {
-                let copy = moved
-                    .iter()
-                    .find(|version| version.version_id == source.version_id)
-                    .expect("each source version should move");
-                assert_same_remote_tuple(copy, source);
-                assert!(case.backend.contains(&source.transitioned_objname).await);
-            }
-            assert_eq!(case.backend.remove_count().await, 0);
+            assert_eq!(owners.len(), 1, "only the moved version remains: {owners:?}");
+            assert_eq!(owners[0].version_id, case.moved.version_id);
+            assert_same_remote_tuple(&owners[0], &case.moved);
+            assert!(!case.backend.contains(&case.expired.transitioned_objname).await);
+            assert!(case.backend.contains(&case.moved.transitioned_objname).await);
+            assert_eq!(case.backend.remove_count().await, 1, "the expired remote object is deleted once");
         });
     }
 
