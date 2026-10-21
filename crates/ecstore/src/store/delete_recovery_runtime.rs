@@ -261,6 +261,15 @@ impl DeleteRecoveryHints {
         state.order.push_back(ticket);
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_pending(&self, key: &DeleteRecoveryKey) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending
+            .contains_key(key)
+    }
+
     fn pending_len(&self) -> usize {
         self.state
             .lock()
