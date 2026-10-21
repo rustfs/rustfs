@@ -3258,4 +3258,164 @@ mod tests {
             assert_eq!(base.matches_strict(candidate), base.matches(Some(candidate), true).1);
         }
     }
+
+    #[test]
+    fn matches_strict_and_matches_buf_strict_cover_dir_empty_and_count_boundaries() {
+        let now = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut obj_a = metacache_entry_single_version(1, now, "etag-1");
+        obj_a.cached = None;
+
+        // Name mismatch short-circuits before decoding.
+        let mut different_name = obj_a.clone();
+        different_name.name = "other-object".to_string();
+        assert!(!obj_a.matches_strict(&different_name));
+        assert!(obj_a.cached.is_none(), "name mismatch must not decode self.metadata");
+
+        // Directory vs directory and directory vs object.
+        let mut dir_a = MetaCacheEntry {
+            name: "prefix/".to_string(),
+            metadata: Vec::new(),
+            cached: None,
+            reusable: false,
+        };
+        let dir_b = dir_a.clone();
+        let mut dir_obj = obj_a.clone();
+        dir_obj.name = "prefix/".to_string();
+        assert!(dir_a.matches_strict(&dir_b));
+        assert!(!dir_a.matches_strict(&dir_obj));
+        assert!(!dir_obj.matches_strict(&dir_a));
+
+        // Corrupt self.metadata returns false.
+        let mut corrupt_self = MetaCacheEntry {
+            name: obj_a.name.clone(),
+            metadata: b"corrupt-self".to_vec(),
+            cached: None,
+            reusable: false,
+        };
+        assert!(!corrupt_self.matches_strict(&obj_a));
+
+        // Version count mismatch in both uncached (matches_buf_strict) and cached paths.
+        let mut two_versions_meta = FileMeta::load(&obj_a.metadata).expect("decode single version");
+        let second = metacache_entry_single_version(2, now, "etag-2");
+        let second_meta = FileMeta::load(&second.metadata).expect("decode second version");
+        two_versions_meta.versions.extend(second_meta.versions);
+        let mut two_versions_entry = MetaCacheEntry {
+            name: obj_a.name.clone(),
+            metadata: two_versions_meta.marshal_msg().expect("marshal two versions"),
+            cached: None,
+            reusable: false,
+        };
+        assert!(!obj_a.matches_strict(&two_versions_entry));
+        two_versions_entry.cached = Some(two_versions_meta);
+        assert!(!obj_a.matches_strict(&two_versions_entry));
+
+        // Zero-length meta payload inside a valid XL2 envelope exercises the `meta.is_empty()`
+        // fast-path in `FileMeta::matches_buf_strict`.
+        let mut zero_meta_envelope = Vec::from(&b"XL2 "[..]);
+        zero_meta_envelope.extend_from_slice(&1u16.to_le_bytes());
+        zero_meta_envelope.extend_from_slice(&3u16.to_le_bytes());
+        zero_meta_envelope.extend_from_slice(&[0xc6, 0, 0, 0, 0]);
+        let empty_crc = u32::try_from(xxhash_rust::xxh64::xxh64(b"", 0) & 0xffff_ffff).expect("u32 crc");
+        zero_meta_envelope.push(0xce);
+        zero_meta_envelope.extend_from_slice(&empty_crc.to_be_bytes());
+        let empty_fm = FileMeta::load(&zero_meta_envelope).expect("load zero-meta xl.meta");
+        assert!(empty_fm.versions.is_empty());
+        assert!(empty_fm.matches_buf_strict(&zero_meta_envelope));
+        assert!(!empty_fm.matches_buf_strict(&obj_a.metadata));
+        assert!(
+            !obj_a
+                .cached
+                .as_ref()
+                .expect("obj_a cached")
+                .matches_buf_strict(&zero_meta_envelope)
+        );
+    }
+
+    #[test]
+    fn is_latest_delete_marker_covers_cached_indexed_and_corrupt_envelopes() {
+        let now = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let obj_entry = metacache_entry_single_version(1, now, "etag-1");
+
+        // Cached object -> false; uncached object -> false.
+        let mut cached_obj = obj_entry.clone();
+        assert!(cached_obj.cached.is_some());
+        assert!(!cached_obj.is_latest_delete_marker());
+
+        let mut uncached_obj = obj_entry.clone();
+        uncached_obj.cached = None;
+        assert!(!uncached_obj.is_latest_delete_marker());
+
+        let mut dm_fm = FileMeta::new();
+        dm_fm
+            .add_version(FileInfo {
+                version_id: Some(Uuid::from_u128(9)),
+                deleted: true,
+                mod_time: Some(now),
+                ..Default::default()
+            })
+            .expect("add delete marker");
+        let mut uncached_dm = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: dm_fm.marshal_msg().expect("marshal delete marker"),
+            cached: None,
+            reusable: false,
+        };
+        assert!(uncached_dm.is_latest_delete_marker());
+
+        // Cached empty versions -> true; cached delete marker -> true.
+        let mut cached_empty = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: Vec::new(),
+            cached: Some(FileMeta::new()),
+            reusable: false,
+        };
+        assert!(cached_empty.is_latest_delete_marker());
+        let mut cached_dm = uncached_dm.clone();
+        cached_dm.cached = Some(dm_fm);
+        assert!(cached_dm.is_latest_delete_marker());
+
+        // Minor version < 3 (e.g. v1.2) makes `is_indexed_meta` return `Ok((&[], &[]))` and
+        // exercises the `self.xl_meta()` fallback branch for both Object and Delete versions.
+        let mut v12_obj_bytes = obj_entry.metadata.clone();
+        v12_obj_bytes[6..8].copy_from_slice(&2u16.to_le_bytes());
+        let mut v12_obj = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: v12_obj_bytes,
+            cached: None,
+            reusable: false,
+        };
+        assert!(!v12_obj.is_latest_delete_marker());
+        assert!(v12_obj.cached.is_some(), "v1.2 fallback must populate self.cached");
+
+        let mut v12_dm_bytes = uncached_dm.metadata;
+        v12_dm_bytes[6..8].copy_from_slice(&2u16.to_le_bytes());
+        let mut v12_dm = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: v12_dm_bytes,
+            cached: None,
+            reusable: false,
+        };
+        assert!(v12_dm.is_latest_delete_marker());
+
+        // Non-XL2 magic -> false.
+        let mut non_xl2 = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: b"NOT_XL2_HEADER".to_vec(),
+            cached: None,
+            reusable: false,
+        };
+        assert!(!non_xl2.is_latest_delete_marker());
+
+        // Valid XL2 header with corrupt CRC in indexed meta -> true.
+        let mut corrupt_crc = obj_entry.metadata;
+        let last = corrupt_crc.len() - 1;
+        corrupt_crc[last] ^= 0xff;
+        let mut corrupt_crc_entry = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: corrupt_crc,
+            cached: None,
+            reusable: false,
+        };
+        assert!(corrupt_crc_entry.is_latest_delete_marker());
+    }
 }

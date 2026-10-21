@@ -27,7 +27,7 @@ use crate::services::tier::{
     warm_backend_s3::WarmBackendS3,
 };
 use rustfs_s3_client::transition_api::{BucketLookupType, ReadCloser, ReaderImpl};
-use rustfs_utils::egress::validate_outbound_url;
+use rustfs_utils::egress::validate_outbound_url_allow_private;
 
 const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
 const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
@@ -48,7 +48,7 @@ impl WarmBackendMinIO {
                 // `BucketLookupAuto`; pinning DNS here would break those deployments.
                 bucket_lookup: BucketLookupType::BucketLookupAuto,
                 provider_tag: "minio",
-                validate_endpoint: validate_outbound_url,
+                validate_endpoint: validate_outbound_url_allow_private,
             })
             .await?,
         ))
@@ -131,10 +131,7 @@ mod tests {
     use super::*;
     use crate::services::tier::tier_config::TierMinIO;
 
-    /// The SSRF guard itself is exercised once, generically, in
-    /// `warm_backend::tests` (see backlog#2040/backlog#2043 and
-    /// rustfs/rustfs#6764) — this test only pins that this provider's
-    /// production constructor really is wired through that shared path.
+    /// Pin the provider's policy wiring independently of the shared constructor.
     #[tokio::test]
     async fn new_rejects_loopback_endpoint_before_network_setup() {
         let conf = TierMinIO {
@@ -149,6 +146,25 @@ mod tests {
         match WarmBackendMinIO::new(&conf, "tier").await {
             Ok(_) => panic!("loopback endpoint should be rejected"),
             Err(err) => assert!(err.to_string().contains("not allowed")),
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_8717_private_endpoint_constructs_without_network_setup() {
+        for endpoint in ["http://192.168.10.200:9000", "https://[fd12:3456::1]:9443"] {
+            let conf = TierMinIO {
+                endpoint: endpoint.to_string(),
+                bucket: "tier-bucket".to_string(),
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                region: "us-east-1".to_string(),
+                ..Default::default()
+            };
+            let backend = WarmBackendMinIO::new(&conf, "tier")
+                .await
+                .expect("private MinIO tier should initialize offline");
+            assert_eq!(backend.0.client.endpoint_url.as_str().trim_end_matches('/'), endpoint);
+            assert_eq!(backend.0.bucket, "tier-bucket");
         }
     }
 }

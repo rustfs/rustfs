@@ -3899,7 +3899,7 @@ mod tests {
             .expect("quorum boundary object should be written");
         {
             let mut pool_meta = store.pool_meta.write().await;
-            let mut next = PoolMeta::new(&store.pools, &pool_meta);
+            let mut next = PoolMeta::new(&store.pools, &pool_meta).expect("pool metadata should be rebuilt");
             next.pools[1].decommission = Some(PoolDecommissionInfo {
                 start_time: Some(OffsetDateTime::UNIX_EPOCH),
                 ..Default::default()
@@ -4140,7 +4140,7 @@ mod tests {
             .await
             .expect_err("missing metadata must latch the format-heal write gate");
 
-        let pool_meta = PoolMeta::new(&store.pools, &PoolMeta::default());
+        let pool_meta = PoolMeta::new(&store.pools, &PoolMeta::default()).expect("initial pool metadata should be built");
         pool_meta
             .save_for_startup(store.pools.clone())
             .await
@@ -4192,7 +4192,8 @@ mod tests {
         assert_eq!(healed.erasure.this, recoverable_format.erasure.sets[0][2]);
 
         // A decommission persists its active attempt before it can complete.
-        let mut completed_meta = PoolMeta::new(&store.pools, &PoolMeta::default());
+        let mut completed_meta =
+            PoolMeta::new(&store.pools, &PoolMeta::default()).expect("initial pool metadata should be built");
         let started = OffsetDateTime::now_utc();
         for status in &mut completed_meta.pools {
             status.last_update = started;
