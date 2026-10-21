@@ -1930,6 +1930,145 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
+    async fn source_bound_repair_preserves_same_key_unknown_responsibility_through_replay() {
+        use crate::heal::mrf_queue::{MrfConsumerConfig, MrfQueue, MrfRuntime};
+
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .prefix("rustfs_mrf_unknown_and_bound_replay")
+            .build()
+            .await;
+        let bucket = "partial-write-retention";
+        env.make_bucket(bucket, false).await;
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+        let manager = Arc::new(HealManager::new_without_root_recovery_for_test(storage, None));
+        let disks = super::super::journal_disks().await;
+        assert!(!disks.is_empty(), "the fixture must register real MRF journal disks");
+        let incarnation = env.ecstore.pools[0]
+            .get_disks(0)
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("the fixture must have an authoritative current incarnation");
+        let config = MrfConsumerConfig::default();
+        let mut writes = PartialWrites::default();
+        let legacy = intent("same-object-unknown-source");
+        writes
+            .admit_with_source_incarnation(legacy.clone(), None, 2, 64 * 1024)
+            .expect("retain a legacy responsibility without inventing its source");
+        writes.mark_persisted();
+        assert!(writes.dispatch_collecting_lifecycle_change(&manager, &config).await);
+        assert_eq!(writes.legacy_generation_unknown_count(), 1);
+        let original_unknown = writes.checkpoint_records(super::super::intent_digest).remove(0);
+        assert_eq!(original_unknown.source_bucket_incarnation_id, None);
+        assert!(matches!(original_unknown.state, ResponsibilityState::LegacyGenerationUnknown { .. }));
+
+        let current = intent("same-object-unknown-source");
+        assert_eq!(super::super::intent_digest(&legacy), super::super::intent_digest(&current));
+        writes
+            .admit_with_source_incarnation(current.clone(), Some(incarnation), 2, 64 * 1024)
+            .expect("a source-bound write must coexist with the same-key unknown responsibility");
+        writes.mark_persisted();
+        assert_eq!(writes.depth(), 2);
+        let current_id = writes
+            .entries
+            .get(&PartialWriteKey::new(&current, Some(incarnation)))
+            .expect("the source-bound responsibility must be distinct")
+            .responsibility_id;
+        assert_ne!(original_unknown.responsibility_id, current_id);
+
+        let mut journal = Vec::new();
+        for retained in writes.intents() {
+            assert!(super::super::encode_intent(retained, &mut journal));
+        }
+        let lifecycle_limit = config.journal_max_bytes.saturating_mul(4);
+        let owner = Uuid::new_v4();
+        let lifecycle = super::super::encode_mrf_lifecycle_checkpoint(
+            owner,
+            7,
+            writes.checkpoint_records(super::super::intent_digest),
+            lifecycle_limit,
+        )
+        .expect("both same-digest source identities must be representable");
+        super::super::snapshot::publish_committed_snapshot_with_companion(
+            &disks,
+            owner,
+            7,
+            &journal,
+            config.journal_max_bytes,
+            Some((&super::super::MRF_LIFECYCLE_PATHS, &lifecycle, lifecycle_limit)),
+        )
+        .await
+        .expect("publish the actual journal and lifecycle companion atomically");
+
+        let mut queue = MrfQueue::new(config.queue_capacity, config.journal_max_bytes);
+        let replay = super::super::replay_into(&manager, &mut queue, &mut None).await;
+        assert_eq!(replay.partial_writes.len(), 2);
+        let mut runtime = MrfRuntime {
+            partial_writes: PartialWrites::default(),
+            queue,
+            config,
+            checkpoint_owner: Uuid::new_v4(),
+            next_checkpoint_sequence: replay.next_checkpoint_sequence,
+            new_since_flush: 0,
+            dirty: false,
+            journal_on_disk: replay.journal_on_disk,
+            retain_replay_journal: replay.retain_journal_for_replay,
+            durable_replay_anchors: replay.durable_replay_anchors,
+            replay_cleanup: replay.cleanup,
+            runtime_checkpoint: None,
+            backoff_until: None,
+        };
+        runtime.adopt_replayed_partial_writes(replay.partial_writes);
+        let current_entry = runtime
+            .partial_writes
+            .entries
+            .get_mut(&PartialWriteKey::new(&current, Some(incarnation)))
+            .expect("replay must restore the source-bound responsibility");
+        assert_eq!(current_entry.responsibility_id, current_id);
+        let anchor = MrfDurableRepairAnchor::from_intent(&current_entry.intent, incarnation)
+            .expect("the replayed attempt must supply its own exact proof anchor");
+        current_entry.anchor = Some(anchor.clone());
+        let proof = |lease| MrfVerifiedRepairEvent {
+            kind: anchor.kind,
+            bucket: anchor.bucket.clone(),
+            object: anchor.object.clone(),
+            version_id: anchor.version_id,
+            scope: anchor.scope,
+            delete_marker_purge: anchor.delete_marker_purge,
+            lease,
+            bucket_incarnation_id: anchor.bucket_incarnation_id,
+            disposition: MrfVerifiedRepairDisposition::Repaired,
+        };
+        assert_ne!(current.lease, Some(anchor.lease), "replay must rotate the live attempt lease");
+        rustfs_common::mrf_channel::note_mrf_verified_repair(proof(current.lease));
+        runtime.discharge_durable_replay_anchors();
+        assert_eq!(
+            runtime.partial_writes.depth(),
+            2,
+            "a pre-restart proof cannot release either responsibility"
+        );
+        rustfs_common::mrf_channel::note_mrf_verified_repair(proof(Some(anchor.lease)));
+        runtime.discharge_durable_replay_anchors();
+        assert!(runtime.partial_writes.intent_for_responsibility(current_id).is_none());
+        assert_eq!(runtime.partial_writes.depth(), 1);
+        assert_eq!(
+            runtime.partial_writes.checkpoint_records(super::super::intent_digest),
+            vec![original_unknown.clone()]
+        );
+        assert!(runtime.flush().await, "the retained unknown must reach a new durable checkpoint");
+
+        let mut queue = MrfQueue::new(runtime.config.queue_capacity, runtime.config.journal_max_bytes);
+        let replay = super::super::replay_into(&manager, &mut queue, &mut None).await;
+        assert_eq!(replay.partial_writes.len(), 1, "a second restart must retain only the unresolved unknown");
+        let (_, record) = &replay.partial_writes[0];
+        assert_eq!(
+            record.as_ref(),
+            Some(&original_unknown),
+            "ID, missing source, state and detection time must survive"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
     async fn durable_mrf_anchor_retires_only_after_exact_bucket_generation_is_deleted() {
         use super::super::{MrfQueue, MrfRuntime};
 

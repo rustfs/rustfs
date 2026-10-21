@@ -66,7 +66,8 @@ pub async fn test_store_with_persisted_rebalance_meta(
     let ctx = std::sync::Arc::new(crate::runtime::instance::InstanceContext::new());
     let (temp_dirs, pool) = crate::core::sets::make_local_two_set_sets_with_ctx(ctx.clone()).await;
     let pools = vec![pool.clone()];
-    let pool_meta = crate::core::pools::PoolMeta::new(&pools, &crate::core::pools::PoolMeta::default());
+    let pool_meta = crate::core::pools::PoolMeta::new(&pools, &crate::core::pools::PoolMeta::default())
+        .expect("new pool topology should produce valid pool metadata");
     pool_meta
         .save_for_startup(pools.clone())
         .await
@@ -199,7 +200,8 @@ async fn test_pool_stores_with_contexts(
             }
         }
     }
-    let mut pool_meta = PoolMeta::new(&pools, &PoolMeta::default());
+    let mut pool_meta =
+        PoolMeta::new(&pools, &PoolMeta::default()).expect("new pool topology should produce valid pool metadata");
     pool_meta.version = POOL_META_VERSION;
     pool_meta
         .save_for_startup(pools.clone())

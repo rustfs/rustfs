@@ -27,7 +27,7 @@ use crate::services::tier::{
     warm_backend_s3::WarmBackendS3,
 };
 use rustfs_s3_client::transition_api::{BucketLookupType, ReadCloser, ReaderImpl};
-use rustfs_utils::egress::{OutboundUrlError, validate_outbound_url};
+use rustfs_utils::egress::{OutboundUrlError, validate_outbound_url_allow_private};
 
 const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
 const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
@@ -43,7 +43,7 @@ fn validate_rustfs_tier_endpoint(url: &url::Url) -> Result<(), OutboundUrlError>
 }
 
 fn validate_rustfs_tier_endpoint_inner(url: &url::Url, allow_loopback: bool) -> Result<(), OutboundUrlError> {
-    match validate_outbound_url(url) {
+    match validate_outbound_url_allow_private(url) {
         Err(OutboundUrlError::ForbiddenHost {
             reason: "loopback address" | "loopback host",
             ..
@@ -90,9 +90,8 @@ impl WarmBackendRustFS {
                 // `BucketLookupAuto`; pinning DNS here would break those endpoints.
                 bucket_lookup: BucketLookupType::BucketLookupAuto,
                 provider_tag: "rustfs",
-                // Debug-only, env-gated loopback exception for this provider's own e2e tier
-                // tests (rustfs/rustfs#6773); every other provider passes plain
-                // `validate_outbound_url`.
+                // Private storage endpoints are allowed; loopback remains a debug-only,
+                // env-gated exception for this provider's own e2e tier tests.
                 validate_endpoint: validate_rustfs_tier_endpoint,
             })
             .await?,
@@ -213,11 +212,27 @@ mod tests {
     }
 
     #[test]
-    fn loopback_opt_in_does_not_allow_other_private_endpoints() {
-        let loopback = url::Url::parse("https://127.0.0.1:9000").unwrap();
-        assert!(validate_rustfs_tier_endpoint_inner(&loopback, true).is_ok());
+    fn loopback_opt_in_preserves_private_storage_and_metadata_boundaries() {
+        let loopback = url::Url::parse("https://127.0.0.1:9000").expect("loopback URL should parse");
+        let private = url::Url::parse("https://10.0.0.1:9000").expect("private URL should parse");
+        for allow_loopback in [false, true] {
+            assert_eq!(validate_rustfs_tier_endpoint_inner(&loopback, allow_loopback).is_ok(), allow_loopback);
+            assert!(validate_rustfs_tier_endpoint_inner(&private, allow_loopback).is_ok());
+            for endpoint in ["http://169.254.169.254", "http://[fd00:ec2::254]", "http://[fe80::1]"] {
+                let url = url::Url::parse(endpoint).expect("restricted URL should parse");
+                assert!(validate_rustfs_tier_endpoint_inner(&url, allow_loopback).is_err(), "{endpoint}");
+            }
+        }
+    }
 
-        let private = url::Url::parse("https://10.0.0.1:9000").unwrap();
-        assert!(validate_rustfs_tier_endpoint_inner(&private, true).is_err());
+    #[tokio::test]
+    async fn issue_8717_private_endpoint_constructs_without_network_setup() {
+        for endpoint in ["http://192.168.10.200:9000", "https://[fd12:3456::1]:9443"] {
+            let backend = WarmBackendRustFS::new(&rustfs_tier(endpoint), "tier")
+                .await
+                .expect("private RustFS tier should initialize offline");
+            assert_eq!(backend.0.client.endpoint_url.as_str().trim_end_matches('/'), endpoint);
+            assert_eq!(backend.0.bucket, "bucket");
+        }
     }
 }

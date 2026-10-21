@@ -179,7 +179,8 @@ fn operation_label(index: usize) -> &'static str {
     S3Operation::ALL.get(index).map_or("unknown", |op| op.as_str())
 }
 
-pub(crate) fn observe_s3_http_operation(op: S3Operation) {
+/// Set the request's first dispatched operation without counting another handler entry.
+pub fn observe_s3_http_operation(op: S3Operation) {
     let _ = CURRENT_OPERATION.try_with(|current| {
         // Internal operations must not overwrite the external request's first
         // dispatched operation. No task-local scope means non-HTTP work.
@@ -333,6 +334,20 @@ mod tests {
         .expect("child task should finish");
 
         assert_eq!(child_operation, Some("s3:GetObject"));
+    }
+
+    #[test]
+    fn observing_dispatch_does_not_count_a_second_handler_entry() {
+        let recorder = DebuggingRecorder::new();
+        let mut request = S3HttpRequestGuard::new("PUT");
+        with_local_recorder(&recorder, || {
+            request.in_scope(|| {
+                observe_s3_http_operation(S3Operation::CreateBucket);
+                observe_s3_http_operation(S3Operation::DeleteBucket);
+                assert_eq!(current_s3_http_operation_name(), Some("s3:CreateBucket"));
+            });
+        });
+        assert!(recorder.snapshotter().snapshot().into_vec().is_empty());
     }
 
     #[test]

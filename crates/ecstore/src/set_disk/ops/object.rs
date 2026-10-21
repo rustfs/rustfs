@@ -9588,6 +9588,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             } else {
                 (ObjectInfo::default(), FileInfo::default(), None)
             };
+            // A quorum-resolved marker returns not-found with a populated name.
+            // Only missing metadata needs recovery; unrelated legacy residue or
+            // an offline disk must not block a new marker write at quorum.
             if gerr
                 .as_ref()
                 .is_some_and(|error| is_err_object_not_found(error) || is_err_version_not_found(error))
@@ -9596,6 +9599,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 && !opts.replication_request
                 && opts.http_preconditions.is_none()
                 && !guarded
+                && goi.name.is_empty()
             {
                 let recovery = self
                     .recover_delete_key(
@@ -10537,6 +10541,17 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 ..Default::default()
                             };
                             delete_request.set_tier_free_version_id(&Uuid::new_v4().to_string());
+                            // A moved transitioned version's remote object now
+                            // belongs to its target copy; any other removed
+                            // transitioned version keeps its free version.
+                            if opts.data_movement
+                                && opts
+                                    .data_movement_transferred_tier_versions
+                                    .as_ref()
+                                    .is_some_and(|transferred| transferred.contains(version))
+                            {
+                                delete_request.set_skip_tier_free_version();
+                            }
                             begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
                             self.delete_object_version_with_purge(
                                 bucket,
@@ -10633,6 +10648,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // disk array, so the object-derived quorum here is unused.
         let (mut goi, mut authoritative_file_info, _write_quorum, mut gerr) =
             self.get_object_info_fileinfo_and_quorum(bucket, object, &opts).await;
+        // A quorum-resolved marker returns not-found with a populated name.
+        // Only missing metadata needs recovery; unrelated legacy residue or
+        // an offline disk must not block a new marker write at quorum.
         if gerr
             .as_ref()
             .is_some_and(|error| is_err_object_not_found(error) || is_err_version_not_found(error))
@@ -10640,6 +10658,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             && !opts.data_movement
             && !opts.replication_request
             && opts.http_preconditions.is_none()
+            && goi.name.is_empty()
         {
             if let Some(expected) = opts.expected_bucket_incarnation_id {
                 self.validate_bucket_incarnation(bucket, expected, &opts).await?;
@@ -19223,6 +19242,7 @@ mod transition_upload_integrity_tests {
                 object,
                 &expected,
                 &[],
+                &[],
                 crate::data_movement::SourceCleanupBucketFence::default(),
                 "test_data_movement",
             )
@@ -19293,6 +19313,7 @@ mod transition_upload_integrity_tests {
                 object,
                 &expected,
                 &[],
+                &[],
                 crate::data_movement::SourceCleanupBucketFence {
                     expected_incarnation_id: None,
                     lifecycle_guard: Some(&bucket_guard),
@@ -19322,6 +19343,171 @@ mod transition_upload_integrity_tests {
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
         drop(local_cleanup_setup);
         drop(distributed_setup);
+    }
+
+    /// Data-movement source cleanup appends no tier free version for a
+    /// transitioned version the mover copied to a target, and keeps the free
+    /// version, the only remote-delete owner, for one it did not copy (such as
+    /// a version lifecycle expired during the move).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn data_movement_cleanup_keeps_a_free_version_only_for_untransferred_tier_versions() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let object = "object.bin";
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        for (bucket, transferred) in [
+            ("data-movement-cleanup-transferred", true),
+            ("data-movement-cleanup-expired", false),
+        ] {
+            let payload = b"a transitioned source removed by data movement".repeat(64);
+            let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+            set_disks
+                .transition_object(bucket, object, &transition_options(&original, tier_name.clone()))
+                .await
+                .expect("transition should commit");
+            let expected = set_disks
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("source versions should be readable")
+                .expect("source versions should exist");
+            let source = expected.versions[0].clone();
+            assert_eq!(source.transition_status, TRANSITION_COMPLETE);
+            let transferred_tier_versions = if transferred {
+                vec![crate::data_movement::source_cleanup_version_identity(&source)]
+            } else {
+                Vec::new()
+            };
+
+            crate::data_movement::cleanup_source_entry_if_unchanged(
+                Arc::clone(&set_disks),
+                bucket,
+                object,
+                &expected,
+                &[],
+                &transferred_tier_versions,
+                crate::data_movement::SourceCleanupBucketFence::default(),
+                "test_data_movement",
+            )
+            .await
+            .expect("source cleanup should succeed");
+
+            let left = set_disks
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("source versions should be readable")
+                .map(|versions| versions.versions)
+                .unwrap_or_default();
+            if transferred {
+                assert!(left.is_empty(), "a transferred version must leave no free version: {left:?}");
+            } else {
+                assert_eq!(left.len(), 1, "an untransferred version must keep its free version: {left:?}");
+                let free = &left[0];
+                assert!(free.tier_free_version());
+                assert_eq!(free.transition_tier, source.transition_tier);
+                assert_eq!(free.transitioned_objname, source.transitioned_objname);
+                assert_eq!(free.transition_version_id, source.transition_version_id);
+            }
+            assert!(
+                backend.contains(&source.transitioned_objname).await,
+                "source cleanup never deletes the remote object itself"
+            );
+        }
+        assert_eq!(backend.remove_count().await, 0);
+        assert_eq!(backend.exact_remove_count(), 0);
+    }
+
+    /// The skip is decided per version: of two transitioned versions of one
+    /// key, only the one reported as transferred leaves no free version. The
+    /// directory object is listed as `dir/`, while the cleanup deletes its
+    /// encoded key, so the match must not depend on the version's name.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn data_movement_cleanup_skips_the_free_version_per_transferred_version() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        for (bucket, object) in [
+            ("data-movement-cleanup-per-version", "object.bin"),
+            ("data-movement-cleanup-directory", "dir/"),
+        ] {
+            for disk in &disk_stores {
+                disk.make_volume(bucket).await.expect("bucket volume should be created");
+            }
+            let disk_object = rustfs_utils::path::encode_dir_object(object);
+            let mut version_ids = Vec::new();
+            for body in [
+                b"first transitioned version".as_slice(),
+                b"second transitioned version".as_slice(),
+            ] {
+                let original = set_disks
+                    .put_object(
+                        bucket,
+                        &disk_object,
+                        &mut PutObjReader::from_vec(body.repeat(64)),
+                        &ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("source version should be written");
+                let mut opts = transition_options(&original, tier_name.clone());
+                opts.versioned = true;
+                set_disks
+                    .transition_object(bucket, &disk_object, &opts)
+                    .await
+                    .expect("transition should commit");
+                version_ids.push(original.version_id);
+            }
+            let expected = set_disks
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("source versions should be readable")
+                .expect("source versions should exist");
+            assert_eq!(expected.versions.len(), 2);
+            let version = |version_id| {
+                expected
+                    .versions
+                    .iter()
+                    .find(|version| version.version_id == version_id)
+                    .cloned()
+                    .expect("each written version should be loaded")
+            };
+            let (moved, kept) = (version(version_ids[0]), version(version_ids[1]));
+            assert_eq!(moved.transition_status, TRANSITION_COMPLETE);
+            assert_eq!(kept.transition_status, TRANSITION_COMPLETE);
+            assert_ne!(moved.transitioned_objname, kept.transitioned_objname);
+
+            crate::data_movement::cleanup_source_entry_if_unchanged(
+                Arc::clone(&set_disks),
+                bucket,
+                object,
+                &expected,
+                &[],
+                &[crate::data_movement::source_cleanup_version_identity(&moved)],
+                crate::data_movement::SourceCleanupBucketFence::default(),
+                "test_data_movement",
+            )
+            .await
+            .expect("source cleanup should succeed");
+
+            let left = set_disks
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("source versions should be readable")
+                .map(|versions| versions.versions)
+                .unwrap_or_default();
+            assert_eq!(left.len(), 1, "only the untransferred version keeps a free version: {left:?}");
+            let free = &left[0];
+            assert!(free.tier_free_version());
+            assert_eq!(free.transitioned_objname, kept.transitioned_objname);
+            assert_eq!(free.transition_version_id, kept.transition_version_id);
+            for remote in [&moved.transitioned_objname, &kept.transitioned_objname] {
+                assert!(backend.contains(remote).await, "source cleanup never deletes the remote object itself");
+            }
+        }
+        assert_eq!(backend.remove_count().await, 0);
     }
 
     #[tokio::test]

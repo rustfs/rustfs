@@ -826,9 +826,9 @@ impl ECStore {
         self.ctx.endpoints()
     }
 
-    /// Get the global region
+    /// Get this store instance's configured region.
     pub fn region(&self) -> Option<s3s::region::Region> {
-        runtime_sources::region()
+        self.ctx.region()
     }
 
     /// Get the tier config manager
@@ -1458,6 +1458,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
 
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.handle_get_object_info(bucket, object, opts).await
+    }
+
+    async fn get_object_info_for_delete(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        ECStore::get_object_info_for_delete(self, bucket, object, opts).await
     }
 
     async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
@@ -3176,6 +3180,21 @@ mod tests {
         assert_eq!(endpoints_b.as_ref()[0].set_count, 2);
         assert!(!endpoints_a.as_ref()[0].legacy);
         assert!(endpoints_b.as_ref()[0].legacy);
+    }
+
+    #[tokio::test]
+    async fn store_region_reads_own_instance_context() {
+        let context_a = Arc::new(InstanceContext::new());
+        let context_b = Arc::new(InstanceContext::new());
+        context_a.set_region("eu-west-1".parse().expect("instance A region"));
+        context_b.set_region("ap-south-1".parse().expect("instance B region"));
+        let store_a = build_store_with_ctx(context_a);
+        let store_b = build_store_with_ctx(context_b);
+        let unconfigured = build_store_with_ctx(Arc::new(InstanceContext::new()));
+
+        assert_eq!(store_a.region().as_ref().map(|region| region.as_str()), Some("eu-west-1"));
+        assert_eq!(store_b.region().as_ref().map(|region| region.as_str()), Some("ap-south-1"));
+        assert_eq!(unconfigured.region(), None);
     }
 
     // The production/test constructors ADOPT the process bootstrap context
