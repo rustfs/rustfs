@@ -311,6 +311,40 @@ mod tests {
                 }
             }
         }
+        let object_lock_client = location_policy_client(
+            &env,
+            "location-lock",
+            serde_json::json!([
+                {"Effect":"Allow", "Action":"s3:CreateBucket", "Resource":"arn:aws:s3:::location-*",
+                 "Condition":{"StringEquals":{"s3:LocationConstraint":"eu-west-1"}}},
+                {"Effect":"Allow", "Action":["s3:PutBucketObjectLockConfiguration", "s3:PutBucketVersioning"],
+                 "Resource":"arn:aws:s3:::location-*", "Condition":{"Null":{"s3:LocationConstraint":"true"}}}
+            ]),
+        )
+        .await?;
+        object_lock_client
+            .create_bucket()
+            .bucket("location-with-lock")
+            .create_bucket_configuration(configuration("eu-west-1"))
+            .object_lock_enabled_for_bucket(true)
+            .send()
+            .await
+            .expect("only CreateBucket receives the XML condition; dependent actions see it absent");
+        let object_lock = root
+            .get_object_lock_configuration()
+            .bucket("location-with-lock")
+            .send()
+            .await?;
+        assert_eq!(
+            object_lock
+                .object_lock_configuration()
+                .and_then(|configuration| configuration.object_lock_enabled())
+                .map(|value| value.as_str()),
+            Some("Enabled")
+        );
+        let versioning = root.get_bucket_versioning().bucket("location-with-lock").send().await?;
+        assert_eq!(versioning.status().map(|value| value.as_str()), Some("Enabled"));
+
         let user = "location-session";
         location_policy_client(
             &env,

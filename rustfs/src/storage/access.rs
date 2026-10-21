@@ -143,10 +143,6 @@ struct RequestedObjectLockRetainUntil(OffsetDateTime);
 #[derive(Clone, Debug)]
 struct RequestedObjectLockRetention(ObjectLockRetention);
 
-/// The CreateBucket XML value, independent of signing and server regions.
-#[derive(Clone)]
-struct RequestedBucketLocationConstraint(Option<String>);
-
 /// These operations stage upload state without publishing an object. Keep this
 /// separate from the marker controlling multipart publication fences.
 #[derive(Clone, Copy, Debug)]
@@ -958,16 +954,15 @@ pub(crate) fn set_requested_object_lock_retain_until<T>(req: &mut S3Request<T>, 
     }
 }
 
-fn set_requested_bucket_location_constraint(req: &mut S3Request<CreateBucketInput>) {
-    let location = req
-        .input
+/// Keep the XML value literal for IAM; endpoint aliases are resolved later.
+fn requested_bucket_location_constraint(input: &CreateBucketInput) -> Option<String> {
+    input
         .create_bucket_configuration
         .as_ref()
         .and_then(|configuration| configuration.location_constraint.as_ref())
         .map(BucketLocationConstraint::as_str)
         .filter(|location| !location.is_empty())
-        .map(str::to_owned);
-    req.extensions.insert(RequestedBucketLocationConstraint(location));
+        .map(str::to_owned)
 }
 
 fn set_requested_object_lock_retention(req: &mut S3Request<PutObjectRetentionInput>) {
@@ -1326,13 +1321,14 @@ impl DenialContext<'_> {
 
 /// Authorizes the request based on the action and credentials.
 pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
-    let location_constraint = if action == Action::S3Action(S3Action::CreateBucketAction) {
-        req.extensions
-            .remove::<RequestedBucketLocationConstraint>()
-            .and_then(|value| value.0)
-    } else {
-        None
-    };
+    authorize_request_with_location_constraint(req, action, None).await
+}
+
+async fn authorize_request_with_location_constraint<T>(
+    req: &mut S3Request<T>,
+    action: Action,
+    location_constraint: Option<String>,
+) -> S3Result<()> {
     let internal_object_authorization = req.extensions.get::<InternalObjectAuthorization>().is_some();
     let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
     let req_info = req_info_ref(req)?;
@@ -2314,8 +2310,9 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        set_requested_bucket_location_constraint(req);
-        authorize_request(req, Action::S3Action(S3Action::CreateBucketAction)).await?;
+        let location_constraint = requested_bucket_location_constraint(&req.input);
+        authorize_request_with_location_constraint(req, Action::S3Action(S3Action::CreateBucketAction), location_constraint)
+            .await?;
 
         if req.input.object_lock_enabled_for_bucket.is_some_and(|v| v) {
             authorize_request(req, Action::S3Action(S3Action::PutBucketObjectLockConfigurationAction)).await?;
@@ -3578,8 +3575,8 @@ mod tests {
         validate_post_object_success_controls, versioned_read_action, versioned_tagging_action,
     };
     use super::{
-        RequestedBucketLocationConstraint, remaining_retention_days, set_requested_bucket_location_constraint,
-        set_requested_object_lock_retain_until, set_requested_object_lock_retention,
+        remaining_retention_days, requested_bucket_location_constraint, set_requested_object_lock_retain_until,
+        set_requested_object_lock_retention,
     };
     use crate::auth::OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION;
     use crate::error::ApiError;
@@ -4657,12 +4654,7 @@ mod tests {
                 ),
                 ..Default::default()
             };
-            set_requested_bucket_location_constraint(&mut req);
-            let location = req
-                .extensions
-                .remove::<RequestedBucketLocationConstraint>()
-                .expect("captured XML constraint")
-                .0;
+            let location = requested_bucket_location_constraint(&req.input);
             let conditions = authorization_conditions(
                 &req,
                 &credentials,
