@@ -32,6 +32,46 @@ pub(super) enum ScannerCycleWakeReason {
     Cancelled,
 }
 
+// Literal labels keep recorder keys bounded and avoid allocating label vectors
+// when telemetry is not installed. Only the outer scheduler records wakeups;
+// activity-poll timer slices are not independent scheduler wakeups.
+fn record_scanner_cycle_trigger(reason: ScannerCycleWakeReason, attempt: bool) {
+    macro_rules! record {
+        ($reason:literal) => {
+            if attempt {
+                metrics::counter!("rustfs_scanner_cycle_attempts_total", "reason" => $reason).increment(1);
+            } else {
+                metrics::counter!("rustfs_scanner_cycle_wakeups_total", "reason" => $reason).increment(1);
+            }
+        };
+    }
+    match reason {
+        ScannerCycleWakeReason::Timer => record!("timer"),
+        ScannerCycleWakeReason::DirtyUsage => record!("dirty_usage"),
+        ScannerCycleWakeReason::MovementGeneration => record!("movement_generation"),
+        ScannerCycleWakeReason::ClusterActivity => record!("cluster_activity"),
+        ScannerCycleWakeReason::ClusterMaintenance => record!("cluster_maintenance"),
+        ScannerCycleWakeReason::ClusterActivityUnavailable => record!("cluster_activity_unavailable"),
+        ScannerCycleWakeReason::RuntimeConfig => record!("runtime_config"),
+        ScannerCycleWakeReason::MaintenanceConfig => record!("maintenance_config"),
+        ScannerCycleWakeReason::Recovery => record!("recovery"),
+        ScannerCycleWakeReason::LeaderLockLost => record!("leader_lock_lost"),
+        ScannerCycleWakeReason::Cancelled => record!("cancelled"),
+    }
+}
+
+pub(super) fn record_scanner_cycle_wakeup(reason: ScannerCycleWakeReason) {
+    record_scanner_cycle_trigger(reason, false);
+}
+
+pub(super) fn record_scanner_cycle_attempt(reason: Option<ScannerCycleWakeReason>) {
+    if let Some(reason) = reason {
+        record_scanner_cycle_trigger(reason, true);
+    } else {
+        metrics::counter!("rustfs_scanner_cycle_attempts_total", "reason" => "initial").increment(1);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScannerCycleOutcome {
     Completed,
