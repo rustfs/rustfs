@@ -1654,7 +1654,7 @@ fn only_mrf_execution_can_pause_unverified_legacy() {
     let bucket = target.bucket.clone();
     let anchor = target.durable_anchor.as_ref().expect("durable fixture anchor");
     let mut canonical = crate::heal::outcome::HealTaskOutcome::default();
-    canonical.record(outcome.clone());
+    canonical.record(outcome);
     canonical.finish(None);
     for status in [
         HealTaskStatus::Completed,
