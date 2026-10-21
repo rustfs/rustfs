@@ -18,7 +18,7 @@
 
 use super::hermetic_set_disks_support::hermetic_set_disks_isolated;
 use super::*;
-use crate::data_movement::{SourceCleanupBucketFence, cleanup_source_entry_if_unchanged};
+use crate::data_movement::{SourceCleanupBucketFence, SourceCleanupError, cleanup_source_entry_if_unchanged};
 use rustfs_filemeta::FileInfoVersions;
 use std::sync::atomic::AtomicBool;
 use tempfile::TempDir;
@@ -54,7 +54,12 @@ async fn source_versions(set_disks: &Arc<SetDisks>, bucket: &str, object: &str) 
         .expect("source versions should exist")
 }
 
-async fn cleanup(set_disks: Arc<SetDisks>, bucket: &str, object: &str, expected: FileInfoVersions) -> Result<ObjectInfo> {
+async fn cleanup(
+    set_disks: Arc<SetDisks>,
+    bucket: &str,
+    object: &str,
+    expected: FileInfoVersions,
+) -> std::result::Result<ObjectInfo, SourceCleanupError> {
     cleanup_source_entry_if_unchanged(
         set_disks,
         bucket,
@@ -66,7 +71,6 @@ async fn cleanup(set_disks: Arc<SetDisks>, bucket: &str, object: &str, expected:
         "test_data_movement_prefix_cleanup",
     )
     .await
-    .map_err(|err| Error::other(format!("{err:?}")))
 }
 
 /// Every file below the child's own directory, per disk.
