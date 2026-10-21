@@ -3516,13 +3516,23 @@ fn resolve_decommission_entry_cleanup_delete_result<T>(result: Result<T>, bucket
 #[error("{0}")]
 struct DecommissionSourceCleanupFailure(Error);
 
-/// A quorum failure while deleting the source of an already copied entry
-/// leaves the source in place: an uncommitted delete transaction is settled by
-/// delete recovery, and the entry's next attempt re-verifies the source before
-/// it cleans up again. Retrying is safe, so it must not fail the pool.
+/// A drive quorum failure while deleting the source of an already copied
+/// entry leaves the source in place: an uncommitted delete transaction is
+/// settled by delete recovery, and the entry's next attempt re-verifies the
+/// source before it cleans up again. Retrying is safe, so it must not fail the
+/// pool. A lost namespace lock or mutation fence
+/// (`NamespaceLockQuorumUnavailable`) is not a drive quorum failure: this
+/// worker no longer owns the key, so it stops without retrying.
 fn is_decommission_source_cleanup_retryable_error(err: &Error) -> bool {
-    data_movement::data_movement_stage_source_as::<DecommissionSourceCleanupFailure>(err)
-        .is_some_and(|failure| failure.0.is_quorum_error())
+    data_movement::data_movement_stage_source_as::<DecommissionSourceCleanupFailure>(err).is_some_and(|failure| {
+        matches!(
+            failure.0,
+            Error::ErasureReadQuorum
+                | Error::ErasureWriteQuorum
+                | Error::InsufficientReadQuorum(_, _)
+                | Error::InsufficientWriteQuorum(_, _)
+        )
+    })
 }
 
 fn resolve_decommission_entry_reload_result(result: Result<()>, bucket: &str, object_name: &str) -> Result<()> {
@@ -32262,6 +32272,27 @@ mod pools_tests {
                 "a retryable source cleanup failure must not fail the pool"
             );
         }
+
+        let lock_lost = resolve_decommission_entry_cleanup_delete_result::<()>(
+            Err(Error::NamespaceLockQuorumUnavailable {
+                mode: "delete_object_commit",
+                bucket: "bucket-a".to_string(),
+                object: "obj.txt".to_string(),
+                required: 1,
+                achieved: 0,
+            }),
+            "bucket-a",
+            "obj.txt",
+        )
+        .expect_err("cleanup fence loss should surface");
+        assert!(
+            !super::is_decommission_source_cleanup_retryable_error(&lock_lost),
+            "a lost cleanup fence must not be retried"
+        );
+        assert!(
+            super::resolve_decommission_entry_failure(lock_lost).is_err(),
+            "a lost cleanup fence stays terminal"
+        );
 
         let terminal = resolve_decommission_entry_cleanup_delete_result::<()>(Err(Error::SlowDown), "bucket-a", "obj.txt")
             .expect_err("cleanup failure should surface");
