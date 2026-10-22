@@ -172,11 +172,41 @@ pub struct MrfUnverifiedLegacyEvent {
     pub anchor: MrfDurableRepairAnchor,
 }
 
+#[derive(Clone, Copy)]
+struct ResolvedMrfRepairIdentity {
+    version_id: Option<[u8; 16]>,
+    scope: Option<MrfScope>,
+    delete_marker_purge: Option<MrfDeleteMarkerPurgeIdentity>,
+    lease: MrfIngressLease,
+    bucket_incarnation_id: Uuid,
+}
+
 impl MrfDurableRepairAnchor {
     /// Build a dischargeable anchor only when the caller supplies the storage
     /// incarnation and the original ingress lease. Legacy replay records lack
     /// both pieces and therefore remain fail-closed.
     pub fn from_intent(intent: &MrfIntent, bucket_incarnation_id: Uuid) -> Option<Self> {
+        let identity = Self::resolve_identity(intent, bucket_incarnation_id)?;
+        Some(Self {
+            kind: intent.kind,
+            bucket: intent.bucket.clone(),
+            object: intent.object.clone(),
+            version_id: identity.version_id,
+            scope: identity.scope,
+            delete_marker_purge: identity.delete_marker_purge,
+            lease: identity.lease,
+            bucket_incarnation_id: identity.bucket_incarnation_id,
+        })
+    }
+
+    /// Check whether the intent can form an anchor for this exact source,
+    /// without retaining its bucket/object handles. This checks identity shape,
+    /// not storage verification or retirement authority.
+    pub fn is_eligible_for_source(intent: &MrfIntent, source: Uuid) -> bool {
+        Self::resolve_identity(intent, source).is_some_and(|identity| identity.bucket_incarnation_id == source)
+    }
+
+    fn resolve_identity(intent: &MrfIntent, bucket_incarnation_id: Uuid) -> Option<ResolvedMrfRepairIdentity> {
         let lease = intent.lease?;
         let (version_id, scope) = canonical_identity(intent.kind, intent.version_id, intent.scope);
         let delete_marker_purge = canonical_delete_marker_purge_identity(intent)?;
@@ -186,10 +216,7 @@ impl MrfDurableRepairAnchor {
         if bucket_incarnation_id.is_nil() {
             return None;
         }
-        Some(Self {
-            kind: intent.kind,
-            bucket: intent.bucket.clone(),
-            object: intent.object.clone(),
+        Some(ResolvedMrfRepairIdentity {
             version_id,
             scope,
             delete_marker_purge,
@@ -963,6 +990,9 @@ mod event_presence_tests;
 
 #[cfg(test)]
 mod proof_queue_tests;
+
+#[cfg(test)]
+mod repair_identity_tests;
 
 #[cfg(test)]
 mod tests {
