@@ -38,8 +38,10 @@ const ENV_STACK_B_REGION: &str = "RUSTFS_E2E_STACK_B_REGION";
 /// Becomes `gateway` once rustfs/backlog#2734 T2.5 assembles the gateway stack.
 const DEFAULT_STACK_B: &str = "legacy";
 /// The region the negative control gives stack A explicitly, so an inherited `RUSTFS_REGION`
-/// cannot erase the injected difference.
-const CONTROL_REGION_A: &str = "us-east-1";
+/// cannot erase the injected difference. Not `us-east-1`: that region answers GetBucketLocation
+/// with an empty LocationConstraint and re-creating an owned bucket with 200, so it would not
+/// report its own name and would add CreateBucket differences to the control.
+const CONTROL_REGION_A: &str = "us-west-2";
 const CONTROL_REGION_B: &str = "eu-west-1";
 /// `normal` cases the legacy stack must answer with a 2xx. The comparison alone cannot tell a
 /// script that exercises real behavior from one in which both stacks fail the same way. Five of
