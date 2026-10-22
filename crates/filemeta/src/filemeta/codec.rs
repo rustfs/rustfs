@@ -196,11 +196,7 @@ impl FileMeta {
     }
 
     #[inline]
-    pub(super) fn read_next_shallow_slice<'a>(
-        meta: &'a [u8],
-        cur: &mut Cursor<&'a [u8]>,
-        header_ver: u8,
-    ) -> Result<(FileMetaVersionHeader, &'a [u8])> {
+    pub(super) fn read_next_raw_slices<'a>(meta: &'a [u8], cur: &mut Cursor<&'a [u8]>) -> Result<(&'a [u8], &'a [u8])> {
         let bin_len = rmp::decode::read_bin_len(cur).map_err(|e| {
             error!("failed to read binary length for version header: {}", e);
             Error::other(format!("failed to read binary length for version header: {e}"))
@@ -213,12 +209,7 @@ impl FileMeta {
             return Err(Error::other("corrupt xl.meta: version header length exceeds metadata size"));
         }
         let end = start + bin_len;
-
-        let mut header = FileMetaVersionHeader::default();
-        header.unmarshal_v(header_ver, &meta[start..end]).map_err(|e| {
-            error!("failed to unmarshal version header: {}", e);
-            e
-        })?;
+        let header_raw = &meta[start..end];
         cur.set_position(end as u64);
 
         let bin_len = rmp::decode::read_bin_len(cur).map_err(|e| {
@@ -238,7 +229,22 @@ impl FileMeta {
         let end = start + bin_len;
         cur.set_position(end as u64);
 
-        Ok((header, &meta[start..end]))
+        Ok((header_raw, &meta[start..end]))
+    }
+
+    #[inline]
+    pub(super) fn read_next_shallow_slice<'a>(
+        meta: &'a [u8],
+        cur: &mut Cursor<&'a [u8]>,
+        header_ver: u8,
+    ) -> Result<(FileMetaVersionHeader, &'a [u8])> {
+        let (header_raw, ver_meta) = Self::read_next_raw_slices(meta, cur)?;
+        let mut header = FileMetaVersionHeader::default();
+        header.unmarshal_v(header_ver, header_raw).map_err(|e| {
+            error!("failed to unmarshal version header: {}", e);
+            e
+        })?;
+        Ok((header, ver_meta))
     }
 
     #[hotpath::measure(impl_type = "FileMeta")]
@@ -289,15 +295,52 @@ impl FileMeta {
 
         let mut cur: Cursor<&[u8]> = Cursor::new(meta);
         for s_version in &self.versions {
-            let Ok((o_header, _ver_meta)) = Self::read_next_shallow_slice(meta, &mut cur, header_ver) else {
+            let Ok((header_raw, _ver_meta)) = Self::read_next_raw_slices(meta, &mut cur) else {
                 return false;
             };
+            if header_ver == XL_HEADER_VERSION
+                && let Some(matched) = Self::header_matches_canonical_v3_raw_strict(&s_version.header, header_raw)
+            {
+                if !matched {
+                    return false;
+                }
+                continue;
+            }
+            let mut o_header = FileMetaVersionHeader::default();
+            if o_header.unmarshal_v(header_ver, header_raw).is_err() {
+                return false;
+            }
             if !Self::headers_match_strict(&s_version.header, &o_header) {
                 return false;
             }
         }
 
         true
+    }
+
+    #[inline]
+    fn header_matches_canonical_v3_raw_strict(s_header: &FileMetaVersionHeader, buf: &[u8]) -> Option<bool> {
+        if buf.len() != 38 {
+            return None;
+        }
+        let fields = parse_canonical_v3_header_fields(buf)?;
+        if !ec_fields_match_strict(s_header.ec_m, s_header.ec_n, fields.ec_m, fields.ec_n)
+            || s_header.signature != fields.signature
+            || s_header.flags != fields.flags
+            || s_header.version_type != fields.version_type
+            || s_header.version_id != Some(Uuid::from_bytes(fields.uuid_bytes))
+        {
+            return Some(false);
+        }
+
+        let time_ok = if fields.unix_nanos == 0 {
+            s_header.mod_time.is_none()
+        } else {
+            s_header
+                .mod_time
+                .is_some_and(|t| t.unix_timestamp_nanos() == i128::from(fields.unix_nanos))
+        };
+        Some(time_ok)
     }
 
     #[inline]
@@ -316,7 +359,7 @@ impl FileMeta {
             && *signature == o_header.signature
             && *version_type == o_header.version_type
             && *flags == o_header.flags
-            && (s_header.has_ec() != o_header.has_ec() || (*ec_n == o_header.ec_n && *ec_m == o_header.ec_m))
+            && ec_fields_match_strict(*ec_m, *ec_n, o_header.ec_m, o_header.ec_n)
     }
 
     #[inline]
@@ -325,28 +368,66 @@ impl FileMeta {
     }
 
     pub(crate) fn decode_borrowed(buf: &[u8]) -> Result<BorrowedFileMeta<'_>> {
+        Self::decode_borrowed_with_hint(buf, None)
+    }
+
+    pub(crate) fn decode_borrowed_with_hint<'a>(
+        buf: &'a [u8],
+        hint: Option<&BorrowedFileMeta<'a>>,
+    ) -> Result<BorrowedFileMeta<'a>> {
         let (meta, inline_buf) = Self::parse_validated_xl_envelope(buf)?;
         if meta.is_empty() {
             return Ok(BorrowedFileMeta {
+                header_ver: 0,
                 meta_ver: 0,
                 inline_buf,
                 versions: BorrowedVersions::Empty,
             });
         }
         let (versions_len, header_ver, meta_ver, meta) = Self::decode_validated_xl_headers(meta)?;
-        let mut cur: Cursor<&[u8]> = Cursor::new(meta);
+        Self::decode_borrowed_body_with_hint(versions_len, header_ver, meta_ver, meta, inline_buf, hint)
+    }
+
+    fn decode_borrowed_body_with_hint<'a>(
+        versions_len: usize,
+        header_ver: u8,
+        meta_ver: u8,
+        meta: &'a [u8],
+        inline_buf: &'a [u8],
+        hint: Option<&BorrowedFileMeta<'a>>,
+    ) -> Result<BorrowedFileMeta<'a>> {
+        let hint_slice = hint
+            .filter(|h| h.header_ver == header_ver && h.versions.as_slice().len() == versions_len)
+            .map(|h| h.versions.as_slice());
+        let mut cur: Cursor<&'a [u8]> = Cursor::new(meta);
+        let decode_idx = |idx: usize, cur: &mut Cursor<&'a [u8]>| -> Result<BorrowedVersionEntry<'a>> {
+            let (header_raw, ver_meta) = Self::read_next_raw_slices(meta, cur)?;
+            if let Some(h_slice) = hint_slice {
+                let (ref h_hdr, h_raw, _) = h_slice[idx];
+                if !h_raw.is_empty() && header_raw == h_raw {
+                    return Ok((h_hdr.clone(), header_raw, ver_meta));
+                }
+            }
+            let mut header = FileMetaVersionHeader::default();
+            header.unmarshal_v(header_ver, header_raw).map_err(|e| {
+                error!("failed to unmarshal version header: {}", e);
+                e
+            })?;
+            Ok((header, header_raw, ver_meta))
+        };
         let versions = match versions_len {
             0 => BorrowedVersions::Empty,
-            1 => BorrowedVersions::Single([Self::read_next_shallow_slice(meta, &mut cur, header_ver)?]),
+            1 => BorrowedVersions::Single([decode_idx(0, &mut cur)?]),
             n => {
                 let mut list = Vec::with_capacity(n);
-                for _ in 0..n {
-                    list.push(Self::read_next_shallow_slice(meta, &mut cur, header_ver)?);
+                for idx in 0..n {
+                    list.push(decode_idx(idx, &mut cur)?);
                 }
                 BorrowedVersions::Multi(list)
             }
         };
         Ok(BorrowedFileMeta {
+            header_ver,
             meta_ver,
             inline_buf,
             versions,
@@ -356,20 +437,77 @@ impl FileMeta {
     pub(crate) fn validate_and_compare_borrowed<'a>(
         buf: &'a [u8],
         selected: &mut BorrowedFileMeta<'a>,
+        fallback_hint: Option<&BorrowedFileMeta<'a>>,
         same_name: bool,
         strict: bool,
-    ) -> Result<Option<bool>> {
-        let candidate = Self::decode_borrowed(buf)?;
-        let outcome = reconcile_headers(
-            candidate.versions.as_slice().iter().map(|(h, _)| h),
-            selected.versions.as_slice().iter().map(|(h, _)| h),
-            same_name,
-            strict,
-        );
-        if outcome == Some(true) {
-            *selected = candidate;
+    ) -> Result<(Option<bool>, Option<BorrowedFileMeta<'a>>)> {
+        if same_name {
+            let (meta, inline_buf) = Self::parse_validated_xl_envelope(buf)?;
+            if meta.is_empty() {
+                if selected.versions.as_slice().is_empty() {
+                    selected.header_ver = 0;
+                    selected.meta_ver = 0;
+                    selected.inline_buf = inline_buf;
+                    return Ok((Some(true), None));
+                }
+                return Ok((
+                    None,
+                    Some(BorrowedFileMeta {
+                        header_ver: 0,
+                        meta_ver: 0,
+                        inline_buf,
+                        versions: BorrowedVersions::Empty,
+                    }),
+                ));
+            }
+            let (versions_len, header_ver, meta_ver, meta) = Self::decode_validated_xl_headers(meta)?;
+            if header_ver == selected.header_ver && versions_len == selected.versions.as_slice().len() {
+                let mut cur: Cursor<&'a [u8]> = Cursor::new(meta);
+                let mut all_raw_equal = true;
+                for (_, sel_raw, _) in selected.versions.as_slice() {
+                    let (hdr_raw, _) = Self::read_next_raw_slices(meta, &mut cur)?;
+                    if sel_raw.is_empty() || hdr_raw != *sel_raw {
+                        all_raw_equal = false;
+                    }
+                }
+                if all_raw_equal {
+                    let mut cur: Cursor<&'a [u8]> = Cursor::new(meta);
+                    for (_, sel_raw, sel_meta) in selected.versions.as_mut_slice() {
+                        let (hdr_raw, ver_meta) = Self::read_next_raw_slices(meta, &mut cur)?;
+                        *sel_raw = hdr_raw;
+                        *sel_meta = ver_meta;
+                    }
+                    selected.meta_ver = meta_ver;
+                    selected.inline_buf = inline_buf;
+                    return Ok((Some(true), None));
+                }
+            }
+            let candidate = Self::decode_borrowed_body_with_hint(
+                versions_len,
+                header_ver,
+                meta_ver,
+                meta,
+                inline_buf,
+                fallback_hint.or(Some(selected)),
+            )?;
+            let outcome = reconcile_headers(
+                candidate.versions.as_slice().iter().map(|(h, _, _)| h),
+                selected.versions.as_slice().iter().map(|(h, _, _)| h),
+                true,
+                strict,
+            );
+            return match outcome {
+                Some(true) => {
+                    let prev = std::mem::replace(selected, candidate);
+                    Ok((Some(true), Some(prev)))
+                }
+                Some(false) => Ok((Some(false), Some(candidate))),
+                None => Ok((None, Some(candidate))),
+            };
         }
-        Ok(outcome)
+
+        let candidate = Self::decode_borrowed_with_hint(buf, fallback_hint.or(Some(selected)))?;
+        Ok((None, Some(candidate)))
     }
 
     #[inline]
@@ -547,24 +685,36 @@ impl FileMeta {
     // }
 }
 
+pub(crate) type BorrowedVersionEntry<'a> = (FileMetaVersionHeader, &'a [u8], &'a [u8]);
+
 pub(crate) enum BorrowedVersions<'a> {
     Empty,
-    Single([(FileMetaVersionHeader, &'a [u8]); 1]),
-    Multi(Vec<(FileMetaVersionHeader, &'a [u8])>),
+    Single([BorrowedVersionEntry<'a>; 1]),
+    Multi(Vec<BorrowedVersionEntry<'a>>),
 }
 
 impl<'a> BorrowedVersions<'a> {
     #[inline]
-    pub(crate) fn as_slice(&self) -> &[(FileMetaVersionHeader, &'a [u8])] {
+    pub(crate) fn as_slice(&self) -> &[BorrowedVersionEntry<'a>] {
         match self {
             Self::Empty => &[],
             Self::Single(one) => one.as_slice(),
             Self::Multi(many) => many.as_slice(),
         }
     }
+
+    #[inline]
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [BorrowedVersionEntry<'a>] {
+        match self {
+            Self::Empty => &mut [],
+            Self::Single(one) => one.as_mut_slice(),
+            Self::Multi(many) => many.as_mut_slice(),
+        }
+    }
 }
 
 pub(crate) struct BorrowedFileMeta<'a> {
+    pub(crate) header_ver: u8,
     pub(crate) meta_ver: u8,
     pub(crate) inline_buf: &'a [u8],
     pub(crate) versions: BorrowedVersions<'a>,
@@ -574,21 +724,62 @@ impl<'a> BorrowedFileMeta<'a> {
     pub(crate) fn from_file_meta(fm: &'a FileMeta) -> Self {
         let versions = match fm.versions.as_slice() {
             [] => BorrowedVersions::Empty,
-            [v0] => BorrowedVersions::Single([(v0.header.clone(), v0.meta.as_slice())]),
-            many => BorrowedVersions::Multi(many.iter().map(|v| (v.header.clone(), v.meta.as_slice())).collect()),
+            [v0] => BorrowedVersions::Single([(v0.header.clone(), &[], v0.meta.as_slice())]),
+            many => BorrowedVersions::Multi(many.iter().map(|v| (v.header.clone(), &[][..], v.meta.as_slice())).collect()),
         };
         Self {
+            header_ver: 0,
             meta_ver: fm.meta_ver,
             inline_buf: fm.data.as_slice(),
             versions,
         }
     }
 
+    pub(crate) fn as_borrowed_stream(&self) -> Vec<(&FileMetaVersionHeader, &'a [u8])> {
+        self.versions.as_slice().iter().map(|(h, _, m)| (h, *m)).collect()
+    }
+
+    /// Builds a borrowed `(header, ver_meta)` stream directly from a pre-validated `xl.meta` buffer
+    /// whose raw version headers match `self`, borrowing `&FileMetaVersionHeader` from `self` without
+    /// allocating an intermediate `BorrowedFileMeta` or re-running CRC validation.
+    pub(crate) fn stream_from_prevalidated_matching_buf<'b>(
+        &'b self,
+        buf: &'b [u8],
+    ) -> Option<Vec<(&'b FileMetaVersionHeader, &'b [u8])>> {
+        if buf.len() < 18 {
+            return None;
+        }
+        let mut size_buf = &buf[8..13];
+        let bin_len = rmp::decode::read_bin_len(&mut size_buf).ok()? as usize;
+        let meta = buf.get(13..13 + bin_len)?;
+        if meta.is_empty() {
+            return self.versions.as_slice().is_empty().then(Vec::new);
+        }
+        let (versions_len, header_ver, _, meta) = FileMeta::decode_xl_headers(meta).ok()?;
+        let sel_slice = self.versions.as_slice();
+        if versions_len == 0 && sel_slice.is_empty() {
+            return Some(Vec::new());
+        }
+        if header_ver != self.header_ver || versions_len != sel_slice.len() {
+            return None;
+        }
+        let mut cur = Cursor::new(meta);
+        let mut stream = Vec::with_capacity(versions_len);
+        for (sel_hdr, sel_raw, _) in sel_slice {
+            let (hdr_raw, ver_meta) = FileMeta::read_next_raw_slices(meta, &mut cur).ok()?;
+            if sel_raw.is_empty() || hdr_raw != *sel_raw {
+                return None;
+            }
+            stream.push((sel_hdr, ver_meta));
+        }
+        Some(stream)
+    }
+
     pub(crate) fn into_versions(self) -> Vec<FileMetaShallowVersion> {
         self.versions
             .as_slice()
             .iter()
-            .map(|(header, meta)| FileMetaShallowVersion {
+            .map(|(header, _, meta)| FileMetaShallowVersion {
                 header: header.clone(),
                 meta: meta.to_vec(),
             })
@@ -607,17 +798,19 @@ impl<'a> BorrowedFileMeta<'a> {
         fm
     }
 
-    pub(crate) fn compare_cached(&mut self, fm: &'a FileMeta, same_name: bool, strict: bool) -> Option<bool> {
+    pub(crate) fn compare_cached(&mut self, fm: &'a FileMeta, same_name: bool, strict: bool) -> (Option<bool>, Option<Self>) {
         let outcome = reconcile_headers(
             fm.versions.iter().map(|v| &v.header),
-            self.versions.as_slice().iter().map(|(h, _)| h),
+            self.versions.as_slice().iter().map(|(h, _, _)| h),
             same_name,
             strict,
         );
         if outcome == Some(true) {
-            *self = Self::from_file_meta(fm);
+            let prev = std::mem::replace(self, Self::from_file_meta(fm));
+            (Some(true), Some(prev))
+        } else {
+            (outcome, None)
         }
-        outcome
     }
 }
 

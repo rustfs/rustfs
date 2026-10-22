@@ -14,7 +14,6 @@
 
 use crate::{
     Error, FileInfo, FileInfoOpts, FileInfoVersions, FileMeta, FileMetaShallowVersion, Result, VersionType, get_file_info,
-    merge_file_meta_versions, merge_file_meta_versions_with_write_quorum,
 };
 use arc_swap::ArcSwapOption;
 use rmp::Marker;
@@ -647,6 +646,7 @@ impl MetaCacheEntries {
         let mut directory: Option<&MetaCacheEntry> = None;
         let mut selected = None;
         let mut invalid_entries: Vec<usize> = Vec::new();
+        let mut fallback_borrowed = Vec::new();
 
         params.candidates.clear();
         let mut objs_agree = 0;
@@ -664,7 +664,7 @@ impl MetaCacheEntries {
                 continue;
             }
 
-            let Some((current_selected, selected_borrowed)) = &mut selected else {
+            let Some((current_selected_idx, current_selected, selected_borrowed)) = &mut selected else {
                 let initial_borrowed = if let Some(fm) = &entry.cached {
                     fm.borrow_cached()
                 } else if entry.metadata.is_empty() {
@@ -680,7 +680,7 @@ impl MetaCacheEntries {
                         }
                     }
                 };
-                selected = Some((entry, initial_borrowed));
+                selected = Some((entry_idx, entry, initial_borrowed));
                 objs_valid = 1;
                 objs_agree = 1;
                 debug!(entry = %entry.name, "metacache resolve selected initial candidate");
@@ -689,15 +689,27 @@ impl MetaCacheEntries {
 
             let same_name = entry.name == current_selected.name;
             let outcome = if let Some(fm) = &entry.cached {
-                selected_borrowed.compare_cached(fm, same_name, params.strict)
+                let (res, maybe_prev) = selected_borrowed.compare_cached(fm, same_name, params.strict);
+                if let Some(prev) = maybe_prev {
+                    fallback_borrowed.push((*current_selected_idx, prev));
+                }
+                res
             } else if entry.metadata.is_empty() {
                 debug!(entry = %entry.name, "metacache resolve skipped candidate with empty xl.meta");
                 continue;
             } else if current_selected.cached.is_none() && entry.metadata == current_selected.metadata {
                 same_name.then_some(true)
             } else {
-                match FileMeta::validate_and_compare_borrowed(&entry.metadata, selected_borrowed, same_name, params.strict) {
-                    Ok(res) => res,
+                let hint = fallback_borrowed.last().map(|(_, b)| b);
+                match FileMeta::validate_and_compare_borrowed(&entry.metadata, selected_borrowed, hint, same_name, params.strict)
+                {
+                    Ok((res, maybe_borrowed)) => {
+                        if let Some(borrowed) = maybe_borrowed {
+                            let saved_idx = if res == Some(true) { *current_selected_idx } else { entry_idx };
+                            fallback_borrowed.push((saved_idx, borrowed));
+                        }
+                        res
+                    }
                     Err(e) => {
                         invalid_entries.push(entry_idx);
                         debug!(entry = %entry.name, error = ?e, "metacache resolve skipped candidate with unreadable xl.meta");
@@ -709,6 +721,7 @@ impl MetaCacheEntries {
             objs_valid += 1;
             if let Some(prefer_self) = outcome {
                 if prefer_self {
+                    *current_selected_idx = entry_idx;
                     *current_selected = entry;
                 }
                 objs_agree += 1;
@@ -720,7 +733,7 @@ impl MetaCacheEntries {
         // Keep directory evidence separate so its arrival cannot displace an
         // object that meets the metadata quorum.
         let directory = directory.filter(|_| dir_exists >= params.dir_quorum);
-        let Some((selected_ref, selected_borrowed)) = selected else {
+        let Some((_selected_idx, selected_ref, selected_borrowed)) = selected else {
             debug!(
                 bucket = %params.bucket,
                 dir_quorum = params.dir_quorum,
@@ -740,19 +753,14 @@ impl MetaCacheEntries {
             return directory.cloned();
         }
 
-        let selected_fm = selected_ref
-            .cached
-            .clone()
-            .unwrap_or_else(|| selected_borrowed.into_file_meta());
-
         if objs_agree == objs_valid {
             let required_quorum = if enforce_write_quorum {
-                selected_fm
+                selected_borrowed
                     .versions
+                    .as_slice()
                     .first()
-                    .map(|version| {
-                        version
-                            .write_quorum(params.obj_quorum)
+                    .map(|(hdr, _, meta)| {
+                        crate::filemeta::write_quorum_from_header_and_meta(hdr, meta, params.obj_quorum)
                             .saturating_sub(params.write_quorum_slack)
                             .max(params.obj_quorum)
                     })
@@ -768,6 +776,10 @@ impl MetaCacheEntries {
                     objs_valid,
                     "metacache resolve reused selected candidate because all valid object entries agreed"
                 );
+                let selected_fm = selected_ref
+                    .cached
+                    .clone()
+                    .unwrap_or_else(|| selected_borrowed.into_file_meta());
                 return Some(MetaCacheEntry {
                     name: selected_ref.name.clone(),
                     metadata: selected_ref.metadata.clone(),
@@ -777,44 +789,41 @@ impl MetaCacheEntries {
             }
         }
 
-        let selected_meta_ver = selected_fm.meta_ver;
-        params.candidates.reserve(objs_valid);
-        let mut last_loaded: Option<(&[u8], usize)> = None;
+        let selected_meta_ver = selected_borrowed.meta_ver;
+        let mut streams: Vec<Vec<(&crate::FileMetaVersionHeader, &[u8])>> = Vec::with_capacity(objs_valid);
         for (entry_idx, entry) in self.0.iter().flatten().enumerate() {
             if entry.name.is_empty() || entry.is_dir() || invalid_entries.contains(&entry_idx) {
                 continue;
             }
             if let Some(fm) = &entry.cached {
-                params.candidates.push(fm.versions.clone());
+                streams.push(fm.versions.iter().map(|v| (&v.header, v.meta.as_slice())).collect());
             } else if std::ptr::eq(entry, selected_ref)
                 || (selected_ref.cached.is_none() && entry.metadata == selected_ref.metadata)
             {
-                params.candidates.push(selected_fm.versions.clone());
-            } else if let Some((prev_bytes, idx)) = last_loaded
-                && entry.metadata.as_slice() == prev_bytes
+                streams.push(selected_borrowed.as_borrowed_stream());
+            } else if let Some((_, borrowed)) = fallback_borrowed.iter().find(|(idx, _)| *idx == entry_idx) {
+                streams.push(borrowed.as_borrowed_stream());
+            } else if let Some(stream) = selected_borrowed
+                .stream_from_prevalidated_matching_buf(&entry.metadata)
+                .or_else(|| {
+                    fallback_borrowed
+                        .iter()
+                        .find_map(|(_, b)| b.stream_from_prevalidated_matching_buf(&entry.metadata))
+                })
             {
-                let cloned = params.candidates[idx].clone();
-                params.candidates.push(cloned);
-            } else if !entry.metadata.is_empty()
-                && let Ok(borrowed) = FileMeta::decode_borrowed(&entry.metadata)
-            {
-                let idx = params.candidates.len();
-                last_loaded = Some((entry.metadata.as_slice(), idx));
-                params.candidates.push(borrowed.into_versions());
+                streams.push(stream);
             }
         }
+        debug_assert_eq!(streams.len(), objs_valid);
 
-        let versions = if enforce_write_quorum {
-            merge_file_meta_versions_with_write_quorum(
-                params.obj_quorum,
-                params.strict,
-                params.requested_versions,
-                params.write_quorum_slack,
-                &params.candidates,
-            )
-        } else {
-            merge_file_meta_versions(params.obj_quorum, params.strict, params.requested_versions, &params.candidates)
-        };
+        let versions = crate::filemeta::merge_file_meta_borrowed_streams(
+            params.obj_quorum,
+            params.strict,
+            params.requested_versions,
+            enforce_write_quorum,
+            params.write_quorum_slack,
+            streams,
+        );
         if versions.is_empty() {
             debug!(
                 selected = %selected_ref.name,
@@ -4107,9 +4116,107 @@ mod tests {
         // 5. Duplicate-header stream removal preserves remaining duplicates per stream.
         let dup_ver = base_fm.versions[0].clone();
         let dup_candidates = vec![vec![dup_ver.clone(), dup_ver.clone()]; 3];
-        let merged_dups = merge_file_meta_versions(2, true, 0, &dup_candidates);
+        let merged_dups = crate::merge_file_meta_versions(2, true, 0, &dup_candidates);
         assert_eq!(merged_dups.len(), 2);
         assert_eq!(merged_dups[0].header, dup_ver.header);
         assert_eq!(merged_dups[1].header, dup_ver.header);
+
+        // 6. Outlier last (drives 0..4 agree with distinct EC index, drive 1 cached, drive 4 disagrees),
+        // exercising `stream_from_prevalidated_matching_buf` and `compare_cached` displaced-entry retention.
+        let mut outlier_last = Vec::with_capacity(5);
+        for disk_idx in 0..5usize {
+            let mut fm = if disk_idx == 4 { base_fm.clone() } else { newer_fm.clone() };
+            let mut ver = FileMetaVersion::try_from(fm.versions[0].meta.as_slice()).expect("decode ver");
+            ver.object.as_mut().expect("obj").erasure_index = disk_idx + 1;
+            fm.versions[0].meta = ver.marshal_msg().expect("marshal ver");
+            let raw = fm.marshal_msg().expect("marshal fm");
+            outlier_last.push(Some(MetaCacheEntry {
+                name: base.name.clone(),
+                metadata: raw,
+                cached: if disk_idx == 1 { Some(fm) } else { None },
+                reusable: false,
+            }));
+        }
+        let res_outlier_last = MetaCacheEntries(outlier_last)
+            .resolve_with_write_quorum(MetadataResolutionParams {
+                dir_quorum: 2,
+                obj_quorum: 3,
+                requested_versions: 1,
+                bucket: "bucket".to_string(),
+                strict: true,
+                write_quorum_slack: 0,
+                candidates: Vec::new(),
+            })
+            .expect("resolve outlier_last");
+        assert_eq!(
+            res_outlier_last.cached.expect("cached").versions[0].header.version_id,
+            Some(Uuid::from_u128(2))
+        );
+
+        // 7. Canonical 38-byte header unmarshal_msg and matches_buf_strict across negative, zero, and subsecond timestamps.
+        for nanos in [-1_705_312_300_123_456_789i128, -1, 0, 1, 1_705_312_300_987_654_321] {
+            let mut fm = base_fm.clone();
+            let ts = OffsetDateTime::from_unix_timestamp_nanos(nanos).expect("valid ts");
+            fm.versions[0].header.mod_time = (ts != OffsetDateTime::UNIX_EPOCH).then_some(ts);
+            let encoded = fm.versions[0].header.marshal_msg().expect("marshal hdr");
+            assert_eq!(encoded.len(), 38);
+            assert!(crate::filemeta::parse_canonical_v3_header_fields(&encoded).is_some());
+            let mut decoded = crate::FileMetaVersionHeader::default();
+            assert_eq!(decoded.unmarshal_msg(&encoded).expect("unmarshal 38B"), 38);
+            assert_eq!(decoded, fm.versions[0].header);
+            let fm_raw = fm.marshal_msg().expect("marshal fm");
+            assert!(fm.matches_buf_strict(&fm_raw));
+            assert_eq!(
+                fm.matches_buf_strict(&base.metadata),
+                fm.versions[0].header.mod_time == base_fm.versions[0].header.mod_time
+            );
+        }
+
+        // 8. Mixed empty V3 (`versions_len == 0`) and zero-meta-payload envelope preserve stream 0 during fallback merge.
+        let empty_v3_raw = FileMeta::new().marshal_msg().expect("marshal empty v3");
+        let mut zero_meta_envelope = Vec::from(&b"XL2 "[..]);
+        zero_meta_envelope.extend_from_slice(&1u16.to_le_bytes());
+        zero_meta_envelope.extend_from_slice(&3u16.to_le_bytes());
+        zero_meta_envelope.extend_from_slice(&[0xc6, 0, 0, 0, 0]);
+        let zero_crc = xxhash_rust::xxh64::xxh64(&[], 0) as u32;
+        zero_meta_envelope.push(0xce);
+        zero_meta_envelope.extend_from_slice(&zero_crc.to_be_bytes());
+
+        let mut two_ver_fm = newer_fm;
+        two_ver_fm.versions.push(base_fm.versions[0].clone());
+        let two_ver_raw = two_ver_fm.marshal_msg().expect("marshal two_ver_fm");
+
+        let mut mixed_empty_entries = vec![Some(MetaCacheEntry {
+            name: base.name.clone(),
+            metadata: empty_v3_raw,
+            cached: None,
+            reusable: false,
+        })];
+        for _ in 0..4 {
+            mixed_empty_entries.push(Some(MetaCacheEntry {
+                name: base.name.clone(),
+                metadata: two_ver_raw.clone(),
+                cached: None,
+                reusable: false,
+            }));
+        }
+        mixed_empty_entries.push(Some(MetaCacheEntry {
+            name: base.name,
+            metadata: zero_meta_envelope,
+            cached: None,
+            reusable: false,
+        }));
+        let res_mixed_empty = MetaCacheEntries(mixed_empty_entries)
+            .resolve_with_write_quorum(MetadataResolutionParams {
+                dir_quorum: 2,
+                obj_quorum: 4,
+                requested_versions: 1,
+                bucket: "bucket".to_string(),
+                strict: true,
+                write_quorum_slack: 0,
+                candidates: Vec::new(),
+            })
+            .expect("resolve mixed empty");
+        assert_eq!(res_mixed_empty.cached.expect("cached").versions.len(), 1);
     }
 }
