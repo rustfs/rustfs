@@ -149,3 +149,40 @@ async fn missing_identity_recovers_after_publication_with_netlink_denied() {
     assert_eq!(fallback, "127.0.0.1");
     assert_eq!(published, "node-b:9000");
 }
+
+#[tokio::test]
+async fn contended_identity_uses_denied_netlink_fallback_then_recovers() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let action = libc::SECCOMP_RET_ERRNO | u32::try_from(libc::EPERM).expect("EPERM fits seccomp errno data");
+    let (unavailable, resolved_while_contended, reader_result, published) = with_faulted_worker("node-a:9000", action, || {
+        let mut writer = rustfs_common::GLOBAL_LOCAL_NODE_NAME.blocking_write();
+        *writer = "node-b:9000".to_string();
+        let unavailable = rustfs_common::try_get_global_local_node_name().is_none();
+        let (resolved_tx, resolved_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let address_missing = rustfs_utils::get_local_ip().is_none();
+            let identity = current_local_node_identity();
+            resolved_tx
+                .send((address_missing, identity))
+                .expect("identity test must retain its result receiver");
+        });
+
+        let resolved_while_contended = resolved_rx.recv_timeout(Duration::from_secs(30));
+        // Release the writer before joining even if a regression blocks the
+        // reader, so the failed test can restore the global identity and exit.
+        drop(writer);
+        let reader_result = reader.join();
+        (unavailable, resolved_while_contended, reader_result, current_local_node_identity())
+    })
+    .await;
+
+    reader_result.expect("faulted identity reader should complete after writer release");
+    assert!(unavailable, "the real nonblocking getter must observe writer contention");
+    let (address_missing, fallback) =
+        resolved_while_contended.expect("identity resolution must finish while the name writer is still held");
+    assert!(address_missing, "the child must inherit the worker's real netlink denial");
+    assert_eq!(fallback, "127.0.0.1");
+    assert_eq!(published, "node-b:9000");
+}
