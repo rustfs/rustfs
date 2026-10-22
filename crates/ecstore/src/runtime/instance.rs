@@ -336,7 +336,14 @@ impl InstanceContext {
         F::Output: Send + 'static,
     {
         // Capture before spawning: Tokio tasks do not inherit request task-locals.
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let mutation = crate::cluster::rpc::runtime_sources::with_captured_read_version_context(
+            rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::DetachedMutation,
+            mutation,
+        );
+        #[cfg(not(feature = "diagnostic-read-version-caller"))]
         let context = rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context();
+        #[cfg(not(feature = "diagnostic-read-version-caller"))]
         let mutation = rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(context, mutation);
         self.detached_mutations.spawn(mutation.in_current_span()).await
     }
@@ -1106,6 +1113,60 @@ mod tests {
                 .expect_err("child panic remains a join failure");
         assert!(failure.is_panic());
         assert_eq!(current_s3_http_operation_name(), None);
+        assert!(ctx.wait_for_detached_mutations(std::time::Duration::from_secs(5)).await);
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn detached_mutations_keep_existing_context_after_waiter_drop_and_nested_spawn() {
+        use crate::cluster::rpc::runtime_sources::{
+            current_read_version_entry_source, current_read_version_request_caller, with_read_version_entry,
+            with_read_version_request_caller,
+        };
+        use rustfs_io_metrics::internode_metrics::{ReadVersionEntrySource, ReadVersionRequestCaller};
+
+        let ctx = Arc::new(InstanceContext::new());
+        let child_ctx = Arc::clone(&ctx);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let mut caller = Box::pin(with_read_version_request_caller(ReadVersionRequestCaller::Object, async {
+            with_read_version_entry(ReadVersionEntrySource::LifecycleRecovery, async {
+                ctx.run_detached_mutation(async move {
+                    entered_tx.send(()).expect("mutation caller is present");
+                    release_rx.await.expect("mutation may finish");
+                    let observed = with_read_version_entry(ReadVersionEntrySource::ConfigRead, async {
+                        child_ctx
+                            .run_detached_mutation(async {
+                                (current_read_version_request_caller(), current_read_version_entry_source())
+                            })
+                            .await
+                            .expect("nested mutation joins")
+                    })
+                    .await;
+                    finished_tx.send(observed).expect("completion observer remains live");
+                })
+                .await
+            })
+            .await
+        }));
+        assert!(futures::poll!(caller.as_mut()).is_pending());
+        entered_rx.await.expect("mutation entered");
+        drop(caller);
+        assert_eq!(current_read_version_request_caller(), None);
+        assert_eq!(current_read_version_entry_source(), None);
+        assert_eq!(ctx.detached_mutation_count(), 1);
+        release_tx.send(()).expect("mutation remains alive after waiter drop");
+        assert_eq!(
+            finished_rx.await.expect("nested mutation completes"),
+            (Some(ReadVersionRequestCaller::Object), Some(ReadVersionEntrySource::LifecycleRecovery))
+        );
+        assert_eq!(
+            ctx.run_detached_mutation(async { (current_read_version_request_caller(), current_read_version_entry_source()) })
+                .await
+                .expect("unscoped mutation joins"),
+            (None, None)
+        );
         assert!(ctx.wait_for_detached_mutations(std::time::Duration::from_secs(5)).await);
     }
 
