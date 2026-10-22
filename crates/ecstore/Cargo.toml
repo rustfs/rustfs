@@ -286,5 +286,9 @@ harness = false
 name = "multipart_read_parts_benchmark"
 harness = false
 
+[[bench]]
+name = "local_walk_dir_benchmark"
+harness = false
+
 [lib]
 doctest = false

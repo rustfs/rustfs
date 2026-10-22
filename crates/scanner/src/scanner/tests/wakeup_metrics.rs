@@ -188,7 +188,8 @@ async fn scanner_trigger_metrics_record_recovery_and_config_without_rate_limited
         crate::scanner_io::clear_dirty_usage_buckets_for_tests();
         global_metrics().set_cycle(None).await;
         let (_temp_dir, store) = setup_scanner_cycle_store().await;
-        let now = scanner_pause_backlog_now();
+        // Model a second passing during the durable writer claim without sleeping.
+        let now = scanner_pause_backlog_now().saturating_sub(1);
         let mut backlog = ScannerPauseBacklogController::claim(store.clone(), now)
             .await
             .expect("seed writer must claim the pause backlog");
@@ -198,7 +199,7 @@ async fn scanner_trigger_metrics_record_recovery_and_config_without_rate_limited
         backlog.observe(observation).await;
         observation.paused = false;
         backlog.observe(observation).await;
-        let ScannerPauseBacklogAttemptDecision::Tracked(serial) = backlog.begin_attempt(now).await else {
+        let ScannerPauseBacklogAttemptDecision::Tracked(serial) = backlog.begin_attempt(observation.now_unix_secs).await else {
             panic!("seeded catch-up must admit its first attempt");
         };
         backlog.finish_attempt(serial, ScannerCycleOutcome::Failed, observation).await;
