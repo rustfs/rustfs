@@ -246,13 +246,11 @@ type ListingMetadataItem = core::result::Result<ListingMetadataRead, ReadAllErro
 
 struct ListingMetadataBatch {
     volume_dir: PathBuf,
-    ready: std::collections::VecDeque<ListingMetadataItem>,
-    rx: tokio::sync::mpsc::UnboundedReceiver<std::collections::VecDeque<ListingMetadataItem>>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<ListingMetadataItem>,
     remaining: usize,
 }
 
 const LISTING_META_INITIAL_READ_BYTES: usize = 4 << 10;
-const LISTING_META_FLUSH_INTERVAL: Duration = Duration::from_millis(20);
 
 fn read_all_data_std(
     opened: std::io::Result<std::fs::File>,
@@ -359,6 +357,30 @@ fn read_listing_metadata_bytes_std(
 }
 
 const LISTING_META_BATCH_MAX_BYTES: usize = 1 << 20;
+
+// Deliver progress before starting another blocking read. A timer checked after a
+// read cannot publish completed entries while the next filesystem call is stalled.
+fn stream_listing_metadata_batch(
+    object_names: &[String],
+    tx: tokio::sync::mpsc::UnboundedSender<ListingMetadataItem>,
+    mut read: impl FnMut(&str) -> ListingMetadataItem,
+) {
+    let mut buffered_bytes = 0usize;
+    for object_name in object_names {
+        if tx.is_closed() {
+            break;
+        }
+        let res = read(object_name);
+        if let Ok(read) = &res {
+            buffered_bytes = buffered_bytes.saturating_add(read.bytes.len());
+        }
+        let stop = res.as_ref().map_or(true, |read| read.has_namespace_child_candidate)
+            || buffered_bytes >= LISTING_META_BATCH_MAX_BYTES;
+        if tx.send(res).is_err() || stop {
+            break;
+        }
+    }
+}
 
 fn parse_listing_metadata_bytes(bytes: &[u8]) -> (Option<FileMeta>, Vec<Uuid>, bool) {
     let file_meta = FileMeta::load(bytes).ok();
@@ -8046,7 +8068,6 @@ impl LocalDisk {
             .rx
             .recv()
             .await
-            .and_then(|mut chunk| chunk.pop_front())
             .ok_or_else(|| DiskError::other("listing metadata batch closed unexpectedly"))?;
         self.resolve_read_all_result(volume, &batch.volume_dir, raw).await
     }
@@ -8069,47 +8090,20 @@ impl LocalDisk {
         let remaining = object_names.len();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         drop(spawn_blocking_with_disk_io_permit(io_permit, move || {
-            let mut buffered_bytes = 0usize;
-            let mut chunk = std::collections::VecDeque::with_capacity(object_names.len());
-            let mut chunk_started = std::time::Instant::now();
-            for object_name in &object_names {
-                if tx.is_closed() {
-                    break;
-                }
+            stream_listing_metadata_batch(&object_names, tx, |object_name| {
                 let (bucket_path, object_dir) = build_local_disk_object_path(&io_root, &volume_str, object_name);
                 #[cfg(target_os = "linux")]
                 let path_check = check_local_disk_valid_object_path_at(&io_root, &mount_lease, &bucket_path, &object_dir);
                 #[cfg(not(target_os = "linux"))]
                 let path_check = check_local_disk_valid_object_path(&io_root, &bucket_path, &object_dir);
-                let res = match path_check {
+                match path_check {
                     Ok(()) => read_listing_metadata_entry_std(&root, &object_dir),
                     Err(err) => Err(ReadAllError::Disk(err)),
-                };
-                if let Ok(read) = &res {
-                    buffered_bytes = buffered_bytes.saturating_add(read.bytes.len());
                 }
-                let stop = res.as_ref().map_or(true, |read| read.has_namespace_child_candidate)
-                    || buffered_bytes >= LISTING_META_BATCH_MAX_BYTES;
-                chunk.push_back(res);
-                if stop {
-                    let _ = tx.send(chunk);
-                    return;
-                }
-                if chunk_started.elapsed() >= LISTING_META_FLUSH_INTERVAL {
-                    let flushed = std::mem::replace(&mut chunk, std::collections::VecDeque::with_capacity(object_names.len()));
-                    if tx.send(flushed).is_err() {
-                        return;
-                    }
-                    chunk_started = std::time::Instant::now();
-                }
-            }
-            if !chunk.is_empty() {
-                let _ = tx.send(chunk);
-            }
+            });
         }));
         Ok(ListingMetadataBatch {
             volume_dir,
-            ready: std::collections::VecDeque::new(),
             rx,
             remaining,
         })
@@ -9414,12 +9408,7 @@ impl LocalDisk {
                         let mut spawned = false;
                         let (volume_dir, raw_res) = loop {
                             if let Some(batch) = prefetched_batch.as_mut() {
-                                if batch.ready.is_empty()
-                                    && let Some(next_chunk) = with_walk_stall_deadline(stall, batch.rx.recv()).await?
-                                {
-                                    batch.ready = next_chunk;
-                                }
-                                if let Some(raw_res) = batch.ready.pop_front() {
+                                if let Some(raw_res) = with_walk_stall_deadline(stall, batch.rx.recv()).await? {
                                     batch.remaining -= 1;
                                     let stop = batch.remaining == 0
                                         || raw_res.as_ref().map_or(true, |r| r.has_namespace_child_candidate);
@@ -22706,6 +22695,94 @@ mod test {
         assert!(parent.has_namespace_child_candidate);
     }
 
+    fn listing_batch_fixture(bytes: Vec<u8>, has_namespace_child_candidate: bool) -> ListingMetadataRead {
+        ListingMetadataRead {
+            bytes,
+            file_meta: None,
+            data_dirs: Vec::new(),
+            has_namespace_child_candidate,
+            counts_toward_limit: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_metadata_batch_publishes_before_the_next_read_completes() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let mut started_tx = Some(started_tx);
+            stream_listing_metadata_batch(&["first".to_string(), "second".to_string()], tx, |name| {
+                if name == "second" {
+                    started_tx
+                        .take()
+                        .expect("second read starts once")
+                        .send(())
+                        .expect("notify reader");
+                    resume_rx.recv().expect("resume second read");
+                }
+                Ok(listing_batch_fixture(name.as_bytes().to_vec(), false))
+            });
+        });
+        started_rx.await.expect("worker must reach the blocked second read");
+        let first = rx.try_recv();
+        // Release the blocking task before asserting, including on regression.
+        resume_tx.send(()).expect("release blocked worker");
+        worker.await.expect("worker must finish");
+        assert_eq!(
+            first
+                .expect("first result must already be published")
+                .ok()
+                .expect("first read succeeds")
+                .bytes,
+            b"first"
+        );
+        assert_eq!(
+            rx.recv()
+                .await
+                .expect("second result")
+                .ok()
+                .expect("second read succeeds")
+                .bytes,
+            b"second"
+        );
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn listing_metadata_batch_stops_on_boundaries_and_cancellation() {
+        for boundary in ["bytes", "child", "error", "cancel"] {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            if boundary == "cancel" {
+                rx.close();
+            }
+            let mut reads = 0;
+            stream_listing_metadata_batch(&["first".to_string(), "second".to_string()], tx, |_| {
+                reads += 1;
+                if boundary == "error" {
+                    Err(ReadAllError::Disk(DiskError::FileNotFound))
+                } else {
+                    Ok(listing_batch_fixture(
+                        vec![
+                            0;
+                            if boundary == "bytes" {
+                                LISTING_META_BATCH_MAX_BYTES
+                            } else {
+                                1
+                            }
+                        ],
+                        boundary == "child",
+                    ))
+                }
+            });
+            assert_eq!(reads, usize::from(boundary != "cancel"), "boundary: {boundary}");
+            if boundary != "cancel" {
+                assert!(rx.try_recv().is_ok(), "the boundary result must be delivered: {boundary}");
+            }
+            assert!(rx.try_recv().is_err(), "no result may follow the boundary: {boundary}");
+        }
+    }
+
     #[tokio::test]
     async fn listing_metadata_skips_inline_payload_bytes_and_preserves_corrupt_classification() {
         use tempfile::tempdir;
@@ -22913,6 +22990,12 @@ mod test {
             fi.data_dir = Some(data_dir);
             fi.size = 16;
             fi.mod_time = Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("ts"));
+            if name == "obj-20" {
+                // A single envelope can exhaust the byte budget before the name
+                // batch ends; subsequent keys must resume in a fresh worker.
+                fi.metadata
+                    .insert("x-amz-meta-padding".to_string(), "p".repeat(LISTING_META_BATCH_MAX_BYTES));
+            }
             fi.data = Some(Bytes::from(vec![b'a'; 16 * 1024]));
             fi.set_inline_data();
             fm.add_version(fi).expect("add version");
@@ -22973,11 +23056,11 @@ mod test {
         assert_eq!(entries[2].name, "parent/");
         assert!(entries[2].is_dir());
 
-        // 6. Batched recursive walk_dir across > WALK_DIR_BATCH_SIZE entries with a nested child
-        // candidate and a real subdirectory mid-batch preserves exact ordering and limit accounting.
+        // Cross multiple batches, including an early stop for a nested child, and
+        // pin both sides of the 32-object batch boundary and an unlimited walk.
         let batch_bucket = "walk-batch-bucket";
         let batch_bucket_dir = dir.path().join(batch_bucket);
-        for idx in 0..40 {
+        for idx in 0..80 {
             let name = format!("obj-{idx:02}");
             let obj_dir = batch_bucket_dir.join(&name);
             fs::create_dir_all(obj_dir.join(data_dir.to_string()))
@@ -22995,31 +23078,34 @@ mod test {
             }
         }
 
-        let (reader, mut writer) = tokio::io::duplex(64 * 1024);
-        let batch_opts = WalkDirOptions {
-            bucket: batch_bucket.to_string(),
-            base_dir: String::new(),
-            recursive: true,
-            limit: 15,
-            ..Default::default()
-        };
-        disk.walk_dir(batch_opts, &mut writer)
-            .await
-            .expect("batched recursive walk_dir must succeed");
-        drop(writer);
-        let batch_entries = MetacacheReader::new(reader)
-            .read_all()
-            .await
-            .expect("read batched recursive metacache stream");
-        let visible_names: Vec<&str> = batch_entries
-            .iter()
-            .filter(|e| !e.metadata.is_empty())
-            .map(|e| e.name.as_str())
-            .collect();
-        assert_eq!(visible_names.len(), 15);
-        assert_eq!(visible_names[10], "obj-10");
-        assert_eq!(visible_names[11], "obj-10/nested");
-        assert_eq!(visible_names[12], "obj-11");
+        let mut expected: Vec<String> = (0..80).map(|i| format!("obj-{i:02}")).collect();
+        expected.insert(11, "obj-10/nested".to_string());
+        for limit in [15, 32, 33, 0] {
+            let (reader, mut writer) = tokio::io::duplex(64 * 1024);
+            let batch_opts = WalkDirOptions {
+                bucket: batch_bucket.to_string(),
+                base_dir: String::new(),
+                recursive: true,
+                limit,
+                ..Default::default()
+            };
+            let disk_ref = &disk;
+            let produce = async move { disk_ref.walk_dir(batch_opts, &mut writer).await };
+            let consume = async { MetacacheReader::new(reader).read_all().await.expect("read batched stream") };
+            let (result, batch_entries) = tokio::join!(produce, consume);
+            result.expect("batched recursive walk_dir must succeed");
+            let visible_names: Vec<_> = batch_entries
+                .iter()
+                .filter(|e| !e.metadata.is_empty())
+                .map(|e| e.name.as_str())
+                .collect();
+            let count = if limit == 0 {
+                expected.len()
+            } else {
+                usize::try_from(limit).expect("positive limit")
+            };
+            assert_eq!(visible_names, expected[..count], "page limit {limit}");
+        }
     }
 
     #[tokio::test]
