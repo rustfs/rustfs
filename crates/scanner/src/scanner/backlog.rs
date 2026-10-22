@@ -1401,9 +1401,10 @@ pub fn register_scanner_pause_backlog_retirement() {
 fn decode_scanner_pause_backlog_retirement_replicas(
     source_pool_index: usize,
     replicas: &[ScannerPauseBacklogRetirementReplica],
-) -> Result<Vec<ScannerPauseBacklogReplica>, ScannerPauseBacklogRetirementError> {
+) -> Result<(Vec<ScannerPauseBacklogReplica>, Vec<ScannerPauseBacklogReplica>), ScannerPauseBacklogRetirementError> {
     let mut ids = BTreeSet::new();
     let mut decoded = Vec::with_capacity(replicas.len());
+    let mut surviving = Vec::new();
     let mut has_source = false;
     for replica in replicas {
         let id = ScannerPauseBacklogReplicaId {
@@ -1433,28 +1434,33 @@ fn decode_scanner_pause_backlog_retirement_replicas(
                 ));
             }
         };
-        decoded.push(ScannerPauseBacklogReplica {
+        let decoded_replica = ScannerPauseBacklogReplica {
             id,
             revision: None,
             state,
-        });
+        };
+        if replica.pool_index != source_pool_index && replica.writable {
+            surviving.push(decoded_replica.clone());
+        }
+        decoded.push(decoded_replica);
     }
     if !has_source {
         return Err(scanner_pause_backlog_retirement_invalid_record(
             "scanner pause backlog retirement has no native source record",
         ));
     }
-    Ok(decoded)
+    Ok((decoded, surviving))
 }
 
 fn verify_scanner_pause_backlog_retirement(
     source_pool_index: usize,
     replicas: &[ScannerPauseBacklogRetirementReplica],
 ) -> Result<(), ScannerPauseBacklogRetirementError> {
-    let mut decoded = decode_scanner_pause_backlog_retirement_replicas(source_pool_index, replicas)?;
-    if decoded.iter().any(|replica| {
-        replica.id.pool_index != source_pool_index && matches!(replica.state, ScannerPauseBacklogReplicaState::Missing)
-    }) {
+    let (mut decoded, surviving) = decode_scanner_pause_backlog_retirement_replicas(source_pool_index, replicas)?;
+    if surviving
+        .iter()
+        .any(|replica| matches!(replica.state, ScannerPauseBacklogReplicaState::Missing))
+    {
         return Err(scanner_pause_backlog_retirement_authority_conflict(
             "scanner pause backlog retirement has a missing surviving replica",
         ));
@@ -1462,11 +1468,6 @@ fn verify_scanner_pause_backlog_retirement(
     // Earlier entries may already have removed a source sibling after a
     // successful handoff. It contributes no stored authority to final cleanup.
     decoded.retain(|replica| !matches!(replica.state, ScannerPauseBacklogReplicaState::Missing));
-    let surviving = decoded
-        .iter()
-        .filter(|replica| replica.id.pool_index != source_pool_index)
-        .cloned()
-        .collect::<Vec<_>>();
     let selected = select_scanner_pause_backlog_replicas(surviving)
         .map_err(|failure| scanner_pause_backlog_retirement_selection_error(failure.error))?;
     if !selected.durable || !selected.stable_matches_ledger {
@@ -1490,12 +1491,7 @@ fn plan_scanner_pause_backlog_retirement(
 ) -> Result<Option<ScannerPauseBacklogRetirementPlan>, ScannerPauseBacklogRetirementError> {
     // Missing entries stay in the native selection. Omitting them could turn
     // an incomplete old cohort into a fabricated stable consensus.
-    let decoded = decode_scanner_pause_backlog_retirement_replicas(source_pool_index, replicas)?;
-    let surviving = decoded
-        .iter()
-        .filter(|replica| replica.id.pool_index != source_pool_index)
-        .cloned()
-        .collect::<Vec<_>>();
+    let (decoded, surviving) = decode_scanner_pause_backlog_retirement_replicas(source_pool_index, replicas)?;
     if surviving.is_empty() {
         return Err(scanner_pause_backlog_retirement_authority_conflict(
             "scanner pause backlog retirement has no surviving membership",
@@ -1585,7 +1581,7 @@ fn plan_scanner_pause_backlog_retirement(
         }
         if decoded
             .iter()
-            .filter(|replica| replica.id.pool_index == source_pool_index)
+            .filter(|replica| !surviving_ids.contains(&replica.id))
             .any(|replica| {
                 matches!(&replica.state, ScannerPauseBacklogReplicaState::Valid(record)
                 if record.stable.as_ref() != Some(&current.ledger)
@@ -1723,6 +1719,12 @@ where
         .iter()
         .filter_map(|replica| replica.revision.clone().map(|revision| (replica.id, revision)))
         .collect::<HashMap<_, _>>();
+    let writable_pool_indices: Arc<[usize]> = writable_ids
+        .iter()
+        .map(|id| id.pool_index)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     // Replica writes can share the pool namespace or the fixed multipool lock.
     // Finish each write before starting another acquisition for this publication.
     // Own the whole selected cohort so canceling the waiter cannot abandon
@@ -1737,7 +1739,13 @@ where
             let result = match revisions.get(&id) {
                 Some(revision) => storeapi
                     .clone()
-                    .save_scanner_pause_backlog_replica(id.pool_index, id.set_index, data.clone(), revision.preconditions())
+                    .save_scanner_pause_backlog_replica_for_membership(
+                        id.pool_index,
+                        id.set_index,
+                        data.clone(),
+                        revision.preconditions(),
+                        Arc::clone(&writable_pool_indices),
+                    )
                     .await
                     .map_err(|err| err.to_string()),
                 None => Err("replica revision is unavailable".to_string()),
@@ -3296,6 +3304,104 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn native_writer_stale_cohort_cannot_stabilize_survivors_after_retirement() {
+        run_native_retirement_test(async || {
+            let (_root, store) = native_pause_backlog_store(3, 2).await;
+            let now = unix_now();
+            let old = ScannerPauseBacklogController::claim(Arc::clone(&store), now)
+                .await
+                .expect("initial stable cohort")
+                .loaded;
+            let next = claim_scanner_pause_backlog_writer(&old.ledger, now + 1).expect("next native writer");
+            let members = scanner_pause_backlog_replica_ids(&old.replicas);
+            let committed = commit_scanner_pause_backlog_record(Some(&old.ledger), &next, &members);
+            write_scanner_pause_backlog_record(Arc::clone(&store), &old, committed)
+                .await
+                .expect("commit before stabilization");
+            let pending = load_scanner_pause_backlog(Arc::clone(&store))
+                .await
+                .expect("pending stabilization");
+            assert_eq!(pending.ledger, next);
+            assert!(!pending.stable_matches_ledger);
+            let stale_topology = store.pool_meta.read().await.clone();
+            let source_before = native_replica_bytes(&store.pools[0].disk_set[0]).await.0;
+            store
+                .prepare_scanner_pause_backlog_retirement_for_test(0, source_before.len() * 2)
+                .await
+                .expect("retire the old cohort's first pool");
+            let surviving = [replica_id(1, 0), replica_id(1, 1), replica_id(2, 0), replica_id(2, 1)];
+            let newer = claim_scanner_pause_backlog_writer(&old.ledger, now + 2).expect("surviving writer");
+            replace_native_pause_backlog_replica(
+                &store,
+                surviving[0],
+                commit_scanner_pause_backlog_record(Some(&old.ledger), &newer, &surviving),
+            )
+            .await;
+            let mut before = Vec::new();
+            for id in surviving {
+                before.push(native_replica_bytes(&store.pools[id.pool_index].disk_set[id.set_index]).await);
+            }
+            // A node may still expose the old writable view while durable pool
+            // metadata has fenced retirement. Admission must use the latter.
+            *store.pool_meta.write().await = stale_topology;
+            let stale = stable_scanner_pause_backlog_record(&pending.ledger, pending.authoritative_commit.as_ref(), &members);
+            write_scanner_pause_backlog_record(Arc::clone(&store), &pending, stale)
+                .await
+                .expect_err("the old cohort must reject publication after retirement");
+            for (id, expected) in surviving.into_iter().zip(before) {
+                assert_eq!(
+                    native_replica_bytes(&store.pools[id.pool_index].disk_set[id.set_index]).await,
+                    expected,
+                    "a rejected old cohort must preserve every survivor's payload and revision"
+                );
+            }
+            assert_eq!(native_replica_bytes(&store.pools[0].disk_set[0]).await.0, source_before);
+            let invalid = Arc::clone(&store)
+                .save_scanner_pause_backlog_replica_for_membership(0, 0, source_before, Default::default(), Arc::from([1, 2]))
+                .await
+                .expect_err("a replica outside the captured cohort must be rejected");
+            assert!(matches!(invalid, EcstoreError::InvalidArgument(_, _, _)));
+            shutdown_native_retirement_store(store).await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_retirement_reads_queued_pool_authority_without_writing_it() {
+        run_native_retirement_test(async || {
+            let (_root, store, original) = native_expanded_backlog_store(2, false).await;
+            let queued_before = native_replica_bytes(&store.pools[1].disk_set[0]).await.0;
+            store
+                .prepare_scanner_pause_backlog_retirement_targets_for_test(&[0, 1], queued_before.len() * 2)
+                .await
+                .expect("queue both old-cohort pools for retirement");
+            for set_index in 0..2 {
+                store
+                    .retire_scanner_pause_backlog_for_test(0, set_index)
+                    .await
+                    .expect("the queued pool must remain available to prove old authority");
+                assert_native_source_missing(&store, set_index).await;
+                for queued_set in &store.pools[1].disk_set {
+                    assert_eq!(
+                        native_replica_bytes(queued_set).await.0,
+                        queued_before,
+                        "queued authority replicas must never be rewritten"
+                    );
+                }
+                let loaded = load_scanner_pause_backlog(Arc::clone(&store))
+                    .await
+                    .expect("active survivors must own the unchanged ledger");
+                assert_eq!(loaded.ledger, original);
+                assert!(loaded.durable && loaded.stable_matches_ledger);
+                let committed = loaded.authoritative_commit.expect("survivor commit proof");
+                assert_eq!(committed.replicas, vec![replica_id(2, 0), replica_id(2, 1)]);
+            }
+            shutdown_native_retirement_store(store).await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn native_retirement_partial_native_phases_resume_from_persisted_authority() {
         run_native_retirement_test(async || {
             use crate::storage_api::owner::NativeScannerPauseBacklogWriteFault;
@@ -3948,8 +4054,50 @@ mod tests {
         ScannerPauseBacklogRetirementReplica {
             pool_index: id.pool_index,
             set_index: id.set_index,
+            writable: true,
             data: Some(serde_json::to_vec(record).expect("native record bytes")),
         }
+    }
+
+    #[test]
+    fn native_retirement_read_only_members_cannot_hide_authority_conflicts() {
+        let source = replica_id(0, 0);
+        let queued = replica_id(1, 0);
+        let target = replica_id(2, 0);
+        let old = durable_ledger(50);
+        let mut newer = old.clone();
+        newer.claim_writer(100).expect("newer source authority");
+        prepare_scanner_pause_backlog_persist(&mut newer, 100).expect("persist newer source authority");
+        let old_record = replica_record_for_members(&old, &old, &[target]);
+        let new_record = replica_record_for_members(&newer, &newer, &[source, queued]);
+        let mut replicas = vec![
+            retirement_replica(source, &new_record),
+            retirement_replica(queued, &new_record),
+            retirement_replica(target, &old_record),
+        ];
+        replicas[1].writable = false;
+        assert!(
+            matches!(
+                plan_scanner_pause_backlog_retirement(0, &replicas),
+                Err(ScannerPauseBacklogRetirementError::AuthorityConflict { .. })
+            ),
+            "a queued member's proof must prevent replacing surviving authority"
+        );
+        assert!(verify_scanner_pause_backlog_retirement(0, &replicas).is_err());
+        replicas[1].data = Some(b"invalid native authority".to_vec());
+        assert!(
+            matches!(
+                plan_scanner_pause_backlog_retirement(0, &replicas),
+                Err(ScannerPauseBacklogRetirementError::InvalidRecord { .. })
+            ),
+            "read-only members must still be decoded and validated"
+        );
+        replicas[1].data = None;
+        replicas[2].data = None;
+        assert!(
+            plan_scanner_pause_backlog_retirement(0, &replicas).is_err(),
+            "missing old and surviving members cannot fabricate a complete commit"
+        );
     }
 
     #[test]
@@ -4033,6 +4181,7 @@ mod tests {
         replicas.extend(targets.iter().map(|id| ScannerPauseBacklogRetirementReplica {
             pool_index: id.pool_index,
             set_index: id.set_index,
+            writable: true,
             data: None,
         }));
         let error = plan_scanner_pause_backlog_retirement(0, &replicas)
