@@ -16563,6 +16563,16 @@ impl ECStore {
         source_pool_index: usize,
         source_bytes: usize,
     ) -> Result<()> {
+        self.prepare_scanner_pause_backlog_retirement_targets_for_test(&[source_pool_index], source_bytes)
+            .await
+    }
+
+    #[cfg(feature = "test-util")]
+    pub async fn prepare_scanner_pause_backlog_retirement_targets_for_test(
+        &self,
+        source_pool_indices: &[usize],
+        source_bytes: usize,
+    ) -> Result<()> {
         let source_bytes = source_bytes.max(1);
         let total = source_bytes.saturating_mul(8).saturating_add(64 * 1024);
         let capacities = (0..self.pools.len())
@@ -16570,14 +16580,18 @@ impl ECStore {
                 DecommissionPoolCapacityInfo::for_test(
                     pool_index,
                     DecommissionErasureLayout { data: 1, parity: 0 },
-                    if pool_index == source_pool_index { 0 } else { total },
+                    if source_pool_indices.contains(&pool_index) { 0 } else { total },
                     total,
-                    if pool_index == source_pool_index { source_bytes } else { 0 },
+                    if source_pool_indices.contains(&pool_index) {
+                        source_bytes
+                    } else {
+                        0
+                    },
                 )
             })
             .collect();
         set_decommission_capacity_info_overrides_for_test(self.id, vec![capacities]);
-        self.save_current_pool_meta_for_decommission_start(&[source_pool_index], Vec::new())
+        self.save_current_pool_meta_for_decommission_start(source_pool_indices, Vec::new())
             .await
             .map(|_| ())
     }
@@ -16679,8 +16693,8 @@ impl ECStore {
         capacity_owner: Option<DecommissionCapacityOwner>,
     ) -> Result<DecommissionEntryAttemptOutcome> {
         use data_movement::scanner_backlog::{
-            SCANNER_PAUSE_BACKLOG_PATH, persist_native_scanner_pause_backlog_replica, plan_scanner_pause_backlog_retirement,
-            read_scanner_pause_backlog_retirement_replicas,
+            SCANNER_PAUSE_BACKLOG_PATH, ScannerPauseBacklogRetirementPhase, persist_native_scanner_pause_backlog_replica,
+            plan_scanner_pause_backlog_retirement, read_scanner_pause_backlog_retirement_replicas,
         };
 
         if expected.versions.is_empty() && expected.free_versions.is_empty() {
@@ -16735,19 +16749,32 @@ impl ECStore {
             .pools
             .iter()
             .enumerate()
-            .filter(|(pool_index, _)| *pool_index == idx || snapshot.scanner_pause_backlog_pool_writable(*pool_index))
-            .flat_map(|(_, pool)| pool.disk_set.iter().cloned())
+            // Queued pools can still carry members of the last native commit.
+            // Read their proof without admitting them as handoff destinations.
+            .filter(|(pool_index, _)| {
+                *pool_index == idx
+                    || snapshot
+                        .pools
+                        .get(*pool_index)
+                        .is_some_and(|pool| !pool.decommission.as_ref().is_some_and(|info| info.complete))
+            })
+            .flat_map(|(pool_index, pool)| {
+                let writable = snapshot.scanner_pause_backlog_pool_writable(pool_index);
+                pool.disk_set.iter().map(move |set| (Arc::clone(set), writable))
+            })
             .collect();
         let mut replicas = read_scanner_pause_backlog_retirement_replicas(idx, set.set_index, sets.clone()).await?;
-        if let Some(plan) = plan_scanner_pause_backlog_retirement(idx, &replicas)? {
+        if let Some(plan) =
+            plan_scanner_pause_backlog_retirement(idx, &replicas, ScannerPauseBacklogRetirementPhase::InitialRead)?
+        {
             let expected_stable_record = plan.stable_record.clone();
             let mut phases = Vec::with_capacity(3);
             if let Some(record) = plan.seed_record {
-                phases.push(("seed", record));
+                phases.push(("seed", ScannerPauseBacklogRetirementPhase::SeedReadback, record));
             }
-            phases.push(("commit", plan.commit_record));
-            phases.push(("stabilize", plan.stable_record));
-            for (phase, record) in phases {
+            phases.push(("commit", ScannerPauseBacklogRetirementPhase::CommitReadback, plan.commit_record));
+            phases.push(("stabilize", ScannerPauseBacklogRetirementPhase::StabilizeReadback, plan.stable_record));
+            for (phase, readback_phase, record) in phases {
                 if object_fence.is_lock_lost()
                     || pool_meta_guard.is_lock_lost()
                     || !reservation.admits_owner(owner, OffsetDateTime::now_utc())
@@ -16756,28 +16783,37 @@ impl ECStore {
                         "scanner pause backlog retirement fence expired during native repair",
                     ));
                 }
-                for read in replicas.iter().filter(|read| read.replica.pool_index != idx) {
+                for read in replicas
+                    .iter()
+                    .filter(|read| read.replica.pool_index != idx && read.replica.writable)
+                {
                     ensure_external_decommission_target_admission(
                         &snapshot,
                         read.replica.pool_index,
                         DecommissionCapacityAdmission::ScannerBacklog,
                     )?;
                 }
-                let results = join_all(replicas.iter().filter(|read| read.replica.pool_index != idx).map(|read| {
-                    let target = Arc::clone(&self.pools[read.replica.pool_index].disk_set[read.replica.set_index]);
-                    let record = record.clone();
-                    let object_fence = &object_fence;
-                    let pool_meta_guard = &pool_meta_guard;
-                    async move {
-                        let mut opts = ObjectOptions {
-                            no_lock: self.pools[0].disk_set[0].shares_namespace_lock_domain(&target).await,
-                            ..Default::default()
-                        };
-                        object_fence.add_namespace_lock_fence(&mut opts);
-                        opts.add_namespace_lock_guard(pool_meta_guard);
-                        persist_native_scanner_pause_backlog_replica(target, record, read.preconditions(), opts, phase).await
-                    }
-                }))
+                let results = join_all(
+                    replicas
+                        .iter()
+                        .filter(|read| read.replica.pool_index != idx && read.replica.writable)
+                        .map(|read| {
+                            let target = Arc::clone(&self.pools[read.replica.pool_index].disk_set[read.replica.set_index]);
+                            let record = record.clone();
+                            let object_fence = &object_fence;
+                            let pool_meta_guard = &pool_meta_guard;
+                            async move {
+                                let mut opts = ObjectOptions {
+                                    no_lock: self.pools[0].disk_set[0].shares_namespace_lock_domain(&target).await,
+                                    ..Default::default()
+                                };
+                                object_fence.add_namespace_lock_fence(&mut opts);
+                                opts.add_namespace_lock_guard(pool_meta_guard);
+                                persist_native_scanner_pause_backlog_replica(target, record, read.preconditions(), opts, phase)
+                                    .await
+                            }
+                        }),
+                )
                 .await;
                 // Every dispatched native CAS has finished before an error can
                 // release the owned task's object and durable membership fences.
@@ -16787,20 +16823,20 @@ impl ECStore {
                 replicas = read_scanner_pause_backlog_retirement_replicas(idx, set.set_index, sets.clone()).await?;
                 if replicas
                     .iter()
-                    .filter(|read| read.replica.pool_index != idx)
+                    .filter(|read| read.replica.pool_index != idx && read.replica.writable)
                     .any(|read| read.replica.data.as_deref() != Some(record.as_slice()))
                 {
                     return Err(Error::other(
                         "scanner pause backlog native repair did not persist every surviving replica",
                     ));
                 }
-                if let Some(next) = plan_scanner_pause_backlog_retirement(idx, &replicas)?
+                if let Some(next) = plan_scanner_pause_backlog_retirement(idx, &replicas, readback_phase)?
                     && next.stable_record != expected_stable_record
                 {
                     return Err(Error::other("scanner pause backlog native authority changed during repair"));
                 }
             }
-            if plan_scanner_pause_backlog_retirement(idx, &replicas)?.is_some() {
+            if plan_scanner_pause_backlog_retirement(idx, &replicas, ScannerPauseBacklogRetirementPhase::FinalCheck)?.is_some() {
                 return Err(Error::other("scanner pause backlog native repair is not fully committed and stable"));
             }
         }
@@ -27386,40 +27422,45 @@ mod tests {
 
     #[test]
     fn decommission_scanner_backlog_handoff_retry_is_typed_and_bounded() {
-        use data_movement::scanner_backlog::ScannerPauseBacklogRetirementError;
+        use data_movement::scanner_backlog::{ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPhase};
 
-        let handoff = data_movement::data_movement_context_error(
-            "scanner pause backlog retirement planner failed: competing proofs".to_string(),
-            ScannerPauseBacklogRetirementError::HandoffConflict {
-                reason: "competing maximum-membership commit proofs".to_string(),
-            },
-        );
-        assert!(is_decommission_scanner_backlog_handoff_conflict(&handoff));
-        assert_eq!(
-            decommission_scanner_backlog_retry_kind(&handoff, DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS - 1),
-            Some(DecommissionScannerBacklogRetryKind::HandoffConflict)
-        );
-        assert_eq!(
-            decommission_scanner_backlog_retry_kind(&handoff, DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS),
-            None,
-            "a divergent handoff must not retry forever"
-        );
-
-        for non_retryable in [
-            ScannerPauseBacklogRetirementError::AuthorityConflict {
-                reason: "larger source authority".to_string(),
-            },
-            ScannerPauseBacklogRetirementError::InvalidRecord {
-                reason: "unread member".to_string(),
-            },
+        for phase in [
+            ScannerPauseBacklogRetirementPhase::InitialRead,
+            ScannerPauseBacklogRetirementPhase::SeedReadback,
+            ScannerPauseBacklogRetirementPhase::CommitReadback,
+            ScannerPauseBacklogRetirementPhase::StabilizeReadback,
+            ScannerPauseBacklogRetirementPhase::FinalCheck,
         ] {
-            let err = data_movement::data_movement_context_error("planner failed".to_string(), non_retryable);
-            assert!(!is_decommission_scanner_backlog_handoff_conflict(&err));
+            let handoff = phase.planner_error(ScannerPauseBacklogRetirementError::HandoffConflict {
+                reason: "competing maximum-membership commit proofs".to_string(),
+            });
+            assert!(is_decommission_scanner_backlog_handoff_conflict(&handoff));
             assert_eq!(
-                decommission_scanner_backlog_retry_kind(&err, 0),
-                None,
-                "only a handoff conflict may be retried"
+                decommission_scanner_backlog_retry_kind(&handoff, DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS - 1),
+                Some(DecommissionScannerBacklogRetryKind::HandoffConflict)
             );
+            assert_eq!(
+                decommission_scanner_backlog_retry_kind(&handoff, DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS),
+                None,
+                "a divergent handoff must not retry forever"
+            );
+
+            for non_retryable in [
+                ScannerPauseBacklogRetirementError::AuthorityConflict {
+                    reason: "larger source authority".to_string(),
+                },
+                ScannerPauseBacklogRetirementError::InvalidRecord {
+                    reason: "unread member".to_string(),
+                },
+            ] {
+                let err = phase.planner_error(non_retryable);
+                assert!(!is_decommission_scanner_backlog_handoff_conflict(&err));
+                assert_eq!(
+                    decommission_scanner_backlog_retry_kind(&err, 0),
+                    None,
+                    "only a handoff conflict may be retried"
+                );
+            }
         }
     }
 

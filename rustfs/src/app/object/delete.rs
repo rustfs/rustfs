@@ -828,8 +828,6 @@ impl DefaultObjectUsecase {
             .await;
 
         let _manager = get_concurrency_manager();
-        let _bucket_clone = bucket.clone();
-        let _deleted_objects = dobjs.clone();
         if !errs.is_empty() && errs.iter().all(|err| err.as_ref().is_some_and(is_err_bucket_not_found)) {
             let result = Err(S3Error::with_message(S3ErrorCode::NoSuchBucket, "Bucket not found".to_string()));
             let _ = helper.complete(&result);

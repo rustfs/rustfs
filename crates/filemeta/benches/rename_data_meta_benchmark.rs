@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use bytes::Bytes;
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
-use rustfs_filemeta::{ErasureAlgo, FileInfo, FileMeta};
+use rustfs_filemeta::{ErasureAlgo, FileInfo, FileMeta, ObjectPartInfo};
 use std::hint::black_box;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -55,7 +56,8 @@ fn build_meta_with_versions(version_count: usize) -> FileMeta {
 fn bench_rename_data_meta_path(c: &mut Criterion) {
     let mut group = c.benchmark_group("rename_data_meta");
     group.sample_size(20);
-    group.measurement_time(Duration::from_secs(10));
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_secs(1));
 
     for &version_count in VERSION_COUNT_CASES {
         let seeded = build_meta_with_versions(version_count);
@@ -66,6 +68,10 @@ fn bench_rename_data_meta_path(c: &mut Criterion) {
             .first()
             .and_then(|v| v.header.version_id)
             .unwrap_or(Uuid::nil());
+
+        group.bench_with_input(BenchmarkId::new("find_unshared_data_dir", version_count), &version_count, |b, _| {
+            b.iter(|| black_box(seeded.find_unshared_data_dir_for_version(black_box(Some(replace_version_id)))));
+        });
 
         group.bench_with_input(BenchmarkId::new("read_modify_write", version_count), &version_count, |b, _| {
             b.iter(|| {
@@ -114,5 +120,59 @@ fn bench_rename_data_meta_path(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_rename_data_meta_path);
+fn bench_delete_version_batches(c: &mut Criterion) {
+    let mut group = c.benchmark_group("delete_version_batch");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_secs(1));
+    for (kind, inline_size) in [
+        ("physical", None),
+        ("inline-64", Some(64_usize)),
+        ("inline-9k", Some(9 * 1024)),
+    ] {
+        for (versions, requested) in [(1_usize, 1), (8, 8), (32, 32), (128, 128), (1000, 1000), (1000, 32)] {
+            let mut meta = FileMeta::new();
+            let base_time = OffsetDateTime::from_unix_timestamp(BENCH_BASE_TIME_UNIX_SECS).expect("fixture timestamp");
+            for id in 1..=versions {
+                let size = inline_size.unwrap_or(64 * 1024);
+                let mut info = make_file_info(
+                    Uuid::from_u128(u128::try_from(id).expect("version id")),
+                    Uuid::from_u128(u128::try_from(versions + id).expect("directory id")),
+                    i64::try_from(size).expect("object size"),
+                    base_time + time::Duration::seconds(i64::try_from(id).expect("version time")),
+                );
+                info.parts.push(ObjectPartInfo {
+                    number: 1,
+                    size,
+                    actual_size: info.size,
+                    ..Default::default()
+                });
+                if inline_size.is_some() {
+                    info.set_inline_data();
+                    info.data = Some(Bytes::from(vec![42; size]));
+                }
+                meta.add_version(info).expect("seed batch metadata");
+            }
+            let requests: Vec<_> = meta
+                .versions
+                .iter()
+                .take(requested)
+                .map(|version| FileInfo {
+                    version_id: version.header.version_id,
+                    ..Default::default()
+                })
+                .collect();
+            group.bench_with_input(BenchmarkId::new(format!("{kind}-r{requested}"), versions), &versions, |b, _| {
+                b.iter_batched(
+                    || meta.clone(),
+                    |mut metadata| black_box(metadata.delete_versions(black_box(&requests)).expect("delete batch")),
+                    BatchSize::LargeInput,
+                )
+            });
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_rename_data_meta_path, bench_delete_version_batches);
 criterion_main!(benches);

@@ -204,6 +204,97 @@ fn bench_delete_inline_versions(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_metacache_stream_page(c: &mut Criterion) {
+    let xl_bytes = create_real_xlmeta().expect("create_real_xlmeta failed");
+    let mut entries = Vec::with_capacity(2000);
+    for i in 0..1000 {
+        entries.push(MetaCacheEntry {
+            name: format!("prefix/subprefix/object-{i:04}"),
+            metadata: xl_bytes.clone(),
+            cached: None,
+            reusable: false,
+        });
+        entries.push(MetaCacheEntry {
+            name: format!("prefix/subprefix/object-{i:04}/"),
+            metadata: Vec::new(),
+            cached: None,
+            reusable: false,
+        });
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current_thread runtime");
+
+    let encoded_stream = rt.block_on(async {
+        let mut cursor = std::io::Cursor::new(Vec::with_capacity(512 * 1024));
+        let mut writer = rustfs_filemeta::MetacacheWriter::new(&mut cursor);
+        writer.write(&entries).await.expect("encode entries");
+        writer.close().await.expect("close stream");
+        cursor.into_inner()
+    });
+
+    let mut group = c.benchmark_group("metacache_stream_page");
+
+    group.bench_function("reader_read_all/1000_objects", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let mut reader =
+                    rustfs_filemeta::MetacacheReader::new(std::io::Cursor::new(black_box(encoded_stream.as_slice())));
+                let out = reader.read_all().await.expect("read_all");
+                black_box(out.len());
+            });
+        });
+    });
+
+    group.bench_function("duplex_4k_write_and_read/1000_objects", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let (rd, mut wr) = tokio::io::duplex(4096);
+                let entries_ref = &entries;
+                let writer_fut = async move {
+                    let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
+                    for chunk in entries_ref.chunks(64) {
+                        out.write(chunk).await.expect("write");
+                    }
+                    out.close().await.expect("close");
+                };
+                let reader_fut = async move {
+                    let mut reader = rustfs_filemeta::MetacacheReader::new(rd);
+                    let out = reader.read_all().await.expect("read_all");
+                    black_box(out.len());
+                };
+                tokio::join!(writer_fut, reader_fut);
+            });
+        });
+    });
+
+    group.bench_function("duplex_4k_write_obj_and_read/1000_objects", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let (rd, mut wr) = tokio::io::duplex(4096);
+                let entries_ref = &entries;
+                let writer_fut = async move {
+                    let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
+                    for entry in entries_ref {
+                        out.write_obj(entry).await.expect("write_obj");
+                    }
+                    out.close().await.expect("close");
+                };
+                let reader_fut = async move {
+                    let mut reader = rustfs_filemeta::MetacacheReader::new(rd);
+                    let out = reader.read_all().await.expect("read_all");
+                    black_box(out.len());
+                };
+                tokio::join!(writer_fut, reader_fut);
+            });
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_create_real_xlmeta,
@@ -218,7 +309,8 @@ criterion_group!(
     bench_validate_integrity,
     bench_into_fileinfo_realistic,
     bench_list_page_to_fileinfo,
-    bench_delete_inline_versions
+    bench_delete_inline_versions,
+    bench_metacache_stream_page
 );
 
 criterion_main!(benches);

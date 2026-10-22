@@ -156,6 +156,9 @@ pub enum ReadVersionContextBoundary {
     AppPutOwner,
     PutCommitOwner,
     TierFreeVersionSourceLookup,
+    BucketTask,
+    BackgroundTask,
+    DetachedMutation,
 }
 
 #[cfg(feature = "diagnostic-read-version-caller")]
@@ -181,6 +184,9 @@ impl ReadVersionContextBoundary {
             Self::AppPutOwner => "app_put_owner",
             Self::PutCommitOwner => "put_commit_owner",
             Self::TierFreeVersionSourceLookup => "tier_free_version_source_lookup",
+            Self::BucketTask => "bucket_task",
+            Self::BackgroundTask => "background_task",
+            Self::DetachedMutation => "detached_mutation",
         }
     }
 }

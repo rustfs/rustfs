@@ -363,7 +363,7 @@ impl PartialWrites {
     }
 
     pub(super) async fn note_retired_generation_proofs(&mut self, manager: &HealManager) {
-        let mut anchors_by_generation: HashMap<(Arc<str>, Uuid), Vec<MrfDurableRepairAnchor>> = HashMap::new();
+        let mut intents_by_generation: HashMap<(Arc<str>, Uuid), Vec<&MrfIntent>> = HashMap::new();
         for entry in self.entries.values() {
             if !entry.persisted {
                 continue;
@@ -371,21 +371,19 @@ impl PartialWrites {
             let Some(source_incarnation) = entry.source_bucket_incarnation_id else {
                 continue;
             };
-            let Some(anchor) = MrfDurableRepairAnchor::from_intent(&entry.intent, source_incarnation)
-                .filter(|anchor| anchor.bucket_incarnation_id == source_incarnation)
-            else {
+            if !MrfDurableRepairAnchor::is_eligible_for_source(&entry.intent, source_incarnation) {
                 continue;
-            };
-            anchors_by_generation
-                .entry((anchor.bucket.clone(), source_incarnation))
+            }
+            intents_by_generation
+                .entry((entry.intent.bucket.clone(), source_incarnation))
                 .or_default()
-                .push(anchor);
+                .push(&entry.intent);
         }
 
         self.retirement_checks
-            .retain(|generation, _| anchors_by_generation.contains_key(generation));
+            .retain(|generation, _| intents_by_generation.contains_key(generation));
         let now = Instant::now();
-        for ((bucket, incarnation), anchors) in anchors_by_generation {
+        for ((bucket, incarnation), intents) in intents_by_generation {
             let retired = match self.retirement_checks.get(&(bucket.clone(), incarnation)) {
                 Some((_, true)) => true,
                 Some((checked_at, false))
@@ -406,11 +404,16 @@ impl PartialWrites {
                 continue;
             }
 
-            for anchor in anchors {
+            for intent in intents {
+                let Some(anchor) = MrfDurableRepairAnchor::from_intent(intent, incarnation)
+                    .filter(|anchor| anchor.bucket_incarnation_id == incarnation)
+                else {
+                    continue;
+                };
                 rustfs_common::mrf_channel::note_mrf_verified_repair(MrfVerifiedRepairEvent {
                     kind: anchor.kind,
-                    bucket: anchor.bucket.clone(),
-                    object: anchor.object.clone(),
+                    bucket: anchor.bucket,
+                    object: anchor.object,
                     version_id: anchor.version_id,
                     scope: anchor.scope,
                     delete_marker_purge: anchor.delete_marker_purge,
@@ -1016,6 +1019,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use uuid::Uuid;
+
+    mod retirement_tests;
 
     fn intent(object: &str) -> MrfIntent {
         let mut intent = MrfIntent {

@@ -280,15 +280,15 @@ name = "comparison_benchmark"
 harness = false
 
 [[bench]]
-name = "rename_data_meta_benchmark"
-harness = false
-
-[[bench]]
 name = "single_block_non_inline_benchmark"
 harness = false
 
 [[bench]]
 name = "multipart_read_parts_benchmark"
+harness = false
+
+[[bench]]
+name = "local_walk_dir_benchmark"
 harness = false
 
 [lib]

@@ -17,8 +17,8 @@
 #[cfg(feature = "diagnostic-read-version-caller")]
 pub mod diagnostic {
     pub use crate::cluster::rpc::runtime_sources::{
-        current_read_version_entry_source, observe_read_version_context_boundary, with_read_version_entry,
-        with_read_version_spawn_context,
+        current_read_version_entry_source, observe_read_version_context_boundary, with_captured_read_version_context,
+        with_read_version_entry, with_read_version_spawn_context,
     };
     pub use rustfs_io_metrics::internode_metrics::{ReadVersionContextBoundary, ReadVersionEntrySource};
 }

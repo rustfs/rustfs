@@ -21,7 +21,7 @@ use super::run_destination_commit_directory_preparation;
 use super::should_fail_local_inline_rollback_hardlink;
 use super::{
     EVENT_DISK_LOCAL_ACCESS_FAILED, EVENT_DISK_LOCAL_HEAL_PURGE_FAILED, EVENT_DISK_LOCAL_RENAME_REJECTED, LOG_COMPONENT_ECSTORE,
-    LOG_SUBSYSTEM_DISK_LOCAL, LocalDisk, SyncMode, effective_durability, inline_metadata_rollback_dir, observe_old_current_size,
+    LOG_SUBSYSTEM_DISK_LOCAL, LocalDisk, SyncMode, effective_durability, inline_metadata_rollback_dir, observe_old_current,
     remove_dir_all_if_exists, remove_dst_base_before_commit, remove_file_if_exists, rename_data_versions_signature,
     run_inline_preparation_before_backup, should_fail_after_metadata_commit, should_fail_before_old_metadata_backup,
     should_fail_commit_rename, should_remove_staged_meta_before_commit, skip_access_checks, tmp_staging_mutation_path,
@@ -46,33 +46,6 @@ use std::{
 use tokio::fs;
 use tracing::{info, warn};
 use uuid::Uuid;
-
-fn transitioned_old_current_source(
-    dst_meta_existed: bool,
-    dst_meta_unparsable: bool,
-    xlmeta: &FileMeta,
-    volume: &str,
-    path: &str,
-    version_id: Uuid,
-) -> (bool, Option<FileInfo>) {
-    if dst_meta_unparsable {
-        return (false, None);
-    }
-    if !dst_meta_existed {
-        return (true, None);
-    }
-    let Ok(old_current) = xlmeta.into_fileinfo(volume, path, "", false, false, true) else {
-        return (false, None);
-    };
-    if old_current.version_id.unwrap_or_default() != version_id {
-        return (true, None);
-    }
-    if old_current.transition_status == rustfs_filemeta::TRANSITION_COMPLETE {
-        (true, Some(old_current))
-    } else {
-        (true, None)
-    }
-}
 
 /// Hold later repair publications after admitting one baseline object. The
 /// fixture arms this on one replacement disk before rejoining the cluster.
@@ -526,12 +499,6 @@ impl LocalDisk {
                 }
             }
 
-            let old_current_size = if dst_meta_unparsable {
-                None
-            } else {
-                observe_old_current_size(has_dst_buf.is_some(), &xlmeta)
-            };
-
             let mut skip_parent = dst_volume_dir.clone();
             if has_dst_buf.as_ref().is_some()
                 && let Some(parent) = dst_file_path.parent()
@@ -540,18 +507,11 @@ impl LocalDisk {
             }
 
             let version_id = fi.version_id.unwrap_or_default();
-            let (old_current_source_checked, old_current_source) = transitioned_old_current_source(
-                has_dst_buf.is_some(),
-                dst_meta_unparsable,
-                &xlmeta,
-                dst_volume,
-                dst_path,
-                version_id,
-            );
+            let (old_current_size, old_current_source_checked, old_current_source) =
+                observe_old_current(has_dst_buf.is_some(), dst_meta_unparsable, &xlmeta, dst_volume, dst_path, version_id);
             let has_old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
-            let old_version_exists = xlmeta.find_version(Some(version_id)).is_ok();
             let rollback_data_dir = has_old_data_dir.or_else(|| {
-                if old_version_exists && has_dst_buf.is_some() {
+                if has_dst_buf.is_some() && xlmeta.find_version(Some(version_id)).is_ok() {
                     Some(inline_metadata_rollback_dir(version_id, &xlmeta))
                 } else {
                     None
@@ -993,14 +953,8 @@ impl LocalDisk {
                     }
                 }
 
-                let old_current_size = if dst_meta_unparsable {
-                    None
-                } else {
-                    observe_old_current_size(has_dst_buf.is_some(), &xlmeta)
-                };
-
                 let version_id = fi.version_id.unwrap_or_default();
-                let (old_current_source_checked, old_current_source) = transitioned_old_current_source(
+                let (old_current_size, old_current_source_checked, old_current_source) = observe_old_current(
                     has_dst_buf.is_some(),
                     dst_meta_unparsable,
                     &xlmeta,
@@ -1015,9 +969,8 @@ impl LocalDisk {
                 let rollback_data_dir = if fi_healing {
                     None
                 } else {
-                    let old_version_exists = xlmeta.find_version(Some(version_id)).is_ok();
                     old_data_dir.or_else(|| {
-                        if old_version_exists && has_dst_buf.is_some() {
+                        if has_dst_buf.is_some() && xlmeta.find_version(Some(version_id)).is_ok() {
                             Some(inline_metadata_rollback_dir(version_id, &xlmeta))
                         } else {
                             None

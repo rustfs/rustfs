@@ -68,6 +68,7 @@ proptest = "1"
 [[bench]]
 name = "hash_hotpath_benchmark"
 harness = false
+required-features = ["hash", "http", "path"]
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, optional = true, features = ["Win32_Storage_FileSystem"] }

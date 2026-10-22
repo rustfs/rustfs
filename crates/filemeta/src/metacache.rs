@@ -911,18 +911,30 @@ impl<W: AsyncWrite + Unpin> MetacacheWriter<W> {
                 return Err(Error::other("metacacheWriter: no name"));
             }
 
-            self.write_obj(obj).await?;
+            Self::encode_obj(&mut self.buf, obj)?;
+            if self.buf.len() >= METACACHE_READ_CHUNK_SIZE {
+                self.flush().await?;
+            }
         }
 
+        if !self.buf.is_empty() {
+            self.flush().await?;
+        }
+
+        Ok(())
+    }
+
+    fn encode_obj(buf: &mut Vec<u8>, obj: &MetaCacheEntry) -> Result<()> {
+        rmp::encode::write_bool(buf, true).map_err(|e| Error::other(format!("{e:?}")))?;
+        rmp::encode::write_str(buf, &obj.name).map_err(|e| Error::other(format!("{e:?}")))?;
+        rmp::encode::write_bin(buf, &obj.metadata).map_err(|e| Error::other(format!("{e:?}")))?;
         Ok(())
     }
 
     pub async fn write_obj(&mut self, obj: &MetaCacheEntry) -> Result<()> {
         self.init().await?;
 
-        rmp::encode::write_bool(&mut self.buf, true).map_err(|e| Error::other(format!("{e:?}")))?;
-        rmp::encode::write_str(&mut self.buf, &obj.name).map_err(|e| Error::other(format!("{e:?}")))?;
-        rmp::encode::write_bin(&mut self.buf, &obj.metadata).map_err(|e| Error::other(format!("{e:?}")))?;
+        Self::encode_obj(&mut self.buf, obj)?;
         self.flush().await?;
 
         Ok(())
@@ -942,6 +954,7 @@ pub struct MetacacheReader<R> {
     in_entry: bool,
     err: Option<Error>,
     buf: Vec<u8>,
+    pos: usize,
     has_current: bool,
 }
 
@@ -953,63 +966,111 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
             in_entry: false,
             err: None,
             buf: Vec::new(),
+            pos: 0,
             has_current: false,
         }
     }
 
     pub async fn read_more(&mut self, read_size: usize) -> Result<&[u8]> {
+        self.read_more_inner(read_size, true).await
+    }
+
+    async fn read_more_inner(&mut self, read_size: usize, lookahead: bool) -> Result<&[u8]> {
         if let Some(err) = &self.err {
             return Err(err.clone());
         }
 
-        let pref = self.buf.len();
-        let Some(ext_size) = pref.checked_add(read_size) else {
-            let err = Error::other("metacache stream: element length overflow");
-            self.err = Some(err.clone());
-            return Err(err);
-        };
+        if self.buf.len() - self.pos >= read_size {
+            let start = self.pos;
+            self.pos += read_size;
+            return Ok(&self.buf[start..self.pos]);
+        }
+
+        if self.pos > 0 {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
 
         // A whole xl.meta can legitimately exceed the limit on its individual
         // msgpack values. Grow only as payload arrives, so a corrupt length
         // prefix cannot cause a speculative allocation of the advertised size.
-        while self.buf.len() < ext_size {
+        while self.buf.len() < read_size {
             let start = self.buf.len();
-            let extra = (ext_size - start).min(METACACHE_READ_CHUNK_SIZE);
+            let extra = if lookahead {
+                let min_chunk = METACACHE_READ_CHUNK_SIZE.saturating_sub(start);
+                (read_size - start).clamp(min_chunk, METACACHE_READ_CHUNK_SIZE)
+            } else {
+                (read_size - start).min(METACACHE_READ_CHUNK_SIZE)
+            };
             if let Err(e) = self.buf.try_reserve(extra) {
                 let err = Error::other(format!("metacache stream: buffer allocation of {extra} bytes failed: {e}"));
                 self.err = Some(err.clone());
                 return Err(err);
             }
-            self.buf.resize(start + extra, 0);
-            if let Err(e) = self.rd.read_exact(&mut self.buf[start..]).await {
-                // Listings treat Unexpected/UnexpectedEof as clean exhaustion.
-                // An incomplete entry must not hide remaining keys. Preserve
-                // the existing empty/between-entry EOF handling.
-                let err = match e.kind() {
-                    std::io::ErrorKind::UnexpectedEof if self.in_entry => Error::FileCorrupt,
-                    _ => Error::from(e),
-                };
-                self.err = Some(err.clone());
-                return Err(err);
+            let mut dst = bytes::BufMut::limit(&mut self.buf, extra);
+            match self.rd.read_buf(&mut dst).await {
+                Ok(0) => {
+                    // Listings treat Unexpected/UnexpectedEof as clean exhaustion.
+                    // An incomplete entry must not hide remaining keys. Preserve
+                    // the existing empty/between-entry EOF handling.
+                    let err = if self.in_entry {
+                        Error::FileCorrupt
+                    } else {
+                        Error::Unexpected
+                    };
+                    self.err = Some(err.clone());
+                    return Err(err);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let err = match e.kind() {
+                        std::io::ErrorKind::UnexpectedEof if self.in_entry => Error::FileCorrupt,
+                        _ => Error::from(e),
+                    };
+                    self.err = Some(err.clone());
+                    return Err(err);
+                }
             }
         }
 
-        Ok(&self.buf[pref..ext_size])
+        self.pos = read_size;
+        Ok(&self.buf[..read_size])
     }
 
     async fn discard(&mut self, mut size: usize) -> Result<()> {
-        self.reset();
+        let avail = self.buf.len() - self.pos;
+        if size <= avail {
+            self.pos += size;
+            self.reset();
+            return Ok(());
+        }
+        size -= avail;
+        self.buf.clear();
+        self.pos = 0;
         while size > 0 {
             let chunk = size.min(METACACHE_READ_CHUNK_SIZE);
-            self.read_more(chunk).await?;
+            self.read_more_inner(chunk, false).await?;
             size -= chunk;
-            self.reset();
+            self.buf.clear();
+            self.pos = 0;
         }
         Ok(())
     }
 
     fn reset(&mut self) {
-        self.buf.clear();
+        if self.pos >= self.buf.len() {
+            self.buf.clear();
+            self.pos = 0;
+            if self.buf.capacity() > METACACHE_READ_CHUNK_SIZE {
+                self.buf.shrink_to(METACACHE_READ_CHUNK_SIZE);
+            }
+        } else if self.pos >= METACACHE_READ_CHUNK_SIZE {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+            if self.buf.capacity() > METACACHE_READ_CHUNK_SIZE {
+                self.buf.shrink_to(METACACHE_READ_CHUNK_SIZE);
+            }
+        }
     }
 
     async fn check_init(&mut self) -> Result<()> {
@@ -1164,9 +1225,11 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
 
         let l = self.read_bin_len().await?;
 
-        let buf = self.read_more(l as usize).await?;
-
-        let metadata = buf.to_vec();
+        let metadata = if l == 0 {
+            Vec::new()
+        } else {
+            self.read_more(l as usize).await?.to_vec()
+        };
 
         self.in_entry = false;
         self.reset();
@@ -1367,6 +1430,74 @@ mod tests {
             .await
             .expect("skip must consume the current and following entry");
         assert_eq!(reader.read_all().await.expect("remaining entries must decode"), entries[3..]);
+    }
+
+    struct FragmentedReader<'a> {
+        data: &'a [u8],
+        chunk: usize,
+        reads: usize,
+    }
+
+    impl AsyncRead for FragmentedReader<'_> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let count = this.data.len().min(this.chunk).min(buf.remaining());
+            buf.put_slice(&this.data[..count]);
+            this.data = &this.data[count..];
+            this.reads += 1;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reader_buffered_wire_frames_survive_fragmented_reads_and_skips() {
+        for version in [1, 2] {
+            let mut bytes = vec![0xcc, version];
+            let payloads = [
+                vec![1; METACACHE_READ_CHUNK_SIZE - 1],
+                vec![],
+                vec![3; METACACHE_READ_CHUNK_SIZE + 1],
+            ];
+            for (i, payload) in payloads.iter().enumerate() {
+                rmp::encode::write_bool(&mut bytes, true).expect("entry marker");
+                rmp::encode::write_str(&mut bytes, &format!("key-{i}")).expect("entry name");
+                rmp::encode::write_bin(&mut bytes, payload).expect("entry metadata");
+            }
+            rmp::encode::write_bool(&mut bytes, false).expect("stream end");
+            for chunk in [1, 2, 7, 4096, METACACHE_READ_CHUNK_SIZE] {
+                let mut reader = MetacacheReader::new(FragmentedReader {
+                    data: &bytes,
+                    chunk,
+                    reads: 0,
+                });
+                assert_eq!(reader.peek().await.expect("first entry").expect("present").metadata, payloads[0]);
+                reader.skip(2).await.expect("consume first and empty second entries");
+                let last = reader.peek().await.expect("last entry").expect("present");
+                assert_eq!(last.name, "key-2");
+                assert_eq!(last.metadata, payloads[2]);
+                assert!(reader.peek().await.expect("valid terminator").is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reader_coalesces_small_entries_without_per_field_reads() {
+        let mut bytes = vec![0xcc, 2];
+        for _ in 0..1000 {
+            bytes.extend_from_slice(&[0xc3, 0xa1, b'x', 0xc4, 1, 0x42]);
+        }
+        bytes.push(0xc2);
+        let mut reader = MetacacheReader::new(FragmentedReader {
+            data: &bytes,
+            chunk: METACACHE_READ_CHUNK_SIZE,
+            reads: 0,
+        });
+        assert_eq!(reader.read_all().await.expect("decode page").len(), 1000);
+        assert_eq!(reader.rd.reads, 1, "a ready page smaller than 64 KiB needs one stream read");
     }
 
     #[tokio::test]
