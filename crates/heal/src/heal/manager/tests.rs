@@ -115,6 +115,8 @@ struct MockStorage;
 
 fn completed_retention_fixture(completed_at: SystemTime) -> CompletedHealStatus {
     CompletedHealStatus {
+        task_id: "fixture-token".to_string(),
+        source: HealRequestSource::Internal,
         outcome: None,
         heal_type: HealType::Cluster,
         options: HealOptions::default(),
@@ -2769,6 +2771,181 @@ async fn test_active_duplicate_token_can_query_and_cancel_original_task() {
 }
 
 #[tokio::test]
+async fn local_automatic_query_preserves_source_path_token_and_state() {
+    use crate::heal::channel::HealChannelProcessor;
+    use crate::heal::outcome::{
+        HealExecutionOutcome, HealObjectDisposition, HealObjectIdentity, HealObjectKind, HealObjectOutcome, HealTaskOutcome,
+        HealTraversalCoverage,
+    };
+
+    for source in [
+        HealRequestSource::Scanner,
+        HealRequestSource::Mrf,
+        HealRequestSource::AutoHeal,
+        HealRequestSource::ReadRepair,
+        HealRequestSource::Admin,
+        HealRequestSource::Internal,
+    ] {
+        for state in ["queued", "active", "retrying", "completed", "displaced"] {
+            let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+            let manager = Arc::new(HealManager::new_without_root_recovery_for_test(storage.clone(), None));
+            let mut request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+            request.source = source;
+            let token = request.id.clone();
+            let task = Arc::new(HealTask::from_request(request.clone(), storage));
+            let mut snapshot = CompletedHealStatus::snapshot(&task, HealTaskStatus::Completed).await;
+            assert_eq!(snapshot.source, source, "completion must retain actual task source");
+            let mut outcome = HealTaskOutcome::default();
+            outcome.execution = HealExecutionOutcome::Completed;
+            outcome.coverage = HealTraversalCoverage::Complete;
+            outcome.record(HealObjectOutcome {
+                identity: HealObjectIdentity {
+                    kind: HealObjectKind::Object,
+                    bucket: "bucket".to_string(),
+                    object: "object".to_string(),
+                    version_id: None,
+                    bucket_incarnation_id: Some(uuid::Uuid::nil()),
+                    pool_index: Some(0),
+                    set_index: Some(0),
+                },
+                disposition: HealObjectDisposition::VerifiedHealthy,
+                detail: None,
+            });
+            snapshot.outcome = Some(Arc::new(outcome));
+            snapshot.seqed_items = vec![(
+                3,
+                HealResultItem {
+                    bucket: "bucket".to_string(),
+                    object: "object".to_string(),
+                    ..Default::default()
+                },
+            )];
+            snapshot.min_seq = 3;
+            snapshot.next_seq = 4;
+            let expected_status = match state {
+                "queued" => {
+                    manager.heal_queue.lock().await.push(request.clone());
+                    HealTaskStatus::Pending
+                }
+                "active" => {
+                    manager.active_heals.lock().await.insert(token.clone(), task);
+                    HealTaskStatus::Pending
+                }
+                "retrying" => {
+                    manager.retrying_heals.lock().await.insert(
+                        token.clone(),
+                        RetryingHeal {
+                            request: request.clone(),
+                            error: "transient".to_string(),
+                            cancel_token: CancellationToken::new(),
+                        },
+                    );
+                    HealTaskStatus::Retrying {
+                        error: "transient".to_string(),
+                        retry_attempt: request.retry_attempts,
+                    }
+                }
+                "completed" => {
+                    manager.completed_heals.lock().await.insert(token.clone(), Arc::new(snapshot));
+                    HealTaskStatus::Completed
+                }
+                "displaced" => {
+                    let terminal = record_displaced_terminal(&manager.displaced_terminals, &request);
+                    terminal.status.clone()
+                }
+                _ => unreachable!("fixed test states"),
+            };
+            let automatic = !matches!(source, HealRequestSource::Admin | HealRequestSource::Internal);
+            let report = manager
+                .get_local_automatic_task_report("bucket/object", &token, Some(2))
+                .await
+                .expect("local source lookup");
+            assert_eq!(report.is_some(), automatic, "source={source:?} state={state}");
+            if let Some(report) = report {
+                assert_eq!(report.status, expected_status);
+                if state == "completed" {
+                    let outcome = report.outcome.as_ref().expect("retained structured outcome");
+                    assert_eq!(outcome.objects.len(), 1);
+                    assert_eq!(outcome.objects[0].identity.object, "object");
+                    assert_eq!(outcome.objects[0].identity.pool_index, Some(0));
+                    assert_eq!(outcome.objects[0].identity.set_index, Some(0));
+                    assert_eq!(outcome.objects[0].disposition, HealObjectDisposition::VerifiedHealthy);
+                    assert_eq!(report.min_seq, 3);
+                    assert_eq!(report.next_seq, 4);
+                    assert_eq!(report.result_items.len(), 1);
+                    assert_eq!(report.result_items[0].object, "object");
+                }
+                let processor = HealChannelProcessor::new(manager.clone());
+                let local = processor
+                    .execute_local_automatic_query("bucket/object", &token, Some(2))
+                    .await
+                    .expect("local response")
+                    .expect("automatic task response");
+                let direct = processor
+                    .execute_query_request_since("bucket/object".to_string(), token.clone(), Some(2))
+                    .await
+                    .expect("original query response");
+                assert!(local.success);
+                assert_eq!(local.request_id, direct.request_id);
+                assert_eq!(local.data, direct.data, "same report encoding and cursor contract");
+                assert_eq!(local.error, direct.error);
+                let coordinator = Arc::new(HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None));
+                let missing = HealChannelProcessor::new(coordinator)
+                    .execute_query_request("bucket/object".to_string(), token.clone())
+                    .await
+                    .expect("coordinator query");
+                let body: serde_json::Value =
+                    serde_json::from_slice(missing.data.as_deref().expect("coordinator response")).expect("coordinator JSON");
+                assert_eq!(body["summary"], "notFound", "a remote manager does not own the automatic task");
+                if state == "completed" {
+                    let completed = manager
+                        .completed_heals
+                        .lock()
+                        .await
+                        .get(&token)
+                        .cloned()
+                        .expect("original completion");
+                    manager
+                        .completed_heals
+                        .lock()
+                        .await
+                        .insert("retired-alias".to_string(), completed);
+                    assert!(
+                        manager
+                            .get_local_automatic_task_report("bucket/object", "retired-alias", None)
+                            .await
+                            .expect("retired alias lookup")
+                            .is_none()
+                    );
+                }
+            }
+            assert!(
+                manager
+                    .get_local_automatic_task_report("bucket/other", &token, None)
+                    .await
+                    .expect("wrong path lookup")
+                    .is_none()
+            );
+            assert!(
+                manager
+                    .get_local_automatic_task_report("bucket/object", "unknown", None)
+                    .await
+                    .expect("unknown token lookup")
+                    .is_none()
+            );
+            manager.insert_task_alias("admin-alias", &token).await;
+            assert!(
+                manager
+                    .get_local_automatic_task_report("bucket/object", "admin-alias", None)
+                    .await
+                    .expect("alias lookup")
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_queued_duplicate_token_can_query_and_cancel_original_request() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
     let manager = HealManager::new_without_root_recovery_for_test(storage, None);
@@ -3697,6 +3874,8 @@ async fn insert_retrying_request(manager: &HealManager, request: HealRequest) ->
         Arc::new(CompletedHealStatus {
             progress: None,
             outcome: None,
+            source: request.source,
+            task_id: request.id.clone(),
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: request.heal_type,
             options: request.options.clone(),
@@ -4545,6 +4724,8 @@ async fn test_retrying_completion_outranks_the_queue_for_the_same_id() {
         Arc::new(CompletedHealStatus {
             progress: None,
             outcome: None,
+            source: request.source,
+            task_id: request.id.clone(),
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: request.heal_type.clone(),
             options: request.options.clone(),
@@ -4584,6 +4765,8 @@ async fn test_get_task_status_reads_recent_completed_status() {
         Arc::new(CompletedHealStatus {
             progress: None,
             outcome: None,
+            source: HealRequestSource::Internal,
+            task_id: "completed-token".to_string(),
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: HealType::Bucket {
                 bucket: "bucket".to_string(),
@@ -4617,6 +4800,8 @@ async fn test_get_task_report_for_path_reads_completed_items() {
         Arc::new(CompletedHealStatus {
             progress: None,
             outcome: None,
+            source: HealRequestSource::Internal,
+            task_id: "completed-token".to_string(),
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: HealType::Object {
                 bucket: "bucket".to_string(),

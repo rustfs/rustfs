@@ -115,6 +115,8 @@ fn admin_request(heal_type: HealType) -> HealRequest {
 
 fn completed_admin_status(heal_type: &HealType, completed_at: SystemTime) -> CompletedHealStatus {
     CompletedHealStatus {
+        task_id: "admin-fixture".to_string(),
+        source: HealRequestSource::Admin,
         outcome: None,
         heal_type: heal_type.clone(),
         options: HealOptions::default(),
@@ -1237,6 +1239,8 @@ async fn root_recovery_completed_non_root_admin_is_queryable_after_restart() {
         .expect("durable bucket responsibility");
     let completed = CompletedHealStatus {
         outcome: None,
+        source: request.source,
+        task_id: request.id.clone(),
         heal_type: request.heal_type.clone(),
         options: request.options.clone(),
         status: HealTaskStatus::Completed,
