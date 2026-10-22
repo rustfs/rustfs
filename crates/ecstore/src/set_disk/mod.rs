@@ -6657,7 +6657,8 @@ impl SetDisks {
         let requested_version = Uuid::parse_str(version_id)?;
         let disks = self.disk_inventory().await;
         let (metadata, errors) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false, false).await?;
-        let quorum = self.default_write_quorum();
+        // Match delete_object_version_with_purge, independently of data parity or online inventory size.
+        let quorum = self.set_drive_count / 2 + 1;
         let (_, marker, _) = Self::select_valid_fileinfo(&disks, &metadata, &errors, version_id, quorum, quorum)
             .map_err(|error| to_object_err(error.into(), vec![bucket, object, version_id]))?;
         if !marker.deleted || marker.tier_free_version() || marker.version_id.unwrap_or_else(Uuid::nil) != requested_version {
