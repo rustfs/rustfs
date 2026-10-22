@@ -18,7 +18,7 @@ use super::*;
 use http::{Extensions, HeaderMap, Method, Uri};
 use std::sync::Arc;
 
-pub(super) use s3s::stream::upload_stream::UploadStreamError;
+pub(super) use crate::app::storage_api::s3::UploadStreamError;
 
 pub(super) fn build_request<T>(input: T, method: Method) -> S3Request<T> {
     S3Request {
