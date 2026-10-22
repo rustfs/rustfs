@@ -403,12 +403,13 @@ pub(crate) trait ScannerStorage:
     async fn list_bucket_for_scanner(&self, opts: &storage_contracts::BucketOptions) -> EcstoreResultType<ScannerBucketListing>;
     fn all_set_disks(&self) -> Vec<Arc<EcstoreSetDisks>>;
     async fn scanner_pause_backlog_writable_set_disks(&self) -> Vec<Arc<EcstoreSetDisks>>;
-    async fn save_scanner_pause_backlog_replica(
+    async fn save_scanner_pause_backlog_replica_for_membership(
         self: Arc<Self>,
         pool_index: usize,
         set_index: usize,
         data: Vec<u8>,
         preconditions: storage_contracts::HTTPPreconditions,
+        writable_pool_indices: Arc<[usize]>,
     ) -> EcstoreResultType<()>;
     #[cfg(test)]
     fn scanner_observed_probe_store_key(&self) -> usize;
@@ -476,16 +477,24 @@ impl ScannerStorage for EcstoreStore {
         EcstoreStore::scanner_pause_backlog_writable_set_disks(self).await
     }
 
-    async fn save_scanner_pause_backlog_replica(
+    async fn save_scanner_pause_backlog_replica_for_membership(
         self: Arc<Self>,
         pool_index: usize,
         set_index: usize,
         data: Vec<u8>,
         preconditions: storage_contracts::HTTPPreconditions,
+        writable_pool_indices: Arc<[usize]>,
     ) -> EcstoreResultType<()> {
-        EcstoreStore::save_scanner_pause_backlog_replica(&self, pool_index, set_index, data, preconditions)
-            .await
-            .map(|_| ())
+        EcstoreStore::save_scanner_pause_backlog_replica_for_membership(
+            &self,
+            pool_index,
+            set_index,
+            data,
+            preconditions,
+            writable_pool_indices,
+        )
+        .await
+        .map(|_| ())
     }
 
     #[cfg(test)]
@@ -652,12 +661,13 @@ mod tests {
             Vec::new()
         }
 
-        async fn save_scanner_pause_backlog_replica(
+        async fn save_scanner_pause_backlog_replica_for_membership(
             self: Arc<Self>,
             _pool_index: usize,
             _set_index: usize,
             _data: Vec<u8>,
             _preconditions: storage_contracts::HTTPPreconditions,
+            _writable_pool_indices: Arc<[usize]>,
         ) -> EcstoreResultType<()> {
             Err(EcstoreErrorType::InvalidArgument(
                 "scanner-backlog".into(),

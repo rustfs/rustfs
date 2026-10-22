@@ -3516,9 +3516,7 @@ impl ECStore {
         ))
     }
 
-    /// Publish a native scanner replica without allowing stale pool selection
-    /// to race retirement. Failed/canceled membership repair remains permitted.
-    /// A canceled waiter cannot release publication fences from an in-flight write.
+    #[cfg(feature = "test-util")]
     pub async fn save_scanner_pause_backlog_replica(
         self: &Arc<Self>,
         pool_index: usize,
@@ -3526,6 +3524,34 @@ impl ECStore {
         data: Vec<u8>,
         preconditions: crate::storage_api_contracts::object::HTTPPreconditions,
     ) -> Result<ObjectInfo> {
+        self.save_scanner_pause_backlog_replica_for_membership(
+            pool_index,
+            set_index,
+            data,
+            preconditions,
+            Arc::from([pool_index]),
+        )
+        .await
+    }
+
+    /// Publish a native scanner replica without allowing stale pool selection
+    /// to race retirement. Failed/canceled membership repair remains permitted.
+    /// A canceled waiter cannot release publication fences from an in-flight write.
+    pub async fn save_scanner_pause_backlog_replica_for_membership(
+        self: &Arc<Self>,
+        pool_index: usize,
+        set_index: usize,
+        data: Vec<u8>,
+        preconditions: crate::storage_api_contracts::object::HTTPPreconditions,
+        writable_pool_indices: Arc<[usize]>,
+    ) -> Result<ObjectInfo> {
+        if !writable_pool_indices.contains(&pool_index) {
+            return Err(Error::InvalidArgument(
+                "scanner-backlog".into(),
+                "membership".into(),
+                "replica is outside the publication cohort".into(),
+            ));
+        }
         let set = self
             .pools
             .get(pool_index)
@@ -3550,6 +3576,9 @@ impl ECStore {
                         .await?,
                 )
             };
+            // Fence every member of the captured publication cohort. After
+            // retirement, a stale fan-out must not stabilize its old record on
+            // still-writable targets and invalidate their native rollback point.
             let capacity_guard = if let Some(guard) = object_guard.as_ref() {
                 guard.add_namespace_lock_fence(&mut opts);
                 opts.no_lock = match store.pools.first().and_then(|pool| pool.disk_set.first()) {
@@ -3557,7 +3586,10 @@ impl ECStore {
                     None => false,
                 };
                 let capacity_guard = store
-                    .acquire_external_decommission_capacity_fence(&[pool_index], DecommissionCapacityAdmission::ScannerBacklog)
+                    .acquire_external_decommission_capacity_fence(
+                        &writable_pool_indices,
+                        DecommissionCapacityAdmission::ScannerBacklog,
+                    )
                     .await?;
                 opts.add_namespace_lock_guard(&capacity_guard);
                 Some(capacity_guard)
