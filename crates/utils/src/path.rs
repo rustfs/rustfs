@@ -135,16 +135,22 @@ pub fn path_join<P: AsRef<Path>>(elem: &[P]) -> PathBuf {
 
     for e in elem {
         let s = e.as_ref().to_string_lossy();
-        if added > 0 || !s.is_empty() {
-            if added > 0 {
-                dst.push_str(SLASH_SEPARATOR);
-            }
-            dst.push_str(&s);
-            added += s.len();
+        if s.is_empty() {
+            continue;
         }
+        if added > 0 && (cfg!(target_os = "windows") || !(dst.ends_with(SLASH_SEPARATOR) ^ s.starts_with(SLASH_SEPARATOR))) {
+            dst.push_str(SLASH_SEPARATOR);
+        }
+        dst.push_str(&s);
+        added += s.len();
     }
 
-    if path_needs_clean(dst.as_bytes()) {
+    let check_str = match dst.strip_suffix(SLASH_SEPARATOR) {
+        Some(trimmed) if !cfg!(target_os = "windows") && trailing_slash && !trimmed.is_empty() => trimmed,
+        _ => dst.as_str(),
+    };
+
+    if path_needs_clean(check_str.as_bytes()) {
         let mut clean_path = clean(&dst);
         if trailing_slash {
             clean_path.push_str(SLASH_SEPARATOR);
@@ -152,7 +158,7 @@ pub fn path_join<P: AsRef<Path>>(elem: &[P]) -> PathBuf {
         return clean_path.into();
     }
 
-    if trailing_slash {
+    if trailing_slash && (dst.len() <= 1 || !dst.ends_with(SLASH_SEPARATOR)) {
         dst.push_str(SLASH_SEPARATOR);
     }
 
@@ -175,17 +181,23 @@ pub fn path_join_buf(elements: &[&str]) -> String {
     let mut dst = String::with_capacity(len);
     let mut added = 0;
 
-    for e in elements {
-        if added > 0 || !e.is_empty() {
-            if added > 0 {
-                dst.push_str(SLASH_SEPARATOR);
-            }
-            dst.push_str(e);
-            added += e.len();
+    for &e in elements {
+        if e.is_empty() {
+            continue;
         }
+        if added > 0 && (cfg!(target_os = "windows") || !(dst.ends_with(SLASH_SEPARATOR) ^ e.starts_with(SLASH_SEPARATOR))) {
+            dst.push_str(SLASH_SEPARATOR);
+        }
+        dst.push_str(e);
+        added += e.len();
     }
 
-    if path_needs_clean(dst.as_bytes()) {
+    let check_str = match dst.strip_suffix(SLASH_SEPARATOR) {
+        Some(trimmed) if !cfg!(target_os = "windows") && trailing_slash && !trimmed.is_empty() => trimmed,
+        _ => dst.as_str(),
+    };
+
+    if path_needs_clean(check_str.as_bytes()) {
         let mut clean_path = clean(&dst);
         if trailing_slash {
             clean_path.push_str(SLASH_SEPARATOR);
@@ -193,7 +205,7 @@ pub fn path_join_buf(elements: &[&str]) -> String {
         return clean_path;
     }
 
-    if trailing_slash {
+    if trailing_slash && (dst.len() <= 1 || !dst.ends_with(SLASH_SEPARATOR)) {
         dst.push_str(SLASH_SEPARATOR);
     }
 
@@ -223,6 +235,50 @@ pub fn fold_object_name_path_separators(object: &str, backslash_is_separator: bo
     Cow::Owned(segments.join(SLASH_SEPARATOR))
 }
 
+#[inline(always)]
+const fn swar_dot_or_slash_mask(w: u64) -> u64 {
+    let y = (w | 0x0101_0101_0101_0101) ^ 0x5050_5050_5050_5050;
+    y.wrapping_add(0x0101_0101_0101_0101) & 0x8080_8080_8080_8080
+}
+
+/// SWAR fast-path detector for already-clean ASCII paths (length >= 8).
+///
+/// Precondition: caller (`path_needs_clean`) has already rejected Windows backslashes (`\\`),
+/// leading `.`, and trailing `/`.
+///
+/// Checks 8 bytes at a time via `slice::as_chunks::<8>()` in little-endian byte order that no
+/// byte has the high bit set (`> 127`) and no two adjacent bytes are both in `{'.', '/'}`
+/// (which covers `"//"`, `"/."`, `"./"`, and `".."`).
+/// Both `'.'` (`0x2e`) and `'/'` (`0x2f`) satisfy `(b | 0x01) == 0x2f`, and `0x2f ^ 0x50 == 0x7f`;
+/// adding `0x01` sets bit 7 (`0x80`) iff an ASCII byte is `'.'` or `'/'`, with zero cross-byte carry.
+#[inline(always)]
+const fn swar_is_clean_ascii_path(path: &[u8]) -> bool {
+    let (chunks, rem) = path.as_chunks::<8>();
+    if chunks.is_empty() {
+        return false;
+    }
+    let mut i = 0;
+    let mut prev_hi = 0u64;
+    while i < chunks.len() {
+        let w = u64::from_le_bytes(chunks[i]);
+        let m = swar_dot_or_slash_mask(w);
+        if ((w & 0x8080_8080_8080_8080) | (m & ((m << 8) | prev_hi))) != 0 {
+            return false;
+        }
+        prev_hi = m >> 56;
+        i += 1;
+    }
+    if rem.is_empty() {
+        return true;
+    }
+    let Some(&tail) = path.last_chunk::<8>() else {
+        return false;
+    };
+    let w = u64::from_le_bytes(tail);
+    let m = swar_dot_or_slash_mask(w);
+    ((w & 0x8080_8080_8080_8080) | (m & (m << 8))) == 0
+}
+
 /// path_needs_clean returns whether path cleaning may change the path.
 /// Will detect all cases that will be cleaned,
 /// but may produce false positives on non-trivial paths.
@@ -236,10 +292,18 @@ fn path_needs_clean(path: &[u8]) -> bool {
         return true;
     }
 
-    let rooted = path[0] == b'/';
-    let n = path.len();
+    if let [first, .., last] = path
+        && *first != b'.'
+        && *first <= 127
+        && *last != b'/'
+        && swar_is_clean_ascii_path(path)
+    {
+        return false;
+    }
 
-    let (mut r, mut w) = if rooted { (1, 1) } else { (0, 0) };
+    let n = path.len();
+    let rooted = path[0] == b'/';
+    let mut r = if rooted { 1 } else { 0 };
 
     while r < n {
         match path[r] {
@@ -260,40 +324,22 @@ fn path_needs_clean(path: &[u8]) -> bool {
                     // .. element: remove to last / - assume it has to be cleaned.
                     return true;
                 }
-                // Handle single dot case
-                if r + 1 == n {
-                    // . element - assume it has to be cleaned.
-                    return true;
-                }
                 // Copy the dot
-                w += 1;
                 r += 1;
             }
             _ => {
-                // real path element.
-                // add slash if needed
-                if (rooted && w != 1) || (!rooted && w != 0) {
-                    w += 1;
-                }
-                // copy element
-                while r < n && path[r] != b'/' {
-                    if cfg!(target_os = "windows") && path[r] == b'\\' {
-                        return true;
+                // Advance to next slash (backslashes on Windows were already rejected above).
+                if let Some(pos) = path[r..].iter().position(|&b| b == b'/') {
+                    r += pos;
+                    // allow one slash, not at end
+                    if r < n - 1 {
+                        r += 1;
                     }
-                    w += 1;
-                    r += 1;
-                }
-                // allow one slash, not at end
-                if r < n - 1 && path[r] == b'/' {
-                    r += 1;
+                } else {
+                    break;
                 }
             }
         }
-    }
-
-    // Turn empty string into "."
-    if w == 0 {
-        return true;
     }
 
     false
@@ -454,6 +500,76 @@ impl LazyBuf {
     }
 }
 
+struct SliceLazyBuf<'a> {
+    s: &'a str,
+    buf: Option<Vec<u8>>,
+    w: usize,
+}
+
+impl<'a> SliceLazyBuf<'a> {
+    #[inline]
+    fn new(s: &'a str) -> Self {
+        Self { s, buf: None, w: 0 }
+    }
+
+    #[inline]
+    fn index(&self, i: usize) -> u8 {
+        if let Some(ref buf) = self.buf {
+            buf[i]
+        } else {
+            self.s.as_bytes()[i]
+        }
+    }
+
+    #[inline]
+    fn ensure_buf(&mut self) -> &mut Vec<u8> {
+        let s_bytes = self.s.as_bytes();
+        let w = self.w;
+        self.buf.get_or_insert_with(|| {
+            let mut new_buf = vec![0; s_bytes.len()];
+            new_buf[..w].copy_from_slice(&s_bytes[..w]);
+            new_buf
+        })
+    }
+
+    #[inline]
+    fn append(&mut self, c: u8) {
+        if self.buf.is_none() && self.w < self.s.len() && self.s.as_bytes()[self.w] == c {
+            self.w += 1;
+            return;
+        }
+        let w = self.w;
+        let buf = self.ensure_buf();
+        buf[w] = c;
+        self.w = w + 1;
+    }
+
+    #[inline]
+    fn append_range(&mut self, start: usize, end: usize) {
+        let len = end - start;
+        if self.buf.is_none() && self.w == start {
+            self.w += len;
+            return;
+        }
+        let s_bytes = self.s.as_bytes();
+        let w = self.w;
+        let buf = self.ensure_buf();
+        buf[w..w + len].copy_from_slice(&s_bytes[start..end]);
+        self.w = w + len;
+    }
+
+    #[inline]
+    fn into_string(self) -> String {
+        if let Some(mut buf) = self.buf {
+            buf.truncate(self.w);
+            // Input `self.s` is valid UTF-8 and separator/dot replacements are ASCII boundaries.
+            String::from_utf8(buf).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+        } else {
+            self.s[..self.w].to_string()
+        }
+    }
+}
+
 /// Returns the shortest path name equivalent to the given path.
 ///
 /// It applies the following rules iteratively until no further processing can be done:
@@ -477,9 +593,10 @@ pub fn clean(path: &str) -> String {
         return ".".to_string();
     }
 
-    let rooted = path.starts_with('/') || (cfg!(target_os = "windows") && path.starts_with('\\'));
-    let n = path.len();
-    let mut out = LazyBuf::new(path.to_string());
+    let bytes = path.as_bytes();
+    let rooted = is_separator(bytes[0]);
+    let n = bytes.len();
+    let mut out = SliceLazyBuf::new(path);
     let mut r = 0;
     let mut dotdot = 0;
 
@@ -490,18 +607,15 @@ pub fn clean(path: &str) -> String {
     }
 
     while r < n {
-        let c = path.as_bytes()[r];
+        let c = bytes[r];
 
         if is_separator(c) {
             // Empty path element
             r += 1;
-        } else if c == b'.' && (r + 1 == n || is_separator(path.as_bytes()[r + 1])) {
+        } else if c == b'.' && (r + 1 == n || is_separator(bytes[r + 1])) {
             // . element
             r += 1;
-        } else if c == b'.'
-            && (r + 1 < n && path.as_bytes()[r + 1] == b'.')
-            && (r + 2 == n || is_separator(path.as_bytes()[r + 2]))
-        {
+        } else if c == b'.' && (r + 1 < n && bytes[r + 1] == b'.') && (r + 2 == n || is_separator(bytes[r + 2])) {
             // .. element: remove to last /
             r += 2;
 
@@ -527,15 +641,10 @@ pub fn clean(path: &str) -> String {
                 out.append(b'/');
             }
 
-            // Copy element
-            while r < n {
-                let c = path.as_bytes()[r];
-                if is_separator(c) {
-                    break;
-                }
-                out.append(c);
-                r += 1;
-            }
+            // Copy element slice in bulk
+            let seg_len = bytes[r..].iter().position(|&b| is_separator(b)).unwrap_or(n - r);
+            out.append_range(r, r + seg_len);
+            r += seg_len;
         }
     }
 
@@ -544,7 +653,7 @@ pub fn clean(path: &str) -> String {
         return ".".to_string();
     }
 
-    out.string()
+    out.into_string()
 }
 
 /// Splits path immediately following the final separator, separating it into a directory and file name component.
@@ -687,6 +796,45 @@ mod tests {
 
         // Test with multipart ETag format
         assert_eq!(trim_etag("\"098f6bcd4621d373cade4e832627b4f6-2\""), "098f6bcd4621d373cade4e832627b4f6-2");
+    }
+
+    #[test]
+    fn test_swar_path_needs_clean_and_join_boundaries() {
+        for len in 8..=34 {
+            let clean_bytes: Vec<u8> = (0..len)
+                .map(|i| if i % 4 == 1 && i + 1 < len { b'/' } else { b'a' })
+                .collect();
+            assert!(!path_needs_clean(&clean_bytes), "clean path failed for len={len}");
+
+            for pos in 0..(len - 1) {
+                let mut doubled = vec![b'a'; len];
+                doubled[pos] = b'/';
+                doubled[pos + 1] = b'/';
+                assert!(path_needs_clean(&doubled), "missed '//' at len={len}, pos={pos}");
+
+                let mut dot_seg = vec![b'a'; len];
+                dot_seg[pos] = b'/';
+                dot_seg[pos + 1] = b'.';
+                if pos + 2 < len {
+                    dot_seg[pos + 2] = b'/';
+                }
+                assert!(path_needs_clean(&dot_seg), "missed '/.' at len={len}, pos={pos}");
+            }
+        }
+
+        assert!(!path_needs_clean(b"/data/rustfs0/bucket/.hidden/xl.meta"));
+        assert!(!path_needs_clean(b"/data/rustfs0/bucket/..hidden/xl.meta"));
+        assert!(path_needs_clean(b"/data/rustfs0/bucket/./xl.meta"));
+        assert!(path_needs_clean(b"/data/rustfs0/bucket/../xl.meta"));
+
+        assert_eq!(
+            path_join_buf(&["/data/rustfs0/", "bucket", "prefix/", "subdir/"]),
+            "/data/rustfs0/bucket/prefix/subdir/"
+        );
+        assert_eq!(
+            path_join_buf(&["/data/rustfs0/", "/bucket", "prefix/", "xl.meta"]),
+            "/data/rustfs0/bucket/prefix/xl.meta"
+        );
     }
 
     #[test]
