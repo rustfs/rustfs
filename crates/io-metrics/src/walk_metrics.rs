@@ -17,6 +17,13 @@
 //! Read/written totals cover metadata payload, exclude transport framing, and are
 //! batched until the logical walk ends (including error/cancellation). Gauges
 //! change immediately; completed-byte rates can lag a long-running walk.
+//! Remote failures additionally record one bounded `reason` in
+//! `rustfs_remote_walk_failures_total`. Read/write reasons identify the boundary
+//! that returned an error, not a diagnosis of the peer or disk. `abandoned`
+//! means the logical operation was dropped before completion, including unwind.
+//! This is separate from S3 request-error accounting and stream-open attempts.
+//! It partitions non-ok logical completions; successful retries add no failure.
+//! Completion and failure families are not an atomic cross-family snapshot.
 
 use metrics::{Counter, Gauge, Histogram, counter, gauge, histogram};
 use std::time::Instant;
@@ -29,6 +36,38 @@ pub struct RemoteWalkGuard {
     inner: Option<Observation>,
 }
 
+/// Terminal failure boundaries for one logical remote walk. Values are bounded
+/// metric labels; they never contain an error message, bucket, key, or peer.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum RemoteWalkFailureReason {
+    Encoding,
+    Open,
+    Read,
+    Write,
+    Flush,
+    /// The outer operation deadline expired, without a returned inner error.
+    OperationTimeout,
+    /// The remote disk rejected admission before invoking the operation.
+    FaultyAdmission,
+    Other,
+}
+
+impl RemoteWalkFailureReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Encoding => "encoding",
+            Self::Open => "open",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Flush => "flush",
+            Self::OperationTimeout => "operation_timeout",
+            Self::FaultyAdmission => "faulty_admission",
+            Self::Other => "other",
+        }
+    }
+}
+
 struct Observation {
     active: Gauge,
     scratch: Gauge,
@@ -37,6 +76,7 @@ struct Observation {
     read: u64,
     written: u64,
     outcome: &'static str,
+    failure_reason: Option<RemoteWalkFailureReason>,
     started: Instant,
     duration: Histogram,
 }
@@ -58,6 +98,7 @@ impl RemoteWalkGuard {
                 read: 0,
                 written: 0,
                 outcome: "cancelled",
+                failure_reason: None,
                 started: Instant::now(),
                 duration: histogram!("rustfs_remote_walk_duration_seconds"),
             }),
@@ -99,6 +140,17 @@ impl RemoteWalkGuard {
     pub fn finish(&mut self, success: bool) {
         if let Some(inner) = &mut self.inner {
             inner.outcome = if success { "ok" } else { "error" };
+            inner.failure_reason = None;
+        }
+    }
+
+    /// Record the final returned failure, after retry and wrapper handling.
+    /// Do not call for an intermediate attempt: dropping an unfinished walk
+    /// must retain its original cancelled outcome and abandoned reason.
+    pub fn finish_error(&mut self, reason: RemoteWalkFailureReason) {
+        if let Some(inner) = &mut self.inner {
+            inner.outcome = "error";
+            inner.failure_reason = Some(reason);
         }
     }
 }
@@ -110,6 +162,14 @@ impl Drop for RemoteWalkGuard {
             inner.written_bytes.increment(inner.written);
             inner.active.decrement(1.0);
             counter!("rustfs_remote_walk_completed_total", "outcome" => inner.outcome).increment(1);
+            let reason = match inner.outcome {
+                "error" => Some(inner.failure_reason.unwrap_or(RemoteWalkFailureReason::Other).label()),
+                "cancelled" => Some("abandoned"),
+                _ => None,
+            };
+            if let Some(reason) = reason {
+                counter!("rustfs_remote_walk_failures_total", "reason" => reason).increment(1);
+            }
             inner.duration.record(inner.started.elapsed().as_secs_f64());
         }
     }
@@ -310,6 +370,97 @@ mod tests {
             walk.finish(false);
         });
         assert!(snapshotter.snapshot().into_vec().is_empty());
+    }
+
+    #[test]
+    fn remote_failure_reasons_preserve_existing_outcomes() {
+        let _lock = METRICS_FLAG_LOCK.lock().expect("metrics gate lock");
+        let _restore = RestoreMetricsGate(crate::metrics_enabled());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            crate::set_metrics_enabled(true);
+            for reason in [
+                RemoteWalkFailureReason::Encoding,
+                RemoteWalkFailureReason::Open,
+                RemoteWalkFailureReason::Read,
+                RemoteWalkFailureReason::Write,
+                RemoteWalkFailureReason::Flush,
+                RemoteWalkFailureReason::OperationTimeout,
+                RemoteWalkFailureReason::FaultyAdmission,
+            ] {
+                let mut walk = RemoteWalkGuard::start();
+                walk.finish_error(reason);
+                walk.finish_error(reason);
+            }
+            let mut success = RemoteWalkGuard::start();
+            success.finish(true);
+            let mut legacy_error = RemoteWalkGuard::start();
+            legacy_error.finish(false);
+            drop(RemoteWalkGuard::start());
+        });
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(counter_total(&rows, "rustfs_remote_walk_started_total"), Some(10));
+        assert_eq!(counter_total(&rows, "rustfs_remote_walk_completed_total"), Some(10));
+        assert_eq!(counter_total(&rows, "rustfs_remote_walk_failures_total"), Some(9));
+        assert_eq!(gauge_value(&rows, "rustfs_remote_walk_active"), Some(0.0));
+        assert_eq!(counter_total(&rows, "rustfs_errors_total"), None);
+        for reason in [
+            "encoding",
+            "open",
+            "read",
+            "write",
+            "flush",
+            "operation_timeout",
+            "faulty_admission",
+            "other",
+            "abandoned",
+        ] {
+            assert!(
+                rows.iter().any(|(key, _, _, value)| {
+                    key.key().name() == "rustfs_remote_walk_failures_total"
+                        && key.key().labels().count() == 1
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "reason" && label.value() == reason)
+                        && matches!(value, DebugValue::Counter(1))
+                }),
+                "missing exact bounded failure reason {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_failure_reasons_follow_the_captured_start_gate() {
+        let _lock = METRICS_FLAG_LOCK.lock().expect("metrics gate lock");
+        let _restore = RestoreMetricsGate(crate::metrics_enabled());
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            crate::set_metrics_enabled(false);
+            let mut disabled = RemoteWalkGuard::start();
+            crate::set_metrics_enabled(true);
+            disabled.finish_error(RemoteWalkFailureReason::Read);
+            drop(disabled);
+            let mut enabled = RemoteWalkGuard::start();
+            crate::set_metrics_enabled(false);
+            enabled.finish_error(RemoteWalkFailureReason::Write);
+            drop(enabled);
+        });
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(counter_total(&rows, "rustfs_remote_walk_started_total"), Some(1));
+        assert_eq!(counter_total(&rows, "rustfs_remote_walk_completed_total"), Some(1));
+        assert_eq!(counter_total(&rows, "rustfs_remote_walk_failures_total"), Some(1));
+        assert_eq!(gauge_value(&rows, "rustfs_remote_walk_active"), Some(0.0));
+        assert!(rows.iter().any(|(key, _, _, value)| {
+            key.key().name() == "rustfs_remote_walk_failures_total"
+                && key
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "reason" && label.value() == "write")
+                && matches!(value, DebugValue::Counter(1))
+        }));
     }
 
     #[test]

@@ -54,7 +54,7 @@ use rustfs_io_metrics::internode_metrics::{
     INTERNODE_STAGE_BATCH_READ_VERSION_RPC_ROUNDTRIP, INTERNODE_STAGE_READ_VERSION_REQUEST_ENCODE,
     INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE, INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP,
 };
-use rustfs_io_metrics::walk_metrics::RemoteWalkGuard;
+use rustfs_io_metrics::walk_metrics::{RemoteWalkFailureReason, RemoteWalkGuard};
 use rustfs_protos::ChannelClass;
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
@@ -332,12 +332,18 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for ObservedWalkWriter<'_, W> {
     }
 }
 
+#[derive(Debug)]
+struct WalkCopyError {
+    reason: RemoteWalkFailureReason,
+    source: io::Error,
+}
+
 async fn copy_stream_with_buffer<R, W>(
     reader: &mut R,
     writer: &mut W,
     buffer_size: usize,
     observation: &mut RemoteWalkGuard,
-) -> io::Result<u64>
+) -> std::result::Result<u64, WalkCopyError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -347,10 +353,16 @@ where
     let _scratch = observation.scratch_allocated(buffer.capacity());
 
     loop {
-        let bytes_read = reader.read(&mut buffer).await?;
+        let bytes_read = reader.read(&mut buffer).await.map_err(|source| WalkCopyError {
+            reason: RemoteWalkFailureReason::Read,
+            source,
+        })?;
         observation.read(bytes_read);
         if bytes_read == 0 {
-            writer.flush().await?;
+            writer.flush().await.map_err(|source| WalkCopyError {
+                reason: RemoteWalkFailureReason::Flush,
+                source,
+            })?;
             return Ok(copied);
         }
 
@@ -359,7 +371,11 @@ where
             observation,
         }
         .write_all(&buffer[..bytes_read])
-        .await?;
+        .await
+        .map_err(|source| WalkCopyError {
+            reason: RemoteWalkFailureReason::Write,
+            source,
+        })?;
         copied += u64::try_from(bytes_read).unwrap_or(u64::MAX);
     }
 }
@@ -3642,7 +3658,7 @@ impl DiskAPI for RemoteDisk {
         let body = match serde_json::to_vec(&opts) {
             Ok(body) => body,
             Err(err) => {
-                observation.finish(false);
+                observation.finish_error(RemoteWalkFailureReason::Encoding);
                 return Err(err.into());
             }
         };
@@ -3656,6 +3672,7 @@ impl DiskAPI for RemoteDisk {
             opts.timeout_duration().unwrap_or_else(get_drive_walkdir_timeout)
         };
 
+        let mut failure_reason = None;
         let result = self
             .execute_with_timeout_for_op_and_health_action(
                 "walk_dir",
@@ -3691,13 +3708,17 @@ impl DiskAPI for RemoteDisk {
                                     continue;
                                 }
 
+                                failure_reason = Some(RemoteWalkFailureReason::Open);
                                 return Err(err);
                             }
                         };
 
                         match copy_stream_with_buffer(&mut reader, wr, DEFAULT_READ_BUFFER_SIZE, &mut observation).await {
                             Ok(_) => return Ok(()),
-                            Err(io_err) => return Err(DiskError::Io(io_err)),
+                            Err(error) => {
+                                failure_reason = Some(error.reason);
+                                return Err(DiskError::Io(error.source));
+                            }
                         }
                     }
 
@@ -3707,7 +3728,14 @@ impl DiskAPI for RemoteDisk {
                 FailureHealthAction::IgnoreFailure,
             )
             .await;
-        observation.finish(result.is_ok());
+        match &result {
+            Ok(()) => observation.finish(true),
+            Err(error) => observation.finish_error(failure_reason.unwrap_or(match error {
+                DiskError::Timeout => RemoteWalkFailureReason::OperationTimeout,
+                DiskError::FaultyDisk => RemoteWalkFailureReason::FaultyAdmission,
+                _ => RemoteWalkFailureReason::Other,
+            })),
+        }
         result
     }
 
@@ -8194,6 +8222,8 @@ mod tests {
         zero_write: bool,
         fail_flush: bool,
         flushed: bool,
+        write_error: Option<io::Error>,
+        flush_error: Option<io::Error>,
     }
 
     impl WalkTestWriter {
@@ -8204,6 +8234,8 @@ mod tests {
                 zero_write: false,
                 fail_flush: false,
                 flushed: false,
+                write_error: None,
+                flush_error: None,
             }
         }
     }
@@ -8215,7 +8247,10 @@ mod tests {
             }
             let remaining = self.accept_limit.saturating_sub(self.bytes.len());
             if remaining == 0 {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected downstream failure")));
+                return Poll::Ready(Err(self
+                    .write_error
+                    .take()
+                    .unwrap_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "injected downstream failure"))));
             }
             let written = remaining.min(buf.len()).min(7);
             self.bytes.extend_from_slice(&buf[..written]);
@@ -8224,6 +8259,9 @@ mod tests {
 
         fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             self.flushed = true;
+            if let Some(error) = self.flush_error.take() {
+                return Poll::Ready(Err(error));
+            }
             Poll::Ready(if self.fail_flush {
                 Err(io::Error::other("injected flush failure"))
             } else {
@@ -8270,7 +8308,11 @@ mod tests {
                 copy_stream_with_buffer(&mut reader, &mut writer, DEFAULT_READ_BUFFER_SIZE, &mut RemoteWalkGuard::default())
                     .await
                     .expect_err("injected write/flush failure must propagate");
-            assert_eq!(error.kind(), expected);
+            assert_eq!(error.source.kind(), expected);
+            assert!(matches!(
+                (error.reason, fail_flush),
+                (RemoteWalkFailureReason::Flush, true) | (RemoteWalkFailureReason::Write, false)
+            ));
             if fail_flush {
                 assert_eq!(writer.bytes, b"walk payload");
             }
@@ -8313,6 +8355,178 @@ mod tests {
         }
     }
 
+    fn assert_walk_failure_reason(recorder: &crate::test_metrics::CapturingRecorder, expected: Option<&str>) {
+        for reason in [
+            "encoding",
+            "open",
+            "read",
+            "write",
+            "flush",
+            "operation_timeout",
+            "faulty_admission",
+            "other",
+            "abandoned",
+        ] {
+            assert_eq!(
+                recorder.counter_value("rustfs_remote_walk_failures_total", &[("reason", reason)]),
+                u64::from(expected == Some(reason)),
+                "one logical terminal reason: {reason}",
+            );
+        }
+    }
+
+    #[derive(Debug)]
+    struct WalkFailureSource(u8);
+
+    impl std::fmt::Display for WalkFailureSource {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "original walk source {}", self.0)
+        }
+    }
+
+    impl std::error::Error for WalkFailureSource {}
+
+    #[test]
+    #[serial_test::serial]
+    fn walk_terminal_reasons_distinguish_identical_io_kinds_and_retain_error_sources() {
+        let _gate = WalkMetricsTestGate::enable();
+        for reason in ["read", "write", "flush"] {
+            let recorder = crate::test_metrics::CapturingRecorder::default();
+            metrics::with_local_recorder(&recorder, || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .expect("walk failure runtime");
+                runtime.block_on(async {
+                    let source: Box<dyn std::error::Error + Send + Sync> = Box::new(WalkFailureSource(7));
+                    let original_source = std::ptr::from_ref(source.as_ref());
+                    let error = io::Error::new(io::ErrorKind::BrokenPipe, source);
+                    let payload = b"walk payload".to_vec();
+                    let mut writer = WalkTestWriter::new(usize::MAX);
+                    let step = match reason {
+                        "read" => WalkDirTestStep::PartialDataThenError { data: payload, error },
+                        "write" => {
+                            writer.accept_limit = 9;
+                            writer.write_error = Some(error);
+                            WalkDirTestStep::Data(payload)
+                        }
+                        "flush" => {
+                            writer.flush_error = Some(error);
+                            WalkDirTestStep::Data(payload)
+                        }
+                        _ => unreachable!("the fixture only covers three copy boundaries"),
+                    };
+                    let transport = RetryingWalkDirInternodeDataTransport::with_steps(vec![step]);
+                    let disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+                    let error = disk
+                        .walk_dir(WalkDirOptions::default(), &mut writer)
+                        .await
+                        .expect_err("the actual walk must retain the injected failure");
+                    let DiskError::Io(error) = error else {
+                        panic!("copy failures must keep their existing DiskError::Io shape");
+                    };
+                    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+                    assert_eq!(error.to_string(), "original walk source 7");
+                    let returned_source = error.get_ref().expect("original typed failure source");
+                    assert!(returned_source.downcast_ref::<WalkFailureSource>().is_some());
+                    assert!(
+                        std::ptr::addr_eq(std::ptr::from_ref(returned_source), original_source),
+                        "observation must move the original boxed source rather than wrap or clone it",
+                    );
+                    let expected = if reason == "write" {
+                        &b"walk payl"[..]
+                    } else {
+                        &b"walk payload"[..]
+                    };
+                    assert_eq!(writer.bytes, expected);
+                    assert_eq!(writer.flushed, reason == "flush");
+                    assert_eq!(transport.calls().len(), 1, "a copy failure must never retry an already-used writer");
+                    assert_eq!(disk.health.waiting_count(), 0);
+                    assert!(!disk.health.is_faulty(), "walk output errors retain IgnoreFailure health policy");
+                });
+            });
+            assert_walk_failure_reason(&recorder, Some(reason));
+            assert_eq!(recorder.counter_value("rustfs_remote_walk_completed_total", &[("outcome", "error")]), 1);
+            assert_eq!(recorder.counter_value("rustfs_remote_walk_read_bytes_total", &[]), 12);
+            assert_eq!(
+                recorder.counter_value("rustfs_remote_walk_written_bytes_total", &[]),
+                if reason == "write" { 9 } else { 12 },
+            );
+            assert_eq!(recorder.counter_value("rustfs_remote_walk_scratch_allocated_bytes_total", &[]), 1_048_576);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn walk_terminal_reasons_keep_final_open_errors_separate_from_wrapper_admission_and_deadline() {
+        let _gate = WalkMetricsTestGate::enable();
+        for (steps, expected, calls) in [
+            (vec![WalkDirTestStep::Error(DiskError::FileNotFound)], DiskError::FileNotFound, 1),
+            (
+                vec![
+                    WalkDirTestStep::Error(DiskError::Timeout),
+                    WalkDirTestStep::Error(DiskError::Timeout),
+                ],
+                DiskError::Timeout,
+                2,
+            ),
+            (vec![WalkDirTestStep::Error(DiskError::FaultyDisk)], DiskError::FaultyDisk, 1),
+        ] {
+            let recorder = crate::test_metrics::CapturingRecorder::default();
+            metrics::with_local_recorder(&recorder, || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .expect("open failure runtime");
+                runtime.block_on(async {
+                    let transport = RetryingWalkDirInternodeDataTransport::with_steps(steps);
+                    let disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+                    let mut writer = Vec::new();
+                    let actual = disk
+                        .walk_dir(WalkDirOptions::default(), &mut writer)
+                        .await
+                        .expect_err("the final open failure must propagate");
+                    assert_eq!(actual, expected);
+                    assert_eq!(transport.calls().len(), calls);
+                    assert!(writer.is_empty());
+                    assert_eq!(disk.health.waiting_count(), 0);
+                });
+            });
+            assert_walk_failure_reason(&recorder, Some("open"));
+            assert_eq!(recorder.counter_value("rustfs_remote_walk_completed_total", &[("outcome", "error")]), 1);
+            assert_eq!(recorder.counter_value("rustfs_remote_walk_scratch_allocations_total", &[]), 0);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn walk_terminal_reasons_record_faulty_admission_without_opening_a_stream() {
+        let _gate = WalkMetricsTestGate::enable();
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("faulty admission runtime");
+            runtime.block_on(async {
+                let transport = RetryingWalkDirInternodeDataTransport::with_steps(Vec::new());
+                let disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+                disk.health.mark_offline(&disk.endpoint, "walk-admission-fixture");
+                let mut writer = Vec::new();
+                assert!(matches!(
+                    disk.walk_dir(WalkDirOptions::default(), &mut writer).await,
+                    Err(DiskError::FaultyDisk)
+                ));
+                assert!(transport.calls().is_empty());
+                assert!(writer.is_empty());
+                assert_eq!(disk.health.waiting_count(), 0);
+            });
+        });
+        assert_walk_failure_reason(&recorder, Some("faulty_admission"));
+        assert_eq!(recorder.counter_value("rustfs_remote_walk_completed_total", &[("outcome", "error")]), 1);
+        assert_eq!(recorder.counter_value("rustfs_remote_walk_scratch_allocations_total", &[]), 0);
+    }
+
     #[test]
     #[serial_test::serial]
     fn walk_stream_counts_partial_output_before_failure() {
@@ -8326,7 +8540,7 @@ mod tests {
                 let mut writer = WalkTestWriter::new(9);
                 let result = copy_stream_with_buffer(&mut reader, &mut writer, DEFAULT_READ_BUFFER_SIZE, &mut observation).await;
                 observation.finish(result.is_ok());
-                assert_eq!(result.expect_err("partial downstream failure").kind(), io::ErrorKind::BrokenPipe);
+                assert_eq!(result.expect_err("partial downstream failure").source.kind(), io::ErrorKind::BrokenPipe);
                 assert_eq!(writer.bytes, b"walk payl");
             });
         });
@@ -8360,6 +8574,7 @@ mod tests {
                 assert_eq!(transport.calls().len(), 2);
             });
         });
+        assert_walk_failure_reason(&recorder, None);
         assert_eq!(recorder.counter_value("rustfs_remote_walk_started_total", &[]), 1);
         assert_eq!(recorder.counter_value("rustfs_remote_walk_completed_total", &[("outcome", "ok")]), 1);
         assert_eq!(recorder.counter_value("rustfs_remote_walk_read_bytes_total", &[]), 12);
@@ -8394,6 +8609,7 @@ mod tests {
                 assert_eq!(transport.calls().len(), 1);
             });
         });
+        assert_walk_failure_reason(&recorder, Some("read"));
         assert_eq!(recorder.counter_value("rustfs_remote_walk_read_bytes_total", &[]), 12);
         assert_eq!(recorder.counter_value("rustfs_remote_walk_written_bytes_total", &[]), 12);
         assert_eq!(recorder.counter_value("rustfs_remote_walk_completed_total", &[("outcome", "error")]), 1);
@@ -8403,7 +8619,7 @@ mod tests {
     #[serial_test::serial]
     fn walk_stream_remote_cancellation_and_timeout_release_tracking() {
         let _gate = WalkMetricsTestGate::enable();
-        for cancelled in [true, false] {
+        for (cancelled, retried_open) in [(true, false), (false, false), (true, true), (false, true)] {
             let recorder = crate::test_metrics::CapturingRecorder::default();
             metrics::with_local_recorder(&recorder, || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -8412,11 +8628,15 @@ mod tests {
                     .build()
                     .expect("paused runtime");
                 runtime.block_on(async {
-                    let transport = RetryingWalkDirInternodeDataTransport::with_steps(vec![WalkDirTestStep::Data(vec![
-                        6;
-                        DEFAULT_READ_BUFFER_SIZE
-                            * 4
-                    ])]);
+                    let mut steps = Vec::new();
+                    if retried_open {
+                        steps.push(WalkDirTestStep::Error(DiskError::Io(io::Error::new(
+                            io::ErrorKind::ConnectionReset,
+                            "transient open before an unfinished copy",
+                        ))));
+                    }
+                    steps.push(WalkDirTestStep::Data(vec![6; DEFAULT_READ_BUFFER_SIZE * 4]));
+                    let transport = RetryingWalkDirInternodeDataTransport::with_steps(steps);
                     let disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
                     let opts = WalkDirOptions {
                         timeout_ms: Some(1000),
@@ -8425,7 +8645,7 @@ mod tests {
                     let (mut writer, mut consumer) = duplex(64);
                     let mut walk = Box::pin(disk.walk_dir(opts, &mut writer));
                     assert!(futures::poll!(&mut walk).is_pending(), "walk must reach a backpressured await");
-                    assert_eq!(transport.calls().len(), 1);
+                    assert_eq!(transport.calls().len(), if retried_open { 2 } else { 1 });
                     if cancelled {
                         drop(walk);
                     } else {
@@ -8439,6 +8659,7 @@ mod tests {
                     assert_eq!(published, vec![6; 64]);
                 });
             });
+            assert_walk_failure_reason(&recorder, Some(if cancelled { "abandoned" } else { "operation_timeout" }));
             let outcome = if cancelled { "cancelled" } else { "error" };
             assert_eq!(recorder.counter_value("rustfs_remote_walk_started_total", &[]), 1);
             assert_eq!(recorder.counter_value("rustfs_remote_walk_completed_total", &[("outcome", outcome)]), 1);
