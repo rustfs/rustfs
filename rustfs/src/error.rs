@@ -1458,10 +1458,7 @@ mod tests {
                 ApiError::from(StorageError::Io(IoError::other(source()))),
                 ApiError::from(IoError::other(source())),
             ] {
-                assert_eq!(
-                    error.code.as_str(),
-                    if sha256 { CONTENT_SHA256_MISMATCH_CODE } else { "BadDigest" }
-                );
+                assert_eq!(error.code.as_str(), if sha256 { CONTENT_SHA256_MISMATCH_CODE } else { "BadDigest" });
             }
         }
     }
