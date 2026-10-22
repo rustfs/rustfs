@@ -747,9 +747,16 @@ mod tests {
         assert_eq!(raw_object_bytes(&store, &bucket, "race").await, b"client");
     }
 
-    #[tokio::test]
+    #[test]
     #[serial_test::serial]
-    async fn write_back_preserves_delete_markers_unless_policy_allows_revival() {
+    fn write_back_preserves_delete_markers_unless_policy_allows_revival() {
+        crate::app::gating_test_env::run_large_stack_test(
+            "odm-write-back-delete-marker-revival",
+            write_back_preserves_delete_markers_unless_policy_allows_revival_inner,
+        );
+    }
+
+    async fn write_back_preserves_delete_markers_unless_policy_allows_revival_inner() {
         for multipart in [false, true] {
             let (store, bucket) = write_back_test_bucket("odm-wb-tombstone", true).await;
             let write_back = OnDemandMigrationWriteBack::new();
