@@ -302,35 +302,42 @@ async fn only_one_client_collector_can_run_at_a_time() {
 #[tokio::test]
 async fn configured_proxy_and_direct_endpoint_failures_are_distinct() {
     let _guard = TEST_LOCK.lock().await;
-    let proxy_probe = HttpClientProbe::new(
-        "http://127.0.0.1:1",
-        None,
-        Some("http://127.0.0.1:9"),
-        Zeroizing::new("access".to_owned()),
-        Zeroizing::new("secret".to_owned()),
-        Zeroizing::new(String::new()),
-        Duration::from_millis(100),
-    )
-    .expect("proxy probe");
-    let measurement = measure_client(&request(ClientOperation::GetObject), &proxy_probe, &CancellationToken::new())
-        .await
-        .expect("typed proxy failure");
-    assert_eq!(measurement.target.reason_code, ClientTargetReasonCode::ProxyFailure);
-
-    let direct_probe = HttpClientProbe::new(
-        "http://127.0.0.1:9",
-        None,
-        None,
-        Zeroizing::new("access".to_owned()),
-        Zeroizing::new("secret".to_owned()),
-        Zeroizing::new(String::new()),
-        Duration::from_millis(100),
-    )
-    .expect("direct probe");
-    let measurement = measure_client(&request(ClientOperation::GetObject), &direct_probe, &CancellationToken::new())
-        .await
-        .expect("typed endpoint failure");
-    assert_eq!(measurement.target.reason_code, ClientTargetReasonCode::EndpointUnavailable);
+    // Classification must not race a short deadline when CI deschedules the test.
+    let failure_budget = Duration::from_secs(20);
+    for (use_proxy, expected) in [
+        (true, ClientTargetReasonCode::ProxyFailure),
+        (false, ClientTargetReasonCode::EndpointUnavailable),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("failure listener");
+        let address = listener.local_addr().expect("failure listener address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("probe connection");
+            // Reject the proxy CONNECT or direct TLS handshake before any HTTP response.
+            drop(stream);
+        });
+        let endpoint = format!("https://{address}");
+        let proxy = format!("http://{address}");
+        let probe = HttpClientProbe::new(
+            &endpoint,
+            None,
+            use_proxy.then_some(proxy.as_str()),
+            Zeroizing::new("access".to_owned()),
+            Zeroizing::new("secret".to_owned()),
+            Zeroizing::new(String::new()),
+            failure_budget,
+        )
+        .expect("failure probe");
+        let mut probe_request = request(ClientOperation::GetObject);
+        probe_request.duration = failure_budget;
+        let measurement = measure_client(&probe_request, &probe, &CancellationToken::new())
+            .await
+            .expect("typed connection failure");
+        assert_eq!(measurement.target.reason_code, expected);
+        tokio::time::timeout(failure_budget, server)
+            .await
+            .expect("failure server must finish")
+            .expect("failure server must not panic");
+    }
 }
 
 #[tokio::test]
