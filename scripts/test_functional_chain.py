@@ -108,6 +108,35 @@ class RaceNativeToolsWorkflowTests(unittest.TestCase):
         selection = workflow.split('      - name: Select exact-source race native evidence\n', 1)[1].split('\n        env:', 1)[0]
         self.assertIn("inputs.validation_case == 'heal.race-multipart-complete-abort'", selection)
 
+    def test_i05_native_prerequisite_propagates_failure_and_exports_only_after_verification(self):
+        shell = self.chain_shell_step('Verify I05 queued-successor native prerequisite')
+        for exit_code in (0, 42):
+            with self.subTest(exit_code=exit_code), tempfile.TemporaryDirectory() as name:
+                root = Path(name)
+                env = self.fixture(root, new_helper=True)
+                script = root / 'auto-testing/scripts/validation_heal/race_native_evidence.py'
+                script.write_text('import os,sys\n'
+                    'assert sys.argv[-2:] == ["--case-id", "heal.lock-timeout-and-caller-abort"]\n'
+                    'assert sys.argv[-3] == os.environ["AUTO_TESTING_SHA"]\n'
+                    'sys.exit(int(os.environ["VERIFY_EXIT"]))\n')
+                validation = root / 'validation'; validation.mkdir()
+                (validation / 'tool-run.json').write_text('{"id":123}')
+                native = root / 'rustfs-validation-native-77-1'; native.mkdir()
+                output = root / 'env'
+                env.update(RUNNER_TEMP=str(root), GITHUB_RUN_ID='77', GITHUB_RUN_ATTEMPT='1',
+                           VALIDATION_ROOT=str(validation), GITHUB_ENV=str(output), VERIFY_EXIT=str(exit_code))
+                result = subprocess.run(['bash', '-c', shell], cwd=root, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, exit_code, result.stderr)
+                self.assertEqual(output.exists(), exit_code == 0)
+                self.assertEqual((native / 'tool-run.json').read_bytes(), (validation / 'tool-run.json').read_bytes())
+        workflow = (candidate.ROOT / '.github/workflows/rustfs-functional-chain.yml').read_text()
+        self.assertLess(workflow.index('Verify I05 queued-successor native prerequisite'),
+                        workflow.index('Run selected canonical validation case'))
+        download = workflow.split('      - name: Download pinned native storage evidence\n', 1)[1].split('        uses:', 1)[0]
+        self.assertIn("inputs.i05_diagnostic_branch == 'queued-successor'", download)
+        execution = workflow.split('      - name: Run selected canonical validation case\n', 1)[1].split('        run:', 1)[0]
+        self.assertIn('I05_DIAGNOSTIC_BRANCH: ${{ inputs.i05_diagnostic_branch }}', execution)
+
     def shell_step(self, name):
         from check_test_wiring import yaml_block
         source = (candidate.ROOT / '.github/workflows/rustfs-validation-tools.yml').read_text()
