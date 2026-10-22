@@ -3524,14 +3524,16 @@ impl ECStore {
         data: Vec<u8>,
         preconditions: crate::storage_api_contracts::object::HTTPPreconditions,
     ) -> Result<ObjectInfo> {
-        self.save_scanner_pause_backlog_replica_for_membership(
-            pool_index,
-            set_index,
-            data,
-            preconditions,
-            Arc::from([pool_index]),
-        )
-        .await
+        let writable_pool_indices = self
+            .scanner_pause_backlog_writable_set_disks()
+            .await
+            .into_iter()
+            .map(|set| set.pool_index)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        self.save_scanner_pause_backlog_replica_for_membership(pool_index, set_index, data, preconditions, writable_pool_indices)
+            .await
     }
 
     /// Publish a native scanner replica without allowing stale pool selection

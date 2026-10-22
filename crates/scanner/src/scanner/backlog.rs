@@ -3184,60 +3184,42 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn native_writer_expansion_rechecks_membership_after_seeding() {
+    fn native_writer_expansion_rejects_an_incomplete_startup_membership() {
         run_native_retirement_test(async || {
-            use crate::storage_api::owner::NativeScannerPauseBacklogWriteFault;
-
             let (_root, store, original) = native_expanded_backlog_store(1, false).await;
-            // Model a node-local writable view learning about another pool while
-            // the already selected seed fan-out is in flight. Durable admission
-            // still uses the complete pool metadata throughout the test.
             let later_member = store.pool_meta.write().await.pools.pop().expect("third pool visibility");
             let before = load_scanner_pause_backlog(Arc::clone(&store))
                 .await
                 .expect("initial writable view");
             assert_eq!(before.replica_count, 4);
             assert_eq!(before.healthy_replicas, 2);
-            let barrier =
-                NativeScannerPauseBacklogWriteFault::pause_after_write(Arc::clone(&store.pools[1].disk_set[1]), "publish");
-            let late_failure =
-                NativeScannerPauseBacklogWriteFault::fail_before_write(Arc::clone(&store.pools[2].disk_set[0]), "publish", 1);
             let now = unix_now().saturating_add(60);
-            let writer_store = Arc::clone(&store);
-            let writer = tokio::spawn(async move { ScannerPauseBacklogController::claim(writer_store, now).await });
-            tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
-                .await
-                .expect("seed publication must reach the native barrier");
+            let result = ScannerPauseBacklogController::claim(Arc::clone(&store), now).await;
             store.pool_meta.write().await.pools.push(later_member);
-            barrier.release();
-            let error = tokio::time::timeout(Duration::from_secs(30), writer)
-                .await
-                .expect("writer must finish after the seed barrier")
-                .expect("writer task must not panic")
+            let error = result
                 .err()
-                .expect("a newly visible unseeded member must block the next commit");
-            assert!(error.contains("failed to stabilize its last committed generation"), "{error}");
-            drop(barrier);
-            drop(late_failure);
+                .expect("durable membership must reject the incomplete startup view");
+            assert!(error.contains("commit did not reach every surviving set"), "{error}");
 
             let loaded = load_scanner_pause_backlog(Arc::clone(&store))
                 .await
-                .expect("the old native authority must survive membership growth during seeding");
+                .expect("the old authority must survive a rejected startup publication");
             assert_eq!(loaded.ledger, original);
             assert_eq!(loaded.authoritative_commit, before.authoritative_commit);
             assert_eq!(loaded.replica_count, 6);
-            assert_eq!(loaded.healthy_replicas, 4);
-            for set in &store.pools[2].disk_set {
-                assert!(matches!(
-                    read_scanner_pause_backlog_replica(Arc::clone(set)).await.state,
-                    ScannerPauseBacklogReplicaState::Missing
-                ));
+            assert_eq!(loaded.healthy_replicas, 2);
+            for pool in store.pools.iter().skip(1) {
+                for set in &pool.disk_set {
+                    assert!(matches!(
+                        read_scanner_pause_backlog_replica(Arc::clone(set)).await.state,
+                        ScannerPauseBacklogReplicaState::Missing
+                    ));
+                }
             }
-
             let expected = claim_scanner_pause_backlog_writer(&original, now).expect("retry writer generation");
             ScannerPauseBacklogController::claim(Arc::clone(&store), now)
                 .await
-                .expect("retry must seed the newly visible members before committing");
+                .expect("the complete membership seeds every new member before committing");
             assert_current_native_writer_ledger(&store, &expected).await;
             shutdown_native_retirement_store(store).await;
         });
@@ -3299,6 +3281,68 @@ mod tests {
                 assert!(original.has_unfinished_attempt());
                 shutdown_native_retirement_store(store).await;
             }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_writer_stale_cohort_cannot_roll_back_expansion_commit() {
+        run_native_retirement_test(async || {
+            let (_root, store) = native_pause_backlog_store(3, 1).await;
+            let now = unix_now();
+            let old = ScannerPauseBacklogController::claim(Arc::clone(&store), now)
+                .await
+                .expect("initial stable cohort")
+                .loaded;
+            let next = claim_scanner_pause_backlog_writer(&old.ledger, now + 1).expect("next native writer");
+            let members = scanner_pause_backlog_replica_ids(&old.replicas);
+            write_scanner_pause_backlog_record(
+                Arc::clone(&store),
+                &old,
+                commit_scanner_pause_backlog_record(Some(&old.ledger), &next, &members),
+            )
+            .await
+            .expect("complete expanded membership commit before stabilization");
+            let pending = load_scanner_pause_backlog(Arc::clone(&store))
+                .await
+                .expect("expanded commit must be authoritative");
+            assert_eq!(pending.ledger, next);
+            let mut before = Vec::new();
+            for pool in &store.pools {
+                before.push(native_replica_bytes(&pool.disk_set[0]).await);
+            }
+
+            // Startup can expose an older node-local membership while durable
+            // pool metadata already includes every configured pool. That view
+            // cannot recognize the expanded commit and selects its rollback.
+            let later_member = store.pool_meta.write().await.pools.pop().expect("last pool visibility");
+            let stale = load_scanner_pause_backlog(Arc::clone(&store))
+                .await
+                .expect("old view selects its stable rollback");
+            assert_eq!(stale.ledger, old.ledger);
+            assert!(stale.authoritative_commit.is_none());
+            let stale_members = scanner_pause_backlog_replica_ids(&stale.replicas);
+            let result = write_scanner_pause_backlog_record(
+                Arc::clone(&store),
+                &stale,
+                stable_scanner_pause_backlog_record(&stale.ledger, None, &stale_members),
+            )
+            .await;
+            store.pool_meta.write().await.pools.push(later_member);
+            result.expect_err("a smaller stale cohort must not overwrite the expanded commit proof");
+            for (pool, expected) in store.pools.iter().zip(before) {
+                assert_eq!(
+                    native_replica_bytes(&pool.disk_set[0]).await,
+                    expected,
+                    "rejected publication preserves each payload and CAS revision"
+                );
+            }
+            let stabilized = stabilize_scanner_pause_backlog(Arc::clone(&store), &pending)
+                .await
+                .expect("the acknowledged expanded commit remains recoverable");
+            assert!(stabilized.all_current_replicas_stable());
+            assert_current_native_writer_ledger(&store, &next).await;
+            shutdown_native_retirement_store(store).await;
         });
     }
 
