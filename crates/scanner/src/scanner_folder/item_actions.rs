@@ -474,10 +474,23 @@ pub(super) fn record_heal_candidate_admission(
     }
 }
 
+pub(crate) fn scanner_disk_heal_scope(disk: &Disk) -> Option<DataUsageCacheSource> {
+    let location = disk.get_disk_location();
+    location.valid().then_some(())?;
+    Some(DataUsageCacheSource::new(location.pool_idx?, location.set_idx?))
+}
+
 pub(super) async fn send_scanner_heal_request(
     candidate_type: &'static str,
-    request: HealChannelRequest,
+    mut request: HealChannelRequest,
+    scope: Option<DataUsageCacheSource>,
 ) -> Result<HealAdmissionResult, ScannerError> {
+    if request.object_prefix.as_deref().is_some_and(|object| !object.is_empty()) {
+        let scope = scope
+            .ok_or_else(|| ScannerError::Other("scanner object heal requires the scanning disk's pool and set".to_string()))?;
+        request.pool_index = Some(scope.pool_index);
+        request.set_index = Some(scope.set_index);
+    }
     let priority = request.priority;
     let trace_context = scanner_heal_candidate_trace_context(&request);
     match send_heal_request_with_admission(request).await {
@@ -533,6 +546,8 @@ pub struct ScannerItem {
     pub lifecycle: Option<Arc<BucketLifecycleConfiguration>>,
     pub object_lock: Option<Arc<ObjectLockConfiguration>>,
     pub replication: Option<Arc<ReplicationConfig>>,
+    /// Actual scanning-disk location; refreshed by the disk reader before actions.
+    pub heal_scope: Option<DataUsageCacheSource>,
     pub heal_enabled: bool,
     pub heal_bitrot: bool,
     pub debug: bool,
@@ -1157,6 +1172,7 @@ impl ScannerItem {
                 scan_mode,
                 HealChannelPriority::Low,
             ),
+            self.heal_scope,
         )
         .await;
 
@@ -1349,6 +1365,7 @@ mod tests {
             lifecycle: None,
             object_lock: None,
             replication: None,
+            heal_scope: None,
             heal_enabled: false,
             heal_bitrot: false,
             debug: false,
