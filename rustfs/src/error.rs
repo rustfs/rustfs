@@ -17,7 +17,11 @@ use crate::storage_api::error::{PoolMetadataError, QuotaError, StorageError, unr
 use http::StatusCode;
 use rustfs_kms::KmsUnavailableError;
 use rustfs_lock::LockError;
+use s3s::stream::{aws_chunked_stream::AwsChunkedStreamError, upload_stream::UploadStreamError};
 use s3s::{S3Error, S3ErrorCode};
+
+pub(crate) const CONTENT_SHA256_MISMATCH_CODE: &str = "XAmzContentSHA256Mismatch";
+const CONTENT_SHA256_MISMATCH_MESSAGE: &str = "The provided 'x-amz-content-sha256' header does not match what was computed.";
 
 const MAX_VERSIONS_EXCEEDED_CODE: &str = "MaxVersionsExceeded";
 const MAX_VERSIONS_EXCEEDED_MESSAGE: &str = "You've exceeded the limit on the number of versions you can create on this object";
@@ -164,7 +168,12 @@ fn data_plane_kms_error(error: &rustfs_kms::KmsError) -> Option<(S3ErrorCode, St
 /// exist" has to say so itself.
 fn custom_error_status(code: &S3ErrorCode) -> Option<StatusCode> {
     match code {
-        S3ErrorCode::Custom(custom) if &**custom == KMS_KEY_NOT_FOUND_ERROR_CODE || &**custom == MAX_VERSIONS_EXCEEDED_CODE => {
+        S3ErrorCode::Custom(custom)
+            if matches!(
+                &**custom,
+                KMS_KEY_NOT_FOUND_ERROR_CODE | MAX_VERSIONS_EXCEEDED_CODE | CONTENT_SHA256_MISMATCH_CODE
+            ) =>
+        {
             Some(StatusCode::BAD_REQUEST)
         }
         S3ErrorCode::Custom(custom) if &**custom == SLOW_DOWN_READ_CODE => Some(StatusCode::SERVICE_UNAVAILABLE),
@@ -398,6 +407,9 @@ impl ApiError {
             S3ErrorCode::InvalidArgument => "Invalid argument".to_string(),
             S3ErrorCode::InvalidStorageClass => "Invalid storage class.".to_string(),
             S3ErrorCode::AccessDenied => "Access Denied.".to_string(),
+            S3ErrorCode::Custom(code) if &**code == CONTENT_SHA256_MISMATCH_CODE => {
+                CONTENT_SHA256_MISMATCH_MESSAGE.to_string()
+            }
             S3ErrorCode::BadDigest => "The Content-Md5 you specified did not match what we received.".to_string(),
             S3ErrorCode::EntityTooSmall => "Your proposed upload is smaller than the minimum allowed object size.".to_string(),
             S3ErrorCode::EntityTooLarge => "Your proposed upload exceeds the maximum allowed object size.".to_string(),
@@ -541,25 +553,34 @@ where
     error_chain_find(err, |error| error.is::<T>().then_some(())).is_some()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum S3sBodyStreamError {
-    Sha256Mismatch,
-    IncompleteBody,
+/// Payload hashes and object checksums have distinct S3 error contracts.
+/// Walk the same bounded chain for direct and storage-wrapped I/O failures.
+fn error_chain_digest_code(err: &(dyn std::error::Error + 'static)) -> Option<S3ErrorCode> {
+    error_chain_find(err, |error| {
+        if error.is::<rustfs_rio::Sha256Mismatch>()
+            || matches!(error.downcast_ref::<UploadStreamError>(), Some(UploadStreamError::Sha256Mismatch))
+        {
+            Some(S3ErrorCode::Custom(CONTENT_SHA256_MISMATCH_CODE.into()))
+        } else if error.is::<rustfs_rio::ChecksumMismatch>() || error.is::<rustfs_rio::BadDigest>() {
+            Some(S3ErrorCode::BadDigest)
+        } else {
+            None
+        }
+    })
 }
 
-fn classify_s3s_body_stream_error_display(err: &(dyn std::error::Error + 'static)) -> Option<S3sBodyStreamError> {
-    match err.to_string().as_str() {
-        "UploadStreamError: Sha256Mismatch" => Some(S3sBodyStreamError::Sha256Mismatch),
-        "UploadStreamError: LengthMismatch"
-        | "UploadStreamError: Incomplete"
-        | "AwsChunkedStreamError: LengthMismatch"
-        | "AwsChunkedStreamError: Incomplete" => Some(S3sBodyStreamError::IncompleteBody),
-        _ => None,
-    }
-}
-
-fn error_chain_s3s_body_stream_error(err: &(dyn std::error::Error + 'static)) -> Option<S3sBodyStreamError> {
-    error_chain_find(err, classify_s3s_body_stream_error_display)
+fn error_chain_has_s3s_incomplete_body(err: &(dyn std::error::Error + 'static)) -> bool {
+    error_chain_find(err, |error| {
+        (matches!(
+            error.downcast_ref::<UploadStreamError>(),
+            Some(UploadStreamError::LengthMismatch | UploadStreamError::Incomplete)
+        ) || matches!(
+            error.downcast_ref::<AwsChunkedStreamError>(),
+            Some(AwsChunkedStreamError::LengthMismatch | AwsChunkedStreamError::Incomplete)
+        ))
+        .then_some(())
+    })
+    .is_some()
 }
 
 /// `io::Error::source` skips its custom payload itself. Visit that payload
@@ -674,17 +695,10 @@ impl From<StorageError> for ApiError {
         if let StorageError::Io(ref io_err) = err
             && let Some(inner) = io_err.get_ref()
         {
-            let s3s_body_stream_error = error_chain_s3s_body_stream_error(inner);
-
-            // Preserve client-provided body and digest failures across I/O boundaries.
-            if inner.downcast_ref::<rustfs_rio::ChecksumMismatch>().is_some()
-                || inner.downcast_ref::<rustfs_rio::BadDigest>().is_some()
-                || inner.downcast_ref::<rustfs_rio::Sha256Mismatch>().is_some()
-                || matches!(s3s_body_stream_error, Some(S3sBodyStreamError::Sha256Mismatch))
-            {
+            if let Some(code) = error_chain_digest_code(inner) {
                 return ApiError {
-                    code: S3ErrorCode::BadDigest,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::BadDigest),
+                    message: ApiError::error_code_to_message(&code),
+                    code,
                     source: Some(Box::new(err)),
                 };
             }
@@ -729,7 +743,7 @@ impl From<StorageError> for ApiError {
                 };
             }
 
-            if matches!(s3s_body_stream_error, Some(S3sBodyStreamError::IncompleteBody)) {
+            if error_chain_has_s3s_incomplete_body(inner) {
                 return ApiError {
                     code: S3ErrorCode::IncompleteBody,
                     message: ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody),
@@ -852,20 +866,15 @@ impl From<HTTPRangeError> for ApiError {
 
 impl From<std::io::Error> for ApiError {
     fn from(err: std::io::Error) -> Self {
-        // Map client-provided digest mismatches to BadDigest.
         if let Some(inner) = err.get_ref() {
-            let s3s_body_stream_error = error_chain_s3s_body_stream_error(inner);
-            if error_chain_has_type::<rustfs_rio::ChecksumMismatch>(inner)
-                || error_chain_has_type::<rustfs_rio::BadDigest>(inner)
-                || error_chain_has_type::<rustfs_rio::Sha256Mismatch>(inner)
-                || matches!(s3s_body_stream_error, Some(S3sBodyStreamError::Sha256Mismatch))
-            {
+            if let Some(code) = error_chain_digest_code(inner) {
                 return ApiError {
-                    code: S3ErrorCode::BadDigest,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::BadDigest),
+                    message: ApiError::error_code_to_message(&code),
+                    code,
                     source: Some(Box::new(err)),
                 };
             }
+
             if error_chain_has_type::<UploadLimitExceeded>(inner) {
                 return ApiError {
                     code: S3ErrorCode::EntityTooLarge,
@@ -904,7 +913,7 @@ impl From<std::io::Error> for ApiError {
                 };
             }
 
-            if matches!(s3s_body_stream_error, Some(S3sBodyStreamError::IncompleteBody)) {
+            if error_chain_has_s3s_incomplete_body(inner) {
                 return ApiError {
                     code: S3ErrorCode::IncompleteBody,
                     message: ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody),
@@ -965,6 +974,7 @@ mod tests {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard;
     use rustfs_s3_ops::S3Operation;
+    use s3s::stream::{aws_chunked_stream::AwsChunkedStreamError, upload_stream::UploadStreamError};
     use s3s::{S3Error, S3ErrorCode};
     use std::io::{Error as IoError, ErrorKind};
 
@@ -1239,34 +1249,6 @@ mod tests {
     }
 
     #[derive(Debug)]
-    enum MockUploadStreamError {
-        Underlying(IoError),
-        Sha256Mismatch,
-        LengthMismatch,
-        Incomplete,
-    }
-
-    impl std::fmt::Display for MockUploadStreamError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::Underlying(err) => write!(f, "UploadStreamError: Underlying: {err}"),
-                Self::Sha256Mismatch => f.write_str("UploadStreamError: Sha256Mismatch"),
-                Self::LengthMismatch => f.write_str("UploadStreamError: LengthMismatch"),
-                Self::Incomplete => f.write_str("UploadStreamError: Incomplete"),
-            }
-        }
-    }
-
-    impl std::error::Error for MockUploadStreamError {
-        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            match self {
-                Self::Underlying(err) => Some(err),
-                Self::Sha256Mismatch | Self::LengthMismatch | Self::Incomplete => None,
-            }
-        }
-    }
-
-    #[derive(Debug)]
     struct MockS3sBodyStreamError(&'static str);
 
     impl std::fmt::Display for MockS3sBodyStreamError {
@@ -1314,94 +1296,124 @@ mod tests {
     }
 
     #[test]
-    fn sha256_mismatch_io_errors_map_to_bad_digest() {
-        let io_error = IoError::new(
-            ErrorKind::InvalidData,
-            rustfs_rio::Sha256Mismatch {
-                expected_sha256: "expected".to_string(),
-                calculated_sha256: "calculated".to_string(),
-            },
-        );
-        let api_error = ApiError::from(io_error);
-        assert_eq!(api_error.code, S3ErrorCode::BadDigest);
-        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
-
-        let storage_error = StorageError::Io(IoError::new(
-            ErrorKind::InvalidData,
-            rustfs_rio::Sha256Mismatch {
-                expected_sha256: "expected".to_string(),
-                calculated_sha256: "calculated".to_string(),
-            },
-        ));
-        let api_error = ApiError::from(storage_error);
-        assert_eq!(api_error.code, S3ErrorCode::BadDigest);
-        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
+    fn payload_sha256_mismatch_io_errors_map_to_content_sha256_mismatch() {
+        for storage in [false, true] {
+            for nested in [false, true] {
+                for error in [
+                    IoError::other(rustfs_rio::Sha256Mismatch {
+                        expected_sha256: "expected".to_string(),
+                        calculated_sha256: "calculated".to_string(),
+                    }),
+                    IoError::other(UploadStreamError::Sha256Mismatch),
+                ] {
+                    let error = if nested { IoError::other(error) } else { error };
+                    let api_error = if storage {
+                        ApiError::from(StorageError::Io(error))
+                    } else {
+                        ApiError::from(error)
+                    };
+                    assert_eq!(api_error.code.as_str(), "XAmzContentSHA256Mismatch");
+                    assert_eq!(
+                        api_error.message,
+                        "The provided 'x-amz-content-sha256' header does not match what was computed."
+                    );
+                    assert!(
+                        error_chain_has_type::<rustfs_rio::Sha256Mismatch>(&api_error)
+                            || error_chain_has_type::<UploadStreamError>(&api_error)
+                    );
+                    let s3_error = S3Error::from(api_error);
+                    assert_eq!(s3_error.status_code(), Some(StatusCode::BAD_REQUEST));
+                    assert!(s3_error.source().is_some());
+                }
+            }
+        }
     }
 
     #[test]
-    fn content_md5_mismatch_io_errors_map_to_bad_digest() {
-        let bad_digest = || rustfs_rio::BadDigest {
-            expected_md5: "expected".to_string(),
-            calculated_md5: "calculated".to_string(),
-        };
-        let api_error = ApiError::from(IoError::new(ErrorKind::InvalidData, bad_digest()));
-        assert_eq!(api_error.code, S3ErrorCode::BadDigest);
-        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
-
-        let api_error = ApiError::from(StorageError::Io(IoError::new(ErrorKind::InvalidData, bad_digest())));
-        assert_eq!(api_error.code, S3ErrorCode::BadDigest);
-        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
-    }
-
-    #[test]
-    fn upload_stream_sha256_mismatch_maps_to_bad_digest() {
-        let api_error = ApiError::from(IoError::other(MockUploadStreamError::Sha256Mismatch));
-        assert_eq!(api_error.code, S3ErrorCode::BadDigest);
-        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
-
-        let api_error = ApiError::from(StorageError::Io(IoError::other(MockUploadStreamError::Sha256Mismatch)));
-        assert_eq!(api_error.code, S3ErrorCode::BadDigest);
-        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
+    fn content_md5_and_additional_checksum_mismatches_map_to_bad_digest() {
+        for storage in [false, true] {
+            for nested in [false, true] {
+                for error in [
+                    IoError::other(rustfs_rio::BadDigest {
+                        expected_md5: "expected".to_string(),
+                        calculated_md5: "calculated".to_string(),
+                    }),
+                    IoError::other(rustfs_rio::ChecksumMismatch {
+                        want: "expected".into(),
+                        got: "calculated".into(),
+                    }),
+                ] {
+                    let error = if nested { IoError::other(error) } else { error };
+                    let api_error = if storage {
+                        ApiError::from(StorageError::Io(error))
+                    } else {
+                        ApiError::from(error)
+                    };
+                    assert_eq!(api_error.code, S3ErrorCode::BadDigest);
+                    assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
+                    assert_eq!(S3Error::from(api_error).status_code(), Some(StatusCode::BAD_REQUEST));
+                }
+            }
+        }
     }
 
     #[test]
     fn underlying_upload_stream_errors_remain_internal() {
-        let api_error =
-            ApiError::from(IoError::other(MockUploadStreamError::Underlying(IoError::other("underlying body error"))));
+        let api_error = ApiError::from(IoError::other(UploadStreamError::Underlying(Box::new(IoError::other(
+            "underlying body error",
+        )))));
         assert_eq!(api_error.code, S3ErrorCode::InternalError);
 
-        let api_error = ApiError::from(StorageError::Io(IoError::other(MockUploadStreamError::Underlying(IoError::other(
-            "underlying body error",
+        let api_error = ApiError::from(StorageError::Io(IoError::other(UploadStreamError::Underlying(Box::new(
+            IoError::other("underlying body error"),
         )))));
         assert_eq!(api_error.code, S3ErrorCode::InternalError);
     }
 
     #[test]
     fn s3s_incomplete_body_stream_errors_map_to_incomplete_body() {
-        for error in [MockUploadStreamError::LengthMismatch, MockUploadStreamError::Incomplete] {
+        for error in [UploadStreamError::LengthMismatch, UploadStreamError::Incomplete] {
             let api_error = ApiError::from(IoError::other(error));
             assert_eq!(api_error.code, S3ErrorCode::IncompleteBody);
             assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
         }
 
-        for error in [MockUploadStreamError::LengthMismatch, MockUploadStreamError::Incomplete] {
+        for error in [UploadStreamError::LengthMismatch, UploadStreamError::Incomplete] {
             let api_error = ApiError::from(StorageError::Io(IoError::other(error)));
             assert_eq!(api_error.code, S3ErrorCode::IncompleteBody);
             assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
         }
 
-        for message in ["AwsChunkedStreamError: LengthMismatch", "AwsChunkedStreamError: Incomplete"] {
-            let api_error = ApiError::from(IoError::other(MockS3sBodyStreamError(message)));
-            assert_eq!(api_error.code, S3ErrorCode::IncompleteBody, "{message}");
-            assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
+        for storage in [false, true] {
+            for nested in [false, true] {
+                for error in [AwsChunkedStreamError::LengthMismatch, AwsChunkedStreamError::Incomplete] {
+                    let error = IoError::other(error);
+                    let error = if nested { IoError::other(error) } else { error };
+                    let api_error = if storage {
+                        ApiError::from(StorageError::Io(error))
+                    } else {
+                        ApiError::from(error)
+                    };
+                    assert_eq!(api_error.code, S3ErrorCode::IncompleteBody);
+                    assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
+                }
+            }
+        }
+    }
 
-            let api_error = ApiError::from(IoError::other(IoError::other(MockS3sBodyStreamError(message))));
-            assert_eq!(api_error.code, S3ErrorCode::IncompleteBody, "{message}");
-            assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
-
-            let api_error = ApiError::from(StorageError::Io(IoError::other(MockS3sBodyStreamError(message))));
-            assert_eq!(api_error.code, S3ErrorCode::IncompleteBody, "{message}");
-            assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
+    #[test]
+    fn body_error_display_text_does_not_impersonate_typed_failures() {
+        for message in [
+            "UploadStreamError: Sha256Mismatch",
+            "UploadStreamError: Incomplete",
+            "AwsChunkedStreamError: LengthMismatch",
+        ] {
+            for error in [
+                ApiError::from(IoError::other(MockS3sBodyStreamError(message))),
+                ApiError::from(StorageError::Io(IoError::other(MockS3sBodyStreamError(message)))),
+            ] {
+                assert_eq!(error.code, S3ErrorCode::InternalError);
+            }
         }
     }
 

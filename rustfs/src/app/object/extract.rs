@@ -1210,7 +1210,9 @@ pub fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: boo
 fn map_extract_archive_error(err: std::io::Error) -> S3Error {
     let message = err.to_string();
     let api_error = ApiError::from(err);
-    if matches!(api_error.code, S3ErrorCode::BadDigest | S3ErrorCode::IncompleteBody) {
+    if matches!(api_error.code, S3ErrorCode::BadDigest | S3ErrorCode::IncompleteBody)
+        || api_error.code.as_str() == crate::error::CONTENT_SHA256_MISMATCH_CODE
+    {
         return api_error.into();
     }
 
@@ -3502,6 +3504,9 @@ mod tests {
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(!state.lock().expect("archive state lock must remain healthy").body_complete);
+        let error = map_extract_archive_error(err);
+        assert_eq!(error.code().as_str(), "XAmzContentSHA256Mismatch");
+        assert_eq!(error.status_code(), Some(http::StatusCode::BAD_REQUEST));
     }
 
     fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {
@@ -3648,6 +3653,9 @@ mod tests {
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(!state.lock().expect("archive state lock must remain healthy").body_complete);
+        let error = map_extract_archive_error(err);
+        assert_eq!(error.code(), &S3ErrorCode::BadDigest);
+        assert_eq!(error.status_code(), Some(http::StatusCode::BAD_REQUEST));
     }
 
     #[tokio::test]

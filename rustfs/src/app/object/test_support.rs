@@ -18,16 +18,7 @@ use super::*;
 use http::{Extensions, HeaderMap, Method, Uri};
 use std::sync::Arc;
 
-#[derive(Debug)]
-pub(super) struct MockUploadStreamSha256Mismatch;
-
-impl std::fmt::Display for MockUploadStreamSha256Mismatch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("UploadStreamError: Sha256Mismatch")
-    }
-}
-
-impl std::error::Error for MockUploadStreamSha256Mismatch {}
+pub(super) use s3s::stream::upload_stream::UploadStreamError;
 
 pub(super) fn build_request<T>(input: T, method: Method) -> S3Request<T> {
     S3Request {

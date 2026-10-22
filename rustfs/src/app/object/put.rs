@@ -3260,28 +3260,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_small_put_body_maps_upload_stream_sha256_mismatch_to_bad_digest() {
+    async fn read_small_put_body_maps_upload_stream_sha256_mismatch_to_content_sha256_mismatch() {
         let body = StreamReader::new(futures::stream::iter(vec![Err::<Bytes, std::io::Error>(s3s_body_error_to_io(Box::new(
-            MockUploadStreamSha256Mismatch,
+            UploadStreamError::Sha256Mismatch,
         )))]));
 
         let error = read_small_put_body_exact_direct(body, 1)
             .await
             .expect_err("SHA256 mismatch should reject the small PUT body");
 
-        assert_eq!(error.code(), &S3ErrorCode::BadDigest);
+        assert_eq!(error.code().as_str(), "XAmzContentSHA256Mismatch");
     }
 
     #[tokio::test]
-    async fn read_zero_copy_put_body_maps_upload_stream_sha256_mismatch_to_bad_digest() {
-        let body = futures::stream::iter(vec![Err::<Bytes, MockUploadStreamSha256Mismatch>(MockUploadStreamSha256Mismatch)]);
+    async fn read_zero_copy_put_body_maps_upload_stream_sha256_mismatch_to_content_sha256_mismatch() {
+        let body = futures::stream::iter(vec![Err::<Bytes, UploadStreamError>(UploadStreamError::Sha256Mismatch)]);
 
         let error = match read_zero_copy_put_body_exact(body, 1).await {
             Ok(_) => panic!("SHA256 mismatch should reject the zero-copy PUT body"),
             Err(error) => error,
         };
 
-        assert_eq!(error.code(), &S3ErrorCode::BadDigest);
+        assert_eq!(error.code().as_str(), "XAmzContentSHA256Mismatch");
     }
 
     struct FragmentedBody {
