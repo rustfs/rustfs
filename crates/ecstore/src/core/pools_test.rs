@@ -764,7 +764,11 @@ mod decommission_lock_order_tests {
     }
 
     /// A two-part source object: a 5 MiB part and a 1-byte part.
-    async fn put_source_multipart_object(store: &Arc<crate::store::ECStore>, bucket: &str, object: &str) {
+    async fn put_source_multipart_object(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+    ) -> crate::object_api::ObjectInfo {
         let source_upload = new_multipart_upload(store, 0, bucket, object, ObjectOptions::default())
             .await
             .expect("create the source multipart upload");
@@ -794,6 +798,7 @@ mod decommission_lock_order_tests {
             .await
             .expect("complete the source multipart object");
         assert!(source_info.is_multipart());
+        source_info
     }
 
     async fn put_source_object(store: &Arc<crate::store::ECStore>, bucket: &str, object: &str, body: Vec<u8>) {
@@ -2031,6 +2036,237 @@ mod decommission_lock_order_tests {
     #[serial_test::serial]
     fn decommission_keeps_a_free_version_for_a_restored_null_version_superseded_on_target() {
         run_large_stack_async_test("decommission-superseded-restored-null-version", run_superseded_restored_null_version_case);
+    }
+
+    /// Every capacity marker of the decommission's target reservations is
+    /// settled: no pending intent and no temporary mutation remain.
+    async fn assert_decommission_capacity_settled(store: &Arc<crate::store::ECStore>) {
+        let pool_meta = store.pool_meta.read().await;
+        let info = pool_meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("the decommission state should remain present");
+        assert!(
+            info.capacity_blocked_reason.is_none(),
+            "the decommission must not pause: {:?}",
+            info.capacity_blocked_reason
+        );
+        let reservation = info
+            .capacity_reservation
+            .as_ref()
+            .expect("the capacity reservation should remain present");
+        assert_eq!(reservation.pending_target_physical_bytes, 0);
+        assert_eq!(reservation.inflight_target_physical_bytes, 0);
+        for target in &reservation.targets {
+            assert!(
+                target.pending_mutation_id.is_none(),
+                "target {} keeps a pending intent",
+                target.pool_index
+            );
+            assert_eq!(target.pending_physical_bytes, 0);
+            assert_eq!(target.inflight_physical_bytes, 0);
+            assert!(
+                target.temporary_mutations.is_empty(),
+                "target {} keeps temporary mutations: {:?}",
+                target.pool_index,
+                target.temporary_mutations
+            );
+        }
+    }
+
+    /// A newer unversioned object written to the target replaces a multipart
+    /// null source. The multipart copy settles as superseded and aborts its
+    /// staged upload; that cleanup must accept the newer target as proof the
+    /// staged copy holds nothing there, instead of failing closed as a
+    /// capacity block that never lets the entry finish (rustfs/backlog#2873).
+    async fn run_superseded_multipart_null_version_case(tiered: bool) {
+        let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+        let bucket = test_bucket("superseded-multipart");
+        let object = "multipart.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create the unversioned bucket");
+        let written = put_source_multipart_object(&store, &bucket, object).await;
+        let backend = if tiered {
+            let tier_name = format!("DECOMTIER{}", &uuid::Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+            let backend = register_mock_tier(&store.pools[0].instance_ctx().tier_config_mgr(), &tier_name).await;
+            store.pools[0]
+                .transition_object(
+                    &bucket,
+                    object,
+                    &ObjectOptions {
+                        transition: crate::bucket::lifecycle::lifecycle::TransitionOptions {
+                            status: TRANSITION_PENDING.to_string(),
+                            tier: tier_name,
+                            etag: written.etag.clone().expect("the multipart source should have an ETag"),
+                            ..Default::default()
+                        },
+                        mod_time: written.mod_time,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("transition the multipart source before the decommission");
+            restore_source_version(&store, &bucket, object, false, &written).await;
+            Some(backend)
+        } else {
+            None
+        };
+        let source_versions = exact_versions(&store, 0, &bucket, object).await;
+        assert_eq!(source_versions.len(), 1);
+        let source = source_versions[0].clone();
+        assert!(source.version_id.is_none(), "the source must be a null version");
+        assert_eq!(source.parts.len(), 2, "the source must move through the multipart copy");
+        assert!(!source.is_remote(), "the source keeps its local copy");
+        let newer = b"written to the target after the source".to_vec();
+        store.pools[1]
+            .put_object(&bucket, object, &mut PutObjReader::from_vec(newer.clone()), &ObjectOptions::default())
+            .await
+            .expect("write a newer null version on the target");
+
+        start_transitioned_entry_decommission(&store, &bucket).await;
+        store
+            .decommission_entry_for_test_with_bucket_incarnation(
+                0,
+                MetaCacheEntry {
+                    name: object.to_string(),
+                    ..Default::default()
+                },
+                bucket.clone(),
+                store.pools[0].get_disks_by_key(object),
+            )
+            .await
+            .expect("the superseded multipart entry should finish");
+
+        let left = exact_versions(&store, 0, &bucket, object).await;
+        if let Some(backend) = backend.as_ref() {
+            // The newer target references no remote object, so the source
+            // cleanup keeps the tier free version that owns the remote delete.
+            assert_eq!(left.len(), 1, "the source must keep one tier free version: {left:?}");
+            assert!(left[0].tier_free_version());
+            assert_same_remote_tuple(&left[0], &source);
+            assert!(backend.contains(&source.transitioned_objname).await);
+            assert_eq!(backend.remove_count().await, 0);
+        } else {
+            assert!(left.is_empty(), "the superseded source must be cleaned up: {left:?}");
+        }
+        let target = exact_versions(&store, 1, &bucket, object).await;
+        assert_eq!(target.len(), 1, "the target keeps only its newer version: {target:?}");
+        assert!(!target[0].tier_free_version());
+        assert!(target[0].transition_status.is_empty(), "the newer version references no remote object");
+        assert!(exact_versions(&store, 2, &bucket, object).await.is_empty());
+        let target_set = store.pools[1].get_disks_by_key(object);
+        let incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("load the bucket incarnation");
+        let staged_identity = format!(
+            "v1:none:{}",
+            source
+                .mod_time
+                .expect("the source has a modification time")
+                .unix_timestamp_nanos()
+        );
+        assert!(
+            target_set
+                .data_movement_multipart_upload_ids(&bucket, object, Some(incarnation), &staged_identity)
+                .await
+                .expect("scan the target for the staged upload")
+                .is_empty(),
+            "the staged upload must be aborted"
+        );
+        let mut reader = store.pools[1]
+            .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("the newer target version should be readable");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("drain the newer version");
+        assert_eq!(body, newer);
+        assert_decommission_capacity_settled(&store).await;
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_finishes_a_restored_multipart_null_version_superseded_on_target() {
+        run_large_stack_async_test("decommission-superseded-restored-multipart", || {
+            run_superseded_multipart_null_version_case(true)
+        });
+    }
+
+    /// The target already holds a null object with the multipart source's
+    /// exact identity but without the data-movement ownership proof. The copy
+    /// cannot publish over it, and its cleanup cannot tell whether that object
+    /// is the staged copy. That identity-proof failure must fail the
+    /// decommission with an accurate error, not pause it as a capacity block
+    /// that only a restart could leave (rustfs/backlog#2873).
+    #[test]
+    #[serial_test::serial]
+    fn decommission_fails_instead_of_pausing_on_an_unowned_exact_multipart_target() {
+        run_large_stack_async_test("decommission-unowned-exact-multipart-target", || async {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("unowned-exact-multipart");
+            let object = "multipart.bin";
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create the unversioned bucket");
+            let written = put_source_multipart_object(&store, &bucket, object).await;
+            let unowned = b"same identity, written without a data movement".to_vec();
+            store.pools[1]
+                .put_object(
+                    &bucket,
+                    object,
+                    &mut PutObjReader::from_vec(unowned.clone()),
+                    &ObjectOptions {
+                        mod_time: written.mod_time,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write the unowned exact-identity object on the target");
+            let target = exact_versions(&store, 1, &bucket, object).await;
+            assert_eq!(target.len(), 1);
+            assert!(target[0].version_id.is_none());
+            assert_eq!(target[0].mod_time, written.mod_time, "the target must carry the staged identity");
+
+            start_transitioned_entry_decommission(&store, &bucket).await;
+            let _ = spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the decommission routine task should join");
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert!(
+                info.failed && !info.complete && info.capacity_blocked_reason.is_none(),
+                "an identity-proof failure must fail the decommission, not pause it as a capacity block: complete={}, failed={}, blocked_reason={:?}",
+                info.complete,
+                info.failed,
+                info.capacity_blocked_reason
+            );
+            drop(local);
+
+            assert_eq!(exact_versions(&store, 0, &bucket, object).await.len(), 1, "the source must stay in place");
+            let mut reader = store.pools[1]
+                .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("the unowned target object should stay readable");
+            let mut body = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("drain the unowned target object");
+            assert_eq!(body, unowned);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_finishes_a_multipart_null_version_superseded_on_target() {
+        run_large_stack_async_test("decommission-superseded-multipart", || run_superseded_multipart_null_version_case(false));
     }
 
     struct ExpiredAndMovedVersions {

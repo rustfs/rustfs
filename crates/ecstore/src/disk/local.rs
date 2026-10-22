@@ -9777,18 +9777,39 @@ fn rename_data_versions_signature(meta: &FileMeta) -> Option<Vec<u8>> {
 /// size field decodes independently of the inline data, so the vote carries
 /// the same value healthy disks report, and skipping the lookup's inline
 /// bytes clone keeps the observation allocation-light.
-fn observe_old_current_size(dst_meta_existed: bool, xlmeta: &FileMeta) -> Option<OldCurrentSize> {
+fn observe_old_current(
+    dst_meta_existed: bool,
+    dst_meta_unparsable: bool,
+    xlmeta: &FileMeta,
+    volume: &str,
+    path: &str,
+    version_id: Uuid,
+) -> (Option<OldCurrentSize>, bool, Option<FileInfo>) {
+    if dst_meta_existed && dst_meta_unparsable {
+        return (None, false, None);
+    }
     if !dst_meta_existed {
-        return Some(OldCurrentSize::Absent);
+        return (Some(OldCurrentSize::Absent), true, None);
     }
     if xlmeta.versions.is_empty() {
-        return Some(OldCurrentSize::Present(0));
+        return (Some(OldCurrentSize::Present(0)), false, None);
     }
-    match xlmeta.into_fileinfo("", "", "", false, false, true) {
-        Ok(fi) => Some(OldCurrentSize::Present(fi.size)),
-        Err(rustfs_filemeta::Error::FileNotFound) => Some(OldCurrentSize::Absent),
-        Err(_) => None,
+    match xlmeta.into_fileinfo(volume, path, "", false, false, true) {
+        Ok(old_current) => {
+            let size = Some(OldCurrentSize::Present(old_current.size));
+            let source = (old_current.version_id.unwrap_or_default() == version_id
+                && old_current.transition_status == rustfs_filemeta::TRANSITION_COMPLETE)
+                .then_some(old_current);
+            (size, true, source)
+        }
+        Err(rustfs_filemeta::Error::FileNotFound) => (Some(OldCurrentSize::Absent), false, None),
+        Err(_) => (None, false, None),
     }
+}
+
+#[cfg(test)]
+fn observe_old_current_size(dst_meta_existed: bool, xlmeta: &FileMeta) -> Option<OldCurrentSize> {
+    observe_old_current(dst_meta_existed, false, xlmeta, "", "", Uuid::nil()).0
 }
 
 fn is_root_path(path: impl AsRef<Path>) -> bool {
@@ -18338,6 +18359,69 @@ mod test {
                 mod_time: Some(mod_time),
                 ..Default::default()
             }
+        }
+
+        #[test]
+        fn observe_preserves_source_check_decisions_for_missing_empty_and_corrupt_metadata() {
+            for (exists, unparsable, expected_size, expected_checked) in [
+                (false, false, Some(OldCurrentSize::Absent), true),
+                (true, false, Some(OldCurrentSize::Present(0)), false),
+                (true, true, None, false),
+            ] {
+                let (size, checked, source) =
+                    observe_old_current(exists, unparsable, &FileMeta::new(), "bucket", "object", Uuid::nil());
+                assert_eq!(size, expected_size);
+                assert_eq!(checked, expected_checked);
+                assert!(source.is_none());
+            }
+
+            let mut metadata = FileMeta::new();
+            metadata
+                .add_version(live_file_info("object", Uuid::new_v4(), 42, OffsetDateTime::now_utc()))
+                .expect("seed a live version");
+            metadata.versions[0].meta = vec![0xc1];
+            let (size, checked, source) = observe_old_current(true, false, &metadata, "bucket", "object", Uuid::nil());
+            assert_eq!(size, None);
+            assert!(!checked);
+            assert!(source.is_none());
+        }
+
+        #[test]
+        fn observe_returns_only_the_matching_transitioned_old_current_source() {
+            let version_id = Uuid::new_v4();
+            let mut info = live_file_info("object", version_id, 42, OffsetDateTime::now_utc());
+            info.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_string();
+            info.transition_tier = "WARM".to_string();
+            info.transitioned_objname = "remote-object".to_string();
+            let mut metadata = FileMeta::new();
+            metadata.add_version(info).expect("seed transitioned current version");
+
+            for (requested, expected_source) in [(version_id, true), (Uuid::new_v4(), false)] {
+                let (size, checked, source) = observe_old_current(true, false, &metadata, "bucket", "object", requested);
+                assert_eq!(size, Some(OldCurrentSize::Present(42)));
+                assert!(checked);
+                assert_eq!(source.is_some(), expected_source);
+                if let Some(source) = source {
+                    assert_eq!(source.version_id, Some(version_id));
+                    assert_eq!(source.name, "object");
+                    assert_eq!(source.volume, "bucket");
+                    assert_eq!(source.transition_status, rustfs_filemeta::TRANSITION_COMPLETE);
+                    assert_eq!(source.transition_tier, "WARM");
+                    assert_eq!(source.transitioned_objname, "remote-object");
+                }
+            }
+
+            metadata
+                .add_version(delete_marker_file_info(
+                    "object",
+                    Uuid::new_v4(),
+                    OffsetDateTime::now_utc() + time::Duration::seconds(1),
+                ))
+                .expect("seed newer delete marker");
+            let (size, checked, source) = observe_old_current(true, false, &metadata, "bucket", "object", version_id);
+            assert_eq!(size, Some(OldCurrentSize::Present(0)));
+            assert!(checked);
+            assert!(source.is_none(), "a historical transitioned version is not the old current");
         }
 
         #[test]

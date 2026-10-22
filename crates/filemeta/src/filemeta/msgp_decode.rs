@@ -122,9 +122,14 @@ pub(crate) fn read_slice<'a>(cur: &mut std::io::Cursor<&'a [u8]>, len: usize) ->
 }
 
 #[inline]
-pub(crate) fn read_str_slice<'a>(cur: &mut std::io::Cursor<&'a [u8]>) -> Result<&'a str> {
+pub(crate) fn read_str_bytes_slice<'a>(cur: &mut std::io::Cursor<&'a [u8]>) -> Result<&'a [u8]> {
     let len = rmp::decode::read_str_len(cur)? as usize;
-    let bytes = read_slice(cur, len)?;
+    read_slice(cur, len)
+}
+
+#[inline]
+pub(crate) fn read_str_slice<'a>(cur: &mut std::io::Cursor<&'a [u8]>) -> Result<&'a str> {
+    let bytes = read_str_bytes_slice(cur)?;
     std::str::from_utf8(bytes).map_err(|e| Error::FromUtf8(e.to_string()))
 }
 
