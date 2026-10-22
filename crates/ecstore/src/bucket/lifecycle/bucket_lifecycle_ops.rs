@@ -879,7 +879,11 @@ fn free_version_cleanup_fences_current(
         && free_version_physical_topology_generation(api) == topology_generation
 }
 
-async fn cleanup_free_version_exact(api: Arc<ECStore>, oi: &ObjectInfo, cancel: &CancellationToken) -> std::io::Result<bool> {
+pub(crate) async fn cleanup_free_version_exact(
+    api: Arc<ECStore>,
+    oi: &ObjectInfo,
+    cancel: &CancellationToken,
+) -> std::io::Result<bool> {
     const FREE_VERSION_REMOTE_DEADLINE: StdDuration = StdDuration::from_secs(30);
 
     let topology_generation = free_version_physical_topology_generation(&api);
@@ -1056,10 +1060,6 @@ impl HeldExpiryQueue {
         let state = runtime_sources::expiry_state_handle();
         let previous = std::mem::replace(&mut *state.write().await, held);
         Self { state, previous }
-    }
-
-    pub(crate) async fn pending_tasks(&self) -> usize {
-        self.state.read().await.pending_tasks()
     }
 
     /// Drops the held tasks unrun and restores the previous expiry state.

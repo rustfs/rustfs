@@ -26,10 +26,12 @@ pub(crate) fn EndpointServerPools(
 
 #[cfg(feature = "diagnostic-read-version-caller")]
 pub(crate) mod diagnostic {
-    #[cfg(test)]
-    pub(crate) use crate::storage::storage_api::ecstore_diagnostic::current_read_version_entry_source;
     pub(crate) use crate::storage::storage_api::ecstore_diagnostic::{
-        ReadVersionContextBoundary, ReadVersionEntrySource, with_read_version_spawn_context,
+        ReadVersionContextBoundary, ReadVersionEntrySource, with_captured_read_version_context, with_read_version_spawn_context,
+    };
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_diagnostic::{
+        current_read_version_entry_source, with_read_version_entry,
     };
 }
 

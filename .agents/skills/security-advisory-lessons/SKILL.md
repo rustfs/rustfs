@@ -36,6 +36,21 @@ changed lesson.
 
 ## Finding Standard
 
-Each finding includes severity, `file:line`, attacker prerequisites, concrete
-input/path, impact, smallest safe fix, and a regression check. Do not exaggerate
-unauthenticated impact when the actual issue requires authenticated low privilege.
+Every candidate names the lower-trust principal, the boundary it crosses, the
+affected resource, and the observable result. A best-practice gap or an impact
+confined to the caller's own principal is hardening, not a candidate.
+
+Report each candidate under exactly one verdict:
+
+- `confirmed`: a complete `file:line` source trace and a bounded observed
+  result. Only confirmed findings carry severity; each also states attacker
+  prerequisites, concrete input/path, impact, smallest safe fix, and a
+  regression check.
+- `needs_validation`: the trace is blocked on one exact unresolved fact, such
+  as deployment or infrastructure behavior. State that fact; assign no severity
+  and do not substitute an assumption.
+- `rejected`: a disproved candidate, with the caller, invariant, or test that
+  disproves it.
+
+Do not exaggerate unauthenticated impact when the actual issue requires
+authenticated low privilege.

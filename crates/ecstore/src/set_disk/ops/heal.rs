@@ -1245,6 +1245,7 @@ impl SetDisks {
                                 .all(|drive| drive.state == DriveState::Ok.to_string());
 
                         if !latest_meta.deleted && !latest_meta.is_remote() && !protected {
+                            result.legacy_identity_unverified = true;
                             result.detail =
                                 rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL.to_owned();
                         }
@@ -3175,6 +3176,7 @@ fn finalize_object_heal_result(
         result.repair_verified = false;
         result.metadata_verified = false;
         result.metadata_repair_verified = false;
+        result.legacy_identity_unverified = false;
         *absence = None;
         error = Some(Error::NamespaceLockQuorumUnavailable {
             mode: "write",
@@ -3820,6 +3822,7 @@ mod heal_result_report_tests {
             repair_verified: true,
             metadata_verified: true,
             metadata_repair_verified: true,
+            legacy_identity_unverified: true,
             ..Default::default()
         };
 
@@ -3829,6 +3832,7 @@ mod heal_result_report_tests {
         assert!(!result.repair_verified);
         assert!(!result.metadata_verified);
         assert!(!result.metadata_repair_verified);
+        assert!(!result.legacy_identity_unverified);
         assert!(absence.is_none());
         assert!(matches!(
             error,
@@ -8492,6 +8496,7 @@ mod shard_identity_tests {
             let (result, error) = heal.expect("legacy scan");
             assert!(error.is_none(), "legacy scan remains observable");
             assert!(!result.integrity_verified, "a foreign codeword must not be certified");
+            assert!(result.legacy_identity_unverified, "format classification is not an integrity proof");
             assert_eq!(result.drives_healed(), Some(0), "legacy scan must not rewrite data");
         }
     }

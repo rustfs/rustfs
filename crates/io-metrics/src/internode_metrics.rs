@@ -148,6 +148,7 @@ pub enum ReadVersionContextBoundary {
     RemoteRpc,
     ScannerCacheLoad,
     ScannerCycleStateLoad,
+    ConfigTask,
     ConfigWrite,
     ScannerConfigWrite,
     WritePreconditionLookup,
@@ -155,6 +156,9 @@ pub enum ReadVersionContextBoundary {
     AppPutOwner,
     PutCommitOwner,
     TierFreeVersionSourceLookup,
+    BucketTask,
+    BackgroundTask,
+    DetachedMutation,
 }
 
 #[cfg(feature = "diagnostic-read-version-caller")]
@@ -172,6 +176,7 @@ impl ReadVersionContextBoundary {
             Self::RemoteRpc => "remote_rpc",
             Self::ScannerCacheLoad => "scanner_cache_load",
             Self::ScannerCycleStateLoad => "scanner_cycle_state_load",
+            Self::ConfigTask => "config_task",
             Self::ConfigWrite => "config_write",
             Self::ScannerConfigWrite => "scanner_config_write",
             Self::WritePreconditionLookup => "write_precondition_lookup",
@@ -179,6 +184,9 @@ impl ReadVersionContextBoundary {
             Self::AppPutOwner => "app_put_owner",
             Self::PutCommitOwner => "put_commit_owner",
             Self::TierFreeVersionSourceLookup => "tier_free_version_source_lookup",
+            Self::BucketTask => "bucket_task",
+            Self::BackgroundTask => "background_task",
+            Self::DetachedMutation => "detached_mutation",
         }
     }
 }
