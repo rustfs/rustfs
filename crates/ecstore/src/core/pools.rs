@@ -16678,8 +16678,8 @@ impl ECStore {
         capacity_owner: Option<DecommissionCapacityOwner>,
     ) -> Result<DecommissionEntryAttemptOutcome> {
         use data_movement::scanner_backlog::{
-            SCANNER_PAUSE_BACKLOG_PATH, persist_native_scanner_pause_backlog_replica, plan_scanner_pause_backlog_retirement,
-            read_scanner_pause_backlog_retirement_replicas,
+            SCANNER_PAUSE_BACKLOG_PATH, ScannerPauseBacklogRetirementPhase, persist_native_scanner_pause_backlog_replica,
+            plan_scanner_pause_backlog_retirement, read_scanner_pause_backlog_retirement_replicas,
         };
 
         if expected.versions.is_empty() && expected.free_versions.is_empty() {
@@ -16738,15 +16738,17 @@ impl ECStore {
             .flat_map(|(_, pool)| pool.disk_set.iter().cloned())
             .collect();
         let mut replicas = read_scanner_pause_backlog_retirement_replicas(idx, set.set_index, sets.clone()).await?;
-        if let Some(plan) = plan_scanner_pause_backlog_retirement(idx, &replicas)? {
+        if let Some(plan) =
+            plan_scanner_pause_backlog_retirement(idx, &replicas, ScannerPauseBacklogRetirementPhase::InitialRead)?
+        {
             let expected_stable_record = plan.stable_record.clone();
             let mut phases = Vec::with_capacity(3);
             if let Some(record) = plan.seed_record {
-                phases.push(("seed", record));
+                phases.push(("seed", ScannerPauseBacklogRetirementPhase::SeedReadback, record));
             }
-            phases.push(("commit", plan.commit_record));
-            phases.push(("stabilize", plan.stable_record));
-            for (phase, record) in phases {
+            phases.push(("commit", ScannerPauseBacklogRetirementPhase::CommitReadback, plan.commit_record));
+            phases.push(("stabilize", ScannerPauseBacklogRetirementPhase::StabilizeReadback, plan.stable_record));
+            for (phase, readback_phase, record) in phases {
                 if object_fence.is_lock_lost()
                     || pool_meta_guard.is_lock_lost()
                     || !reservation.admits_owner(owner, OffsetDateTime::now_utc())
@@ -16793,13 +16795,13 @@ impl ECStore {
                         "scanner pause backlog native repair did not persist every surviving replica",
                     ));
                 }
-                if let Some(next) = plan_scanner_pause_backlog_retirement(idx, &replicas)?
+                if let Some(next) = plan_scanner_pause_backlog_retirement(idx, &replicas, readback_phase)?
                     && next.stable_record != expected_stable_record
                 {
                     return Err(Error::other("scanner pause backlog native authority changed during repair"));
                 }
             }
-            if plan_scanner_pause_backlog_retirement(idx, &replicas)?.is_some() {
+            if plan_scanner_pause_backlog_retirement(idx, &replicas, ScannerPauseBacklogRetirementPhase::FinalCheck)?.is_some() {
                 return Err(Error::other("scanner pause backlog native repair is not fully committed and stable"));
             }
         }
@@ -27385,40 +27387,45 @@ mod tests {
 
     #[test]
     fn decommission_scanner_backlog_handoff_retry_is_typed_and_bounded() {
-        use data_movement::scanner_backlog::ScannerPauseBacklogRetirementError;
+        use data_movement::scanner_backlog::{ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPhase};
 
-        let handoff = data_movement::data_movement_context_error(
-            "scanner pause backlog retirement planner failed: competing proofs".to_string(),
-            ScannerPauseBacklogRetirementError::HandoffConflict {
-                reason: "competing maximum-membership commit proofs".to_string(),
-            },
-        );
-        assert!(is_decommission_scanner_backlog_handoff_conflict(&handoff));
-        assert_eq!(
-            decommission_scanner_backlog_retry_kind(&handoff, DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS - 1),
-            Some(DecommissionScannerBacklogRetryKind::HandoffConflict)
-        );
-        assert_eq!(
-            decommission_scanner_backlog_retry_kind(&handoff, DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS),
-            None,
-            "a divergent handoff must not retry forever"
-        );
-
-        for non_retryable in [
-            ScannerPauseBacklogRetirementError::AuthorityConflict {
-                reason: "larger source authority".to_string(),
-            },
-            ScannerPauseBacklogRetirementError::InvalidRecord {
-                reason: "unread member".to_string(),
-            },
+        for phase in [
+            ScannerPauseBacklogRetirementPhase::InitialRead,
+            ScannerPauseBacklogRetirementPhase::SeedReadback,
+            ScannerPauseBacklogRetirementPhase::CommitReadback,
+            ScannerPauseBacklogRetirementPhase::StabilizeReadback,
+            ScannerPauseBacklogRetirementPhase::FinalCheck,
         ] {
-            let err = data_movement::data_movement_context_error("planner failed".to_string(), non_retryable);
-            assert!(!is_decommission_scanner_backlog_handoff_conflict(&err));
+            let handoff = phase.planner_error(ScannerPauseBacklogRetirementError::HandoffConflict {
+                reason: "competing maximum-membership commit proofs".to_string(),
+            });
+            assert!(is_decommission_scanner_backlog_handoff_conflict(&handoff));
             assert_eq!(
-                decommission_scanner_backlog_retry_kind(&err, 0),
-                None,
-                "only a handoff conflict may be retried"
+                decommission_scanner_backlog_retry_kind(&handoff, DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS - 1),
+                Some(DecommissionScannerBacklogRetryKind::HandoffConflict)
             );
+            assert_eq!(
+                decommission_scanner_backlog_retry_kind(&handoff, DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS),
+                None,
+                "a divergent handoff must not retry forever"
+            );
+
+            for non_retryable in [
+                ScannerPauseBacklogRetirementError::AuthorityConflict {
+                    reason: "larger source authority".to_string(),
+                },
+                ScannerPauseBacklogRetirementError::InvalidRecord {
+                    reason: "unread member".to_string(),
+                },
+            ] {
+                let err = phase.planner_error(non_retryable);
+                assert!(!is_decommission_scanner_backlog_handoff_conflict(&err));
+                assert_eq!(
+                    decommission_scanner_backlog_retry_kind(&err, 0),
+                    None,
+                    "only a handoff conflict may be retried"
+                );
+            }
         }
     }
 
