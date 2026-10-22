@@ -2043,18 +2043,20 @@ mod tests {
         assert!(called.swap(false, Ordering::SeqCst));
         assert_eq!(fallback.data, local.data);
 
-        let error =
-            super::query_heal_status_on_owner(async { Err(s3s::s3_error!(InternalError, "local lookup failed")) }, || async {
+        let error = super::query_heal_status_on_owner(
+            async { Err(super::admin_error(S3ErrorCode::InternalError, "local lookup failed")) },
+            || async {
                 called.store(true, Ordering::SeqCst);
                 Ok(response())
-            })
-            .await
-            .expect_err("local failure must not become coordinator success");
+            },
+        )
+        .await
+        .expect_err("local failure must not become coordinator success");
         assert_eq!(error.code(), &S3ErrorCode::InternalError);
         assert!(!called.load(Ordering::SeqCst));
 
         let error = super::query_heal_status_on_owner(async { Ok(None) }, || async {
-            Err(s3s::s3_error!(ServiceUnavailable, "coordinator unavailable"))
+            Err(super::admin_error(S3ErrorCode::ServiceUnavailable, "coordinator unavailable"))
         })
         .await
         .expect_err("coordinator error must remain visible");
