@@ -796,16 +796,22 @@ impl HealTask {
                                 match unavailable_recreate_error(&storage_result.item, &heal_opts) {
                                     Some(error) => Some(error),
                                     None => {
-                                        telemetry_unknown |= !increment_counter(&mut healed);
-                                        telemetry_unknown |= !add_bytes(
-                                            &mut bytes,
-                                            u64::try_from(storage_result.item.object_size).unwrap_or(u64::MAX),
-                                        );
+                                        #[cfg(test)]
+                                        super::pause_storage_receipt(&self.id).await;
                                         recorded_authoritative_outcome = self
                                             .record_verified_storage_receipt(identity.clone(), storage_result.receipt)
                                             .await;
-                                        self.record_result_item(storage_result.item).await;
-                                        None
+                                        if !recorded_authoritative_outcome && self.cancel_token.is_cancelled() {
+                                            Some(Error::TaskCancelled)
+                                        } else {
+                                            telemetry_unknown |= !increment_counter(&mut healed);
+                                            telemetry_unknown |= !add_bytes(
+                                                &mut bytes,
+                                                u64::try_from(storage_result.item.object_size).unwrap_or(u64::MAX),
+                                            );
+                                            self.record_result_item(storage_result.item).await;
+                                            None
+                                        }
                                     }
                                 }
                             }

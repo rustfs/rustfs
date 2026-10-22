@@ -279,6 +279,53 @@ mod canonical_outcome {
     }
 
     #[tokio::test]
+    async fn bucket_cancellation_after_storage_success_keeps_typed_cancelled_responsibility() {
+        let incarnation = Uuid::new_v4();
+        let storage = Arc::new(MockStorage {
+            heal_object_receipts: Mutex::new(HashMap::from([(
+                "object-a".to_string(),
+                VecDeque::from([object_receipt("object-a", None, HealObjectDisposition::Repaired, incarnation)]),
+            )])),
+            bucket_incarnation_id: Mutex::new(Some(incarnation)),
+            ..Default::default()
+        });
+        let task = Arc::new(bucket_task(storage.clone()));
+        let hook = Arc::new(OutcomeFinishTestHook {
+            task_id: task.id.clone(),
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *STORAGE_RECEIPT_TEST_HOOK.lock().await = Some(hook.clone());
+        let runner = {
+            let task = task.clone();
+            tokio::spawn(async move { task.execute().await })
+        };
+        tokio::time::timeout(Duration::from_secs(10), hook.reached.notified())
+            .await
+            .expect("storage success must reach the receipt boundary");
+        assert_eq!(storage.healed_objects.lock().expect("storage mutations").as_slice(), ["object-a"]);
+        task.cancel().await.expect("cancel before receipt recording");
+        hook.release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(10), runner)
+            .await
+            .expect("cancelled worker must stop")
+            .expect("worker must not panic");
+        STORAGE_RECEIPT_TEST_HOOK.lock().await.take();
+        assert!(matches!(result, Err(Error::TaskCancelled)));
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.execution, HealExecutionOutcome::Aborted(HealAbortReason::Cancelled));
+        assert_eq!(outcome.coverage, HealTraversalCoverage::Partial);
+        assert_eq!(outcome.counters.processed, 1);
+        assert_eq!(outcome.counters.healed, 0);
+        assert_eq!(outcome.counters.unchanged, 0);
+        assert_eq!(outcome.counters.unknown, 0);
+        assert_eq!(outcome.counters.skipped, 1);
+        assert_eq!(outcome.objects.len(), 1);
+        assert_eq!(outcome.objects[0].identity.object, "object-a");
+        assert_eq!(outcome.objects[0].disposition, HealObjectDisposition::Cancelled);
+    }
+
+    #[tokio::test]
     async fn bucket_heal_rejects_stale_receipts_without_double_recording() {
         let expected_incarnation = Uuid::new_v4();
         let storage = Arc::new(MockStorage {

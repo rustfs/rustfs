@@ -60,6 +60,19 @@ pub(crate) static OUTCOME_FINISH_TEST_HOOK: std::sync::LazyLock<tokio::sync::Mut
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
 
 #[cfg(test)]
+static STORAGE_RECEIPT_TEST_HOOK: std::sync::LazyLock<tokio::sync::Mutex<Option<Arc<OutcomeFinishTestHook>>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+
+#[cfg(test)]
+async fn pause_storage_receipt(task_id: &str) {
+    let hook = STORAGE_RECEIPT_TEST_HOOK.lock().await.clone();
+    if let Some(hook) = hook.filter(|hook| hook.task_id == task_id) {
+        hook.reached.notify_one();
+        hook.release.notified().await;
+    }
+}
+
+#[cfg(test)]
 async fn pause_outcome_finish(task_id: &str) {
     let hook = OUTCOME_FINISH_TEST_HOOK.lock().await.clone();
     if let Some(hook) = hook.filter(|hook| hook.task_id == task_id) {
