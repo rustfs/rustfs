@@ -6557,6 +6557,16 @@ fn should_force_delete_marker_for_missing_version(opts: &ObjectOptions) -> bool 
     opts.delete_marker || ((opts.versioned || opts.version_suspended) && opts.version_id.is_none() && !opts.data_movement)
 }
 
+fn republishes_data_movement_delete_marker(opts: &ObjectOptions, goi: &ObjectInfo, version_found: bool) -> bool {
+    opts.data_movement
+        && opts.delete_marker
+        && version_found
+        && goi.delete_marker
+        && opts.version_purge_status().is_empty()
+        && goi.version_purge_status.is_empty()
+        && opts.version_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()) == Some(goi.version_id.unwrap_or_else(Uuid::nil))
+}
+
 /// Whether a plain client delete addressed to an explicit version removed an
 /// existing delete marker, so the response must carry delete-marker semantics
 /// (`x-amz-delete-marker: true` / `DeleteMarker` in `DeleteObjects` entries).
@@ -6572,6 +6582,7 @@ fn should_force_delete_marker_for_missing_version(opts: &ObjectOptions) -> bool 
 /// `resolve_delete_version_state` that clear `delete_marker` for them.
 fn explicit_delete_removed_marker(opts: &ObjectOptions, goi: &ObjectInfo, version_found: bool) -> bool {
     opts.version_id.is_some()
+        && !republishes_data_movement_delete_marker(opts, goi, version_found)
         && version_found
         && goi.delete_marker
         && goi.version_purge_status.is_empty()
@@ -6580,6 +6591,9 @@ fn explicit_delete_removed_marker(opts: &ObjectOptions, goi: &ObjectInfo, versio
 }
 
 fn resolve_delete_version_state(opts: &ObjectOptions, goi: &ObjectInfo, version_found: bool) -> (bool, bool) {
+    if republishes_data_movement_delete_marker(opts, goi, version_found) {
+        return (true, true);
+    }
     let mut mark_delete = goi.version_id.is_some() || ((opts.versioned || opts.version_suspended) && opts.version_id.is_none());
     let mut delete_marker = opts.versioned;
 
@@ -6634,6 +6648,29 @@ fn resolve_delete_version_state(opts: &ObjectOptions, goi: &ObjectInfo, version_
 }
 
 impl SetDisks {
+    pub(crate) async fn verify_data_movement_delete_marker_write_quorum(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+    ) -> Result<()> {
+        let requested_version = Uuid::parse_str(version_id)?;
+        let disks = self.disk_inventory().await;
+        let (metadata, errors) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false, false).await?;
+        // Match delete_object_version_with_purge, independently of data parity or online inventory size.
+        let quorum = self.set_drive_count / 2 + 1;
+        let (_, marker, _) = Self::select_valid_fileinfo(&disks, &metadata, &errors, version_id, quorum, quorum)
+            .map_err(|error| to_object_err(error.into(), vec![bucket, object, version_id]))?;
+        if !marker.deleted || marker.tier_free_version() || marker.version_id.unwrap_or_else(Uuid::nil) != requested_version {
+            return Err(Error::DataMovementOverwriteErr(
+                bucket.to_owned(),
+                object.to_owned(),
+                version_id.to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Publish an internal tier free-version record without changing its
     /// delete-marker shape or remote-tier identity. The caller holds the
     /// source and target object locks; a write quorum is required before the
@@ -9136,6 +9173,56 @@ mod tests {
             !explicit_delete_removed_marker(&replica_purge, &marker, true),
             "replication purge shapes keep their existing response semantics"
         );
+    }
+
+    #[test]
+    fn data_movement_marker_republication_preserves_creation_and_exact_identity() {
+        for version in [Uuid::nil(), Uuid::new_v4()] {
+            for replica in [false, true] {
+                let opts = ObjectOptions {
+                    versioned: !version.is_nil(),
+                    version_suspended: version.is_nil(),
+                    version_id: Some(version.to_string()),
+                    data_movement: true,
+                    delete_marker: true,
+                    delete_replication: replica.then(|| ReplicationState {
+                        replica_status: ReplicationStatusType::Replica,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let current = ObjectInfo {
+                    version_id: (!version.is_nil()).then_some(version),
+                    delete_marker: true,
+                    ..Default::default()
+                };
+                assert_eq!(resolve_delete_version_state(&opts, &current, true), (true, true));
+                assert!(!explicit_delete_removed_marker(&opts, &current, true));
+                let mut changed = current.clone();
+                changed.version_id = Some(Uuid::new_v4());
+                assert!(!republishes_data_movement_delete_marker(&opts, &changed, true));
+                changed.version_id = current.version_id;
+                changed.delete_marker = false;
+                assert!(!republishes_data_movement_delete_marker(&opts, &changed, true));
+                changed = current.clone();
+                changed.version_purge_status = VersionPurgeStatusType::Complete;
+                assert!(!republishes_data_movement_delete_marker(&opts, &changed, true));
+                let purging = ObjectOptions {
+                    delete_replication: Some(ReplicationState {
+                        version_purge_status_internal: Some("target=PENDING;".to_string()),
+                        purge_targets: version_purge_statuses_map("target=PENDING;"),
+                        ..Default::default()
+                    }),
+                    ..opts.clone()
+                };
+                assert!(!republishes_data_movement_delete_marker(&purging, &current, true));
+                let ordinary = ObjectOptions {
+                    data_movement: false,
+                    ..opts
+                };
+                assert!(!republishes_data_movement_delete_marker(&ordinary, &current, true));
+            }
+        }
     }
 
     #[test]

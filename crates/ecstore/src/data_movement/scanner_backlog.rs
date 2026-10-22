@@ -85,6 +85,8 @@ impl ScannerPauseBacklogRetirementPhase {
 pub struct ScannerPauseBacklogRetirementReplica {
     pub pool_index: usize,
     pub set_index: usize,
+    /// False for retiring members retained only to verify the old commit proof.
+    pub writable: bool,
     pub data: Option<Vec<u8>>,
 }
 
@@ -134,10 +136,11 @@ impl ScannerPauseBacklogRetirementRead {
     }
 }
 
-async fn read_replica(set: Arc<SetDisks>) -> Result<ScannerPauseBacklogRetirementRead> {
+async fn read_replica((set, writable): (Arc<SetDisks>, bool)) -> Result<ScannerPauseBacklogRetirementRead> {
     let mut replica = ScannerPauseBacklogRetirementReplica {
         pool_index: set.pool_index,
         set_index: set.set_index,
+        writable,
         data: None,
     };
     let opts = ObjectOptions {
@@ -186,7 +189,7 @@ async fn read_replica(set: Arc<SetDisks>) -> Result<ScannerPauseBacklogRetiremen
 pub(crate) async fn read_scanner_pause_backlog_retirement_replicas(
     source_pool_index: usize,
     source_set_index: usize,
-    sets: Vec<Arc<SetDisks>>,
+    sets: Vec<(Arc<SetDisks>, bool)>,
 ) -> Result<Vec<ScannerPauseBacklogRetirementRead>> {
     let replicas = join_all(sets.into_iter().map(read_replica))
         .await
@@ -219,6 +222,7 @@ pub(crate) fn plan_scanner_pause_backlog_retirement(
         .map(|read| ScannerPauseBacklogRetirementReplica {
             pool_index: read.replica.pool_index,
             set_index: read.replica.set_index,
+            writable: read.replica.writable,
             data: read.replica.data.clone(),
         })
         .collect::<Vec<_>>();
