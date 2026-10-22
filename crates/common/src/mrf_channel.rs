@@ -829,6 +829,21 @@ static MRF_VERIFIED_REPAIR_EVENTS: OnceLock<std::sync::Mutex<std::collections::V
 static MRF_UNVERIFIED_LEGACY_EVENTS: OnceLock<std::sync::Mutex<std::collections::VecDeque<MrfUnverifiedLegacyEvent>>> =
     OnceLock::new();
 
+/// Whether durable repair events may need consumption. This is only a work
+/// hint: either queue can receive an event after its empty observation, and a
+/// bounded queue can evict that event before the next consumer invocation.
+/// An unavailable lock is unknown, so callers must keep their normal path.
+/// An allocated empty verified queue also needs the normal consumer pass to
+/// release its buffer; this hint must not extend that buffer's lifetime.
+pub fn mrf_durable_repair_events_may_be_pending() -> bool {
+    MRF_VERIFIED_REPAIR_EVENTS
+        .get()
+        .is_some_and(|registry| registry.try_lock().map_or(true, |events| events.capacity() != 0))
+        || MRF_UNVERIFIED_LEGACY_EVENTS
+            .get()
+            .is_some_and(|registry| registry.try_lock().map_or(true, |events| !events.is_empty()))
+}
+
 /// Record a legacy notification for compatibility. This is not an
 /// acknowledgement of storage verification or durable repair completion.
 pub fn note_mrf_repaired(bucket: &str, object: &str, version_id: Option<[u8; 16]>) {
@@ -942,6 +957,9 @@ pub fn take_mrf_unverified_legacy_events_for(bucket: &str) -> Vec<MrfUnverifiedL
     });
     taken
 }
+
+#[cfg(test)]
+mod event_presence_tests;
 
 #[cfg(test)]
 mod proof_queue_tests;

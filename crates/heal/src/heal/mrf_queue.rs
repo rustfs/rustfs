@@ -1388,15 +1388,21 @@ impl MrfRuntime {
     }
 
     fn discharge_durable_replay_anchors(&mut self) {
+        if self.durable_replay_anchors.is_empty() && self.partial_writes.anchors().next().is_none() {
+            return;
+        }
+        if !rustfs_common::mrf_channel::mrf_durable_repair_events_may_be_pending() {
+            // Keep the nonempty-anchor publication. An empty observation
+            // acknowledges nothing; concurrent events can wait or be evicted.
+            self.publish_metrics();
+            return;
+        }
         let mut anchors: Vec<_> = self
             .durable_replay_anchors
             .iter()
             .chain(self.partial_writes.anchors())
             .cloned()
             .collect();
-        if anchors.is_empty() {
-            return;
-        }
         let mut buckets: Vec<Arc<str>> = anchors.iter().map(|anchor| anchor.bucket.clone()).collect();
         buckets.sort_unstable();
         buckets.dedup();
@@ -2056,6 +2062,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc as StdArc;
     use std::time::{Duration as StdDuration, Instant};
+
+    mod empty_events_tests;
 
     #[tokio::test(start_paused = true)]
     async fn journal_disk_io_bounds_fanout_and_collects_every_result() {
