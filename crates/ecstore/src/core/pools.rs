@@ -12781,6 +12781,19 @@ impl ECStore {
         let (pool_meta_guard, snapshot) = self
             .acquire_pool_meta_read_guard(&save_guard, "target capacity admission failed")
             .await?;
+        // A scanner publication must cover the complete durable membership.
+        // A smaller startup view could otherwise overwrite an expanded commit
+        // proof with its older stable rollback, even though every target is writable.
+        if matches!(admission, DecommissionCapacityAdmission::ScannerBacklog)
+            && !snapshot
+                .pools
+                .iter()
+                .enumerate()
+                .filter_map(|(index, _)| snapshot.scanner_pause_backlog_pool_writable(index).then_some(index))
+                .eq(target_pool_indices.iter().copied())
+        {
+            return Err(Error::SlowDown);
+        }
         for target_pool_index in target_pool_indices.iter().copied() {
             ensure_external_decommission_target_admission(&snapshot, target_pool_index, admission)?;
         }
