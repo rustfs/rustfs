@@ -739,8 +739,8 @@ pub(super) fn completed_usage_candidate(
 
         let merged_last_update = validated.last_update;
         let buckets_usage = bucket_entries
-            .iter()
-            .map(|(bucket, entry)| Ok((bucket.clone(), checked_bucket_usage_info(entry).ok_or(CandidateOutcome::UsageCounters)?)))
+            .into_iter()
+            .map(|(bucket, entry)| Ok((bucket, checked_bucket_usage_info(entry).ok_or(CandidateOutcome::UsageCounters)?)))
             .collect::<std::result::Result<HashMap<_, _>, CandidateOutcome>>()?;
         let bucket_sizes = buckets_usage
             .iter()
@@ -1037,8 +1037,8 @@ pub(super) fn observational_data_usage_info(
         }
         let merged_last_update = merged_last_update.ok_or(CandidateOutcome::MissingLastUpdate)?;
         let buckets_usage = bucket_entries
-            .iter()
-            .map(|(bucket, entry)| Ok((bucket.clone(), checked_bucket_usage_info(entry).ok_or(CandidateOutcome::UsageCounters)?)))
+            .into_iter()
+            .map(|(bucket, entry)| Ok((bucket, checked_bucket_usage_info(entry).ok_or(CandidateOutcome::UsageCounters)?)))
             .collect::<std::result::Result<HashMap<_, _>, CandidateOutcome>>()?;
         Ok((
             DataUsageInfo {
