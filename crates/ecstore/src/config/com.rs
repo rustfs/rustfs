@@ -1966,16 +1966,14 @@ fn sync_rendered_target_section(
                         .and_then(Value::as_str)
                         .is_some_and(|key| descriptor.valid_keys.contains(&key))
                 })
-            {
-                if !entries
+                && !entries
                     .iter()
                     .any(|entry| entry.get("key").and_then(Value::as_str) == Some(ENABLE_KEY))
-                {
-                    entries.extend(rendered_scalar_config_kvs_entries(&HashMap::from([(
-                        ENABLE_KEY.to_string(),
-                        "off".to_string(),
-                    )])));
-                }
+            {
+                entries.extend(rendered_scalar_config_kvs_entries(&HashMap::from([(
+                    ENABLE_KEY.to_string(),
+                    "off".to_string(),
+                )])));
             }
             merged.insert(instance_name, instance);
         }
