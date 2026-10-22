@@ -459,6 +459,8 @@ impl RootHealTerminal {
 
     fn into_completed(self) -> CompletedHealStatus {
         CompletedHealStatus {
+            task_id: self.task_id,
+            source: HealRequestSource::Admin,
             outcome: None,
             progress: self.progress,
             retained_bytes: std::sync::OnceLock::new(),
