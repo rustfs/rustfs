@@ -18,7 +18,7 @@ use super::*;
 
 use crate::app::trailer_adapter::trailer_source;
 use crate::auth::{RUSTFS_MAX_CONTENT_LENGTH_QUERY, VerifiedPresignedRequest, parse_presigned_put_max_content_length};
-use crate::error::{UploadLimitExceeded, normalize_put_read_quorum_error};
+use crate::error::{ClientBodyReadTimeout, UploadLimitExceeded, normalize_put_read_quorum_error};
 static PUT_FAILURE_LOGS: rustfs_utils::LogThrottle = rustfs_utils::LogThrottle::new(5_000);
 
 #[cfg(test)]
@@ -293,12 +293,10 @@ impl Stream for RequestBodyReadTimeout {
                     );
                     return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
-                        format!(
-                            "request body read stalled: received {} of {} bytes, no data for {}s",
-                            this.received,
-                            expected_display,
-                            this.timeout.as_secs()
-                        ),
+                        ClientBodyReadTimeout {
+                            timeout: this.timeout,
+                            raw_bytes_received: this.received,
+                        },
                     )) as StdError)));
                 }
 
@@ -2970,7 +2968,7 @@ mod tests {
         assert!(!object_traffic_health.snapshot().write_stalled);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn put_object_body_read_timeout_guard_aborts_on_stall() {
         // Inner stream never yields and never reports EOF (a proxy that forwarded
         // a partial body then went silent while holding the connection open).
@@ -2993,6 +2991,9 @@ mod tests {
             .downcast_ref::<std::io::Error>()
             .expect("stall error should wrap an io::Error");
         assert_eq!(io_err.kind(), std::io::ErrorKind::TimedOut);
+        let error = S3Error::from(ApiError::from(s3s_body_error_to_io(err)));
+        assert_eq!(error.code(), &S3ErrorCode::RequestTimeout);
+        assert_eq!(error.status_code(), Some(http::StatusCode::BAD_REQUEST));
 
         // After a stall the guard terminates the stream instead of re-polling the
         // abandoned inner stream.

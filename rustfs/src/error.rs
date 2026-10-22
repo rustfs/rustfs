@@ -20,7 +20,7 @@ use rustfs_lock::LockError;
 use s3s::stream::{aws_chunked_stream::AwsChunkedStreamError, upload_stream::UploadStreamError};
 use s3s::{S3Error, S3ErrorCode};
 
-pub(crate) const CONTENT_SHA256_MISMATCH_CODE: &str = "XAmzContentSHA256Mismatch";
+const CONTENT_SHA256_MISMATCH_CODE: &str = "XAmzContentSHA256Mismatch";
 const CONTENT_SHA256_MISMATCH_MESSAGE: &str = "The provided 'x-amz-content-sha256' header does not match what was computed.";
 
 const MAX_VERSIONS_EXCEEDED_CODE: &str = "MaxVersionsExceeded";

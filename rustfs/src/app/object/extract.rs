@@ -1208,15 +1208,12 @@ pub fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: boo
 }
 
 fn map_extract_archive_error(err: std::io::Error) -> S3Error {
-    let message = err.to_string();
     let api_error = ApiError::from(err);
-    if matches!(api_error.code, S3ErrorCode::BadDigest | S3ErrorCode::IncompleteBody)
-        || api_error.code.as_str() == crate::error::CONTENT_SHA256_MISMATCH_CODE
-    {
+    if api_error.code != S3ErrorCode::InternalError {
         return api_error.into();
     }
 
-    let mut archive_error = s3_error!(InvalidArgument, "Failed to process archive entry: {}", message);
+    let mut archive_error = s3_error!(InvalidArgument, "Failed to process archive entry: {}", api_error.message);
     archive_error.set_source(Box::new(api_error));
     archive_error
 }
@@ -2241,14 +2238,7 @@ impl DefaultObjectUsecase {
         }
 
         while let Some(entry) = entries.next().await {
-            let mut f = match entry {
-                Ok(f) => f,
-                Err(error) => {
-                    error!(error = %error, "Archive entry read failed");
-                    flush_extract_batch(&mut batch, &mut batch_state, &commit_context, extract_options.ignore_errors).await?;
-                    return Err(s3_error!(InvalidArgument, "Failed to read archive entry: {:?}", error));
-                }
-            };
+            let mut f = extract_try!(entry.map_err(map_extract_archive_error));
             extracted_entry_count = extracted_entry_count.saturating_add(1);
             extract_try!(validate_put_object_extract_entry_count(extracted_entry_count, extract_limits,));
             let entry_size = f.effective_size();
@@ -3474,6 +3464,123 @@ mod tests {
                 .expect("raw TAR member should parse");
 
             assert_eq!(entry.path_bytes().expect("raw TAR member path should parse").as_ref(), path.as_bytes());
+        }
+    }
+
+    #[test]
+    fn archive_error_mapping_preserves_classified_body_errors() {
+        use crate::error::{ClientBodyReadTimeout, ServerSideSourceReadError, UploadLimitExceeded};
+        for (error, code) in [
+            (
+                io::Error::other(ClientBodyReadTimeout {
+                    timeout: Duration::from_secs(1),
+                    raw_bytes_received: 16,
+                }),
+                S3ErrorCode::RequestTimeout,
+            ),
+            (
+                io::Error::other(s3s::BodySizeLimitExceeded { size: 6, limit: 5 }),
+                S3ErrorCode::EntityTooLarge,
+            ),
+            (io::Error::other(UploadLimitExceeded { limit: 5 }), S3ErrorCode::EntityTooLarge),
+            (
+                io::Error::other(ServerSideSourceReadError::new("CopyObject", io::Error::other("source unavailable"))),
+                S3ErrorCode::ServiceUnavailable,
+            ),
+        ] {
+            let error = map_extract_archive_error(error);
+            assert_eq!(error.code(), &code);
+            assert_eq!(error.message(), Some(ApiError::error_code_to_message(&code).as_str()));
+            assert!(error.source().is_some());
+        }
+        let error = map_extract_archive_error(io::Error::new(io::ErrorKind::InvalidData, "invalid TAR header"));
+        assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(error.message(), Some("Failed to process archive entry: invalid TAR header"));
+        assert!(error.source().is_some());
+    }
+
+    #[test]
+    fn archive_body_errors_do_not_format_discarded_diagnostics() {
+        #[derive(Debug)]
+        struct DisplayProbe {
+            source: io::Error,
+            displays: Arc<AtomicUsize>,
+        }
+        impl std::fmt::Display for DisplayProbe {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.displays.fetch_add(1, Ordering::Relaxed);
+                f.write_str("archive transport diagnostics")
+            }
+        }
+        impl std::error::Error for DisplayProbe {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.source)
+            }
+        }
+        let displays = Arc::new(AtomicUsize::new(0));
+        let error = map_extract_archive_error(io::Error::other(DisplayProbe {
+            source: io::Error::other(UploadStreamError::Sha256Mismatch),
+            displays: Arc::clone(&displays),
+        }));
+        assert_eq!(error.code().as_str(), "XAmzContentSHA256Mismatch");
+        assert_eq!(
+            displays.load(Ordering::Relaxed),
+            0,
+            "classified body failures need only their public message"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snowball_extract_preserves_sha256_failure_after_sniffing() {
+        use crate::app::storage_api::s3::UploadStream;
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use http::Method;
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("extract-body-error-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create extract test bucket");
+        let mut header = Header::new_gnu();
+        header.set_path("member.txt").expect("valid member path");
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let mut archive = header.as_bytes().to_vec();
+        archive.extend_from_slice(&[0; 1024]);
+        let size = archive.len();
+        // Sniffing consumes only the prefix; the final frame fails while TAR
+        // reads its first header, before a member can be prepared or committed.
+        let frames = futures::stream::iter([
+            Ok::<_, StdError>(Bytes::copy_from_slice(&archive[..16])),
+            Ok(Bytes::copy_from_slice(&archive[16..])),
+        ]);
+        let body = StreamingBlob::wrap(UploadStream::new(frames, size, s3s_sigv4::Sha256Sum::from_bytes([0; 32])));
+        let input = PutObjectInput::builder()
+            .bucket(bucket.clone())
+            .key("archive.tar".to_string())
+            .content_length(Some(i64::try_from(size).expect("fixture size")))
+            .body(Some(body))
+            .build()
+            .expect("extract input");
+        let mut request = build_request(input, Method::PUT);
+        request
+            .headers
+            .insert("x-amz-meta-snowball-auto-extract", HeaderValue::from_static("true"));
+        let error = DefaultObjectUsecase::with_context(Some(context))
+            .execute_put_object_extract(request)
+            .await
+            .expect_err("a bad payload digest must reject the archive request");
+        assert_eq!(error.code().as_str(), "XAmzContentSHA256Mismatch");
+        assert_eq!(error.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        for key in ["archive.tar", "member.txt"] {
+            let missing = store
+                .get_object_info(&bucket, key, &ObjectOptions::default())
+                .await
+                .expect_err("rejected archive cannot publish a member");
+            assert!(is_err_object_not_found(&missing), "{missing}");
         }
     }
 
@@ -4785,7 +4892,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn snowball_extract_body_guard_aborts_stalled_upload() {
         let body = StreamingBlob::wrap(futures::stream::pending::<Result<Bytes, std::io::Error>>());
         let mut guarded = guard_put_object_body_read_timeout(
@@ -4806,6 +4913,9 @@ mod tests {
             .downcast_ref::<std::io::Error>()
             .expect("stall error should retain its I/O kind");
         assert_eq!(io_err.kind(), std::io::ErrorKind::TimedOut);
+        let error = map_extract_archive_error(s3s_body_error_to_io(err));
+        assert_eq!(error.code(), &S3ErrorCode::RequestTimeout);
+        assert_eq!(error.status_code(), Some(http::StatusCode::BAD_REQUEST));
     }
 
     #[test]
