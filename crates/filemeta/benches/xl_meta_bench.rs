@@ -355,12 +355,13 @@ fn bench_metacache_resolve(c: &mut Criterion) {
     let sets_8_disagree: Vec<MetaCacheEntries> = (0..N)
         .map(|i| {
             let name = format!("prefix/object-{i:08}");
+            let stale_slot = (i as usize) % 8;
             MetaCacheEntries(
                 (0..8)
                     .map(|disk| {
                         Some(MetaCacheEntry {
                             name: name.clone(),
-                            metadata: if disk == 0 {
+                            metadata: if disk == stale_slot {
                                 stale_data.clone()
                             } else {
                                 per_disk_data[disk].clone()
@@ -374,6 +375,65 @@ fn bench_metacache_resolve(c: &mut Criterion) {
         })
         .collect();
 
+    // Also build a realistic 13-version per-disk corpus (`create_complex_xlmeta`) with distinct
+    // `erasure_index` per drive to measure versioned bucket quorum resolution and steady-state `matches_strict`.
+    let complex_data = create_complex_xlmeta().expect("complex xl.meta");
+    let complex_base_fm = FileMeta::load(&complex_data).expect("load complex_data");
+    let per_disk_complex: Vec<Vec<u8>> = (1..=8usize)
+        .map(|disk_idx| {
+            let mut fm = complex_base_fm.clone();
+            for shallow in &mut fm.versions {
+                let mut ver = FileMetaVersion::try_from(shallow.meta.as_slice()).expect("decode version");
+                if let Some(obj) = ver.object.as_mut() {
+                    obj.erasure_index = disk_idx;
+                    shallow.meta = ver.marshal_msg().expect("marshal version");
+                }
+            }
+            fm.marshal_msg().expect("marshal complex fm")
+        })
+        .collect();
+    assert_ne!(per_disk_complex[0], per_disk_complex[1]);
+
+    let sets_8_agree_13v: Vec<MetaCacheEntries> = (0..N)
+        .map(|i| {
+            let name = format!("prefix/versioned-{i:08}");
+            MetaCacheEntries(
+                (0..8)
+                    .map(|disk| {
+                        Some(MetaCacheEntry {
+                            name: name.clone(),
+                            metadata: per_disk_complex[disk].clone(),
+                            cached: None,
+                            reusable: false,
+                        })
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+
+    let sets_8_disagree_13v: Vec<MetaCacheEntries> = (0..N)
+        .map(|i| {
+            let name = format!("prefix/versioned-{i:08}");
+            let stale_slot = (i as usize) % 8;
+            MetaCacheEntries(
+                (0..8)
+                    .map(|disk| {
+                        Some(MetaCacheEntry {
+                            name: name.clone(),
+                            metadata: if disk == stale_slot {
+                                stale_data.clone()
+                            } else {
+                                per_disk_complex[disk].clone()
+                            },
+                            cached: None,
+                            reusable: false,
+                        })
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
     let mut group = c.benchmark_group("metacache_resolve");
     group.throughput(Throughput::Elements(N));
 
@@ -441,6 +501,94 @@ fn bench_metacache_resolve(c: &mut Criterion) {
                     candidates: Vec::new(),
                 });
                 black_box(resolved);
+            }
+        });
+    });
+
+    group.bench_function("8_disks_agree_13_versions/1000_objects", |b| {
+        b.iter(|| {
+            for entries in &sets_8_agree_13v {
+                let resolved = entries.resolve_with_write_quorum(MetadataResolutionParams {
+                    dir_quorum: 4,
+                    obj_quorum: 4,
+                    requested_versions: 1,
+                    bucket: "bucket".to_string(),
+                    strict: true,
+                    write_quorum_slack: 0,
+                    candidates: Vec::new(),
+                });
+                black_box(resolved);
+            }
+        });
+    });
+
+    group.bench_function("8_disks_disagree_13_versions/1000_objects", |b| {
+        b.iter(|| {
+            for entries in &sets_8_disagree_13v {
+                let resolved = entries.resolve_with_write_quorum(MetadataResolutionParams {
+                    dir_quorum: 4,
+                    obj_quorum: 4,
+                    requested_versions: 1,
+                    bucket: "bucket".to_string(),
+                    strict: true,
+                    write_quorum_slack: 0,
+                    candidates: Vec::new(),
+                });
+                black_box(resolved);
+            }
+        });
+    });
+
+    group.bench_function("8_disks_matches_strict_1v/1000_objects", |b| {
+        let mut sets = sets_8_agree
+            .iter()
+            .map(|entries| {
+                entries
+                    .as_ref()
+                    .iter()
+                    .map(|opt| opt.as_ref().expect("entry").clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        b.iter(|| {
+            for set in &mut sets {
+                let (first, rest) = set.split_first_mut().expect("non-empty");
+                first.cached = None;
+                let mut agree = 1usize;
+                for other in rest.iter() {
+                    if first.matches_strict(other) {
+                        agree += 1;
+                    }
+                }
+                assert_eq!(agree, 8);
+                black_box(&first.cached);
+            }
+        });
+    });
+
+    group.bench_function("8_disks_matches_strict_13v/1000_objects", |b| {
+        let mut sets = sets_8_agree_13v
+            .iter()
+            .map(|entries| {
+                entries
+                    .as_ref()
+                    .iter()
+                    .map(|opt| opt.as_ref().expect("entry").clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        b.iter(|| {
+            for set in &mut sets {
+                let (first, rest) = set.split_first_mut().expect("non-empty");
+                first.cached = None;
+                let mut agree = 1usize;
+                for other in rest.iter() {
+                    if first.matches_strict(other) {
+                        agree += 1;
+                    }
+                }
+                assert_eq!(agree, 8);
+                black_box(&first.cached);
             }
         });
     });

@@ -642,20 +642,25 @@ impl FileMetaShallowVersion {
     }
 
     pub fn write_quorum(&self, fallback_quorum: usize) -> usize {
-        let header_quorum = self.header.write_quorum(fallback_quorum);
-        if self.header.has_ec() || !matches!(self.header.version_type, VersionType::Object | VersionType::Legacy) {
-            return header_quorum;
-        }
-
-        self.parse_version_meta()
-            .ok()
-            .and_then(|version| version.erasure_write_quorum())
-            .unwrap_or(header_quorum)
+        write_quorum_from_header_and_meta(&self.header, self.meta.as_slice(), fallback_quorum)
     }
 
     pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfo> {
         FileMetaVersion::decode_fileinfo_from_slice(self.meta.as_slice(), volume, path, all_parts, true)
     }
+}
+
+#[inline]
+pub(crate) fn write_quorum_from_header_and_meta(header: &FileMetaVersionHeader, meta: &[u8], fallback_quorum: usize) -> usize {
+    let header_quorum = header.write_quorum(fallback_quorum);
+    if header.has_ec() || !matches!(header.version_type, VersionType::Object | VersionType::Legacy) {
+        return header_quorum;
+    }
+
+    FileMetaVersion::try_from(meta)
+        .ok()
+        .and_then(|version| version.erasure_write_quorum())
+        .unwrap_or(header_quorum)
 }
 
 impl TryFrom<FileMetaVersion> for FileMetaShallowVersion {
@@ -1679,6 +1684,47 @@ pub struct FileMetaVersionHeader {
     pub ec_m: u8,
 }
 
+pub(crate) struct CanonicalV3HeaderFields {
+    pub(crate) uuid_bytes: [u8; 16],
+    pub(crate) unix_nanos: i64,
+    pub(crate) signature: [u8; 4],
+    pub(crate) version_type: VersionType,
+    pub(crate) flags: u8,
+    pub(crate) ec_n: u8,
+    pub(crate) ec_m: u8,
+}
+
+#[inline]
+pub(crate) fn ec_fields_match_strict(s_ec_m: u8, s_ec_n: u8, o_ec_m: u8, o_ec_n: u8) -> bool {
+    let s_has_ec = s_ec_m > 0 && s_ec_n > 0;
+    let o_has_ec = o_ec_m > 0 && o_ec_n > 0;
+    s_has_ec != o_has_ec || (s_ec_n == o_ec_n && s_ec_m == o_ec_m)
+}
+
+#[inline]
+pub(crate) fn parse_canonical_v3_header_fields(buf: &[u8]) -> Option<CanonicalV3HeaderFields> {
+    let chunk = buf.first_chunk::<38>()?;
+    if chunk[0] != 0x97 || chunk[1] != 0xc4 || chunk[2] != 0x10 || chunk[19] != 0xd3 || chunk[28] != 0xc4 || chunk[29] != 0x04 {
+        return None;
+    }
+    let [vt, flags, ec_n, ec_m] = [chunk[34], chunk[35], chunk[36], chunk[37]];
+    if (vt | flags | ec_n | ec_m) >= 0x80 {
+        return None;
+    }
+    let uuid_bytes: [u8; 16] = chunk[3..19].try_into().ok()?;
+    let unix_nanos = i64::from_be_bytes(chunk[20..28].try_into().ok()?);
+    let signature: [u8; 4] = chunk[30..34].try_into().ok()?;
+    Some(CanonicalV3HeaderFields {
+        uuid_bytes,
+        unix_nanos,
+        signature,
+        version_type: VersionType::from_u8(vt),
+        flags,
+        ec_n,
+        ec_m,
+    })
+}
+
 impl FileMetaVersionHeader {
     fn reset_for_unmarshal(&mut self) {
         self.version_id = None;
@@ -1868,6 +1914,24 @@ impl FileMetaVersionHeader {
     }
 
     pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
+        if let Some(fields) = parse_canonical_v3_header_fields(buf) {
+            let mod_time = if fields.unix_nanos == 0 {
+                None
+            } else {
+                let secs = fields.unix_nanos.div_euclid(1_000_000_000);
+                let subsec_nanos = u32::try_from(fields.unix_nanos.rem_euclid(1_000_000_000)).unwrap_or(0);
+                Some(OffsetDateTime::from_unix_timestamp(secs)?.replace_nanosecond(subsec_nanos)?)
+            };
+            self.version_id = Some(Uuid::from_bytes(fields.uuid_bytes));
+            self.mod_time = mod_time;
+            self.signature = fields.signature;
+            self.version_type = fields.version_type;
+            self.flags = fields.flags;
+            self.ec_n = fields.ec_n;
+            self.ec_m = fields.ec_m;
+            return Ok(38);
+        }
+
         self.reset_for_unmarshal();
 
         let mut cur = Cursor::new(buf);
@@ -4064,46 +4128,49 @@ pub fn merge_file_meta_versions(
     requested_versions: usize,
     versions: &[Vec<FileMetaShallowVersion>],
 ) -> Vec<FileMetaShallowVersion> {
-    merge_file_meta_versions_inner(quorum, strict, requested_versions, false, 0, versions)
+    let streams: Vec<Vec<(&FileMetaVersionHeader, &[u8])>> = versions
+        .iter()
+        .map(|v| v.iter().map(|ver| (&ver.header, ver.meta.as_slice())).collect())
+        .collect();
+    merge_file_meta_borrowed_streams(quorum, strict, requested_versions, false, 0, streams)
 }
 
-pub(crate) fn merge_file_meta_versions_with_write_quorum(
-    quorum: usize,
-    strict: bool,
-    requested_versions: usize,
-    write_quorum_slack: usize,
-    versions: &[Vec<FileMetaShallowVersion>],
-) -> Vec<FileMetaShallowVersion> {
-    merge_file_meta_versions_inner(quorum, strict, requested_versions, true, write_quorum_slack, versions)
-}
-
-fn merge_file_meta_versions_inner(
+pub(crate) fn merge_file_meta_borrowed_streams(
     mut quorum: usize,
     mut strict: bool,
     requested_versions: usize,
     enforce_write_quorum: bool,
     write_quorum_slack: usize,
-    versions: &[Vec<FileMetaShallowVersion>],
+    mut streams: Vec<Vec<(&FileMetaVersionHeader, &[u8])>>,
 ) -> Vec<FileMetaShallowVersion> {
+    let to_shallow = |(header, meta): (&FileMetaVersionHeader, &[u8])| FileMetaShallowVersion {
+        header: header.clone(),
+        meta: meta.to_vec(),
+    };
+
     if quorum == 0 {
         quorum = 1;
     }
 
-    if versions.len() < quorum || versions.is_empty() {
+    if streams.len() < quorum || streams.is_empty() {
         return Vec::new();
     }
 
-    if versions.len() == 1 {
+    if streams.len() == 1 {
         if !enforce_write_quorum {
-            return versions[0].clone();
+            return streams[0].iter().copied().map(to_shallow).collect();
         }
 
-        let required_quorum = versions[0]
+        let required_quorum = streams[0]
             .first()
-            .map(|version| version.write_quorum(quorum).saturating_sub(write_quorum_slack).max(quorum))
+            .map(|&(hdr, meta)| {
+                write_quorum_from_header_and_meta(hdr, meta, quorum)
+                    .saturating_sub(write_quorum_slack)
+                    .max(quorum)
+            })
             .unwrap_or(quorum);
-        if versions.len() >= required_quorum {
-            return versions[0].clone();
+        if streams.len() >= required_quorum {
+            return streams[0].iter().copied().map(to_shallow).collect();
         }
         return Vec::new();
     }
@@ -4112,16 +4179,17 @@ fn merge_file_meta_versions_inner(
         strict = true;
     }
 
-    let required_quorum = |version: &FileMetaShallowVersion| {
+    let required_quorum = |(hdr, meta): (&FileMetaVersionHeader, &[u8])| {
         if enforce_write_quorum {
-            version.write_quorum(quorum).saturating_sub(write_quorum_slack).max(quorum)
+            write_quorum_from_header_and_meta(hdr, meta, quorum)
+                .saturating_sub(write_quorum_slack)
+                .max(quorum)
         } else {
             quorum
         }
     };
 
-    let mut streams: Vec<Vec<&FileMetaShallowVersion>> = versions.iter().map(|v| v.iter().collect()).collect();
-    let mut tops: Vec<&FileMetaShallowVersion> = Vec::with_capacity(streams.len());
+    let mut tops: Vec<(&FileMetaVersionHeader, &[u8])> = Vec::with_capacity(streams.len());
 
     let mut n_versions = 0;
 
@@ -4136,10 +4204,10 @@ fn merge_file_meta_versions_inner(
                 continue;
             };
             if let Some(sig) = top_sig {
-                consistent = consistent && &first.header == sig;
+                consistent = consistent && first.0 == sig;
             } else {
                 consistent = true;
-                top_sig = Some(&first.header);
+                top_sig = Some(first.0);
             }
             tops.push(first);
         }
@@ -4149,12 +4217,12 @@ fn merge_file_meta_versions_inner(
             break;
         }
 
-        let latest: &FileMetaShallowVersion;
+        let latest: (&FileMetaVersionHeader, &[u8]);
         if consistent {
             latest = tops[0];
             if tops.len() >= required_quorum(latest) {
-                merged.push(latest.clone());
-                if !latest.header.free_version() {
+                merged.push(to_shallow(latest));
+                if !latest.0.free_version() {
                     n_versions += 1;
                 }
             }
@@ -4162,13 +4230,13 @@ fn merge_file_meta_versions_inner(
             let mut latest_ref = tops[0];
             let mut latest_count = 1;
             for &ver in &tops[1..] {
-                if ver.header == latest_ref.header {
+                if ver.0 == latest_ref.0 {
                     latest_count += 1;
                     continue;
                 }
 
-                if ver.header.sorts_before(&latest_ref.header) {
-                    if !strict && ver.header.matches_not_strict(&latest_ref.header) {
+                if ver.0.sorts_before(latest_ref.0) {
+                    if !strict && ver.0.matches_not_strict(latest_ref.0) {
                         latest_count += 1;
                     } else {
                         latest_count = 1;
@@ -4178,18 +4246,18 @@ fn merge_file_meta_versions_inner(
                 }
 
                 // Mismatch, but older.
-                if !strict && ver.header.matches_not_strict(&latest_ref.header) {
+                if !strict && ver.0.matches_not_strict(latest_ref.0) {
                     latest_count += 1;
                     continue;
                 }
 
-                if ver.header.version_id == latest_ref.header.version_id {
+                if ver.0.version_id == latest_ref.0.version_id {
                     let mut x: HashMap<FileMetaVersionHeader, usize> = HashMap::new();
                     for &a in &tops {
-                        if a.header.version_id != ver.header.version_id {
+                        if a.0.version_id != ver.0.version_id {
                             continue;
                         }
-                        let mut hdr = a.header.clone();
+                        let mut hdr = a.0.clone();
                         if !strict {
                             hdr.signature = [0; 4];
                         }
@@ -4197,11 +4265,11 @@ fn merge_file_meta_versions_inner(
                     }
                     latest_count = 0;
                     for (k, v) in x.iter() {
-                        if *v < latest_count || (*v == latest_count && latest_ref.header.sorts_before(k)) {
+                        if *v < latest_count || (*v == latest_count && latest_ref.0.sorts_before(k)) {
                             continue;
                         }
                         for &a in &tops {
-                            let mut hdr = a.header.clone();
+                            let mut hdr = a.0.clone();
                             if !strict {
                                 hdr.signature = [0; 4];
                             }
@@ -4217,28 +4285,28 @@ fn merge_file_meta_versions_inner(
             }
             latest = latest_ref;
             if latest_count >= required_quorum(latest) {
-                if !latest.header.free_version() {
+                if !latest.0.free_version() {
                     n_versions += 1;
                 }
-                merged.push(latest.clone());
+                merged.push(to_shallow(latest));
             }
         }
 
         // Remove from all streams up until latest modtime or if selected.
         for vers in &mut streams {
             if let Some(pos) = vers.iter().position(|ver| {
-                ver.header.mod_time > latest.header.mod_time
-                    || ver.header == latest.header
-                    || latest.header.version_id == ver.header.version_id
+                ver.0.mod_time > latest.0.mod_time
+                    || ver.0 == latest.0
+                    || latest.0.version_id == ver.0.version_id
                     || merged
                         .iter()
-                        .any(|merged_v| ver.header.version_id == merged_v.header.version_id)
+                        .any(|merged_v: &FileMetaShallowVersion| ver.0.version_id == merged_v.header.version_id)
             }) {
                 vers.remove(pos);
             }
         }
         if requested_versions > 0 && requested_versions == n_versions {
-            merged.extend(streams[0].iter().map(|v| (*v).clone()));
+            merged.extend(streams[0].iter().copied().map(to_shallow));
             break;
         }
     }
