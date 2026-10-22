@@ -39,6 +39,9 @@ use uuid::Uuid;
 
 mod storage_api;
 
+#[path = "lifecycle/scanner_heal_scope.rs"]
+mod scanner_heal_scope;
+
 use storage_api::lifecycle::{
     BUCKET_LIFECYCLE_CONFIG, BUCKET_VERSIONING_CONFIG, BucketOperations, BucketOptions, BucketVersioningSys, CompletePart,
     DeleteAfterObjectLockSnapshotBarrier, DiskOption, ECStore, EcstoreError, Endpoint, EndpointServerPools, Endpoints,

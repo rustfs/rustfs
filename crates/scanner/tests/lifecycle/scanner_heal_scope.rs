@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::api::disk::{DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, new_disk};
 use rustfs_filemeta::{FileInfo, FileMeta};
 use rustfs_heal_contracts::heal_channel::{HealAdmissionResult, HealChannelCommand, HealRequestSource, init_heal_channel};
 use rustfs_scanner::DataUsageCacheSource;
@@ -20,8 +19,32 @@ use rustfs_scanner::scanner_folder::ScannerItem;
 use rustfs_scanner::scanner_io::ScannerIODisk;
 use tokio::sync::mpsc;
 
-#[tokio::test]
-async fn scanner_object_requests_bind_the_actual_disk_scope() {
+use super::storage_api::lifecycle::{DiskOption, Endpoint, STORAGE_FORMAT_FILE, new_disk};
+
+#[test]
+fn scanner_object_requests_bind_the_actual_disk_scope() {
+    const CHILD: &str = "RUSTFS_TEST_SCANNER_SCOPE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().expect("locate integration test executable"))
+            .args([
+                "--exact",
+                "scanner_heal_scope::scanner_object_requests_bind_the_actual_disk_scope",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .expect("run scanner scope regression in an isolated process");
+        assert!(status.success(), "isolated scanner scope regression failed: {status}");
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build isolated scanner runtime")
+        .block_on(check_scanner_object_scope());
+}
+
+async fn check_scanner_object_scope() {
     let mut commands = init_heal_channel().expect("initialize isolated scanner request channel");
     let (captured, mut requests) = mpsc::unbounded_channel();
     let responder = tokio::spawn(async move {
@@ -99,8 +122,8 @@ async fn scanner_object_requests_bind_the_actual_disk_scope() {
             disk.get_size_with_tier_names(item, &[]).await.expect("scan original object");
             if let (Some(pool), Some(set), Some(_)) = (pool, set, disk_index) {
                 let request = requests.try_recv().expect("scanner submitted one real object request");
-                assert_eq!(request.pool_index, Some(usize::try_from(pool).expect("pool index fits")));
-                assert_eq!(request.set_index, Some(usize::try_from(set).expect("set index fits")));
+                assert_eq!(request.pool_index, Some(pool));
+                assert_eq!(request.set_index, Some(set));
                 assert_eq!(request.bucket, bucket);
                 assert_eq!(request.object_prefix.as_deref(), Some(object));
                 assert_eq!(request.object_version_id, version_id.map(|value| value.to_string()));
