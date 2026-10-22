@@ -546,41 +546,55 @@ impl ApiError {
     }
 }
 
-fn error_chain_has_type<T>(err: &(dyn std::error::Error + 'static)) -> bool
-where
-    T: std::error::Error + 'static,
-{
-    error_chain_find(err, |error| error.is::<T>().then_some(())).is_some()
-}
-
-/// Payload hashes and object checksums have distinct S3 error contracts.
-/// Walk the same bounded chain for direct and storage-wrapped I/O failures.
-fn error_chain_digest_code(err: &(dyn std::error::Error + 'static)) -> Option<S3ErrorCode> {
-    error_chain_find(err, |error| {
+/// Classify body failures in one bounded pass, retaining precedence across wrappers.
+/// A digest failure wins immediately; other markers must wait for deeper causes.
+fn body_read_error_code(err: &(dyn std::error::Error + 'static)) -> Option<S3ErrorCode> {
+    let mut upload_limit_exceeded = false;
+    let mut server_source_failed = false;
+    let mut client_body_timed_out = false;
+    let mut body_size_exceeded = false;
+    let mut incomplete_body = false;
+    let digest = error_chain_find(err, |error| {
         if error.is::<rustfs_rio::Sha256Mismatch>()
             || matches!(error.downcast_ref::<UploadStreamError>(), Some(UploadStreamError::Sha256Mismatch))
         {
-            Some(S3ErrorCode::Custom(CONTENT_SHA256_MISMATCH_CODE.into()))
-        } else if error.is::<rustfs_rio::ChecksumMismatch>() || error.is::<rustfs_rio::BadDigest>() {
-            Some(S3ErrorCode::BadDigest)
+            return Some(S3ErrorCode::Custom(CONTENT_SHA256_MISMATCH_CODE.into()));
+        }
+        if error.is::<rustfs_rio::ChecksumMismatch>() || error.is::<rustfs_rio::BadDigest>() {
+            return Some(S3ErrorCode::BadDigest);
+        }
+
+        upload_limit_exceeded |= error.is::<UploadLimitExceeded>();
+        server_source_failed |= error.is::<ServerSideSourceReadError>();
+        client_body_timed_out |= error.is::<ClientBodyReadTimeout>();
+        body_size_exceeded |= error.is::<s3s::BodySizeLimitExceeded>();
+        incomplete_body |= error.is::<rustfs_rio::IncompleteBody>()
+            || matches!(
+                error.downcast_ref::<UploadStreamError>(),
+                Some(UploadStreamError::LengthMismatch | UploadStreamError::Incomplete)
+            )
+            || matches!(
+                error.downcast_ref::<AwsChunkedStreamError>(),
+                Some(AwsChunkedStreamError::LengthMismatch | AwsChunkedStreamError::Incomplete)
+            )
+            || is_hyper_body_eof(error);
+        None
+    });
+    digest.or_else(|| {
+        if upload_limit_exceeded {
+            Some(S3ErrorCode::EntityTooLarge)
+        } else if server_source_failed {
+            Some(S3ErrorCode::ServiceUnavailable)
+        } else if client_body_timed_out {
+            Some(S3ErrorCode::RequestTimeout)
+        } else if body_size_exceeded {
+            Some(S3ErrorCode::EntityTooLarge)
+        } else if incomplete_body {
+            Some(S3ErrorCode::IncompleteBody)
         } else {
             None
         }
     })
-}
-
-fn error_chain_has_s3s_incomplete_body(err: &(dyn std::error::Error + 'static)) -> bool {
-    error_chain_find(err, |error| {
-        (matches!(
-            error.downcast_ref::<UploadStreamError>(),
-            Some(UploadStreamError::LengthMismatch | UploadStreamError::Incomplete)
-        ) || matches!(
-            error.downcast_ref::<AwsChunkedStreamError>(),
-            Some(AwsChunkedStreamError::LengthMismatch | AwsChunkedStreamError::Incomplete)
-        ))
-        .then_some(())
-    })
-    .is_some()
 }
 
 /// `io::Error::source` skips its custom payload itself. Visit that payload
@@ -605,10 +619,6 @@ fn error_chain_find<T>(
     None
 }
 
-fn error_chain_has_body_size_limit_exceeded(err: &(dyn std::error::Error + 'static)) -> bool {
-    error_chain_has_type::<s3s::BodySizeLimitExceeded>(err)
-}
-
 /// hyper reports a request body whose connection hit EOF before
 /// `Content-Length` bytes arrived as a `Kind::Body` error carrying an
 /// `UnexpectedEof` `io::Error` (its `IncompleteBody` marker is private).
@@ -618,10 +628,6 @@ fn is_hyper_body_eof(err: &(dyn std::error::Error + 'static)) -> bool {
         .and_then(|hyper_err| std::error::Error::source(hyper_err))
         .and_then(|cause| cause.downcast_ref::<std::io::Error>())
         .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::UnexpectedEof)
-}
-
-fn error_chain_has_hyper_body_eof(err: &(dyn std::error::Error + 'static)) -> bool {
-    error_chain_find(err, |error| is_hyper_body_eof(error).then_some(())).is_some()
 }
 
 impl From<ApiError> for S3Error {
@@ -695,58 +701,10 @@ impl From<StorageError> for ApiError {
         if let StorageError::Io(ref io_err) = err
             && let Some(inner) = io_err.get_ref()
         {
-            if let Some(code) = error_chain_digest_code(inner) {
+            if let Some(code) = body_read_error_code(inner) {
                 return ApiError {
                     message: ApiError::error_code_to_message(&code),
                     code,
-                    source: Some(Box::new(err)),
-                };
-            }
-
-            if error_chain_has_type::<UploadLimitExceeded>(inner) {
-                return ApiError {
-                    code: S3ErrorCode::EntityTooLarge,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
-                    source: Some(Box::new(err)),
-                };
-            }
-
-            if error_chain_has_type::<ServerSideSourceReadError>(inner) {
-                return ApiError {
-                    code: S3ErrorCode::ServiceUnavailable,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable),
-                    source: Some(Box::new(err)),
-                };
-            }
-
-            if error_chain_has_type::<ClientBodyReadTimeout>(inner) {
-                return ApiError {
-                    code: S3ErrorCode::RequestTimeout,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::RequestTimeout),
-                    source: Some(Box::new(err)),
-                };
-            }
-
-            if error_chain_has_body_size_limit_exceeded(inner) {
-                return ApiError {
-                    code: S3ErrorCode::EntityTooLarge,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
-                    source: Some(Box::new(err)),
-                };
-            }
-
-            if error_chain_has_hyper_body_eof(inner) {
-                return ApiError {
-                    code: S3ErrorCode::IncompleteBody,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody),
-                    source: Some(Box::new(err)),
-                };
-            }
-
-            if error_chain_has_s3s_incomplete_body(inner) {
-                return ApiError {
-                    code: S3ErrorCode::IncompleteBody,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody),
                     source: Some(Box::new(err)),
                 };
             }
@@ -866,67 +824,14 @@ impl From<HTTPRangeError> for ApiError {
 
 impl From<std::io::Error> for ApiError {
     fn from(err: std::io::Error) -> Self {
-        if let Some(inner) = err.get_ref() {
-            if let Some(code) = error_chain_digest_code(inner) {
-                return ApiError {
-                    message: ApiError::error_code_to_message(&code),
-                    code,
-                    source: Some(Box::new(err)),
-                };
-            }
-
-            if error_chain_has_type::<UploadLimitExceeded>(inner) {
-                return ApiError {
-                    code: S3ErrorCode::EntityTooLarge,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
-                    source: Some(Box::new(err)),
-                };
-            }
-            if error_chain_has_type::<ServerSideSourceReadError>(inner) {
-                return ApiError {
-                    code: S3ErrorCode::ServiceUnavailable,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable),
-                    source: Some(Box::new(err)),
-                };
-            }
-            if error_chain_has_type::<ClientBodyReadTimeout>(inner) {
-                return ApiError {
-                    code: S3ErrorCode::RequestTimeout,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::RequestTimeout),
-                    source: Some(Box::new(err)),
-                };
-            }
-
-            if error_chain_has_body_size_limit_exceeded(inner) {
-                return ApiError {
-                    code: S3ErrorCode::EntityTooLarge,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
-                    source: Some(Box::new(err)),
-                };
-            }
-
-            if error_chain_has_hyper_body_eof(inner) {
-                return ApiError {
-                    code: S3ErrorCode::IncompleteBody,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody),
-                    source: Some(Box::new(err)),
-                };
-            }
-
-            if error_chain_has_s3s_incomplete_body(inner) {
-                return ApiError {
-                    code: S3ErrorCode::IncompleteBody,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody),
-                    source: Some(Box::new(err)),
-                };
-            }
-            if error_chain_has_type::<rustfs_rio::IncompleteBody>(inner) {
-                return ApiError {
-                    code: S3ErrorCode::IncompleteBody,
-                    message: ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody),
-                    source: Some(Box::new(err)),
-                };
-            }
+        if let Some(inner) = err.get_ref()
+            && let Some(code) = body_read_error_code(inner)
+        {
+            return ApiError {
+                message: ApiError::error_code_to_message(&code),
+                code,
+                source: Some(Box::new(err)),
+            };
         }
         ApiError {
             code: S3ErrorCode::InternalError,
@@ -977,6 +882,13 @@ mod tests {
     use s3s::stream::{aws_chunked_stream::AwsChunkedStreamError, upload_stream::UploadStreamError};
     use s3s::{S3Error, S3ErrorCode};
     use std::io::{Error as IoError, ErrorKind};
+
+    fn error_chain_has_type<T>(err: &(dyn std::error::Error + 'static)) -> bool
+    where
+        T: std::error::Error + 'static,
+    {
+        error_chain_find(err, |error| error.is::<T>().then_some(())).is_some()
+    }
 
     #[tokio::test]
     async fn lock_timeout_response_advises_retry_without_exposing_resource() {
@@ -1489,8 +1401,12 @@ mod tests {
 
     #[test]
     fn body_error_classification_bounds_cyclic_source_chains() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
         #[derive(Debug)]
-        struct Cycle;
+        struct Cycle(Arc<AtomicUsize>);
         impl std::fmt::Display for Cycle {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("cycle")
@@ -1498,11 +1414,70 @@ mod tests {
         }
         impl std::error::Error for Cycle {
             fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.0.fetch_add(1, Ordering::Relaxed);
                 Some(self)
             }
         }
-        assert!(!error_chain_has_type::<ClientBodyReadTimeout>(&Cycle));
-        assert_eq!(ApiError::from(IoError::other(Cycle)).code, S3ErrorCode::InternalError);
+        let visits = Arc::new(AtomicUsize::new(0));
+        let error = ApiError::from(IoError::other(Cycle(Arc::clone(&visits))));
+        assert_eq!(error.code, S3ErrorCode::InternalError);
+        assert!(visits.load(Ordering::Relaxed) <= 64, "body classification must share one chain budget");
+    }
+
+    #[test]
+    fn body_error_classification_preserves_nested_marker_precedence() {
+        for storage in [false, true] {
+            for (inner, expected) in [
+                (IoError::other(UploadStreamError::Sha256Mismatch), CONTENT_SHA256_MISMATCH_CODE),
+                (
+                    IoError::other(rustfs_rio::BadDigest {
+                        expected_md5: "expected".into(),
+                        calculated_md5: "calculated".into(),
+                    }),
+                    "BadDigest",
+                ),
+                (IoError::other(UploadLimitExceeded { limit: 5 }), "EntityTooLarge"),
+                (
+                    IoError::other(ClientBodyReadTimeout {
+                        timeout: std::time::Duration::from_secs(300),
+                        raw_bytes_received: 0,
+                    }),
+                    "ServiceUnavailable",
+                ),
+                (IoError::other(s3s::BodySizeLimitExceeded { size: 6, limit: 5 }), "ServiceUnavailable"),
+            ] {
+                let error = IoError::other(ServerSideSourceReadError::new("CopyObject", inner));
+                let error = if storage {
+                    ApiError::from(StorageError::Io(error))
+                } else {
+                    ApiError::from(error)
+                };
+                assert_eq!(error.code.as_str(), expected);
+                assert!(error.source.is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn short_hash_reader_body_maps_to_incomplete_body_across_io_boundaries() {
+        use tokio::io::AsyncReadExt;
+        for storage in [false, true] {
+            let mut reader =
+                rustfs_rio::HashReader::from_stream(std::io::Cursor::new(b"short".to_vec()), 10, 10, None, None, false)
+                    .expect("valid declared body length");
+            let error = reader
+                .read_to_end(&mut Vec::new())
+                .await
+                .expect_err("five bytes cannot satisfy declared ten");
+            let error = if storage {
+                ApiError::from(StorageError::Io(error))
+            } else {
+                ApiError::from(error)
+            };
+            assert_eq!(error.code, S3ErrorCode::IncompleteBody);
+            assert!(error_chain_has_type::<rustfs_rio::IncompleteBody>(&error));
+            assert_eq!(S3Error::from(error).status_code(), Some(StatusCode::BAD_REQUEST));
+        }
     }
 
     /// Exercise the public error type through the actual body budget.
