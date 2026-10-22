@@ -50,6 +50,36 @@ impl ScannerPauseBacklogRetirementError {
     }
 }
 
+/// The same native planner runs before repair and after each durable phase.
+/// Keep this context bounded without exposing replica payloads or revisions.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ScannerPauseBacklogRetirementPhase {
+    InitialRead,
+    SeedReadback,
+    CommitReadback,
+    StabilizeReadback,
+    FinalCheck,
+}
+
+impl ScannerPauseBacklogRetirementPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InitialRead => "initial_read",
+            Self::SeedReadback => "seed_readback",
+            Self::CommitReadback => "commit_readback",
+            Self::StabilizeReadback => "stabilize_readback",
+            Self::FinalCheck => "final_check",
+        }
+    }
+
+    pub(crate) fn planner_error(self, err: ScannerPauseBacklogRetirementError) -> Error {
+        data_movement_context_error(
+            format!("scanner pause backlog retirement planner failed during {}: {err}", self.as_str()),
+            err,
+        )
+    }
+}
+
 /// A bounded, storage-fenced native replica. Only a confirmed missing object
 /// has no payload; read failures never enter the Scanner verifier.
 pub struct ScannerPauseBacklogRetirementReplica {
@@ -173,10 +203,14 @@ pub(crate) async fn read_scanner_pause_backlog_retirement_replicas(
 pub(crate) fn plan_scanner_pause_backlog_retirement(
     source_pool_index: usize,
     replicas: &[ScannerPauseBacklogRetirementRead],
+    phase: ScannerPauseBacklogRetirementPhase,
 ) -> Result<Option<ScannerPauseBacklogRetirementPlan>> {
-    let planner = RETIREMENT_PLANNER
-        .get()
-        .ok_or_else(|| Error::other("scanner pause backlog native retirement planner is unavailable"))?;
+    let planner = RETIREMENT_PLANNER.get().ok_or_else(|| {
+        Error::other(format!(
+            "scanner pause backlog native retirement planner is unavailable during {}",
+            phase.as_str()
+        ))
+    })?;
     let snapshots = replicas
         .iter()
         .map(|read| ScannerPauseBacklogRetirementReplica {
@@ -185,8 +219,7 @@ pub(crate) fn plan_scanner_pause_backlog_retirement(
             data: read.replica.data.clone(),
         })
         .collect::<Vec<_>>();
-    planner(source_pool_index, &snapshots)
-        .map_err(|err| data_movement_context_error(format!("scanner pause backlog retirement planner failed: {err}"), err))
+    planner(source_pool_index, &snapshots).map_err(|err| phase.planner_error(err))
 }
 
 /// The native writer and retirement handoff use the same conditional, full-tail
@@ -313,5 +346,115 @@ pub mod test_util {
             return Err(Error::other(InjectedWriteFailure { phase }));
         }
         Ok(Some(fault))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_movement::data_movement_stage_source_as;
+
+    fn failing_planner(
+        source_pool_index: usize,
+        replicas: &[ScannerPauseBacklogRetirementReplica],
+    ) -> std::result::Result<Option<ScannerPauseBacklogRetirementPlan>, ScannerPauseBacklogRetirementError> {
+        assert!(replicas.is_empty(), "the callback fixture needs no storage replicas");
+        Err(match source_pool_index {
+            0 => ScannerPauseBacklogRetirementError::HandoffConflict {
+                reason: "original reason".to_owned(),
+            },
+            1 => ScannerPauseBacklogRetirementError::AuthorityConflict {
+                reason: "original reason".to_owned(),
+            },
+            2 => ScannerPauseBacklogRetirementError::InvalidRecord {
+                reason: "original reason".to_owned(),
+            },
+            _ => panic!("unexpected planner fixture source {source_pool_index}"),
+        })
+    }
+
+    #[test]
+    fn retirement_planner_phase_context_preserves_every_typed_error() {
+        const TEST_NAME: &str =
+            "data_movement::scanner_backlog::tests::retirement_planner_phase_context_preserves_every_typed_error";
+        const CHILD: &str = "RUSTFS_TEST_RETIREMENT_PLANNER_PHASE_CHILD";
+        if std::env::var(CHILD).ok().as_deref() != Some(TEST_NAME) {
+            // Registration is process-global and must not replace another test's planner.
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", TEST_NAME, "--nocapture", "--color", "never"])
+                .env(CHILD, TEST_NAME)
+                .output()
+                .expect("start isolated retirement planner test");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let one_passed = stdout
+                .lines()
+                .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;"));
+            assert!(
+                output.status.success() && one_passed,
+                "isolated planner regression must execute exactly one passing test: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let phases = [
+            (ScannerPauseBacklogRetirementPhase::InitialRead, "initial_read"),
+            (ScannerPauseBacklogRetirementPhase::SeedReadback, "seed_readback"),
+            (ScannerPauseBacklogRetirementPhase::CommitReadback, "commit_readback"),
+            (ScannerPauseBacklogRetirementPhase::StabilizeReadback, "stabilize_readback"),
+            (ScannerPauseBacklogRetirementPhase::FinalCheck, "final_check"),
+        ];
+        for (phase, label) in phases {
+            let unavailable = match plan_scanner_pause_backlog_retirement(0, &[], phase) {
+                Ok(_) => panic!("unregistered planner must fail during {label}"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                unavailable.to_string(),
+                format!("Io error: scanner pause backlog native retirement planner is unavailable during {label}"),
+            );
+            assert!(data_movement_stage_source_as::<ScannerPauseBacklogRetirementError>(&unavailable).is_none());
+        }
+        register_scanner_pause_backlog_retirement_planner(failing_planner);
+        for (phase, label) in phases {
+            for (source_pool_index, source) in [
+                ScannerPauseBacklogRetirementError::HandoffConflict {
+                    reason: "original reason".to_owned(),
+                },
+                ScannerPauseBacklogRetirementError::AuthorityConflict {
+                    reason: "original reason".to_owned(),
+                },
+                ScannerPauseBacklogRetirementError::InvalidRecord {
+                    reason: "original reason".to_owned(),
+                },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let discriminant = std::mem::discriminant(&source);
+                let retryable = source.is_retryable_handoff_conflict();
+                let original = source.to_string();
+                let error = match plan_scanner_pause_backlog_retirement(source_pool_index, &[], phase) {
+                    Ok(_) => panic!("the registered planner fixture must fail during {label}"),
+                    Err(error) => error,
+                };
+                assert_eq!(
+                    error.to_string(),
+                    format!("Io error: scanner pause backlog retirement planner failed during {label}: {original}")
+                );
+                let recovered = data_movement_stage_source_as::<ScannerPauseBacklogRetirementError>(&error)
+                    .expect("the worker classifier must still reach the original native error");
+                assert_eq!(std::mem::discriminant(recovered), discriminant);
+                assert_eq!(recovered.to_string(), original);
+                assert_eq!(recovered.is_retryable_handoff_conflict(), retryable);
+                let mut source = std::error::Error::source(&error);
+                let mut found_native = false;
+                while let Some(cause) = source {
+                    found_native |= cause.downcast_ref::<ScannerPauseBacklogRetirementError>().is_some();
+                    source = cause.source();
+                }
+                assert!(found_native, "the standard source chain must retain the native error during {label}");
+            }
+        }
     }
 }
