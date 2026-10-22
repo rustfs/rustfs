@@ -1432,6 +1432,74 @@ mod tests {
         assert_eq!(reader.read_all().await.expect("remaining entries must decode"), entries[3..]);
     }
 
+    struct FragmentedReader<'a> {
+        data: &'a [u8],
+        chunk: usize,
+        reads: usize,
+    }
+
+    impl AsyncRead for FragmentedReader<'_> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let count = this.data.len().min(this.chunk).min(buf.remaining());
+            buf.put_slice(&this.data[..count]);
+            this.data = &this.data[count..];
+            this.reads += 1;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reader_buffered_wire_frames_survive_fragmented_reads_and_skips() {
+        for version in [1, 2] {
+            let mut bytes = vec![0xcc, version];
+            let payloads = [
+                vec![1; METACACHE_READ_CHUNK_SIZE - 1],
+                vec![],
+                vec![3; METACACHE_READ_CHUNK_SIZE + 1],
+            ];
+            for (i, payload) in payloads.iter().enumerate() {
+                rmp::encode::write_bool(&mut bytes, true).expect("entry marker");
+                rmp::encode::write_str(&mut bytes, &format!("key-{i}")).expect("entry name");
+                rmp::encode::write_bin(&mut bytes, payload).expect("entry metadata");
+            }
+            rmp::encode::write_bool(&mut bytes, false).expect("stream end");
+            for chunk in [1, 2, 7, 4096, METACACHE_READ_CHUNK_SIZE] {
+                let mut reader = MetacacheReader::new(FragmentedReader {
+                    data: &bytes,
+                    chunk,
+                    reads: 0,
+                });
+                assert_eq!(reader.peek().await.expect("first entry").expect("present").metadata, payloads[0]);
+                reader.skip(2).await.expect("consume first and empty second entries");
+                let last = reader.peek().await.expect("last entry").expect("present");
+                assert_eq!(last.name, "key-2");
+                assert_eq!(last.metadata, payloads[2]);
+                assert!(reader.peek().await.expect("valid terminator").is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reader_coalesces_small_entries_without_per_field_reads() {
+        let mut bytes = vec![0xcc, 2];
+        for _ in 0..1000 {
+            bytes.extend_from_slice(&[0xc3, 0xa1, b'x', 0xc4, 1, 0x42]);
+        }
+        bytes.push(0xc2);
+        let mut reader = MetacacheReader::new(FragmentedReader {
+            data: &bytes,
+            chunk: METACACHE_READ_CHUNK_SIZE,
+            reads: 0,
+        });
+        assert_eq!(reader.read_all().await.expect("decode page").len(), 1000);
+        assert_eq!(reader.rd.reads, 1, "a ready page smaller than 64 KiB needs one stream read");
+    }
+
     #[tokio::test]
     async fn test_reader_invalid_utf8_name_remains_a_sticky_error() {
         let stream = vec![0xcc, 2, 0xc3, 0xa1, 0xff, 0xc4, 0, 0xc2];

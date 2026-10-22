@@ -5511,6 +5511,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn read_dir_probe_matches_uuid_namespace_probe() {
+        let data_dir = uuid::Uuid::from_u128(0xabcdef);
+        let canonical = data_dir.to_string();
+        let uppercase = canonical.to_uppercase();
+        let simple = data_dir.simple().to_string();
+        for (directories, file_count) in [
+            (vec![], 0),
+            (vec![], 1),
+            (vec![canonical.as_str()], 1),
+            (vec![canonical.as_str(), "child"], 1),
+            (vec![uppercase.as_str()], 1),
+            (vec![simple.as_str()], 1),
+            (vec![canonical.as_str()], 2),
+            (vec![canonical.as_str()], 3),
+        ] {
+            let root = tempdir().expect("create probe directory");
+            for name in &directories {
+                std::fs::create_dir(root.path().join(name)).expect("create test directory");
+            }
+            for i in 0..file_count {
+                std::fs::write(root.path().join(format!("file-{i}")), []).expect("create test file");
+            }
+            let probe = read_dir_probe(root.path(), 3).expect("reference probe");
+            let expected = !probe.complete
+                || probe
+                    .entries
+                    .iter()
+                    .any(|entry| entry.strip_suffix('/').is_some_and(|name| name != canonical));
+            assert_eq!(
+                has_non_data_dir_entry(root.path(), &[data_dir]).expect("UUID probe"),
+                expected,
+                "directories={directories:?}, files={file_count}"
+            );
+        }
+        let missing = tempdir().expect("missing probe parent");
+        assert!(!has_non_data_dir_entry(missing.path().join("absent"), &[]).expect("missing directory is not a child"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn read_dir_probe_bounds_unsupported_entries() {
