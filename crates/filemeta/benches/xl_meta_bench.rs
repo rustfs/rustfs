@@ -204,6 +204,241 @@ fn bench_delete_inline_versions(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_metacache_stream_page(c: &mut Criterion) {
+    let xl_bytes = create_real_xlmeta().expect("create_real_xlmeta failed");
+    let mut entries = Vec::with_capacity(2000);
+    for i in 0..1000 {
+        entries.push(MetaCacheEntry {
+            name: format!("prefix/subprefix/object-{i:04}"),
+            metadata: xl_bytes.clone(),
+            cached: None,
+            reusable: false,
+        });
+        entries.push(MetaCacheEntry {
+            name: format!("prefix/subprefix/object-{i:04}/"),
+            metadata: Vec::new(),
+            cached: None,
+            reusable: false,
+        });
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current_thread runtime");
+
+    let encoded_stream = rt.block_on(async {
+        let mut cursor = std::io::Cursor::new(Vec::with_capacity(512 * 1024));
+        let mut writer = rustfs_filemeta::MetacacheWriter::new(&mut cursor);
+        writer.write(&entries).await.expect("encode entries");
+        writer.close().await.expect("close stream");
+        cursor.into_inner()
+    });
+
+    let mut group = c.benchmark_group("metacache_stream_page");
+
+    group.bench_function("reader_read_all/1000_objects", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let mut reader =
+                    rustfs_filemeta::MetacacheReader::new(std::io::Cursor::new(black_box(encoded_stream.as_slice())));
+                let out = reader.read_all().await.expect("read_all");
+                black_box(out.len());
+            });
+        });
+    });
+
+    group.bench_function("duplex_4k_write_and_read/1000_objects", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let (rd, mut wr) = tokio::io::duplex(4096);
+                let entries_ref = &entries;
+                let writer_fut = async move {
+                    let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
+                    for chunk in entries_ref.chunks(64) {
+                        out.write(chunk).await.expect("write");
+                    }
+                    out.close().await.expect("close");
+                };
+                let reader_fut = async move {
+                    let mut reader = rustfs_filemeta::MetacacheReader::new(rd);
+                    let out = reader.read_all().await.expect("read_all");
+                    black_box(out.len());
+                };
+                tokio::join!(writer_fut, reader_fut);
+            });
+        });
+    });
+
+    group.bench_function("duplex_4k_write_obj_and_read/1000_objects", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let (rd, mut wr) = tokio::io::duplex(4096);
+                let entries_ref = &entries;
+                let writer_fut = async move {
+                    let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
+                    for entry in entries_ref {
+                        out.write_obj(entry).await.expect("write_obj");
+                    }
+                    out.close().await.expect("close");
+                };
+                let reader_fut = async move {
+                    let mut reader = rustfs_filemeta::MetacacheReader::new(rd);
+                    let out = reader.read_all().await.expect("read_all");
+                    black_box(out.len());
+                };
+                tokio::join!(writer_fut, reader_fut);
+            });
+        });
+    });
+
+    let temp_dir = std::env::temp_dir().join(format!("rustfs_walk_bench_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).expect("create bench dir");
+    let mut obj_dirs = Vec::with_capacity(1000);
+    let mut obj_names = Vec::with_capacity(1000);
+    let sample_meta = FileMeta::load(&xl_bytes).expect("load sample meta");
+    let sample_data_dir = sample_meta
+        .get_data_dirs()
+        .expect("get data dirs")
+        .into_iter()
+        .flatten()
+        .next()
+        .unwrap_or_else(Uuid::new_v4);
+    for i in 0..1000 {
+        let name = format!("prefix/subprefix/object-{i:04}");
+        let obj_dir = temp_dir.join(format!("object-{i:04}"));
+        std::fs::create_dir_all(obj_dir.join(sample_data_dir.to_string())).expect("create data_dir");
+        std::fs::write(obj_dir.join("xl.meta"), &xl_bytes).expect("write xl.meta");
+        obj_dirs.push(obj_dir);
+        obj_names.push(name);
+    }
+
+    let mt_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("build multi_thread runtime");
+
+    group.bench_function("walk_dir_1000_objects", |b| {
+        b.iter(|| {
+            mt_rt.block_on(async {
+                let (rd, mut wr) = tokio::io::duplex(4096);
+                let dirs = &obj_dirs;
+                let names = &obj_names;
+                let writer_fut = async move {
+                    let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
+                    for (dir_chunk, name_chunk) in dirs.chunks(32).zip(names.chunks(32)) {
+                        let dir_chunk = dir_chunk.to_vec();
+                        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                        drop(tokio::task::spawn_blocking(move || {
+                            let mut chunk = Vec::with_capacity(dir_chunk.len());
+                            let mut chunk_started = std::time::Instant::now();
+                            for obj_dir in &dir_chunk {
+                                if tx.is_closed() {
+                                    break;
+                                }
+                                let mut file = std::fs::File::open(obj_dir.join("xl.meta")).expect("open");
+                                let mut initial_buf = [0u8; 4096];
+                                let n = std::io::Read::read(&mut file, &mut initial_buf).expect("read");
+                                let bytes = initial_buf[..n].to_vec();
+                                let file_meta = FileMeta::load(&bytes).ok();
+                                let mut data_dirs = Vec::new();
+                                if let Some(meta) = file_meta.as_ref()
+                                    && let Ok(dirs) = meta.get_data_dirs()
+                                {
+                                    data_dirs.extend(dirs.into_iter().flatten());
+                                    data_dirs.sort_unstable();
+                                    data_dirs.dedup();
+                                }
+                                let counts = file_meta.as_ref().is_none_or(|m| {
+                                    m.into_fileinfo_without_part_checksums("", "", "", false, true).map_or_else(
+                                        |_| !m.all_hidden(true),
+                                        |latest| !latest.deleted && !latest.tier_free_version(),
+                                    )
+                                });
+                                let mut dir = std::fs::read_dir(obj_dir).expect("read_dir");
+                                let mut has_child = false;
+                                for _ in 0..256 {
+                                    let Some(entry) = dir.next() else { break };
+                                    let entry = entry.expect("entry");
+                                    let fname = entry.file_name();
+                                    let ft = entry.file_type().expect("ft");
+                                    if ft.is_dir() {
+                                        let is_dd = fname.len() == uuid::fmt::Hyphenated::LENGTH
+                                            && fname
+                                                .to_str()
+                                                .and_then(|s| {
+                                                    let parsed = Uuid::try_parse(s).ok()?;
+                                                    let mut buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
+                                                    (parsed.hyphenated().encode_lower(&mut buf) == s
+                                                        && data_dirs.binary_search(&parsed).is_ok())
+                                                    .then_some(())
+                                                })
+                                                .is_some();
+                                        if !is_dd {
+                                            has_child = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                chunk.push((bytes, counts, has_child));
+                                if has_child {
+                                    let _ = tx.send(chunk);
+                                    return;
+                                }
+                                if chunk_started.elapsed() >= std::time::Duration::from_millis(20) {
+                                    let flushed = std::mem::replace(&mut chunk, Vec::with_capacity(dir_chunk.len()));
+                                    if tx.send(flushed).is_err() {
+                                        return;
+                                    }
+                                    chunk_started = std::time::Instant::now();
+                                }
+                            }
+                            if !chunk.is_empty() {
+                                let _ = tx.send(chunk);
+                            }
+                        }));
+                        let mut name_iter = name_chunk.iter();
+                        while let Some(subchunk) = rx.recv().await {
+                            for (bytes, _counts, _has_child) in subchunk {
+                                let name = name_iter.next().expect("name");
+                                out.write_obj(&MetaCacheEntry {
+                                    name: name.clone(),
+                                    metadata: bytes,
+                                    cached: None,
+                                    reusable: false,
+                                })
+                                .await
+                                .expect("write_obj");
+                                out.write_obj(&MetaCacheEntry {
+                                    name: format!("{name}/"),
+                                    metadata: Vec::new(),
+                                    cached: None,
+                                    reusable: false,
+                                })
+                                .await
+                                .expect("write_dir");
+                            }
+                        }
+                    }
+                    out.close().await.expect("close");
+                };
+                let reader_fut = async move {
+                    let mut reader = rustfs_filemeta::MetacacheReader::new(rd);
+                    let out = reader.read_all().await.expect("read_all");
+                    black_box(out.len());
+                };
+                tokio::join!(writer_fut, reader_fut);
+            });
+        });
+    });
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_create_real_xlmeta,
@@ -218,7 +453,8 @@ criterion_group!(
     bench_validate_integrity,
     bench_into_fileinfo_realistic,
     bench_list_page_to_fileinfo,
-    bench_delete_inline_versions
+    bench_delete_inline_versions,
+    bench_metacache_stream_page
 );
 
 criterion_main!(benches);
