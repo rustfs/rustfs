@@ -51,7 +51,9 @@ pub(super) fn rules() -> Vec<Rule> {
         },
         Rule {
             anchors: strings([
-                "persisted server config cannot be decoded",
+                "Persisted server config could not be decoded; the read remains failed",
+                "server_config_decode_failed",
+                "server_config_decrypt_failed",
                 "server config is corrupt after heal",
             ]),
             ..base(
@@ -60,6 +62,9 @@ pub(super) fn rules() -> Vec<Rule> {
                 "startup",
                 "持久化服务配置损坏或解密失败",
                 any([
+                    field("event", "server_config_decode_failed"),
+                    field("event", "server_config_decrypt_failed"),
+                    contains("Persisted server config could not be decoded; the read remains failed"),
                     contains("persisted server config cannot be decoded"),
                     prefix("server config corrupt:"),
                     contains("server config is corrupt after heal"),
