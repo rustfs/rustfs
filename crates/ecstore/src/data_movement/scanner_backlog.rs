@@ -416,7 +416,32 @@ mod tests {
                 unavailable.to_string(),
                 format!("Io error: scanner pause backlog native retirement planner is unavailable during {label}"),
             );
+            let Error::Io(io_error) = &unavailable else {
+                panic!("unregistered planner must retain its IO error boundary during {label}");
+            };
+            let recovered = io_error
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<ScannerPauseBacklogPlannerUnavailable>())
+                .expect("unregistered planner must retain its typed cause");
+            assert_eq!(recovered.phase, label);
             assert!(data_movement_stage_source_as::<ScannerPauseBacklogRetirementError>(&unavailable).is_none());
+            let same_failure = plan_scanner_pause_backlog_retirement(0, &[], phase)
+                .err()
+                .expect("a second unregistered call must fail in the same phase");
+            let errors = [
+                Some(
+                    unavailable
+                        .narrow_to_disk()
+                        .expect("planner IO error must cross the disk boundary"),
+                ),
+                Some(
+                    same_failure
+                        .narrow_to_disk()
+                        .expect("same-phase planner IO error must cross the disk boundary"),
+                ),
+            ];
+            let (count, _) = crate::disk::error_reduce::reduce_errs(&errors, &[]);
+            assert_eq!(count, 2, "same-phase planner failures must share one quorum bucket");
         }
         register_scanner_pause_backlog_retirement_planner(failing_planner);
         for (phase, label) in phases {
