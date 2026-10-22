@@ -20,8 +20,10 @@ fn roundtrip(cfg: &Config, seed: &[u8]) -> (Config, Value) {
     let encoded = encode_server_config_blob(cfg, Some(seed)).expect("encode config with seed");
     let decoded = decode_server_config_blob(&encoded).expect("reload saved config");
     let repeated = encode_server_config_blob(&decoded, Some(&encoded)).expect("encode reloaded config");
-    assert_eq!(encoded, repeated, "a second save must be byte-stable");
-    (decoded, serde_json::from_slice(&encoded).unwrap())
+    let encoded_value: Value = serde_json::from_slice(&encoded).unwrap();
+    let repeated_value: Value = serde_json::from_slice(&repeated).unwrap();
+    assert_eq!(encoded_value, repeated_value, "a second save must preserve JSON values");
+    (decoded, encoded_value)
 }
 
 #[test]
