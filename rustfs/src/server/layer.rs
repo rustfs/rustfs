@@ -294,7 +294,9 @@ where
 
 /// Start accounting for an external S3 request. While a typed telemetry trace
 /// is being recorded, the finished request is also published to the trace bus
-/// as a pre-classified event; otherwise no clock is read.
+/// as a pre-classified event. The separate metrics-gated entry-to-dispatch
+/// timer measures wall time through authentication, parsing and scheduling.
+/// Neither timer reads a clock when its own gate is disabled.
 pub fn s3_http_request_guard(method: &str) -> S3HttpRequestGuard {
     let guard = S3HttpRequestGuard::new(method);
     if telemetry_trace_subscriber_count() == 0 {
@@ -2533,6 +2535,108 @@ mod tests {
         let readiness = Arc::new(GlobalReadiness::new());
         readiness.mark_stage(rustfs_common::SystemStage::FullReady);
         PublicHealthEndpointLayer::new(crate::runtime_sources::ServerContextSlot::new(), readiness)
+    }
+
+    #[test]
+    fn external_s3_http_entry_to_dispatch_metrics() {
+        const CHILD_ENV: &str = "RUSTFS_TEST_HTTP_DISPATCH_METRICS_PROCESS";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // The metric gate is process-wide. Match the console-prefix test
+            // pattern to isolate this switch from other server unit tests.
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "server::layer::tests::external_s3_http_entry_to_dispatch_metrics",
+                    "--exact",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("run isolated dispatch timing test");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed; 0 failed"),
+                "isolated dispatch timing test must execute exactly once: {stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use rustfs_io_metrics::record_s3_op;
+        use rustfs_s3_ops::S3Operation;
+
+        let previous_gate = rustfs_io_metrics::metrics_enabled();
+        let recorder = DebuggingRecorder::new();
+        metrics::with_local_recorder(&recorder, || {
+            rustfs_io_metrics::set_metrics_enabled(true);
+            let inner = tower::service_fn(|req: Request<()>| async move {
+                match req.uri().path() {
+                    "/bucket/rejected" => Ok(Response::builder().status(403).body(()).expect("rejected response")),
+                    "/bucket/service-error" => Err(io::Error::other("pre-dispatch service failure")),
+                    "/bucket/cancelled" => std::future::pending::<Result<Response<()>, io::Error>>().await,
+                    _ => {
+                        record_s3_op(S3Operation::DeleteObjects);
+                        Ok(Response::new(()))
+                    }
+                }
+            });
+            let mut service = ExternalRequestContextLayer::default().layer(inner);
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            for path in [
+                "/bucket/dispatched",
+                "/bucket/rejected",
+                "/health/ready",
+                "/rustfs/admin/v3/info",
+            ] {
+                let mut response = Box::pin(service.call(Request::builder().uri(path).body(()).expect("request")));
+                assert!(matches!(response.as_mut().poll(&mut cx), Poll::Ready(Ok(_))), "{path}");
+            }
+            let mut failed = Box::pin(
+                service.call(
+                    Request::builder()
+                        .uri("/bucket/service-error")
+                        .body(())
+                        .expect("service-error request"),
+                ),
+            );
+            assert!(matches!(failed.as_mut().poll(&mut cx), Poll::Ready(Err(_))));
+            let mut cancelled = Box::pin(
+                service.call(
+                    Request::builder()
+                        .uri("/bucket/cancelled")
+                        .body(())
+                        .expect("cancelled request"),
+                ),
+            );
+            assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+            drop(cancelled);
+            rustfs_io_metrics::set_metrics_enabled(previous_gate);
+        });
+        let samples: std::collections::BTreeMap<_, _> = recorder
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| key.key().name() == "rustfs_s3_http_entry_to_dispatch_duration_seconds")
+            .map(|(key, _, _, value)| {
+                let labels: std::collections::BTreeMap<_, _> =
+                    key.key().labels().map(|label| (label.key(), label.value())).collect();
+                assert_eq!(labels.keys().copied().collect::<Vec<_>>(), ["op", "outcome"]);
+                let DebugValue::Histogram(samples) = value else {
+                    panic!("dispatch timing must be a histogram");
+                };
+                ((labels["op"].to_owned(), labels["outcome"].to_owned()), samples.len())
+            })
+            .collect();
+        assert_eq!(samples.len(), 4, "health/admin requests cannot manufacture S3 timing samples");
+        for (operation, outcome) in [
+            ("s3:DeleteObjects", "dispatched"),
+            ("unknown", "4xx"),
+            ("unknown", "service_error"),
+            ("unknown", "cancelled"),
+        ] {
+            assert_eq!(samples[&(operation.to_owned(), outcome.to_owned())], 1, "{operation}/{outcome}");
+        }
     }
 
     #[tokio::test]

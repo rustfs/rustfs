@@ -233,24 +233,32 @@ pub fn consume_recorded_verified_mrf_repair_events_for(bucket: &str, anchors: &m
     let Ok(mut events) = registry.lock() else {
         return 0;
     };
+    consume_verified_mrf_repair_events_from_queue(bucket, anchors, &mut events)
+}
+
+fn consume_verified_mrf_repair_events_from_queue(
+    bucket: &str,
+    anchors: &mut Vec<MrfDurableRepairAnchor>,
+    events: &mut std::collections::VecDeque<MrfVerifiedRepairEvent>,
+) -> usize {
     let before = anchors.len();
-    let mut retained = std::collections::VecDeque::with_capacity(events.len());
-    while let Some(event) = events.pop_front() {
+    let previous_event_count = events.len();
+    events.retain(|event| {
         if event.bucket.as_ref() != bucket {
-            retained.push_back(event);
-            continue;
+            return true;
         }
         let mut matched = false;
         anchors.retain(|anchor| {
-            let proven = anchor.is_proven_by(&event);
+            let proven = anchor.is_proven_by(event);
             matched |= proven;
             !proven
         });
-        if !matched {
-            retained.push_back(event);
-        }
-    }
-    *events = retained;
+        !matched
+    });
+    // The old queue rebuild reserved the pre-consumption event count. Reuse
+    // that buffer when possible without extending its capacity lifetime:
+    // an emptied queue releases its backing storage on the next consumption.
+    events.shrink_to(previous_event_count);
     before.saturating_sub(anchors.len())
 }
 
@@ -934,6 +942,9 @@ pub fn take_mrf_unverified_legacy_events_for(bucket: &str) -> Vec<MrfUnverifiedL
     });
     taken
 }
+
+#[cfg(test)]
+mod proof_queue_tests;
 
 #[cfg(test)]
 mod tests {
