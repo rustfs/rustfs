@@ -200,17 +200,20 @@ pub(crate) async fn read_scanner_pause_backlog_retirement_replicas(
     Ok(replicas)
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("scanner pause backlog native retirement planner is unavailable during {phase}")]
+struct ScannerPauseBacklogPlannerUnavailable {
+    phase: &'static str,
+}
+
 pub(crate) fn plan_scanner_pause_backlog_retirement(
     source_pool_index: usize,
     replicas: &[ScannerPauseBacklogRetirementRead],
     phase: ScannerPauseBacklogRetirementPhase,
 ) -> Result<Option<ScannerPauseBacklogRetirementPlan>> {
-    let planner = RETIREMENT_PLANNER.get().ok_or_else(|| {
-        Error::other(format!(
-            "scanner pause backlog native retirement planner is unavailable during {}",
-            phase.as_str()
-        ))
-    })?;
+    let planner = RETIREMENT_PLANNER
+        .get()
+        .ok_or_else(|| Error::other(ScannerPauseBacklogPlannerUnavailable { phase: phase.as_str() }))?;
     let snapshots = replicas
         .iter()
         .map(|read| ScannerPauseBacklogRetirementReplica {
