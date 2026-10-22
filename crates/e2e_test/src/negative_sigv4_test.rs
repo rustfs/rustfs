@@ -566,47 +566,54 @@ async fn tampered_payload_is_rejected() -> Result<(), Box<dyn std::error::Error 
     let mut env = RustFSTestEnvironment::new().await?;
     setup(&mut env).await?;
 
-    let key = "tampered-payload.txt";
-    let path = format!("/{BUCKET}/{key}");
-    let claimed_body = b"the-body-i-claim-to-send";
-    let actual_body = b"the-body-i-really-send!!";
-    assert_eq!(claimed_body.len(), actual_body.len(), "keep content-length stable for the mismatch");
+    use md5::{Digest, Md5};
 
     let signer = SigV4::new(&env);
-    // Sign over the hash of the CLAIMED body (single-chunk payload hash), then
-    // send a different body of equal length.
-    let headers = signer.sign("PUT", &path, "", &sha256_hex(claimed_body));
-
-    let result = send_signed(&env, reqwest::Method::PUT, &path, &headers, Some(actual_body.to_vec())).await;
-    match result {
-        Ok(resp) => {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+    let client = env.create_s3_client();
+    // Empty, small-eager, zero-copy, and streaming PUTs must share the error contract.
+    for size in [0, 24, 2 * 1024 * 1024, 17 * 1024 * 1024] {
+        let actual_body = vec![b'a'; size];
+        let wrong_hash = sha256_hex(b"a different payload");
+        let content_md5 = base64_simd::STANDARD.encode_to_string(Md5::digest(&actual_body));
+        for with_md5 in [false, true] {
+            let key = format!("tampered-payload-{size}-{with_md5}.txt");
+            let path = format!("/{BUCKET}/{key}");
+            let extra = if with_md5 {
+                vec![("content-md5", content_md5.as_str())]
+            } else {
+                vec![]
+            };
+            let headers = signer.sign_with_extra_headers("PUT", &path, "", &wrong_hash, &extra);
+            let mut request = local_http_client()
+                .put(format!("{}{}", env.url, path))
+                .header("x-amz-date", &headers.amz_date)
+                .header("x-amz-content-sha256", &headers.content_sha256)
+                .header("authorization", &headers.authorization);
+            for (name, value) in extra {
+                request = request.header(name, value);
+            }
+            let response = request.body(actual_body.clone()).send().await?;
+            let status = response.status();
+            let body = response.text().await?;
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "payload mismatch: {body}");
+            assert_error_code(&body, "XAmzContentSHA256Mismatch");
             assert!(
-                status.is_client_error(),
-                "payload mismatch must be rejected with a client error, got {status}, body:\n{body}"
+                body.replace("&apos;", "'")
+                    .contains("<Message>The provided 'x-amz-content-sha256' header does not match what was computed.</Message>"),
+                "wrong message: {body}"
             );
-            info!(%status, "tampered payload rejected with error status");
-        }
-        // A mid-stream hash-mismatch abort surfacing as a transport error is
-        // also a valid rejection (definitely not a 200 success).
-        Err(err) => {
-            assert!(!err.is_connect(), "connection failure is not proof of payload rejection: {err}");
-            assert!(!err.is_timeout(), "request timeout is not proof of payload rejection: {err}");
-            info!(%err, "tampered payload rejected via mid-stream transport error");
+
+            let absent = client
+                .get_object()
+                .bucket(BUCKET)
+                .key(&key)
+                .send()
+                .await
+                .expect_err("a tampered payload must not publish an object");
+            assert_eq!(absent.raw_response().map(|response| response.status().as_u16()), Some(404));
+            assert_eq!(absent.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
         }
     }
-
-    let absent = env
-        .create_s3_client()
-        .get_object()
-        .bucket(BUCKET)
-        .key(key)
-        .send()
-        .await
-        .expect_err("a tampered payload must not publish an object");
-    assert_eq!(absent.raw_response().map(|response| response.status().as_u16()), Some(404));
-    assert_eq!(absent.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
     Ok(())
 }
 
@@ -638,9 +645,9 @@ async fn tampered_upload_part_payload_is_rejected() -> Result<(), Box<dyn std::e
     assert_eq!(
         status,
         reqwest::StatusCode::BAD_REQUEST,
-        "multipart payload mismatch must be rejected as BadDigest, body:\n{body}"
+        "multipart payload mismatch must be rejected as XAmzContentSHA256Mismatch, body:\n{body}"
     );
-    assert_error_code(&body, "BadDigest");
+    assert_error_code(&body, "XAmzContentSHA256Mismatch");
 
     let parts = client
         .list_parts()
