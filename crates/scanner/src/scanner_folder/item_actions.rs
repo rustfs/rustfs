@@ -1032,7 +1032,11 @@ impl ScannerItem {
     }
 
     pub(super) async fn heal_replication(&mut self, oi: &ObjectInfo, size_summary: &mut SizeSummary) {
-        if oi.version_id.is_none_or(|version| version.is_nil()) && !oi.delete_marker && oi.version_purge_status.is_empty() {
+        // Only an unversioned listing (no version id) carries nothing to
+        // replicate. A versioned or suspended bucket lists its null version as
+        // the nil UUID — MinIO's "null" — and it is an existing object like
+        // any other (rustfs/rustfs#8747).
+        if oi.version_id.is_none() && !oi.delete_marker && oi.version_purge_status.is_empty() {
             return;
         }
 

@@ -3,6 +3,9 @@
 This file contains repository-wide rules. Use the nearest subdirectory
 `AGENTS.md` for path-specific invariants.
 
+S3-compatible object store in Rust, derived from MinIO. Erasure-coded,
+multi-pool, supports ILM tiering/lifecycle.
+
 ## Precedence
 
 1. System/developer instructions.
@@ -38,6 +41,27 @@ rules. A skill cannot expand the user's requested scope or grant authorization.
   pending. Before requesting missing approval, prepare the concrete result that
   is already authorized; retain explicit merge and release gates.
 
+- Keep individual tool outputs concise. Save large outputs to task-owned logs
+  and retrieve only the relevant ranges.
+
+## Common Commands
+
+```bash
+cargo build --release --bin rustfs   # production binary
+cargo check -p <crate>               # fast type-check one crate
+cargo test -p <crate>                # test one crate
+cargo fmt --all --check              # for Rust changes; see AGENTS.md verification tiers
+make pre-commit                      # fast gate: fmt + arch checks + quick-check (NO clippy/tests)
+make pre-pr                          # optional full gate for broad cross-module changes
+make build-docker BUILD_OS=ubuntu22.04
+```
+
+> **Docker build note**: `buildx build` without `--load` keeps the image in
+> the buildx cache only — `docker run` will use a stale local image. The
+> Makefile already includes `--load`; if you suspect a stale binary, add
+> `--no-cache` to the `buildx build` invocation inside
+> `.config/make/build-docker.mak`.
+
 ## Task-Specific Guidance
 
 Read only the reference needed for the current task, once per unchanged context:
@@ -64,6 +88,19 @@ Do not commit one-shot plans, trackers, migration ledgers, benchmark snapshots,
 or agent scratch notes. Durable architecture belongs under `docs/architecture/`,
 operations under `docs/operations/`, and testing references under
 `docs/testing/`. `scripts/check_no_planning_docs.sh` enforces this boundary.
+
+## Further References
+
+- Agent knowledge base index and doc-writing rules: [docs/architecture/README.md](docs/architecture/README.md)
+- Crate membership: `Cargo.toml` `[workspace].members`
+- Architecture, layering, crate map: [ARCHITECTURE.md](ARCHITECTURE.md)
+- Migration guardrails & readiness contracts: [docs/architecture/](docs/architecture/README.md)
+- CI workflow steps: `.github/workflows/`; event, timeout, and required-status
+  matrix: [docs/testing/ci-gates.md](docs/testing/ci-gates.md)
+- Test-layer taxonomy, per-layer entry commands, serial/nextest rules, flake
+  policy: [docs/testing/README.md](docs/testing/README.md)
+- Tier/ILM transition debugging (xl.meta inspection, versionId tracing):
+  [docs/operations/tier-ilm-debugging.md](docs/operations/tier-ilm-debugging.md)
 
 ## Verification
 

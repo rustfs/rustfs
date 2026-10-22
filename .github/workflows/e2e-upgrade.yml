@@ -46,14 +46,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  UPGRADE_SOURCE_VERSION: 1.0.0-rc.5
-  UPGRADE_SOURCE_ASSET: rustfs-linux-x86_64-gnu-v1.0.0-rc.5.zip
-  UPGRADE_SOURCE_SHA256: 3ee8df71e8edcfada533be452c4135868f697bc515460ae97b027313eade7a3d
 
 jobs:
   build:
     name: Build upgrade candidate
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -66,18 +63,10 @@ jobs:
       - name: Setup Rust environment
         uses: ./.github/actions/setup
         with:
-          cache-shared-key: e2e-upgrade-server
+          cache-shared-key: e2e-upgrade-server-hosted
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           install-build-packaging-tools: "false"
           install-test-tools: "false"
-
-      - name: Download pinned previous release
-        run: |
-          mkdir -p target/debug
-          archive="target/debug/$UPGRADE_SOURCE_ASSET"
-          curl --fail --location --retry 3 --output "$archive" \
-            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${UPGRADE_SOURCE_VERSION}/${UPGRADE_SOURCE_ASSET}"
-          echo "$UPGRADE_SOURCE_SHA256  $archive" | sha256sum --check --strict
 
       - name: Build current RustFS binary
         run: python3 scripts/e2e_binary.py build
@@ -89,19 +78,31 @@ jobs:
           path: |
             target/debug/rustfs
             target/debug/rustfs.e2e.json
-            target/debug/${{ env.UPGRADE_SOURCE_ASSET }}
           if-no-files-found: error
           retention-days: 3
           compression-level: 0
           overwrite: true
 
   upgrade:
-    name: Upgrade compatibility
+    name: Upgrade compatibility (${{ matrix.source.version }})
     needs: build
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        source:
+          - version: 1.0.0-rc.5
+            asset: rustfs-linux-x86_64-gnu-v1.0.0-rc.5.zip
+            sha256: 3ee8df71e8edcfada533be452c4135868f697bc515460ae97b027313eade7a3d
+          - version: 1.0.1
+            asset: rustfs-linux-x86_64-gnu-v1.0.1.zip
+            sha256: 9742e183cb0dfb0d48fa909797af572fe47b7f827569036baa4156e0d3958ee5
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      UPGRADE_SOURCE_VERSION: ${{ matrix.source.version }}
+      UPGRADE_SOURCE_ASSET: ${{ matrix.source.asset }}
+      UPGRADE_SOURCE_SHA256: ${{ matrix.source.sha256 }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -111,7 +112,7 @@ jobs:
       - name: Setup Rust environment
         uses: ./.github/actions/setup
         with:
-          cache-shared-key: e2e-upgrade-tests
+          cache-shared-key: e2e-upgrade-tests-hosted
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           install-build-packaging-tools: "false"
           install-test-tools: "false"
@@ -132,6 +133,8 @@ jobs:
           set -euo pipefail
           mkdir -p "$SOURCE_DIR"
           archive="target/debug/$UPGRADE_SOURCE_ASSET"
+          curl --fail --location --retry 3 --output "$archive" \
+            "https://github.com/rustfs/rustfs/releases/download/${UPGRADE_SOURCE_VERSION}/${UPGRADE_SOURCE_ASSET}"
           echo "$UPGRADE_SOURCE_SHA256  $archive" | sha256sum --check --strict
           unzip -q "$archive" -d "$SOURCE_DIR"
           chmod +x "$SOURCE_DIR/rustfs"
@@ -148,14 +151,18 @@ jobs:
         run: |
           export no_proxy="$NO_PROXY"
           cases=(
-            direct-upgrade:direct_upgrade_from_rc2_preserves_object_contracts
-            mixed-version-upgrade:rolling_upgrade_from_rc2_preserves_mixed_version_contracts
+            direct-upgrade:direct_upgrade_from_previous_release_preserves_object_contracts
+            mixed-version-upgrade:rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
             bucket-config-upgrade:direct_upgrade_from_previous_release_preserves_bucket_configuration
             bucket-config-rollback:rollback_to_previous_release_reads_current_bucket_metadata
-            odm-config-rollback:rc5_rollback_requires_restoring_odm_configuration
-            multipart-layout-upgrade:direct_upgrade_from_rc5_preserves_multipart_layouts
-            multipart-layout-baseline:rc5_baseline_replicates_multipart_layouts
+            multipart-layout-upgrade:direct_upgrade_from_previous_release_preserves_multipart_layouts
+            multipart-layout-baseline:previous_release_baseline_replicates_multipart_layouts
           )
+          if [[ "$UPGRADE_SOURCE_VERSION" == "1.0.0-rc.5" ]]; then
+            cases+=(odm-config-rollback:rc5_rollback_requires_restoring_odm_configuration)
+          else
+            cases+=(legacy-delete-reservation:stable_upgrade_deletes_foreign_reservations_without_losing_live_objects)
+          fi
           status=0
           for entry in "${cases[@]}"; do
             artifact="${entry%%:*}"
@@ -180,7 +187,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: upgrade-g09-evidence-${{ github.run_number }}
+          name: upgrade-g09-evidence-${{ matrix.source.version }}-${{ github.run_number }}
           path: ${{ runner.temp }}/rustfs-upgrade-g09-evidence
           if-no-files-found: ignore
           retention-days: 14
@@ -189,7 +196,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: upgrade-server-logs-${{ github.run_number }}
+          name: upgrade-server-logs-${{ matrix.source.version }}-${{ github.run_number }}
           path: ${{ runner.temp }}/rustfs-upgrade-logs
           if-no-files-found: warn
           retention-days: 14

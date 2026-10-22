@@ -49,6 +49,7 @@ use crate::layout::endpoints::{EndpointServerPools, SetupType};
 use crate::object_api::ObjectEncryptionResolver;
 use crate::services::event_notification::EventNotifier;
 use crate::services::tier::tier::TierConfigMgr;
+use crate::store::delete_recovery_runtime::DeleteRecoveryHints;
 use rustfs_lock::{GlobalLockManager, get_global_lock_manager};
 use rustfs_s3_types::Region;
 use std::collections::{HashMap, HashSet};
@@ -82,12 +83,16 @@ pub(crate) enum ScannerPublicationLeasePurpose {
     Observational,
 }
 
+/// Movement read admission granted with a publication lease. Lease-scoped
+/// target operations share it rather than queueing a second read on the gate.
+pub(crate) type ScannerPublicationLeasePermit = Arc<OwnedRwLockReadGuard<()>>;
+
 pub(crate) struct ScannerPublicationLeaseEntry {
     pub(crate) expires_at: Instant,
     pub(crate) movement_generation: u64,
     pub(crate) namespace_generation: Option<u64>,
     pub(crate) purpose: ScannerPublicationLeasePurpose,
-    pub(crate) _operation_guard: OwnedRwLockReadGuard<()>,
+    pub(crate) operation_guard: ScannerPublicationLeasePermit,
 }
 
 pub(crate) struct NamespaceCommitGuard {
@@ -212,6 +217,10 @@ pub struct InstanceContext {
     /// Readers are held across one publication commit; movement transitions
     /// take the writer at their durable state commit boundary.
     data_movement_operation_gate: Arc<RwLock<()>>,
+    /// Set while an operator decommission start runs on this instance. A
+    /// start runs detached from its caller, so this keeps abandoned requests
+    /// and their retries from stacking concurrent starts and preflight heals.
+    decommission_start_in_flight: AtomicBool,
     /// Remote scanner publication leases own a read guard until explicit
     /// release or bounded expiry.  Keeping the guard in storage-owned state
     /// makes a remote movement transition wait on the same fence as a local
@@ -240,6 +249,7 @@ pub struct InstanceContext {
     namespace_commit_generation: AtomicU64,
     /// Resolves object-encryption material at the application boundary.
     object_encryption_resolver: OnceLock<Arc<dyn ObjectEncryptionResolver>>,
+    delete_recovery_hints: DeleteRecoveryHints,
     tier_delete_journal_recovery_stores: std::sync::Mutex<HashSet<Uuid>>,
     #[cfg(test)]
     suppress_tier_delete_journal_recovery: bool,
@@ -284,6 +294,7 @@ impl InstanceContext {
             bucket_metadata_sys: std::sync::Mutex::new(None),
             background_cancel_token: OnceLock::new(),
             data_movement_operation_gate: Arc::new(RwLock::new(())),
+            decommission_start_in_flight: AtomicBool::new(false),
             scanner_publication_leases: Arc::new(Mutex::new(HashMap::new())),
             data_movement_operation_epoch: AtomicU64::new(0),
             data_movement_operation_epoch_exhausted: AtomicBool::new(false),
@@ -294,6 +305,7 @@ impl InstanceContext {
             namespace_commits: AtomicU64::new(0),
             namespace_commit_generation: AtomicU64::new(0),
             object_encryption_resolver: OnceLock::new(),
+            delete_recovery_hints: DeleteRecoveryHints::default(),
             tier_delete_journal_recovery_stores: std::sync::Mutex::new(HashSet::new()),
             #[cfg(test)]
             suppress_tier_delete_journal_recovery: false,
@@ -323,6 +335,9 @@ impl InstanceContext {
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        // Capture before spawning: Tokio tasks do not inherit request task-locals.
+        let context = rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context();
+        let mutation = rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(context, mutation);
         self.detached_mutations.spawn(mutation.in_current_span()).await
     }
 
@@ -340,6 +355,22 @@ impl InstanceContext {
 
     pub(crate) fn data_movement_operation_gate(&self) -> Arc<RwLock<()>> {
         Arc::clone(&self.data_movement_operation_gate)
+    }
+
+    /// Claim the single decommission start slot; `false` when a start is
+    /// already running. Release it with [`Self::end_decommission_start`].
+    pub(crate) fn try_begin_decommission_start(&self) -> bool {
+        self.decommission_start_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn end_decommission_start(&self) {
+        self.decommission_start_in_flight.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn decommission_start_running(&self) -> bool {
+        self.decommission_start_in_flight.load(Ordering::Acquire)
     }
 
     pub(crate) async fn install_scanner_publication_lease(
@@ -362,7 +393,7 @@ impl InstanceContext {
                 movement_generation,
                 namespace_generation,
                 purpose,
-                _operation_guard: operation_guard,
+                operation_guard: Arc::new(operation_guard),
             },
         );
         true
@@ -380,16 +411,35 @@ impl InstanceContext {
         &self,
         token: Uuid,
     ) -> Option<(u64, Option<u64>, ScannerPublicationLeasePurpose)> {
+        self.scanner_publication_lease_admission(token)
+            .await
+            .map(|(movement_generation, namespace_generation, purpose, _)| (movement_generation, namespace_generation, purpose))
+    }
+
+    /// Return the live lease's generations and purpose together with a share
+    /// of its movement read admission. The share keeps movement writers out
+    /// for as long as the caller holds it, even if the lease is released or
+    /// expires meanwhile, without queueing a new read behind a waiting writer.
+    pub(crate) async fn scanner_publication_lease_admission(
+        &self,
+        token: Uuid,
+    ) -> Option<(u64, Option<u64>, ScannerPublicationLeasePurpose, ScannerPublicationLeasePermit)> {
         let mut leases = self.scanner_publication_leases.lock().await;
         let now = Instant::now();
-        let (expires_at, movement_generation, namespace_generation, purpose) = leases
-            .get(&token)
-            .map(|entry| (entry.expires_at, entry.movement_generation, entry.namespace_generation, entry.purpose))?;
+        let (expires_at, movement_generation, namespace_generation, purpose, permit) = leases.get(&token).map(|entry| {
+            (
+                entry.expires_at,
+                entry.movement_generation,
+                entry.namespace_generation,
+                entry.purpose,
+                Arc::clone(&entry.operation_guard),
+            )
+        })?;
         if expires_at <= now {
             leases.remove(&token);
             return None;
         }
-        Some((movement_generation, namespace_generation, purpose))
+        Some((movement_generation, namespace_generation, purpose, permit))
     }
 
     pub(crate) async fn expire_scanner_publication_lease(&self, token: Uuid, expires_at: Instant) {
@@ -465,6 +515,10 @@ impl InstanceContext {
         self.namespace_commit_generation.load(Ordering::Acquire)
     }
 
+    /// Whether a namespace commit is still pending. The scanner publication
+    /// barrier no longer consults it (an ordinary PUT shades its bucket
+    /// instead); fixtures use it to drain rename tails deterministically.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn namespace_commits_pending(&self) -> bool {
         self.namespace_commits.load(Ordering::Acquire) != 0 || self.namespace_commit_generation() == u64::MAX
     }
@@ -728,6 +782,10 @@ impl InstanceContext {
         self.background_cancel_token.get_or_init(|| token).clone()
     }
 
+    pub(crate) fn delete_recovery_hints(&self) -> &DeleteRecoveryHints {
+        &self.delete_recovery_hints
+    }
+
     pub(crate) fn mark_tier_delete_journal_recovery_started(&self, store_id: Uuid) -> bool {
         #[cfg(test)]
         if self.suppress_tier_delete_journal_recovery {
@@ -977,6 +1035,78 @@ mod tests {
         release_tx.send(()).expect("the detached mutation should still be waiting");
         assert!(ctx.wait_for_detached_mutations(std::time::Duration::from_secs(5)).await);
         assert!(finished.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn detached_mutations_keep_operation_and_guards_after_caller_drops() {
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, current_s3_http_operation_name, with_s3_http_operation_context,
+        };
+
+        let mut request = S3HttpRequestGuard::new("DELETE");
+        let operation = request.in_scope(|| {
+            rustfs_io_metrics::s3_http_metrics::observe_s3_http_operation(rustfs_s3_ops::S3Operation::DeleteObject);
+            current_s3_http_operation_context().expect("delete operation was captured")
+        });
+        for parent in [Some(operation), None] {
+            let ctx = InstanceContext::new();
+            let gate = Arc::new(RwLock::new(()));
+            let guard = gate.clone().read_owned().await;
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let expected = parent.map(|_| "s3:DeleteObject");
+            let mut caller = Box::pin(with_s3_http_operation_context(
+                parent,
+                ctx.run_detached_mutation(async move {
+                    release_rx.await.expect("release detached mutation");
+                    result_tx
+                        .send(current_s3_http_operation_name())
+                        .expect("report detached operation");
+                    drop(guard);
+                }),
+            ));
+            assert!(futures::poll!(caller.as_mut()).is_pending());
+            drop(caller);
+            assert_eq!(current_s3_http_operation_name(), None, "parent scope was restored");
+            assert_eq!(ctx.detached_mutation_count(), 1);
+            assert!(gate.try_write().is_err(), "mutation retains the owned guard after caller cancellation");
+            release_tx.send(()).expect("detached mutation is still alive");
+            assert_eq!(result_rx.await.expect("detached operation result"), expected);
+            assert!(ctx.wait_for_detached_mutations(std::time::Duration::from_secs(5)).await);
+            assert!(gate.try_write().is_ok(), "completion releases the mutation guard");
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_mutation_captures_operation_when_polled_and_keeps_results() {
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, current_s3_http_operation_name, observe_s3_http_operation,
+            with_s3_http_operation_context,
+        };
+
+        let mut request = S3HttpRequestGuard::new("PUT");
+        let operation = request.in_scope(|| {
+            observe_s3_http_operation(rustfs_s3_ops::S3Operation::PutObject);
+            current_s3_http_operation_context().expect("PUT operation context")
+        });
+        let ctx = InstanceContext::new();
+        let mutation = ctx.run_detached_mutation(async { (current_s3_http_operation_name(), Err::<(), _>("mutation failure")) });
+        let result = with_s3_http_operation_context(Some(operation), mutation)
+            .await
+            .expect("mutation task completes");
+        assert_eq!(result, (Some("s3:PutObject"), Err("mutation failure")));
+        assert_eq!(current_s3_http_operation_name(), None);
+
+        let mutation = request.in_scope(|| ctx.run_detached_mutation(async { current_s3_http_operation_name() }));
+        assert_eq!(mutation.await.expect("unscoped poll completes"), None);
+
+        let failure =
+            with_s3_http_operation_context(Some(operation), ctx.run_detached_mutation(async { panic!("mutation panic") }))
+                .await
+                .expect_err("child panic remains a join failure");
+        assert!(failure.is_panic());
+        assert_eq!(current_s3_http_operation_name(), None);
+        assert!(ctx.wait_for_detached_mutations(std::time::Duration::from_secs(5)).await);
     }
 
     // A fresh context (before any update) reflects the initial all-false state.

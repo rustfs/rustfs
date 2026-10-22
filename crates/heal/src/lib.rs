@@ -23,7 +23,7 @@ pub use heal::{
     HealSourceCounts, HealType,
     channel::HealChannelProcessor,
     progress::{HealProgress, aggregate_heal_progress},
-    resume::{ReplacementRecoveryRecord, ReplacementRecoveryState, ResumeUtils},
+    resume::{ReplacementRecoveryBlock, ReplacementRecoveryRecord, ReplacementRecoveryState, ResumeUtils},
 };
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use std::collections::BTreeMap;
@@ -266,6 +266,15 @@ pub async fn current_heal_progress_snapshot() -> Option<HealProgress> {
     } else {
         None
     }
+}
+
+/// Durable replacement generations that this node's discovery could not
+/// verify or resolve, with their reasons. Node-local; empty when the heal
+/// runtime is not initialized.
+pub fn current_replacement_recovery_blocks() -> Vec<ReplacementRecoveryBlock> {
+    get_heal_manager()
+        .map(|manager| manager.replacement_recovery_blocks())
+        .unwrap_or_default()
 }
 
 /// Read all local survivor-disk replacement records without conflating an I/O

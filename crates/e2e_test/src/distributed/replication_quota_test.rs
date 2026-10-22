@@ -13,13 +13,14 @@
 // limitations under the License.
 
 use super::harness::{
-    DistCluster, DistLayout, TestResult, enable_versioning, put_bucket_replication, put_object, retrying_put, set_bucket_quota,
-    set_remote_target, unique_bucket, wait_for_ready, wait_for_replicated_bytes, wait_until,
+    DistCluster, DistLayout, TestResult, cluster_admin_ok, enable_versioning, put_bucket_replication, put_object,
+    quota_stats_current_usage, quota_stats_on_every_node, retrying_put, set_bucket_quota, set_remote_target, unique_bucket,
+    wait_for_ready, wait_for_replicated_bytes, wait_until,
 };
-use crate::common::{FAST_DATA_USAGE_SCANNER_ENV, init_logging};
+use crate::common::{FAST_DATA_USAGE_SCANNER_ENV, admin_request, init_logging};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
-use http::Method;
+use http::{Method, StatusCode};
 use std::time::Duration;
 
 async fn wait_for_replication_status(
@@ -110,11 +111,164 @@ async fn four_node_bucket_replication_converges_to_peer_cluster() -> TestResult 
 }
 
 #[tokio::test]
+async fn four_node_quota_changes_refresh_peers_before_response() -> TestResult {
+    init_logging();
+    let mut dist = DistCluster::start(DistLayout::FourByFour).await?;
+    let bucket = unique_bucket("quota-refresh");
+    dist.create_bucket(&bucket).await?;
+    let native_path = format!("/rustfs/admin/v3/quota/{bucket}");
+    let compat_set = format!("/rustfs/admin/v3/set-bucket-quota?bucket={bucket}");
+    let compat_get = format!("/rustfs/admin/v3/get-bucket-quota?bucket={bucket}");
+
+    // Warm every node's no-quota cache. The compatibility GET does not
+    // depend on a scanner usage snapshot for this newly created bucket.
+    for node in &dist.cluster.nodes {
+        let (status, body) = admin_request(
+            &node.url,
+            Method::GET,
+            &compat_get,
+            None,
+            &dist.cluster.access_key,
+            &dist.cluster.secret_key,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body)?["quota"], 0);
+    }
+    wait_until(
+        Duration::from_secs(30),
+        || async {
+            let (status, body) = admin_request(
+                &dist.cluster.nodes[0].url,
+                Method::PUT,
+                &native_path,
+                Some(serde_json::json!({"quota": 8192, "quota_type": "HARD"}).to_string()),
+                &dist.cluster.access_key,
+                &dist.cluster.secret_key,
+            )
+            .await?;
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                return Ok(false);
+            }
+            assert_eq!(status, StatusCode::OK, "{body}");
+            Ok(true)
+        },
+        "quota fleet capability ready",
+    )
+    .await?;
+
+    for (method, path, payload, expected) in [
+        (Method::GET, native_path.as_str(), None, Some(8192_u64)),
+        (
+            Method::PUT,
+            native_path.as_str(),
+            Some(serde_json::json!({"quota": 4096, "quota_type": "HARD"})),
+            Some(4096),
+        ),
+        (Method::DELETE, native_path.as_str(), None, None),
+        (
+            Method::PUT,
+            compat_set.as_str(),
+            Some(serde_json::json!({"quota": 16384, "quotatype": "hard", "reservation_protocol": 2})),
+            Some(16384),
+        ),
+        (
+            Method::PUT,
+            compat_set.as_str(),
+            Some(serde_json::json!({"quota": 0, "quotatype": "hard"})),
+            None,
+        ),
+    ] {
+        if method != Method::GET {
+            cluster_admin_ok(&dist.cluster, method, path, payload.map(|value| value.to_string())).await?;
+        }
+        // No polling: a successful mutation waits for healthy peers to reload.
+        for (index, node) in dist.cluster.nodes.iter().enumerate() {
+            let (status, body) = admin_request(
+                &node.url,
+                Method::GET,
+                &compat_get,
+                None,
+                &dist.cluster.access_key,
+                &dist.cluster.secret_key,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::OK, "node {index}: {body}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body)?["quota"],
+                expected.unwrap_or(0),
+                "node {index} kept stale quota metadata",
+            );
+            if expected.is_some() {
+                let (status, body) = admin_request(
+                    &node.url,
+                    Method::GET,
+                    &native_path,
+                    None,
+                    &dist.cluster.access_key,
+                    &dist.cluster.secret_key,
+                )
+                .await?;
+                assert_eq!(status, StatusCode::OK, "node {index}: {body}");
+                assert_eq!(serde_json::from_str::<serde_json::Value>(&body)?["quota"].as_u64(), expected);
+            }
+        }
+    }
+
+    cluster_admin_ok(
+        &dist.cluster,
+        Method::PUT,
+        &native_path,
+        Some(serde_json::json!({"quota": 8192, "quota_type": "HARD"}).to_string()),
+    )
+    .await?;
+    dist.cluster.stop_node(3)?;
+    // An unreachable peer cannot turn an already committed clear into a failure.
+    cluster_admin_ok(&dist.cluster, Method::DELETE, &native_path, None).await?;
+    for node in dist.cluster.nodes.iter().take(3) {
+        let (status, body) = admin_request(
+            &node.url,
+            Method::GET,
+            &compat_get,
+            None,
+            &dist.cluster.access_key,
+            &dist.cluster.secret_key,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body)?["quota"], 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn four_node_four_drive_hard_quota_rejects_over_limit_put() -> TestResult {
     init_logging();
     let dist = DistCluster::start_with_env(DistLayout::FourByFour, FAST_DATA_USAGE_SCANNER_ENV).await?;
     let bucket = unique_bucket("quota");
     dist.create_bucket(&bucket).await?;
+    // A bucket without a quota reports usage only once a snapshot covers it.
+    // The scanner leader sees its own save at once; every other node holds a
+    // snapshot cached before the bucket existed and must reload it early
+    // rather than answer 503 for the rest of the 30 s cache TTL.
+    wait_until(
+        Duration::from_secs(30),
+        || async {
+            let stats = quota_stats_on_every_node(&dist.cluster, &bucket).await?;
+            Ok(stats.iter().any(|(status, _)| status.is_success()))
+        },
+        "first node reports quota stats for the new bucket",
+    )
+    .await?;
+    wait_until(
+        Duration::from_secs(15),
+        || async {
+            let stats = quota_stats_on_every_node(&dist.cluster, &bucket).await?;
+            Ok(stats.iter().all(|(status, _)| status.is_success()))
+        },
+        "every node reports quota stats for the new bucket",
+    )
+    .await?;
     set_bucket_quota(&dist.cluster, &bucket, 8 * 1024).await?;
 
     let client = dist.client(1)?;
@@ -122,23 +276,12 @@ async fn four_node_four_drive_hard_quota_rejects_over_limit_put() -> TestResult 
     wait_until(
         Duration::from_secs(30),
         || async {
-            let (status, body) = super::harness::cluster_admin(
-                &dist.cluster,
-                Method::GET,
-                &format!("/rustfs/admin/v3/quota-stats/{bucket}"),
-                None,
-            )
-            .await?;
-            if !status.is_success() {
-                return Ok(false);
+            for (status, body) in quota_stats_on_every_node(&dist.cluster, &bucket).await? {
+                if status.is_success() && quota_stats_current_usage(&body)?.is_some_and(|usage| usage >= 1024) {
+                    return Ok(true);
+                }
             }
-            let stats: serde_json::Value =
-                serde_json::from_str(&body).map_err(|error| format!("quota stats returned invalid JSON: {error}: {body}"))?;
-            let usage = stats
-                .get("current_usage")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| format!("quota stats omitted current_usage: {stats}"))?;
-            Ok(usage >= 1024)
+            Ok(false)
         },
         "quota stats observe small object",
     )

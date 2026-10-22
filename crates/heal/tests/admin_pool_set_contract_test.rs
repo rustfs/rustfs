@@ -120,14 +120,14 @@ fn manager(env: &TestECStoreEnv) -> Arc<HealManager> {
     ))
 }
 
-async fn start(processor: &HealChannelProcessor, token: &str) {
+async fn start(processor: &HealChannelProcessor, token: &str, scan_mode: HealScanMode) {
     let receipt = processor
         .execute_start_request(HealChannelRequest {
             id: token.to_owned(),
             disk: Some("pool_0_set_0".to_owned()),
             pool_index: Some(0),
             set_index: Some(0),
-            scan_mode: Some(HealScanMode::Deep),
+            scan_mode: Some(scan_mode),
             recursive: Some(true),
             dry_run: Some(false),
             remove_corrupted: Some(false),
@@ -189,7 +189,7 @@ async fn mixed_contract(mode: ShardIntegrityWriteMode) {
     manager.start().await.expect("start manager");
     let processor = HealChannelProcessor::new(manager.clone());
     let token = uuid::Uuid::new_v4().to_string();
-    start(&processor, &token).await;
+    start(&processor, &token, HealScanMode::Deep).await;
     let value = terminal(&processor, &token).await;
     assert_eq!(value["summary"], "finished");
     assert_eq!(
@@ -228,6 +228,12 @@ async fn mixed_contract(mode: ShardIntegrityWriteMode) {
             .expect("incarnation UUID")
             .is_nil()
         );
+        if !protected {
+            assert_eq!(
+                receipt["detail"],
+                rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL
+            );
+        }
         assert_eq!(
             receipt["disposition"]["state"],
             if !protected {
@@ -249,6 +255,51 @@ async fn mixed_contract(mode: ShardIntegrityWriteMode) {
     assert_eq!(restored, value, "retain the complete wire response for the same token");
     assert_eq!(restarted.get_queue_length().await, 0);
     restarted.stop().await.expect("stop restarted manager");
+}
+
+#[test]
+#[serial]
+fn admin_selector_healthy_legacy_reason_survives_normal_and_deep_checks() {
+    run_async(|| async {
+        for mode in [ShardIntegrityWriteMode::Legacy, ShardIntegrityWriteMode::Protected] {
+            let root = tempfile::tempdir().expect("healthy selector fixture");
+            let env = TestECStoreEnv::builder().base_dir(root.path()).build().await;
+            let fixtures = seed(&env, 1, 0, mode).await;
+            let manager = manager(&env);
+            manager.start().await.expect("start manager");
+            let processor = HealChannelProcessor::new(manager.clone());
+            for scan_mode in [HealScanMode::Normal, HealScanMode::Deep] {
+                let token = uuid::Uuid::new_v4().to_string();
+                start(&processor, &token, scan_mode).await;
+                let value = terminal(&processor, &token).await;
+                let outcome = &value["outcome"];
+                let protected = mode == ShardIntegrityWriteMode::Protected;
+                assert_eq!(outcome["counters"]["processed"], 1);
+                assert_eq!(outcome["counters"]["healed"], 0);
+                assert_eq!(outcome["counters"]["unknown"], u64::from(!protected));
+                assert_eq!(outcome["counters"]["unchanged"], u64::from(protected));
+                let object = &outcome["objects"][0];
+                assert_eq!(
+                    object["disposition"]["state"],
+                    if !protected {
+                        "unknown"
+                    } else if scan_mode == HealScanMode::Deep {
+                        "verified_healthy"
+                    } else {
+                        "metadata_healthy"
+                    }
+                );
+                if !protected {
+                    assert_eq!(
+                        object["detail"],
+                        rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL
+                    );
+                }
+                verify_data(&env, &fixtures).await;
+            }
+            manager.stop().await.expect("stop manager");
+        }
+    });
 }
 
 #[test]
@@ -310,7 +361,11 @@ fn admin_selector_survives_sigkill_with_original_scope_and_receipts() {
             "{}",
             std::fs::read_to_string(root.path().join("prepare.log")).expect("prepare log")
         );
-        assert!(Instant::now() < deadline, "child never acknowledged partial work");
+        assert!(
+            Instant::now() < deadline,
+            "child never acknowledged partial work: {}",
+            std::fs::read_to_string(root.path().join("prepare.log")).expect("prepare log")
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     first.0.kill().expect("SIGKILL the interrupted executor");
@@ -328,36 +383,49 @@ fn admin_selector_survives_sigkill_with_original_scope_and_receipts() {
             );
             break;
         }
-        assert!(Instant::now() < deadline, "replay child did not complete");
+        assert!(
+            Instant::now() < deadline,
+            "replay child did not complete: {}",
+            std::fs::read_to_string(root.path().join("replay.log")).expect("replay log")
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
 }
 
 #[cfg(unix)]
 async fn crash_child(root: PathBuf, replay: bool) {
+    // Several objects preserve a partial traversal without exhausting the
+    // process deadline on repeated durable shard writes and checkpoint syncs.
+    const OBJECT_COUNT: usize = 8;
+    let expected_processed = u64::try_from(OBJECT_COUNT).expect("fixture object count fits u64");
+    eprintln!("heal crash fixture: replay={replay}, stage=bootstrap");
     let env = TestECStoreEnv::builder().base_dir(root.join("disks")).build().await;
     let token = "dff22383-67ee-4d8b-ae8a-dc6d8276c974";
     if !replay {
-        let fixtures = seed(&env, 64, 64, ShardIntegrityWriteMode::Protected).await;
+        eprintln!("heal crash fixture: replay={replay}, stage=seed");
+        let fixtures = seed(&env, OBJECT_COUNT, OBJECT_COUNT, ShardIntegrityWriteMode::Protected).await;
         std::fs::write(root.join("objects.json"), serde_json::to_vec(&fixtures).expect("fixture manifest"))
             .expect("persist fixture manifest");
     } else {
+        eprintln!("heal crash fixture: replay={replay}, stage=scope-control");
         env.make_bucket("created-after-crash", false).await;
         env.put_object_bytes("created-after-crash", "outside-original-scope", body())
             .await;
     }
     let manager = manager(&env);
+    eprintln!("heal crash fixture: replay={replay}, stage=start-manager");
     manager.start().await.expect("start durable owner");
     let processor = HealChannelProcessor::new(manager.clone());
     if !replay {
-        start(&processor, token).await;
+        eprintln!("heal crash fixture: replay={replay}, stage=partial-progress");
+        start(&processor, token, HealScanMode::Deep).await;
         loop {
             let value = query(&processor, token).await;
             assert_eq!(value["summary"], "running", "crash must precede terminal publication");
             if let Some(processed) = value["outcome"]["counters"]["processed"].as_u64()
                 && processed > 0
             {
-                assert!(processed < 64, "crash must interrupt a partial traversal");
+                assert!(processed < expected_processed, "crash must interrupt a partial traversal");
                 // The parent may kill us as soon as the final path exists.
                 let mut acknowledged = tempfile::NamedTempFile::new_in(&root).expect("acknowledgement staging file");
                 serde_json::to_writer(acknowledged.as_file_mut(), &value["outcome"]).expect("write acknowledged outcome");
@@ -374,17 +442,19 @@ async fn crash_child(root: PathBuf, replay: bool) {
             tokio::task::yield_now().await;
         }
     }
+    eprintln!("heal crash fixture: replay={replay}, stage=terminal");
     let value = terminal(&processor, token).await;
+    eprintln!("heal crash fixture: replay={replay}, stage=verify-receipts");
     assert_eq!(value["summary"], "finished");
     assert_eq!(value["outcome"]["coverage"], "complete");
-    assert_eq!(value["outcome"]["counters"]["processed"], 64);
+    assert_eq!(value["outcome"]["counters"]["processed"], expected_processed);
     let counters = &value["outcome"]["counters"];
     assert_eq!(
         counters["healed"].as_u64().expect("healed count") + counters["unchanged"].as_u64().expect("healthy count"),
-        64
+        expected_processed
     );
     let receipts = value["outcome"]["objects"].as_array().expect("resumed receipts");
-    assert_eq!(receipts.len(), 64);
+    assert_eq!(receipts.len(), OBJECT_COUNT);
     assert!(receipts.iter().all(|item| item["identity"]["bucket"] == BUCKET));
     let acknowledged: Value = serde_json::from_slice(&std::fs::read(root.join("acknowledged.json")).expect("acknowledged bytes"))
         .expect("acknowledged JSON");
@@ -406,6 +476,9 @@ async fn crash_child(root: PathBuf, replay: bool) {
             acknowledged["objects"][0]["identity"]["bucketIncarnationId"]
         );
     }
+    eprintln!("heal crash fixture: replay={replay}, stage=verify-data");
     verify_data(&env, &fixtures).await;
+    eprintln!("heal crash fixture: replay={replay}, stage=stop-manager");
     manager.stop().await.expect("stop recovered manager");
+    eprintln!("heal crash fixture: replay={replay}, stage=completed");
 }

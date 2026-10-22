@@ -174,6 +174,7 @@ pub(crate) mod owner {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::set_disk::test_util::{
         PutObjectCommitBarrier, PutObjectCommitPause, hold_namespace_commit as ecstore_hold_namespace_commit,
+        namespace_commits_pending as ecstore_namespace_commits_pending,
     };
 
     pub(crate) use super::storage_contracts::{

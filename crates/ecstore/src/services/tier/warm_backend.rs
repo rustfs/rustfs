@@ -328,11 +328,9 @@ pub(crate) struct S3CompatibleWarmBackendParams<'a> {
     /// and metrics stay attributable.
     pub provider_tag: &'a str,
     /// SSRF guard run against the parsed endpoint once it's known to have a
-    /// host. Almost every provider passes [`rustfs_utils::egress::validate_outbound_url`]
-    /// unchanged; RustFS passes its own wrapper that adds a debug-only,
-    /// env-gated loopback exception for its e2e tier tests (see
-    /// rustfs/rustfs#6773) — the shared constructor stays the single call
-    /// site either way, so no provider can silently end up unvalidated.
+    /// host. Cloud providers use [`rustfs_utils::egress::validate_outbound_url`];
+    /// MinIO allows private storage endpoints, and RustFS additionally wraps
+    /// that policy with its debug-only, env-gated loopback exception.
     pub validate_endpoint: fn(&url::Url) -> Result<(), rustfs_utils::egress::OutboundUrlError>,
 }
 
@@ -2009,11 +2007,8 @@ mod tests {
         assert_eq!(err.to_string(), "Invalid endpoint URL: missing host");
     }
 
-    /// Every migrated provider that uses `validate_outbound_url` directly (all
-    /// but RustFS, which injects its own debug-only, env-gated wrapper — see
-    /// rustfs/rustfs#6773) goes through this one construction path, so the
-    /// SSRF guard only needs to be pinned here rather than once per provider
-    /// file (see backlog#2040's migrate steps and rustfs/rustfs#6764).
+    /// Cloud providers retain the strict literal guard through the shared
+    /// constructor; self-hosted providers inject their own policy.
     #[tokio::test]
     async fn s3_compatible_backend_rejects_a_loopback_endpoint_before_any_network_setup() {
         let err = init_error(s3_compatible_params("https://127.0.0.1:9000"), "a loopback endpoint must be rejected").await;

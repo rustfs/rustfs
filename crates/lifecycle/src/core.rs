@@ -674,7 +674,11 @@ impl Lifecycle for PersistedLifecycleConfiguration {
     async fn eval(&self, obj: &ObjectOpts) -> Event {
         // A single-object lookup cannot prove how many newer historical versions
         // survive. Count-dependent actions wait for the complete-group evaluator.
-        self.eval_inner(obj, OffsetDateTime::now_utc(), 0).await
+        let mut event = self.eval_inner(obj, OffsetDateTime::now_utc(), 0).await;
+        if event.requires_expiry_policy() {
+            event.expiry_policy = Some(Arc::new(self.clone()).into());
+        }
+        event
     }
 
     async fn predict_expiration(&self, obj: &ObjectOpts) -> Event {
@@ -713,6 +717,7 @@ impl Lifecycle for PersistedLifecycleConfiguration {
                 noncurrent_days: 0,
                 newer_noncurrent_versions: 0,
                 storage_class: "".into(),
+                expiry_policy: None,
             };
             let predicted_due = predicted.due.unwrap_or(OffsetDateTime::UNIX_EPOCH).unix_timestamp();
             let should_replace = event
@@ -775,6 +780,7 @@ impl Lifecycle for PersistedLifecycleConfiguration {
                                 noncurrent_days: 0,
                                 newer_noncurrent_versions: 0,
                                 storage_class: "".into(),
+                                expiry_policy: None,
                             });
                             // Stop after scheduling an expired delete-marker event.
                             break;
@@ -790,6 +796,7 @@ impl Lifecycle for PersistedLifecycleConfiguration {
                                 noncurrent_days: 0,
                                 newer_noncurrent_versions: 0,
                                 storage_class: "".into(),
+                                expiry_policy: None,
                             });
                         }
                     }
@@ -809,6 +816,7 @@ impl Lifecycle for PersistedLifecycleConfiguration {
                             noncurrent_days: 0,
                             newer_noncurrent_versions: 0,
                             storage_class: "".into(),
+                            expiry_policy: None,
                         });
                     }
                     continue;
@@ -838,6 +846,7 @@ impl Lifecycle for PersistedLifecycleConfiguration {
                                 noncurrent_days: 0,
                                 newer_noncurrent_versions: 0,
                                 storage_class: "".into(),
+                                expiry_policy: None,
                             });
                         }
                     } else {
@@ -905,6 +914,7 @@ impl Lifecycle for PersistedLifecycleConfiguration {
                                     noncurrent_days: 0,
                                     newer_noncurrent_versions: 0,
                                     storage_class: "".into(),
+                                    expiry_policy: None,
                                 });
                             }
                         } else if let Some(days) = expiration.days {
@@ -926,6 +936,7 @@ impl Lifecycle for PersistedLifecycleConfiguration {
                                     noncurrent_days: 0,
                                     newer_noncurrent_versions: 0,
                                     storage_class: "".into(),
+                                    expiry_policy: None,
                                 };
                                 // MinIO extension: ExpiredObjectAllVersions deletes all versions
                                 if rule
@@ -963,6 +974,7 @@ impl Lifecycle for PersistedLifecycleConfiguration {
                                 rule_id: rule.id.clone().unwrap_or_default(),
                                 due,
                                 storage_class: storage_class.as_str().to_string(),
+                                expiry_policy: None,
                                 noncurrent_days: 0,
                                 newer_noncurrent_versions: 0,
                             });
@@ -1011,6 +1023,7 @@ impl Lifecycle for PersistedLifecycleConfiguration {
                             newer_noncurrent_versions: retained,
                             due: Some(OffsetDateTime::UNIX_EPOCH),
                             storage_class: "".into(),
+                            expiry_policy: Some(Arc::clone(&self).into()),
                         }
                     } else {
                         Event {
@@ -1021,6 +1034,7 @@ impl Lifecycle for PersistedLifecycleConfiguration {
                             newer_noncurrent_versions: 0,
                             due: Some(OffsetDateTime::UNIX_EPOCH),
                             storage_class: "".into(),
+                            expiry_policy: Some(Arc::clone(&self).into()),
                         }
                     };
                 }
@@ -1312,7 +1326,27 @@ fn ilm_action_priority_rank(action: &IlmAction) -> u8 {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Immutable policy identity carried from lifecycle evaluation to deletion.
+/// Consumers can compare authoritative metadata without exposing the policy's
+/// wire representation in storage operation options. Clones share the policy.
+#[derive(Clone)]
+pub struct ExpiryPolicySnapshot {
+    configuration: Arc<PersistedLifecycleConfiguration>,
+}
+
+impl From<Arc<PersistedLifecycleConfiguration>> for ExpiryPolicySnapshot {
+    fn from(configuration: Arc<PersistedLifecycleConfiguration>) -> Self {
+        Self { configuration }
+    }
+}
+
+impl ExpiryPolicySnapshot {
+    pub fn matches_configuration(&self, current: Option<&PersistedLifecycleConfiguration>) -> bool {
+        current == Some(self.configuration.as_ref())
+    }
+}
+
+#[derive(Clone)]
 pub struct Event {
     pub action: IlmAction,
     pub rule_id: String,
@@ -1320,6 +1354,35 @@ pub struct Event {
     pub noncurrent_days: u32,
     pub newer_noncurrent_versions: usize,
     pub storage_class: String,
+    /// In-memory policy that authorized logical expiration. Execution must
+    /// compare it with authoritative bucket metadata under the transaction lock.
+    pub expiry_policy: Option<ExpiryPolicySnapshot>,
+}
+
+impl Event {
+    pub fn requires_expiry_policy(&self) -> bool {
+        matches!(
+            self.action,
+            IlmAction::DeleteAction
+                | IlmAction::DeleteVersionAction
+                | IlmAction::DeleteAllVersionsAction
+                | IlmAction::DelMarkerDeleteAllVersionsAction
+        )
+    }
+}
+
+impl std::fmt::Debug for Event {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Event")
+            .field("action", &self.action)
+            .field("rule_id", &self.rule_id)
+            .field("due", &self.due)
+            .field("noncurrent_days", &self.noncurrent_days)
+            .field("newer_noncurrent_versions", &self.newer_noncurrent_versions)
+            .field("storage_class", &self.storage_class)
+            .field("has_expiry_policy", &self.expiry_policy.is_some())
+            .finish()
+    }
 }
 
 impl Default for Event {
@@ -1331,6 +1394,7 @@ impl Default for Event {
             noncurrent_days: 0,
             newer_noncurrent_versions: 0,
             storage_class: "".into(),
+            expiry_policy: None,
         }
     }
 }

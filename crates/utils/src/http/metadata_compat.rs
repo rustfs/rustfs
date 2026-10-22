@@ -223,6 +223,19 @@ pub fn insert_str(map: &mut HashMap<String, String>, suffix: &str, value: String
     map.insert(k2, value);
 }
 
+fn eq_prefix_suffix_ignore_ascii_case(key: &str, prefix: &str, suffix: &str) -> bool {
+    if key.len() != prefix.len() + suffix.len() {
+        return false;
+    }
+    let (key_prefix, key_suffix) = key.as_bytes().split_at(prefix.len());
+    key_prefix.eq_ignore_ascii_case(prefix.as_bytes()) && key_suffix.eq_ignore_ascii_case(suffix.as_bytes())
+}
+
+fn matches_either_internal_key_ignore_ascii_case(key: &str, suffix: &str) -> bool {
+    eq_prefix_suffix_ignore_ascii_case(key, RUSTFS_INTERNAL_PREFIX, suffix)
+        || eq_prefix_suffix_ignore_ascii_case(key, MINIO_INTERNAL_PREFIX, suffix)
+}
+
 pub fn get_str(map: &HashMap<String, String>, suffix: &str) -> Option<String> {
     if let Some(v) = with_internal_key(RUSTFS_INTERNAL_PREFIX, suffix, |k1| map.get(k1).cloned()) {
         return Some(v);
@@ -231,17 +244,15 @@ pub fn get_str(map: &HashMap<String, String>, suffix: &str) -> Option<String> {
         return Some(v);
     }
     // Rare fallback: case-insensitive scan for non-canonical key casing.
-    let (k1, k2) = both_keys(suffix);
     map.iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(&k1) || key.eq_ignore_ascii_case(&k2))
+        .find(|(key, _)| matches_either_internal_key_ignore_ascii_case(key, suffix))
         .map(|(_, value)| value.clone())
 }
 
 fn get_consistent_value<'a, V: AsRef<[u8]>>(map: &'a HashMap<String, V>, suffix: &str) -> Option<&'a V> {
-    let (rustfs_key, minio_key) = both_keys(suffix);
     let mut value = None;
     for (key, candidate) in map {
-        if !key.eq_ignore_ascii_case(&rustfs_key) && !key.eq_ignore_ascii_case(&minio_key) {
+        if !matches_either_internal_key_ignore_ascii_case(key, suffix) {
             continue;
         }
         if candidate.as_ref().is_empty() || value.is_some_and(|current: &V| current.as_ref() != candidate.as_ref()) {
@@ -266,16 +277,14 @@ pub fn contains_key_str(map: &HashMap<String, String>, suffix: &str) -> bool {
     if with_internal_key(MINIO_INTERNAL_PREFIX, suffix, |k2| map.contains_key(k2)) {
         return true;
     }
-    let (k1, k2) = both_keys(suffix);
     map.keys()
-        .any(|key| key.eq_ignore_ascii_case(&k1) || key.eq_ignore_ascii_case(&k2))
+        .any(|key| matches_either_internal_key_ignore_ascii_case(key, suffix))
 }
 
 pub fn remove_str(map: &mut HashMap<String, String>, suffix: &str) {
     with_internal_key(RUSTFS_INTERNAL_PREFIX, suffix, |k1| map.remove(k1));
     with_internal_key(MINIO_INTERNAL_PREFIX, suffix, |k2| map.remove(k2));
-    let (k1, k2) = both_keys(suffix);
-    map.retain(|key, _| !key.eq_ignore_ascii_case(&k1) && !key.eq_ignore_ascii_case(&k2));
+    map.retain(|key, _| !matches_either_internal_key_ignore_ascii_case(key, suffix));
 }
 
 // === Vec<u8> type (meta_sys) ===
@@ -455,6 +464,16 @@ mod tests {
             format!("{MINIO_INTERNAL_PREFIX}{SUFFIX_TRANSITION_TIER_DESTINATION_ID}"),
             "identity-b".to_string(),
         );
+        assert_eq!(get_consistent_str(&metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID), None);
+    }
+
+    #[test]
+    fn test_consistent_str_rejects_conflicting_mixed_case_aliases() {
+        let metadata = HashMap::from([
+            ("X-RustFS-Internal-transition-tier-destination-id".to_string(), "identity-a".to_string()),
+            ("X-Minio-Internal-Transition-Tier-Destination-Id".to_string(), "identity-b".to_string()),
+        ]);
+
         assert_eq!(get_consistent_str(&metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID), None);
     }
 

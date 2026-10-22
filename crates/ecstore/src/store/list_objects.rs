@@ -24,7 +24,7 @@ use crate::bucket::lifecycle::bucket_lifecycle_ops::free_version_remote_tuple_ma
 use crate::bucket::metadata_sys::{
     get_versioning_config, has_authoritative_never_versioned_state, has_authoritative_never_versioned_state_in,
 };
-use crate::bucket::utils::check_list_objs_args;
+use crate::bucket::utils::{check_list_objs_args, has_bad_path_component};
 use crate::bucket::versioning::VersioningApi;
 use crate::cache_value::metacache_set::{
     FallbackClaimTracker, ListPathRawOptions, list_path_raw_with_claim_tracker, list_path_raw_with_partial_result,
@@ -2956,7 +2956,7 @@ async fn read_fallback_listing_disk(
     endpoint: String,
     options: ListingSupplementOptions,
 ) -> Vec<FallbackListingEntry> {
-    let (rd, mut wr) = duplex(64);
+    let (rd, mut wr) = duplex(64 * 1024);
     let walk_endpoint = endpoint.clone();
     let mut walk_jobs = JoinSet::new();
     walk_jobs.spawn(async move {
@@ -3268,11 +3268,23 @@ fn resolve_agreed_listing_entry(
         return ListingEntryResolution::Rejected;
     }
 
-    let cached = match entry.xl_meta() {
+    let cached = match entry.xl_meta_ref() {
         Ok(cached) => cached,
         Err(_) if resolver.obj_quorum <= 1 => return ListingEntryResolution::Resolved(entry),
         Err(_) => return ListingEntryResolution::Rejected,
     };
+    if resolver.requested_versions == 1
+        && let Some(first) = cached.versions.first()
+        && !first.header.free_version()
+        && reader_disks
+            >= first
+                .write_quorum(resolver.obj_quorum)
+                .saturating_sub(resolver.write_quorum_slack)
+                .max(resolver.obj_quorum)
+    {
+        return ListingEntryResolution::Resolved(entry);
+    }
+    let cached = cached.clone();
     let mut selected_versions = Vec::new();
     let mut selected_object_versions = 0;
     let mut first_selected_idx = None;
@@ -4114,6 +4126,12 @@ impl ECStore {
         max_keys: i32,
         incl_deleted: bool,
     ) -> Result<ListObjectsInfo> {
+        // Stored keys cannot contain repeated separators. Keep the query literal
+        // and avoid walking or cleaning up an aliased filesystem path.
+        if prefix.contains("//") && !has_bad_path_component(prefix) && !prefix.contains('\0') {
+            check_list_objs_args(bucket, "", &marker)?;
+            return Ok(ListObjectsInfo::default());
+        }
         let max_keys = normalize_max_keys(max_keys);
         let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
         let mut opts = ListPathOptions {
@@ -4262,6 +4280,79 @@ impl ECStore {
             include_version_purge: true,
         })
         .await
+    }
+
+    /// Capture one logical key's version group for write-triggered expiry.
+    pub(crate) async fn get_object_versions_for_lifecycle(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        bucket_incarnation_id: Uuid,
+    ) -> Result<Vec<ObjectInfo>> {
+        crate::bucket::utils::check_object_args(bucket, object)?;
+        let mut opts = opts.clone();
+        // Lock order matches writes: bucket lifecycle, metadata validation,
+        // then object namespace. Borrow fences supplied by an outer operation.
+        let bucket_guard = if opts.bucket_lifecycle_lock_fence.is_none() {
+            let guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
+            opts.add_bucket_lifecycle_lock_guard(&guard);
+            Some(guard)
+        } else {
+            None
+        };
+        let incarnation = crate::bucket::metadata_sys::get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
+        if incarnation != bucket_incarnation_id {
+            return Err(Error::BucketNotFound(bucket.to_owned()));
+        }
+        let metadata_sys = crate::bucket::metadata_sys::bucket_metadata_sys_of(&self.ctx)?;
+        let metadata_sys = metadata_sys.read().await.clone();
+        let (versioning, _) = metadata_sys.get_versioning_config(bucket).await?;
+        let disk_object = path::encode_dir_object(object);
+        let object_guard = self
+            .acquire_object_read_lock_if_needed("lifecycle_versions", bucket, &disk_object, &mut opts)
+            .await?;
+
+        // As with version listings, include every physical set: migration can
+        // leave a key's history in more than its current hash destination.
+        let reads = self
+            .pools
+            .iter()
+            .flat_map(|pool| &pool.disk_set)
+            .map(|set| set.read_object_versions_for_lifecycle(bucket, object));
+        let mut entries = Vec::new();
+        for result in join_all(reads).await {
+            if let Some(entry) = result.map_err(|error| to_object_err(error.into(), vec![bucket, object]))? {
+                entries.push(entry);
+            }
+        }
+        if self.pools.is_empty()
+            || bucket_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+            || opts
+                .bucket_lifecycle_lock_fence
+                .as_ref()
+                .is_some_and(|fence| fence.is_lock_lost())
+            || opts.namespace_lock_fence.as_ref().is_some_and(|fence| fence.is_lock_lost())
+            || object_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+        {
+            return Err(Error::PreconditionFailed);
+        }
+        let mut entries = entries.into_iter();
+        let Some(mut entry) = entries.next() else {
+            return Ok(Vec::new());
+        };
+        if entries.len() > 0 {
+            merge_object_entry_versions(&mut entry, entries)?;
+        }
+        // This projection excludes tier free-version bookkeeping but retains
+        // pending version purges for the evaluator's replication safeguards.
+        let versions = entry.file_info_versions(bucket)?;
+        let versioned = versioning.versioned(object);
+        Ok(versions
+            .versions
+            .iter()
+            .map(|version| ObjectInfo::from_file_info(version, bucket, object, versioned))
+            .collect())
     }
 
     async fn inner_list_object_versions_with_projection(
@@ -7294,6 +7385,9 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 mod differential_tests;
 
 #[cfg(test)]
+mod lifecycle_exact_tests;
+
+#[cfg(test)]
 mod test {
     use super::{
         ENV_API_LIST_OBJECTS_INDEX_MODE, ENV_API_LIST_OBJECTS_INDEX_PROVIDER, ENV_API_LIST_OBJECTS_INDEX_PROVIDER_GENERATION,
@@ -7522,7 +7616,7 @@ mod test {
         }
     }
 
-    fn test_pending_version_purge_meta_entry(bucket: &str, name: &str) -> (MetaCacheEntry, Uuid) {
+    pub(super) fn test_pending_version_purge_meta_entry(bucket: &str, name: &str) -> (MetaCacheEntry, Uuid) {
         let version_id = Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0);
         let data_dir = Uuid::from_u128(0xabcd_ef12_3456_7890_abcd_ef12_3456_7890);
         let mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
@@ -11079,6 +11173,95 @@ mod test {
         assert!(matches!(
             resolve_agreed_listing_entry(entry, 2, resolver, true),
             ListingEntryResolution::NeedsSupplement(_, _)
+        ));
+    }
+
+    #[test]
+    fn agreed_listing_entry_covers_quorum_corrupt_and_free_version_branches() {
+        let t1 = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("t1");
+        let t2 = time::OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("t2");
+        let obj_entry = test_object_meta_entry_with_erasure_versions("object", &[(t1, "etag", 2, 2)]);
+
+        // 1. enforce_write_quorum = false immediately resolves without inspecting quorum or metadata.
+        let strict_resolver = list_metadata_resolution_params("bucket".to_string(), 4, 4, false, 0);
+        assert!(matches!(
+            resolve_agreed_listing_entry(obj_entry.clone(), 1, strict_resolver.clone(), false),
+            ListingEntryResolution::Resolved(_)
+        ));
+
+        // 2. Directory entry resolves when reader_disks >= dir_quorum and rejects below dir_quorum.
+        let dir_entry = test_dir_meta_entry("prefix/");
+        assert!(matches!(
+            resolve_agreed_listing_entry(dir_entry.clone(), 4, strict_resolver.clone(), true),
+            ListingEntryResolution::Resolved(_)
+        ));
+        assert!(matches!(
+            resolve_agreed_listing_entry(dir_entry, 3, strict_resolver.clone(), true),
+            ListingEntryResolution::Rejected
+        ));
+
+        // 3. reader_disks < obj_quorum rejects before decoding xl.meta.
+        assert!(matches!(
+            resolve_agreed_listing_entry(obj_entry, 3, strict_resolver, true),
+            ListingEntryResolution::Rejected
+        ));
+
+        // 4. Corrupt xl.meta resolves when obj_quorum <= 1 and rejects when obj_quorum > 1.
+        let corrupt_entry = MetaCacheEntry {
+            name: "corrupt".to_string(),
+            metadata: b"not-valid-xl-meta".to_vec(),
+            cached: None,
+            reusable: false,
+        };
+        let q1_resolver = list_metadata_resolution_params("bucket".to_string(), 1, 1, false, 0);
+        assert!(matches!(
+            resolve_agreed_listing_entry(corrupt_entry.clone(), 1, q1_resolver, true),
+            ListingEntryResolution::Resolved(_)
+        ));
+        let q2_resolver = list_metadata_resolution_params("bucket".to_string(), 2, 2, false, 0);
+        assert!(matches!(
+            resolve_agreed_listing_entry(corrupt_entry, 2, q2_resolver.clone(), true),
+            ListingEntryResolution::Rejected
+        ));
+
+        // 5. Latest version is a tier free-version record (`first.header.free_version() == true`),
+        // followed by a committed object version: the fast-path at index 0 is skipped because
+        // index 0 is a free version, and the loop selects the free version + first object version.
+        let mut transitioned = test_transitioned_meta_entry("transitioned-obj", "remote-key", true);
+        let mut fm = transitioned.cached.take().expect("cached transitioned meta");
+        let older_obj = test_object_meta_entry_with_erasure_versions(
+            "transitioned-obj",
+            &[(t1 - time::Duration::seconds(10), "older-etag", 2, 2)],
+        );
+        fm.versions.extend(older_obj.cached.expect("older cached").versions);
+        // Ensure free-version record is at index 0 (newest).
+        fm.versions[0].header.mod_time = Some(t2);
+        assert!(fm.versions[0].header.free_version());
+        transitioned.metadata = fm.marshal_msg().expect("marshal free+object versions");
+        transitioned.cached = None;
+
+        // With reader_disks = 2, the index-0 free version satisfies quorum 2, so without the
+        // `!first.header.free_version()` guard the fast-path would falsely resolve; instead
+        // the loop inspects the 2+2 object version (write quorum 3) and requests a supplement.
+        assert!(matches!(
+            resolve_agreed_listing_entry(transitioned.clone(), 2, q2_resolver.clone(), true),
+            ListingEntryResolution::NeedsSupplement(_, Some(_))
+        ));
+
+        let ListingEntryResolution::Resolved(resolved) = resolve_agreed_listing_entry(transitioned, 3, q2_resolver.clone(), true)
+        else {
+            panic!("expected Resolved for free-version + committed object");
+        };
+        let info = resolved.to_fileinfo("bucket").expect("decode resolved entry");
+        assert_eq!(info.metadata.get("etag").map(String::as_str), Some("older-etag"));
+
+        // 6. Only a free-version record exists (`selected_object_versions == 0` when `requested_versions == 1`):
+        // `selected_versions` has length == `cached.versions.len()`, so `resolve_agreed_listing_entry` returns Resolved.
+        let mut free_only = test_transitioned_meta_entry("free-only-obj", "remote-key", true);
+        free_only.cached = None;
+        assert!(matches!(
+            resolve_agreed_listing_entry(free_only, 3, q2_resolver, true),
+            ListingEntryResolution::Resolved(_)
         ));
     }
 

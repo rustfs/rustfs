@@ -419,7 +419,6 @@ pub(crate) struct QuotaContext {
     quota_revision: Option<OffsetDateTime>,
     quota_limit: Option<u64>,
     reservation_protocol: Option<u32>,
-    capability_proof: Option<crate::services::notification_sys::CrossPoolFenceFleetProofToken>,
     snapshot_admission: Option<QuotaAdmission>,
     legacy_data_movement: bool,
     metadata_guard: Option<Arc<NamespaceLockGuard>>,
@@ -479,7 +478,6 @@ impl QuotaContext {
             reservation: reservation.clone(),
         };
         let metadata_guard = self.metadata_guard;
-        let capability_proof = self.capability_proof;
 
         tokio::spawn(async move {
             reap_stale_reservations(Arc::clone(&store), &ledger_data.bucket, &ledger_data.ledger_object).await?;
@@ -526,7 +524,6 @@ impl QuotaContext {
                 ledger: Some(ReservationLedgerData::Single(ledger_data)),
                 operation_guard: Some(operation_guard),
                 metadata_guard,
-                capability_proof,
                 state: ReservationState::Pending,
             })
         })
@@ -555,7 +552,6 @@ async fn reserve_sharded(context: QuotaContext, old_size: u64, new_size: u64) ->
         commit_started: false,
     };
     let metadata_guard = context.metadata_guard;
-    let capability_proof = context.capability_proof;
     let data = ShardedReservationData {
         store: Arc::clone(&store),
         bucket: context.bucket,
@@ -640,7 +636,6 @@ async fn reserve_sharded(context: QuotaContext, old_size: u64, new_size: u64) ->
                 ledger: Some(ReservationLedgerData::Sharded(data)),
                 operation_guard: Some(operation_guard),
                 metadata_guard,
-                capability_proof,
                 state: ReservationState::Pending,
             });
         }
@@ -725,20 +720,12 @@ impl ReservationLedgerData {
             Self::Sharded(data) => &data.bucket,
         }
     }
-
-    fn error_object(&self) -> &str {
-        match self {
-            Self::Single(data) => &data.ledger_object,
-            Self::Sharded(data) => &data.shard_object,
-        }
-    }
 }
 
 pub(crate) struct QuotaReservation {
     ledger: Option<ReservationLedgerData>,
     operation_guard: Option<NamespaceLockGuard>,
     metadata_guard: Option<Arc<NamespaceLockGuard>>,
-    capability_proof: Option<crate::services::notification_sys::CrossPoolFenceFleetProofToken>,
     state: ReservationState,
 }
 
@@ -756,7 +743,6 @@ impl QuotaReservation {
             ledger: None,
             operation_guard: None,
             metadata_guard,
-            capability_proof: None,
             state: ReservationState::Pending,
         }
     }
@@ -766,17 +752,7 @@ impl QuotaReservation {
             || self.metadata_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
     }
 
-    pub(crate) fn capability_proof_matches(&self) -> bool {
-        self.capability_proof
-            .as_ref()
-            .is_none_or(crate::services::notification_sys::cross_pool_fence_fleet_proof_matches)
-    }
-
     pub(crate) async fn mark_commit_started(&mut self) -> Result<()> {
-        if !self.capability_proof_matches() {
-            let ledger = self.ledger.as_ref().ok_or(StorageError::PartMissingOrCorrupt)?;
-            return Err(quota_capability_error(ledger.bucket(), ledger.error_object()));
-        }
         if let Some(ledger) = self.ledger.as_ref() {
             mark_commit_started(ledger).await?;
         }
@@ -864,7 +840,6 @@ pub(crate) async fn begin(
             quota_revision: None,
             quota_limit: None,
             reservation_protocol: None,
-            capability_proof: None,
             snapshot_admission: None,
             legacy_data_movement: false,
             metadata_guard: None,
@@ -883,7 +858,6 @@ pub(crate) async fn begin(
             quota_revision: None,
             quota_limit: Some(snapshot_admission.quota_limit()),
             reservation_protocol: None,
-            capability_proof: None,
             snapshot_admission: Some(snapshot_admission),
             legacy_data_movement: false,
             metadata_guard: None,
@@ -902,7 +876,6 @@ pub(crate) async fn begin(
             quota_revision: None,
             quota_limit: None,
             reservation_protocol: None,
-            capability_proof: None,
             snapshot_admission: None,
             legacy_data_movement: false,
             metadata_guard: None,
@@ -994,19 +967,9 @@ pub(crate) async fn begin(
         rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_POLICY_EVALUATE,
         policy_evaluate_started,
     );
-    let capability_proof_started = rustfs_io_metrics::put_stage_timer();
-    let capability_proof = if durable_quota.is_some() {
-        Some(
-            crate::services::notification_sys::acquire_cross_pool_fence_fleet_proof()
-                .ok_or_else(|| quota_capability_error(bucket, &ledger_object(bucket)))?,
-        )
-    } else {
-        None
-    };
-    rustfs_io_metrics::record_put_object_stage_duration_from(
-        rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_CAPABILITY_PROOF,
-        capability_proof_started,
-    );
+    // Durable writes are fenced by a write quorum of participating disks that
+    // enforce the configured topology. Fleet-wide proof remains a configuration gate;
+    // losing an unrelated peer must not revoke an admitted object write.
     let durable_quota_limit = durable_quota.and_then(|quota| quota.quota);
     let snapshot_admission_started = rustfs_io_metrics::put_stage_timer();
     let reservation_protocol = durable_quota.and_then(|quota| quota.reservation_protocol);
@@ -1067,7 +1030,6 @@ pub(crate) async fn begin(
         quota_revision: Some(quota_revision),
         quota_limit,
         reservation_protocol,
-        capability_proof,
         snapshot_admission,
         legacy_data_movement,
         metadata_guard: Some(metadata_guard),
@@ -1082,16 +1044,6 @@ fn quota_cache_reason(quota: Option<&crate::bucket::quota::BucketQuota>) -> &'st
         Some(quota) if quota.uses_durable_reservations() => "durable_quota",
         Some(quota) if quota.quota.is_some() => "snapshot_quota",
         Some(_) => "quota_without_limit",
-    }
-}
-
-fn quota_capability_error(bucket: &str, object: &str) -> StorageError {
-    StorageError::NamespaceLockQuorumUnavailable {
-        mode: "quota_capability",
-        bucket: bucket.to_string(),
-        object: object.to_string(),
-        required: 1,
-        achieved: 0,
     }
 }
 
@@ -2507,7 +2459,10 @@ mod tests {
         }
     }
 
+    // Its writes read the process-wide usage snapshot cache through the
+    // degraded-baseline fallback, which the data-usage cache tests rewrite.
     #[tokio::test]
+    #[serial]
     async fn sharded_reservation_reloads_allocator_after_concurrent_refill() {
         use crate::object_api::PutObjReader;
         use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};

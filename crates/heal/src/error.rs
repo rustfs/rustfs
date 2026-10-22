@@ -56,6 +56,10 @@ pub enum Error {
     #[error("Heal task execution failed: {message}")]
     TaskExecutionFailed { message: String },
 
+    /// Only the qualified MRF Deep check may produce this terminal result.
+    #[error("Heal task execution failed: Missing exact storage proof for durable MRF repair {target}")]
+    LegacyMrfUnverified { target: String },
+
     #[error("Replacement failure could not be persisted: {failure}; persistence error: {persistence}")]
     ReplacementFailurePersistence {
         #[source]
@@ -121,81 +125,28 @@ impl Error {
     }
 
     /// Whether a heal operation can be retried without changing its inputs.
-    ///
-    /// Typed-first (backlog#1845): the primary classification reads error
-    /// variants and typed helpers (`is_quorum_error`, `LockError::is_fatal`);
-    /// the substring fallback in [`is_recoverable_heal_error_message`] only
-    /// catches errors whose typed identity was destroyed upstream.
     pub(crate) fn is_recoverable_heal(&self) -> bool {
-        match self {
-            Error::TaskCancelled | Error::TaskTimeout | Error::StaleBucketIncarnation { .. } => false,
-            Error::ReplacementTargetNotReady(_) | Error::DanglingDeleteDeferred { .. } => true,
-            Error::TransientSkip { .. } | Error::BucketDiscoveryIncomplete => true,
-            // Lock failures classify by LockError's own taxonomy: only the
-            // fatal variants (ResourceNotFound / PermissionDenied /
-            // Configuration) are terminal - retrying cannot fix them - while
-            // contention and transport variants (Timeout, Network, Internal,
-            // AlreadyLocked, QuorumNotReached, InsufficientNodes, ...) stay
-            // recoverable, as the previous blanket `Lock(_) => true` treated
-            // them.
-            Error::Storage(EcstoreError::Lock(lock_err)) => !lock_err.is_fatal(),
-            Error::Storage(err) => {
-                if err.is_dangling_delete_grace() {
-                    return true;
-                }
-                err.is_quorum_error()
-                    || matches!(err, EcstoreError::Io(error) if is_recoverable_io_error(error))
-                    || matches!(
-                        err,
-                        EcstoreError::DiskNotFound
-                            | EcstoreError::VolumeNotFound
-                            | EcstoreError::FaultyDisk
-                            | EcstoreError::FaultyRemoteDisk
-                            | EcstoreError::SlowDown
-                            | EcstoreError::OperationCanceled
-                            | EcstoreError::RemoteClientUnavailable(_)
-                    )
-                    || is_recoverable_heal_error_message(&err.to_string())
+        match classify_heal_error(self) {
+            // Only a typed grace window replays the task. A grace window
+            // rendered into a task message or an io::Error comes from an
+            // attempt that already finished; its owner (for example a durable
+            // MRF responsibility) schedules the next attempt.
+            HealErrorClass::DanglingGrace { .. } => {
+                matches!(self, Error::DanglingDeleteDeferred { .. } | Error::Storage(_) | Error::Disk(_))
             }
-            // Nonblocking local CAS and replacement leases report lock
-            // contention as WouldBlock; retain the existing task retry budget.
-            Error::Disk(DiskError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => true,
-            Error::Disk(err) => {
-                if err.is_dangling_delete_grace() {
-                    return true;
-                }
-                matches!(
-                    err,
-                    DiskError::DiskNotFound
-                        | DiskError::ErasureReadQuorum
-                        | DiskError::ErasureWriteQuorum
-                        | DiskError::Timeout
-                        | DiskError::SourceStalled
-                        | DiskError::FaultyRemoteDisk
-                        | DiskError::FaultyDisk
-                        | DiskError::RemoteClientUnavailable(_)
-                ) || matches!(err, DiskError::Io(error) if is_recoverable_io_error(error))
-                    || is_recoverable_heal_error_message(&err.to_string())
-            }
-            Error::TaskExecutionFailed { message } | Error::Other(message) => is_recoverable_heal_error_message(message),
-            Error::Io(err) => is_recoverable_io_error(err) || is_recoverable_heal_error_message(&err.to_string()),
-            _ => false,
+            class => class.is_retryable(),
         }
     }
 
     /// Retry an unproven missing object only within the per-object budget.
     /// Generic task retries retain the narrower classification above.
     pub(crate) fn is_recoverable_object_heal(&self) -> bool {
-        self.is_recoverable_heal()
-            || matches!(
-                self,
-                Error::Storage(
-                    EcstoreError::FileNotFound
-                        | EcstoreError::FileVersionNotFound
-                        | EcstoreError::ObjectNotFound(_, _)
-                        | EcstoreError::VersionNotFound(_, _, _)
-                ) | Error::Disk(DiskError::FileNotFound | DiskError::FileVersionNotFound)
-            )
+        self.is_recoverable_heal() || self.is_object_absent()
+    }
+
+    /// The locked storage read found no replica of the object or version.
+    pub(crate) fn is_object_absent(&self) -> bool {
+        classify_heal_error(self) == HealErrorClass::Absent
     }
 
     pub(crate) fn dangling_delete_retry_not_before(&self) -> Option<std::time::SystemTime> {
@@ -212,17 +163,156 @@ impl Error {
     }
 
     pub(crate) fn is_dangling_delete_grace(&self) -> bool {
-        match self {
-            Error::DanglingDeleteDeferred { .. } => true,
-            Error::Storage(err) => err.is_dangling_delete_grace(),
-            Error::Disk(err) => err.is_dangling_delete_grace(),
-            Error::Io(err) => DiskError::io_error_is_dangling_delete_grace(err),
-            Error::TaskExecutionFailed { message } | Error::Other(message) => {
-                message.contains(HEAL_DANGLING_DELETE_GRACE_MESSAGE)
-            }
-            _ => false,
-        }
+        matches!(classify_heal_error(self), HealErrorClass::DanglingGrace { .. })
     }
+}
+
+/// Verdict classes shared by every heal error consumer (backlog#2900).
+///
+/// One classifier replaces the per-call-site predicates that disagreed on the
+/// same input. The class is decided from typed variants; display text is
+/// consulted only by [`classify_error_display`] for errors whose type was
+/// destroyed upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HealErrorClass {
+    /// The locked quorum read found no replica of the object or version:
+    /// nothing to repair, independent of request source or options. This is
+    /// a verdict, not a durable absence proof.
+    Absent,
+    /// Offline disk, missing volume, unmet quorum, transport failure,
+    /// slow-down or cancelled RPC: the same request can succeed later.
+    Transient,
+    /// Lock contention or a lock/RPC timeout (non-fatal `LockError`).
+    LockContention,
+    /// A storage grace window; `retry_not_before` is the absolute UNIX
+    /// deadline when storage reported one.
+    DanglingGrace { retry_not_before: Option<u64> },
+    /// Storage reports nothing to heal.
+    NoHealRequired,
+    /// The task was cancelled, timed out or its admission became stale: the
+    /// object's state is unknown and no retry budget applies.
+    Aborted,
+    /// Retrying cannot help: corruption beyond parity, permission, fatal
+    /// lock state or invalid input.
+    Permanent,
+}
+
+impl HealErrorClass {
+    /// Whether the same request can be retried unchanged.
+    pub(crate) const fn is_retryable(self) -> bool {
+        matches!(self, Self::Transient | Self::LockContention | Self::DanglingGrace { .. })
+    }
+}
+
+/// Classify a heal error from its typed identity.
+pub(crate) fn classify_heal_error(error: &Error) -> HealErrorClass {
+    match error {
+        Error::TaskCancelled | Error::TaskTimeout | Error::StaleBucketIncarnation { .. } => HealErrorClass::Aborted,
+        Error::DanglingDeleteDeferred { retry_not_before } => HealErrorClass::DanglingGrace {
+            retry_not_before: Some(*retry_not_before),
+        },
+        Error::ReplacementTargetNotReady(_) | Error::TransientSkip { .. } | Error::BucketDiscoveryIncomplete => {
+            HealErrorClass::Transient
+        }
+        Error::LegacyMrfUnverified { .. } => HealErrorClass::Permanent,
+        Error::Storage(error) => classify_storage_error(error),
+        Error::Disk(error) => classify_disk_error(error),
+        Error::Io(error) => classify_io_error(error),
+        Error::TaskExecutionFailed { message } | Error::Other(message) => {
+            classify_error_display(message).unwrap_or(HealErrorClass::Permanent)
+        }
+        _ => HealErrorClass::Permanent,
+    }
+}
+
+/// Classify a storage error. Lock failures follow `LockError`'s own taxonomy:
+/// only its fatal variants are terminal. `StorageError::is_not_found()` is
+/// deliberately not used: it lumps `DiskNotFound`/`VolumeNotFound` together
+/// with object absence, the conflation that once let an offline drive be
+/// recorded as absent and skipped (backlog#856 / #799 B7).
+pub(crate) fn classify_storage_error(error: &EcstoreError) -> HealErrorClass {
+    if let EcstoreError::Lock(lock_error) = error {
+        return if lock_error.is_fatal() {
+            HealErrorClass::Permanent
+        } else {
+            HealErrorClass::LockContention
+        };
+    }
+    if error.is_dangling_delete_grace() {
+        return HealErrorClass::DanglingGrace {
+            retry_not_before: dangling_deadline(error.dangling_delete_retry_after()),
+        };
+    }
+    match error {
+        EcstoreError::FileNotFound
+        | EcstoreError::FileVersionNotFound
+        | EcstoreError::ObjectNotFound(_, _)
+        | EcstoreError::VersionNotFound(_, _, _) => HealErrorClass::Absent,
+        EcstoreError::NoHealRequired => HealErrorClass::NoHealRequired,
+        // An ambiguous legacy delete residue needs operator inspection;
+        // retrying the same heal cannot resolve it (backlog#2902).
+        EcstoreError::DeleteRecoveryLegacyAmbiguous => HealErrorClass::Permanent,
+        EcstoreError::Timeout => HealErrorClass::LockContention,
+        EcstoreError::DiskNotFound
+        | EcstoreError::VolumeNotFound
+        | EcstoreError::FaultyDisk
+        | EcstoreError::FaultyRemoteDisk
+        | EcstoreError::SlowDown
+        | EcstoreError::OperationCanceled
+        | EcstoreError::RemoteClientUnavailable(_) => HealErrorClass::Transient,
+        _ if error.is_quorum_error() => HealErrorClass::Transient,
+        EcstoreError::Io(error) => classify_io_error(error),
+        _ => classify_error_display(&error.to_string()).unwrap_or(HealErrorClass::Permanent),
+    }
+}
+
+/// Classify a disk error. Nonblocking local CAS and replacement leases report
+/// lock contention as `WouldBlock`.
+pub(crate) fn classify_disk_error(error: &DiskError) -> HealErrorClass {
+    if error.is_dangling_delete_grace() {
+        return HealErrorClass::DanglingGrace {
+            retry_not_before: dangling_deadline(error.dangling_delete_retry_after()),
+        };
+    }
+    match error {
+        DiskError::FileNotFound | DiskError::FileVersionNotFound => HealErrorClass::Absent,
+        DiskError::NoHealRequired => HealErrorClass::NoHealRequired,
+        DiskError::Timeout => HealErrorClass::LockContention,
+        DiskError::Io(error) if error.kind() == std::io::ErrorKind::WouldBlock => HealErrorClass::LockContention,
+        DiskError::DiskNotFound
+        | DiskError::VolumeNotFound
+        | DiskError::ErasureReadQuorum
+        | DiskError::ErasureWriteQuorum
+        | DiskError::SourceStalled
+        | DiskError::FaultyRemoteDisk
+        | DiskError::FaultyDisk
+        | DiskError::RemoteClientUnavailable(_) => HealErrorClass::Transient,
+        DiskError::Io(error) => classify_io_error(error),
+        _ => classify_error_display(&error.to_string()).unwrap_or(HealErrorClass::Permanent),
+    }
+}
+
+fn classify_io_error(error: &std::io::Error) -> HealErrorClass {
+    if DiskError::io_error_is_dangling_delete_grace(error) {
+        return HealErrorClass::DanglingGrace {
+            retry_not_before: dangling_deadline(DiskError::io_error_dangling_delete_retry_after(error)),
+        };
+    }
+    if is_recoverable_io_error(error) {
+        return HealErrorClass::Transient;
+    }
+    classify_error_display(&error.to_string()).unwrap_or(HealErrorClass::Permanent)
+}
+
+/// Storage reports whole remaining seconds. Round the absolute deadline up so
+/// subsecond grace boundaries cannot hot-loop.
+fn dangling_deadline(retry_after: Option<std::time::Duration>) -> Option<u64> {
+    std::time::SystemTime::now()
+        .checked_add(retry_after?)?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs()
+        .checked_add(1)
 }
 
 fn is_recoverable_io_error(error: &std::io::Error) -> bool {
@@ -262,43 +352,71 @@ fn is_recoverable_io_error(error: &std::io::Error) -> bool {
             && matches!(error.kind(), InternodeHttpErrorKind::HttpStatus(status) if matches!(status.as_u16(), 409 | 500)))
 }
 
-/// Documented substring fallback for errors that reach heal with their typed
-/// identity destroyed (stringified through `TaskExecutionFailed`/`Other`, or
-/// boxed into `Io`). Every needle is annotated with the producer that emits
-/// it; when a producer becomes typed end-to-end, delete its needle here
-/// (backlog#1845 - this list only shrinks).
-fn is_recoverable_heal_error_message(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    [
-        // set_disk/ops/locking.rs ns_loc lock failures rendered into messages.
+/// Messages that reach heal with their typed identity destroyed: an older
+/// peer's display text, a local `format!` into `TaskExecutionFailed`/`Other`,
+/// or a boxed `io::Error`. Every needle names the producer that emits it; when
+/// a producer becomes typed end-to-end, delete its needle here. This is the
+/// only place in the heal crate that classifies error text.
+// RUSTFS_COMPAT_TODO(backlog-2900-heal-error-display): map typed displays back to a class once, here. Remove after every heal producer and the minimum supported peer version return typed storage errors end-to-end.
+pub(crate) fn classify_error_display(message: &str) -> Option<HealErrorClass> {
+    // set_disk/ops/locking.rs ns_loc lock failures, ecstore remote_locker.rs
+    // and lock/src lock responses, tokio/tonic deadline and timeout rendering,
+    // and LockError::QuorumNotReached, when stringified before typing.
+    const LOCK_CONTENTION: [&str; 7] = [
         "failed to acquire read lock",
-        // ecstore cluster/rpc/remote_locker.rs "Lock acquisition failed on
-        // remote server" and lock/src local lock responses.
         "lock acquisition failed",
-        // lock/src/distributed_lock.rs + client/local.rs LockResponse::failure.
         "lock acquisition timeout",
-        // remote_locker.rs RPC deadline wrapper.
         "remote lock rpc timed out",
-        // tokio/tonic deadline rendering, reaches heal via stringified RPC errors.
         "deadline has elapsed",
-        // generic io/tonic timeout rendering.
         "timed out",
-        // tonic transport failure rendering.
-        "transport error",
-        // LockError::Network display prefix.
-        "network error",
-        // io::Error ConnectionRefused rendering.
-        "connection refused",
-        // StorageError::OperationCanceled rendered through task messages.
-        "operation canceled",
-        // LockError::QuorumNotReached display, when stringified before typing.
         "quorum not reached",
-        // set_disk/ops/heal.rs HEAL_RENAME_INCOMPLETE - the one needle with no
-        // typed variant yet; the producer formats it into a plain message.
+    ];
+    // tonic transport failure, LockError::Network and io ConnectionRefused
+    // rendering, StorageError::OperationCanceled rendered through task
+    // messages, and set_disk/ops/heal.rs HEAL_RENAME_INCOMPLETE, the one
+    // needle with no typed variant yet.
+    const TRANSIENT: [&str; 5] = [
+        "transport error",
+        "network error",
+        "connection refused",
+        "operation canceled",
         "heal rename incomplete",
-    ]
-    .iter()
-    .any(|pattern| error.contains(pattern))
+    ];
+    // Canonical `Display` of DiskError/StorageError::NoHealRequired and the
+    // legacy heal-format wording.
+    const NO_HEAL_REQUIRED: [&str; 2] = ["No heal required", "No healing is required"];
+
+    if message.contains(HEAL_DANGLING_DELETE_GRACE_MESSAGE) {
+        return Some(HealErrorClass::DanglingGrace { retry_not_before: None });
+    }
+    // A contention or transient needle wins over an absence phrase: misreading
+    // a transient failure as absence would drop the object from repair.
+    let lower = message.to_ascii_lowercase();
+    if LOCK_CONTENTION.iter().any(|needle| lower.contains(needle)) {
+        return Some(HealErrorClass::LockContention);
+    }
+    if TRANSIENT.iter().any(|needle| lower.contains(needle)) {
+        return Some(HealErrorClass::Transient);
+    }
+    // Only canonical errors and their type wrappers are absence evidence.
+    // Object names in contextual task messages can contain these same words.
+    let mut display = message;
+    while let Some(inner) = ["Storage error: ", "Disk error: ", "I/O error: ", "Other error: "]
+        .iter()
+        .find_map(|prefix| display.strip_prefix(*prefix))
+    {
+        display = inner;
+    }
+    if matches!(display, "File not found" | "File version not found")
+        || display.starts_with("Object not found: ")
+        || display.starts_with("Version not found: ")
+    {
+        return Some(HealErrorClass::Absent);
+    }
+    if NO_HEAL_REQUIRED.iter().any(|display| message.contains(display)) {
+        return Some(HealErrorClass::NoHealRequired);
+    }
+    None
 }
 
 impl From<Error> for std::io::Error {
@@ -492,7 +610,7 @@ mod tests {
                     "RPC conversion and cloning must retain the typed transport source"
                 );
                 assert!(
-                    !super::is_recoverable_heal_error_message(&error.to_string()),
+                    super::classify_error_display(&error.to_string()).is_none(),
                     "GOAWAY regression must not be covered by the legacy message fallback: {error}"
                 );
                 assert!(error.is_recoverable_heal(), "a peer GOAWAY must remain recoverable: {error}");
@@ -670,6 +788,176 @@ mod tests {
                 !Error::Storage(EcstoreError::Lock(lock_err)).is_recoverable_heal(),
                 "fatal lock failures cannot be fixed by retrying"
             );
+        }
+    }
+
+    #[test]
+    fn classify_legacy_peer_display_not_found_is_object_level_absent() {
+        // backlog#2900: a typed display that lost its type at an old peer or a
+        // type wrapper converts back once, at the boundary.
+        for error in [
+            Error::Other("File not found".to_string()),
+            Error::Other("File version not found".to_string()),
+            Error::Other("Object not found: bucket/object".to_string()),
+            Error::Other("Version not found: bucket/object/version".to_string()),
+            Error::Other("I/O error: Other error: Disk error: File version not found".to_string()),
+            Error::TaskExecutionFailed {
+                message: "Storage error: File not found".to_string(),
+            },
+        ] {
+            assert!(error.is_recoverable_object_heal(), "{error:?}");
+            assert!(!error.is_recoverable_heal(), "absence must not requeue the whole task: {error:?}");
+        }
+        for error in [
+            Error::Other("file not found".to_string()),
+            Error::Other("Disk not found".to_string()),
+            Error::Other("Volume not found".to_string()),
+        ] {
+            assert!(!error.is_recoverable_object_heal(), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn classify_disk_volume_not_found_is_recoverable_like_storage() {
+        assert!(Error::Disk(DiskError::VolumeNotFound).is_recoverable_heal());
+        assert!(Error::Disk(DiskError::VolumeNotFound).is_recoverable_object_heal());
+    }
+
+    #[test]
+    fn classify_heal_error_table() {
+        use super::{HealErrorClass as C, classify_heal_error};
+        use rustfs_lock::LockError;
+        let grace = "dangling object deletion deferred by heal grace window; retry_after_secs=5; grace_secs=10";
+        let cases = [
+            (Error::TaskCancelled, C::Aborted),
+            (Error::TaskTimeout, C::Aborted),
+            (
+                Error::StaleBucketIncarnation {
+                    bucket: "b".into(),
+                    expected: None,
+                },
+                C::Aborted,
+            ),
+            (Error::Storage(EcstoreError::FileNotFound), C::Absent),
+            (Error::Storage(EcstoreError::FileVersionNotFound), C::Absent),
+            (Error::Storage(EcstoreError::ObjectNotFound("b".into(), "o".into())), C::Absent),
+            (
+                Error::Storage(EcstoreError::VersionNotFound("b".into(), "o".into(), "v".into())),
+                C::Absent,
+            ),
+            (Error::Disk(DiskError::FileNotFound), C::Absent),
+            (Error::Disk(DiskError::FileVersionNotFound), C::Absent),
+            (Error::Storage(EcstoreError::DiskNotFound), C::Transient),
+            (Error::Storage(EcstoreError::VolumeNotFound), C::Transient),
+            (Error::Storage(EcstoreError::FaultyDisk), C::Transient),
+            (Error::Storage(EcstoreError::FaultyRemoteDisk), C::Transient),
+            (Error::Storage(EcstoreError::SlowDown), C::Transient),
+            (Error::Storage(EcstoreError::OperationCanceled), C::Transient),
+            (Error::Storage(EcstoreError::RemoteClientUnavailable("rebuild".into())), C::Transient),
+            (Error::Storage(EcstoreError::ErasureReadQuorum), C::Transient),
+            (Error::Storage(EcstoreError::InsufficientReadQuorum("b".into(), "o".into())), C::Transient),
+            (Error::Disk(DiskError::DiskNotFound), C::Transient),
+            (Error::Disk(DiskError::VolumeNotFound), C::Transient),
+            (Error::Disk(DiskError::ErasureWriteQuorum), C::Transient),
+            (Error::Disk(DiskError::SourceStalled), C::Transient),
+            (Error::TransientSkip { message: "skip".into() }, C::Transient),
+            (Error::ReplacementTargetNotReady("restarting".into()), C::Transient),
+            (Error::BucketDiscoveryIncomplete, C::Transient),
+            (
+                Error::Storage(EcstoreError::Lock(LockError::timeout("b/o", std::time::Duration::from_secs(1)))),
+                C::LockContention,
+            ),
+            (Error::Storage(EcstoreError::Timeout), C::LockContention),
+            (Error::Disk(DiskError::Timeout), C::LockContention),
+            (
+                Error::Disk(DiskError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock))),
+                C::LockContention,
+            ),
+            (Error::Other("remote lock rpc timed out".into()), C::LockContention),
+            (Error::Storage(EcstoreError::Lock(LockError::permission_denied("policy"))), C::Permanent),
+            (Error::Storage(EcstoreError::DeleteRecoveryLegacyAmbiguous), C::Permanent),
+            (Error::Disk(DiskError::FileCorrupt), C::Permanent),
+            (Error::Disk(DiskError::FileAccessDenied), C::Permanent),
+            (Error::Disk(DiskError::DiskFull), C::Permanent),
+            (Error::Other("boom".into()), C::Permanent),
+            (Error::Config("bad".into()), C::Permanent),
+            (Error::Storage(EcstoreError::NoHealRequired), C::NoHealRequired),
+            (Error::Disk(DiskError::NoHealRequired), C::NoHealRequired),
+            (Error::Other("No heal required".into()), C::NoHealRequired),
+            (
+                Error::DanglingDeleteDeferred { retry_not_before: 42 },
+                C::DanglingGrace {
+                    retry_not_before: Some(42),
+                },
+            ),
+            (
+                Error::TaskExecutionFailed { message: grace.into() },
+                C::DanglingGrace { retry_not_before: None },
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(classify_heal_error(&error), expected, "{error:?}");
+        }
+        assert!(matches!(
+            classify_heal_error(&Error::Disk(DiskError::other(grace))),
+            C::DanglingGrace { .. }
+        ));
+    }
+
+    #[test]
+    fn rendered_grace_window_is_grace_but_does_not_replay_the_task() {
+        let grace = "dangling object deletion deferred by heal grace window; retry_after_secs=5; grace_secs=10";
+        let rendered = Error::TaskExecutionFailed {
+            message: format!("Failed to recreate missing object b/o: Disk error: {grace}"),
+        };
+        assert!(rendered.is_dangling_delete_grace());
+        assert!(!rendered.is_recoverable_heal(), "the owner of a finished attempt schedules the next one");
+        assert!(!rendered.is_recoverable_object_heal());
+        let typed = Error::Disk(DiskError::other(grace));
+        assert!(typed.is_dangling_delete_grace());
+        assert!(typed.is_recoverable_heal());
+        assert!(Error::DanglingDeleteDeferred { retry_not_before: 1 }.is_recoverable_heal());
+    }
+
+    #[test]
+    fn classify_error_display_prefers_contention_over_absence_text() {
+        use super::{HealErrorClass as C, classify_error_display};
+        assert_eq!(
+            classify_error_display("File not found while waiting: lock acquisition timeout"),
+            Some(C::LockContention)
+        );
+        assert_eq!(classify_error_display("Storage error: File not found"), Some(C::Absent));
+        assert_eq!(classify_error_display("Object not found: b/o"), Some(C::Absent));
+        assert_eq!(classify_error_display("file not found"), None);
+        assert_eq!(classify_error_display("Disk not found"), None);
+        assert_eq!(classify_error_display("operation was canceled"), None);
+    }
+
+    #[test]
+    fn classify_error_display_does_not_take_absence_from_object_context() {
+        use super::{HealErrorClass, classify_error_display, classify_heal_error};
+        for object in [
+            "File not found",
+            "File version not found",
+            "Object not found: b/o",
+            "Version not found: b/o/v",
+        ] {
+            let message = format!(
+                "Heal left one or more drives unhealthy for bucket/{object}; retry after the missing drives are restored"
+            );
+            assert_eq!(
+                classify_heal_error(&Error::TaskExecutionFailed { message }),
+                HealErrorClass::Permanent,
+                "{object}"
+            );
+        }
+        for message in [
+            "File not found.txt",
+            "File version not found.txt",
+            "Failed to heal object bucket/object: Storage error: File not found",
+            "Failed to heal object bucket/Object not found: b/o: access denied",
+        ] {
+            assert_eq!(classify_error_display(message), None, "{message}");
         }
     }
 

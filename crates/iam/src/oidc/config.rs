@@ -11,15 +11,20 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+use crate::{EVENT_OIDC_DIAGNOSTICS, LOG_COMPONENT_IAM, LOG_SUBSYSTEM_OIDC};
 use base64_simd::URL_SAFE_NO_PAD;
 use rustfs_config::oidc::*;
 use rustfs_config::server_config::{Config as ServerConfig, KVS};
-use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
+use rustfs_config::{
+    CONSOLE_OIDC_SESSION_DURATION_MAX_SECS, DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS, DEFAULT_DELIMITER, ENABLE_KEY,
+    ENV_CONSOLE_OIDC_SESSION_DURATION, EnableState,
+};
 use rustfs_utils::egress::{OutboundUrlError, validate_outbound_url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
+use tracing::warn;
 use url::Url;
 
 pub(super) const REDACTED_SECRET: &str = "***redacted***";
@@ -813,6 +818,38 @@ pub(super) fn parse_single_persisted_provider(kvs: &KVS, id: &str) -> Option<Oid
 
 pub fn load_oidc_provider_configs_from_env() -> Vec<OidcProviderConfig> {
     parse_env_configs()
+}
+
+/// Credential lifetime, in seconds, for Console credentials issued by the OIDC callback.
+///
+/// `RUSTFS_CONSOLE_OIDC_SESSION_DURATION` overrides the default for every provider. An unset,
+/// unparseable, or zero value keeps [`DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS`], so a
+/// misconfigured variable can never issue credentials that are already expired. Values above
+/// [`CONSOLE_OIDC_SESSION_DURATION_MAX_SECS`] are clamped to that maximum with a warning.
+///
+/// Both the credential lifetime and the Console logout-token retention derive from this single
+/// value, so they stay in step whichever way the variable is set.
+pub fn console_session_duration_secs() -> usize {
+    let configured = rustfs_utils::get_env_opt_u64(ENV_CONSOLE_OIDC_SESSION_DURATION)
+        .and_then(|seconds| usize::try_from(seconds).ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DEFAULT_CONSOLE_OIDC_SESSION_DURATION_SECS);
+
+    if configured > CONSOLE_OIDC_SESSION_DURATION_MAX_SECS {
+        warn!(
+            event = EVENT_OIDC_DIAGNOSTICS,
+            component = LOG_COMPONENT_IAM,
+            subsystem = LOG_SUBSYSTEM_OIDC,
+            state = "console_session_duration_clamped",
+            config_key = ENV_CONSOLE_OIDC_SESSION_DURATION,
+            configured,
+            max = CONSOLE_OIDC_SESSION_DURATION_MAX_SECS,
+            "Console OIDC session duration exceeds the maximum"
+        );
+        return CONSOLE_OIDC_SESSION_DURATION_MAX_SECS;
+    }
+
+    configured
 }
 
 pub fn load_oidc_provider_configs_from_server_config(cfg: &ServerConfig) -> Vec<OidcProviderConfig> {

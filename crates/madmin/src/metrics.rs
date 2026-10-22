@@ -318,6 +318,27 @@ pub struct ScannerUsageFreshnessSnapshot {
     pub last_deferred_unix_secs: u64,
     #[serde(rename = "last_deferred_reason", default)]
     pub last_deferred_reason: String,
+    /// Cluster-activity guardrail vetoes, attributed as `<field>@<host>`.
+    #[serde(rename = "guardrail_veto_total", default)]
+    pub guardrail_veto_total: u64,
+    #[serde(rename = "last_guardrail_veto_unix_secs", default)]
+    pub last_guardrail_veto_unix_secs: u64,
+    #[serde(rename = "last_guardrail_veto_reason", default)]
+    pub last_guardrail_veto_reason: String,
+    /// Cycles eligible for a dirty-bucket scope that walked the whole
+    /// namespace instead; the reason names the scope precondition that failed.
+    #[serde(rename = "scope_fallback_total", default)]
+    pub scope_fallback_total: u64,
+    #[serde(rename = "last_scope_fallback_unix_secs", default)]
+    pub last_scope_fallback_unix_secs: u64,
+    #[serde(rename = "last_scope_fallback_reason", default)]
+    pub last_scope_fallback_reason: String,
+    #[serde(rename = "disk_io_budget_wait_events", default)]
+    pub disk_io_budget_wait_events: u64,
+    #[serde(rename = "disk_io_budget_wait_millis", default)]
+    pub disk_io_budget_wait_millis: u64,
+    #[serde(rename = "last_disk_io_budget_wait_unix_secs", default)]
+    pub last_disk_io_budget_wait_unix_secs: u64,
 }
 
 impl ScannerUsageFreshnessSnapshot {
@@ -343,6 +364,25 @@ impl ScannerUsageFreshnessSnapshot {
             self.last_publication_reason = other.last_publication_reason.clone();
         }
         self.deferred_total = self.deferred_total.saturating_add(other.deferred_total);
+        self.guardrail_veto_total = self.guardrail_veto_total.saturating_add(other.guardrail_veto_total);
+        self.disk_io_budget_wait_events = self
+            .disk_io_budget_wait_events
+            .saturating_add(other.disk_io_budget_wait_events);
+        self.disk_io_budget_wait_millis = self
+            .disk_io_budget_wait_millis
+            .saturating_add(other.disk_io_budget_wait_millis);
+        self.last_disk_io_budget_wait_unix_secs = self
+            .last_disk_io_budget_wait_unix_secs
+            .max(other.last_disk_io_budget_wait_unix_secs);
+        if other.last_guardrail_veto_unix_secs > self.last_guardrail_veto_unix_secs {
+            self.last_guardrail_veto_unix_secs = other.last_guardrail_veto_unix_secs;
+            self.last_guardrail_veto_reason = other.last_guardrail_veto_reason.clone();
+        }
+        self.scope_fallback_total = self.scope_fallback_total.saturating_add(other.scope_fallback_total);
+        if other.last_scope_fallback_unix_secs > self.last_scope_fallback_unix_secs {
+            self.last_scope_fallback_unix_secs = other.last_scope_fallback_unix_secs;
+            self.last_scope_fallback_reason = other.last_scope_fallback_reason.clone();
+        }
         if other_deferred_state_at > self_deferred_state_at {
             self.deferred_pending = other.deferred_pending;
         } else if other_deferred_state_at == self_deferred_state_at {
@@ -431,6 +471,8 @@ pub struct ScannerPacingPressureSnapshot {
     pub last_cycle_pause_observed: bool,
     #[serde(rename = "last_cycle_throttle_sleep_ratio", default)]
     pub last_cycle_throttle_sleep_ratio: f64,
+    #[serde(rename = "last_cycle_disk_io_budget_wait_ratio", default)]
+    pub last_cycle_disk_io_budget_wait_ratio: f64,
     #[serde(rename = "last_cycle_yield_ratio", default)]
     pub last_cycle_yield_ratio: f64,
     #[serde(rename = "last_cycle_total_pause_ratio", default)]
@@ -446,6 +488,7 @@ impl Default for ScannerPacingPressureSnapshot {
             last_cycle_budget_limited: false,
             last_cycle_pause_observed: false,
             last_cycle_throttle_sleep_ratio: 0.0,
+            last_cycle_disk_io_budget_wait_ratio: 0.0,
             last_cycle_yield_ratio: 0.0,
             last_cycle_total_pause_ratio: 0.0,
         }
@@ -458,6 +501,8 @@ impl ScannerPacingPressureSnapshot {
             "queued_scans"
         } else if self.last_cycle_budget_limited {
             "cycle_budget"
+        } else if self.last_cycle_disk_io_budget_wait_ratio > 0.0 {
+            "disk_io_budget"
         } else if self.last_cycle_pause_observed {
             "throttle_pause"
         } else if self.current_active_scans > 0 {
@@ -480,6 +525,9 @@ impl ScannerPacingPressureSnapshot {
         self.last_cycle_throttle_sleep_ratio = self
             .last_cycle_throttle_sleep_ratio
             .max(other.last_cycle_throttle_sleep_ratio);
+        self.last_cycle_disk_io_budget_wait_ratio = self
+            .last_cycle_disk_io_budget_wait_ratio
+            .max(other.last_cycle_disk_io_budget_wait_ratio);
         self.last_cycle_yield_ratio = self.last_cycle_yield_ratio.max(other.last_cycle_yield_ratio);
         self.last_cycle_total_pause_ratio = self.last_cycle_total_pause_ratio.max(other.last_cycle_total_pause_ratio);
         self.refresh_primary_pressure();
@@ -629,6 +677,10 @@ pub struct ScannerMetrics {
     pub current_cycle_throttle_sleep_events: u64,
     #[serde(rename = "current_cycle_throttle_sleep_duration_seconds", default)]
     pub current_cycle_throttle_sleep_duration_seconds: f64,
+    #[serde(rename = "current_cycle_disk_io_budget_wait_events", default)]
+    pub current_cycle_disk_io_budget_wait_events: u64,
+    #[serde(rename = "current_cycle_disk_io_budget_wait_duration_seconds", default)]
+    pub current_cycle_disk_io_budget_wait_duration_seconds: f64,
     #[serde(rename = "current_cycle_ilm_actions", default)]
     pub current_cycle_ilm_actions: u64,
     #[serde(rename = "current_cycle_lifecycle_expiry_actions", default)]
@@ -675,6 +727,10 @@ pub struct ScannerMetrics {
     pub last_cycle_throttle_sleep_events: u64,
     #[serde(rename = "last_cycle_throttle_sleep_duration_seconds", default)]
     pub last_cycle_throttle_sleep_duration_seconds: f64,
+    #[serde(rename = "last_cycle_disk_io_budget_wait_events", default)]
+    pub last_cycle_disk_io_budget_wait_events: u64,
+    #[serde(rename = "last_cycle_disk_io_budget_wait_duration_seconds", default)]
+    pub last_cycle_disk_io_budget_wait_duration_seconds: f64,
     #[serde(rename = "last_cycle_ilm_actions", default)]
     pub last_cycle_ilm_actions: u64,
     #[serde(rename = "last_cycle_heal_objects", default)]
@@ -856,6 +912,10 @@ impl ScannerMetrics {
             .current_cycle_throttle_sleep_events
             .saturating_add(other.current_cycle_throttle_sleep_events);
         self.current_cycle_throttle_sleep_duration_seconds += other.current_cycle_throttle_sleep_duration_seconds;
+        self.current_cycle_disk_io_budget_wait_events = self
+            .current_cycle_disk_io_budget_wait_events
+            .saturating_add(other.current_cycle_disk_io_budget_wait_events);
+        self.current_cycle_disk_io_budget_wait_duration_seconds += other.current_cycle_disk_io_budget_wait_duration_seconds;
         self.current_cycle_ilm_actions = self.current_cycle_ilm_actions.saturating_add(other.current_cycle_ilm_actions);
         self.current_cycle_lifecycle_expiry_actions = self
             .current_cycle_lifecycle_expiry_actions
@@ -888,6 +948,10 @@ impl ScannerMetrics {
             .last_cycle_throttle_sleep_events
             .saturating_add(other.last_cycle_throttle_sleep_events);
         self.last_cycle_throttle_sleep_duration_seconds += other.last_cycle_throttle_sleep_duration_seconds;
+        self.last_cycle_disk_io_budget_wait_events = self
+            .last_cycle_disk_io_budget_wait_events
+            .saturating_add(other.last_cycle_disk_io_budget_wait_events);
+        self.last_cycle_disk_io_budget_wait_duration_seconds += other.last_cycle_disk_io_budget_wait_duration_seconds;
         self.last_cycle_ilm_actions = self.last_cycle_ilm_actions.saturating_add(other.last_cycle_ilm_actions);
         self.last_cycle_lifecycle_expiry_actions = self
             .last_cycle_lifecycle_expiry_actions
@@ -1719,6 +1783,46 @@ mod tests {
         .expect("legacy usage freshness should decode");
         assert!(!legacy.deferred_pending);
         assert_eq!(legacy.deferred_total, 0);
+        assert_eq!(legacy.guardrail_veto_total, 0);
+        assert_eq!(legacy.last_guardrail_veto_unix_secs, 0);
+        assert!(legacy.last_guardrail_veto_reason.is_empty());
+        assert_eq!(legacy.scope_fallback_total, 0);
+        assert_eq!(legacy.last_scope_fallback_unix_secs, 0);
+        assert!(legacy.last_scope_fallback_reason.is_empty());
+
+        let mut fallbacks = ScannerUsageFreshnessSnapshot::default();
+        fallbacks.merge(&ScannerUsageFreshnessSnapshot {
+            scope_fallback_total: 3,
+            last_scope_fallback_unix_secs: 40,
+            last_scope_fallback_reason: "dirty_bucket_overflow".to_string(),
+            ..Default::default()
+        });
+        fallbacks.merge(&ScannerUsageFreshnessSnapshot {
+            scope_fallback_total: 1,
+            last_scope_fallback_unix_secs: 25,
+            last_scope_fallback_reason: "baseline_unavailable".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(fallbacks.scope_fallback_total, 4);
+        assert_eq!(fallbacks.last_scope_fallback_unix_secs, 40);
+        assert_eq!(fallbacks.last_scope_fallback_reason, "dirty_bucket_overflow");
+
+        let mut vetoes = ScannerUsageFreshnessSnapshot::default();
+        vetoes.merge(&ScannerUsageFreshnessSnapshot {
+            guardrail_veto_total: 2,
+            last_guardrail_veto_unix_secs: 30,
+            last_guardrail_veto_reason: "publication_blocked@<local>".to_string(),
+            ..Default::default()
+        });
+        vetoes.merge(&ScannerUsageFreshnessSnapshot {
+            guardrail_veto_total: 1,
+            last_guardrail_veto_unix_secs: 20,
+            last_guardrail_veto_reason: "movement_generation@node-2".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(vetoes.guardrail_veto_total, 3);
+        assert_eq!(vetoes.last_guardrail_veto_unix_secs, 30);
+        assert_eq!(vetoes.last_guardrail_veto_reason, "publication_blocked@<local>");
 
         let mut merged = ScannerUsageFreshnessSnapshot::default();
         merged.merge(&ScannerUsageFreshnessSnapshot {

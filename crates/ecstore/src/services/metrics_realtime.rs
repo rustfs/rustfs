@@ -144,6 +144,8 @@ fn to_madmin_scanner_metrics(metrics: rustfs_scanner_metrics::metrics::ScannerMe
         current_cycle_yield_duration_seconds: metrics.current_cycle_yield_duration_seconds,
         current_cycle_throttle_sleep_events: metrics.current_cycle_throttle_sleep_events,
         current_cycle_throttle_sleep_duration_seconds: metrics.current_cycle_throttle_sleep_duration_seconds,
+        current_cycle_disk_io_budget_wait_events: metrics.current_cycle_disk_io_budget_wait_events,
+        current_cycle_disk_io_budget_wait_duration_seconds: metrics.current_cycle_disk_io_budget_wait_duration_seconds,
         current_cycle_ilm_actions: metrics.current_cycle_ilm_actions,
         current_cycle_lifecycle_expiry_actions: metrics.current_cycle_lifecycle_expiry_actions,
         current_cycle_lifecycle_transition_actions: metrics.current_cycle_lifecycle_transition_actions,
@@ -167,6 +169,8 @@ fn to_madmin_scanner_metrics(metrics: rustfs_scanner_metrics::metrics::ScannerMe
         last_cycle_yield_duration_seconds: metrics.last_cycle_yield_duration_seconds,
         last_cycle_throttle_sleep_events: metrics.last_cycle_throttle_sleep_events,
         last_cycle_throttle_sleep_duration_seconds: metrics.last_cycle_throttle_sleep_duration_seconds,
+        last_cycle_disk_io_budget_wait_events: metrics.last_cycle_disk_io_budget_wait_events,
+        last_cycle_disk_io_budget_wait_duration_seconds: metrics.last_cycle_disk_io_budget_wait_duration_seconds,
         last_cycle_ilm_actions: metrics.last_cycle_ilm_actions,
         last_cycle_heal_objects: metrics.last_cycle_heal_objects,
         last_cycle_replication_checks: metrics.last_cycle_replication_checks,
@@ -184,6 +188,7 @@ fn to_madmin_scanner_metrics(metrics: rustfs_scanner_metrics::metrics::ScannerMe
             last_cycle_budget_limited: metrics.pacing_pressure.last_cycle_budget_limited,
             last_cycle_pause_observed: metrics.pacing_pressure.last_cycle_pause_observed,
             last_cycle_throttle_sleep_ratio: metrics.pacing_pressure.last_cycle_throttle_sleep_ratio,
+            last_cycle_disk_io_budget_wait_ratio: metrics.pacing_pressure.last_cycle_disk_io_budget_wait_ratio,
             last_cycle_yield_ratio: metrics.pacing_pressure.last_cycle_yield_ratio,
             last_cycle_total_pause_ratio: metrics.pacing_pressure.last_cycle_total_pause_ratio,
         },
@@ -231,6 +236,15 @@ fn to_madmin_scanner_metrics(metrics: rustfs_scanner_metrics::metrics::ScannerMe
             deferred_total: metrics.usage_freshness.deferred_total,
             last_deferred_unix_secs: metrics.usage_freshness.last_deferred_unix_secs,
             last_deferred_reason: metrics.usage_freshness.last_deferred_reason,
+            guardrail_veto_total: metrics.usage_freshness.guardrail_veto_total,
+            last_guardrail_veto_unix_secs: metrics.usage_freshness.last_guardrail_veto_unix_secs,
+            last_guardrail_veto_reason: metrics.usage_freshness.last_guardrail_veto_reason,
+            scope_fallback_total: metrics.usage_freshness.scope_fallback_total,
+            last_scope_fallback_unix_secs: metrics.usage_freshness.last_scope_fallback_unix_secs,
+            last_scope_fallback_reason: metrics.usage_freshness.last_scope_fallback_reason,
+            disk_io_budget_wait_events: metrics.usage_freshness.disk_io_budget_wait_events,
+            disk_io_budget_wait_millis: metrics.usage_freshness.disk_io_budget_wait_millis,
+            last_disk_io_budget_wait_unix_secs: metrics.usage_freshness.last_disk_io_budget_wait_unix_secs,
         },
         maintenance_control: MadminScannerMaintenanceControlSnapshot {
             primary_control: metrics.maintenance_control.primary_control,
@@ -747,6 +761,7 @@ mod test {
                 last_cycle_budget_limited: true,
                 last_cycle_pause_observed: true,
                 last_cycle_throttle_sleep_ratio: 0.25,
+                last_cycle_disk_io_budget_wait_ratio: 0.15,
                 last_cycle_yield_ratio: 0.05,
                 last_cycle_total_pause_ratio: 0.3,
             },
@@ -886,10 +901,25 @@ mod test {
                 deferred_total: 15,
                 last_deferred_unix_secs: 16,
                 last_deferred_reason: "data_movement".to_string(),
+                guardrail_veto_total: 4,
+                last_guardrail_veto_unix_secs: 17,
+                last_guardrail_veto_reason: "publication_blocked@<local>".to_string(),
+                scope_fallback_total: 5,
+                last_scope_fallback_unix_secs: 18,
+                last_scope_fallback_reason: "dirty_snapshot_incomplete".to_string(),
+                disk_io_budget_wait_events: 5,
+                disk_io_budget_wait_millis: 2_500,
+                last_disk_io_budget_wait_unix_secs: 18,
             },
             ..Default::default()
         });
 
+        assert_eq!(scanner.usage_freshness.guardrail_veto_total, 4);
+        assert_eq!(scanner.usage_freshness.last_guardrail_veto_unix_secs, 17);
+        assert_eq!(scanner.usage_freshness.scope_fallback_total, 5);
+        assert_eq!(scanner.usage_freshness.last_scope_fallback_unix_secs, 18);
+        assert_eq!(scanner.usage_freshness.last_scope_fallback_reason, "dirty_snapshot_incomplete");
+        assert_eq!(scanner.usage_freshness.last_guardrail_veto_reason, "publication_blocked@<local>");
         assert_eq!(scanner.usage_freshness.dirty_pending_buckets, 3);
         assert_eq!(scanner.usage_freshness.last_dirty_mark_unix_secs, 10);
         assert_eq!(scanner.usage_freshness.last_dirty_clear_unix_secs, 11);

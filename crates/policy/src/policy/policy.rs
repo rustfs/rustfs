@@ -1749,6 +1749,53 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_table_location_claim_is_limited_to_the_physical_prefix() -> Result<()> {
+        use crate::policy::action::{Action, AdminAction};
+
+        let policy = Policy::parse_config(
+            br#"{
+                "Version": "2012-10-17",
+                "Statement": [
+                    {"Effect": "Allow", "Action": "admin:CreateTable", "Resource": "arn:aws:s3:::warehouse/namespaces/lab"},
+                    {"Effect": "Allow", "Action": "admin:ClaimTableLocation", "Resource": [
+                        "arn:aws:s3:::warehouse/owned", "arn:aws:s3:::warehouse/owned/*"
+                    ]},
+                    {"Effect": "Deny", "Action": "admin:ClaimTableLocation", "Resource": [
+                        "arn:aws:s3:::warehouse/owned/private", "arn:aws:s3:::warehouse/owned/private/*"
+                    ]}
+                ]
+            }"#,
+        )?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let groups = None;
+        for (bucket, object, allowed) in [
+            ("warehouse", "owned", true),
+            ("warehouse", "owned/", true),
+            ("warehouse", "owned/child/", true),
+            ("warehouse", "owned/private/", false),
+            ("warehouse", "owned2/", false),
+            ("warehouse", "shared/", false),
+            ("warehouse", "namespaces/lab", false),
+            ("another-warehouse", "owned/", false),
+        ] {
+            let args = Args {
+                account: "creator",
+                groups: &groups,
+                action: Action::AdminAction(AdminAction::ClaimTableLocationAction),
+                bucket,
+                conditions: &conditions,
+                is_owner: false,
+                object,
+                claims: &claims,
+                deny_only: false,
+            };
+            assert_eq!(policy.is_allowed(&args).await, allowed, "{bucket}/{object}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_table_admin_action_with_resource_is_limited_to_bucket() -> Result<()> {
         use crate::policy::action::{Action, AdminAction};
 

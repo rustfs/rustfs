@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
 # Fail when an agent-instruction or architecture document references a
-# repository file path that no longer exists. Keeps CLAUDE.md / AGENTS.md /
+# repository file path that no longer exists. Keeps AGENTS.md /
 # ARCHITECTURE.md / docs/ honest after refactors move code.
 #
-# Checked files: all tracked AGENTS.md, CLAUDE.md, ARCHITECTURE.md, and every
+# Checked files: all tracked AGENTS.md, ARCHITECTURE.md, and every
 # Markdown file under docs/ (architecture, operations, testing, and the index).
 #
 # A reference is any token starting with crates/, rustfs/, scripts/, docs/,
@@ -21,7 +21,7 @@ cd "$ROOT_DIR"
 FAILURES=0
 
 doc_files() {
-  git ls-files 'AGENTS.md' '*/AGENTS.md' 'CLAUDE.md' 'ARCHITECTURE.md' 'docs/*.md' 'docs/architecture/*.md' 'docs/operations/*.md' 'docs/postmortems/*.md' 'docs/testing/*.md'
+  git ls-files 'AGENTS.md' '*/AGENTS.md' 'ARCHITECTURE.md' 'docs/*.md' 'docs/architecture/*.md' 'docs/operations/*.md' 'docs/postmortems/*.md' 'docs/testing/*.md'
 }
 
 check_file() {

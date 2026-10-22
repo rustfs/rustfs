@@ -34,7 +34,7 @@ jobs:
   update-flake:
     if: github.repository == 'rustfs/rustfs'
     name: Update flake.lock
-    runs-on: sm-standard-2
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"

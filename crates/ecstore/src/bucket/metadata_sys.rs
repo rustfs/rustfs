@@ -522,6 +522,15 @@ pub(crate) async fn get_bucket_incarnation_id_in(ctx: &crate::runtime::instance:
     sys.get_bucket_incarnation_id_from_disk(bucket).await
 }
 
+pub(crate) async fn find_bucket_incarnation_id_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+) -> Result<Option<Uuid>> {
+    let sys = bucket_metadata_sys_of(ctx)?;
+    let sys = sys.read().await.clone();
+    sys.find_bucket_incarnation_id_from_disk(bucket).await
+}
+
 /// Directory loss is recoverable only for a committed, non-retired generation.
 /// The caller retains the bucket lifecycle fence through the ensuing reconstruction.
 pub(crate) async fn validate_bucket_reconstruction_in(
@@ -1015,6 +1024,52 @@ async fn update_quota_if_incarnation_stamped(
     update_under_config_write_guard(sys, &guard, rustfs_config::QUOTA_CONFIG_FILE, data, updated_at).await
 }
 
+/// Rewrite the quota configuration only while the bucket still carries
+/// `expected_incarnation_id` and `expected_quota_revision` (its
+/// `quota_config_updated_at`), under the same guards and fleet proof as
+/// [`update_quota_if_incarnation`].
+///
+/// The revision check turns a stale read into a typed
+/// [`Error::PreconditionFailed`] instead of a lost update: the reservation
+/// protocol migration (rustfs/backlog#2904) rewrites a configuration it read
+/// from the cache, and an admin save landing in between must win. The system
+/// is passed explicitly so the write publishes into the cache the caller
+/// reads from.
+pub async fn update_quota_with_sys_if_incarnation_and_revision(
+    sys: Arc<RwLock<BucketMetadataSys>>,
+    bucket: &str,
+    data: Vec<u8>,
+    expected_incarnation_id: Uuid,
+    expected_quota_revision: OffsetDateTime,
+    proof: &crate::services::notification_sys::CrossPoolFenceFleetProofToken,
+) -> Result<OffsetDateTime> {
+    let guard = Box::pin(acquire_config_write_guard_for_incarnation(
+        sys.clone(),
+        bucket,
+        Some(expected_incarnation_id),
+    ))
+    .await?;
+    if !crate::services::notification_sys::cross_pool_fence_fleet_proof_matches(proof) {
+        return Err(Error::NamespaceLockQuorumUnavailable {
+            mode: "quota_capability",
+            bucket: bucket.to_string(),
+            object: rustfs_config::QUOTA_CONFIG_FILE.to_string(),
+            required: 1,
+            achieved: 0,
+        });
+    }
+    let metadata_sys = sys.read().await.clone();
+    match Box::pin(metadata_sys.read_authoritative_metadata_from_disk_under_transaction_lock(bucket)).await? {
+        BucketMetadataAuthority::Authoritative(current) if current.quota_config_updated_at == expected_quota_revision => {}
+        BucketMetadataAuthority::Authoritative(_) => return Err(Error::PreconditionFailed),
+        BucketMetadataAuthority::MissingBucket => return Err(Error::BucketNotFound(bucket.to_string())),
+        BucketMetadataAuthority::Fabricated => {
+            return Err(Error::other("bucket quota metadata is not authoritative"));
+        }
+    }
+    update_under_config_write_guard(sys, &guard, rustfs_config::QUOTA_CONFIG_FILE, data, None).await
+}
+
 pub async fn update_bucket_targets_under_transaction_lock(
     guard: &BucketMetadataMutationGuard,
     bucket: &str,
@@ -1365,6 +1420,18 @@ pub(crate) async fn get_object_lock_config_and_incarnation_from_disk_with_guard_
     bucket: &str,
     guard: Option<&rustfs_lock::NamespaceLockGuard>,
 ) -> Result<(ObjectLockConfigState, Uuid, OffsetDateTime)> {
+    get_delete_config_from_disk_in(ctx, bucket, guard, None).await
+}
+
+/// Validate queued expiration against the same fresh metadata used for Object
+/// Lock admission. The caller holds the transaction read lock through commit,
+/// so a successful lifecycle update cannot be followed by an old-policy delete.
+pub(crate) async fn get_delete_config_from_disk_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    expiry_policy: Option<&rustfs_lifecycle::ExpiryPolicySnapshot>,
+) -> Result<(ObjectLockConfigState, Uuid, OffsetDateTime)> {
     let bucket_meta_sys_lock = bucket_metadata_sys_of(ctx)?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await.clone();
 
@@ -1384,6 +1451,13 @@ pub(crate) async fn get_object_lock_config_and_incarnation_from_disk_with_guard_
         BucketMetadataAuthority::Authoritative(metadata)
             if metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() =>
         {
+            if let Some(expected) = expiry_policy {
+                let current = ConfigState::of(&metadata.lifecycle_config_xml, &metadata.lifecycle_config)
+                    .require(bucket, BUCKET_LIFECYCLE_CONFIG)?;
+                if !expected.matches_configuration(current) {
+                    return Err(Error::PreconditionFailed);
+                }
+            }
             let object_lock_config_updated_at = metadata.object_lock_config_updated_at;
             Ok((
                 object_lock_config_state_from_authoritative_metadata(&metadata)?,
@@ -2707,6 +2781,11 @@ impl BucketMetadataSys {
     }
 
     async fn get_bucket_incarnation_id_from_disk(&self, bucket: &str) -> Result<Uuid> {
+        let incarnation_id = self.find_bucket_incarnation_id_from_disk(bucket).await?;
+        Self::require_bucket_incarnation_id(bucket, incarnation_id)
+    }
+
+    async fn find_bucket_incarnation_id_from_disk(&self, bucket: &str) -> Result<Option<Uuid>> {
         let transaction_lock = self
             .object_store()
             .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
@@ -2714,7 +2793,7 @@ impl BucketMetadataSys {
         let _transaction_guard = transaction_lock
             .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
             .await?;
-        self.get_bucket_incarnation_id_under_transaction_lock(bucket, &_transaction_guard)
+        self.find_bucket_incarnation_id_under_transaction_lock(bucket, &_transaction_guard)
             .await
     }
 
@@ -2723,14 +2802,26 @@ impl BucketMetadataSys {
         bucket: &str,
         transaction_guard: &rustfs_lock::NamespaceLockGuard,
     ) -> Result<Uuid> {
+        let incarnation_id = self
+            .find_bucket_incarnation_id_under_transaction_lock(bucket, transaction_guard)
+            .await?;
+        Self::require_bucket_incarnation_id(bucket, incarnation_id)
+    }
+
+    fn require_bucket_incarnation_id(bucket: &str, incarnation_id: Option<Uuid>) -> Result<Uuid> {
+        incarnation_id.ok_or_else(|| Error::other(format!("bucket incarnation metadata is not authoritative: {bucket}")))
+    }
+
+    async fn find_bucket_incarnation_id_under_transaction_lock(
+        &self,
+        bucket: &str,
+        transaction_guard: &rustfs_lock::NamespaceLockGuard,
+    ) -> Result<Option<Uuid>> {
         let incarnation_id = load_bucket_incarnation(self.object_store(), bucket).await?;
         if transaction_guard.is_lock_lost() {
             return Err(Error::other(format!("bucket incarnation metadata transaction lock was lost: {bucket}")));
         }
-        match incarnation_id {
-            Some(incarnation_id) if !incarnation_id.is_nil() => Ok(incarnation_id),
-            _ => Err(Error::other(format!("bucket incarnation metadata is not authoritative: {bucket}"))),
-        }
+        Ok(incarnation_id)
     }
 
     async fn get_metadata_authority(&self, bucket: &str) -> Result<BucketMetadataAuthority> {

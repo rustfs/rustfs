@@ -704,6 +704,180 @@ mod serial_tests {
 
 #[test]
 #[serial]
+fn historical_rebalance_topology_allows_format_and_object_rebuild() {
+    const STACK_SIZE: usize = 8 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("historical-rebalance-rebuild".to_owned())
+        .stack_size(STACK_SIZE)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_stack_size(STACK_SIZE)
+                .enable_all()
+                .build()
+                .expect("historical rebalance recovery runtime");
+            runtime.block_on(historical_rebalance_topology_allows_format_and_object_rebuild_case());
+        })
+        .expect("historical rebalance recovery test thread")
+        .join()
+        .expect("historical rebalance recovery test result");
+}
+
+async fn historical_rebalance_topology_allows_format_and_object_rebuild_case() {
+    use storage_api::integration::{
+        DiskAPI as _, DiskError, DiskOption, RUSTFS_META_BUCKET, RebalStatus, RebalanceMeta, RebalanceStats, new_disk,
+    };
+
+    let temp = tempfile::tempdir().expect("isolated historical rebalance fixture");
+    let env = rustfs_test_utils::TestECStoreEnv::builder()
+        .base_dir(temp.path())
+        .build()
+        .await;
+    let ecstore = env.ecstore;
+    let disks = env.disk_paths;
+    let storage = Arc::new(ECStoreHealStorage::new(ecstore.clone()));
+    assert_eq!(ecstore.pools.len(), 1);
+    let bucket = "historical-rebalance-rebuild";
+    let object = "non-inline-object";
+    let expected = non_inline_test_data();
+    create_test_bucket(&ecstore, bucket).await;
+    upload_test_object(&ecstore, bucket, object, &expected).await;
+    wait_for_object_copies(&disks, bucket, object).await;
+
+    // Model the persisted post-removal state. This test does not execute a
+    // rebalance worker, decommission lifecycle, or mount-identity handoff.
+    let mut historical = RebalanceMeta {
+        id: uuid::Uuid::new_v4().to_string(),
+        pool_stats: vec![RebalanceStats::default(), RebalanceStats::default()],
+        ..Default::default()
+    };
+    for pool in &mut historical.pool_stats {
+        pool.participating = true;
+        pool.info.status = RebalStatus::Completed;
+    }
+    historical
+        .save_with_opts(
+            ecstore.pools[0].clone(),
+            ObjectOptions {
+                write_completion: WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("persist completed historical two-pool metadata on the current metadata pool");
+    let historical_bytes = ecstore.pools[0]
+        .get_object_reader(RUSTFS_META_BUCKET, "rebalance.bin", None, HeaderMap::new(), &ObjectOptions::default())
+        .await
+        .expect("open persisted historical metadata")
+        .read_all()
+        .await
+        .expect("read persisted historical metadata");
+    let old_format: serde_json::Value = serde_json::from_slice(
+        &fs::read(disks[0].join(RUSTFS_META_BUCKET).join("format.json"))
+            .await
+            .expect("read target format"),
+    )
+    .expect("decode target format");
+    let target_object = disks[0].join(bucket).join(object);
+    let old_shard = fs::read(find_part_file(&target_object).expect("original target shard"))
+        .await
+        .expect("read original target shard bytes");
+
+    // Preserve the root inode held by disk I/O, while replacing its contents
+    // with an empty target, as in the existing fresh-target recovery fixture.
+    for entry in std::fs::read_dir(&disks[0]).expect("read replacement target root") {
+        let entry = entry.expect("replacement target entry");
+        if entry.file_type().expect("replacement entry type").is_dir() {
+            fs::remove_dir_all(entry.path()).await.expect("empty target directory");
+        } else {
+            fs::remove_file(entry.path()).await.expect("empty target file");
+        }
+    }
+    assert!(!disks[0].join(RUSTFS_META_BUCKET).join("format.json").exists());
+    assert!(!target_object.exists());
+    // A replacement reconnects with a fresh handle. Reusing the old handle
+    // would retain its cached format bytes despite the emptied directory.
+    let endpoint = ecstore.pools[0].endpoints.endpoints.as_ref()[0].clone();
+    let replacement = new_disk(
+        &endpoint,
+        &DiskOption {
+            cleanup: false,
+            health_check: false,
+        },
+    )
+    .await
+    .expect("open a fresh replacement disk handle");
+    assert!(matches!(replacement.get_disk_id().await, Err(DiskError::UnformattedDisk)));
+    ecstore.pools[0].get_disks(0).disks.write().await[0] = Some(replacement);
+    let target = endpoint.to_string();
+    let (_, format_error) = storage
+        .heal_replacement_format(false, 0, 0, std::slice::from_ref(&target))
+        .await
+        .expect("historical topology must admit target-scoped format repair");
+    assert!(format_error.is_none(), "target format repair: {format_error:?}");
+    let repaired_format: serde_json::Value = serde_json::from_slice(
+        &fs::read(disks[0].join(RUSTFS_META_BUCKET).join("format.json"))
+            .await
+            .expect("read repaired target format"),
+    )
+    .expect("decode repaired target format");
+    assert_eq!(
+        repaired_format["xl"]["this"], old_format["xl"]["this"],
+        "format repair must retain the original slot UUID"
+    );
+    assert!(
+        !target_object.exists(),
+        "format repair alone must not be mistaken for object reconstruction"
+    );
+
+    let mut request = HealRequest::new(
+        HealType::ErasureSet {
+            buckets: vec![bucket.to_owned()],
+            set_disk_id: "pool_0_set_0".to_owned(),
+        },
+        HealOptions {
+            recursive: true,
+            pool_index: Some(0),
+            set_index: Some(0),
+            scan_mode: HealScanMode::Deep,
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+    request.source = HealRequestSource::Admin;
+    let task = HealTask::from_request(request, storage);
+    task.execute()
+        .await
+        .expect("rebuild objects after historical-topology format repair");
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
+    assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
+    // Verify target-side physical repair before a GET could perform read repair.
+    assert!(target_object.join("xl.meta").exists());
+    let rebuilt_shard = fs::read(find_part_file(&target_object).expect("rebuilt target shard"))
+        .await
+        .expect("read rebuilt target shard bytes");
+    assert_eq!(rebuilt_shard, old_shard, "the replacement shard must contain the original encoded bytes");
+    let actual = ecstore
+        .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+        .await
+        .expect("open rebuilt object")
+        .read_all()
+        .await
+        .expect("read rebuilt object bytes");
+    assert_eq!(actual, expected, "reconstructed object bytes must be unchanged");
+    let retained_history = ecstore.pools[0]
+        .get_object_reader(RUSTFS_META_BUCKET, "rebalance.bin", None, HeaderMap::new(), &ObjectOptions::default())
+        .await
+        .expect("open retained historical metadata")
+        .read_all()
+        .await
+        .expect("read retained historical metadata");
+    assert_eq!(retained_history, historical_bytes, "healing must retain the historical rebalance payload");
+}
+
+#[test]
+#[serial]
 fn replacement_delete_recovery_on_fresh_target() {
     // Match the debug server's worker stack for the composed Heal future.
     // Libtest otherwise polls it on its smaller calling-thread stack.

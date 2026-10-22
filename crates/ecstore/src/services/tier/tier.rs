@@ -3400,12 +3400,15 @@ impl TierConfigMgr {
 
     pub async fn remove(&mut self, tier_name: &str, force: bool) -> std::result::Result<(), AdminError> {
         self.ensure_generation_is_idle(tier_name)?;
-        let driver = match self.get_driver(tier_name).await {
-            Ok(driver) => driver,
-            Err(err) if err.code == ERR_TIER_NOT_FOUND.code => return Ok(()),
-            Err(err) => return Err(err),
-        };
+        if force && !self.tiers.contains_key(tier_name) {
+            return Ok(());
+        }
         if !force {
+            let driver = match self.get_driver(tier_name).await {
+                Ok(driver) => driver,
+                Err(err) if err.code == ERR_TIER_NOT_FOUND.code => return Ok(()),
+                Err(err) => return Err(err),
+            };
             match driver.in_use().await {
                 Err(err) => {
                     let mut e = ERR_TIER_PERM_ERR.clone();
@@ -8819,8 +8822,9 @@ mod tests {
     #[tokio::test]
     async fn test_remove_unknown_tier_is_idempotent() {
         let mut mgr = empty_mgr();
-        // Unknown tier: get_driver returns NotFound, which `remove` swallows.
-        mgr.remove("NOPE", false).await.expect("removing an unknown tier is a no-op");
+        for force in [false, true] {
+            mgr.remove("NOPE", force).await.expect("removing an unknown tier is a no-op");
+        }
     }
 
     #[tokio::test]
@@ -8883,6 +8887,68 @@ mod tests {
         mgr.remove("COLD-A", true).await.expect("force remove must not probe in_use");
         assert!(!mgr.tiers.contains_key("COLD-A"));
         assert!(!mgr.driver_cache.contains_key("COLD-A"));
+    }
+
+    #[tokio::test]
+    async fn test_remove_force_skips_uncached_driver_construction() {
+        let mut mgr = empty_mgr();
+        let mut tier = build_s3_tier("COLD-A");
+        tier.s3.as_mut().expect("S3 fixture must have a backend").endpoint = "https://169.254.169.254".to_string();
+        mgr.tiers.insert("COLD-A".to_string(), tier);
+        assert!(mgr.driver_cache.is_empty());
+
+        let err = mgr
+            .remove("COLD-A", false)
+            .await
+            .expect_err("non-force removal must retain endpoint validation");
+        assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
+        assert!(err.message.contains("tier endpoint is not allowed"), "{}", err.message);
+        assert!(mgr.tiers.contains_key("COLD-A"));
+        assert!(mgr.driver_cache.is_empty());
+
+        mgr.remove("COLD-A", true)
+            .await
+            .expect("force removal must not construct a driver for the forbidden endpoint");
+        assert!(!mgr.tiers.contains_key("COLD-A"));
+        assert!(mgr.driver_cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persisted_private_tiers_rebuild_uncached_drivers_without_rebinding() {
+        let endpoint = "https://192.168.10.200:9000";
+        for provider in ["s3", "minio", "rustfs"] {
+            let tier: TierConfig = serde_json::from_value(serde_json::json!({
+                "type": provider,
+                "name": "COLD-A",
+                (provider): {
+                    "name": "COLD-A",
+                    "endpoint": endpoint,
+                    "accessKey": "access",
+                    "secretKey": "secret",
+                    "bucket": "tier-bucket",
+                    "prefix": "archive",
+                    "region": "us-east-1"
+                }
+            }))
+            .expect("private tier fixture must decode");
+            let identity = tier_backend_identity(&tier).expect("private tier identity must encode");
+            let mut persisted = empty_mgr();
+            persisted.tiers.insert("COLD-A".to_string(), tier);
+            let blob = encode_external_tiering_config_blob(&persisted).expect("private tier config must persist");
+            let mut loaded = decode_external_tiering_config_blob(&blob).expect("private tier config must reload");
+            assert!(loaded.driver_cache.is_empty(), "{provider} reload must start with a cold cache");
+
+            loaded
+                .get_driver("COLD-A")
+                .await
+                .expect("a persisted private tier must construct its driver without editing its endpoint");
+            assert!(loaded.driver_cache.contains_key("COLD-A"));
+            let config = &loaded.tiers["COLD-A"];
+            assert_eq!(config.name, "COLD-A");
+            assert_eq!(tier_backend_identity(config).expect("reloaded identity must encode"), identity);
+            let wire = serde_json::to_value(config).expect("reloaded tier must serialize");
+            assert_eq!(wire[provider]["endpoint"], endpoint, "{provider} endpoint must remain unchanged");
+        }
     }
 
     #[tokio::test]
@@ -16154,6 +16220,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn force_remove_uncached_invalid_endpoint_preserves_persisted_reference_proof() {
+        for has_free_version in [false, true] {
+            let store = Arc::new(CasConfigStore::default());
+            let mut tier = build_rustfs_tier("COLD-A");
+            tier.rustfs.as_mut().expect("RustFS fixture must have a backend").endpoint = "https://169.254.169.254".to_string();
+            let identity = tier_backend_identity(&tier).expect("forbidden endpoint must retain a valid backend identity");
+            let mut persisted = empty_mgr();
+            persisted.tiers.insert("COLD-A".to_string(), tier.clone_with_credentials());
+            persisted
+                .save_tiering_config_if_current(store.clone(), None)
+                .await
+                .expect("cold-cache remove fixture must persist");
+            let (_, original_version) = load_tier_config_for_update(store.clone())
+                .await
+                .expect("original config version must load");
+            if has_free_version {
+                let mut object = transitioned_tier_object("photos", "free-version.jpg", "COLD-A", Some(identity));
+                object.transitioned_object.status = "pending".to_string();
+                object.transitioned_object.free_version = true;
+                store.add_listed_version(object);
+            }
+            let manager = TierConfigMgr::new();
+            manager.write().await.tiers.insert("COLD-A".to_string(), tier);
+            assert!(manager.read().await.driver_cache.is_empty());
+
+            let result = TierConfigMgr::remove_and_save_with(&manager, store.clone(), "COLD-A", true).await;
+            if has_free_version {
+                match result.expect_err("a free-version reference must block force removal without constructing a driver") {
+                    TierConfigUpdateError::Publish(err) => {
+                        assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
+                        assert!(err.message.contains("photos/free-version.jpg"), "{}", err.message);
+                    }
+                    other => panic!("reference proof must surface as a publish error: {other:?}"),
+                }
+            } else {
+                result.expect("force removal without references must persist despite a forbidden endpoint");
+            }
+
+            {
+                let live = manager.read().await;
+                assert_eq!(live.tiers.contains_key("COLD-A"), has_free_version);
+                assert!(live.driver_cache.is_empty());
+            }
+            let (loaded, current_version) = load_tier_config_for_update(store)
+                .await
+                .expect("post-removal config must reload");
+            assert_eq!(loaded.tiers.contains_key("COLD-A"), has_free_version);
+            if has_free_version {
+                assert_eq!(current_version, original_version, "blocked removal must not save the candidate");
+                assert_eq!(
+                    tier_backend_identity(&loaded.tiers["COLD-A"]).expect("preserved tier identity must encode"),
+                    identity
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn zero_reference_proof_blocks_remove_before_config_save() {
         let store = Arc::new(CasConfigStore::default());
         let tier = build_rustfs_tier("COLD-A");
@@ -17759,7 +17883,10 @@ mod tests {
                             TierConfigMgr::update_candidate_with_config_lock(
                                 &manager,
                                 store,
-                                TierCandidateMutation::Remove("COLD-A".to_string(), true),
+                                // Non-force removal still validates the remote driver before
+                                // entering reference proof; force removal intentionally skips
+                                // that construction so an invalid endpoint can be removed.
+                                TierCandidateMutation::Remove("COLD-A".to_string(), false),
                             ),
                         ),
                     ),

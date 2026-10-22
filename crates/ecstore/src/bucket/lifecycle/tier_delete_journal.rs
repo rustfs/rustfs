@@ -959,7 +959,7 @@ impl PersistedTierDeleteJournalEntry {
 
     fn into_jentry(self) -> Result<Jentry> {
         // Empty `version_id` is a legal sentinel for objects transitioned to an
-        // unversioned remote tier (see CLAUDE.md: a tier version of `None`/`""`
+        // unversioned remote tier (see AGENTS.md: a tier version of `None`/`""`
         // means the tier bucket is unversioned, so the remote delete is issued
         // without a versionId). Only reject entries missing the object or tier
         // name, which are always populated for a TRANSITION_COMPLETE object.

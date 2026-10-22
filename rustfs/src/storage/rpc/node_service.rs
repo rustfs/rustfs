@@ -591,6 +591,14 @@ pub struct NodeService {
     local_peer: LocalPeerS3Client,
     context: Option<Arc<runtime_sources::AppContext>>,
     server_ctx: Option<Arc<ServerContextSlot>>,
+    quota_topology_cache: std::sync::Mutex<Option<QuotaTopologyCacheEntry>>,
+    #[cfg(test)]
+    quota_topology_computations: std::sync::atomic::AtomicUsize,
+}
+
+struct QuotaTopologyCacheEntry {
+    store: std::sync::Weak<ECStore>,
+    fingerprint: String,
 }
 
 enum LocalMutationTarget {
@@ -710,6 +718,9 @@ pub fn make_server_for_context(context: Option<Arc<runtime_sources::AppContext>>
         local_peer,
         context,
         server_ctx: None,
+        quota_topology_cache: std::sync::Mutex::new(None),
+        #[cfg(test)]
+        quota_topology_computations: std::sync::atomic::AtomicUsize::new(0),
     }
 }
 
@@ -1711,7 +1722,7 @@ impl Node for NodeService {
         if !request.get_ref().bucket_incarnation_id.is_empty() {
             return Err(Status::invalid_argument("incarnation-bound rename requires RenameDataAtIncarnation"));
         }
-        self.handle_rename_data(request).await
+        self.handle_rename_data(request, false).await
     }
 
     async fn rename_data_at_incarnation(
@@ -1726,7 +1737,14 @@ impl Node for NodeService {
         {
             return Err(Status::invalid_argument("bucket incarnation must be a non-nil UUID"));
         }
-        self.handle_rename_data(request).await
+        self.handle_rename_data(request, false).await
+    }
+
+    async fn rename_data_with_quota_fence(
+        &self,
+        request: Request<RenameDataRequest>,
+    ) -> Result<Response<RenameDataResponse>, Status> {
+        self.handle_rename_data(request, true).await
     }
 
     async fn make_volumes(&self, request: Request<MakeVolumesRequest>) -> Result<Response<MakeVolumesResponse>, Status> {
@@ -1752,7 +1770,13 @@ impl Node for NodeService {
         &self,
         request: Request<SnapshotLeaseRequest>,
     ) -> Result<Response<SnapshotLeaseResponse>, Status> {
-        self.handle_acquire_snapshot_lease(request).await
+        self.handle_acquire_snapshot_lease(request, false).await
+    }
+    async fn acquire_quota_mutation_fence(
+        &self,
+        request: Request<SnapshotLeaseRequest>,
+    ) -> Result<Response<SnapshotLeaseResponse>, Status> {
+        self.handle_acquire_snapshot_lease(request, true).await
     }
     async fn renew_snapshot_lease(
         &self,
@@ -1764,7 +1788,13 @@ impl Node for NodeService {
         &self,
         request: Request<SnapshotLeaseReleaseRequest>,
     ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
-        self.handle_release_snapshot_lease(request).await
+        self.handle_release_snapshot_lease(request, false).await
+    }
+    async fn release_quota_mutation_fence(
+        &self,
+        request: Request<SnapshotLeaseReleaseRequest>,
+    ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
+        self.handle_release_snapshot_lease(request, true).await
     }
     async fn read_metadata(&self, request: Request<ReadMetadataRequest>) -> Result<Response<ReadMetadataResponse>, Status> {
         self.handle_read_metadata(request).await
@@ -2769,6 +2799,39 @@ impl Node for NodeService {
         }
     }
 
+    async fn peer_drive_admission(
+        &self,
+        request: Request<PeerDriveAdmissionRequest>,
+    ) -> Result<Response<PeerDriveAdmissionResponse>, Status> {
+        let host = request.into_inner().host;
+        match crate::server::observe_peer_drive_admission(&host).await {
+            Ok(drives) => Ok(Response::new(PeerDriveAdmissionResponse {
+                success: true,
+                drives: drives
+                    .into_iter()
+                    .map(|drive| PeerDriveAdmission {
+                        pool_index: drive.pool_index,
+                        set_index: drive.set_index,
+                        disk_index: drive.disk_index,
+                        online: drive.online,
+                        runtime_state: drive.runtime_state,
+                        host_online: drive.host_online,
+                    })
+                    .collect(),
+                error_info: None,
+                error_code: None,
+            })),
+            Err(err) => Ok(Response::new(PeerDriveAdmissionResponse {
+                success: false,
+                drives: Vec::new(),
+                error_info: Some(err.to_string()),
+                error_code: err
+                    .not_initialized()
+                    .then_some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
+            })),
+        }
+    }
+
     async fn get_metacache_listing(
         &self,
         _request: Request<GetMetacacheListingRequest>,
@@ -3112,9 +3175,10 @@ mod tests {
     use tonic::{Request, Response, Status};
     use uuid::Uuid;
 
-    const DISK_MUTATION_RPC_METHODS: [&str; 26] = [
+    const DISK_MUTATION_RPC_METHODS: [&str; 29] = [
         "renamedata",
         "renamedataatincarnation",
+        "renamedatawithquotafence",
         "writemetadataatincarnation",
         "deleteatincarnation",
         "deleteversionatincarnation",
@@ -3137,8 +3201,10 @@ mod tests {
         "makevolume",
         "makevolumes",
         "acquiresnapshotlease",
+        "acquirequotamutationfence",
         "renewsnapshotlease",
         "releasesnapshotlease",
+        "releasequotamutationfence",
     ];
 
     fn normalized_rpc_method(method: &str) -> String {
@@ -4304,10 +4370,54 @@ mod tests {
         }])
     }
 
+    fn quota_two_pool_topologies() -> (EndpointServerPools, EndpointServerPools) {
+        let mut original = heal_control_test_endpoints("node-d").as_ref().to_vec();
+        let mut second = heal_control_test_endpoints("node-e").as_ref()[0].clone();
+        for (index, endpoint) in second.endpoints.as_mut().iter_mut().enumerate() {
+            *endpoint = Endpoint::try_from(format!("http://other-node-{index}:9000/disk{}", index + 1).as_str())
+                .expect("disjoint second pool endpoint");
+            endpoint.set_set_index(index / 2);
+            endpoint.set_disk_index(index % 2);
+        }
+        original.push(second);
+        let reindex = |pools: &mut Vec<PoolEndpoints>| {
+            for (index, pool) in pools.iter_mut().enumerate() {
+                for endpoint in pool.endpoints.as_mut() {
+                    endpoint.set_pool_index(index);
+                }
+            }
+        };
+        reindex(&mut original);
+        let mut swapped = original.clone();
+        swapped.swap(0, 1);
+        reindex(&mut swapped);
+        (EndpointServerPools::from(original), EndpointServerPools::from(swapped))
+    }
+
+    #[test]
+    fn quota_topology_fingerprint_binds_pool_order_after_reindexing() {
+        let (original, swapped) = quota_two_pool_topologies();
+        assert_ne!(
+            heal_topology_fingerprint(&original).expect("valid original pools"),
+            heal_topology_fingerprint(&swapped).expect("valid reordered pools"),
+            "different pool zero lock owners must not share a quota coordinator identity"
+        );
+    }
+
     fn mark_v2_authenticated<T>(request: &mut Request<T>) {
         request
             .metadata_mut()
             .insert("x-rustfs-rpc-auth-version", "2".parse().expect("valid metadata value"));
+    }
+
+    fn sign_quota_test_request<T>(request: &mut Request<T>, body: &[u8], topology: &str) {
+        request.metadata_mut().insert(
+            rustfs_protos::QUOTA_MUTATION_TOPOLOGY_HEADER,
+            topology.parse().expect("quota topology metadata"),
+        );
+        let body = rustfs_protos::canonical_quota_mutation_request_body(topology, body).expect("quota topology envelope");
+        set_tonic_canonical_body_digest(request, &body).expect("quota request digest");
+        mark_v2_authenticated(request);
     }
 
     fn signed_tier_prepare_request(mutation_id: uuid::Uuid, canonical_payload: Bytes) -> Request<TierMutationPrepareRequest> {
@@ -4513,6 +4623,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orphan_data_dir_probe_requires_body_bound_authentication() {
+        let service = make_server();
+        let operation = crate::storage::storage_api::DeleteRecoveryRpcOperation::InspectOrphanDataDir {
+            path: format!("object/{}", uuid::Uuid::new_v4()),
+        };
+        let message = RecoverDeleteTransactionRequest {
+            disk: "unknown".into(),
+            volume: "bucket".into(),
+            protocol_version: 1,
+            operation: rmp_serde::to_vec_named(&operation).expect("encode orphan probe").into(),
+        };
+        let error = service
+            .recover_delete_transaction(Request::new(message.clone()))
+            .await
+            .expect_err("unsigned probe must fail");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        let mut tampered = Request::new(message.clone());
+        let body = rustfs_protos::canonical_recover_delete_transaction_request_body(tampered.get_ref()).expect("canonical probe");
+        set_tonic_canonical_body_digest(&mut tampered, &body).expect("probe digest");
+        mark_v2_authenticated(&mut tampered);
+        tampered.get_mut().volume = "other-bucket".into();
+        let error = service
+            .recover_delete_transaction(tampered)
+            .await
+            .expect_err("bucket scope must be body-bound");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        let mut signed = Request::new(message);
+        set_tonic_canonical_body_digest(&mut signed, &body).expect("probe digest");
+        mark_v2_authenticated(&mut signed);
+        let result = service
+            .recover_delete_transaction(signed)
+            .await
+            .expect("signed probe reaches disk lookup")
+            .into_inner();
+        assert!(!result.success);
+        assert!(result.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_exists_requires_body_bound_authentication() {
+        use crate::storage::storage_api::DeleteRecoveryRpcOperation;
+        let service = make_server();
+        let operation = DeleteRecoveryRpcOperation::Exists {
+            object: "object".to_owned(),
+        };
+        let message = RecoverDeleteTransactionRequest {
+            disk: "unknown".into(),
+            volume: "bucket".into(),
+            protocol_version: 1,
+            operation: rmp_serde::to_vec_named(&operation).expect("encode existence probe").into(),
+        };
+        let error = service
+            .recover_delete_transaction(Request::new(message.clone()))
+            .await
+            .expect_err("unsigned existence probe must fail");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        for change_object in [false, true] {
+            let mut request = Request::new(message.clone());
+            let body = rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref())
+                .expect("canonical existence probe");
+            set_tonic_canonical_body_digest(&mut request, &body).expect("existence digest");
+            mark_v2_authenticated(&mut request);
+            if change_object {
+                request.get_mut().operation = rmp_serde::to_vec_named(&DeleteRecoveryRpcOperation::Exists {
+                    object: "other-object".to_owned(),
+                })
+                .expect("encode changed key")
+                .into();
+            } else {
+                request.get_mut().volume = "other-bucket".into();
+            }
+            let error = service
+                .recover_delete_transaction(request)
+                .await
+                .expect_err("bucket and exact-key scopes must be body-bound");
+            assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        }
+        let mut request = Request::new(message);
+        let body = rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref())
+            .expect("canonical existence probe");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("existence digest");
+        mark_v2_authenticated(&mut request);
+        let result = service
+            .recover_delete_transaction(request)
+            .await
+            .expect("signed probe reaches disk lookup")
+            .into_inner();
+        assert!(!result.success, "an unavailable disk cannot establish absence");
+        assert!(result.error.is_some());
+    }
+
+    #[tokio::test]
     async fn delete_recovery_requires_digest_and_valid_protocol_payload() {
         let service = make_server();
         let operation = crate::storage::storage_api::DeleteRecoveryRpcOperation::Discover {
@@ -4605,8 +4807,16 @@ mod tests {
                 // lookup, so it must NOT fail with PermissionDenied.
                 let mut ok = Request::new(msg.clone());
                 let body = $canonical(ok.get_ref()).expect("canonical body should encode");
-                set_tonic_canonical_body_digest(&mut ok, &body).expect("digest metadata should encode");
-                mark_v2_authenticated(&mut ok);
+                let quota_method = matches!(
+                    stringify!($method),
+                    "acquire_quota_mutation_fence" | "release_quota_mutation_fence" | "rename_data_with_quota_fence"
+                );
+                if quota_method {
+                    sign_quota_test_request(&mut ok, &body, &"a".repeat(64));
+                } else {
+                    set_tonic_canonical_body_digest(&mut ok, &body).expect("digest metadata should encode");
+                    mark_v2_authenticated(&mut ok);
+                }
                 if let Err(status) = service.$method(ok).await {
                     assert_ne!(
                         status.code(),
@@ -4617,8 +4827,13 @@ mod tests {
 
                 // Mismatched digest: the gate must reject before any disk work.
                 let mut bad = Request::new(msg);
-                set_tonic_canonical_body_digest(&mut bad, b"unrelated-canonical-body").expect("digest metadata should encode");
-                mark_v2_authenticated(&mut bad);
+                if quota_method {
+                    sign_quota_test_request(&mut bad, b"unrelated-canonical-body", &"a".repeat(64));
+                } else {
+                    set_tonic_canonical_body_digest(&mut bad, b"unrelated-canonical-body")
+                        .expect("digest metadata should encode");
+                    mark_v2_authenticated(&mut bad);
+                }
                 let err = service
                     .$method(bad)
                     .await
@@ -4643,6 +4858,15 @@ mod tests {
                 dst_path: "dp".into(),
                 file_info_bin: vec![0x80].into(),
                 scanner_publication_lease_token: Vec::new().into(),
+            },
+            rustfs_protos::canonical_rename_data_request_body
+        );
+        assert_gated!(
+            rename_data_with_quota_fence,
+            RenameDataRequest {
+                disk: disk.clone(),
+                file_info: "{}".into(),
+                ..Default::default()
             },
             rustfs_protos::canonical_rename_data_request_body
         );
@@ -4799,6 +5023,16 @@ mod tests {
             rustfs_protos::canonical_snapshot_lease_request_body
         );
         assert_gated!(
+            acquire_quota_mutation_fence,
+            SnapshotLeaseRequest {
+                disk: disk.clone(),
+                volume: ".rustfs.sys".into(),
+                path: format!("tmp/quota-mutation-fences/{}", "a".repeat(64)),
+                ttl_ms: 60_000,
+            },
+            rustfs_protos::canonical_snapshot_lease_request_body
+        );
+        assert_gated!(
             renew_snapshot_lease,
             SnapshotLeaseRenewRequest {
                 disk: disk.clone(),
@@ -4816,6 +5050,16 @@ mod tests {
                 volume: "v".into(),
                 path: "p".into(),
                 token: vec![1; 16].into(),
+            },
+            rustfs_protos::canonical_snapshot_lease_release_request_body
+        );
+        assert_gated!(
+            release_quota_mutation_fence,
+            SnapshotLeaseReleaseRequest {
+                disk: disk.clone(),
+                volume: ".rustfs.sys".into(),
+                path: format!("tmp/quota-mutation-fences/{}", "a".repeat(64)),
+                token: vec![0; 16].into(),
             },
             rustfs_protos::canonical_snapshot_lease_release_request_body
         );
@@ -4914,6 +5158,254 @@ mod tests {
         assert_eq!(
             covered_methods, expected_methods,
             "the disk mutation exclusion set must exactly match handlers exercised by the independent digest test",
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_fence_handlers_reject_unsigned_requests_wrong_scopes_and_invalid_tokens() {
+        use crate::storage::storage_api::ecstore_disk::QUOTA_MUTATION_FENCE_METADATA_SUFFIX;
+        use rustfs_filemeta::FileInfo;
+
+        let service = super::make_server_for_slot(super::ServerContextSlot::new());
+        macro_rules! signed {
+            ($message:expr, $canonical:path) => {{
+                let mut request = Request::new($message);
+                let body = $canonical(request.get_ref()).expect("quota request canonical body");
+                sign_quota_test_request(&mut request, &body, &"a".repeat(64));
+                request
+            }};
+        }
+        assert_eq!(
+            service
+                .acquire_quota_mutation_fence(Request::new(SnapshotLeaseRequest::default()))
+                .await
+                .expect_err("unsigned acquire")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            service
+                .release_quota_mutation_fence(Request::new(SnapshotLeaseReleaseRequest::default()))
+                .await
+                .expect_err("unsigned release")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            service
+                .rename_data_with_quota_fence(Request::new(RenameDataRequest::default()))
+                .await
+                .expect_err("unsigned rename")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+
+        for (volume, path) in [
+            ("bucket", format!("tmp/quota-mutation-fences/{}", "a".repeat(64))),
+            (".rustfs.sys", "tmp/quota-mutation-fences/not-a-digest".to_string()),
+        ] {
+            let acquire = SnapshotLeaseRequest {
+                volume: volume.into(),
+                path: path.clone(),
+                ..Default::default()
+            };
+            let release = SnapshotLeaseReleaseRequest {
+                volume: volume.into(),
+                path,
+                token: vec![0; 16].into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                service
+                    .acquire_quota_mutation_fence(signed!(acquire, rustfs_protos::canonical_snapshot_lease_request_body))
+                    .await
+                    .expect_err("invalid acquire scope")
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+            assert_eq!(
+                service
+                    .release_quota_mutation_fence(signed!(release, rustfs_protos::canonical_snapshot_lease_release_request_body))
+                    .await
+                    .expect_err("invalid release scope")
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+
+        for token in [None, Some("not-a-uuid".to_string()), Some(Uuid::nil().to_string())] {
+            let mut file_info = FileInfo::default();
+            if let Some(token) = token {
+                rustfs_utils::http::metadata_compat::insert_str(
+                    &mut file_info.metadata,
+                    QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+                    token,
+                );
+            }
+            let message = RenameDataRequest {
+                file_info: serde_json::to_string(&file_info).expect("file info"),
+                ..Default::default()
+            };
+            assert_eq!(
+                service
+                    .rename_data_with_quota_fence(signed!(message, rustfs_protos::canonical_rename_data_request_body))
+                    .await
+                    .expect_err("invalid quota token")
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+        let mut file_info = FileInfo::default();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut file_info.metadata,
+            QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+            Uuid::new_v4().to_string(),
+        );
+        file_info.metadata.insert(
+            format!("x-minio-internal-{QUOTA_MUTATION_FENCE_METADATA_SUFFIX}"),
+            Uuid::new_v4().to_string(),
+        );
+        let conflicting = RenameDataRequest {
+            file_info: serde_json::to_string(&file_info).expect("file info"),
+            ..Default::default()
+        };
+        assert_eq!(
+            service
+                .rename_data_with_quota_fence(signed!(conflicting, rustfs_protos::canonical_rename_data_request_body))
+                .await
+                .expect_err("conflicting quota tokens")
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+
+        let path = format!("tmp/quota-mutation-fences/{}", "a".repeat(64));
+        let acquire = SnapshotLeaseRequest {
+            volume: ".rustfs.sys".into(),
+            path: path.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            service
+                .acquire_quota_mutation_fence(signed!(acquire, rustfs_protos::canonical_snapshot_lease_request_body))
+                .await
+                .expect_err("quota acquire requires a captured ready target")
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        let release = SnapshotLeaseReleaseRequest {
+            volume: ".rustfs.sys".into(),
+            path,
+            token: vec![0; 16].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            service
+                .release_quota_mutation_fence(signed!(release, rustfs_protos::canonical_snapshot_lease_release_request_body))
+                .await
+                .expect_err("quota release requires a captured ready target")
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut file_info.metadata,
+            QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+            Uuid::new_v4().to_string(),
+        );
+        let valid = RenameDataRequest {
+            file_info: serde_json::to_string(&file_info).expect("file info"),
+            ..Default::default()
+        };
+        assert_eq!(
+            service
+                .rename_data_with_quota_fence(signed!(valid, rustfs_protos::canonical_rename_data_request_body))
+                .await
+                .expect_err("quota rename requires a captured ready target")
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_fence_handlers_reject_missing_duplicate_malformed_and_tampered_topology() {
+        let service = super::make_server_for_slot(super::ServerContextSlot::new());
+        macro_rules! rejects_invalid_topology {
+            ($method:ident, $message:expr, $canonical:path) => {{
+                for case in [
+                    "missing",
+                    "duplicate",
+                    "empty",
+                    "short",
+                    "uppercase",
+                    "nonhex",
+                    "tampered",
+                    "v1",
+                ] {
+                    let mut request = Request::new($message);
+                    let body = $canonical(request.get_ref()).expect("quota canonical body");
+                    sign_quota_test_request(&mut request, &body, &"a".repeat(64));
+                    let header = rustfs_protos::QUOTA_MUTATION_TOPOLOGY_HEADER;
+                    match case {
+                        "missing" => {
+                            request.metadata_mut().remove(header);
+                        }
+                        "duplicate" => {
+                            request
+                                .metadata_mut()
+                                .append(header, "a".repeat(64).parse().expect("header"));
+                        }
+                        "empty" => {
+                            request.metadata_mut().insert(header, "".parse().expect("header"));
+                        }
+                        "short" => {
+                            request
+                                .metadata_mut()
+                                .insert(header, "a".repeat(63).parse().expect("header"));
+                        }
+                        "uppercase" => {
+                            request
+                                .metadata_mut()
+                                .insert(header, "A".repeat(64).parse().expect("header"));
+                        }
+                        "nonhex" => {
+                            request
+                                .metadata_mut()
+                                .insert(header, "g".repeat(64).parse().expect("header"));
+                        }
+                        "tampered" => {
+                            request
+                                .metadata_mut()
+                                .insert(header, "b".repeat(64).parse().expect("header"));
+                        }
+                        "v1" => {
+                            request
+                                .metadata_mut()
+                                .insert("x-rustfs-rpc-auth-version", "1".parse().expect("auth version"));
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert_eq!(
+                        service.$method(request).await.expect_err(case).code(),
+                        tonic::Code::PermissionDenied,
+                        "{} must reject {case} topology authentication before resolving a disk",
+                        stringify!($method)
+                    );
+                }
+            }};
+        }
+        rejects_invalid_topology!(
+            acquire_quota_mutation_fence,
+            SnapshotLeaseRequest::default(),
+            rustfs_protos::canonical_snapshot_lease_request_body
+        );
+        rejects_invalid_topology!(
+            release_quota_mutation_fence,
+            SnapshotLeaseReleaseRequest::default(),
+            rustfs_protos::canonical_snapshot_lease_release_request_body
+        );
+        rejects_invalid_topology!(
+            rename_data_with_quota_fence,
+            RenameDataRequest::default(),
+            rustfs_protos::canonical_rename_data_request_body
         );
     }
 
@@ -6230,7 +6722,7 @@ mod tests {
                 "the standard builder must use this exact instance context"
             );
             super::timeout(Duration::from_secs(10), async {
-                while env.ecstore.scanner_data_usage_publication_blocked().await {
+                while env.ecstore.namespace_commits_pending_for_test() {
                     tokio::task::yield_now().await;
                 }
             })
@@ -6267,6 +6759,124 @@ mod tests {
         set_tonic_canonical_body_digest(&mut request, &body).expect("compare-and-update digest");
         mark_v2_authenticated(&mut request);
         request
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_exists_rpc_reports_exact_key_evidence_without_mutation() {
+        use crate::storage::storage_api::{DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply};
+        let fixture = target_rpc_fixture().await;
+        let set = fixture
+            .env
+            .ecstore
+            .all_set_disks()
+            .into_iter()
+            .next()
+            .expect("target erasure set");
+        let configured = set.disks.read().await.iter().find_map(Clone::clone).expect("configured disk");
+        let service = make_server_for_context(Some(fixture.context.clone()));
+        let disk = service
+            .find_disk(&configured.endpoint().to_string())
+            .await
+            .expect("RPC target disk");
+        let volume = "evidence-rpc";
+        disk.make_volume(volume).await.expect("create evidence bucket");
+        let record = format!("object/{}/delete-prepared", Uuid::new_v4());
+        disk.write_all(volume, &record, Bytes::from_static(b"unresolved recovery record"))
+            .await
+            .expect("write evidence");
+        for (object, expected) in [("object", true), ("other", false)] {
+            let mut request = Request::new(RecoverDeleteTransactionRequest {
+                disk: configured.endpoint().to_string(),
+                volume: volume.to_owned(),
+                protocol_version: 1,
+                operation: rmp_serde::to_vec_named(&DeleteRecoveryRpcOperation::Exists {
+                    object: object.to_owned(),
+                })
+                .expect("encode existence probe")
+                .into(),
+            });
+            let body = rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref())
+                .expect("canonical existence probe");
+            set_tonic_canonical_body_digest(&mut request, &body).expect("existence digest");
+            mark_v2_authenticated(&mut request);
+            let response = service
+                .recover_delete_transaction(request)
+                .await
+                .expect("existence RPC response")
+                .into_inner();
+            assert!(response.success, "existence RPC failed: {:?}", response.error);
+            assert!(matches!(
+                rustfs_protos::decode_delete_recovery_payload::<DeleteRecoveryRpcReply>(&response.result).expect("decode evidence reply"),
+                DeleteRecoveryRpcReply::Evidence { present } if present == expected
+            ));
+        }
+        assert_eq!(
+            disk.read_all(volume, &record).await.expect("read retained evidence"),
+            b"unresolved recovery record"[..]
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_data_dir_delete_rpc_reports_snapshot_deferral_as_pending() {
+        let fixture = target_rpc_fixture().await;
+        let set = fixture
+            .env
+            .ecstore
+            .all_set_disks()
+            .into_iter()
+            .next()
+            .expect("target erasure set");
+        let configured = set.disks.read().await.iter().find_map(Clone::clone).expect("configured disk");
+        let service = make_server_for_context(Some(fixture.context.clone()));
+        let disk = service
+            .find_disk(&configured.endpoint().to_string())
+            .await
+            .expect("RPC target disk");
+        let volume = "orphan-rpc";
+        disk.make_volume(volume).await.expect("create orphan bucket");
+        let mut info = rustfs_filemeta::FileInfo::new("object", 1, 1);
+        info.data_dir = Some(Uuid::new_v4());
+        info.mod_time = Some(OffsetDateTime::now_utc());
+        info.size = 1;
+        let mut metadata = rustfs_filemeta::FileMeta::default();
+        metadata.add_version(info).expect("add parent version");
+        disk.write_all(volume, "object/xl.meta", metadata.marshal_msg().expect("encode parent metadata").into())
+            .await
+            .expect("write parent metadata");
+        let path = format!("object/{}", Uuid::new_v4());
+        disk.write_all(volume, &format!("{path}/part.1"), Bytes::from_static(b"snapshot payload"))
+            .await
+            .expect("write orphan payload");
+        let token = disk.acquire_snapshot_lease(volume, &path).await.expect("acquire snapshot");
+        let mut request = Request::new(DeleteRequest {
+            disk: configured.endpoint().to_string(),
+            volume: volume.into(),
+            path: path.clone(),
+            options: serde_json::to_string(&crate::storage::storage_api::DeleteOptions {
+                orphan_data_dir: true,
+                immediate: true,
+                ..Default::default()
+            })
+            .expect("encode orphan options"),
+            ..Default::default()
+        });
+        let body = rustfs_protos::canonical_delete_request_body(request.get_ref()).expect("canonical orphan delete");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("delete digest");
+        mark_v2_authenticated(&mut request);
+        let reply = service.delete(request).await.expect("run delete handler").into_inner();
+        assert!(!reply.success, "the legacy RPC must not report deferred reclamation as completed");
+        let error: DiskError = reply.error.expect("pending error code").into();
+        assert_eq!(error, DiskError::DiskOngoingReq);
+        assert_eq!(
+            disk.read_all(volume, &format!("{path}/part.1"))
+                .await
+                .expect("read retained snapshot"),
+            b"snapshot payload"[..]
+        );
+        disk.release_snapshot_lease(volume, &path, token)
+            .await
+            .expect("release completes safe cleanup");
+        assert!(matches!(disk.list_dir("", volume, &path, 1).await, Err(DiskError::FileNotFound)));
     }
 
     #[tokio::test]
@@ -7101,6 +7711,218 @@ mod tests {
         request
     }
 
+    fn target_quota_rename_request(
+        disk: &super::DiskStore,
+        fi: &rustfs_filemeta::FileInfo,
+        topology: &str,
+    ) -> Request<RenameDataRequest> {
+        let mut request = target_rename_request(disk, fi);
+        let body = rustfs_protos::canonical_rename_data_request_body(request.get_ref()).expect("quota rename body");
+        sign_quota_test_request(&mut request, &body, topology);
+        request
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn quota_fence_handlers_commit_real_data_and_drain_before_revocation() {
+        use crate::storage::storage_api::{
+            LocalPublicationPause, LocalPublicationStage,
+            ecstore_disk::{DiskAPI, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, ReadOptions},
+        };
+        use sha2::{Digest, Sha256};
+
+        let fixture = target_rpc_fixture().await;
+        // Mirror server startup: the disk fixture builds the store but leaves
+        // its write-once instance topology for the listener to initialize.
+        fixture.instance.set_endpoints(fixture.env.endpoint_pools.clone());
+        let (disk, mut fi, _) = stage_target_rpc(&fixture).await;
+        let service = make_server_for_context(Some(fixture.context.clone()));
+        let topology =
+            super::heal::heal_topology_fingerprint(&fixture.env.ecstore.instance_endpoints().expect("target topology"))
+                .expect("target fingerprint");
+        let _without_proof = crate::storage::storage_api::ecstore_notification::without_cross_pool_fence_fleet_proof_for_test();
+        let path = format!(
+            "tmp/quota-mutation-fences/{}",
+            rustfs_utils::crypto::hex(Sha256::digest(b"target-rpc\0destination"))
+        );
+        assert!(crate::storage::storage_api::ecstore_notification::acquire_cross_pool_fence_fleet_proof().is_none());
+        let (_, swapped) = quota_two_pool_topologies();
+        let wrong_topology = heal_topology_fingerprint(&swapped).expect("reordered pool fingerprint");
+        assert_ne!(wrong_topology, topology);
+        let set = fixture
+            .env
+            .ecstore
+            .all_set_disks()
+            .into_iter()
+            .next()
+            .expect("quota erasure set");
+        let disks = set.disks.read().await.iter().filter_map(Clone::clone).collect::<Vec<_>>();
+        assert_eq!(disks.len(), 4);
+        let mut successful = 0;
+        for participant in &disks {
+            let message = SnapshotLeaseRequest {
+                disk: participant.endpoint().to_string(),
+                volume: RUSTFS_META_BUCKET.to_string(),
+                path: path.clone(),
+                ttl_ms: 60_000,
+            };
+            let mut wrong = Request::new(message.clone());
+            let body = rustfs_protos::canonical_snapshot_lease_request_body(wrong.get_ref()).expect("acquire body");
+            sign_quota_test_request(&mut wrong, &body, &wrong_topology);
+            assert_eq!(
+                service
+                    .acquire_quota_mutation_fence(wrong)
+                    .await
+                    .expect_err("wrong layout must not issue a token")
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+            let mut correct = Request::new(message);
+            sign_quota_test_request(&mut correct, &body, &topology);
+            let response = service
+                .acquire_quota_mutation_fence(correct)
+                .await
+                .expect("same layout acquire")
+                .into_inner();
+            assert!(response.success, "same layout participant must issue a token: {:?}", response.error);
+            successful += 1;
+        }
+        assert_eq!(
+            successful, 4,
+            "correct topology admits every available quorum participant without a fleet proof"
+        );
+        let acquire_message = SnapshotLeaseRequest {
+            disk: disk.endpoint().to_string(),
+            volume: RUSTFS_META_BUCKET.to_string(),
+            path: path.clone(),
+            ttl_ms: 60_000,
+        };
+        let acquire_request = || {
+            let mut request = Request::new(acquire_message.clone());
+            let body = rustfs_protos::canonical_snapshot_lease_request_body(request.get_ref()).expect("acquire body");
+            sign_quota_test_request(&mut request, &body, &topology);
+            request
+        };
+        let acquired = service
+            .acquire_quota_mutation_fence(acquire_request())
+            .await
+            .expect("production quota acquire handler")
+            .into_inner();
+        assert!(acquired.success, "real quota fence must be acquired: {:?}", acquired.error);
+        let token = Uuid::from_slice(&acquired.token).expect("quota token UUID");
+        assert!(!token.is_nil());
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut fi.metadata,
+            QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+            token.to_string(),
+        );
+        let mut wrong_release = Request::new(SnapshotLeaseReleaseRequest {
+            disk: disk.endpoint().to_string(),
+            volume: RUSTFS_META_BUCKET.to_string(),
+            path: path.clone(),
+            token: vec![0; 16].into(),
+        });
+        let body = rustfs_protos::canonical_snapshot_lease_release_request_body(wrong_release.get_ref()).expect("release body");
+        sign_quota_test_request(&mut wrong_release, &body, &wrong_topology);
+        assert_eq!(
+            service
+                .release_quota_mutation_fence(wrong_release)
+                .await
+                .expect_err("wrong topology must not revoke")
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            service
+                .rename_data_with_quota_fence(target_quota_rename_request(&disk, &fi, &wrong_topology))
+                .await
+                .expect_err("wrong topology must not publish")
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert!(disk.path().join("target-rpc/staged/xl.meta").exists());
+        assert!(!disk.path().join("target-rpc/destination/xl.meta").exists());
+        // The following publication uses the same token: rejecting the wrong
+        // topology must neither revoke it nor consume the staged object.
+        let mut pause =
+            LocalPublicationPause::install(&disk, "target-rpc", "destination/xl.meta", LocalPublicationStage::PreparedRename)
+                .expect("pause the real quota publication");
+        let mut rename = Box::pin(service.rename_data_with_quota_fence(target_quota_rename_request(&disk, &fi, &topology)));
+        super::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                result = &mut rename => panic!("quota rename finished before the physical pause: {result:?}"),
+                entered = pause.entered() => entered.expect("quota rename reached physical publication"),
+            }
+        })
+        .await
+        .expect("bounded quota publication entry");
+
+        let mut request = Request::new(SnapshotLeaseReleaseRequest {
+            disk: disk.endpoint().to_string(),
+            volume: RUSTFS_META_BUCKET.to_string(),
+            path,
+            token: vec![0; 16].into(),
+        });
+        let body = rustfs_protos::canonical_snapshot_lease_release_request_body(request.get_ref()).expect("release body");
+        sign_quota_test_request(&mut request, &body, &topology);
+        let mut revoke = Box::pin(service.release_quota_mutation_fence(request));
+        super::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut revoke => panic!("revocation returned before the physical commit drained: {result:?}"),
+                    result = service.acquire_quota_mutation_fence(acquire_request()) => {
+                        if !result.expect("probe revoked quota fence").into_inner().success {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("revocation must reject new tokens while waiting for the active commit");
+        drop(pause);
+        let (renamed, revoked) = super::timeout(Duration::from_secs(10), async { tokio::join!(rename, revoke) })
+            .await
+            .expect("quota publication and revocation drain");
+        let renamed = renamed.expect("quota rename response").into_inner();
+        assert!(renamed.success, "real quota rename must commit: {:?}", renamed.error);
+        let revoked = revoked.expect("quota revoke response").into_inner();
+        assert!(revoked.success, "real quota revoke must finish: {:?}", revoked.error);
+        let read = disk
+            .read_version(
+                "target-rpc",
+                "target-rpc",
+                "destination",
+                &fi.version_id.expect("version").to_string(),
+                &ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read quota RPC committed object");
+        assert_eq!(read.data, fi.data);
+        assert!(
+            !rustfs_utils::http::metadata_compat::contains_key_str(&read.metadata, QUOTA_MUTATION_FENCE_METADATA_SUFFIX),
+            "the transient quota token must not persist in object metadata"
+        );
+        disk.write_metadata("target-rpc", "target-rpc", "staged", fi.clone())
+            .await
+            .expect("restage valid data for a revoked-token replay");
+        let replay = service
+            .rename_data_with_quota_fence(target_quota_rename_request(&disk, &fi, &topology))
+            .await
+            .expect("revoked token replay response")
+            .into_inner();
+        assert!(!replay.success, "revoked quota token must not authorize another real rename");
+        assert!(
+            disk.path().join("target-rpc/staged/xl.meta").exists(),
+            "rejected replay must retain its staged input"
+        );
+    }
+
     #[tokio::test]
     async fn target_slot_rejects_mismatched_and_repeated_install_before_global_publication() {
         let fixture = target_rpc_fixture().await;
@@ -7211,7 +8033,7 @@ mod tests {
             before
         );
         assert!(!disk.path().join("target-rpc/destination").exists());
-        assert!(!fixture.env.ecstore.scanner_data_usage_publication_blocked().await);
+        assert!(!fixture.env.ecstore.namespace_commits_pending_for_test());
     }
 
     #[tokio::test]
@@ -7244,7 +8066,7 @@ mod tests {
                 .expect("source remains"),
             before
         );
-        assert!(!fixture.env.ecstore.scanner_data_usage_publication_blocked().await);
+        assert!(!fixture.env.ecstore.namespace_commits_pending_for_test());
     }
 
     #[cfg(not(windows))]
@@ -7471,12 +8293,12 @@ mod tests {
         .expect("bounded physical entry");
         drop(handler);
         assert!(
-            fixture.env.ecstore.scanner_data_usage_publication_blocked().await,
+            fixture.env.ecstore.namespace_commits_pending_for_test(),
             "dropping the actual target handler must not release its physical owner"
         );
         drop(pause);
         super::timeout(Duration::from_secs(10), async {
-            while fixture.env.ecstore.scanner_data_usage_publication_blocked().await {
+            while fixture.env.ecstore.namespace_commits_pending_for_test() {
                 tokio::task::yield_now().await;
             }
         })
@@ -7557,10 +8379,10 @@ mod tests {
         .await
         .expect("bounded physical restore entry");
         drop(handler);
-        assert!(fixture.env.ecstore.scanner_data_usage_publication_blocked().await);
+        assert!(fixture.env.ecstore.namespace_commits_pending_for_test());
         drop(pause);
         super::timeout(Duration::from_secs(10), async {
-            while fixture.env.ecstore.scanner_data_usage_publication_blocked().await {
+            while fixture.env.ecstore.namespace_commits_pending_for_test() {
                 tokio::task::yield_now().await;
             }
         })
@@ -7618,6 +8440,7 @@ mod tests {
                 platform: "test".to_string(),
             }]);
             let instance = new_instance_ctx();
+            instance.set_endpoints(pools.clone());
             init_local_disks_with_instance_ctx(&instance, pools.clone())
                 .await
                 .expect("register this instance's real disks");
@@ -7703,7 +8526,7 @@ mod tests {
             // Copy the complete internal trees, including erasure part data,
             // without editing disk IDs, cluster identity, epochs or pool topology.
             super::timeout(Duration::from_secs(10), async {
-                while store_b.scanner_data_usage_publication_blocked().await {
+                while store_b.namespace_commits_pending_for_test() {
                     tokio::task::yield_now().await;
                 }
             })
@@ -7726,7 +8549,7 @@ mod tests {
             }
             assert_eq!(internal_snapshot(root_a.path()).await, snapshot, "A must receive the complete physical snapshot");
             assert_eq!(internal_snapshot(root_b.path()).await, snapshot, "B's source snapshot must remain unchanged");
-            assert!(!store_b.scanner_data_usage_publication_blocked().await);
+            assert!(!store_b.namespace_commits_pending_for_test());
             assert_eq!(store_b.scanner_namespace_mutation_generation(), snapshot_generation);
             let store_a = build_store(root_a.path()).await;
             assert_eq!(
@@ -7741,8 +8564,13 @@ mod tests {
                 pool_identity,
                 "A must preserve the initialized cluster identity and epoch"
             );
-            let service = make_server_for_context(Some(context(&store_a).await));
-            assert!(Arc::ptr_eq(&service.resolve_object_store().expect("captured store"), &store_a));
+            let slot_a = super::ServerContextSlot::new();
+            slot_a.try_install(context(&store_a).await).expect("install captured instance A");
+            let service = super::make_server_for_slot(slot_a);
+            let super::LocalMutationTarget::Ready(captured_store) = service.local_mutation_target() else {
+                panic!("slot A must capture a ready mutation target");
+            };
+            assert!(Arc::ptr_eq(&captured_store, &store_a));
             assert!(Arc::ptr_eq(
                 &crate::runtime_sources::current_object_store_handle().expect("global store"),
                 &store_b
@@ -7758,6 +8586,64 @@ mod tests {
                 .await
                 .expect("global UUID lookup must resolve B before the request");
             assert!(Arc::ptr_eq(&global_disk, &disk_b));
+
+            let topology_a = heal_topology_fingerprint(&store_a.instance_endpoints().expect("A layout")).expect("A identity");
+            let topology_b = heal_topology_fingerprint(&store_b.instance_endpoints().expect("B layout")).expect("B identity");
+            assert_ne!(topology_a, topology_b, "the captured and ambient layouts use different physical paths");
+            let target_a = super::LocalMutationTarget::Ready(store_a.clone());
+            let target_b = super::LocalMutationTarget::Ready(store_b.clone());
+            for _ in 0..4 {
+                assert!(Arc::ptr_eq(service.quota_store_for_topology(&target_a, &topology_a).expect("cached A"), &store_a));
+            }
+            assert_eq!(service.quota_topology_computations.load(std::sync::atomic::Ordering::Relaxed), 1,
+                "repeated fanout requests for one captured instance must hash its topology only once");
+            assert!(Arc::ptr_eq(service.quota_store_for_topology(&target_b, &topology_b).expect("replacement B"), &store_b));
+            assert_eq!(service.quota_topology_computations.load(std::sync::atomic::Ordering::Relaxed), 2,
+                "a different Arc with the same deployment identity must replace the cache entry");
+            assert!(Arc::ptr_eq(service.quota_store_for_topology(&target_a, &topology_a).expect("return to A"), &store_a));
+            assert_eq!(service.quota_topology_computations.load(std::sync::atomic::Ordering::Relaxed), 3,
+                "the bounded single-entry cache must recompute after an instance switch");
+            let fence_path = format!("tmp/quota-mutation-fences/{}", "d".repeat(64));
+            let acquire = |topology: &str| {
+                let mut request = Request::new(SnapshotLeaseRequest {
+                    disk: disk_id.to_string(),
+                    volume: RUSTFS_META_BUCKET.to_string(),
+                    path: fence_path.clone(),
+                    ttl_ms: 60_000,
+                });
+                let body = rustfs_protos::canonical_snapshot_lease_request_body(request.get_ref()).expect("acquire body");
+                sign_quota_test_request(&mut request, &body, topology);
+                request
+            };
+            assert_eq!(
+                service.acquire_quota_mutation_fence(acquire(&topology_b)).await.expect_err("ambient layout must not authorize A").code(),
+                tonic::Code::FailedPrecondition
+            );
+            let response = service.acquire_quota_mutation_fence(acquire(&topology_a)).await.expect("captured acquire").into_inner();
+            assert!(response.success, "A must acquire its own token: {:?}", response.error);
+            let token_a = crate::storage::storage_api::SnapshotLeaseToken::from_slice(&response.token).expect("A token");
+            assert!(disk_b.renew_snapshot_lease(RUSTFS_META_BUCKET, &fence_path, token_a).await.is_err());
+            let token_a = disk_a.renew_snapshot_lease(RUSTFS_META_BUCKET, &fence_path, token_a).await.expect("token belongs to A");
+            let token_b = disk_b.acquire_snapshot_lease(RUSTFS_META_BUCKET, &fence_path).await.expect("independent B token");
+            let release = |topology: &str| {
+                let mut request = Request::new(SnapshotLeaseReleaseRequest {
+                    disk: disk_id.to_string(),
+                    volume: RUSTFS_META_BUCKET.to_string(),
+                    path: fence_path.clone(),
+                    token: vec![0; 16].into(),
+                });
+                let body = rustfs_protos::canonical_snapshot_lease_release_request_body(request.get_ref()).expect("release body");
+                sign_quota_test_request(&mut request, &body, topology);
+                request
+            };
+            assert_eq!(
+                service.release_quota_mutation_fence(release(&topology_b)).await.expect_err("ambient layout must not revoke A").code(),
+                tonic::Code::FailedPrecondition
+            );
+            let token_a = disk_a.renew_snapshot_lease(RUSTFS_META_BUCKET, &fence_path, token_a).await.expect("wrong layout did not revoke A");
+            assert!(service.release_quota_mutation_fence(release(&topology_a)).await.expect("captured release").into_inner().success);
+            assert!(disk_a.renew_snapshot_lease(RUSTFS_META_BUCKET, &fence_path, token_a).await.is_err());
+            assert!(disk_b.renew_snapshot_lease(RUSTFS_META_BUCKET, &fence_path, token_b).await.is_ok(), "A release must leave ambient B untouched");
 
             let volume = "namespace-target-context";
             let object = "destination";
@@ -7793,8 +8679,8 @@ mod tests {
             assert!(tokio::fs::try_exists(&a_staging).await.expect("A staging exists"));
             assert_ne!(a_before, b_before, "the old on-disk bodies must distinguish A from B");
             super::timeout(Duration::from_secs(10), async {
-                while store_a.scanner_data_usage_publication_blocked().await
-                    || store_b.scanner_data_usage_publication_blocked().await
+                while store_a.namespace_commits_pending_for_test()
+                    || store_b.namespace_commits_pending_for_test()
                 {
                     tokio::task::yield_now().await;
                 }
@@ -7843,8 +8729,8 @@ mod tests {
                 store_b.scanner_namespace_mutation_generation(),
             );
             let pending_after = (
-                store_a.scanner_data_usage_publication_blocked().await,
-                store_b.scanner_data_usage_publication_blocked().await,
+                store_a.namespace_commits_pending_for_test(),
+                store_b.namespace_commits_pending_for_test(),
             );
             for disk in store_a.disk_map.values().chain(store_b.disk_map.values()).flatten().flatten() {
                 disk.close().await.expect("close real fixture disk before assertions and directory cleanup");

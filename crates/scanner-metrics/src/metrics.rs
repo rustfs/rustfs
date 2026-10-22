@@ -13,6 +13,9 @@
 // limitations under the License.
 
 use crate::last_minute::{AccElem, LastMinuteLatency};
+use crate::usage_candidate::{
+    ScannerUsageCandidateCount, ScannerUsageCandidateKind, ScannerUsageCandidateOutcome, USAGE_CANDIDATE_COUNTER_SLOTS,
+};
 use chrono::{DateTime, Utc};
 use jiff::Timestamp;
 use rustfs_heal_contracts::heal_channel::HealScanMode;
@@ -919,6 +922,8 @@ pub struct Metrics {
     current_scan_cycle_yield_duration_millis_start: AtomicU64,
     current_scan_cycle_throttle_sleep_events_start: AtomicU64,
     current_scan_cycle_throttle_sleep_duration_millis_start: AtomicU64,
+    current_scan_cycle_disk_io_budget_wait_events_start: AtomicU64,
+    current_scan_cycle_disk_io_budget_wait_duration_millis_start: AtomicU64,
     current_scan_cycle_ilm_actions_start: AtomicU64,
     current_scan_cycle_lifecycle_expiry_actions_start: AtomicU64,
     current_scan_cycle_lifecycle_transition_actions_start: AtomicU64,
@@ -956,6 +961,8 @@ pub struct Metrics {
     last_scan_cycle_yield_duration_millis: AtomicU64,
     last_scan_cycle_throttle_sleep_events: AtomicU64,
     last_scan_cycle_throttle_sleep_duration_millis: AtomicU64,
+    last_scan_cycle_disk_io_budget_wait_events: AtomicU64,
+    last_scan_cycle_disk_io_budget_wait_duration_millis: AtomicU64,
     last_scan_cycle_ilm_actions: AtomicU64,
     last_scan_cycle_lifecycle_expiry_actions: AtomicU64,
     last_scan_cycle_lifecycle_transition_actions: AtomicU64,
@@ -971,6 +978,9 @@ pub struct Metrics {
     partial_scan_cycles_by_source: Vec<AtomicU64>,
     scanner_yield_duration_millis: AtomicU64,
     scanner_throttle_sleep_duration_millis: AtomicU64,
+    scanner_disk_io_budget_wait_events: AtomicU64,
+    scanner_disk_io_budget_wait_duration_millis: AtomicU64,
+    scanner_disk_io_budget_last_wait_unix_secs: AtomicU64,
     scanner_ilm_actions: AtomicU64,
     scanner_lifecycle_expiry_actions: AtomicU64,
     scanner_lifecycle_transition_actions: AtomicU64,
@@ -1027,11 +1037,18 @@ pub struct Metrics {
     scanner_dirty_usage_last_clear_unix_secs: AtomicU64,
     scanner_dirty_usage_last_cycle_dirty_buckets: AtomicU64,
     scanner_dirty_usage_last_cycle_cleared_buckets: AtomicU64,
+    usage_candidates: [AtomicU64; USAGE_CANDIDATE_COUNTER_SLOTS],
     scanner_usage_last_save_unix_secs: AtomicU64,
     scanner_usage_last_durable_success_unix_secs: AtomicU64,
     scanner_usage_last_publication_unix_secs: AtomicU64,
     scanner_usage_last_publication_state: Mutex<String>,
     scanner_usage_last_publication_reason: Mutex<String>,
+    scanner_guardrail_veto_total: AtomicU64,
+    scanner_guardrail_last_veto_unix_secs: AtomicU64,
+    scanner_guardrail_last_veto_reason: Mutex<String>,
+    scanner_scope_fallback_total: AtomicU64,
+    scanner_scope_fallback_last_unix_secs: AtomicU64,
+    scanner_scope_fallback_last_reason: Mutex<String>,
     scanner_usage_last_save_result: AtomicU8,
     scanner_usage_deferred_pending: AtomicBool,
     scanner_usage_deferred_total: AtomicU64,
@@ -1138,6 +1155,8 @@ pub struct ScanCycleWorkSnapshot {
     yield_duration_millis: u64,
     throttle_sleep_events: u64,
     throttle_sleep_duration_millis: u64,
+    disk_io_budget_wait_events: u64,
+    disk_io_budget_wait_duration_millis: u64,
     ilm_actions: u64,
     lifecycle_expiry_actions: u64,
     lifecycle_transition_actions: u64,
@@ -1258,6 +1277,8 @@ pub struct ScannerPacingPressureSnapshot {
     pub last_cycle_budget_limited: bool,
     pub last_cycle_pause_observed: bool,
     pub last_cycle_throttle_sleep_ratio: f64,
+    #[serde(default)]
+    pub last_cycle_disk_io_budget_wait_ratio: f64,
     pub last_cycle_yield_ratio: f64,
     pub last_cycle_total_pause_ratio: f64,
 }
@@ -1271,6 +1292,7 @@ impl Default for ScannerPacingPressureSnapshot {
             last_cycle_budget_limited: false,
             last_cycle_pause_observed: false,
             last_cycle_throttle_sleep_ratio: 0.0,
+            last_cycle_disk_io_budget_wait_ratio: 0.0,
             last_cycle_yield_ratio: 0.0,
             last_cycle_total_pause_ratio: 0.0,
         }
@@ -1359,6 +1381,30 @@ pub struct ScannerUsageFreshnessSnapshot {
     pub last_deferred_unix_secs: u64,
     #[serde(default)]
     pub last_deferred_reason: String,
+    /// Guardrail vetoes attributed as `<field>@<host>`; a phase-2 peer
+    /// dirty-usage fallback is reported through the same fields.
+    #[serde(default)]
+    pub guardrail_veto_total: u64,
+    #[serde(default)]
+    pub last_guardrail_veto_unix_secs: u64,
+    #[serde(default)]
+    pub last_guardrail_veto_reason: String,
+    /// Cycles eligible for a dirty-bucket scope that walked the whole
+    /// namespace instead, with the reason of the last one.
+    #[serde(default)]
+    pub scope_fallback_total: u64,
+    #[serde(default)]
+    pub last_scope_fallback_unix_secs: u64,
+    #[serde(default)]
+    pub last_scope_fallback_reason: String,
+    /// Waits imposed by the per-disk background I/O budget; sustained waits
+    /// explain slow usage freshness on a budgeted disk.
+    #[serde(default)]
+    pub disk_io_budget_wait_events: u64,
+    #[serde(default)]
+    pub disk_io_budget_wait_millis: u64,
+    #[serde(default)]
+    pub last_disk_io_budget_wait_unix_secs: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1427,6 +1473,10 @@ pub struct ScannerMetricsReport {
     #[serde(default)]
     pub current_cycle_throttle_sleep_duration_seconds: f64,
     #[serde(default)]
+    pub current_cycle_disk_io_budget_wait_events: u64,
+    #[serde(default)]
+    pub current_cycle_disk_io_budget_wait_duration_seconds: f64,
+    #[serde(default)]
     pub current_cycle_ilm_actions: u64,
     #[serde(default)]
     pub current_cycle_lifecycle_expiry_actions: u64,
@@ -1466,6 +1516,10 @@ pub struct ScannerMetricsReport {
     #[serde(default)]
     pub last_cycle_throttle_sleep_duration_seconds: f64,
     #[serde(default)]
+    pub last_cycle_disk_io_budget_wait_events: u64,
+    #[serde(default)]
+    pub last_cycle_disk_io_budget_wait_duration_seconds: f64,
+    #[serde(default)]
     pub last_cycle_ilm_actions: u64,
     #[serde(default)]
     pub last_cycle_lifecycle_expiry_actions: u64,
@@ -1498,6 +1552,10 @@ pub struct ScannerMetricsReport {
     pub lifecycle_transition: ScannerLifecycleTransitionSnapshot,
     #[serde(default)]
     pub usage_freshness: ScannerUsageFreshnessSnapshot,
+    /// Process-lifetime candidate-construction results. Missing on older reports
+    /// means unobserved, not accepted or healthy. Publication is tracked separately.
+    #[serde(default)]
+    pub usage_candidates: Vec<ScannerUsageCandidateCount>,
     #[serde(default)]
     pub maintenance_control: ScannerMaintenanceControlSnapshot,
     #[serde(default)]
@@ -1627,6 +1685,7 @@ fn scanner_primary_pressure(
     current_queued_scans: u64,
     current_active_scans: u64,
     last_cycle_budget_limited: bool,
+    last_cycle_disk_io_budget_wait_events: u64,
     last_cycle_throttle_sleep_events: u64,
     last_cycle_yield_events: u64,
 ) -> &'static str {
@@ -1634,6 +1693,8 @@ fn scanner_primary_pressure(
         "queued_scans"
     } else if last_cycle_budget_limited {
         "cycle_budget"
+    } else if last_cycle_disk_io_budget_wait_events > 0 {
+        "disk_io_budget"
     } else if last_cycle_throttle_sleep_events > 0 || last_cycle_yield_events > 0 {
         "throttle_pause"
     } else if current_active_scans > 0 {
@@ -1653,12 +1714,20 @@ fn scanner_pacing_pressure(metrics: &ScannerMetricsReport) -> ScannerPacingPress
         .max(usize_to_u64_saturated(metrics.active_scan_paths));
     let last_cycle_budget_limited =
         scanner_last_cycle_budget_limited(metrics.last_cycle_result_code, metrics.last_cycle_partial_reason.as_str());
-    let last_cycle_pause_observed = metrics.last_cycle_throttle_sleep_events > 0 || metrics.last_cycle_yield_events > 0;
+    let last_cycle_pause_observed = metrics.last_cycle_throttle_sleep_events > 0
+        || metrics.last_cycle_disk_io_budget_wait_events > 0
+        || metrics.last_cycle_yield_events > 0;
     let last_cycle_throttle_sleep_ratio =
         scanner_ratio(metrics.last_cycle_throttle_sleep_duration_seconds, metrics.last_cycle_duration_seconds);
+    let last_cycle_disk_io_budget_wait_ratio = scanner_ratio(
+        metrics.last_cycle_disk_io_budget_wait_duration_seconds,
+        metrics.last_cycle_duration_seconds,
+    );
     let last_cycle_yield_ratio = scanner_ratio(metrics.last_cycle_yield_duration_seconds, metrics.last_cycle_duration_seconds);
     let last_cycle_total_pause_ratio = scanner_ratio(
-        metrics.last_cycle_throttle_sleep_duration_seconds.max(0.0) + metrics.last_cycle_yield_duration_seconds.max(0.0),
+        metrics.last_cycle_throttle_sleep_duration_seconds.max(0.0)
+            + metrics.last_cycle_disk_io_budget_wait_duration_seconds.max(0.0)
+            + metrics.last_cycle_yield_duration_seconds.max(0.0),
         metrics.last_cycle_duration_seconds,
     );
 
@@ -1667,6 +1736,7 @@ fn scanner_pacing_pressure(metrics: &ScannerMetricsReport) -> ScannerPacingPress
             current_queued_scans,
             current_active_scans,
             last_cycle_budget_limited,
+            metrics.last_cycle_disk_io_budget_wait_events,
             metrics.last_cycle_throttle_sleep_events,
             metrics.last_cycle_yield_events,
         )
@@ -1676,6 +1746,7 @@ fn scanner_pacing_pressure(metrics: &ScannerMetricsReport) -> ScannerPacingPress
         last_cycle_budget_limited,
         last_cycle_pause_observed,
         last_cycle_throttle_sleep_ratio,
+        last_cycle_disk_io_budget_wait_ratio,
         last_cycle_yield_ratio,
         last_cycle_total_pause_ratio,
     }
@@ -1994,6 +2065,8 @@ impl Metrics {
             current_scan_cycle_yield_duration_millis_start: AtomicU64::new(0),
             current_scan_cycle_throttle_sleep_events_start: AtomicU64::new(0),
             current_scan_cycle_throttle_sleep_duration_millis_start: AtomicU64::new(0),
+            current_scan_cycle_disk_io_budget_wait_events_start: AtomicU64::new(0),
+            current_scan_cycle_disk_io_budget_wait_duration_millis_start: AtomicU64::new(0),
             current_scan_cycle_ilm_actions_start: AtomicU64::new(0),
             current_scan_cycle_lifecycle_expiry_actions_start: AtomicU64::new(0),
             current_scan_cycle_lifecycle_transition_actions_start: AtomicU64::new(0),
@@ -2027,6 +2100,8 @@ impl Metrics {
             last_scan_cycle_yield_duration_millis: AtomicU64::new(0),
             last_scan_cycle_throttle_sleep_events: AtomicU64::new(0),
             last_scan_cycle_throttle_sleep_duration_millis: AtomicU64::new(0),
+            last_scan_cycle_disk_io_budget_wait_events: AtomicU64::new(0),
+            last_scan_cycle_disk_io_budget_wait_duration_millis: AtomicU64::new(0),
             last_scan_cycle_ilm_actions: AtomicU64::new(0),
             last_scan_cycle_lifecycle_expiry_actions: AtomicU64::new(0),
             last_scan_cycle_lifecycle_transition_actions: AtomicU64::new(0),
@@ -2042,6 +2117,9 @@ impl Metrics {
             partial_scan_cycles_by_source: ScannerWorkSource::all().iter().map(|_| AtomicU64::new(0)).collect(),
             scanner_yield_duration_millis: AtomicU64::new(0),
             scanner_throttle_sleep_duration_millis: AtomicU64::new(0),
+            scanner_disk_io_budget_wait_events: AtomicU64::new(0),
+            scanner_disk_io_budget_wait_duration_millis: AtomicU64::new(0),
+            scanner_disk_io_budget_last_wait_unix_secs: AtomicU64::new(0),
             scanner_ilm_actions: AtomicU64::new(0),
             scanner_lifecycle_expiry_actions: AtomicU64::new(0),
             scanner_lifecycle_transition_actions: AtomicU64::new(0),
@@ -2095,11 +2173,18 @@ impl Metrics {
             scanner_dirty_usage_last_clear_unix_secs: AtomicU64::new(0),
             scanner_dirty_usage_last_cycle_dirty_buckets: AtomicU64::new(0),
             scanner_dirty_usage_last_cycle_cleared_buckets: AtomicU64::new(0),
+            usage_candidates: std::array::from_fn(|_| AtomicU64::new(0)),
             scanner_usage_last_save_unix_secs: AtomicU64::new(0),
             scanner_usage_last_durable_success_unix_secs: AtomicU64::new(0),
             scanner_usage_last_publication_unix_secs: AtomicU64::new(0),
             scanner_usage_last_publication_state: Mutex::new(String::new()),
             scanner_usage_last_publication_reason: Mutex::new(String::new()),
+            scanner_guardrail_veto_total: AtomicU64::new(0),
+            scanner_guardrail_last_veto_unix_secs: AtomicU64::new(0),
+            scanner_guardrail_last_veto_reason: Mutex::new(String::new()),
+            scanner_scope_fallback_total: AtomicU64::new(0),
+            scanner_scope_fallback_last_unix_secs: AtomicU64::new(0),
+            scanner_scope_fallback_last_reason: Mutex::new(String::new()),
             scanner_usage_last_save_result: AtomicU8::new(ScannerUsageSaveResult::Unknown as u8),
             scanner_usage_deferred_pending: AtomicBool::new(false),
             scanner_usage_deferred_total: AtomicU64::new(0),
@@ -2260,6 +2345,19 @@ impl Metrics {
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(duration_millis))
             });
+    }
+
+    /// Record one wait imposed by a per-disk background I/O budget.
+    pub fn record_scanner_disk_io_budget_wait(&self, duration: Duration) {
+        self.scanner_disk_io_budget_wait_events.fetch_add(1, Ordering::Relaxed);
+        let duration_millis = duration_millis_saturated(duration);
+        let _ = self
+            .scanner_disk_io_budget_wait_duration_millis
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(duration_millis))
+            });
+        self.scanner_disk_io_budget_last_wait_unix_secs
+            .store(unix_now_secs(), Ordering::Relaxed);
     }
 
     pub fn record_scanner_ilm_action(&self, count: u64) {
@@ -2478,6 +2576,37 @@ impl Metrics {
         }
     }
 
+    /// Record exactly one normal return from a candidate builder. Accepted does
+    /// not mean published or durable. Like other scanner metrics, the local
+    /// report remains available when no OTEL recorder is installed.
+    pub fn record_usage_candidate(&self, kind: ScannerUsageCandidateKind, outcome: ScannerUsageCandidateOutcome) {
+        let slot = kind.index() * ScannerUsageCandidateOutcome::ALL.len() + outcome.index();
+        self.usage_candidates[slot].fetch_add(1, Ordering::Relaxed);
+        metrics::counter!(
+            "rustfs_scanner_usage_candidates_total",
+            "kind" => kind.as_label(),
+            "outcome" => outcome.as_label()
+        )
+        .increment(1);
+    }
+
+    /// Read the bounded counters without resetting them. Cells are loaded
+    /// independently and do not form a transactional snapshot.
+    pub fn usage_candidate_counts(&self) -> Vec<ScannerUsageCandidateCount> {
+        let mut counts = Vec::with_capacity(USAGE_CANDIDATE_COUNTER_SLOTS);
+        for kind in ScannerUsageCandidateKind::ALL {
+            for outcome in ScannerUsageCandidateOutcome::ALL {
+                let slot = kind.index() * ScannerUsageCandidateOutcome::ALL.len() + outcome.index();
+                counts.push(ScannerUsageCandidateCount {
+                    kind,
+                    outcome,
+                    count: self.usage_candidates[slot].load(Ordering::Relaxed),
+                });
+            }
+        }
+        counts
+    }
+
     pub fn record_scanner_usage_save_result(&self, result: ScannerUsageSaveResult) {
         self.scanner_usage_last_save_result.store(result as u8, Ordering::Relaxed);
         self.scanner_usage_last_save_unix_secs
@@ -2498,6 +2627,33 @@ impl Metrics {
             Err(poisoned) => poisoned.into_inner(),
         };
         *last_reason = reason;
+    }
+
+    /// Record an attributed cluster-activity guardrail veto (`<field>@<host>`)
+    /// so an operator can tell a rebalance or a PUT tail from a broken probe.
+    pub fn record_scanner_guardrail_veto(&self, reason: impl Into<String>) {
+        self.scanner_guardrail_veto_total.fetch_add(1, Ordering::Relaxed);
+        self.scanner_guardrail_last_veto_unix_secs
+            .store(unix_now_secs(), Ordering::Relaxed);
+        let mut last_reason = match self.scanner_guardrail_last_veto_reason.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *last_reason = reason.into();
+    }
+
+    /// Record a cycle that could have been scoped to its dirty buckets but
+    /// walked the whole namespace, so an operator can tell why scoped
+    /// convergence is not happening.
+    pub fn record_scanner_scope_fallback(&self, reason: impl Into<String>) {
+        self.scanner_scope_fallback_total.fetch_add(1, Ordering::Relaxed);
+        self.scanner_scope_fallback_last_unix_secs
+            .store(unix_now_secs(), Ordering::Relaxed);
+        let mut last_reason = match self.scanner_scope_fallback_last_reason.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *last_reason = reason.into();
     }
 
     pub fn record_scanner_usage_durable_success(&self) {
@@ -2971,6 +3127,10 @@ impl Metrics {
             .store(snapshot.throttle_sleep_events, Ordering::Relaxed);
         self.current_scan_cycle_throttle_sleep_duration_millis_start
             .store(snapshot.throttle_sleep_duration_millis, Ordering::Relaxed);
+        self.current_scan_cycle_disk_io_budget_wait_events_start
+            .store(snapshot.disk_io_budget_wait_events, Ordering::Relaxed);
+        self.current_scan_cycle_disk_io_budget_wait_duration_millis_start
+            .store(snapshot.disk_io_budget_wait_duration_millis, Ordering::Relaxed);
         self.current_scan_cycle_ilm_actions_start
             .store(snapshot.ilm_actions, Ordering::Relaxed);
         self.current_scan_cycle_lifecycle_expiry_actions_start
@@ -3035,6 +3195,8 @@ impl Metrics {
             yield_duration_millis: self.scanner_yield_duration_millis.load(Ordering::Relaxed),
             throttle_sleep_events: self.lifetime(Metric::ThrottleSleep),
             throttle_sleep_duration_millis: self.scanner_throttle_sleep_duration_millis.load(Ordering::Relaxed),
+            disk_io_budget_wait_events: self.scanner_disk_io_budget_wait_events.load(Ordering::Relaxed),
+            disk_io_budget_wait_duration_millis: self.scanner_disk_io_budget_wait_duration_millis.load(Ordering::Relaxed),
             ilm_actions: self.scanner_ilm_actions.load(Ordering::Relaxed),
             lifecycle_expiry_actions: self.scanner_lifecycle_expiry_actions.load(Ordering::Relaxed),
             lifecycle_transition_actions: self.scanner_lifecycle_transition_actions.load(Ordering::Relaxed),
@@ -3055,6 +3217,12 @@ impl Metrics {
             throttle_sleep_events: self.current_scan_cycle_throttle_sleep_events_start.load(Ordering::Relaxed),
             throttle_sleep_duration_millis: self
                 .current_scan_cycle_throttle_sleep_duration_millis_start
+                .load(Ordering::Relaxed),
+            disk_io_budget_wait_events: self
+                .current_scan_cycle_disk_io_budget_wait_events_start
+                .load(Ordering::Relaxed),
+            disk_io_budget_wait_duration_millis: self
+                .current_scan_cycle_disk_io_budget_wait_duration_millis_start
                 .load(Ordering::Relaxed),
             ilm_actions: self.current_scan_cycle_ilm_actions_start.load(Ordering::Relaxed),
             lifecycle_expiry_actions: self.current_scan_cycle_lifecycle_expiry_actions_start.load(Ordering::Relaxed),
@@ -3093,6 +3261,12 @@ impl Metrics {
             throttle_sleep_duration_millis: current
                 .throttle_sleep_duration_millis
                 .saturating_sub(start.throttle_sleep_duration_millis),
+            disk_io_budget_wait_events: current
+                .disk_io_budget_wait_events
+                .saturating_sub(start.disk_io_budget_wait_events),
+            disk_io_budget_wait_duration_millis: current
+                .disk_io_budget_wait_duration_millis
+                .saturating_sub(start.disk_io_budget_wait_duration_millis),
             ilm_actions: current.ilm_actions.saturating_sub(start.ilm_actions),
             lifecycle_expiry_actions: current
                 .lifecycle_expiry_actions
@@ -3366,6 +3540,10 @@ impl Metrics {
             .store(work.throttle_sleep_events, Ordering::Relaxed);
         self.last_scan_cycle_throttle_sleep_duration_millis
             .store(work.throttle_sleep_duration_millis, Ordering::Relaxed);
+        self.last_scan_cycle_disk_io_budget_wait_events
+            .store(work.disk_io_budget_wait_events, Ordering::Relaxed);
+        self.last_scan_cycle_disk_io_budget_wait_duration_millis
+            .store(work.disk_io_budget_wait_duration_millis, Ordering::Relaxed);
         self.last_scan_cycle_ilm_actions.store(work.ilm_actions, Ordering::Relaxed);
         self.last_scan_cycle_lifecycle_expiry_actions
             .store(work.lifecycle_expiry_actions, Ordering::Relaxed);
@@ -3443,6 +3621,9 @@ impl Metrics {
                 m.current_cycle_yield_duration_seconds = current_work.yield_duration_millis as f64 / 1000.0;
                 m.current_cycle_throttle_sleep_events = current_work.throttle_sleep_events;
                 m.current_cycle_throttle_sleep_duration_seconds = current_work.throttle_sleep_duration_millis as f64 / 1000.0;
+                m.current_cycle_disk_io_budget_wait_events = current_work.disk_io_budget_wait_events;
+                m.current_cycle_disk_io_budget_wait_duration_seconds =
+                    current_work.disk_io_budget_wait_duration_millis as f64 / 1000.0;
                 m.current_cycle_ilm_actions = current_work.ilm_actions;
                 m.current_cycle_lifecycle_expiry_actions = current_work.lifecycle_expiry_actions;
                 m.current_cycle_lifecycle_transition_actions = current_work.lifecycle_transition_actions;
@@ -3513,6 +3694,11 @@ impl Metrics {
         m.last_cycle_throttle_sleep_events = self.last_scan_cycle_throttle_sleep_events.load(Ordering::Relaxed);
         m.last_cycle_throttle_sleep_duration_seconds =
             self.last_scan_cycle_throttle_sleep_duration_millis.load(Ordering::Relaxed) as f64 / 1000.0;
+        m.last_cycle_disk_io_budget_wait_events = self.last_scan_cycle_disk_io_budget_wait_events.load(Ordering::Relaxed);
+        m.last_cycle_disk_io_budget_wait_duration_seconds = self
+            .last_scan_cycle_disk_io_budget_wait_duration_millis
+            .load(Ordering::Relaxed) as f64
+            / 1000.0;
         m.last_cycle_ilm_actions = self.last_scan_cycle_ilm_actions.load(Ordering::Relaxed);
         m.last_cycle_lifecycle_expiry_actions = self.last_scan_cycle_lifecycle_expiry_actions.load(Ordering::Relaxed);
         m.last_cycle_lifecycle_transition_actions = self.last_scan_cycle_lifecycle_transition_actions.load(Ordering::Relaxed);
@@ -3566,6 +3752,7 @@ impl Metrics {
             completed: self.scanner_transition_completed.load(Ordering::Relaxed),
             failed: self.scanner_transition_failed.load(Ordering::Relaxed),
         };
+        m.usage_candidates = self.usage_candidate_counts();
         let usage_save_result = ScannerUsageSaveResult::from_code(self.scanner_usage_last_save_result.load(Ordering::Relaxed));
         m.usage_freshness = ScannerUsageFreshnessSnapshot {
             dirty_pending_buckets: self.scanner_dirty_usage_pending_buckets.load(Ordering::Relaxed),
@@ -3590,6 +3777,21 @@ impl Metrics {
             deferred_total: self.scanner_usage_deferred_total.load(Ordering::Relaxed),
             last_deferred_unix_secs: self.scanner_usage_last_deferred_unix_secs.load(Ordering::Relaxed),
             last_deferred_reason: match self.scanner_usage_last_deferred_reason.lock() {
+                Ok(reason) => reason.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            },
+            guardrail_veto_total: self.scanner_guardrail_veto_total.load(Ordering::Relaxed),
+            disk_io_budget_wait_events: self.scanner_disk_io_budget_wait_events.load(Ordering::Relaxed),
+            disk_io_budget_wait_millis: self.scanner_disk_io_budget_wait_duration_millis.load(Ordering::Relaxed),
+            last_disk_io_budget_wait_unix_secs: self.scanner_disk_io_budget_last_wait_unix_secs.load(Ordering::Relaxed),
+            last_guardrail_veto_unix_secs: self.scanner_guardrail_last_veto_unix_secs.load(Ordering::Relaxed),
+            last_guardrail_veto_reason: match self.scanner_guardrail_last_veto_reason.lock() {
+                Ok(reason) => reason.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            },
+            scope_fallback_total: self.scanner_scope_fallback_total.load(Ordering::Relaxed),
+            last_scope_fallback_unix_secs: self.scanner_scope_fallback_last_unix_secs.load(Ordering::Relaxed),
+            last_scope_fallback_reason: match self.scanner_scope_fallback_last_reason.lock() {
                 Ok(reason) => reason.clone(),
                 Err(poisoned) => poisoned.into_inner().clone(),
             },
@@ -4063,6 +4265,32 @@ mod tests {
             .map(|s| s.checked)
             .unwrap_or_default();
         assert_eq!(lifecycle_checked, 4, "ILM-checked versions tracked on the Lifecycle source");
+    }
+
+    #[tokio::test]
+    async fn report_includes_disk_io_budget_waits_in_pacing_and_freshness() {
+        let metrics = Metrics::new();
+        metrics.record_scanner_disk_io_budget_wait(Duration::from_millis(250));
+        metrics.record_scanner_disk_io_budget_wait(Duration::from_millis(750));
+        metrics.record_scan_cycle_complete(true, Duration::from_secs(10));
+        metrics.record_scan_cycle_work(ScanCycleWorkSnapshot {
+            disk_io_budget_wait_events: 2,
+            disk_io_budget_wait_duration_millis: 1_000,
+            ..Default::default()
+        });
+
+        let report = metrics.report().await;
+
+        assert_eq!(report.usage_freshness.disk_io_budget_wait_events, 2);
+        assert_eq!(report.usage_freshness.disk_io_budget_wait_millis, 1_000);
+        assert!(report.usage_freshness.last_disk_io_budget_wait_unix_secs > 0);
+        assert_eq!(report.last_cycle_disk_io_budget_wait_events, 2);
+        assert_eq!(report.last_cycle_disk_io_budget_wait_duration_seconds, 1.0);
+        assert_eq!(report.pacing_pressure.primary_pressure, "disk_io_budget");
+        assert!(report.pacing_pressure.last_cycle_pause_observed);
+        assert_eq!(report.pacing_pressure.last_cycle_disk_io_budget_wait_ratio, 0.1);
+        assert_eq!(report.pacing_pressure.last_cycle_total_pause_ratio, 0.1);
+        assert_eq!(report.pacing_pressure.last_cycle_throttle_sleep_ratio, 0.0);
     }
 
     #[tokio::test]
@@ -5526,5 +5754,72 @@ mod tests {
         assert_eq!(current.cycle_timeout_total, 1);
         assert_eq!(current.cycle_last_progress_age, 0);
         assert!(!current.leader_lease_without_progress);
+    }
+    #[tokio::test]
+    async fn usage_candidate_report_survives_disabled_export_and_preserves_legacy_unknown() {
+        let metrics = Metrics::new();
+        assert!(metrics.usage_candidate_counts().iter().all(|row| row.count == 0));
+        metrics::with_local_recorder(&metrics::NoopRecorder, || {
+            for kind in ScannerUsageCandidateKind::ALL {
+                for outcome in ScannerUsageCandidateOutcome::ALL {
+                    metrics.record_usage_candidate(kind, outcome);
+                }
+            }
+            metrics.record_usage_candidate(
+                ScannerUsageCandidateKind::Observational,
+                ScannerUsageCandidateOutcome::NoUsableSnapshots,
+            );
+        });
+        let report = metrics.report().await;
+        assert_eq!(report.usage_candidates.len(), 38);
+        for row in &report.usage_candidates {
+            let expected = if row.kind == ScannerUsageCandidateKind::Observational
+                && row.outcome == ScannerUsageCandidateOutcome::NoUsableSnapshots
+            {
+                2
+            } else {
+                1
+            };
+            assert_eq!(row.count, expected, "{row:?}");
+        }
+        let mut legacy = serde_json::to_value(&report).expect("serialize scanner report");
+        legacy
+            .as_object_mut()
+            .expect("scanner report object")
+            .remove("usage_candidates");
+        let legacy: ScannerMetricsReport = serde_json::from_value(legacy).expect("read a pre-candidate-metrics report");
+        assert!(
+            legacy.usage_candidates.is_empty(),
+            "missing telemetry must remain unknown, not a synthetic accepted bucket"
+        );
+        let roundtrip: ScannerMetricsReport =
+            serde_json::from_slice(&serde_json::to_vec(&report).expect("encode report")).expect("decode report");
+        assert_eq!(roundtrip.usage_candidates, report.usage_candidates);
+    }
+
+    #[test]
+    fn usage_candidate_buckets_preserve_concurrent_updates() {
+        let metrics = Arc::new(Metrics::new());
+        let threads = (0..4)
+            .map(|_| {
+                let metrics = metrics.clone();
+                std::thread::spawn(move || {
+                    metrics::with_local_recorder(&metrics::NoopRecorder, || {
+                        for _ in 0..1000 {
+                            metrics.record_usage_candidate(
+                                ScannerUsageCandidateKind::Completed,
+                                ScannerUsageCandidateOutcome::Merge,
+                            );
+                        }
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().expect("candidate counter thread");
+        }
+        let rows = metrics.usage_candidate_counts();
+        assert_eq!(rows.iter().map(|row| row.count).sum::<u64>(), 4000);
+        assert_eq!(rows.iter().find(|row| row.kind == ScannerUsageCandidateKind::Completed && row.outcome == ScannerUsageCandidateOutcome::Merge).expect("merge bucket").count, 4000);
     }
 }

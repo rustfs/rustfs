@@ -537,6 +537,20 @@ impl<'a, B> TableCommitLockPublication<'a, B> {
         Ok(())
     }
 
+    fn attach_catalog_write_guard(&self, guard: TableCatalogLockGuard) -> TableCatalogStoreResult<()> {
+        if guard.is_lock_lost() {
+            return Err(TableCatalogStoreError::Conflict("table catalog write lock was lost".to_string()));
+        }
+        let mut state = self.state.lock();
+        if state.table_bucket.is_none() || state.table.is_some() {
+            return Err(TableCatalogStoreError::Internal(
+                "catalog write guard must be attached between bucket and table publication locks".to_string(),
+            ));
+        }
+        state.guards.push(guard);
+        Ok(())
+    }
+
     fn release_publication_locks(&self) {
         // Read-only planning may proceed without excluding unrelated tables' commits.
         // The migration permit remains attached until the whole operation completes.
@@ -951,6 +965,12 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
     }
 
     async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogLockGuard>;
+
+    /// Authorize adopting a caller-selected warehouse prefix. Request adapters
+    /// enforce the caller's policy; trusted storage backends have no IAM identity.
+    async fn authorize_table_warehouse_location(&self, _table_bucket: &str, _location: &str) -> TableCatalogStoreResult<()> {
+        Ok(())
+    }
 
     async fn begin_table_bucket_commit_publication(&self, _table_bucket: &str) -> TableCatalogStoreResult<()> {
         Ok(())
@@ -2007,6 +2027,40 @@ where
             Self::DurableStrong(store) => {
                 store
                     .run_table_metadata_maintenance_worker_once(table_bucket, namespace, table, worker_id)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn run_table_metadata_maintenance_worker_once_conditionally(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        worker_id: String,
+        condition: &TableMaintenanceWorkerCondition,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        match self {
+            Self::ObjectBacked(store) => {
+                store
+                    .run_table_metadata_maintenance_worker_once_conditionally(
+                        table_bucket,
+                        namespace,
+                        table,
+                        worker_id,
+                        condition,
+                    )
+                    .await
+            }
+            Self::DurableStrong(store) => {
+                store
+                    .run_table_metadata_maintenance_worker_once_conditionally(
+                        table_bucket,
+                        namespace,
+                        table,
+                        worker_id,
+                        condition,
+                    )
                     .await
             }
         }

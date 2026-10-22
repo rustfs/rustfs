@@ -19,6 +19,7 @@
 //! stay isolated.
 
 use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::{Client, Config};
 #[cfg(feature = "e2e-test-hooks")]
@@ -1066,4 +1067,134 @@ mod signed_target_rpc {
         assert!(!destination_exists.expect("read original destination state"));
         assert_eq!(sentinel_after.expect("global B sentinel survives"), sentinel_before);
     }
+}
+
+#[test]
+fn two_embedded_servers_keep_regions_isolated() {
+    common::run_embedded_test(two_embedded_servers_keep_regions_isolated_body);
+}
+
+async fn two_embedded_servers_keep_regions_isolated_body() {
+    let port_a = find_available_port().expect("allocate instance A port");
+    let server_a = RustFSServerBuilder::new()
+        .address(format!("127.0.0.1:{port_a}"))
+        .access_key("region-a-access")
+        .secret_key("region-a-secret")
+        .region("eu-west-1")
+        .build()
+        .await
+        .expect("start instance A");
+    let port_b = find_available_port().expect("allocate instance B port");
+    let server_b = RustFSServerBuilder::new()
+        .address(format!("127.0.0.1:{port_b}"))
+        .access_key("region-b-access")
+        .secret_key("region-b-secret")
+        .region("ap-south-1")
+        .build()
+        .await
+        .expect("start instance B");
+    let client_a = Client::from_conf(
+        s3_client(&server_a.endpoint(), server_a.access_key(), server_a.secret_key())
+            .config()
+            .to_builder()
+            .region(Region::new("eu-west-1"))
+            .build(),
+    );
+    let client_b = Client::from_conf(
+        s3_client(&server_b.endpoint(), server_b.access_key(), server_b.secret_key())
+            .config()
+            .to_builder()
+            .region(Region::new("ap-south-1"))
+            .build(),
+    );
+
+    let bucket = "isolated-region-bucket";
+    for (client, region, contents) in [
+        (&client_a, "eu-west-1", b"instance-a".as_slice()),
+        (&client_b, "ap-south-1", b"instance-b".as_slice()),
+    ] {
+        client
+            .create_bucket()
+            .bucket(bucket)
+            .send()
+            .await
+            .expect("create instance-local bucket");
+        let location = client
+            .get_bucket_location()
+            .bucket(bucket)
+            .send()
+            .await
+            .expect("query own region");
+        assert_eq!(location.location_constraint().map(|value| value.as_str()), Some(region));
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("marker")
+            .body(ByteStream::from_static(contents))
+            .send()
+            .await
+            .expect("write instance marker");
+        let object = client
+            .get_object()
+            .bucket(bucket)
+            .key("marker")
+            .send()
+            .await
+            .expect("read instance marker");
+        assert_eq!(object.body.collect().await.expect("collect marker").into_bytes().as_ref(), contents);
+    }
+
+    // The request's signing scope must not become the server's reported location.
+    let alternate_scope = Client::from_conf(client_b.config().to_builder().region(Region::new("eu-west-1")).build());
+    let location = alternate_scope
+        .get_bucket_location()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("query B with an alternate signing scope");
+    assert_eq!(location.location_constraint().map(|value| value.as_str()), Some("ap-south-1"));
+    let invalid_secret = Client::from_conf(
+        client_b
+            .config()
+            .to_builder()
+            .credentials_provider(Credentials::new(server_b.access_key(), "incorrect-secret", None, None, "test"))
+            .build(),
+    );
+    let denied = invalid_secret
+        .get_bucket_location()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect_err("a wrong secret must still fail signature validation");
+    assert_eq!(
+        denied.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("SignatureDoesNotMatch")
+    );
+
+    server_a.shutdown().await;
+    client_b
+        .create_bucket()
+        .bucket("after-region-a-shutdown")
+        .send()
+        .await
+        .expect("B creates after A shutdown");
+    let location = client_b
+        .get_bucket_location()
+        .bucket("after-region-a-shutdown")
+        .send()
+        .await
+        .expect("B retains its region after A shutdown");
+    assert_eq!(location.location_constraint().map(|value| value.as_str()), Some("ap-south-1"));
+    let object = client_b
+        .get_object()
+        .bucket(bucket)
+        .key("marker")
+        .send()
+        .await
+        .expect("B remains readable after A shutdown");
+    assert_eq!(
+        object.body.collect().await.expect("collect B marker").into_bytes().as_ref(),
+        b"instance-b"
+    );
+    server_b.shutdown().await;
 }

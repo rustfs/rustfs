@@ -84,6 +84,7 @@ pub(crate) use readiness::ReadinessDegradedReason;
 pub(crate) use readiness::ReadinessGateLayer;
 pub(crate) use readiness::collect_dependency_readiness_report;
 pub(crate) use readiness::collect_node_readiness_report;
+pub(crate) use readiness::observe_peer_drive_admission;
 pub use readiness::publish_ready_when_runtime_ready;
 pub(crate) use readiness::snapshot_dependency_readiness_report;
 pub(crate) use readiness::{collect_cluster_read_health_report, collect_cluster_write_health_report};

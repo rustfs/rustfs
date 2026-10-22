@@ -70,7 +70,7 @@ async fn test_conditional_put_okay() -> TestResult {
     let test_key = "conditional-put-ok";
     let initial_data = generate_test_data(1024); // 1KB test data
     let matching_data = generate_test_data(2048); // 2KB updated data
-    let non_matching_data = generate_test_data(3072); // 3KB updated data
+    let created_data = generate_test_data(3072); // 3KB new object
 
     // Upload initial object and get its ETag
     let initial_etag = upload_object_with_metadata(&client, TEST_BUCKET, test_key, &initial_data).await?;
@@ -86,17 +86,17 @@ async fn test_conditional_put_okay() -> TestResult {
         .await?;
     assert_eq!(object_body(&client, test_key).await?.as_ref(), matching_data);
 
-    // Test 2: PUT with non-matching If-None-Match condition (should succeed)
-    let fake_etag = "\"fake-etag-12345\"";
+    // Test 2: PUT with If-None-Match: * on a missing key (should succeed)
+    let created_key = "conditional-put-ok-created";
     client
         .put_object()
         .bucket(TEST_BUCKET)
-        .key(test_key)
-        .body(Bytes::from(non_matching_data.clone()).into())
-        .if_none_match(fake_etag)
+        .key(created_key)
+        .body(Bytes::from(created_data.clone()).into())
+        .if_none_match("*")
         .send()
         .await?;
-    assert_eq!(object_body(&client, test_key).await?.as_ref(), non_matching_data);
+    assert_eq!(object_body(&client, created_key).await?.as_ref(), created_data);
 
     Ok(())
 }
@@ -130,17 +130,30 @@ async fn test_conditional_put_failed() -> TestResult {
     assert_s3_error_code(response1, "PreconditionFailed");
     assert_eq!(object_body(&client, test_key).await?.as_ref(), initial_data);
 
-    // Test 2: PUT with matching If-None-Match condition (should fail with 412)
-    let response2 = client
-        .put_object()
+    // Test 2: writes accept If-None-Match only as `*`; RustFS rejects an ETag
+    // value with 501 NotImplemented whether or not it matches.
+    for if_none_match in [initial_etag.as_str(), "\"fake-etag-12345\""] {
+        let response = client
+            .put_object()
+            .bucket(TEST_BUCKET)
+            .key(test_key)
+            .body(Bytes::from(updated_data.clone()).into())
+            .if_none_match(if_none_match)
+            .send()
+            .await;
+        assert_s3_error_code(response, "NotImplemented");
+    }
+
+    let response = client
+        .copy_object()
         .bucket(TEST_BUCKET)
         .key(test_key)
-        .body(Bytes::from(updated_data.clone()).into())
-        .if_none_match(&initial_etag)
+        .copy_source(format!("{TEST_BUCKET}/{test_key}"))
+        .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+        .if_none_match("\"fake-etag-12345\"")
         .send()
         .await;
-
-    assert_s3_error_code(response2, "PreconditionFailed");
+    assert_s3_error_code(response, "NotImplemented");
     assert_eq!(object_body(&client, test_key).await?.as_ref(), initial_data);
 
     Ok(())
@@ -252,7 +265,7 @@ async fn test_conditional_multi_part_upload() -> TestResult {
 
     assert_s3_error_code(complete_response, "PreconditionFailed");
 
-    // Test 2: Multipart upload with matching If-None-Match, should fail
+    // Test 2: Multipart upload with an unsupported ETag If-None-Match
     let complete_response = client
         .complete_multipart_upload()
         .bucket(TEST_BUCKET)
@@ -263,7 +276,7 @@ async fn test_conditional_multi_part_upload() -> TestResult {
         .send()
         .await;
 
-    assert_s3_error_code(complete_response, "PreconditionFailed");
+    assert_s3_error_code(complete_response, "NotImplemented");
 
     // Test 3: Multipart upload with unmatching If-Match, should fail
     let complete_response = client

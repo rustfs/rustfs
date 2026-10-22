@@ -2339,6 +2339,162 @@ async fn test_checkpoint_schema_v5_discarded_on_load() {
     temp_dir.close().expect("remove schema test directory");
 }
 
+// Keep these signed wire fixtures independent of today's struct and its defaults.
+const LEGACY_SIGNED_CHECKPOINTS: [&str; 3] = [
+    r#"{"schema_version":5,"task_id":"00000000-0000-4000-8000-000000000002","checkpoint_time":1700000000,"current_bucket_index":2,"current_object_index":500,"processed_objects":["a","b"],"failed_objects":["c"],"skipped_objects":["d"],"integrity_digest":"/AZPOA1TZttBQ0ieKM0QBVMDnr5s2YWZqb+3rmg+vds="}"#,
+    r#"{"schema_version":6,"task_id":"00000000-0000-4000-8000-000000000002","checkpoint_time":1700000000,"current_bucket_index":2,"current_object_index":500,"processed_objects":["a","b"],"failed_objects":["c"],"skipped_objects":["d"],"integrity_digest":"4IBOlSw4ln91DXRnVZD0D7qDt+DKSp205Y6eFwNpm80="}"#,
+    r#"{"schema_version":6,"task_id":"00000000-0000-4000-8000-000000000002","checkpoint_time":1700000000,"current_bucket_index":2,"current_object_index":500,"processed_objects":["a","b"],"failed_objects":["c"],"skipped_objects":["d"],"integrity_digest":"mkGdi8fQRM6f1yS9NIyf+O8F9FRL4/pBXL79CD/il7k="}"#,
+];
+
+#[tokio::test]
+async fn signed_legacy_checkpoint_verifies_before_schema_upgrade() {
+    for legacy in LEGACY_SIGNED_CHECKPOINTS {
+        let (temp_dir, disk) = schema_test_disk().await;
+        let task_id = "00000000-0000-4000-8000-000000000002";
+        let path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+        disk.write_all(RUSTFS_META_BUCKET, &path, legacy.as_bytes().to_vec().into())
+            .await
+            .expect("write signed legacy checkpoint");
+
+        assert!(
+            CheckpointManager::is_resumable(&disk, task_id)
+                .await
+                .expect("discovery must accept an intact signed legacy checkpoint")
+        );
+        let manager = CheckpointManager::load_from_disk(disk.clone(), task_id)
+            .await
+            .expect("verify the original signed fields before filling defaults");
+        let checkpoint = manager.get_checkpoint().await;
+        assert_eq!(checkpoint.schema_version, CURRENT_CHECKPOINT_SCHEMA);
+        assert_eq!(checkpoint.current_bucket_index, 0);
+        assert_eq!(checkpoint.current_object_index, 0);
+        assert!(checkpoint.processed_objects.is_empty());
+        assert!(checkpoint.failed_objects.is_empty());
+        assert!(checkpoint.skipped_objects.is_empty());
+        assert_eq!(checkpoint.successful_objects, 0);
+        assert_eq!(checkpoint.failed_object_count, 0);
+        assert_eq!(checkpoint.skipped_object_count, 0);
+        assert!(!checkpoint.baseline_known);
+        assert!(!CheckpointManager::is_blocked(&disk, task_id).await);
+
+        manager
+            .update_position(1, 3)
+            .await
+            .expect("save upgraded checkpoint with CAS");
+        let restored = CheckpointManager::load_from_disk(disk, task_id)
+            .await
+            .expect("reload upgraded checkpoint")
+            .get_checkpoint()
+            .await;
+        assert_eq!(restored.current_bucket_index, 1);
+        assert_eq!(restored.current_object_index, 3);
+        temp_dir.close().expect("remove signed legacy checkpoint fixture");
+    }
+}
+
+#[tokio::test]
+async fn signed_legacy_checkpoint_rejects_tampering() {
+    for legacy in LEGACY_SIGNED_CHECKPOINTS {
+        let (temp_dir, disk) = schema_test_disk().await;
+        let task_id = "00000000-0000-4000-8000-000000000002";
+        let path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+        let tampered = legacy.replace("\"current_object_index\":500", "\"current_object_index\":501");
+        disk.write_all(RUSTFS_META_BUCKET, &path, tampered.as_bytes().to_vec().into())
+            .await
+            .expect("write modified signed legacy checkpoint");
+
+        assert!(matches!(
+            CheckpointManager::load_from_disk(disk.clone(), task_id).await,
+            Err(Error::InvalidCheckpoint(message)) if message.contains("digest does not match")
+        ));
+        assert!(CheckpointManager::is_blocked(&disk, task_id).await);
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, &path)
+                .await
+                .expect("invalid snapshot must remain available"),
+            tampered.as_bytes()
+        );
+        temp_dir.close().expect("remove modified legacy checkpoint fixture");
+    }
+}
+
+#[tokio::test]
+async fn signed_checkpoint_rejects_duplicate_fields() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = "00000000-0000-4000-8000-000000000002";
+    let path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+    let duplicate = LEGACY_SIGNED_CHECKPOINTS[2].replace(
+        "\"current_object_index\":500",
+        "\"current_object_index\":501,\"current_object_index\":500",
+    );
+    disk.write_all(RUSTFS_META_BUCKET, &path, duplicate.as_bytes().to_vec().into())
+        .await
+        .expect("write checkpoint with conflicting duplicate fields");
+
+    assert!(matches!(
+        CheckpointManager::load_from_disk(disk.clone(), task_id).await,
+        Err(Error::TaskExecutionFailed { message }) if message.contains("duplicate field")
+    ));
+    assert!(CheckpointManager::is_blocked(&disk, task_id).await);
+    temp_dir.close().expect("remove duplicate field checkpoint fixture");
+}
+
+#[tokio::test]
+async fn checkpoint_writer_preserves_base_reader_canonicalization() {
+    use sha2::{Digest, Sha256};
+
+    for admin in [false, true] {
+        let (temp_dir, disk) = schema_test_disk().await;
+        let task_id = ResumeUtils::generate_task_id();
+        let manager = CheckpointManager::new(disk.clone(), task_id.clone())
+            .await
+            .expect("create rollback-compatible checkpoint");
+        if admin {
+            manager
+                .set_admin(AdminErasureCheckpoint {
+                    set_disk_id: "pool_0_set_0".to_string(),
+                    options: Default::default(),
+                    buckets: [("bucket".to_string(), Some(uuid::Uuid::new_v4()))].into(),
+                    outcome: Default::default(),
+                    completed: false,
+                })
+                .await
+                .expect("save nested administrator checkpoint");
+        }
+        manager.add_processed_object("b".to_string()).await.expect("record object b");
+        manager.add_processed_object("a".to_string()).await.expect("record object a");
+        manager.update_position(2, 9).await.expect("flush rollback fixture");
+        let path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+        let bytes = disk
+            .read_all(RUSTFS_META_BUCKET, &path)
+            .await
+            .expect("read real writer output");
+        let mut wire: serde_json::Value = serde_json::from_slice(&bytes).expect("decode writer output");
+        wire.sort_all_objects();
+        assert_eq!(
+            bytes.as_ref(),
+            serde_json::to_vec(&wire).expect("encode recursively sorted payload"),
+            "persisted keys must have the production base writer's order, including nested admin fields"
+        );
+        let signature = wire["integrity_digest"].take();
+        let unsigned = serde_json::to_vec(&wire).expect("encode base reader signing representation");
+        assert_eq!(
+            signature,
+            base64_simd::STANDARD.encode_to_string(Sha256::digest(&unsigned)),
+            "the production base reader must accept this writer's signature"
+        );
+        let restored = CheckpointManager::load_from_disk(disk, &task_id)
+            .await
+            .expect("same-version control must also load")
+            .get_checkpoint()
+            .await;
+        assert_eq!(restored.current_bucket_index, 2);
+        assert_eq!(restored.current_object_index, 9);
+        assert_eq!(restored.admin.is_some(), admin);
+        temp_dir.close().expect("remove rollback canonicalization fixture");
+    }
+}
+
 #[tokio::test]
 async fn downgraded_unsigned_checkpoint_resets_untrusted_progress() {
     let (temp_dir, disk) = schema_test_disk().await;
@@ -2770,34 +2926,38 @@ async fn checkpoint_cleanup_leaves_no_task_specific_lock_artifact() {
 }
 
 #[tokio::test]
-async fn an_empty_blocked_marker_still_blocks_resume_selection() {
+async fn an_empty_blocked_marker_over_a_missing_snapshot_is_cleared_by_revalidation() {
+    // A legacy marker is due immediately. With no snapshot left to isolate,
+    // a fresh scan is the safe continuation, so the marker is cleared.
     let (temp_dir, disk) = schema_test_disk().await;
     let task_id = ResumeUtils::generate_task_id();
-    let manager = CheckpointManager::new(disk.clone(), task_id.clone())
-        .await
-        .expect("create checkpoint manager");
     let blocked_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_BLOCKED_FILE}");
     disk.write_all(RUSTFS_META_BUCKET, &blocked_path, EcstoreDiskBytes::new())
         .await
         .expect("write empty blocked marker fixture");
 
-    assert!(CheckpointManager::is_blocked(&disk, &task_id).await);
-    assert!(CheckpointManager::is_resumable(&disk, &task_id).await.is_err());
-    // Recovery requires replacing/cleaning the snapshot, then removing the
-    // marker; ordinary selector retries are intentionally not an unlock path.
-    manager.cleanup().await.expect("clean blocked checkpoint");
     assert!(!CheckpointManager::is_blocked(&disk, &task_id).await);
+    assert!(disk.read_all(RUSTFS_META_BUCKET, &blocked_path).await.is_err());
+    assert!(
+        CheckpointManager::is_resumable(&disk, &task_id)
+            .await
+            .expect("no snapshot and no marker")
+    );
     temp_dir.close().expect("remove empty blocked marker test directory");
 }
 
 #[tokio::test]
-async fn resumable_selector_skips_healthy_tasks_with_blocked_markers() {
+async fn resumable_selector_revalidates_legacy_markers_per_task() {
+    // One task carries a legacy marker over an intact snapshot: it unblocks.
+    // The other carries a legacy marker over a corrupt snapshot: it stays
+    // blocked and keeps failing the selector, while its bytes are retained.
     let (temp_dir, disk) = schema_test_disk().await;
-    let tasks = [
-        (ResumeUtils::generate_task_id(), EcstoreDiskBytes::new()),
-        (ResumeUtils::generate_task_id(), EcstoreDiskBytes::from_static(b"blocked")),
-    ];
-    for (task_id, marker) in &tasks {
+    let healthy = ResumeUtils::generate_task_id();
+    let corrupt = ResumeUtils::generate_task_id();
+    for (task_id, marker) in [
+        (&healthy, EcstoreDiskBytes::new()),
+        (&corrupt, EcstoreDiskBytes::from_static(b"blocked")),
+    ] {
         ResumeManager::new(
             disk.clone(),
             task_id.clone(),
@@ -2806,28 +2966,35 @@ async fn resumable_selector_skips_healthy_tasks_with_blocked_markers() {
             vec!["bucket".to_string()],
         )
         .await
-        .expect("create healthy resume state");
+        .expect("create resume state");
         CheckpointManager::new(disk.clone(), task_id.clone())
             .await
-            .expect("create healthy checkpoint");
-        let checkpoint_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
-        let checkpoint_bytes = disk
-            .read_all(RUSTFS_META_BUCKET, &checkpoint_path)
-            .await
-            .expect("read healthy checkpoint before blocking");
+            .expect("create checkpoint");
         let marker_path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_BLOCKED_FILE}");
-        disk.write_all(RUSTFS_META_BUCKET, &marker_path, marker.clone())
+        disk.write_all(RUSTFS_META_BUCKET, &marker_path, marker)
             .await
-            .expect("write blocked marker");
-
-        assert!(ResumeUtils::get_resumable_tasks(&disk).await.is_err());
-        assert_eq!(
-            disk.read_all(RUSTFS_META_BUCKET, &checkpoint_path)
-                .await
-                .expect("read healthy checkpoint after blocking"),
-            checkpoint_bytes
-        );
+            .expect("write legacy blocked marker");
     }
+    let corrupt_path = format!("{BUCKET_META_PREFIX}/{corrupt}_{RESUME_CHECKPOINT_FILE}");
+    disk.write_all(RUSTFS_META_BUCKET, &corrupt_path, b"{truncated".to_vec().into())
+        .await
+        .expect("corrupt one snapshot");
+
+    assert!(
+        CheckpointManager::is_resumable(&disk, &healthy)
+            .await
+            .expect("intact snapshot unblocks")
+    );
+    assert!(!CheckpointManager::is_blocked(&disk, &healthy).await);
+    assert!(CheckpointManager::is_resumable(&disk, &corrupt).await.is_err());
+    assert!(CheckpointManager::is_blocked(&disk, &corrupt).await);
+    assert!(ResumeUtils::get_resumable_tasks(&disk).await.is_err());
+    assert_eq!(
+        disk.read_all(RUSTFS_META_BUCKET, &corrupt_path)
+            .await
+            .expect("corrupt snapshot retained"),
+        b"{truncated".as_slice()
+    );
     temp_dir.close().expect("remove blocked selector test directory");
 }
 
@@ -3220,4 +3387,218 @@ async fn resume_state_rejects_filename_and_json_task_id_mismatch() {
         error,
         Error::TaskExecutionFailed { message } if message == "Resume checkpoint task id does not match filename"
     ));
+}
+
+async fn budget_fixture() -> (tempfile::TempDir, DiskStore, ResumeManager) {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = ResumeManager::new_replacement_intent(
+        disk.clone(),
+        task_id,
+        "pool_0_set_0".to_string(),
+        vec!["bucket".to_string()],
+        vec!["replacement-a".to_string()],
+        vec![ReplacementTargetIdentity {
+            endpoint: "replacement-a".to_string(),
+            canonical_path: "/mnt/replacement-a".to_string(),
+            physical_device_ids: vec!["device-a".to_string()],
+            filesystem_identity: "1:2:3".to_string(),
+        }],
+    )
+    .await
+    .expect("replacement intent should persist");
+    (temp_dir, disk, manager)
+}
+
+#[tokio::test]
+async fn preformat_failures_do_not_consume_the_rebuild_budget() {
+    // rustfs/rustfs#8565: a format fence rejection before `format.json`
+    // exists is not a rebuild attempt.
+    let (_temp_dir, disk, manager) = budget_fixture().await;
+    let task_id = manager.get_state().await.task_id;
+    for attempt in 1..=5 {
+        manager
+            .record_replacement_failure(&Error::Storage(crate::heal::EcstoreError::SlowDown), attempt)
+            .await
+            .expect("pre-format failure persists");
+    }
+    let state = ResumeManager::load_replacement_intent(disk.clone(), &task_id)
+        .await
+        .expect("reload")
+        .get_state()
+        .await;
+    assert_eq!(state.replacement_phase, ReplacementPhase::Intent);
+    assert_eq!(state.retry_count, 0, "pre-format failures must not spend the rebuild budget");
+    assert!(
+        state
+            .error_message
+            .as_deref()
+            .is_some_and(|m| m.contains("reduce your request rate"))
+    );
+    assert_ne!(
+        ReplacementRecoveryRecord::from_state(state.clone()).expect("record").state,
+        ReplacementRecoveryState::Unrecoverable
+    );
+
+    // Genuine rebuild failures after formatting still exhaust the budget.
+    manager
+        .mark_replacement_rebuilding(state.replacement_target_identities.clone())
+        .await
+        .expect("format admitted");
+    for attempt in 1..=state.max_retries {
+        manager
+            .record_replacement_failure(&Error::other("rebuild failed"), attempt)
+            .await
+            .expect("rebuild failure persists");
+    }
+    let exhausted = manager.get_state().await;
+    assert_eq!(exhausted.retry_count, exhausted.max_retries);
+    assert_eq!(
+        ReplacementRecoveryRecord::from_state(exhausted).expect("record").state,
+        ReplacementRecoveryState::Unrecoverable
+    );
+}
+
+#[tokio::test]
+async fn repeated_target_outages_never_consume_the_rebuild_budget() {
+    let (_temp_dir, _disk, manager) = budget_fixture().await;
+    let identities = manager.get_state().await.replacement_target_identities;
+    manager
+        .mark_replacement_rebuilding(identities)
+        .await
+        .expect("format admitted");
+    manager
+        .record_replacement_failure(&Error::other("one real failure"), 1)
+        .await
+        .expect("rebuild failure persists");
+    for attempt in 2..=11 {
+        manager
+            .record_replacement_failure(&Error::ReplacementTargetNotReady("target offline".to_string()), attempt)
+            .await
+            .expect("outage persists as a deferral");
+    }
+    let state = manager.get_state().await;
+    assert_eq!(state.retry_count, 1, "ten outages must leave the single real failure");
+    assert!(state.replacement_retry_waiting_for_target);
+    assert!(state.can_retry());
+}
+
+fn blocked_marker_path(task_id: &str) -> String {
+    format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_BLOCKED_FILE}")
+}
+
+#[tokio::test]
+async fn blocked_checkpoint_is_unblocked_when_the_current_reader_accepts_it() {
+    // rustfs/rustfs#8645: an older binary blocked a checkpoint whose digest it
+    // could not verify. The compatible reader accepts it, so a revalidation
+    // must clear the legacy marker instead of blocking the task forever.
+    for legacy in LEGACY_SIGNED_CHECKPOINTS {
+        let (temp_dir, disk) = schema_test_disk().await;
+        let task_id = "00000000-0000-4000-8000-000000000002";
+        let path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+        disk.write_all(RUSTFS_META_BUCKET, &path, legacy.as_bytes().to_vec().into())
+            .await
+            .expect("write signed legacy checkpoint");
+        disk.write_all(
+            RUSTFS_META_BUCKET,
+            &blocked_marker_path(task_id),
+            EcstoreDiskBytes::from_static(b"blocked"),
+        )
+        .await
+        .expect("write legacy blocked marker");
+
+        assert!(
+            CheckpointManager::is_resumable(&disk, task_id)
+                .await
+                .expect("revalidation must accept the intact checkpoint")
+        );
+        assert!(!CheckpointManager::is_blocked(&disk, task_id).await, "revalidation clears the marker");
+        assert!(
+            disk.read_all(RUSTFS_META_BUCKET, &blocked_marker_path(task_id))
+                .await
+                .is_err(),
+            "the marker file is removed"
+        );
+        assert_eq!(
+            disk.read_all(RUSTFS_META_BUCKET, &path).await.expect("checkpoint retained"),
+            legacy.as_bytes()
+        );
+        temp_dir.close().expect("remove revalidation fixture");
+    }
+}
+
+#[tokio::test]
+async fn tampered_checkpoint_stays_blocked_after_revalidation() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = "00000000-0000-4000-8000-000000000002";
+    let path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+    let tampered = LEGACY_SIGNED_CHECKPOINTS[2].replace("\"current_object_index\":500", "\"current_object_index\":501");
+    disk.write_all(RUSTFS_META_BUCKET, &path, tampered.as_bytes().to_vec().into())
+        .await
+        .expect("write tampered checkpoint");
+    disk.write_all(
+        RUSTFS_META_BUCKET,
+        &blocked_marker_path(task_id),
+        EcstoreDiskBytes::from_static(b"blocked"),
+    )
+    .await
+    .expect("write legacy blocked marker");
+
+    assert!(CheckpointManager::is_resumable(&disk, task_id).await.is_err());
+    assert!(CheckpointManager::is_blocked(&disk, task_id).await);
+    let marker = disk
+        .read_all(RUSTFS_META_BUCKET, &blocked_marker_path(task_id))
+        .await
+        .expect("marker retained");
+    let marker: serde_json::Value = serde_json::from_slice(&marker).expect("revalidated marker is structured");
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let revalidate_after = marker["revalidate_after"].as_u64().expect("next revalidation time");
+    assert!(revalidate_after > now + 3000, "revalidation is rescheduled about an hour later");
+    assert!(marker["reason"].as_str().is_some_and(|reason| reason.contains("digest")));
+
+    // Not due yet: the second call must not rewrite the marker.
+    assert!(CheckpointManager::is_resumable(&disk, task_id).await.is_err());
+    let unchanged = disk
+        .read_all(RUSTFS_META_BUCKET, &blocked_marker_path(task_id))
+        .await
+        .expect("marker retained");
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&unchanged).expect("marker JSON"), marker);
+    assert_eq!(
+        disk.read_all(RUSTFS_META_BUCKET, &path).await.expect("checkpoint retained"),
+        tampered.as_bytes()
+    );
+    temp_dir.close().expect("remove tampered revalidation fixture");
+}
+
+#[tokio::test]
+async fn blocked_checkpoint_is_not_revalidated_before_its_schedule() {
+    let (temp_dir, disk) = schema_test_disk().await;
+    let task_id = "00000000-0000-4000-8000-000000000002";
+    let path = format!("{BUCKET_META_PREFIX}/{task_id}_{RESUME_CHECKPOINT_FILE}");
+    disk.write_all(RUSTFS_META_BUCKET, &path, LEGACY_SIGNED_CHECKPOINTS[2].as_bytes().to_vec().into())
+        .await
+        .expect("write intact checkpoint");
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let marker = serde_json::json!({
+        "schema": 1,
+        "blocked_at": now,
+        "revalidate_after": now + 3600,
+        "reason": "digest mismatch observed by a previous reader",
+    });
+    disk.write_all(
+        RUSTFS_META_BUCKET,
+        &blocked_marker_path(task_id),
+        serde_json::to_vec(&marker).expect("marker JSON").into(),
+    )
+    .await
+    .expect("write scheduled marker");
+
+    assert!(CheckpointManager::is_resumable(&disk, task_id).await.is_err());
+    assert!(CheckpointManager::is_blocked(&disk, task_id).await);
+    let retained = disk
+        .read_all(RUSTFS_META_BUCKET, &blocked_marker_path(task_id))
+        .await
+        .expect("marker retained");
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&retained).expect("marker JSON"), marker);
+    temp_dir.close().expect("remove scheduled revalidation fixture");
 }

@@ -1399,6 +1399,9 @@ pub(crate) struct ReplacementRecoveryStatusResponse {
     pub path: String,
     pub scope: &'static str,
     pub local: rustfs_heal::ReplacementRecoverySnapshot,
+    /// Generations this node's discovery could not verify or resolve, with
+    /// reasons. Node-local and additive; it is not part of the peer merge.
+    pub local_blocked: Vec<rustfs_heal::ReplacementRecoveryBlock>,
     pub cluster: ReplacementRecoveryClusterStatus,
 }
 
@@ -1412,6 +1415,7 @@ pub(crate) struct ReplacementRecoveryClusterStatus {
 
 fn build_replacement_recovery_status_response(
     local: rustfs_heal::ReplacementRecoverySnapshot,
+    local_blocked: Vec<rustfs_heal::ReplacementRecoveryBlock>,
     cluster: ReplacementRecoveryClusterStatus,
 ) -> ReplacementRecoveryStatusResponse {
     ReplacementRecoveryStatusResponse {
@@ -1419,6 +1423,7 @@ fn build_replacement_recovery_status_response(
         path: format!("{}{}", ADMIN_PREFIX, REPLACEMENT_RECOVERY_STATUS_ROUTE_SUFFIX),
         scope: "cluster_survivor_disks",
         local,
+        local_blocked,
         cluster,
     }
 }
@@ -1611,7 +1616,7 @@ pub struct BackgroundHealStatusHandler {}
 struct MrfLegacyResponsibilityActionRequest {
     action: MrfLegacyResponsibilityAction,
     responsibility_id: uuid::Uuid,
-    expected_bucket_incarnation_id: uuid::Uuid,
+    expected_bucket_incarnation_id: Option<uuid::Uuid>,
     #[serde(default)]
     acknowledge_unverified_data_risk: Option<bool>,
     #[serde(default)]
@@ -1635,8 +1640,11 @@ enum MrfLegacyResponsibilityAction {
 }
 
 fn validate_mrf_legacy_responsibility_action(action: &MrfLegacyResponsibilityActionRequest) -> Result<(), &'static str> {
-    if action.responsibility_id.is_nil() || action.expected_bucket_incarnation_id.is_nil() {
+    if action.responsibility_id.is_nil() || action.expected_bucket_incarnation_id.is_some_and(|id| id.is_nil()) {
         return Err("responsibility and bucket incarnation IDs must be non-nil");
+    }
+    if action.expected_bucket_incarnation_id.is_none() && !matches!(action.action, MrfLegacyResponsibilityAction::Refresh) {
+        return Err("a known bucket incarnation is required for recheck and risk acceptance");
     }
     match action.action {
         MrfLegacyResponsibilityAction::Refresh | MrfLegacyResponsibilityAction::Recheck => {
@@ -1793,7 +1801,9 @@ impl Operation for MrfLegacyResponsibilitiesActionHandler {
                     Duration::from_secs(30),
                     rustfs_heal::heal::mrf_queue::recheck_legacy_responsibility(
                         action.responsibility_id,
-                        action.expected_bucket_incarnation_id,
+                        action
+                            .expected_bucket_incarnation_id
+                            .ok_or_else(|| admin_error(S3ErrorCode::InvalidRequest, "expectedBucketIncarnationId is required"))?,
                     ),
                 )
                 .await
@@ -1816,7 +1826,9 @@ impl Operation for MrfLegacyResponsibilitiesActionHandler {
                     rustfs_heal::heal::mrf_queue::accept_unverified_legacy_risk(
                         rustfs_heal::heal::mrf_queue::MrfLegacyRiskAcceptanceRequest {
                             responsibility_id: action.responsibility_id,
-                            expected_bucket_incarnation_id: action.expected_bucket_incarnation_id,
+                            expected_bucket_incarnation_id: action.expected_bucket_incarnation_id.ok_or_else(|| {
+                                admin_error(S3ErrorCode::InvalidRequest, "expectedBucketIncarnationId is required")
+                            })?,
                             acknowledge_unknown_source_incarnation: action.acknowledge_unknown_source_incarnation == Some(true),
                             acknowledge_incarnation_mismatch: action.acknowledge_bucket_incarnation_mismatch == Some(true),
                             actor,
@@ -1919,7 +1931,8 @@ impl Operation for ReplacementRecoveryStatusHandler {
         let local = rustfs_heal::current_replacement_recovery_snapshot().await;
         let cluster =
             read_cluster_replacement_recovery_status(local.clone(), notification_system.as_deref(), expected_nodes).await?;
-        let response = build_replacement_recovery_status_response(local, cluster);
+        let local_blocked = rustfs_heal::current_replacement_recovery_blocks();
+        let response = build_replacement_recovery_status_response(local, local_blocked, cluster);
         let body = encode_replacement_recovery_status(&response)?;
         info!(
             event = EVENT_ADMIN_RESPONSE_EMITTED,
@@ -1964,6 +1977,26 @@ mod tests {
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, Ordering};
     use uuid::Uuid;
+
+    #[test]
+    fn mrf_legacy_only_refresh_accepts_an_unobserved_incarnation() {
+        for action in ["refresh", "recheck", "acceptUnverifiedRisk"] {
+            let request: MrfLegacyResponsibilityActionRequest = serde_json::from_value(json!({
+                "action": action,
+                "responsibilityId": Uuid::new_v4(),
+                "expectedBucketIncarnationId": null,
+            }))
+            .expect("decode explicit unknown observation");
+            assert_eq!(validate_mrf_legacy_responsibility_action(&request).is_ok(), action == "refresh");
+        }
+        let request: MrfLegacyResponsibilityActionRequest = serde_json::from_value(json!({
+            "action": "refresh",
+            "responsibilityId": Uuid::new_v4(),
+            "expectedBucketIncarnationId": Uuid::nil(),
+        }))
+        .expect("decode nil identity");
+        assert!(validate_mrf_legacy_responsibility_action(&request).is_err());
+    }
 
     #[test]
     fn mrf_legacy_risk_action_requires_explicit_acknowledgment_and_audit_fields() {
@@ -2014,7 +2047,7 @@ mod tests {
         let recheck = MrfLegacyResponsibilityActionRequest {
             action: MrfLegacyResponsibilityAction::Recheck,
             responsibility_id: Uuid::new_v4(),
-            expected_bucket_incarnation_id: Uuid::new_v4(),
+            expected_bucket_incarnation_id: Some(Uuid::new_v4()),
             acknowledge_unverified_data_risk: None,
             acknowledge_unknown_source_incarnation: None,
             acknowledge_bucket_incarnation_mismatch: None,
@@ -2360,7 +2393,7 @@ mod tests {
     fn replacement_recovery_status_response_reports_cluster_proof() {
         let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
         let cluster = aggregate_replacement_recovery_cluster_status(vec![local.clone()], Vec::new(), 1, true);
-        let response = build_replacement_recovery_status_response(local, cluster);
+        let response = build_replacement_recovery_status_response(local, Vec::new(), cluster);
         let value = serde_json::to_value(response).expect("replacement status response should serialize");
 
         assert_eq!(value["contractVersion"], 2);
@@ -2368,6 +2401,7 @@ mod tests {
         assert_eq!(value["scope"], "cluster_survivor_disks");
         assert_eq!(value["local"]["definitive"], true);
         assert_eq!(value["local"]["records"][0]["state"], "completed");
+        assert_eq!(value["localBlocked"], serde_json::json!([]));
         assert_eq!(value["cluster"]["definitive"], true);
         assert!(value["cluster"]["reason"].is_null());
         assert_eq!(value["cluster"]["records"][0]["state"], "completed");

@@ -124,6 +124,15 @@ data:
     {{- if ne (toString .max_concurrent_disk_scans) "" }}
   RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS: {{ .max_concurrent_disk_scans | quote }}
     {{- end }}
+    {{- if ne (toString .walkers_per_disk) "" }}
+  RUSTFS_SCANNER_WALKERS_PER_DISK: {{ .walkers_per_disk | quote }}
+    {{- end }}
+    {{- if ne (toString .disk_io_budget_iops) "" }}
+  RUSTFS_SCANNER_DISK_IO_BUDGET_IOPS: {{ .disk_io_budget_iops | quote }}
+    {{- end }}
+    {{- if ne (toString .disk_io_budget_bytes_per_sec) "" }}
+  RUSTFS_SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC: {{ .disk_io_budget_bytes_per_sec | quote }}
+    {{- end }}
     {{- if ne (toString .yield_every_n_objects) "" }}
   RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS: {{ .yield_every_n_objects | quote }}
     {{- end }}

@@ -71,6 +71,11 @@ pub(crate) async fn schedule_delete(bucket: String, delete_object: DeletedObject
 }
 
 #[cfg(test)]
+pub(crate) fn take_scheduled_deletes_for_test() -> Vec<DeletedObject> {
+    ReplicationLifecycleBridge::take_scheduled_deletes_for_test()
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 

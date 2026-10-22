@@ -679,7 +679,9 @@ pub(super) enum ScannerPauseBacklogAttemptDecision {
     Untracked,
     RateLimited,
     Tracked(u64),
-    PersistenceUnavailable,
+    /// The ledger is not durable. The cycle still runs, untracked, behind the
+    /// data-movement fence; the claim is retried on later observations.
+    Degraded,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
@@ -1866,12 +1868,15 @@ where
         Ok(controller)
     }
 
+    /// Run without a durable ledger (rustfs/rustfs#8251). Cycles are not
+    /// skipped: publication stays fenced by data movement, and the claim is
+    /// retried by `observe` once the refresh interval has passed.
     pub(super) fn unavailable(storeapi: Arc<S>, error: String, now: u64) -> Self {
-        set_runtime_error(Some(error));
+        set_runtime_error(Some(degraded_runtime_error(error)));
         let loaded = LoadedScannerPauseBacklog {
             ledger: ScannerPauseBacklogLedger::default(),
             durable: false,
-            persistence_state: "unavailable".to_string(),
+            persistence_state: SCANNER_PAUSE_BACKLOG_PERSISTENCE_DEGRADED.to_string(),
             replicas: Vec::new(),
             replica_count: 0,
             healthy_replicas: 0,
@@ -1892,7 +1897,9 @@ where
 
     pub(super) fn scheduling_delay(&self, now: u64, usage_bootstrap_rebuild_pending: bool) -> Option<Duration> {
         if self.persistence_disabled {
-            return Some(Duration::from_secs(self.persistence_retry_at_unix_secs.saturating_sub(now)));
+            // A degraded ledger follows the ordinary cadence; the claim retry
+            // rides on each observation instead of forcing a probe schedule.
+            return None;
         }
         if usage_bootstrap_rebuild_pending && !self.loaded.ledger.blocks_usage_bootstrap_rebuild() {
             return None;
@@ -1932,7 +1939,7 @@ where
         begin: fn(&mut ScannerPauseBacklogLedger, u64) -> ScannerPauseBacklogAttemptDecision,
     ) -> ScannerPauseBacklogAttemptDecision {
         if self.persistence_disabled {
-            return ScannerPauseBacklogAttemptDecision::PersistenceUnavailable;
+            return ScannerPauseBacklogAttemptDecision::Degraded;
         }
         let mut candidate = self.loaded.ledger.clone();
         let decision = begin(&mut candidate, now);
@@ -1942,7 +1949,7 @@ where
         }
         if let Err(err) = prepare_scanner_pause_backlog_persist(&mut candidate, now) {
             self.disable_persistence(err, now);
-            return ScannerPauseBacklogAttemptDecision::PersistenceUnavailable;
+            return ScannerPauseBacklogAttemptDecision::Degraded;
         }
         match persist_scanner_pause_backlog(self.storeapi.clone(), &self.loaded, candidate).await {
             Ok(loaded) => {
@@ -1953,7 +1960,7 @@ where
             }
             Err(err) => {
                 self.disable_persistence(err, now);
-                ScannerPauseBacklogAttemptDecision::PersistenceUnavailable
+                ScannerPauseBacklogAttemptDecision::Degraded
             }
         }
     }
@@ -2008,7 +2015,8 @@ where
     fn disable_persistence(&mut self, error: String, now: u64) {
         self.persistence_disabled = true;
         self.persistence_retry_at_unix_secs = now.saturating_add(SCANNER_PAUSE_REFRESH_INTERVAL_SECONDS);
-        set_runtime_error(Some(error));
+        self.loaded.persistence_state = SCANNER_PAUSE_BACKLOG_PERSISTENCE_DEGRADED.to_string();
+        set_runtime_error(Some(degraded_runtime_error(error)));
         self.record_status(now);
     }
 
@@ -2027,7 +2035,7 @@ where
             }
             Err(error) => {
                 self.persistence_retry_at_unix_secs = now.saturating_add(SCANNER_PAUSE_REFRESH_INTERVAL_SECONDS);
-                set_runtime_error(Some(error));
+                set_runtime_error(Some(degraded_runtime_error(error)));
                 self.record_status(now);
                 false
             }
@@ -2046,6 +2054,14 @@ fn prepare_scanner_pause_backlog_persist(ledger: &mut ScannerPauseBacklogLedger,
         .ok_or_else(|| "scanner pause backlog generation is exhausted".to_string())?;
     ledger.last_updated_at_unix_secs = now;
     ledger.validate()
+}
+
+const SCANNER_PAUSE_BACKLOG_PERSISTENCE_DEGRADED: &str = "degraded";
+
+fn degraded_runtime_error(error: String) -> String {
+    format!(
+        "{error}; scanner cycles continue without a durable pause ledger behind the data-movement fence and the ledger claim is retried at most every {SCANNER_PAUSE_REFRESH_INTERVAL_SECONDS} seconds"
+    )
 }
 
 fn set_runtime_error(error: Option<String>) {
@@ -2068,6 +2084,9 @@ pub async fn scanner_pause_backlog_status(storeapi: Arc<ECStore>) -> ScannerPaus
     match select_scanner_pause_backlog_replicas(replicas) {
         Ok(loaded) => {
             let mut status = loaded.status(now, runtime_error());
+            if status.error.is_some() {
+                status.persistence_state = SCANNER_PAUSE_BACKLOG_PERSISTENCE_DEGRADED.to_string();
+            }
             if status.error.is_some()
                 || !status.durable
                 || status.stale_or_unavailable_replicas > 0
@@ -2078,12 +2097,18 @@ pub async fn scanner_pause_backlog_status(storeapi: Arc<ECStore>) -> ScannerPaus
             status
         }
         Err(failure) => {
-            let error = runtime_error().map_or(failure.to_string(), |runtime| format!("{failure}; {runtime}"));
+            let runtime = runtime_error();
+            let persistence_state = if runtime.is_some() {
+                SCANNER_PAUSE_BACKLOG_PERSISTENCE_DEGRADED
+            } else {
+                "unavailable"
+            };
+            let error = runtime.map_or(failure.to_string(), |runtime| format!("{failure}; {runtime}"));
             let replica_diagnostics = scanner_pause_backlog_replica_diagnostics(failure.replicas);
             status_from_ledger(
                 &ScannerPauseBacklogLedger::default(),
                 now,
-                "unavailable".to_string(),
+                persistence_state.to_string(),
                 false,
                 replica_count,
                 0,
@@ -3740,6 +3765,52 @@ mod tests {
                 .expect("retained target intent snapshot")
             };
             assert_eq!(after, before, "native cleanup never clears or estimates a target mutation intent");
+            shutdown_native_retirement_store(store).await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_retirement_waits_for_an_adopted_target_intent() {
+        run_native_retirement_test(async || {
+            let (_root, store) = native_retirement_store().await;
+            let seeded = ScannerPauseBacklogController::claim(Arc::clone(&store), unix_now())
+                .await
+                .expect("seed the real native record on every set");
+            drop(seeded);
+            let (source_bytes, _) = native_replica_bytes(&store.pools[0].disk_set[0]).await;
+            store
+                .prepare_scanner_pause_backlog_retirement_for_test(0, source_bytes.len() * 2)
+                .await
+                .expect("activate native retirement");
+            store
+                .stage_scanner_pause_backlog_retirement_intent_for_test(0, 0)
+                .await
+                .expect("retain a real target intent after failure in the admitted operation");
+            // A resumed decommission routine moves the leftover intent into
+            // the mutation's adopted marker.
+            store
+                .adopt_previous_incarnation_decommission_capacity_intents_for_test(0)
+                .await
+                .expect("adopt the leftover retirement intent");
+            {
+                let meta = store.pool_meta.read().await;
+                let reservation = meta.pools[0]
+                    .decommission
+                    .as_ref()
+                    .unwrap()
+                    .capacity_reservation
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(reservation.pending_target_physical_bytes, 0);
+                assert!(reservation.inflight_target_physical_bytes > 0);
+            }
+            let blocked = store
+                .retire_scanner_pause_backlog_for_test(0, 0)
+                .await
+                .expect_err("an adopted target intent still blocks retirement");
+            assert!(blocked.to_string().contains("unresolved target capacity intent"), "{blocked}");
+            assert_eq!(native_replica_bytes(&store.pools[0].disk_set[0]).await.0, source_bytes);
             shutdown_native_retirement_store(store).await;
         });
     }

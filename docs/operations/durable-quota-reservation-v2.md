@@ -1,5 +1,7 @@
 # Durable quota reservation protocol v2
 
+**Use this when:** operating durable hard quotas, upgrading quota-enabled clusters, or diagnosing quota writes during a node outage.
+
 Protocol v2 is an opt-in hard-quota protocol for distributed deployments. It
 keeps the quota limit authoritative in one allocator ledger while moving
 request reservations into sixteen independently locked shard ledgers.
@@ -66,6 +68,43 @@ The default `BucketQuota::new` remains protocol v1. This keeps existing
 deployments compatible until an operator has completed the rollout and chosen
 the sharded protocol explicitly.
 
+## Availability and fence protocol upgrades
+
+Both reservation protocols use the same write-availability rules. Setting a
+durable quota still requires the existing whole-fleet capability proof. Once
+configured, a quota write does not require that proof to remain live. It needs
+the namespace locks, authoritative bucket configuration, quota ledger, and
+object mutation fences to satisfy their respective quorums. A failed node
+therefore does not stop quota writes when those quorums remain available.
+
+Object fences use the target erasure set's write quorum. Ledger, allocator,
+and shard fencing retains the existing per-pool set checks. An unavailable
+set that owns required quota state can still block a write even if its object
+data set is healthy; a majority of nodes across the whole cluster is not a
+substitute for these quorums.
+
+Participating disks must also agree with the coordinator's configured
+pool/set/disk topology. The dedicated quota RPCs authenticate that topology
+identity and reject a different layout, including a different pool order.
+An offline node does not change the configured topology, so this check does
+not require every node to respond.
+
+Quota mutations use the dedicated `AcquireQuotaMutationFence`,
+`ReleaseQuotaMutationFence`, and `RenameDataWithQuotaFence` RPCs. A fenced
+rename requires a valid token for that disk process and object. A restart
+discards the token registry, and revocation waits for existing claims to
+drain before returning success. Unsupported peers fail closed; clients never
+fall back to ordinary rename or lease RPCs for a quota mutation.
+
+Upgrade every node before relying on degraded quota writes. During a rolling
+upgrade, new coordinators cannot count old peers toward quota fence quorums,
+so their quota writes can temporarily fail until enough upgraded disks are
+available in every required set. Older coordinators retain their whole-fleet
+proof requirement. The same limitation applies when rolling back: avoid
+routing quota writes to a newer coordinator that lacks enough compatible
+peers. The quota and ledger formats are unchanged, including the zero-quota
+encoding that makes pre-reservation coordinators reject positive growth.
+
 ## Performance boundary
 
 Normal v2 requests take a shared allocator read lock and one shard write lock;
@@ -77,3 +116,69 @@ bound, not a best-effort token bucket.
 Unused credit is intentionally retained until the quota epoch changes or a
 future reconciliation operation returns it, trading some capacity utilization
 for a simple crash-safe upper bound.
+
+## Quotas saved before the reservation protocols
+
+A quota configuration without `reservation_protocol` (saved by a release
+before protocol v1) is still admitted from scanner usage snapshots: its writes
+need an authoritative or degraded usage value and fail closed with a
+retryable `503` when neither exists. Decision D3
+([scanner-usage-authority-decision.md](../architecture/scanner-usage-authority-decision.md))
+moves such buckets onto the sharded durable protocol by re-saving the same
+limit and type with `reservation_protocol: 2`; `created_at` is preserved.
+
+Two triggers exist and both go through the same guarded save:
+
+- Lazily, on the first quota read of such a bucket through the instance's
+  registered bucket metadata system (every PUT, COPY, multipart completion
+  and admin quota read). The read answers with the configuration it found and
+  schedules the re-save in the background; it is never blocked or failed by
+  the attempt. An attempt that does not settle the bucket is retried no
+  sooner than five minutes later.
+- In bulk, with `POST /rustfs/admin/v3/quota-migration`
+  (`admin:SetBucketQuota`). The sweep visits every bucket and answers with a
+  per-bucket report:
+
+```json
+{
+  "target_reservation_protocol": 2,
+  "migrated": 1, "already_durable": 3, "no_quota": 10, "skipped": 0, "failed": 0,
+  "buckets": [
+    {"bucket": "photos", "outcome": "migrated", "reservation_protocol": 2, "updated_at": "2026-10-19T02:14:07Z"},
+    {"bucket": "logs", "outcome": "already_durable", "reservation_protocol": 1},
+    {"bucket": "tmp", "outcome": "no_quota"}
+  ]
+}
+```
+
+`outcome` is one of `migrated`, `already_durable`, `no_quota`, `skipped`
+(`reason`: `unsupported_reservation_protocol`, `quota_revision_changed`,
+`bucket_incarnation_changed`) or `failed` (`reason` carries the error). A
+failed bucket does not stop the sweep; run the command again after fixing the
+cause.
+
+The save keeps the admin save's preconditions: the whole-fleet capability
+proof must be live (a mixed-version fleet fails the attempt rather than
+exposing protocol v2 to a node that would fail closed on it), the bucket
+incarnation must still match, and the quota revision must be the one that was
+read. A quota edited in between is reported as `quota_revision_changed` and
+left for the next attempt. A protocol this node does not understand is never
+rewritten. Durable quotas (protocol v1 or v2) are not touched; the admin
+default for a new quota remains protocol v1.
+
+Each attempt logs one `quota_reservation_protocol_migration` event
+(`trigger` is `lazy` or `admin`, `result` is `migrated`, `noop`, `skipped` or
+`failed`) and increments
+`rustfs_quota_reservation_protocol_migrations_total` with the same labels.
+
+## Usage reporting for durable quotas
+
+For a bucket on protocol v1 or v2 the request-path quota check and the admin
+quota endpoints read scanner usage for reporting only. When no usage is
+available, `GET /rustfs/admin/v3/quota-stats/{bucket}` and
+`POST /rustfs/admin/v3/quota-check/{bucket}` answer `200` with
+`current_usage: null` (and no `remaining_quota` or `usage_percentage`) instead
+of `503`, and object writes are admitted by the ledger alone. Each such
+lookup logs a `quota_usage_report` event at debug level and increments
+`rustfs_quota_usage_report_unavailable_total`. A bucket without
+`reservation_protocol` keeps the previous behaviour until it is migrated.

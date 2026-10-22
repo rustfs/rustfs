@@ -1037,6 +1037,22 @@ pub async fn awscurl_post_sts_form_urlencoded(
     Ok(response)
 }
 
+fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml[start..end].to_string())
+}
+
+/// Returns `(access_key, secret_key, session_token)` from an STS `AssumeRole` XML response.
+pub fn parse_assume_role_credentials(xml: &str) -> Result<(String, String, String), Box<dyn std::error::Error + Send + Sync>> {
+    let access_key = extract_xml_tag(xml, "AccessKeyId").ok_or("missing AccessKeyId in AssumeRole response")?;
+    let secret_key = extract_xml_tag(xml, "SecretAccessKey").ok_or("missing SecretAccessKey in AssumeRole response")?;
+    let session_token = extract_xml_tag(xml, "SessionToken").ok_or("missing SessionToken in AssumeRole response")?;
+    Ok((access_key, secret_key, session_token))
+}
+
 /// Helper function for POST requests
 pub async fn awscurl_post(
     url: &str,
@@ -1828,6 +1844,47 @@ impl RustFSTestClusterEnvironment {
         }
 
         Ok(new_idx)
+    }
+
+    /// Remove retired single-node pools from a stopped multi-pool cluster.
+    ///
+    /// A decommissioned pool must leave the server command line before the
+    /// next start; the server refuses to start while it is still listed. The
+    /// remaining pools keep their node order and are renumbered from zero.
+    /// Data directories are left on disk for the owning harness to clean up.
+    pub fn remove_single_node_pools(&mut self, retired: &[usize]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.nodes.iter().any(|node| node.process.is_some()) {
+            return Err("stop the cluster before removing a pool".into());
+        }
+        let pools = self.topology.normalized_pools();
+        if pools.iter().any(|nodes| nodes.len() != 1) {
+            return Err("remove_single_node_pools requires one node per pool".into());
+        }
+        if retired.iter().any(|pool| *pool >= pools.len()) || retired.len() >= pools.len() {
+            return Err(format!("cannot remove pools {retired:?} from {} pools", pools.len()).into());
+        }
+        let keep: Vec<usize> = (0..self.nodes.len())
+            .filter(|node_idx| !retired.contains(&self.nodes[*node_idx].pool_idx))
+            .collect();
+        fn retain_indices<T>(values: &mut Vec<T>, keep: &[usize]) {
+            let old = std::mem::take(values);
+            *values = old
+                .into_iter()
+                .enumerate()
+                .filter(|(idx, _)| keep.contains(idx))
+                .map(|(_, value)| value)
+                .collect();
+        }
+        retain_indices(&mut self.nodes, &keep);
+        retain_indices(&mut self.node_extra_env, &keep);
+        retain_indices(&mut self.node_capture_log_paths, &keep);
+        retain_indices(&mut self.volume_proxy_addresses, &keep);
+        for (pool_idx, node) in self.nodes.iter_mut().enumerate() {
+            node.pool_idx = pool_idx;
+        }
+        self.topology.node_count = self.nodes.len();
+        self.topology.pools = (0..self.nodes.len()).map(|node_idx| vec![node_idx]).collect();
+        Ok(())
     }
 
     /// Gracefully stop one cluster node and wait for its process to exit.

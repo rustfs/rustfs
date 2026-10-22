@@ -39,6 +39,7 @@ use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::{get_object::GetObjectError, put_object::PutObjectError};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+use futures::future::try_join_all;
 use http::{Method, StatusCode};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -77,6 +78,7 @@ pub(crate) struct DistCluster {
     pub cluster: RustFSTestClusterEnvironment,
     pool_storage_roots: Option<Vec<PathBuf>>,
     owned_pool_dirs: Vec<PathBuf>,
+    capture_log_dir: Option<PathBuf>,
 }
 
 impl DistCluster {
@@ -128,11 +130,12 @@ impl DistCluster {
         for &(key, value) in extra_env {
             cluster.set_env(key, value);
         }
-        configure_node_logs(&mut cluster)?;
+        configure_node_logs(&mut cluster, None)?;
         Ok(Self {
             cluster,
             pool_storage_roots,
             owned_pool_dirs,
+            capture_log_dir: None,
         })
     }
 
@@ -170,6 +173,14 @@ impl DistCluster {
         Ok(())
     }
 
+    /// Append every node's stdout/stderr to `directory/node-<idx>.log`, including
+    /// nodes added by later pool expansion. Call before the first start so startup
+    /// events such as the resolved durability mode are captured.
+    pub fn capture_logs_under(&mut self, directory: &Path) -> TestResult {
+        self.capture_log_dir = Some(directory.to_path_buf());
+        configure_node_logs(&mut self.cluster, Some(directory))
+    }
+
     pub fn client_with_credentials(&self, node_idx: usize, access_key: &str, secret_key: &str) -> TestResult<Client> {
         if node_idx >= self.cluster.nodes.len() {
             return Err("node_idx is invalid".into());
@@ -183,6 +194,16 @@ impl DistCluster {
         )))
     }
 
+    /// Stop the fleet, drop retired pools from the command line, and restart
+    /// the remaining pools, which are renumbered from zero.
+    pub async fn remove_retired_pools_and_restart(&mut self, retired: &[usize]) -> TestResult {
+        self.stop_all_gracefully().await?;
+        self.cluster.remove_single_node_pools(retired)?;
+        self.cluster.start().await?;
+        wait_for_ready(&self.cluster).await?;
+        Ok(())
+    }
+
     pub async fn append_pool_and_restart(&mut self) -> TestResult<usize> {
         self.stop_all_gracefully().await?;
         let node_idx = self.cluster.append_single_node_pool().await?;
@@ -192,7 +213,7 @@ impl DistCluster {
             .ok_or("pool expansion requires configured isolated pool filesystems")?;
         self.owned_pool_dirs
             .push(relocate_pool_storage(&mut self.cluster, node_idx, roots)?);
-        configure_node_logs(&mut self.cluster)?;
+        configure_node_logs(&mut self.cluster, self.capture_log_dir.as_deref())?;
         self.cluster.start().await?;
         wait_for_ready(&self.cluster).await?;
         Ok(node_idx)
@@ -326,7 +347,19 @@ fn relocate_pool_storage(cluster: &mut RustFSTestClusterEnvironment, node_idx: u
     Ok(pool_run_root)
 }
 
-fn configure_node_logs(cluster: &mut RustFSTestClusterEnvironment) -> TestResult {
+fn configure_node_logs(cluster: &mut RustFSTestClusterEnvironment, capture_dir: Option<&Path>) -> TestResult {
+    if let Some(directory) = capture_dir {
+        std::fs::create_dir_all(directory)?;
+        for node_idx in 0..cluster.nodes.len() {
+            // Overrides a path assigned from RUSTFS_E2E_LOG_DIR so every node of
+            // the run, including the seed node, logs into the same directory.
+            let path = directory.join(format!("node-{node_idx}.log"));
+            if cluster.node_capture_log_paths[node_idx].as_deref() != Some(path.to_string_lossy().as_ref()) {
+                cluster.set_node_capture_log_path(node_idx, path.to_string_lossy().into_owned())?;
+            }
+        }
+        return Ok(());
+    }
     let Some(log_dir) = std::env::var_os("RUSTFS_E2E_LOG_DIR") else {
         return Ok(());
     };
@@ -656,13 +689,50 @@ pub(crate) async fn wait_for_replicated_bytes(
     .await
 }
 
+/// Quota stats for `bucket` from every node at once. Each node answers from
+/// its own cached copy of the persisted usage snapshot, and only the scanner
+/// leader's save invalidates that copy. Leadership goes to whichever node
+/// starts its scanner first, so a probe pinned to one node can wait out the
+/// whole cache TTL on a node that never saves.
+pub(crate) async fn quota_stats_on_every_node(
+    cluster: &RustFSTestClusterEnvironment,
+    bucket: &str,
+) -> TestResult<Vec<(StatusCode, String)>> {
+    let path = format!("/rustfs/admin/v3/quota-stats/{bucket}");
+    try_join_all(
+        cluster
+            .nodes
+            .iter()
+            .map(|node| admin_request(&node.url, Method::GET, &path, None, &cluster.access_key, &cluster.secret_key)),
+    )
+    .await
+}
+
+/// `current_usage` from a quota-stats body. `None` means the node has no
+/// scanner usage for the bucket yet: a quota admitted by the reservation
+/// ledger reports `null` rather than a guess.
+pub(crate) fn quota_stats_current_usage(body: &str) -> TestResult<Option<u64>> {
+    let stats: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| format!("quota stats returned invalid JSON: {error}: {body}"))?;
+    match stats.get("current_usage") {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(usage) => Ok(Some(
+            usage
+                .as_u64()
+                .ok_or_else(|| format!("quota stats current_usage is not a byte count: {stats}"))?,
+        )),
+        None => Err(format!("quota stats omitted current_usage: {stats}").into()),
+    }
+}
+
 pub(crate) async fn set_bucket_quota(cluster: &RustFSTestClusterEnvironment, bucket: &str, quota_bytes: u64) -> TestResult {
     wait_until(
         Duration::from_secs(30),
         || async {
-            let (status, _) =
-                cluster_admin(cluster, Method::GET, &format!("/rustfs/admin/v3/quota-stats/{bucket}"), None).await?;
-            Ok(status.is_success() || status == StatusCode::NOT_FOUND)
+            let stats = quota_stats_on_every_node(cluster, bucket).await?;
+            Ok(stats
+                .iter()
+                .any(|(status, _)| status.is_success() || *status == StatusCode::NOT_FOUND))
         },
         "quota stats ready",
     )
@@ -686,23 +756,44 @@ pub(crate) async fn set_bucket_quota(cluster: &RustFSTestClusterEnvironment, buc
     .await
 }
 
+/// The existing decommission cases wait up to 180 s for movement to finish; a
+/// start refused because a movement gate is busy is retried within the same budget.
+const DECOMMISSION_START_BUSY_BUDGET: Duration = Duration::from_secs(180);
+const DECOMMISSION_START_PROOF_BUDGET: Duration = Duration::from_secs(45);
+
 /// Start decommission and fail closed unless the admin API acknowledges it.
 pub(crate) async fn start_decommission(cluster: &RustFSTestClusterEnvironment, pool_id: usize) -> TestResult {
     let path = format!("/rustfs/admin/v3/pools/decommission?pool={pool_id}&by-id=true");
-    let deadline = Instant::now() + Duration::from_secs(45);
+    post_decommission_start(cluster, &path, DECOMMISSION_START_BUSY_BUDGET).await?;
+    Ok(())
+}
+
+/// POST a decommission start and return the response body. A start that meets
+/// a busy movement gate answers a retryable 503 and is retried within
+/// `busy_budget`; the init stage's missing fleet capability proof (500) is
+/// retried for 45 s. Every other status is fatal.
+pub(crate) async fn post_decommission_start(
+    cluster: &RustFSTestClusterEnvironment,
+    path: &str,
+    busy_budget: Duration,
+) -> TestResult<String> {
+    let started = Instant::now();
+    let mut delay = Duration::from_millis(250);
     loop {
-        let (status, response) = cluster_admin(cluster, Method::POST, &path, None).await?;
+        let (status, response) = cluster_admin(cluster, Method::POST, path, None).await?;
         if status.is_success() {
-            return Ok(());
+            return Ok(response);
         }
-        if status == StatusCode::INTERNAL_SERVER_ERROR
+        let elapsed = started.elapsed();
+        let busy = status == StatusCode::SERVICE_UNAVAILABLE && elapsed < busy_budget;
+        let awaiting_proof = status == StatusCode::INTERNAL_SERVER_ERROR
             && response.contains("requires a live fleet capability proof")
-            && Instant::now() < deadline
-        {
-            sleep(Duration::from_secs(1)).await;
-            continue;
+            && elapsed < DECOMMISSION_START_PROOF_BUDGET;
+        if !busy && !awaiting_proof {
+            return Err(format!("POST {path} did not start decommission: {status} {response}").into());
         }
-        return Err(format!("POST {path} did not start decommission: {status} {response}").into());
+        sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(2));
     }
 }
 
@@ -1257,6 +1348,29 @@ async fn append_single_node_pool_extends_ellipses_volumes() {
     let volumes = env.rustfs_volumes_arg();
     assert_eq!(volumes.split(' ').count(), 3, "expected three pool arguments, got: {volumes}");
     assert!(volumes.contains("/drive{0...1}"), "expanded layout must keep drive ellipses: {volumes}");
+}
+
+#[tokio::test]
+async fn remove_single_node_pools_drops_retired_pools_and_renumbers() {
+    let mut env =
+        RustFSTestClusterEnvironment::with_topology(ClusterTopology::per_node_pools(2, vec![vec![0], vec![1], vec![2], vec![3]]))
+            .await
+            .expect("four-pool topology");
+    let kept: Vec<String> = env.nodes[2..].iter().map(|node| node.address.clone()).collect();
+
+    env.remove_single_node_pools(&[0, 1]).expect("remove two retired pools");
+    assert_eq!(env.nodes.len(), 2);
+    assert_eq!(env.nodes.iter().map(|node| node.address.clone()).collect::<Vec<_>>(), kept);
+    assert_eq!(env.nodes.iter().map(|node| node.pool_idx).collect::<Vec<_>>(), vec![0, 1]);
+    let volumes = env.rustfs_volumes_arg();
+    assert_eq!(volumes.split(' ').count(), 2, "expected two pool arguments, got: {volumes}");
+    assert!(
+        volumes.contains(&kept[0]) && volumes.contains(&kept[1]),
+        "retired pools must leave the command line: {volumes}"
+    );
+
+    env.remove_single_node_pools(&[0, 1])
+        .expect_err("the last remaining pool cannot be removed");
 }
 
 #[tokio::test]

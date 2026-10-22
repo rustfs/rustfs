@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use rustfs_utils::path::path_join_buf;
 
 #[tokio::test]
 #[serial]
@@ -168,6 +169,30 @@ async fn progress_proof_is_bounded_without_a_runtime_budget() {
 #[tokio::test]
 #[serial]
 async fn coordinator_persists_budget_progress_without_usage_or_dirty_acknowledgement() {
+    assert_coordinator_partial_progress(false, None, false).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn coordinator_preserves_checkpoint_when_bucket_identity_is_unavailable() {
+    assert_coordinator_partial_progress(false, None, true).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn coordinator_persists_mixed_plan_tail_without_usage_or_dirty_acknowledgement() {
+    assert_coordinator_partial_progress(true, None, false).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn coordinator_partial_progress_requires_successful_cycle_state_save() {
+    for after_commit in [false, true] {
+        assert_coordinator_partial_progress(true, Some(after_commit), false).await;
+    }
+}
+
+async fn assert_coordinator_partial_progress(resume_mixed_plan: bool, fail_cycle_save: Option<bool>, block_identity_read: bool) {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     let bucket = "scanner-budget-progress";
@@ -217,6 +242,7 @@ async fn coordinator_persists_budget_progress_without_usage_or_dirty_acknowledge
         ScannerCycleScheduling {
             requires_full_scan: true,
             service_cohort: None,
+            scope_fallback: None,
         },
     )
     .await;
@@ -239,8 +265,275 @@ async fn coordinator_persists_budget_progress_without_usage_or_dirty_acknowledge
             .expect("unchanged root"),
         baseline
     );
-    assert!(read_config(store, DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()).await.is_err());
+    assert!(
+        read_config(store.clone(), DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str())
+            .await
+            .is_err()
+    );
     assert_eq!(crate::scanner_io::dirty_usage_buckets_for_tests(), dirty_before);
+
+    if block_identity_read {
+        let set = store.pools[0].disk_set[0].clone();
+        let cache_name = path_join_buf(&[bucket, DATA_USAGE_CACHE_NAME]);
+        let mut checkpoint = DataUsageCache::default();
+        let revisions = checkpoint
+            .load_with_revisions(set.clone(), &cache_name)
+            .await
+            .expect("load the saved checkpoint before blocking its identity read");
+        assert!(checkpoint.info.scan_identity.is_some());
+        assert!(checkpoint.has_scan_position());
+        let before = serde_json::to_value(&checkpoint).expect("serialize the existing checkpoint");
+        let identity_key = path_join_buf(&[crate::BUCKET_META_PREFIX, bucket, ".bucket-incarnation"]);
+        let lock = store
+            .new_ns_lock(RUSTFS_META_BUCKET, &identity_key)
+            .await
+            .expect("bucket identity object lock");
+        let guard = lock
+            .get_write_lock(Duration::from_secs(30))
+            .await
+            .expect("hold the identity sidecar unavailable to scanner reads");
+        let blocked_budget = ScannerCycleBudget::new_with_progress_tracking(
+            &ctx,
+            ScannerCycleBudgetConfig {
+                max_objects: Some(1),
+                ..Default::default()
+            },
+        );
+        let blocked_outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_data_scanner_cycle_with_budget(
+                &ctx,
+                &store,
+                &mut cycle,
+                &mut revision,
+                1,
+                Arc::clone(&blocked_budget),
+                ScannerCycleScheduling {
+                    requires_full_scan: true,
+                    service_cohort: None,
+                    scope_fallback: None,
+                },
+            ),
+        )
+        .await
+        .expect("blocked identity reads must finish within the existing acquisition bounds");
+        assert_eq!(
+            blocked_outcome,
+            ScannerCycleOutcome::Failed,
+            "no verified bucket work must not publish a cycle"
+        );
+        assert_eq!(blocked_budget.progress().0, 0, "unverified identity must not start a legacy rebuild");
+        let after_revisions = checkpoint
+            .load_with_revisions(set, &cache_name)
+            .await
+            .expect("reload the retained checkpoint while only the identity object is locked");
+        assert_eq!(after_revisions, revisions, "unavailable identity must not overwrite saved progress");
+        assert_eq!(serde_json::to_value(&checkpoint).expect("serialize retained checkpoint"), before);
+        assert_eq!(crate::scanner_io::dirty_usage_buckets_for_tests(), dirty_before);
+        drop(guard);
+
+        let recovery_budget = ScannerCycleBudget::new_with_progress_tracking(
+            &ctx,
+            ScannerCycleBudgetConfig {
+                max_objects: Some(1),
+                ..Default::default()
+            },
+        );
+        let recovered = run_data_scanner_cycle_with_budget(
+            &ctx,
+            &store,
+            &mut cycle,
+            &mut revision,
+            1,
+            Arc::clone(&recovery_budget),
+            ScannerCycleScheduling {
+                requires_full_scan: true,
+                service_cohort: None,
+                scope_fallback: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            recovered,
+            ScannerCycleOutcome::Partial,
+            "the same checkpoint must resume after identity reads recover"
+        );
+        assert_eq!(recovery_budget.progress().0, 1);
+        checkpoint
+            .load(store.pools[0].disk_set[0].clone(), &cache_name)
+            .await
+            .expect("reload resumed progress");
+        assert!(checkpoint.info.scan_identity.is_some());
+        assert!(checkpoint.has_scan_position());
+        assert_eq!(crate::scanner_io::dirty_usage_buckets_for_tests(), dirty_before);
+    }
+
+    if resume_mixed_plan {
+        let set = store.pools[0].disk_set[0].clone();
+        let cache_name = path_join_buf(&[bucket, DATA_USAGE_CACHE_NAME]);
+        let mut checkpoint = DataUsageCache::default();
+        let revisions = checkpoint
+            .load_with_revisions(set.clone(), &cache_name)
+            .await
+            .expect("load the bounded sweep's durable checkpoint");
+        assert!(
+            checkpoint.info.scan_checkpoint.is_some()
+                || checkpoint.info.scan_resume_after.is_some()
+                || checkpoint.info.scan_raw_enumeration_cursor.is_some()
+                || checkpoint.info.scan_raw_enumeration_page_index.is_some()
+                || checkpoint.info.scan_coverage_receipt.is_some(),
+            "bounded sweep must retain a durable position: {:?}",
+            checkpoint.info
+        );
+        let progress = checkpoint.info.scan_progress.as_mut().expect("bounded sweep has a plan");
+        // A restarted process requests a new plan while retaining the old prefix.
+        progress.started_plan.0[0] ^= 1;
+        let epoch = checkpoint.info.scan_identity.expect("checkpoint identity").publication_epoch;
+        checkpoint
+            .save_with_revisions_for_epoch(set.clone(), &cache_name, &revisions, epoch)
+            .await
+            .expect("persist a prefix from a different process plan");
+
+        let tail_budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, ScannerCycleBudgetConfig::default());
+        // A committed-then-failed write is confirmed from durable state by the
+        // save itself, so only an uncommitted fault that outlives every bounded
+        // retry makes the cycle-state save fail.
+        let failure_guard = fail_cycle_save.map(|after_commit| {
+            if after_commit {
+                super::cycle_persist_failure::fail_next_save(1, true)
+            } else {
+                super::cycle_persist_failure::fail_saves(1, false, SCANNER_PERSIST_CAS_RETRIES + 1)
+            }
+        });
+        let tail_outcome = run_data_scanner_cycle_with_budget(
+            &ctx,
+            &store,
+            &mut cycle,
+            &mut revision,
+            1,
+            Arc::clone(&tail_budget),
+            ScannerCycleScheduling {
+                requires_full_scan: true,
+                service_cohort: None,
+                scope_fallback: None,
+            },
+        )
+        .await;
+        assert!(!tail_budget.budget_elapsed(), "this is not the budget-exhaustion fast path");
+        checkpoint.load(set, &cache_name).await.expect("reload the saved mixed tail");
+        assert!(!checkpoint.info.snapshot_complete);
+        assert!(checkpoint.info.scan_checkpoint.is_none());
+        assert!(checkpoint.info.scan_resume_after.is_none());
+        let progress = checkpoint
+            .info
+            .scan_progress
+            .expect("a fresh verification sweep is still required");
+        assert_eq!(progress.started_plan, progress.requested_plan);
+        assert_eq!(
+            read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+                .await
+                .expect("root retained"),
+            baseline
+        );
+        assert!(
+            read_config(store.clone(), DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str())
+                .await
+                .is_err()
+        );
+        assert_eq!(crate::scanner_io::dirty_usage_buckets_for_tests(), dirty_before);
+        if let Some(after_commit) = fail_cycle_save {
+            assert!(super::cycle_persist_failure::take_failure(1).is_none(), "injected fault must have fired");
+            let state = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
+                .await
+                .expect("last durable cycle");
+            let durable_next = decode_scanner_cycle_state(&state)
+                .expect("cycle after failed acknowledgement")
+                .0
+                .next;
+            if after_commit {
+                // The write committed before the error surfaced; the save
+                // confirms it from durable state under the same epoch.
+                assert_eq!(tail_outcome, ScannerCycleOutcome::Partial);
+                assert!(tail_budget.cycle_state_persisted());
+                assert_eq!(durable_next, 354);
+            } else {
+                // Every bounded retry failed: progress stays unacknowledged
+                // and the durable cycle does not move.
+                assert_eq!(tail_outcome, ScannerCycleOutcome::StatePersistenceFailed);
+                assert!(!tail_budget.cycle_state_persisted());
+                assert_eq!(durable_next, 353);
+            }
+            drop(failure_guard);
+            global_metrics().set_cycle(None).await;
+            crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+            return;
+        }
+        assert_eq!(
+            tail_outcome,
+            ScannerCycleOutcome::Partial,
+            "saved recovery progress is not a usage-save failure"
+        );
+        assert_eq!(cycle.next, 354);
+        assert!(cycle.cycle_completed.is_empty());
+        assert!(tail_budget.cycle_state_persisted());
+        let state = read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH)
+            .await
+            .expect("durable tail cycle");
+        assert_eq!(decode_scanner_cycle_state(&state).expect("tail cycle state").0.next, 354);
+
+        let verification = run_data_scanner_cycle_with_budget(
+            &ctx,
+            &store,
+            &mut cycle,
+            &mut revision,
+            1,
+            ScannerCycleBudget::new_with_progress_tracking(&ctx, ScannerCycleBudgetConfig::default()),
+            ScannerCycleScheduling {
+                requires_full_scan: true,
+                service_cohort: None,
+                scope_fallback: None,
+            },
+        )
+        .await;
+        assert_eq!(verification, ScannerCycleOutcome::Completed, "only the fresh sweep certifies usage");
+        let usage: DataUsageInfo = serde_json::from_slice(
+            &read_config(store, DATA_USAGE_OBJ_NAME_PATH.as_str())
+                .await
+                .expect("verified root"),
+        )
+        .expect("verified usage JSON");
+        assert_eq!((usage.objects_total_count, usage.objects_total_size), (3, 15));
+        assert!(!crate::scanner_io::dirty_usage_buckets_pending());
+    }
     global_metrics().set_cycle(None).await;
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+}
+
+#[test]
+fn partial_progress_does_not_mask_missing_updates_or_persistence_failure() {
+    for (persisted, expected) in [
+        (DataUsagePersistOutcome::NoUpdate, ScannerCycleOutcome::Partial),
+        (DataUsagePersistOutcome::Failed, ScannerCycleOutcome::Failed),
+        (DataUsagePersistOutcome::Current, ScannerCycleOutcome::Failed),
+        (
+            DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement),
+            ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement),
+        ),
+    ] {
+        let result = ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None).with_partial_bucket_progress(true);
+        assert_eq!(scanner_cycle_completion_outcome_for_result(&result, persisted), expected);
+    }
+    for result in [
+        ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None),
+        ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None)
+            .with_partial_bucket_progress(true)
+            .with_usage_update_emitted(true),
+        ScannerCycleResult::new(ScannerCycleStatus::Complete, None).with_partial_bucket_progress(true),
+    ] {
+        assert_eq!(
+            scanner_cycle_completion_outcome_for_result(&result, DataUsagePersistOutcome::NoUpdate),
+            ScannerCycleOutcome::Failed,
+            "partial progress cannot stand in for an expected root update: {result:?}"
+        );
+    }
 }

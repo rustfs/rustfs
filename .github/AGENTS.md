@@ -23,6 +23,11 @@ duplicate its rules here.
   pass by fixing the cause, not by weakening the gate).
 - If `shellcheck` is installed, actionlint also lints `run:` scripts; treat
   those findings as part of the gate.
+- Runner placement and billing rules live in `.github/workflows/README.md`.
+  A new job defaults to `ubuntu-latest` (free for this public repository);
+  a self-hosted `runs-on` needs one of the reasons listed there, stated in a
+  comment next to it, and a `rust-cache` key is never shared between the
+  hosted and self-hosted images.
 
 ## CI Alignment
 

@@ -544,6 +544,53 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertEqual(validation["claim"], "automated-smoke")
         self.assertEqual(validation["client_name"], "PyIceberg")
 
+        for legacy in ("create-append-reload-scan", "create-append-reload-scan-backing-contracts"):
+            with self.subTest(scenario=legacy):
+                historical = dict(record, scenario=legacy)
+                validated = engine_compatibility.validate_live_conformance_evidence(historical)
+                self.assertEqual(validated["scenario"], legacy)
+                self.assertNotIn("catalog_probes", historical)
+
+    def test_backing_probe_evidence_rejects_missing_or_overstated_results(self) -> None:
+        for backing in ("object", "durable-strong"):
+            for skipped in (False, True):
+                for vended in (False, True):
+                    with self.subTest(backing=backing, skipped=skipped, vended=vended):
+                        scenario = (engine_compatibility.PYICEBERG_CORE_SCENARIO if skipped
+                                    else engine_compatibility.PYICEBERG_BACKING_SCENARIO)
+                        record = engine_compatibility.live_conformance_evidence_record(
+                            client_name="PyIceberg", client_version="0.11.1", scenario=scenario,
+                            rustfs_build="test", git_sha="abc123", catalog_backing=backing,
+                            endpoint="http://127.0.0.1:9000", warehouse="lake", rest_path="/iceberg",
+                            namespace="sales", table="orders", metadata_location="s3://lake/metadata/v2.json",
+                            run_timestamp_utc="2026-10-14T00:00:00Z", operator="test",
+                            expected_status="pass", observed_status="pass", row_count=2,
+                            cleanup_result="not-requested", claim="automated-smoke", command="smoke",
+                        )
+                        probes = engine_compatibility.pyiceberg_catalog_probe_results(
+                            backing, skipped=skipped, vended=vended
+                        )
+                        record.update(catalog_probes=probes, rest_signing_name="s3",
+                                      credential_vending_required=vended)
+                        validate = engine_compatibility.validate_live_conformance_evidence
+                        self.assertEqual(validate(record)["status"], "accepted")
+                        for changes in (
+                            {"catalog_probes": {}},
+                            {"catalog_probes": {**probes, "automatic-worker": "pass"}},
+                            {"rest_signing_name": "unknown"},
+                            {"credential_vending_required": "false"},
+                        ):
+                            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                                validate({**record, **changes})
+                        if skipped:
+                            with self.assertRaises(ValueError):
+                                validate({**record, "scenario": engine_compatibility.PYICEBERG_BACKING_SCENARIO})
+                        else:
+                            for name in ("metadata-maintenance", "maintenance-worker-dry-run", "diagnostics", "export"):
+                                broken = {**probes, name: "skipped"}
+                                with self.subTest(probe=name), self.assertRaises(ValueError):
+                                    validate({**record, "catalog_probes": broken})
+
     def test_live_conformance_evidence_rejects_missing_or_mismatched_results(self) -> None:
         record = engine_compatibility.live_conformance_evidence_record(
             client_name="Spark Iceberg REST catalog",

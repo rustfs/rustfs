@@ -1406,6 +1406,119 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn repeated_versioned_delete_returns_204_with_legacy_residue() {
+        crate::app::gating_test_env::run_large_stack_test("repeated-versioned-delete-http", || async {
+            use crate::app::storage_api::s3::{Body, S3ServiceBuilder};
+            use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+            use http_body_util::BodyExt;
+
+            let (paths, store) = crate::app::gating_test_env::shared_gating_ecstore_and_disk_paths().await;
+            let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+            let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+            let slot = crate::app::runtime_sources::ServerContextSlot::new();
+            assert!(slot.install(context));
+            let service = S3ServiceBuilder::new(FS::with_server_ctx(slot)).build();
+            let bucket = format!("repeated-delete-http-{}", Uuid::new_v4());
+            let key = "history";
+            let payload = b"historical version behind repeated delete markers";
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        versioning_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create versioned HTTP fixture");
+            let original = store
+                .put_object(
+                    &bucket,
+                    key,
+                    &mut PutObjReader::from_vec(payload.to_vec()),
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write historical version");
+            // Exercise HTTP decoding and serialization with the production FS
+            // dispatcher. Authentication is supplied by the owner fixture.
+            let request = |method: Method, uri: String| {
+                http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("host", "localhost")
+                    .extension(crate::storage::access::ReqInfo {
+                        cred: Some(rustfs_credentials::Credentials::default()),
+                        is_owner: true,
+                        ..Default::default()
+                    })
+                    .body(Body::empty())
+                    .expect("HTTP request")
+            };
+            let mut marker_ids = Vec::new();
+            let mut backup = None;
+            for attempt in 0..2 {
+                let response = service
+                    .call(request(Method::DELETE, format!("/{bucket}/{key}")))
+                    .await
+                    .expect("DELETE HTTP response");
+                assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                assert_eq!(response.headers()["x-amz-delete-marker"], "true");
+                marker_ids.push(
+                    response.headers()["x-amz-version-id"]
+                        .to_str()
+                        .expect("marker version ID")
+                        .to_owned(),
+                );
+                assert!(
+                    BodyExt::collect(response.into_body())
+                        .await
+                        .expect("DELETE body")
+                        .to_bytes()
+                        .is_empty()
+                );
+                if attempt == 0 {
+                    let root = paths[0].join(&bucket).join(key);
+                    let dir = root.join(Uuid::new_v4().to_string());
+                    tokio::fs::create_dir(&dir).await.expect("legacy backup directory");
+                    let path = dir.join("xl.meta.bkp");
+                    tokio::fs::copy(root.join("xl.meta"), &path)
+                        .await
+                        .expect("legacy metadata backup");
+                    let bytes = tokio::fs::read(&path).await.expect("backup bytes");
+                    backup = Some((path, bytes));
+                }
+            }
+            assert_ne!(marker_ids[0], marker_ids[1]);
+            for id in marker_ids {
+                assert!(!Uuid::parse_str(&id).expect("UUID marker version").is_nil());
+            }
+            let (path, bytes) = backup.expect("legacy backup fixture");
+            assert_eq!(tokio::fs::read(path).await.expect("legacy backup remains"), bytes);
+            let response = service
+                .call(request(
+                    Method::GET,
+                    format!("/{bucket}/{key}?versionId={}", original.version_id.expect("historical version ID")),
+                ))
+                .await
+                .expect("historical GET HTTP response");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                BodyExt::collect(response.into_body())
+                    .await
+                    .expect("historical GET body")
+                    .to_bytes()
+                    .as_ref(),
+                payload
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn execute_read_delete_marker_headers_in_single_and_multi_pool() {
         crate::app::gating_test_env::run_large_stack_test("read-marker-headers", || async {
             use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};

@@ -168,6 +168,91 @@ pub(super) fn replacement_targets_match_identities(targets: &[String], identitie
         && identities.iter().map(|identity| &identity.endpoint).eq(targets.iter())
 }
 
+/// Whether a durable generation still reserves its target slots. Active and
+/// verified generations do; so does an `Abandoned` record that never
+/// transferred its responsibility. A committed handoff or an approved legacy
+/// migration has moved the responsibility to the successor, so the retired
+/// record neither owns the set nor blocks fresh admission for other slots.
+pub(crate) fn replacement_generation_reserves_targets(state: &ResumeState) -> bool {
+    state.replacement_generation.as_deref() == Some(state.task_id.as_str())
+        && !state.replacement_targets.is_empty()
+        && (matches!(
+            state.replacement_phase,
+            ReplacementPhase::Intent
+                | ReplacementPhase::OwnershipPending
+                | ReplacementPhase::HandoffPending
+                | ReplacementPhase::Rebuilding
+                | ReplacementPhase::Verified
+                | ReplacementPhase::CleanupPending
+        ) || replacement_generation_is_orphaned_abandoned(state))
+}
+
+/// An `Abandoned` record whose responsibility was never transferred.
+pub(crate) fn replacement_generation_is_orphaned_abandoned(state: &ResumeState) -> bool {
+    state.replacement_phase == ReplacementPhase::Abandoned
+        && state.replacement_handoff.is_none()
+        && state.replacement_legacy_successor.is_none()
+}
+
+/// A retired predecessor: committed handoff or approved legacy migration.
+pub(crate) fn replacement_generation_is_retired(state: &ResumeState) -> bool {
+    state.replacement_phase == ReplacementPhase::Abandoned
+        && (state
+            .replacement_handoff
+            .as_ref()
+            .is_some_and(|handoff| handoff.phase == super::ReplacementHandoffPhase::Committed)
+            || state.replacement_legacy_successor.is_some())
+}
+
+/// An orphaned `Abandoned` record releases its target slots only once every
+/// slot's healing marker names another generation of the same set. A missing
+/// marker, a marker this generation still owns, or an unreadable marker keeps
+/// the reservation.
+pub(crate) async fn abandoned_targets_are_owned_by_another_generation(state: &ResumeState, disks: &[DiskStore]) -> bool {
+    if !replacement_generation_is_orphaned_abandoned(state) {
+        return false;
+    }
+    let own_marker = format!("{}:{}", state.set_disk_id, state.task_id);
+    let set_prefix = format!("{}:", state.set_disk_id);
+    for target in &state.replacement_targets {
+        let Some(disk) = disks.iter().find(|disk| disk.endpoint().to_string() == *target) else {
+            return false;
+        };
+        let marker = match disk.read_all(RUSTFS_META_BUCKET, super::super::HEALING_MARKER_PATH).await {
+            Ok(bytes) if bytes.len() <= 256 => String::from_utf8(bytes.to_vec()).ok(),
+            _ => None,
+        };
+        let Some(marker) = marker else {
+            return false;
+        };
+        if marker == own_marker || !marker.starts_with(&set_prefix) {
+            return false;
+        }
+        if super::validate_resume_task_id(&marker[set_prefix.len()..]).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// One durable generation that discovery could not verify or resolve. Blocks
+/// are node-local, keyed by generation, and re-evaluated on every discovery
+/// pass; they never widen to the generation's set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplacementRecoveryBlock {
+    pub task_id: String,
+    pub set_disk_id: String,
+    pub reason: String,
+    /// Whether the blocked record still reserves its target slots, which
+    /// defers fresh admission for the same set until it is repaired.
+    pub reserves_targets: bool,
+    /// UNIX seconds of the first discovery pass that blocked this generation.
+    pub blocked_since: u64,
+    /// UNIX seconds of the latest discovery pass that kept it blocked.
+    pub last_observed: u64,
+}
+
 /// A durable intent can be visible through more than one survivor after a
 /// restart.  The endpoint that exposes the record is a replica location, not
 /// a generation identity, so discovery must merge those observations before it
@@ -537,13 +622,34 @@ impl ResumeManager {
             return self.save_state_strict().await;
         }
         state.error_message = Some(error.to_string());
-        state.retry_count = state.retry_count.max(retry_attempts);
-        if matches!(
-            error,
-            Error::ReplacementRetryBudgetExhausted
-                | Error::ReplacementOwnershipConflict(_)
-                | Error::ReplacementGenerationConflict { .. }
-        ) {
+        // `max_retries` bounds rebuild attempts. Only a failure after the
+        // target was formatted and the generation entered `Rebuilding` is one;
+        // format fences, handoffs, and ownership or generation conflicts keep
+        // their durable reason without spending an attempt.
+        if matches!(error, Error::ReplacementRetryBudgetExhausted) {
+            state.retry_count = state.max_retries;
+        } else if state.replacement_phase == ReplacementPhase::Rebuilding
+            && !matches!(
+                error,
+                Error::ReplacementOwnershipConflict(_) | Error::ReplacementGenerationConflict { .. }
+            )
+        {
+            state.retry_count = state.retry_count.max(retry_attempts);
+        }
+        state.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        drop(state);
+        self.save_state_strict().await
+    }
+
+    /// Persist why resolving this generation's durable record failed. Resolution
+    /// runs before any rebuild, so it never spends a rebuild attempt.
+    pub(super) async fn record_replacement_resolution_failure(&self, error: &Error) -> Result<()> {
+        let mut state = self.state.write().await;
+        if state.replacement_generation.as_deref() != Some(state.task_id.as_str()) {
+            return Err(replacement_recovery_conflict("replacement failure has no matching generation"));
+        }
+        state.error_message = Some(error.to_string());
+        if matches!(error, Error::ReplacementRetryBudgetExhausted) {
             state.retry_count = state.max_retries;
         }
         state.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();

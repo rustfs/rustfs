@@ -42,7 +42,7 @@ use rustfs_s3_client::{
     transition_api::{BucketLookupType, ObjectInfo, Options, TransitionClient, TransitionCore},
     transition_api::{ReadCloser, ReaderImpl},
 };
-use rustfs_utils::egress::validate_outbound_url;
+use rustfs_utils::egress::validate_outbound_url_allow_private;
 use rustfs_utils::path::SLASH_SEPARATOR;
 
 pub struct WarmBackendS3 {
@@ -103,7 +103,8 @@ impl WarmBackendS3 {
                 return Err(std::io::Error::other(err.to_string()));
             }
         };
-        validate_outbound_url(&u).map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
+        validate_outbound_url_allow_private(&u)
+            .map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
 
         let has_web_identity_token_file = !conf.aws_role_web_identity_token_file.is_empty();
         let has_role_arn = !conf.aws_role_arn.is_empty();
@@ -485,6 +486,25 @@ mod tests {
             .expect("a well-formed S3 endpoint should initialize without network I/O");
         assert_eq!(backend.client.endpoint_url.host_str(), Some("tier.example.com"));
         assert_eq!(backend.client.endpoint_url.port(), Some(9443));
+    }
+
+    #[tokio::test]
+    async fn issue_8717_private_endpoint_constructs_without_network_setup() {
+        for endpoint in ["http://192.168.10.200:9000", "https://[fd12:3456::1]:9443"] {
+            let conf = TierS3 {
+                endpoint: endpoint.to_string(),
+                bucket: "tier-bucket".to_string(),
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                region: "us-east-1".to_string(),
+                ..Default::default()
+            };
+            let backend = WarmBackendS3::new(&conf, "tier")
+                .await
+                .expect("private S3 tier should initialize offline");
+            assert_eq!(backend.client.endpoint_url.as_str().trim_end_matches('/'), endpoint);
+            assert_eq!(backend.bucket, "tier-bucket");
+        }
     }
 
     #[tokio::test]

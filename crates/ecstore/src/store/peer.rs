@@ -85,6 +85,13 @@ fn validate_bootstrap_volume(volume: &str) -> DiskResult<()> {
 }
 
 impl ECStore {
+    /// Resolve a quota lease against this request's captured storage instance.
+    pub async fn quota_mutation_fence_disk(&self, disk_ref: &str) -> DiskResult<DiskStore> {
+        let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
+        let _owner = admit_local_disk(&self.ctx, &disk, id, false).await?;
+        Ok(disk)
+    }
+
     pub async fn write_local_metadata_at_incarnation(
         self: &Arc<Self>,
         disk_ref: &str,
@@ -236,11 +243,11 @@ impl ECStore {
         scanner_token: Option<Uuid>,
     ) -> DiskResult<RenameDataResp> {
         let external_guard: Option<Arc<dyn Send + Sync>> = if let Some(token) = scanner_token {
-            Some(Arc::new(
+            Some(
                 self.acquire_scanner_publication_lease_guard_for_rename(token, destination.0, destination.1)
                     .await
-                    .map_err(|err| DiskError::other(err.to_string()))?,
-            ))
+                    .map_err(|err| DiskError::other(err.to_string()))? as Arc<dyn Send + Sync>,
+            )
         } else {
             None
         };
@@ -1118,15 +1125,20 @@ mod tests {
         .await
         .expect("bounded physical entry");
         drop(rename);
-        assert!(store.scanner_data_usage_publication_blocked().await);
+        assert!(
+            !store.scanner_data_usage_publication_blocked().await,
+            "a pending namespace commit is not a local publication barrier"
+        );
         assert!(ctx.namespace_commits_pending());
         assert!(!sibling.namespace_commits_pending());
-        assert!(
+        // The pending physical rename owns the namespace commit, which is
+        // ordinary namespace activity and no longer fences another scanner
+        // admission on the same token.
+        drop(
             store
-                .rename_local_data(&disk_ref, ("target-bucket", "staged"), &fi, ("target-bucket", "another"), Some(token))
+                .acquire_scanner_publication_lease_guard(token)
                 .await
-                .is_err(),
-            "real pending rename blocks another scanner publication"
+                .expect("a pending ordinary rename does not fence another scanner admission"),
         );
         assert!(store.release_scanner_publication_lease(token).await, "remove registered token");
         let gate = ctx.data_movement_operation_gate();
@@ -1283,7 +1295,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_namespace_commit_rejects_stale_scanner_target_admission() {
+    async fn completed_namespace_commit_keeps_scanner_target_admission() {
         use futures::FutureExt;
         use std::time::{Duration, Instant};
         use tokio::time::timeout;
@@ -1494,21 +1506,21 @@ mod tests {
         assert_eq!(final_state, (false, namespace_completed, movement_before, operation_epoch_before));
         assert_eq!(user_latest.data, user_new.data);
         assert_eq!(user_latest.version_id, user_new.version_id);
+        // An ordinary commit that completed after the lease was granted is
+        // namespace activity the scanner certifies per bucket; it is not a
+        // reason to withhold the scanner-owned metadata rename.
         assert!(
-            stale_validate.is_err() && target_rename.is_err(),
-            "completed namespace commit must reject both stale admissions: validate={stale_validate:?}, target={:?}, metadata_changed={metadata_changed}",
+            stale_validate.is_ok() && target_rename.is_ok(),
+            "a completed ordinary commit must keep both admissions: validate={stale_validate:?}, target={:?}, metadata_changed={metadata_changed}",
             target_rename.as_ref().map(|_| ()),
         );
-        assert_eq!(metadata_after, metadata_before, "stale target must not rewrite metadata");
-        assert_eq!(metadata_latest.data, metadata_old.data, "latest metadata body must remain the old one");
-        assert_eq!(
-            metadata_latest.version_id, metadata_old.version_id,
-            "latest metadata version must remain the old one"
-        );
+        assert!(metadata_changed, "the admitted target publishes the staged metadata");
+        assert!(latest_is_staged, "latest metadata must be the published one");
+        assert_ne!(metadata_latest.data, metadata_old.data);
     }
 
     #[tokio::test]
-    async fn renewed_namespace_lease_allows_real_metadata_publication() {
+    async fn scanner_lease_allows_real_metadata_publication_after_an_ordinary_write() {
         use futures::FutureExt;
         use std::time::Duration;
         use tokio::time::timeout;
@@ -1574,12 +1586,10 @@ mod tests {
                 .expect("latest ordinary committed object");
             assert_eq!(user_latest.version_id, user_new.version_id);
             assert_eq!(user_latest.data, user_new.data);
-            assert!(
-                store
-                    .validate_scanner_publication_lease(old_token, movement_generation)
-                    .await
-                    .is_err()
-            );
+            store
+                .validate_scanner_publication_lease(old_token, movement_generation)
+                .await
+                .expect("an ordinary write after the grant does not stale the lease");
             assert_eq!(
                 ctx.scanner_publication_lease_generations(old_token).await,
                 Some((
@@ -1587,7 +1597,7 @@ mod tests {
                     Some(namespace_generation),
                     crate::runtime::instance::ScannerPublicationLeasePurpose::Authoritative,
                 )),
-                "rejection must not refresh or discard the old lease"
+                "validation must not refresh or discard the lease"
             );
             let (fresh_token, fresh_generation) = store
                 .acquire_scanner_publication_lease(movement_generation, ttl)

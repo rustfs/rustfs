@@ -198,7 +198,7 @@ pub(super) fn request_body_is_aws_chunked_framed(headers: &HeaderMap) -> bool {
 
 /// Map a bucket-quota checker outcome onto the S3 admission result.
 ///
-/// Hard is the only supported quota type, so a checker fault (bucket-config read, config parse, or usage lookup) must fail closed rather than admit the write: allowing it would silently bypass a configured hard quota. The no-quota happy path never reaches the error arm — `QuotaChecker::check_quota` returns `Ok(allowed)` via the zero-extra-I/O fast path when no quota is configured, so failing closed here cannot penalise buckets without a quota. A fault surfaces as a retryable `ServiceUnavailable` and is counted; the client-facing message stays generic so internal config/usage details are not leaked.
+/// Hard is the only supported quota type, so a checker fault (bucket-config read, config parse, or usage lookup) must fail closed rather than admit the write: allowing it would silently bypass a configured hard quota. The no-quota happy path never reaches the error arm — `QuotaChecker::check_quota` returns `Ok(allowed)` via the zero-extra-I/O fast path when no quota is configured, so failing closed here cannot penalise buckets without a quota. A bucket admitted by the durable reservation ledger never reaches it for an unavailable usage lookup either: the checker reports that usage as absent (`current_usage = None`) and the ledger settles admission at commit (rustfs/backlog#2904); only the snapshot protocol still fails closed on it. A fault surfaces as a retryable `ServiceUnavailable` and is counted; the client-facing message stays generic so internal config/usage details are not leaked.
 pub(crate) fn map_quota_check_outcome(bucket: &str, outcome: Result<QuotaCheckResult, QuotaError>) -> S3Result<QuotaCheckResult> {
     match outcome {
         Ok(result) if !result.allowed => Err(S3Error::with_message(
@@ -1109,6 +1109,28 @@ pub(crate) fn odm_check_source_preconditions(headers: &HeaderMap, head: &SourceH
     check_preconditions(headers, &info)
 }
 
+/// S3 documents write-side `If-None-Match` only as `*` (create-only).
+/// Reject unsupported ETag comparisons with 501 NotImplemented.
+/// Treating it as an ETag comparison would let a write overwrite an existing key
+/// while still satisfying a policy that requires `s3:if-none-match`.
+pub(crate) fn reject_non_wildcard_write_if_none_match(
+    if_none_match: Option<&s3s::dto::ETagCondition>,
+    headers: &HeaderMap,
+) -> S3Result<()> {
+    // POST parses conditional DTO fields from the form, so HTTP headers also need validation.
+    if matches!(if_none_match, Some(s3s::dto::ETagCondition::ETag(_)))
+        || headers.get_all(http::header::IF_NONE_MATCH).iter().any(|value| {
+            value.to_str().map_or(true, |value| {
+                let value = value.trim();
+                !value.is_empty() && value != "*"
+            })
+        })
+    {
+        return Err(S3Error::new(S3ErrorCode::NotImplemented));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1117,6 +1139,54 @@ mod tests {
         PersistedBucketEncryptionRule as ServerSideEncryptionRule, PersistedEncryptionByDefault as ServerSideEncryptionByDefault,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn reject_non_wildcard_write_if_none_match_allows_only_wildcard() {
+        let headers = HeaderMap::new();
+        assert!(reject_non_wildcard_write_if_none_match(None, &headers).is_ok());
+        assert!(reject_non_wildcard_write_if_none_match(Some(&s3s::dto::ETagCondition::Any), &headers).is_ok());
+
+        let etag = s3s::dto::ETagCondition::ETag(ETag::Strong("9b2cf535f27731c974343645a3985328".to_owned()));
+        let err =
+            reject_non_wildcard_write_if_none_match(Some(&etag), &headers).expect_err("an ETag If-None-Match must be rejected");
+        assert_eq!(*err.code(), S3ErrorCode::NotImplemented);
+        assert_eq!(err.status_code(), Some(http::StatusCode::NOT_IMPLEMENTED));
+        assert_eq!(
+            err.message(),
+            Some("A header you provided implies functionality that is not implemented.")
+        );
+    }
+
+    #[test]
+    fn reject_non_wildcard_write_if_none_match_checks_header_without_dto() {
+        for value in ["*", " * ", "", " "] {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::IF_NONE_MATCH, http::HeaderValue::from_str(value).expect("valid header"));
+            assert!(reject_non_wildcard_write_if_none_match(None, &headers).is_ok(), "{value:?}");
+        }
+        for value in ["\"different-etag\"", "W/\"weak-etag\"", "unquoted-etag"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::IF_NONE_MATCH, http::HeaderValue::from_str(value).expect("valid header"));
+            let err = reject_non_wildcard_write_if_none_match(None, &headers)
+                .expect_err("header-only ETag precondition must be rejected");
+            assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        }
+    }
+
+    #[test]
+    fn reject_non_wildcard_write_if_none_match_rejects_conflicting_sources() {
+        for value in [
+            http::HeaderValue::from_static("\"different-etag\""),
+            http::HeaderValue::from_bytes(b"\xff").expect("obs-text is a valid HTTP header"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.append(http::header::IF_NONE_MATCH, http::HeaderValue::from_static("*"));
+            headers.append(http::header::IF_NONE_MATCH, value);
+            let err = reject_non_wildcard_write_if_none_match(Some(&s3s::dto::ETagCondition::Any), &headers)
+                .expect_err("a form wildcard must not hide an unsupported raw HTTP precondition");
+            assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+        }
+    }
 
     #[test]
     fn s3_response_version_id_distinguishes_absent_null_and_uuid_versions() {
@@ -1859,6 +1929,7 @@ mod tests {
             noncurrent_days: 0,
             newer_noncurrent_versions: 0,
             storage_class: String::new(),
+            expiry_policy: None,
         };
 
         assert!(build_put_object_expiration_header(&event).is_none());
@@ -1874,6 +1945,7 @@ mod tests {
             noncurrent_days: 0,
             newer_noncurrent_versions: 0,
             storage_class: String::new(),
+            expiry_policy: None,
         };
 
         // HTTP-date, not RFC 3339: the AWS SDKs parse this field with an
@@ -1891,6 +1963,7 @@ mod tests {
             noncurrent_days: 0,
             newer_noncurrent_versions: 0,
             storage_class: String::new(),
+            expiry_policy: None,
         };
 
         assert!(build_put_object_expiration_header(&event).is_none());
@@ -1902,6 +1975,7 @@ mod tests {
             noncurrent_days: 0,
             newer_noncurrent_versions: 0,
             storage_class: String::new(),
+            expiry_policy: None,
         };
 
         assert!(build_put_object_expiration_header(&event).is_none());
@@ -2111,14 +2185,38 @@ mod tests {
 
     #[test]
     fn quota_admission_fails_closed_on_unknown_authoritative_usage() {
+        // Only the snapshot protocol still surfaces this: the checker never
+        // returns it for a bucket the durable reservation ledger admits.
         let err = map_quota_check_outcome(
             "bucket",
             Err(QuotaError::UsageUnavailable {
                 bucket: "bucket".to_string(),
             }),
         )
-        .expect_err("unknown authoritative usage must not admit a quota-controlled write");
+        .expect_err("unknown authoritative usage must not admit a snapshot-protocol write");
         assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+    }
+
+    /// rustfs/backlog#2904: a durable-quota check whose scanner usage is
+    /// unknown admits the write at the handler and leaves the decision to the
+    /// ledger; nothing on the handler path treats the absent usage as zero.
+    #[test]
+    fn durable_quota_without_scanner_usage_admits_the_write() {
+        let unknown_usage = QuotaCheckResult {
+            allowed: true,
+            current_usage: None,
+            quota_limit: Some(2048),
+            operation_size: 512,
+            remaining: None,
+            uses_durable_reservations: true,
+        };
+        let result = map_quota_check_outcome("bucket", Ok(unknown_usage)).expect("the ledger settles admission at commit");
+        assert_eq!(result.current_usage, None);
+
+        let mut opts = ObjectOptions::default();
+        apply_quota_admission(&mut opts, &result).expect("durable admission carries no snapshot into the write");
+        assert!(opts.quota_admission.is_none());
+        ensure_object_size_within_quota(&result, 4096).expect("unknown usage cannot pre-reject an object");
     }
 }
 

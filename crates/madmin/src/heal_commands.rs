@@ -34,6 +34,20 @@ pub struct Infos {
 /// enum's crate).
 const DRIVE_STATE_OK: &str = "ok";
 
+/// Unresolved delete recovery work, independent of ordinary object healing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteRecoveryStatus {
+    pub pending: usize,
+    pub blocked: usize,
+    pub failed: usize,
+}
+
+impl DeleteRecoveryStatus {
+    pub fn has_unresolved(&self) -> bool {
+        self.pending != 0 || self.blocked != 0 || self.failed != 0
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HealResultItem {
     /// Only the coordinator's authenticated full scan may set this. Transported
@@ -54,6 +68,10 @@ pub struct HealResultItem {
     /// this heal. This is intentionally in-process only.
     #[serde(skip)]
     pub metadata_repair_verified: bool,
+    /// Storage-owner observation that canonical metadata has no independent
+    /// payload identity commitment. This alone does not authorize MRF pause.
+    #[serde(skip)]
+    pub legacy_identity_unverified: bool,
     #[serde(rename = "resultId")]
     pub result_index: usize,
     #[serde(rename = "type")]
@@ -70,6 +88,8 @@ pub struct HealResultItem {
     pub resolved_version_id: Option<[u8; 16]>,
     #[serde(rename = "detail")]
     pub detail: String,
+    #[serde(default, rename = "deleteRecovery", skip_serializing_if = "Option::is_none")]
+    pub delete_recovery: Option<DeleteRecoveryStatus>,
     #[serde(rename = "parityBlocks")]
     pub parity_blocks: usize,
     #[serde(rename = "dataBlocks")]
@@ -119,9 +139,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delete_recovery_status_preserves_partial_results_and_legacy_shape() {
+        let legacy = serde_json::to_value(HealResultItem::default()).expect("serialize legacy result");
+        assert!(legacy.get("deleteRecovery").is_none());
+        let decoded: HealResultItem = serde_json::from_value(legacy).expect("decode result without recovery status");
+        assert!(decoded.delete_recovery.is_none());
+        for status in [
+            DeleteRecoveryStatus {
+                pending: 1,
+                ..Default::default()
+            },
+            DeleteRecoveryStatus {
+                blocked: 1,
+                ..Default::default()
+            },
+            DeleteRecoveryStatus {
+                failed: 1,
+                ..Default::default()
+            },
+        ] {
+            let item = HealResultItem {
+                delete_recovery: Some(status),
+                ..Default::default()
+            };
+            let wire = serde_json::to_value(item).expect("serialize recovery status");
+            let decoded: HealResultItem = serde_json::from_value(wire).expect("decode recovery status");
+            assert_eq!(decoded.delete_recovery, Some(status));
+            assert!(status.has_unresolved());
+        }
+        assert!(!DeleteRecoveryStatus::default().has_unresolved());
+    }
+
+    #[test]
     fn resolved_heal_version_is_not_wire_proof() {
         let item = HealResultItem {
             resolved_version_id: Some([0; 16]),
+            legacy_identity_unverified: true,
             ..Default::default()
         };
         let mut wire = serde_json::to_value(&item).expect("heal result should serialize");
@@ -133,9 +186,14 @@ mod tests {
         assert!(wire.get("metadataVerified").is_none());
         assert!(wire.get("metadata_repair_verified").is_none());
         assert!(wire.get("metadataRepairVerified").is_none());
+        assert!(wire.get("legacy_identity_unverified").is_none());
+        assert!(wire.get("legacyIdentityUnverified").is_none());
+        wire["legacy_identity_unverified"] = serde_json::json!(true);
+        wire["legacyIdentityUnverified"] = serde_json::json!(true);
         wire["resolved_version_id"] = serde_json::json!(vec![0; 16]);
         let decoded: HealResultItem = serde_json::from_value(wire).expect("legacy wire shape should remain readable");
         assert_eq!(decoded.resolved_version_id, None, "wire input cannot supply owner proof");
+        assert!(!decoded.legacy_identity_unverified, "wire input cannot supply owner classification");
     }
 
     fn drive(state: &str) -> HealDriveInfo {

@@ -27,6 +27,7 @@
 
 use super::{DiskStore, HealDiskExt as _, local_disk_map_read};
 use crate::heal::manager::{HealManager, MrfRepairNoticeTarget};
+use futures::{StreamExt, stream};
 use metrics::{counter, gauge};
 use rustfs_common::mrf_channel::{
     MRF_MAX_ATTEMPTS, MRF_MAX_DELETE_MARKER_BYTES, MrfDeleteMarkerPurge, MrfDeleteMarkerPurgeIdentity, MrfDurableAdmissionError,
@@ -48,6 +49,7 @@ pub use partial_write::{MrfLegacyResponsibility, MrfOperatorAcceptance};
 use partial_write::{PartialWrites, ResponsibilityCheckpoint};
 
 const MRF_LIFECYCLE_CONTROL_CAPACITY: usize = 128;
+const MRF_JOURNAL_DISK_CONCURRENCY: usize = 4;
 const MRF_LIFECYCLE_LIST_MAX_LIMIT: usize = 256;
 
 static GLOBAL_MRF_LIFECYCLE_SENDER: std::sync::OnceLock<mpsc::Sender<MrfLifecycleCommand>> = std::sync::OnceLock::new();
@@ -137,7 +139,7 @@ pub async fn recheck_legacy_responsibility(
 
 pub async fn refresh_legacy_responsibility(
     responsibility_id: Uuid,
-    expected_bucket_incarnation_id: Uuid,
+    expected_bucket_incarnation_id: Option<Uuid>,
 ) -> Result<(), MrfLifecycleControlError> {
     let sender = GLOBAL_MRF_LIFECYCLE_SENDER
         .get()
@@ -179,7 +181,7 @@ enum MrfLifecycleCommand {
     },
     Refresh {
         responsibility_id: Uuid,
-        expected_bucket_incarnation_id: Uuid,
+        expected_bucket_incarnation_id: Option<Uuid>,
         response: tokio::sync::oneshot::Sender<Result<(), MrfLifecycleControlError>>,
     },
     AcceptUnverifiedRisk {
@@ -712,7 +714,29 @@ fn intent_digest(intent: &MrfIntent) -> Option<[u8; 32]> {
 
 async fn journal_disks() -> Vec<DiskStore> {
     let map = local_disk_map_read().await;
-    map.values().flatten().cloned().collect()
+    distinct_journal_disks(map.values().flatten())
+}
+
+fn distinct_journal_disks<'a>(disks: impl IntoIterator<Item = &'a DiskStore>) -> Vec<DiskStore> {
+    let mut roots = HashSet::new();
+    disks
+        .into_iter()
+        .filter(|disk| {
+            !crate::heal::storage_api::owner::EcstoreDiskAPI::is_local(disk.as_ref())
+                || roots.insert(crate::heal::storage_api::owner::EcstoreDiskAPI::path(disk.as_ref()))
+        })
+        .cloned()
+        .collect()
+}
+
+// Bound disk fan-out without serializing independent fsyncs. The caller keeps
+// each disk's commit steps in one future and waits for every replica result.
+fn journal_disk_io<I, F>(operations: I) -> impl std::future::Future<Output = Vec<F::Output>>
+where
+    I: IntoIterator<Item = F>,
+    F: std::future::Future,
+{
+    stream::iter(operations).buffered(MRF_JOURNAL_DISK_CONCURRENCY).collect()
 }
 
 async fn read_journal(path: &str) -> Option<Vec<u8>> {
@@ -750,9 +774,15 @@ async fn read_mrf_lifecycle_checkpoint(
 /// the next tick retries the persist.
 async fn write_journal(path: &str, data: &[u8]) -> bool {
     let payload = bytes::Bytes::copy_from_slice(data);
+    let disks = journal_disks().await;
+    let results = journal_disk_io(disks.into_iter().map(|disk| {
+        let payload = payload.clone();
+        async move { disk.write_all(super::RUSTFS_META_BUCKET, path, payload).await }
+    }))
+    .await;
     let mut any_persisted = false;
-    for disk in journal_disks().await {
-        match disk.write_all(super::RUSTFS_META_BUCKET, path, payload.clone()).await {
+    for result in results {
+        match result {
             Ok(()) => any_persisted = true,
             Err(err) => warn_mrf_journal_write(&err),
         }
@@ -766,15 +796,17 @@ async fn delete_journal(path: &str) -> bool {
         counter!("rustfs_heal_mrf_journal_delete_failures_total").increment(1);
         return false;
     }
+    let results = journal_disk_io(disks.into_iter().map(|disk| async move {
+        disk.delete(
+            super::RUSTFS_META_BUCKET,
+            path,
+            crate::heal::storage_api::owner::EcstoreDeleteOptions::default(),
+        )
+        .await
+    }))
+    .await;
     let mut all_deleted = true;
-    for disk in disks {
-        let result = disk
-            .delete(
-                super::RUSTFS_META_BUCKET,
-                path,
-                crate::heal::storage_api::owner::EcstoreDeleteOptions::default(),
-            )
-            .await;
+    for result in results {
         if let Err(err) = result {
             // Delete is idempotent: a compatibility mirror that was never
             // written (or was already removed) is clean, not a retry state.
@@ -979,15 +1011,16 @@ impl MrfRuntime {
 
     fn list_unverified_legacy(&self, after: Option<Uuid>, limit: usize) -> MrfLegacyResponsibilitySnapshot {
         let (responsibilities, next_cursor) = self.partial_writes.list_unverified_legacy(after, limit);
+        let lifecycle = self.partial_writes.lifecycle_summary();
         MrfLegacyResponsibilitySnapshot {
-            contract_version: 1,
+            contract_version: 2,
             node_local: true,
             checkpoint_owner: self.runtime_checkpoint.map(|(owner, _)| owner),
             checkpoint_sequence: self.runtime_checkpoint.map(|(_, sequence)| sequence),
-            held_count: self.partial_writes.unverified_legacy_count(),
-            legacy_generation_unknown_count: self.partial_writes.legacy_generation_unknown_count(),
-            bucket_incarnation_changed_count: self.partial_writes.bucket_incarnation_changed_count(),
-            operator_accepted_count: self.partial_writes.operator_accepted_unverified_count(),
+            held_count: lifecycle.held_count,
+            legacy_generation_unknown_count: lifecycle.legacy_generation_unknown_count,
+            bucket_incarnation_changed_count: lifecycle.bucket_incarnation_changed_count,
+            operator_accepted_count: lifecycle.operator_accepted_count,
             responsibilities,
             next_cursor,
         }
@@ -1053,20 +1086,25 @@ impl MrfRuntime {
         &mut self,
         manager: &HealManager,
         responsibility_id: Uuid,
-        expected_bucket_incarnation_id: Uuid,
+        expected_bucket_incarnation_id: Option<Uuid>,
     ) -> Result<(), MrfLifecycleControlError> {
         let (intent, state, source_incarnation) = self
             .partial_writes
             .intent_for_responsibility(responsibility_id)
             .ok_or(MrfLifecycleControlError::StaleGeneration)?;
-        if state.bucket_incarnation_id() != Some(expected_bucket_incarnation_id) {
+        if state.bucket_incarnation_id() != expected_bucket_incarnation_id {
+            return Err(MrfLifecycleControlError::StaleGeneration);
+        }
+        if expected_bucket_incarnation_id.is_none()
+            && (source_incarnation.is_some() || !matches!(state, partial_write::ResponsibilityState::Active))
+        {
             return Err(MrfLifecycleControlError::StaleGeneration);
         }
         let anchor = manager
             .durable_mrf_repair_anchor(&intent)
             .await
             .ok_or(MrfLifecycleControlError::IncarnationChanged)?;
-        if anchor.bucket_incarnation_id == expected_bucket_incarnation_id {
+        if Some(anchor.bucket_incarnation_id) == expected_bucket_incarnation_id {
             return Ok(());
         }
         let previous_acceptance = self.partial_writes.last_operator_acceptance(responsibility_id);
@@ -1383,28 +1421,23 @@ impl MrfRuntime {
     fn publish_metrics(&self) {
         gauge!("rustfs_heal_mrf_queue_depth").set(metric_f64(self.queue.depth() + self.partial_writes.depth()));
         gauge!("rustfs_heal_mrf_queue_bytes").set(metric_f64(self.queue.bytes() + self.partial_writes.bytes()));
-        let held = self.partial_writes.unverified_legacy_count();
-        gauge!("rustfs_heal_mrf_unverified_legacy").set(metric_f64(held));
-        gauge!("rustfs_heal_mrf_legacy_generation_unknown")
-            .set(metric_f64(self.partial_writes.legacy_generation_unknown_count()));
-        gauge!("rustfs_heal_mrf_bucket_incarnation_changed")
-            .set(metric_f64(self.partial_writes.bucket_incarnation_changed_count()));
-        gauge!("rustfs_heal_mrf_operator_accepted_unverified")
-            .set(metric_f64(self.partial_writes.operator_accepted_unverified_count()));
+        let lifecycle = self.partial_writes.lifecycle_summary();
+        gauge!("rustfs_heal_mrf_unverified_legacy").set(metric_f64(lifecycle.held_count));
+        gauge!("rustfs_heal_mrf_legacy_generation_unknown").set(metric_f64(lifecycle.legacy_generation_unknown_count));
+        gauge!("rustfs_heal_mrf_bucket_incarnation_changed").set(metric_f64(lifecycle.bucket_incarnation_changed_count));
+        gauge!("rustfs_heal_mrf_operator_accepted_unverified").set(metric_f64(lifecycle.operator_accepted_count));
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or_default();
-        let oldest_age_seconds = self
-            .partial_writes
-            .oldest_unverified_legacy_enqueued_at_ms()
+        let oldest_age_seconds = lifecycle
+            .oldest_unverified_legacy_enqueued_at_ms
             .map(|held_since_ms| now_ms.saturating_sub(held_since_ms) / 1_000)
             .unwrap_or_default();
         gauge!("rustfs_heal_mrf_unverified_legacy_oldest_age_seconds")
             .set(metric_f64(usize::try_from(oldest_age_seconds).unwrap_or(usize::MAX)));
-        let oldest_operator_accepted_age_seconds = self
-            .partial_writes
-            .oldest_operator_accepted_at_ms()
+        let oldest_operator_accepted_age_seconds = lifecycle
+            .oldest_operator_accepted_at_ms
             .map(|accepted_at_ms| now_ms.saturating_sub(accepted_at_ms) / 1_000)
             .unwrap_or_default();
         gauge!("rustfs_heal_mrf_operator_accepted_unverified_oldest_age_seconds")
@@ -2023,6 +2056,60 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc as StdArc;
     use std::time::{Duration as StdDuration, Instant};
+
+    #[tokio::test(start_paused = true)]
+    async fn journal_disk_io_bounds_fanout_and_collects_every_result() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let completed = AtomicUsize::new(0);
+        let results = journal_disk_io((0..9).map(|index| {
+            let (active, peak, completed) = (&active, &peak, &completed);
+            async move {
+                let running = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(running, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                completed.fetch_add(1, Ordering::SeqCst);
+                if index == 0 || index == 8 { Err(index) } else { Ok(index) }
+            }
+        }))
+        .await;
+
+        assert_eq!(peak.load(Ordering::SeqCst), MRF_JOURNAL_DISK_CONCURRENCY);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(completed.load(Ordering::SeqCst), 9, "an early failure must not skip later replicas");
+        assert_eq!(results, vec![Err(0), Ok(1), Ok(2), Ok(3), Ok(4), Ok(5), Ok(6), Ok(7), Err(8)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn journal_disk_io_cancellation_drops_inflight_operations() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct InFlight<'a>(&'a AtomicUsize);
+        impl Drop for InFlight<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let started = AtomicUsize::new(0);
+        let active = AtomicUsize::new(0);
+        let work = journal_disk_io((0..9).map(|_| {
+            let (started, active) = (&started, &active);
+            async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                active.fetch_add(1, Ordering::SeqCst);
+                let _guard = InFlight(active);
+                std::future::pending::<()>().await;
+            }
+        }));
+        tokio::time::timeout(Duration::from_secs(1), work)
+            .await
+            .expect_err("the unfinished fan-out must remain cancellable");
+        assert_eq!(started.load(Ordering::SeqCst), MRF_JOURNAL_DISK_CONCURRENCY);
+        assert_eq!(active.load(Ordering::SeqCst), 0, "fan-out must not detach replica tasks");
+    }
 
     const W13_EVIDENCE_DIR_ENV: &str = "RUSTFS_SCANNER_HEAL_W13_EVIDENCE_DIR";
     const W13_SOURCE_REVISION_ENV: &str = "RUSTFS_SCANNER_HEAL_W13_SOURCE_REVISION";

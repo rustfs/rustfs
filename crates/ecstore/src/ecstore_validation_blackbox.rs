@@ -560,7 +560,10 @@ async fn blackbox_heal_requests_preserve_repair_scope() {
         assert_eq!(request.pool_index, Some(0));
         assert_eq!(request.set_index, Some(0));
         assert_eq!(request.priority, HealChannelPriority::Low);
-        assert_eq!(request.recreate_missing, Some(true));
+        assert_eq!(
+            request.recreate_missing, None,
+            "a degraded read does not instruct recreation; storage decides absence"
+        );
 
         let mpu_bucket = "bb-mpu-convergence-heal";
         let partial_object = "partial.bin";

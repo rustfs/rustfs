@@ -372,7 +372,7 @@ async fn list_path_raw_inner(
         let cancel_rx_clone = cancel_rx.clone();
         let producer_errs_clone = producer_errs.clone();
         let disk_io_context_clone = disk_io_context.clone();
-        let (rd, wr) = tokio::io::duplex(64);
+        let (rd, wr) = tokio::io::duplex(64 * 1024);
         readers.push(MetacacheReader::new(rd));
         jobs.spawn(with_optional_disk_io_context(disk_io_context_clone, async move {
             let mut wr = PublishedBytesWriter::new(wr);
@@ -702,6 +702,7 @@ async fn list_path_raw_inner(
 
         loop {
             let mut current = MetaCacheEntry::default();
+            let mut current_idx: Option<usize> = None;
 
             // warn!(
             //     "list_path_raw: loop start, bucket: {}, path: {}, current: {:?}",
@@ -840,22 +841,10 @@ async fn list_path_raw_inner(
 
                 // If no current, add it.
                 if current.name.is_empty() {
-                    top_entries[i] = Some(entry.clone());
+                    current_idx = Some(i);
                     current = entry;
                     agree += 1;
 
-                    continue;
-                }
-                // If exact match, we agree.
-                if let (_, true) = current.matches(Some(&entry), true) {
-                    top_entries[i] = Some(entry);
-                    agree += 1;
-
-                    continue;
-                }
-                // If only the name matches we didn't agree, but add it for resolution.
-                if entry.name == current.name {
-                    top_entries[i] = Some(entry);
                     continue;
                 }
                 // We got different entries
@@ -863,7 +852,21 @@ async fn list_path_raw_inner(
                     pending_entries[i] = Some(entry);
                     continue;
                 }
+                if entry.name == current.name {
+                    // If exact match, we agree.
+                    if current.matches_strict(&entry) {
+                        top_entries[i] = Some(entry);
+                        agree += 1;
+                    } else {
+                        // If only the name matches we didn't agree, but add it for resolution.
+                        top_entries[i] = Some(entry);
+                    }
+                    continue;
+                }
 
+                if let Some(idx) = current_idx.take() {
+                    pending_entries[idx] = Some(std::mem::take(&mut current));
+                }
                 for (idx, item) in top_entries.iter_mut().enumerate().take(i) {
                     if let Some(entry) = item.take() {
                         pending_entries[idx] = Some(entry);
@@ -871,7 +874,7 @@ async fn list_path_raw_inner(
                 }
 
                 agree = 1;
-                top_entries[i] = Some(entry.clone());
+                current_idx = Some(i);
                 current = entry;
             }
 
@@ -976,6 +979,10 @@ async fn list_path_raw_inner(
             }
 
             // warn!("list_path_raw: skip start, current: {:?}", &current.name);
+
+            if let Some(idx) = current_idx.take() {
+                top_entries[idx] = Some(current);
+            }
 
             for (i, r) in readers.iter_mut().enumerate() {
                 if top_entries[i].is_some() {
@@ -2179,5 +2186,256 @@ mod tests {
         .expect_err("producer access failure must not be treated as an empty listing");
 
         assert_eq!(err, DiskError::FileAccessDenied);
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_demotes_current_and_agreed_peers_across_cascading_smaller_keys() {
+        fn make_entry(name: &str, vid: u128, etag: &str) -> MetaCacheEntry {
+            let mut meta = FileMeta::default();
+            let mut fi = FileInfo::new(name, 2, 2);
+            fi.version_id = Some(Uuid::from_u128(vid));
+            fi.mod_time = Some(OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp"));
+            fi.metadata.insert("etag".to_string(), etag.to_string());
+            meta.add_version(fi).expect("add version");
+            MetaCacheEntry {
+                name: name.to_string(),
+                metadata: meta.marshal_msg().expect("marshal metadata"),
+                cached: None,
+                reusable: false,
+            }
+        }
+
+        // Round 1: Disks 0 and 1 BOTH start at "key-d" and strictly agree, populating `current_idx = Some(0)`
+        // and `top_entries[1] = Some(key-d)`. Disk 2 then yields "key-b" (< "key-d"), forcing demotion of
+        // BOTH `current_idx` (`pending_entries[0]`) AND `top_entries[1]` (`pending_entries[1]`).
+        // Disk 3 then yields "key-a" (< "key-b"), forcing a second cascading demotion of Disk 2 to `pending_entries[2]`.
+        // Later at "key-e", all 4 disks present the same name, version_id, and mod_time, but Disk 2 has a different
+        // ETag ("etag-e2" vs "etag-e1"), proving `matches_strict` routes all 4 replicas to `partial` instead of `agreed`.
+        let k_a = make_entry("key-a", 1, "etag-a");
+        let k_b = make_entry("key-b", 2, "etag-b");
+        let k_d = make_entry("key-d", 4, "etag-d");
+        let k_e_v1 = make_entry("key-e", 5, "etag-e1");
+        let k_e_v2 = make_entry("key-e", 5, "etag-e2");
+
+        let disk0 = vec![k_d.clone(), k_e_v1.clone()];
+        let disk1 = vec![k_d.clone(), k_e_v1.clone()];
+        let disk2 = vec![k_b.clone(), k_d.clone(), k_e_v2];
+        let disk3 = vec![k_a, k_b, k_d, k_e_v1];
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let agreed_events = events.clone();
+        let partial_events = events.clone();
+
+        list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None, None, None],
+                min_disks: 1,
+                test_reader_behaviors: vec![
+                    TestReaderBehavior::Entries(disk0),
+                    TestReaderBehavior::Entries(disk1),
+                    TestReaderBehavior::Entries(disk2),
+                    TestReaderBehavior::Entries(disk3),
+                ],
+                agreed: Some(Box::new(move |entry| {
+                    let agreed_events = agreed_events.clone();
+                    Box::pin(async move {
+                        agreed_events.lock().expect("events lock").push((entry.name, 4usize, true));
+                    })
+                })),
+                partial: Some(Box::new(move |entries, _| {
+                    let partial_events = partial_events.clone();
+                    Box::pin(async move {
+                        let present = entries.0.iter().flatten().count();
+                        let name = entries
+                            .0
+                            .iter()
+                            .flatten()
+                            .next()
+                            .expect("at least one entry in partial")
+                            .name
+                            .clone();
+                        partial_events.lock().expect("events lock").push((name, present, false));
+                    })
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("cascading demotion listing should succeed");
+
+        assert_eq!(
+            events.lock().expect("events lock").as_slice(),
+            &[
+                ("key-a".to_string(), 1, false),
+                ("key-b".to_string(), 2, false),
+                ("key-d".to_string(), 4, true),
+                ("key-e".to_string(), 4, false),
+            ],
+            "cascading demotions must preserve pending_entries from both current_idx and top_entries, and 4-disk ETag divergence must take partial"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_seeded_multi_disk_streams_match_reference_oracle() {
+        type Step = (String, Vec<Option<String>>, bool);
+
+        fn make_entry(name: &str, variant: u64) -> MetaCacheEntry {
+            if name.ends_with('/') {
+                return MetaCacheEntry {
+                    name: name.to_string(),
+                    metadata: Vec::new(),
+                    cached: None,
+                    reusable: false,
+                };
+            }
+            let mut meta = FileMeta::default();
+            let mut fi = FileInfo::new(name, 2, 2);
+            fi.version_id = Some(Uuid::from_u128(1));
+            fi.mod_time = Some(OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp"));
+            fi.metadata.insert("etag".to_string(), format!("etag-{variant}"));
+            meta.add_version(fi).expect("add version");
+            MetaCacheEntry {
+                name: name.to_string(),
+                metadata: meta.marshal_msg().expect("marshal metadata"),
+                cached: None,
+                reusable: false,
+            }
+        }
+
+        fn describe_entry(entry: &MetaCacheEntry) -> String {
+            if entry.is_dir() {
+                return format!("{}:0", entry.name);
+            }
+            let fi = entry.to_fileinfo("bucket").expect("decode test entry");
+            let etag = fi.metadata.get("etag").expect("etag present");
+            let v = etag.strip_prefix("etag-").expect("etag prefix");
+            format!("{}:{v}", entry.name)
+        }
+
+        let universe = ["a", "a/", "a/b", "a/b/", "a/c", "a0", "b", "b/", "b/1", "c", "d/", "e"];
+
+        // Deterministic LCG seed using high bits across 24 random 4-disk stream schedules.
+        let mut seed = 0x5eed_cafe_1234_5678_u64;
+        let mut next_rand = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            seed >> 33
+        };
+
+        let mut total_agreed = 0usize;
+        let mut total_partial = 0usize;
+        let mut total_preserved_all_four = 0usize;
+
+        for round in 0..24 {
+            let preserve_replica_metadata = round % 3 == 0;
+            let mut disk_streams: Vec<Vec<MetaCacheEntry>> = vec![Vec::new(); 4];
+            let mut expected_steps: Vec<Step> = Vec::new();
+
+            for &key in &universe {
+                // High-bit mask in 1..=15; force mask 15 on every 4th key so 4-disk agreement/divergence is heavily exercised.
+                let mask = if next_rand() % 4 == 0 {
+                    0b1111_u64
+                } else {
+                    (next_rand() % 15) + 1
+                };
+                let mut slot_variants: Vec<Option<u64>> = Vec::with_capacity(4);
+                let mut first_variant = None;
+                let mut all_present_and_equal = true;
+
+                for (disk_idx, stream) in disk_streams.iter_mut().enumerate() {
+                    if (mask & (1_u64 << disk_idx)) != 0 {
+                        // Directory entries carry no metadata, so their variant is always 0.
+                        let v = if key.ends_with('/') {
+                            first_variant = Some(0);
+                            0
+                        } else if first_variant.is_none() || (next_rand() % 4 != 0) {
+                            let v = first_variant.unwrap_or_else(|| next_rand() % 3);
+                            first_variant = Some(v);
+                            v
+                        } else {
+                            all_present_and_equal = false;
+                            (first_variant.unwrap_or(0) + 1) % 3
+                        };
+                        stream.push(make_entry(key, v));
+                        slot_variants.push(Some(v));
+                    } else {
+                        all_present_and_equal = false;
+                        slot_variants.push(None);
+                    }
+                }
+
+                let expect_agreed = all_present_and_equal && !preserve_replica_metadata;
+                if expect_agreed {
+                    total_agreed += 1;
+                } else {
+                    total_partial += 1;
+                    if all_present_and_equal && preserve_replica_metadata {
+                        total_preserved_all_four += 1;
+                    }
+                }
+                let expected_slots = slot_variants
+                    .into_iter()
+                    .map(|opt| opt.map(|v| format!("{key}:{v}")))
+                    .collect();
+                expected_steps.push((key.to_string(), expected_slots, expect_agreed));
+            }
+
+            let observed: Arc<Mutex<Vec<Step>>> = Arc::new(Mutex::new(Vec::new()));
+            let agreed_obs = observed.clone();
+            let partial_obs = observed.clone();
+
+            list_path_raw(
+                CancellationToken::new(),
+                ListPathRawOptions {
+                    disks: vec![None; 4],
+                    min_disks: 1,
+                    preserve_replica_metadata,
+                    test_reader_behaviors: disk_streams.into_iter().map(TestReaderBehavior::Entries).collect(),
+                    agreed: Some(Box::new(move |entry| {
+                        let agreed_obs = agreed_obs.clone();
+                        let desc = describe_entry(&entry);
+                        let name = entry.name;
+                        Box::pin(async move {
+                            agreed_obs.lock().expect("obs lock").push((name, vec![Some(desc); 4], true));
+                        })
+                    })),
+                    partial: Some(Box::new(move |entries, _| {
+                        let partial_obs = partial_obs.clone();
+                        let name = entries
+                            .0
+                            .iter()
+                            .flatten()
+                            .next()
+                            .expect("partial must contain at least one entry")
+                            .name
+                            .clone();
+                        let slots = entries
+                            .0
+                            .iter()
+                            .map(|opt| opt.as_ref().map(describe_entry))
+                            .collect::<Vec<_>>();
+                        Box::pin(async move {
+                            partial_obs.lock().expect("obs lock").push((name, slots, false));
+                        })
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seeded list_path_raw must succeed");
+
+            assert_eq!(
+                *observed.lock().expect("obs lock"),
+                expected_steps,
+                "round={round}, preserve_replica_metadata={preserve_replica_metadata}"
+            );
+        }
+
+        assert!(total_agreed > 0, "seeded schedule must exercise agreed fast-path");
+        assert!(total_partial > 0, "seeded schedule must exercise partial path");
+        assert!(
+            total_preserved_all_four > 0,
+            "seeded schedule must exercise preserve_replica_metadata on 4-disk agreement"
+        );
     }
 }

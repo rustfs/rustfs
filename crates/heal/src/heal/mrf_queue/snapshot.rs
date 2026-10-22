@@ -28,7 +28,7 @@
 //! One surviving committed replica supports process restart recovery only;
 //! this reader does not establish a replication quorum or a power-loss policy.
 
-use super::{MRF_JOURNAL_PATH, MRF_SCOPED_JOURNAL_PATH, decode_journal};
+use super::{MRF_JOURNAL_PATH, MRF_SCOPED_JOURNAL_PATH, decode_journal, distinct_journal_disks, journal_disk_io};
 use crate::heal::RUSTFS_META_BUCKET;
 use crate::heal::storage_api::owner::{
     EcstoreConditionalFileUpdate, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskStore,
@@ -307,7 +307,7 @@ async fn read_committed_with_stats(
 async fn cas_replace(
     disk: &EcstoreDiskStore,
     path: &str,
-    replacement: &[u8],
+    replacement: EcstoreDiskBytes,
     limit: usize,
 ) -> Result<EcstoreConditionalFileUpdate, SnapshotError> {
     let expected = read_bounded(disk, path, limit).await?.map(EcstoreDiskBytes::from);
@@ -318,17 +318,11 @@ async fn cas_replace_expected(
     disk: &EcstoreDiskStore,
     path: &str,
     expected: Option<EcstoreDiskBytes>,
-    replacement: &[u8],
+    replacement: EcstoreDiskBytes,
 ) -> Result<EcstoreConditionalFileUpdate, SnapshotError> {
-    EcstoreDiskAPI::compare_and_update_file(
-        disk.as_ref(),
-        RUSTFS_META_BUCKET,
-        path,
-        expected,
-        Some(EcstoreDiskBytes::copy_from_slice(replacement)),
-    )
-    .await
-    .map_err(SnapshotError::Disk)
+    EcstoreDiskAPI::compare_and_update_file(disk.as_ref(), RUSTFS_META_BUCKET, path, expected, Some(replacement))
+        .await
+        .map_err(SnapshotError::Disk)
 }
 
 async fn cas_delete_expected(
@@ -391,56 +385,58 @@ pub async fn publish_committed_snapshot_with_companion(
     if decode_journal(payload).1 != 0 {
         return Err(SnapshotError::Corrupt);
     }
-    let current = read_committed(disks, limit).await?;
+    // Endpoint aliases can share the same canonical local root and CAS lock.
+    let disks = distinct_journal_disks(disks.iter());
+    let current = read_committed(&disks, limit).await?;
     if current.as_ref().is_some_and(|snapshot| snapshot.sequence() >= sequence) {
         return Err(SnapshotError::Conflict);
     }
     let slot = current.as_ref().map_or(0, |snapshot| 1usize.saturating_sub(snapshot.slot()));
-    let manifest = Manifest::encode(owner, sequence, payload)?;
+    let manifest = EcstoreDiskBytes::from(Manifest::encode(owner, sequence, payload)?);
+    let payload = EcstoreDiskBytes::copy_from_slice(payload);
+    let companion = companion.map(|(paths, bytes, limit)| (paths, EcstoreDiskBytes::copy_from_slice(bytes), limit));
+    // Share encoded bodies across replicas; parallel fsync must not multiply
+    // the large payload/lifecycle allocations. CAS steps stay ordered per disk.
+    let manifest = &manifest;
+    let payload = &payload;
+    let companion = &companion;
+    let results = journal_disk_io(disks.into_iter().map(|disk| async move {
+        let mut payload_written = false;
+        let manifest_written: Result<bool, SnapshotError> = async {
+            let expected_manifest = read_bounded(&disk, MANIFEST_PATHS[slot], MANIFEST_LEN).await?;
+            validate_reusable_manifest_slot(expected_manifest.as_deref(), sequence, limit)?;
+            match cas_replace(&disk, PAYLOAD_PATHS[slot], payload.clone(), limit).await? {
+                EcstoreConditionalFileUpdate::Updated => payload_written = true,
+                EcstoreConditionalFileUpdate::Missing | EcstoreConditionalFileUpdate::Mismatch => return Ok(false),
+            }
+            if let Some((companion_paths, companion_bytes, companion_limit)) = companion {
+                match cas_replace(&disk, companion_paths[slot], companion_bytes.clone(), *companion_limit).await? {
+                    EcstoreConditionalFileUpdate::Updated => {}
+                    EcstoreConditionalFileUpdate::Missing | EcstoreConditionalFileUpdate::Mismatch => return Ok(false),
+                }
+            }
+            Ok(matches!(
+                cas_replace_expected(
+                    &disk,
+                    MANIFEST_PATHS[slot],
+                    expected_manifest.map(EcstoreDiskBytes::from),
+                    manifest.clone(),
+                )
+                .await?,
+                EcstoreConditionalFileUpdate::Updated
+            ))
+        }
+        .await;
+        (payload_written, manifest_written)
+    }))
+    .await;
     let mut payload_replicas = 0usize;
     let mut manifest_replicas = 0usize;
     let mut first_error = None;
-    for disk in disks {
-        let expected_manifest = match read_bounded(disk, MANIFEST_PATHS[slot], MANIFEST_LEN).await {
-            Ok(expected) => expected,
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-                continue;
-            }
-        };
-        if let Err(error) = validate_reusable_manifest_slot(expected_manifest.as_deref(), sequence, limit) {
-            if first_error.is_none() {
-                first_error = Some(error);
-            }
-            continue;
-        }
-        match cas_replace(disk, PAYLOAD_PATHS[slot], payload, limit).await {
-            Ok(EcstoreConditionalFileUpdate::Updated) => payload_replicas += 1,
-            Ok(EcstoreConditionalFileUpdate::Missing | EcstoreConditionalFileUpdate::Mismatch) => continue,
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-                continue;
-            }
-        }
-        if let Some((companion_paths, companion_bytes, companion_limit)) = companion {
-            match cas_replace(disk, companion_paths[slot], companion_bytes, companion_limit).await {
-                Ok(EcstoreConditionalFileUpdate::Updated) => {}
-                Ok(EcstoreConditionalFileUpdate::Missing | EcstoreConditionalFileUpdate::Mismatch) => continue,
-                Err(error) => {
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
-                    continue;
-                }
-            }
-        }
-        match cas_replace_expected(disk, MANIFEST_PATHS[slot], expected_manifest.map(EcstoreDiskBytes::from), &manifest).await {
-            Ok(EcstoreConditionalFileUpdate::Updated) => manifest_replicas += 1,
-            Ok(EcstoreConditionalFileUpdate::Missing | EcstoreConditionalFileUpdate::Mismatch) => {}
+    for (payload_written, result) in results {
+        payload_replicas += usize::from(payload_written);
+        match result {
+            Ok(written) => manifest_replicas += usize::from(written),
             Err(error) => {
                 if first_error.is_none() {
                     first_error = Some(error);
@@ -1451,6 +1447,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn committed_snapshot_writer_retains_payload_count_when_one_companion_fails() {
+        let root = TempDir::new().expect("test directory");
+        let first = disk(&root, "first").await;
+        let second = disk(&root, "second").await;
+        let paths = super::super::MRF_LIFECYCLE_PATHS;
+        std::fs::create_dir(EcstoreDiskAPI::path(first.as_ref()).join(RUSTFS_META_BUCKET).join(paths[0]))
+            .expect("block only the first replica's companion");
+        let owner = Uuid::new_v4();
+        let bytes = payload("healthy-companion-replica");
+        let disks = [first.clone(), second];
+        let publication =
+            publish_committed_snapshot_with_companion(&disks, owner, 1, &bytes, 4096, Some((&paths, b"lifecycle", 4096)))
+                .await
+                .expect("a failed companion must not stop another replica's commit");
+        assert_eq!(publication.payload_replicas, 2);
+        assert_eq!(publication.manifest_replicas, 1);
+        assert!(
+            read_bounded(&first, MANIFEST_PATHS[0], MANIFEST_LEN)
+                .await
+                .expect("read the failed replica's manifest")
+                .is_none(),
+            "a failed companion must not publish its commit manifest"
+        );
+        assert_eq!(
+            read_committed_companion(&disks, owner, 1, &paths, 4096, 4096)
+                .await
+                .expect("read the healthy committed companion")
+                .as_deref(),
+            Some(b"lifecycle".as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_snapshot_writer_deduplicates_disk_roots_before_parallel_cas() {
+        let root = TempDir::new().expect("test directory");
+        let first = disk(&root, "first").await;
+        let alias = disk(&root, "first").await;
+        let second = disk(&root, "second").await;
+        let bytes = payload("distinct-replicas");
+        let disks = [first.clone(), first, alias, second];
+        let publication = publish_committed_snapshot(&disks, Uuid::new_v4(), 1, &bytes, 4096)
+            .await
+            .expect("duplicate handles must not contend with their own replica CAS");
+        assert_eq!(publication.payload_replicas, 2, "count canonical disk roots, not handles");
+        assert_eq!(publication.manifest_replicas, 2);
+        assert_eq!(
+            read_committed(&disks, 4096)
+                .await
+                .expect("read both independent replicas")
+                .expect("committed snapshot")
+                .payload(),
+            bytes
+        );
+    }
+
+    #[tokio::test]
     async fn committed_snapshot_writer_publishes_100k_records_with_bounded_readback() {
         let root = TempDir::new().expect("test directory");
         let first = disk(&root, "first").await;
@@ -1521,16 +1573,17 @@ mod tests {
             .await
             .ok();
         assert_eq!(
-            cas_replace(&store, PAYLOAD_PATHS[1], &next, 4096)
+            cas_replace(&store, PAYLOAD_PATHS[1], EcstoreDiskBytes::copy_from_slice(&next), 4096)
                 .await
                 .expect("successor payload CAS"),
             EcstoreConditionalFileUpdate::Updated
         );
         install(&store, MANIFEST_PATHS[1], &damaged_manifest).await;
 
-        let manifest_update = cas_replace_expected(&store, MANIFEST_PATHS[1], expected_manifest, &manifest(owner, 2, &next))
-            .await
-            .expect("successor manifest CAS");
+        let manifest_update =
+            cas_replace_expected(&store, MANIFEST_PATHS[1], expected_manifest, manifest(owner, 2, &next).into())
+                .await
+                .expect("successor manifest CAS");
         assert_eq!(manifest_update, EcstoreConditionalFileUpdate::Mismatch);
 
         let reopened = disk(&root, "disk").await;

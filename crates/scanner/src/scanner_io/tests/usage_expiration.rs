@@ -9,6 +9,77 @@ use crate::storage_api::scanner_io::{
     record_bucket_object_write_memory, replace_bucket_usage_memory_from_info, seed_persisted_usage, update_bucket_metadata,
 };
 
+#[tokio::test]
+#[serial]
+async fn disk_scan_withdraws_persisted_lifecycle_policy() {
+    let (_temp_dir, store) = setup_local_scanner_store(1, 1).await;
+    let bucket = "withdrawn-lifecycle";
+    store.make_bucket(bucket, &MakeBucketOptions::default()).await.unwrap();
+    let mut reader = ScannerPutObjReader::from_vec(b"retained".to_vec());
+    store
+        .put_object(bucket, "object", &mut reader, &ScannerObjectOptions::default())
+        .await
+        .unwrap();
+    let xml = br#"<LifecycleConfiguration><Rule><ID>expire</ID><Status>Enabled</Status><Filter><Prefix></Prefix></Filter><Expiration><Days>0</Days></Expiration></Rule></LifecycleConfiguration>"#;
+    update_bucket_metadata(bucket, BUCKET_LIFECYCLE_CONFIG, xml.to_vec())
+        .await
+        .unwrap();
+    let (policy, _) = get_lifecycle_config(bucket).await.unwrap();
+    let set = Arc::clone(&store.pools[0].disk_set[0]);
+    let disks = scanner_set_disk_inventory(&set).await;
+    let cache_name = format!("{bucket}/{DATA_USAGE_CACHE_NAME}");
+    for config in [
+        Vec::new(),
+        String::from_utf8(xml.to_vec())
+            .unwrap()
+            .replace("Enabled", "Disabled")
+            .into_bytes(),
+    ] {
+        let mut old_cache = DataUsageCache::default();
+        old_cache.info.name = bucket.to_string();
+        old_cache.info.lifecycle = Some(Arc::new(policy.clone()));
+        old_cache.replace(bucket, "", DataUsageEntry::default());
+        old_cache.save(Arc::clone(&set), &cache_name).await.unwrap();
+        update_bucket_metadata(bucket, BUCKET_LIFECYCLE_CONFIG, config).await.unwrap();
+
+        // A fresh cache instance models restart: the obsolete policy survives
+        // serialization and must be withdrawn by the actual disk scan.
+        let mut loaded = DataUsageCache::default();
+        loaded.load(Arc::clone(&set), &cache_name).await.unwrap();
+        assert!(loaded.info.lifecycle.is_some());
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+        let outcome = disks[0]
+            .clone()
+            .nsscanner_disk(
+                ctx,
+                budget,
+                disks.clone(),
+                loaded,
+                None,
+                ScannerDiskScanOptions {
+                    scan_mode: HealScanMode::Normal,
+                    prefix_scan_scope: None,
+                    checkpoint_tx: None,
+                },
+            )
+            .await
+            .unwrap();
+        let ScannerDiskScanOutcome::Complete(refreshed) = outcome else {
+            panic!("the single-drive scan must complete");
+        };
+        assert!(refreshed.info.lifecycle.is_none());
+        refreshed.save(Arc::clone(&set), &cache_name).await.unwrap();
+        let mut restarted = DataUsageCache::default();
+        restarted.load(Arc::clone(&set), &cache_name).await.unwrap();
+        assert!(restarted.info.lifecycle.is_none(), "another restart must not resurrect policy");
+        store
+            .get_object_info(bucket, "object", &ScannerObjectOptions::default())
+            .await
+            .unwrap();
+    }
+}
+
 // Lifecycle expiry goes through the process-global store, which the first
 // store created in the process claims. Nextest runs this test in its own
 // process; the lifecycle scenarios share the store that owns expiry processing.

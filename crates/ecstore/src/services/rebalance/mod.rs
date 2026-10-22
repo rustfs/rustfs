@@ -40,6 +40,8 @@ pub(crate) const REBALANCE_SOURCE_CLEANUP_DEFERRED_ERROR_PREFIX: &str = "deferre
 const REBALANCE_CLEANUP_WARNING_ENTRY_LIMIT: usize = 10;
 
 mod control;
+#[cfg(test)]
+pub(crate) use control::{REBALANCE_REFRESH_ACTIVATION_GATE, REBALANCE_REFRESH_MOVEMENT_GATE, REBALANCE_REFRESH_START_GATE};
 mod entry;
 mod meta;
 mod migration;
@@ -64,7 +66,8 @@ pub async fn test_store_with_persisted_rebalance_meta(
     let ctx = std::sync::Arc::new(crate::runtime::instance::InstanceContext::new());
     let (temp_dirs, pool) = crate::core::sets::make_local_two_set_sets_with_ctx(ctx.clone()).await;
     let pools = vec![pool.clone()];
-    let pool_meta = crate::core::pools::PoolMeta::new(&pools, &crate::core::pools::PoolMeta::default());
+    let pool_meta = crate::core::pools::PoolMeta::new(&pools, &crate::core::pools::PoolMeta::default())
+        .expect("new pool topology should produce valid pool metadata");
     pool_meta
         .save_for_startup(pools.clone())
         .await
@@ -98,6 +101,17 @@ pub(crate) async fn test_two_pool_stores(
     std::sync::Arc<crate::store::ECStore>,
 ) {
     test_pool_stores_with_contexts(rebalance_meta, false, 2, 2).await
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) async fn test_three_pool_stores(
+    rebalance_meta: Option<RebalanceMeta>,
+) -> (
+    Vec<tempfile::TempDir>,
+    std::sync::Arc<crate::store::ECStore>,
+    std::sync::Arc<crate::store::ECStore>,
+) {
+    test_pool_stores_with_contexts(rebalance_meta, false, 3, 2).await
 }
 
 #[cfg(test)]
@@ -186,7 +200,8 @@ async fn test_pool_stores_with_contexts(
             }
         }
     }
-    let mut pool_meta = PoolMeta::new(&pools, &PoolMeta::default());
+    let mut pool_meta =
+        PoolMeta::new(&pools, &PoolMeta::default()).expect("new pool topology should produce valid pool metadata");
     pool_meta.version = POOL_META_VERSION;
     pool_meta
         .save_for_startup(pools.clone())

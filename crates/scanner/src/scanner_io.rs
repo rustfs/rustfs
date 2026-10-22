@@ -26,7 +26,7 @@ use futures::future::join_all;
 use metrics::counter;
 use rand::seq::SliceRandom as _;
 #[cfg(test)]
-use rustfs_config::{ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS};
+use rustfs_config::{ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, ENV_SCANNER_WALKERS_PER_DISK};
 use rustfs_data_usage::{BucketTargetUsageInfo, BucketUsageInfo, observed_data_usage_is_newer};
 use rustfs_filemeta::FileMeta;
 use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration as BucketLifecycleConfiguration;
@@ -41,7 +41,7 @@ use rustfs_scanner_metrics::metrics::{
 };
 use rustfs_utils::path::path_join_buf;
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -129,7 +129,11 @@ struct DirtyUsageSnapshot {
     buckets: Arc<DirtyUsageBuckets>,
     scopes: Arc<DirtyUsageBucketScopes>,
     generation: u64,
+    /// Nothing moved in the dirty map during the bucket listing.
     covers_all_pending: bool,
+    /// Every pending bucket this cycle listed is in the snapshot; see
+    /// `snapshot_dirty_usage_buckets_after_listing`. Admits a scoped walk.
+    covers_listed_pending: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -411,14 +415,26 @@ fn resolve_remote_dirty_usage_scope(
     }
 }
 
+/// `expected_converged` is `None` for the authoritative object: a `Complete`
+/// cycle with pending buckets publishes there unconverged and is still a
+/// structural baseline, because the buckets it could not certify stay in the
+/// dirty map and are rescanned rather than reused. The convergence marker
+/// must still be present; a snapshot without one was not written by a
+/// certifying scanner.
 fn complete_scanner_cache_snapshot_plan_digest(
     snapshot: &DataUsageInfo,
     proof: ScannerCacheBaselineProof<'_>,
-    expected_converged: bool,
+    expected_converged: Option<bool>,
 ) -> Option<DataUsageScanPlanDigest> {
+    // The observational mark disqualifies only the authoritative slot: an
+    // observed candidate carries it by construction.
+    let marks_accepted = match expected_converged {
+        Some(expected) => snapshot.usage_snapshot_converged == Some(expected),
+        None => snapshot.usage_snapshot_converged.is_some() && !snapshot.usage_snapshot_observational,
+    };
     if !snapshot.is_complete_bucket_usage_snapshot()
         || snapshot.usage_snapshot_partial
-        || snapshot.usage_snapshot_converged != Some(expected_converged)
+        || !marks_accepted
         || snapshot.scanner_epoch != Some(proof.leader_epoch)
         || snapshot.usage_snapshot_set_states.len() != proof.expected_sources.len()
     {
@@ -428,13 +444,7 @@ fn complete_scanner_cache_snapshot_plan_digest(
     // Completed maintenance also covers ordinary usage. Keep its exact stored
     // proof for cache reuse, and reject mixtures of different set work proofs.
     let baseline_plan_digest = DataUsageScanPlanDigest(snapshot.usage_snapshot_set_states.first()?.scan_plan_digest?);
-    if ![
-        proof.scan_plan_digest,
-        scanner_bucket_work_digest(proof.scan_plan_digest, HealScanMode::Normal, true),
-        scanner_bucket_work_digest(proof.scan_plan_digest, HealScanMode::Deep, true),
-    ]
-    .contains(&baseline_plan_digest)
-    {
+    if !scanner_plan_digest_is_work_variant(proof.scan_plan_digest, baseline_plan_digest) {
         return None;
     }
     let mut states = HashSet::with_capacity(snapshot.usage_snapshot_set_states.len());
@@ -455,9 +465,35 @@ fn complete_scanner_cache_snapshot_plan_digest(
     (states == *proof.expected_sources).then_some(baseline_plan_digest)
 }
 
+/// Whether `digest` is `structural` under any work flag: the same bucket
+/// list, topology and movement state walked as a scoped, full or Deep sweep.
+/// The flag changes what a walk must visit, not the namespace it describes.
+fn scanner_plan_digest_is_work_variant(structural: DataUsageScanPlanDigest, digest: DataUsageScanPlanDigest) -> bool {
+    [
+        structural,
+        scanner_bucket_work_digest(structural, HealScanMode::Normal, true),
+        scanner_bucket_work_digest(structural, HealScanMode::Deep, true),
+    ]
+    .contains(&digest)
+}
+
+/// Buckets the last authoritative publication left pending. A `Complete`
+/// cycle names every bucket whose value it could not certify, including a
+/// partial walk that published the bucket's last certified value, so the
+/// next scoped cycle must walk them even when the dirty map no longer names
+/// them. Over-inclusion only costs a walk; a missing baseline contributes
+/// nothing and the dirty map decides alone.
+fn scanner_baseline_pending_buckets(proof: &ScannerCacheBaselineProof<'_>) -> Vec<String> {
+    proof
+        .authoritative_data
+        .and_then(|data| serde_json::from_slice::<DataUsageInfo>(data).ok())
+        .map(|snapshot| snapshot.usage_snapshot_pending_buckets)
+        .unwrap_or_default()
+}
+
 fn complete_scanner_cache_baseline_plan_digest(proof: ScannerCacheBaselineProof<'_>) -> Option<DataUsageScanPlanDigest> {
     let authoritative = serde_json::from_slice::<DataUsageInfo>(proof.authoritative_data?).ok()?;
-    if let Some(validated_digest) = complete_scanner_cache_snapshot_plan_digest(&authoritative, proof, true) {
+    if let Some(validated_digest) = complete_scanner_cache_snapshot_plan_digest(&authoritative, proof, None) {
         return Some(validated_digest);
     }
 
@@ -466,7 +502,7 @@ fn complete_scanner_cache_baseline_plan_digest(proof: ScannerCacheBaselineProof<
     // remains observational: this proof grants bucket-scope reuse only and
     // never changes authoritative usage publication or dirty acknowledgement.
     let authoritative_has_identity = (crate::scanner::data_usage_info_has_persisted_baseline_identity(&authoritative)
-        && authoritative.usage_snapshot_converged != Some(false))
+        && !authoritative.usage_snapshot_observational)
         || crate::scanner::data_usage_info_is_bootstrap_pending(&authoritative);
     if !authoritative_has_identity {
         return None;
@@ -476,7 +512,7 @@ fn complete_scanner_cache_baseline_plan_digest(proof: ScannerCacheBaselineProof<
         return None;
     }
 
-    complete_scanner_cache_snapshot_plan_digest(&observed, proof, false)
+    complete_scanner_cache_snapshot_plan_digest(&observed, proof, Some(false))
 }
 
 fn scanner_segment_reuse_baseline_producer_evidence(
@@ -494,7 +530,9 @@ fn scanner_segment_reuse_baseline_producer_evidence(
     let Ok(authoritative) = serde_json::from_slice::<DataUsageInfo>(authoritative_data) else {
         return (evidence, false);
     };
-    if complete_scanner_cache_snapshot_plan_digest(&authoritative, baseline_proof, true).is_none() {
+    // Segment (prefix) reuse keeps requiring a converged baseline: its
+    // producer evidence is proven against a dirty snapshot that was current.
+    if complete_scanner_cache_snapshot_plan_digest(&authoritative, baseline_proof, Some(true)).is_none() {
         return (evidence, false);
     }
     let Some(cold_zero_walk_oracle) =
@@ -552,6 +590,7 @@ fn scoped_scan_scope_from_dirty_buckets(
     let current_buckets = all_buckets.iter().map(|bucket| bucket.name.as_str()).collect::<HashSet<_>>();
     let selected_buckets = dirty_buckets
         .into_iter()
+        .chain(scanner_baseline_pending_buckets(&baseline_proof))
         .filter(|bucket| current_buckets.contains(bucket.as_str()))
         .collect::<HashSet<_>>();
     if selected_buckets.is_empty() {
@@ -582,6 +621,80 @@ fn scoped_scan_scope_from_dirty_buckets(
     };
 
     ScannerBucketScanScope::from_dirty_buckets(selected_buckets, selected_bucket_prefixes, baseline_scan_plan_digest)
+}
+
+/// Why a cycle eligible for a dirty-bucket scope walked the whole namespace.
+///
+/// Only cycles that were not required to walk everything are classified, so
+/// scheduled maintenance, deep scans, and the startup cycle never report one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScannerScopeFallbackReason {
+    /// A dirty entry was removed or replaced during the bucket listing.
+    DirtySnapshotIncomplete,
+    /// The dirty-usage generation is exhausted and cannot be verified.
+    DirtyGenerationExhausted,
+    /// More buckets are dirty than one scoped cycle may select.
+    DirtyBucketOverflow,
+    /// No dirty bucket is in the listing, so there is nothing to scope to.
+    NoListedDirtyBuckets,
+    /// No complete authoritative or observed baseline matches the plan.
+    BaselineUnavailable,
+    /// Peer dirty usage could not be verified or scoped acknowledgements
+    /// were rejected.
+    PeerScopeUnavailable,
+}
+
+impl ScannerScopeFallbackReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::DirtySnapshotIncomplete => "dirty_snapshot_incomplete",
+            Self::DirtyGenerationExhausted => "dirty_generation_exhausted",
+            Self::DirtyBucketOverflow => "dirty_bucket_overflow",
+            Self::NoListedDirtyBuckets => "no_listed_dirty_buckets",
+            Self::BaselineUnavailable => "baseline_unavailable",
+            Self::PeerScopeUnavailable => "peer_scope_unavailable",
+        }
+    }
+}
+
+/// Classify a resolved full-namespace scope against the preconditions
+/// `resolve_scanner_bucket_scan_scope` checks, in the same order. Returns
+/// `None` when the cycle was required to walk everything or was scoped.
+fn scanner_scope_fallback_reason(
+    scope_eligible: bool,
+    resolved_scope: &ScannerBucketScanScope,
+    dirty_usage_snapshot: &DirtyUsageSnapshot,
+    all_buckets: &[BucketInfo],
+    baseline_proof: ScannerCacheBaselineProof<'_>,
+    distributed: bool,
+) -> Option<ScannerScopeFallbackReason> {
+    if !scope_eligible || !resolved_scope.is_default() {
+        return None;
+    }
+    if dirty_usage_snapshot.generation == u64::MAX {
+        return Some(ScannerScopeFallbackReason::DirtyGenerationExhausted);
+    }
+    if !dirty_usage_snapshot.covers_listed_pending {
+        return Some(ScannerScopeFallbackReason::DirtySnapshotIncomplete);
+    }
+    if dirty_usage_snapshot.buckets.len() > crate::SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES {
+        return Some(ScannerScopeFallbackReason::DirtyBucketOverflow);
+    }
+    // Peers may contribute dirty buckets the local snapshot does not hold.
+    if !distributed {
+        let listed = all_buckets.iter().map(|bucket| bucket.name.as_str()).collect::<HashSet<_>>();
+        if !dirty_usage_snapshot
+            .buckets
+            .keys()
+            .any(|bucket| listed.contains(bucket.as_str()))
+        {
+            return Some(ScannerScopeFallbackReason::NoListedDirtyBuckets);
+        }
+    }
+    if complete_scanner_cache_baseline_plan_digest(baseline_proof).is_none() {
+        return Some(ScannerScopeFallbackReason::BaselineUnavailable);
+    }
+    distributed.then_some(ScannerScopeFallbackReason::PeerScopeUnavailable)
 }
 
 fn scanner_segment_reuse_activation_preflight() -> ScannerSegmentReuseActivationPreflight {
@@ -809,6 +922,12 @@ pub struct ScannerBucketScanPlan {
     digest: DataUsageScanPlanDigest,
     /// Includes mutation generations even when the set planner uses a structural digest.
     bucket_coverage_digest: DataUsageScanPlanDigest,
+    /// The plan a bucket sweep is started and resumed under: the coverage
+    /// identity (`scanner_activity_coverage_digest`) with the bucket list.
+    /// It leaves out what `bucket_coverage_digest` binds for reuse, so a
+    /// coordinator restart or a maintenance publication does not turn a
+    /// resumed sweep into mixed coverage.
+    checkpoint_coverage_digest: DataUsageScanPlanDigest,
     requires_full_scan: bool,
     service_cohort: Option<Arc<StdMutex<ScannerServiceCohort>>>,
     // Cache work must invalidate on namespace completion even when its scoped baseline remains reusable.
@@ -831,10 +950,13 @@ pub struct ScannerBucketScanPlan {
 struct ScannerBucketFailureState {
     hard: Arc<Mutex<HashSet<String>>>,
     partial: Arc<Mutex<HashSet<String>>>,
+    /// Partial buckets whose set scan published the bucket's last certified
+    /// value in place of the unfinished walk; a subset of `partial`.
+    partial_carried: Arc<Mutex<HashSet<String>>>,
     namespace_not_found: Arc<Mutex<HashSet<String>>>,
 }
 
-fn scanner_bucket_plan_digest(buckets: &[BucketInfo], activity_digest: [u8; 32]) -> DataUsageScanPlanDigest {
+pub(crate) fn scanner_bucket_plan_digest(buckets: &[BucketInfo], activity_digest: [u8; 32]) -> DataUsageScanPlanDigest {
     let mut buckets = buckets.iter().collect::<Vec<_>>();
     buckets.sort_unstable_by(|left, right| left.name.cmp(&right.name));
 
@@ -941,20 +1063,48 @@ fn finalize_nsscanner_result(results: &[DataUsageCache], first_err: Option<Error
 enum ScannerBucketScanStatus {
     Complete,
     Failed,
+    /// At least one bucket walk stopped early and no certified value could
+    /// stand in for it on some set.
     Partial,
+    /// Every bucket walk that stopped early was covered by that bucket's
+    /// last certified set value, so the cycle may complete with those
+    /// buckets pending. Necessary, not sufficient: `completed_all_sets`
+    /// still proves that every set published.
+    PartialCarried,
     NamespaceNotFound,
 }
 
-fn scanner_bucket_scan_status(has_failed: bool, has_partial: bool, has_namespace_not_found: bool) -> ScannerBucketScanStatus {
+fn scanner_bucket_scan_status(
+    has_failed: bool,
+    has_uncarried_partial: bool,
+    has_namespace_not_found: bool,
+    has_carried_partial: bool,
+) -> ScannerBucketScanStatus {
     if has_failed {
         ScannerBucketScanStatus::Failed
-    } else if has_partial {
+    } else if has_uncarried_partial {
         ScannerBucketScanStatus::Partial
     } else if has_namespace_not_found {
         ScannerBucketScanStatus::NamespaceNotFound
+    } else if has_carried_partial {
+        ScannerBucketScanStatus::PartialCarried
     } else {
         ScannerBucketScanStatus::Complete
     }
+}
+
+fn scanner_partial_progress_is_usable(
+    bucket_plan_complete: bool,
+    scan_scope_matches: bool,
+    bucket_status: ScannerBucketScanStatus,
+    has_set_failure: bool,
+    has_missing_namespace: bool,
+) -> bool {
+    bucket_plan_complete
+        && scan_scope_matches
+        && matches!(bucket_status, ScannerBucketScanStatus::Partial | ScannerBucketScanStatus::PartialCarried)
+        && !has_set_failure
+        && !has_missing_namespace
 }
 
 fn scanner_cycle_cold_zero_walk_oracle(
@@ -991,9 +1141,16 @@ fn classify_nsscanner_cycle(
     if activity_status == ScannerCycleActivityStatus::Unverified {
         return ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
     }
+    // A bucket walk that stopped early keeps the cycle incomplete only when
+    // no certified value stands in for it (`Partial`). `PartialCarried`
+    // means every such bucket published its last certified value and is
+    // reported pending; `completed_all_sets` proves the sets agreed.
     if budget_elapsed
         || cancelled
-        || !matches!(bucket_scan_status, ScannerBucketScanStatus::Complete)
+        || !matches!(
+            bucket_scan_status,
+            ScannerBucketScanStatus::Complete | ScannerBucketScanStatus::PartialCarried
+        )
         || dirty_usage_status == DirtyUsageSnapshotStatus::Unverified
     {
         return ScannerCycleStatus::Incomplete;
@@ -1002,9 +1159,14 @@ fn classify_nsscanner_cycle(
         return ScannerCycleStatus::Incomplete;
     }
 
-    match (activity_status, dirty_usage_status) {
-        (ScannerCycleActivityStatus::Unchanged, DirtyUsageSnapshotStatus::Current) => ScannerCycleStatus::Complete,
-        _ => ScannerCycleStatus::Superseded,
+    // Termination is snapshot-at-the-beginning: a structurally complete walk
+    // that the guardrail did not veto is `Complete`. Buckets whose dirty
+    // generation moved during the walk, and buckets whose walk stopped early
+    // behind a certified value, stay pending for the next cycle and are
+    // reported in the publication; they no longer supersede the cycle.
+    match activity_status {
+        ScannerCycleActivityStatus::Unchanged => ScannerCycleStatus::Complete,
+        ScannerCycleActivityStatus::Changed | ScannerCycleActivityStatus::Unverified => ScannerCycleStatus::Superseded,
     }
 }
 
@@ -1016,24 +1178,52 @@ fn should_publish_observational_snapshot(status: ScannerCycleStatus) -> bool {
     matches!(status, ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable))
 }
 
+/// Pending buckets of a cycle, sorted so the publication is deterministic.
+pub(crate) type ScannerCyclePendingBuckets = BTreeSet<String>;
+
+/// Stamp the certification outcome of a cycle on its usage snapshot. A
+/// `Complete` cycle publishes an authoritative snapshot that is converged
+/// only when no bucket is pending; any other publishable status is an
+/// observational snapshot routed to the observed object. The marks are part
+/// of the bytes the publication expectation digests, so every writer applies
+/// exactly this function.
+fn apply_scanner_cycle_publication_marks(
+    data_usage_info: &mut DataUsageInfo,
+    status: ScannerCycleStatus,
+    pending_buckets: &ScannerCyclePendingBuckets,
+) {
+    let complete = status == ScannerCycleStatus::Complete;
+    data_usage_info.usage_snapshot_observational = !complete;
+    data_usage_info.usage_snapshot_converged = Some(complete && pending_buckets.is_empty());
+    if complete {
+        data_usage_info.usage_snapshot_pending_buckets = pending_buckets.iter().cloned().collect();
+        data_usage_info.usage_snapshot_pending_bucket_count = u64::try_from(pending_buckets.len()).unwrap_or(u64::MAX);
+    } else {
+        data_usage_info.usage_snapshot_pending_buckets.clear();
+        data_usage_info.usage_snapshot_pending_bucket_count = 0;
+    }
+}
+
 fn prepare_usage_snapshot_for_publication(
     status: ScannerCycleStatus,
+    pending_buckets: &ScannerCyclePendingBuckets,
     mut data_usage_info: DataUsageInfo,
 ) -> Option<DataUsageInfo> {
     if !should_publish_usage_snapshot(status) {
         return None;
     }
 
-    data_usage_info.usage_snapshot_converged = Some(status == ScannerCycleStatus::Complete);
+    apply_scanner_cycle_publication_marks(&mut data_usage_info, status, pending_buckets);
     Some(data_usage_info)
 }
 
 async fn publish_usage_snapshot(
     updates: &mpsc::Sender<DataUsageInfo>,
     status: ScannerCycleStatus,
+    pending_buckets: &ScannerCyclePendingBuckets,
     data_usage_info: DataUsageInfo,
 ) -> Result<bool> {
-    let Some(data_usage_info) = prepare_usage_snapshot_for_publication(status, data_usage_info) else {
+    let Some(data_usage_info) = prepare_usage_snapshot_for_publication(status, pending_buckets, data_usage_info) else {
         return Ok(false);
     };
     send_data_usage_update(updates, data_usage_info).await?;
@@ -1047,10 +1237,17 @@ async fn publish_observational_snapshot(
     data_usage_info.usage_snapshot_complete = false;
     data_usage_info.usage_snapshot_partial = true;
     data_usage_info.usage_snapshot_converged = Some(false);
+    data_usage_info.usage_snapshot_observational = true;
+    data_usage_info.usage_snapshot_pending_buckets.clear();
+    data_usage_info.usage_snapshot_pending_bucket_count = 0;
     send_data_usage_update(updates, data_usage_info).await?;
     Ok(true)
 }
 
+/// Post-walk verdict of the cluster activity guardrail. `Changed` is an
+/// attributed veto (or, for peers, the phase-2 dirty-usage fallback); local
+/// namespace and dirty-usage generation movement is not a veto and is
+/// certified per bucket instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScannerCycleActivityStatus {
     Unchanged,
@@ -1066,15 +1263,54 @@ async fn scanner_cycle_activity_status<S>(
 where
     S: ScannerStorage,
 {
-    // Read the pending-commit barrier before sampling its completion generation.
-    // A tail that drains during this await must invalidate the earlier baseline.
+    // Read the storage movement barrier before sampling the activity
+    // generations. A movement that starts during this await must invalidate
+    // the earlier baseline. Ordinary PUT tails are not part of the barrier:
+    // they shade their bucket and are certified per bucket below.
     let publication_blocked = store.scanner_data_usage_publication_blocked().await;
     match crate::scanner::probe_scanner_activity(store, distributed).await {
         Ok(after) => {
-            let status = if !publication_blocked && after == *before {
-                ScannerCycleActivityStatus::Unchanged
+            let veto = if publication_blocked {
+                Some(crate::scanner::ScannerActivityGuardrailVeto::new(
+                    crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE,
+                    "publication_blocked",
+                ))
             } else {
+                crate::scanner::scanner_activity_guardrail_veto(before, &after)
+            };
+            let status = if let Some(veto) = veto {
+                warn!(
+                    target: "rustfs::scanner::io",
+                    event = EVENT_SCANNER_SET_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_IO,
+                    state = "cycle_guardrail_veto",
+                    stage = "post_scan_probe",
+                    field = veto.field,
+                    host = %veto.host,
+                    "Scanner cycle publication vetoed by the cluster activity guardrail"
+                );
+                global_metrics().record_scanner_guardrail_veto(veto.reason());
                 ScannerCycleActivityStatus::Changed
+            } else if let Some(moved) = crate::scanner::scanner_peer_dirty_usage_moved(before, &after) {
+                // Per-bucket certification covers the local dirty map only;
+                // a peer whose dirty state moved keeps today's whole-cycle
+                // outcome until scoped acknowledgements can name its buckets.
+                tracing::info!(
+                    target: "rustfs::scanner::io",
+                    event = EVENT_SCANNER_SET_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_IO,
+                    state = "cycle_peer_dirty_usage_moved",
+                    stage = "post_scan_probe",
+                    field = moved.field,
+                    host = %moved.host,
+                    "Scanner cycle superseded because a peer's dirty usage moved during the walk"
+                );
+                global_metrics().record_scanner_guardrail_veto(moved.reason());
+                ScannerCycleActivityStatus::Changed
+            } else {
+                ScannerCycleActivityStatus::Unchanged
             };
             (status, crate::scanner::scanner_activity_publication_lease_targets(&after))
         }
@@ -1136,12 +1372,30 @@ pub(crate) fn cache_root_entry_info(cache: &DataUsageCache) -> std::result::Resu
     })
 }
 
-fn apply_bucket_result_to_cache(cache: &mut DataUsageCache, result: DataUsageEntryInfo, update_time: SystemTime) -> bool {
+fn apply_bucket_result_to_cache(
+    cache: &mut DataUsageCache,
+    result: DataUsageEntryInfo,
+    update_time: SystemTime,
+) -> Option<String> {
     if cache.info.tier_registry_generation != result.tier_registry_generation {
         // A result from another registry generation must never be folded into
         // this cycle. Leaving it unapplied makes the cycle incomplete and
         // forces the caller to re-account it under one frozen registry.
-        return false;
+        warn!(
+            target: "rustfs::scanner::io",
+            event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_IO,
+            state = "bucket_result_rejected",
+            bucket = %result.name,
+            pool = cache.info.source.map(|source| source.pool_index),
+            set = cache.info.source.map(|source| source.set_index),
+            cycle = cache.info.next_cycle,
+            expected_tier_registry_generation = cache.info.tier_registry_generation,
+            result_tier_registry_generation = result.tier_registry_generation,
+            "Scanner bucket result rejected because the tier registry generation differs"
+        );
+        return None;
     }
     match result.bucket_incarnation {
         Some(incarnation) if !incarnation.is_nil() => {
@@ -1153,7 +1407,7 @@ fn apply_bucket_result_to_cache(cache: &mut DataUsageCache, result: DataUsageEnt
     }
     cache.replace(&result.name, &result.parent, result.entry);
     cache.info.last_update = Some(update_time);
-    true
+    Some(result.name)
 }
 
 fn should_publish_completed_snapshot(completed_count: usize, total_count: usize, budget_elapsed: bool, cancelled: bool) -> bool {
@@ -1182,6 +1436,42 @@ fn namespace_scanner_workers<T>(
             .map(|(disk, server_epoch)| (disk, NamespaceScannerWorkerMode::RemoteV4(server_epoch))),
     );
     workers
+}
+
+struct NamespaceScannerWalker<T> {
+    disk: T,
+    mode: NamespaceScannerWorkerMode,
+    /// Shared by every walker of one local disk; `None` for disks the
+    /// coordinator reaches over the network, which keep today's one walker.
+    local_admission: Option<Arc<crate::remote_scanner::LocalDiskAdmissionShare>>,
+}
+
+/// Expands each worker into its bucket walkers. A local coordinator disk gets
+/// `walkers_per_disk` walkers sharing one disk admission; every other worker
+/// keeps a single walker, so the walker count never drops below the disk count.
+fn namespace_scanner_walkers<T: Clone>(
+    workers: Vec<(T, NamespaceScannerWorkerMode)>,
+    walkers_per_disk: usize,
+    is_local: impl Fn(&T) -> bool,
+) -> Vec<NamespaceScannerWalker<T>> {
+    let mut walkers = Vec::with_capacity(workers.len());
+    for (disk, mode) in workers {
+        if mode == NamespaceScannerWorkerMode::Coordinator && is_local(&disk) {
+            let local_admission = crate::remote_scanner::LocalDiskAdmissionShare::new();
+            walkers.extend((0..walkers_per_disk.max(1)).map(|_| NamespaceScannerWalker {
+                disk: disk.clone(),
+                mode,
+                local_admission: Some(local_admission.clone()),
+            }));
+        } else {
+            walkers.push(NamespaceScannerWalker {
+                disk,
+                mode,
+                local_admission: None,
+            });
+        }
+    }
+    walkers
 }
 
 fn group_remote_disks_by_peer<T>(disks: Vec<T>, peer_key: impl Fn(&T) -> String) -> Vec<Vec<T>> {
@@ -1346,8 +1636,10 @@ pub(crate) async fn scanner_bucket_checkpoint_identity(
     publication_epoch: u64,
     tier_registry_generation: u64,
     scan_mode: HealScanMode,
-) -> Result<crate::DataUsageScanIdentity> {
-    let bucket_incarnation = set.bucket_incarnation_id_from_disk(bucket).await?;
+) -> Result<Option<crate::DataUsageScanIdentity>> {
+    let Some(bucket_incarnation) = set.find_bucket_incarnation_id_from_disk(bucket).await? else {
+        return Ok(None);
+    };
     let disks = set
         .format
         .erasure
@@ -1363,14 +1655,14 @@ pub(crate) async fn scanner_bucket_checkpoint_identity(
     for disk in disks {
         digest.update(disk.as_bytes());
     }
-    Ok(crate::DataUsageScanIdentity {
+    Ok(Some(crate::DataUsageScanIdentity {
         version: 1,
         bucket_incarnation,
         set_layout: crate::DataUsageScanPlanDigest(digest.finalize().into()),
         publication_epoch,
         tier_registry_generation,
         scan_mode,
-    })
+    }))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1428,7 +1720,10 @@ pub(crate) struct ScannerCycleResult {
     pub(crate) status: ScannerCycleStatus,
     publication_epoch: Option<u64>,
     activity_digest: Option<[u8; 32]>,
+    activity_baseline: Option<Arc<crate::scanner::ScannerActivitySnapshot>>,
+    pending_dirty_usage_buckets: usize,
     usage_update_emitted: bool,
+    partial_bucket_progress: bool,
     dirty_usage_clear: Option<DirtyUsageBuckets>,
     remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
     distributed_segment_invalidation_evidence: Option<DistributedSegmentInvalidationEvidence>,
@@ -1437,6 +1732,7 @@ pub(crate) struct ScannerCycleResult {
     failed_dirty_usage: bool,
     pending_maintenance_work: bool,
     required_cycle_floor: Option<u64>,
+    scope_fallback: Option<ScannerScopeFallbackReason>,
     publication_expectation: Option<ScannerPublicationExpectation>,
 }
 
@@ -1446,7 +1742,10 @@ impl ScannerCycleResult {
             status,
             publication_epoch: None,
             activity_digest: None,
+            activity_baseline: None,
+            pending_dirty_usage_buckets: 0,
             usage_update_emitted: false,
+            partial_bucket_progress: false,
             dirty_usage_clear,
             remote_dirty_usage_acknowledgements: Vec::new(),
             distributed_segment_invalidation_evidence: None,
@@ -1455,6 +1754,7 @@ impl ScannerCycleResult {
             failed_dirty_usage: false,
             pending_maintenance_work: false,
             required_cycle_floor: None,
+            scope_fallback: None,
             publication_expectation: None,
         }
     }
@@ -1475,8 +1775,32 @@ impl ScannerCycleResult {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn activity_digest(&self) -> Option<[u8; 32]> {
         self.activity_digest
+    }
+
+    fn with_activity_baseline(mut self, baseline: Arc<crate::scanner::ScannerActivitySnapshot>) -> Self {
+        self.publication_expectation = None;
+        self.activity_baseline = Some(baseline);
+        self
+    }
+
+    /// The pre-walk activity probe the post-lease guardrail recheck compares
+    /// against.
+    pub(crate) fn activity_baseline(&self) -> Option<&crate::scanner::ScannerActivitySnapshot> {
+        self.activity_baseline.as_deref()
+    }
+
+    fn with_pending_dirty_usage_buckets(mut self, pending: usize) -> Self {
+        self.publication_expectation = None;
+        self.pending_dirty_usage_buckets = pending;
+        self
+    }
+
+    /// Buckets a `Complete` cycle left pending for the next cycle.
+    pub(crate) fn pending_dirty_usage_buckets(&self) -> usize {
+        self.pending_dirty_usage_buckets
     }
 
     pub(crate) fn with_usage_update_emitted(mut self, emitted: bool) -> Self {
@@ -1489,6 +1813,16 @@ impl ScannerCycleResult {
         self.usage_update_emitted
     }
 
+    pub(crate) fn with_partial_bucket_progress(mut self, partial_bucket_progress: bool) -> Self {
+        self.publication_expectation = None;
+        self.partial_bucket_progress = partial_bucket_progress;
+        self
+    }
+
+    pub(crate) fn has_partial_bucket_progress(&self) -> bool {
+        self.partial_bucket_progress
+    }
+
     fn with_failed_dirty_usage(mut self, failed_dirty_usage: bool) -> Self {
         self.publication_expectation = None;
         self.failed_dirty_usage = failed_dirty_usage;
@@ -1499,6 +1833,27 @@ impl ScannerCycleResult {
         self.publication_expectation = None;
         self.pending_maintenance_work = pending_maintenance_work;
         self
+    }
+
+    fn with_scope_fallback(mut self, scope_fallback: Option<ScannerScopeFallbackReason>) -> Self {
+        self.publication_expectation = None;
+        self.scope_fallback = scope_fallback;
+        self
+    }
+
+    /// Why this cycle walked the whole namespace although a dirty-bucket
+    /// scope was eligible.
+    #[cfg(test)]
+    pub(crate) fn scope_fallback(&self) -> Option<ScannerScopeFallbackReason> {
+        self.scope_fallback
+    }
+
+    /// A `Complete` full-namespace fallback: while dirty buckets remain, the
+    /// next cycle must not run under the scoped cycle's immediate wake.
+    pub(crate) fn completed_scope_fallback(&self) -> Option<ScannerScopeFallbackReason> {
+        (self.status == ScannerCycleStatus::Complete)
+            .then_some(self.scope_fallback)
+            .flatten()
     }
 
     fn with_required_cycle_floor(mut self, required_cycle_floor: Option<u64>) -> Self {
@@ -1613,7 +1968,8 @@ use guards::*;
 
 pub(crate) use cache::{
     DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerCheckpointPersistContext, ScannerCheckpointPersistResult,
-    acquire_scanner_cache_locks, current_cache_root_or_prepare_with_generation, persist_scanner_checkpoint,
+    acquire_scanner_cache_locks, current_cache_root_or_prepare_with_generation, log_saved_partial_bucket_cache,
+    persist_scanner_checkpoint,
 };
 pub use dirty_usage::{
     ScannerDirtyUsageAckError, ScannerDirtyUsageBucket, ScannerDirtyUsageClearObserver, ScannerDirtyUsageMutationObserver,

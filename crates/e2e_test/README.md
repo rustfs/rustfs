@@ -22,7 +22,7 @@ Registered in [`src/lib.rs`](src/lib.rs). Grouped by concern:
 | **functional** | top-level `*_test.rs` | S3 data plane: `list_objects_*`, `copy_object_*`, `delete_objects_versioning`, `head_object_*`, `checksum_upload`, `compression`, `content_encoding`, `special_chars`, `leading_slash_key`, `create_bucket_region`, `quota`, `data_usage`, `snowball_auto_extract`, `mc_mirror_small_bucket`, `archive_download_integrity`, `version_id_regression`, `delete_marker_migration_semantics` |
 | **object_lock** | [`src/object_lock/`](src/object_lock) | Retention / legal-hold / WORM semantics |
 | **kms** | [`src/kms/`](src/kms) | SSE-S3 / SSE-KMS / SSE-C, local + Vault backends, multipart encryption. Own guide: [`src/kms/README.md`](src/kms/README.md) |
-| **policy** | [`src/policy/`](src/policy), `existing_object_tag_policy_test`, `bucket_policy_check_test`, `anonymous_access_test`, `security_boundary_test`, `multipart_auth_test` | IAM / bucket-policy / STS session policy, policy variables, anonymous access, DoS/SSRF boundaries. Own guide: [`src/policy/README.md`](src/policy/README.md) |
+| **policy** | [`src/policy/`](src/policy), `existing_object_tag_policy_test`, `conditional_write_policy_test`, `bucket_policy_check_test`, `anonymous_access_test`, `security_boundary_test`, `multipart_auth_test` | IAM / bucket-policy / STS session policy, policy variables, anonymous access, DoS/SSRF boundaries. Own guide: [`src/policy/README.md`](src/policy/README.md) |
 | **protocols** | [`src/protocols/`](src/protocols) | FTPS, WebDAV, SFTP compliance. Fixed ports, own guide: [`src/protocols/README.md`](src/protocols/README.md) |
 | **reliant** | [`src/reliant/`](src/reliant) | Tests that reuse an **externally started** server (SQL/select, conditional writes, lifecycle, deleted-object reads, node-interact). Run via [`scripts/run_e2e_tests.sh`](../../scripts/run_e2e_tests.sh); see [`src/reliant/README.md`](src/reliant/README.md) |
 | **cluster** | `cluster_concurrency_test`, `stale_multipart_cleanup_cluster_test`, `namespace_lock_quorum_test`, `admin_timeout_regression_test`, `object_lambda_test`, `replication_extension_test`, `tier_stats_cluster_test` | Multi-node scenarios via `RustFSTestClusterEnvironment` |
@@ -200,10 +200,11 @@ python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run
 python3 scripts/e2e_binary.py run --binary "$RUSTFS_E2E_STARTUP_CAS_BINARY" --features e2e-test-hooks -- cargo nextest run --profile e2e-full -p e2e_test
 python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-nightly -p e2e_test
 
-# Distributed 4-node 4-disk lane uses the default server.
+# Distributed 4-node 4-disk lane uses the fault-test hooks server; the
+# scanner_heal_topology_ fault cases fail closed without it.
 # Upgrade cases require RUSTFS_UPGRADE_SOURCE_BINARY and fail closed without it.
-python3 scripts/e2e_binary.py build
-python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-distributed -p e2e_test
+python3 scripts/e2e_binary.py build --bins --features e2e-test-hooks
+python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-distributed -p e2e_test
 
 # Replication nightly uses the default server; awscurl is required for STS.
 python3 scripts/e2e_binary.py build

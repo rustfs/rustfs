@@ -20,10 +20,10 @@ use super::handles::{
     default_endpoints_interface, default_expiry_state_interface, default_federated_identity_interface,
     default_internode_metrics_interface, default_local_node_name_interface, default_lock_client_interface,
     default_lock_clients_interface, default_notification_system_interface, default_notify_interface,
-    default_outbound_tls_runtime_interface, default_performance_metrics_interface, default_region_interface,
-    default_replication_pool_interface, default_replication_stats_interface, default_runtime_port_interface,
-    default_s3select_db_interface, default_scanner_metrics_interface, default_server_config_interface,
-    default_storage_class_interface, default_tier_config_interface, default_transition_state_interface,
+    default_outbound_tls_runtime_interface, default_performance_metrics_interface, default_replication_pool_interface,
+    default_replication_stats_interface, default_runtime_port_interface, default_s3select_db_interface,
+    default_scanner_metrics_interface, default_server_config_interface, default_storage_class_interface,
+    default_tier_config_interface, default_transition_state_interface,
 };
 use super::interfaces::{
     ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
@@ -80,6 +80,7 @@ pub struct AppContext {
 
 impl AppContext {
     pub fn new(object_store: Arc<ECStore>, iam: Arc<dyn IamInterface>, kms: Arc<dyn KmsInterface>) -> Self {
+        let region: Arc<dyn RegionInterface> = object_store.clone();
         let object_data_cache = ObjectDataCacheAdapter::from_env_or_disabled();
         let kms_runtime = Arc::new(crate::app::context::handles::KmsRuntimeHandle::new(kms.handle()));
         // Let ecstore probe this cache inside get_object_reader, after
@@ -116,7 +117,7 @@ impl AppContext {
             s3select_db: default_s3select_db_interface(),
             local_node_name: default_local_node_name_interface(),
             action_credentials: default_action_credential_interface(),
-            region: default_region_interface(),
+            region,
             tier_config: default_tier_config_interface(),
             expiry_state: default_expiry_state_interface(),
             transition_state: default_transition_state_interface(),

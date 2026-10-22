@@ -137,14 +137,17 @@ impl ErasureAlgo {
             _ => ErasureAlgo::Invalid,
         }
     }
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            ErasureAlgo::Invalid => "Invalid",
+            ErasureAlgo::ReedSolomon => ERASURE_ALGORITHM,
+        }
+    }
 }
 
 impl std::fmt::Display for ErasureAlgo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ErasureAlgo::Invalid => write!(f, "Invalid"),
-            ErasureAlgo::ReedSolomon => write!(f, "{ERASURE_ALGORITHM}"),
-        }
+        f.write_str(self.as_str())
     }
 }
 

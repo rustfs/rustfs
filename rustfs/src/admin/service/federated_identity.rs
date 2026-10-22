@@ -572,6 +572,36 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn console_session_duration_bounds_signed_credential_expiration() {
+        let secret = "console-session-expiration-test-secret";
+        for (configured, expected_seconds) in [(None, 3600), (Some("7200"), 7200), (Some("604801"), 604_800)] {
+            temp_env::with_var(rustfs_config::ENV_CONSOLE_OIDC_SESSION_DURATION, configured, || {
+                let mut transaction = transaction();
+                transaction.duration_seconds = rustfs_iam::oidc::console_session_duration_secs();
+                let before = OffsetDateTime::now_utc().unix_timestamp();
+                let credentials = issue_credentials(&transaction, &["readonly".to_string()], Some(secret))
+                    .expect("configured Console session should issue credentials");
+                let after = OffsetDateTime::now_utc().unix_timestamp();
+                let claims = rustfs_iam::sys::get_claims_from_token_with_secret(&credentials.session_token, secret)
+                    .expect("Console credential signature should verify");
+                let expiration = claims["exp"].as_i64().expect("signed expiration should be an integer");
+                assert!(
+                    (before + expected_seconds..=after + expected_seconds).contains(&expiration),
+                    "signed expiration must reflect the bounded Console session for {configured:?}"
+                );
+                assert_eq!(
+                    credentials
+                        .expiration
+                        .expect("Console credential must expire")
+                        .unix_timestamp(),
+                    expiration
+                );
+            });
+        }
+    }
+
+    #[test]
     fn issued_credentials_and_replication_item_use_minio_parent_shape() {
         let transaction = transaction();
         let expected_parent = transaction

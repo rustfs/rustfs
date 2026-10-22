@@ -47,9 +47,46 @@ absence alone cannot certify it. Cross-transaction null-version supersession als
 predecessor evidence; timestamps alone cannot authorize it. Cleanup respects active snapshots and removes only validated
 transaction files, with directory removal performed nonrecursively.
 
+A live object upgraded from 1.0.1 can still carry an old
+`reserve-delete-data.<T_old>` inside its data directory. A later certified
+deletion may reclaim that regular-file reservation together with the payload
+only in the directory owned by the current transaction. The old reservation
+never authorizes deletion by itself. Foreign commit markers, malformed marker
+names, symlinks, unknown files, live versions, and UUID-prefix child objects
+remain protected. Snapshot release uses the same checked cleanup path.
+
+Ordinary heal applies the same boundary to orphan data directories. A UUID
+directory name alone is not evidence that a directory contains disposable
+shards: it can be a child object's key. Reclamation requires a complete drive
+inventory, readable parent metadata that does not reference the directory, no
+pending transaction records, and a leaf containing only recognized payload
+files. The final mutation rechecks these conditions under the metadata lease,
+including after snapshot deferral. It unlinks only the classified files and
+removes the empty directory nonrecursively; strict mode synchronizes both the
+leaf and its parent. Missing metadata or an unsupported inspection RPC leaves
+the directory intact for later recovery.
+The evidence check traverses empty pages until completion and owns its iterator
+state for the request, so large multipart directories do not block cleanup and
+completed or canceled probes do not consume shared discovery cursors.
+
 ## Entry points
 
-Unclean-shutdown erasure-set healing performs raw transaction recovery before
+Every startup, including a clean restart, starts incremental raw discovery of
+local transaction records. During normal operation, deletion registers a
+bounded, coalesced exact-key retry hint before preparing metadata. Synchronous
+completion clears only its own hint generation; an uncertain publication or
+unfinished cleanup remains eligible for automatic replay without another
+DELETE or administrator request. The on-disk journal and receipt remain the
+only durable decision authority; the in-memory hints contain no commit decision.
+Returning drives and queue overflow request discovery again, and a low-frequency
+bounded reconciliation scan covers records written through remote participants.
+Discovery advances by pages and retries failed sources separately, rather than
+rescanning every healthy bucket on each maintenance tick.
+Corrupt record contents remain discoverable by their physical key; exact-key
+inspection rejects them without hiding later records. Unsafe paths, symlinks,
+and structural filesystem errors still stop that discovery scope.
+
+Unclean-shutdown erasure-set healing also performs transaction recovery before
 ordinary object listing. Administrator bucket, set, prefix, and object heal use the
 same recovery core. Existing heal selection, lifecycle admission, namespace
 locking, and movement guards still apply. Prefix recovery settles only matching
@@ -68,6 +105,20 @@ configured drive has no current metadata. This is a new authorized decision;
 it does not infer an old commit from missing causal evidence. Mixed or
 unrecognized historical layouts remain blocked.
 
+A certified absent-target transaction can coexist with an unrelated old backup
+in a different data directory. Automatic recovery finishes the certified
+transaction's own cleanup, preserves the ambiguous backup, and retains receipts
+until the whole key settles. A fresh unconditional DELETE can discard eligible
+legacy residue alongside those receipts under the same checks above. A foreign
+transaction marker alone never authorizes removing the backup.
+
+An isolated `xl.meta.bkp` is not enough to distinguish a committed delete from
+an interrupted rollback. Automatic recovery does not guess which outcome was
+intended. Preserve a copy of the original volume and use an authoritative
+application backup or snapshot for recovery when no transaction decision can be
+established. `remove` means explicitly discarding eligible residue; it cannot
+restore ambiguous data or bypass versioning and Object Lock protections.
+
 A missing specific-version DELETE first recovers hidden transactions and then
 reads the current version again. It must not acknowledge an unresolved hidden
 version as an idempotent no-op.
@@ -81,6 +132,8 @@ causes the modern operation to fail before decision publication. Modern nodes
 also reject legacy forward transactional user-bucket deletes. A cluster still
 controlled by an older majority retains the older behavior. Do not downgrade
 while recovery records remain; old binaries cannot interpret the new protocol.
+An upgraded initiator reports an unsupported participant as retryable S3
+`ServiceUnavailable` (503), including when the delete aggregates pool results.
 
 Keep unavailable drives and transaction directories intact. Bring the full
 set online, run a scoped heal in dry-run mode, inspect its recovery result,
@@ -90,10 +143,36 @@ to be deleted and the bucket meets the restrictions above. Do not recursively
 remove transaction directories by hand to make a bucket appear empty.
 
 Recovery reports discovered, committed, rolled-back, reclaimed historical,
-and blocked transaction counts. Unavailable participants return a retryable
-quorum error; blocked evidence requires operator investigation. A successful
+blocked, pending, and failed outcomes. Pending and failed counts can represent
+an incomplete set or a failed discovery/inspection scope rather than a known
+number of transactions. Bucket and prefix results
+include a structured `deleteRecovery` status: `pending` means unavailable
+participants or unfinished work, `blocked` means insufficient safe evidence,
+and `failed` means corrupt transaction data. A local corruption or pending
+transaction does not prevent other buckets or ordinary object healing from
+running. The pass still reports incomplete recovery and does not publish a
+completed recovery checkpoint. Cancellation, lifecycle/incarnation changes,
+movement fences, invalid paths, and other set-level errors retain their
+termination semantics. Exact-object recovery still returns a retryable quorum
+error for unavailable participants; blocked evidence requires operator
+investigation. A successful
 S3 delete response does not imply immediate physical cleanup while snapshots
 or returning participants still retain necessary proof.
+
+If ordinary set healing overlaps unresolved transactions, its resume state
+durably records that coverage needs refreshing. Pending retries preserve the
+completed object-scan progress. Once recovery resolves, the set is scanned
+again before reporting completion, including when a background rollback already
+restored and finalized formerly hidden objects. This additional scan is required
+on that recovery transition; it is not a periodic full-set heal.
+
+The upgrade CI retains its pinned rc.5 source and independently tests stable
+1.0.1. The legacy-reservation case uses metadata and shards written by the
+official 1.0.1 binary and injects an empty reservation while it is stopped;
+this is a deterministic interruption fixture, not a hardware power-loss test.
+Mixed-version stages verify that modern DELETE fails safely while older
+participants are online. They do not promise continuous DELETE availability or
+arbitrary downgrade while new recovery records exist.
 
 ## Settlement deadline and durability
 

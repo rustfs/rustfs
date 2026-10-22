@@ -18,7 +18,7 @@
 
 use crate::common::{
     AdminTransport, RustFSTestEnvironment, admin_add_canned_policy_via, admin_attach_user_policy_via, admin_create_user_via,
-    awscurl_delete, awscurl_post_sts_form_urlencoded, build_test_s3_config, init_logging,
+    awscurl_delete, awscurl_post_sts_form_urlencoded, build_test_s3_config, init_logging, parse_assume_role_credentials,
 };
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
@@ -39,21 +39,6 @@ fn sts_session_client(env: &RustFSTestEnvironment, access_key: &str, secret_key:
         Some(session_token),
         "e2e-sts-session",
     ))
-}
-
-fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&close)? + start;
-    Some(xml[start..end].to_string())
-}
-
-fn parse_assume_role_credentials(xml: &str) -> Result<(String, String, String), Box<dyn std::error::Error + Send + Sync>> {
-    let ak = extract_xml_tag(xml, "AccessKeyId").ok_or("missing AccessKeyId in AssumeRole response")?;
-    let sk = extract_xml_tag(xml, "SecretAccessKey").ok_or("missing SecretAccessKey in AssumeRole response")?;
-    let token = extract_xml_tag(xml, "SessionToken").ok_or("missing SessionToken in AssumeRole response")?;
-    Ok((ak, sk, token))
 }
 
 async fn assume_role_with_session_policy(

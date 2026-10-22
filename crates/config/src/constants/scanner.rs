@@ -59,6 +59,15 @@ pub const SCANNER_MAX_CONCURRENT_SET_SCANS: &str = "max_concurrent_set_scans";
 /// Scanner config key capping concurrent scanner disk bucket walks per set.
 pub const SCANNER_MAX_CONCURRENT_DISK_SCANS: &str = "max_concurrent_disk_scans";
 
+/// Scanner config key setting how many bucket walkers each local disk runs.
+pub const SCANNER_WALKERS_PER_DISK: &str = "walkers_per_disk";
+
+/// Per-local-disk scanner I/O ceiling in operations per second.
+pub const SCANNER_DISK_IO_BUDGET_IOPS: &str = "disk_io_budget_iops";
+
+/// Per-local-disk scanner I/O ceiling in bytes per second.
+pub const SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC: &str = "disk_io_budget_bytes_per_sec";
+
 /// Scanner config key controlling how often object loops yield.
 pub const SCANNER_YIELD_EVERY_N_OBJECTS: &str = "yield_every_n_objects";
 
@@ -86,6 +95,9 @@ pub const SCANNER_KEYS: &[&str] = &[
     SCANNER_CACHE_SAVE_TIMEOUT,
     SCANNER_MAX_CONCURRENT_SET_SCANS,
     SCANNER_MAX_CONCURRENT_DISK_SCANS,
+    SCANNER_WALKERS_PER_DISK,
+    SCANNER_DISK_IO_BUDGET_IOPS,
+    SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC,
     SCANNER_YIELD_EVERY_N_OBJECTS,
     SCANNER_ALERT_EXCESS_VERSIONS,
     SCANNER_ALERT_EXCESS_VERSION_SIZE,
@@ -214,6 +226,18 @@ pub const ENV_SCANNER_MAX_CONCURRENT_SET_SCANS: &str = "RUSTFS_SCANNER_MAX_CONCU
 /// - Example: `export RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS=1`
 pub const ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS: &str = "RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS";
 
+/// Environment variable that sets how many bucket walkers each local disk runs.
+/// The walkers of one disk share its scanner admission, so a peer still sees one
+/// scan session per physical disk. Remote disks keep one walker. The product of
+/// local disks and this factor is what `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS`
+/// caps; the disk count stays the floor. Valid range is `1` through `16`.
+/// - Example: `export RUSTFS_SCANNER_WALKERS_PER_DISK=4`
+pub const ENV_SCANNER_WALKERS_PER_DISK: &str = "RUSTFS_SCANNER_WALKERS_PER_DISK";
+
+pub const ENV_SCANNER_DISK_IO_BUDGET_IOPS: &str = "RUSTFS_SCANNER_DISK_IO_BUDGET_IOPS";
+
+pub const ENV_SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC: &str = "RUSTFS_SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC";
+
 /// Environment variable that controls how often scanner object loops yield to the async runtime.
 /// A value of `0` disables this extra object-count yield.
 /// - Example: `export RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS=32`
@@ -227,6 +251,36 @@ pub const DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS: usize = 4;
 
 /// Default disk scan concurrency budget.
 pub const DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS: usize = 4;
+
+/// Default bucket walkers per local disk.
+///
+/// One walker per disk keeps today's I/O profile, which is what rotational
+/// media needs. Flash is meant to default higher once a local disk can report
+/// its media type; `rustfs_utils::os::Info::rotational` is never populated
+/// today, so every deployment starts from one walker.
+pub const DEFAULT_SCANNER_WALKERS_PER_DISK: usize = 1;
+
+/// Upper bound for `walkers_per_disk`; a larger factor only multiplies
+/// contention on one spindle or NVMe queue without more disks to spread it.
+pub const MAX_SCANNER_WALKERS_PER_DISK: usize = 16;
+
+/// Default spelling of both per-disk scanner I/O budget keys: resolve the
+/// rate from the detected media. `off` removes the cap; a number is explicit.
+pub const DEFAULT_SCANNER_DISK_IO_BUDGET: &str = "auto";
+
+/// Rotational media budget, also used when media cannot be detected: about
+/// half of a 7200 rpm spindle's random reads stay available to foreground
+/// requests, and the byte ceiling sits well above the steady ~2 MB/s a paced
+/// single-disk scan was measured at once admission landed (rustfs/rustfs#8377).
+pub const DEFAULT_SCANNER_DISK_IO_BUDGET_ROTATIONAL_IOPS: u64 = 100;
+
+pub const DEFAULT_SCANNER_DISK_IO_BUDGET_ROTATIONAL_BYTES_PER_SEC: u64 = 16 * 1024 * 1024;
+
+/// Flash media budget: a few percent of a SATA SSD's random-read capacity,
+/// enough to keep metadata walks far from saturating the device.
+pub const DEFAULT_SCANNER_DISK_IO_BUDGET_FLASH_IOPS: u64 = 4000;
+
+pub const DEFAULT_SCANNER_DISK_IO_BUDGET_FLASH_BYTES_PER_SEC: u64 = 256 * 1024 * 1024;
 
 /// Default object interval for cooperative scanner yields.
 pub const DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS: u64 = 128;

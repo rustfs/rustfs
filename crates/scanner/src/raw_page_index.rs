@@ -310,7 +310,8 @@ impl RawEnumerationPageIndex {
             return Err(RawEnumerationPageIndexError::StaleGeneration);
         }
         let entries_start = inner.validated_committed_entries()?.len();
-        inner.commit_building_page(entries_start)
+        inner.commit_building_page(entries_start)?;
+        inner.pages.last().cloned().ok_or(RawEnumerationPageIndexError::EmptyCommit)
     }
 
     pub fn page(&self, page_index: u64, expected_digest: [u8; 32]) -> Result<&RawEnumerationPage, RawEnumerationPageIndexError> {
@@ -347,8 +348,9 @@ impl RawEnumerationPageIndex {
 
 impl RawEnumerationPageIndexInner {
     // Callers validate the committed prefix at the restore/API boundary. The
-    // live writer maintains its entry count without revisiting that prefix.
-    fn commit_building_page(&mut self, entries_start: usize) -> Result<RawEnumerationPage, RawEnumerationPageIndexError> {
+    // live writer maintains its entry count without revisiting that prefix,
+    // and the committed page moves into `pages` without a copy.
+    fn commit_building_page(&mut self, entries_start: usize) -> Result<(), RawEnumerationPageIndexError> {
         let Some(building) = self.building.as_ref() else {
             return Err(RawEnumerationPageIndexError::EmptyCommit);
         };
@@ -365,9 +367,9 @@ impl RawEnumerationPageIndexInner {
         };
         let page = RawEnumerationPage::new(&self.parent, building);
         self.complete = page.terminal;
-        self.pages.push(page.clone());
+        self.pages.push(page);
         self.generation = self.generation.saturating_add(1);
-        Ok(page)
+        Ok(())
     }
 
     fn status(&self) -> RawEnumerationPageOwnerStatus {

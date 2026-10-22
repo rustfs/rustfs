@@ -561,3 +561,121 @@ fn protocol_policy_denials_and_request_conditions() {
         }
     });
 }
+
+#[test]
+#[serial_test::serial]
+fn protocol_object_creation_operation_preserves_multipart_staging() {
+    crate::app::gating_test_env::run_large_stack_test("protocol-object-creation", || async {
+        let root = Credentials {
+            access_key: "creation-policy-root".into(),
+            secret_key: "creation-policy-root-secret".into(),
+            status: "on".into(),
+            ..Default::default()
+        };
+        let (_temp, context, iam) = protocol_test_context(root).await;
+        let store = context.object_store();
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(context));
+        let backend = crate::init::protocol_storage_client_for_server(slot);
+        let bucket = "protocol-object-creation";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        iam.create_user(
+            "creation-writer",
+            &rustfs_madmin::AddOrUpdateUserReq {
+                secret_key: "creation-writer-secret".into(),
+                policy: None,
+                status: rustfs_madmin::AccountStatus::Enabled,
+            },
+        )
+        .await
+        .expect("create protocol writer");
+        let identity = iam
+            .check_key("creation-writer")
+            .await
+            .expect("load writer")
+            .0
+            .expect("writer exists");
+        let sessions: Vec<_> = [Protocol::Ftps, Protocol::Sftp]
+            .into_iter()
+            .map(|protocol| {
+                SessionContext::new(
+                    ProtocolPrincipal::new(Arc::new(identity.clone())),
+                    protocol,
+                    "127.0.0.1".parse().expect("loopback"),
+                )
+            })
+            .collect();
+        let resource = format!("arn:aws:s3:::{bucket}/*");
+        let allow = json!({"Effect":"Allow", "Action":"s3:PutObject", "Resource": resource});
+        iam.set_policy(
+            "creation-policy",
+            decode_policy(json!({"Version":"2012-10-17","Statement":[allow.clone()]})).expect("parse initial allow"),
+        )
+        .await
+        .expect("save initial allow");
+        iam.policy_db_set("creation-writer", UserType::Reg, false, "creation-policy")
+            .await
+            .expect("attach writer policy");
+        for source in ["IAM", "bucket"] {
+            for denied_creation in [false, true] {
+                let deny = json!({"Effect":"Deny", "Action":"s3:PutObject", "Resource": resource,
+                    "Condition":{"Bool":{"s3:ObjectCreationOperation":denied_creation.to_string()}}});
+                let mut statements = vec![allow.clone()];
+                let mut bucket_statements = Vec::new();
+                if source == "IAM" {
+                    statements.push(deny);
+                } else {
+                    let mut deny = deny;
+                    deny["Principal"] = json!("*");
+                    bucket_statements.push(deny);
+                }
+                iam.set_policy(
+                    "creation-policy",
+                    decode_policy(json!({"Version":"2012-10-17","Statement":statements})).expect("parse IAM policy"),
+                )
+                .await
+                .expect("save IAM policy");
+                store
+                    .update_bucket_metadata_config(
+                        bucket,
+                        "policy.json",
+                        serde_json::to_vec(&json!({"Version":"2012-10-17","Statement":bucket_statements}))
+                            .expect("encode bucket policy"),
+                    )
+                    .await
+                    .expect("save bucket policy");
+                for session in &sessions {
+                    for (action, creates_object) in [
+                        (S3Action::CreateMultipartUpload, false),
+                        (S3Action::UploadPart, false),
+                        (S3Action::CompleteMultipartUpload, true),
+                        (S3Action::PutObject, true),
+                        (S3Action::CopyObject, true),
+                    ] {
+                        if session.protocol == Protocol::Ftps && action == S3Action::CopyObject {
+                            continue;
+                        }
+                        let result = backend.authorize_operation(session, &action, bucket, Some("key")).await;
+                        if creates_object == denied_creation {
+                            assert!(
+                                matches!(result, Err(AuthorizationError::AccessDenied)),
+                                "{source} deny={denied_creation}, {:?}, {action:?}: {result:?}",
+                                session.protocol
+                            );
+                        } else {
+                            result.unwrap_or_else(|error| {
+                                panic!(
+                                    "{source} deny={denied_creation}, {:?}, {action:?} should allow: {error}",
+                                    session.protocol
+                                )
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    });
+}

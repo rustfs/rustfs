@@ -254,11 +254,11 @@ pub mod bucket {
     pub mod quota {
         pub use crate::bucket::quota::{
             BucketQuota, QUOTA_RESERVATION_PROTOCOL_V1, QUOTA_RESERVATION_PROTOCOL_V2, QuotaCheckResult, QuotaError,
-            QuotaOperation,
+            QuotaMigrationSkipReason, QuotaOperation, QuotaProtocolMigration,
         };
 
         pub mod checker {
-            pub use crate::bucket::quota::checker::QuotaChecker;
+            pub use crate::bucket::quota::checker::{QuotaChecker, record_reservation_protocol_migration};
         }
     }
 
@@ -343,8 +343,9 @@ pub mod cache {
 
 pub mod capacity {
     pub use crate::core::pools::{
-        DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free,
-        is_pool_activation_fleet_proof_error, path2_bucket_object, path2_bucket_object_with_base_path,
+        DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolMeta, PoolStatus, get_total_usable_capacity,
+        get_total_usable_capacity_free, is_pool_activation_fleet_proof_error, path2_bucket_object,
+        path2_bucket_object_with_base_path,
     };
     pub use crate::store::utils::is_reserved_or_invalid_bucket;
 }
@@ -439,9 +440,9 @@ pub mod disk {
         DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DeleteRecoveryState,
         Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, DiskStore, FileInfoVersions, FileReader, FileWriter,
         GuardedDeleteVersionsPayload, GuardedFileInfoVersions, HEALING_MARKER_PATH, NsScannerOpenRequest, OldCurrentSize,
-        PartTransactionAction, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
-        STORAGE_FORMAT_FILE, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, new_disk,
-        validate_batch_read_version_item_count,
+        PartTransactionAction, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp,
+        ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+        is_quota_mutation_fence_path, new_disk, validate_batch_read_version_item_count,
     };
     pub use bytes::Bytes;
     pub use endpoint::Endpoint;
@@ -510,17 +511,19 @@ pub mod metrics {
 }
 
 pub mod notification {
-    #[cfg(any(test, feature = "test-util"))]
-    pub use crate::services::notification_sys::rotate_cross_pool_fence_fleet_proof_for_test;
     pub use crate::services::notification_sys::{
         ClusterTierDailyStats, CrossPoolFenceFleetProofToken, IlmRecoveryExportFleetProofToken,
         LegacyTransitionStateReconcileFleetProofToken, NotificationPeerErr, NotificationSys, ScannerPublicationLeaseGrant,
         acquire_cross_pool_fence_fleet_proof, acquire_ilm_recovery_export_fleet_proof,
-        acquire_legacy_transition_state_reconcile_fleet_proof, cross_pool_fence_fleet_proof_matches, get_global_notification_sys,
-        ilm_recovery_export_fleet_proof_matches, ilm_recovery_export_local_process_epoch,
-        ilm_recovery_export_member_epochs_sha256, ilm_recovery_export_topology_generation,
-        legacy_transition_state_reconcile_fleet_proof_matches, new_global_notification_sys,
-        scanner_peer_transport_error_message_is_retryable, start_remote_version_state_fleet_probe,
+        acquire_legacy_transition_state_reconcile_fleet_proof, configured_fleet_topology_fingerprint,
+        cross_pool_fence_fleet_proof_matches, get_global_notification_sys, ilm_recovery_export_fleet_proof_matches,
+        ilm_recovery_export_local_process_epoch, ilm_recovery_export_member_epochs_sha256,
+        ilm_recovery_export_topology_generation, legacy_transition_state_reconcile_fleet_proof_matches,
+        new_global_notification_sys, scanner_peer_transport_error_message_is_retryable, start_remote_version_state_fleet_probe,
+    };
+    #[cfg(any(test, feature = "test-util"))]
+    pub use crate::services::notification_sys::{
+        rotate_cross_pool_fence_fleet_proof_for_test, without_cross_pool_fence_fleet_proof_for_test,
     };
 }
 
@@ -613,6 +616,14 @@ pub mod set_disk {
         #[must_use]
         pub fn hold_namespace_commit(store: &crate::store::ECStore) -> impl Send + Sync {
             store.ctx.begin_namespace_commit()
+        }
+
+        /// Whether an ordinary namespace commit (a PUT rename fanout, including
+        /// its post-ACK tail) is still pending on this instance. Test fixtures
+        /// drain tails through this probe; the scanner's publication barrier no
+        /// longer reports them.
+        pub fn namespace_commits_pending(store: &crate::store::ECStore) -> bool {
+            store.ctx.namespace_commits_pending()
         }
     }
 }

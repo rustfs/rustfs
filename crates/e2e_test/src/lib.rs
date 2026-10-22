@@ -144,6 +144,10 @@ mod admin_auth_test;
 #[cfg(test)]
 mod existing_object_tag_policy_test;
 
+/// IAM / bucket / STS session policy with `s3:if-none-match` / `s3:if-match` conditions (E2E).
+#[cfg(test)]
+mod conditional_write_policy_test;
+
 #[cfg(test)]
 mod sts_query_compat_test;
 
@@ -190,6 +194,9 @@ mod conditional_delete_objects_test;
 
 #[cfg(test)]
 mod delete_authorization_test;
+
+#[cfg(test)]
+mod table_location_authorization_test;
 
 // Regression test for signed DELETE Object?versionId requests without Content-Length.
 #[cfg(test)]

@@ -69,8 +69,10 @@ pub(crate) mod admin {
 pub(crate) mod capacity {
     pub(crate) type DecommissionUnresolvedEntry = crate::storage::storage_api::ecstore_capacity::DecommissionUnresolvedEntry;
     pub(crate) type PoolDecommissionInfo = crate::storage::storage_api::ecstore_capacity::PoolDecommissionInfo;
+    pub(crate) type PoolMeta = crate::storage::storage_api::ecstore_capacity::PoolMeta;
     pub(crate) type PoolStatus = crate::storage::storage_api::ecstore_capacity::PoolStatus;
     pub(crate) type RebalStatus = crate::storage::storage_api::ecstore_rebalance::RebalStatus;
+    pub(crate) type RebalanceMeta = crate::storage::storage_api::ecstore_rebalance::RebalanceMeta;
 
     pub(crate) fn get_total_usable_capacity(disks: &[rustfs_madmin::Disk], info: &rustfs_madmin::StorageInfo) -> usize {
         crate::storage::storage_api::ecstore_capacity::get_total_usable_capacity(disks, info)

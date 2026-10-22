@@ -55,6 +55,29 @@ metadata, mismatched expected and observed status, invalid row counts, or
 claim promotion beyond the client boundary are treated as evidence failures
 instead of support-matrix proof.
 
+The smoke reads `rustfs.catalog-backing` from `/v1/config`, applying overrides
+after defaults, before creating objects. `--catalog-backing` is an optional
+expected value, not a way to relabel the deployment. A mismatch or an unknown
+server backing aborts the run. Object mode uses the wire value `object`; the
+legacy operator label `object-backed` is accepted as an expected-value alias.
+Durable-strong must already be provisioned through the
+[cutover procedure](../../docs/operations/s3-tables-cutover-runbook.md).
+`--client-version` likewise checks the installed PyIceberg version rather than
+overriding the version recorded in evidence. A mismatch aborts before setup.
+
+New PyIceberg evidence includes `catalog_probes`, `rest_signing_name`, and
+`credential_vending_required`. Probe results distinguish `pass`,
+`expected-unsupported`, and `skipped`. Both backings exercise maintenance
+configuration, scheduler/worker dry-run, job inspection, quarantine inspection,
+diagnostics, and export. Only the direct metadata-maintenance endpoint is
+expected to reject durable-strong requests. A completed dry-run must retain its
+queued job identity, report zero deletions, and leave the commit state unchanged;
+the smoke restores its disabled, paused configuration after execution.
+New full runs use `create-append-reload-scan-backing-contracts-v2`; historical
+scenario names retain their original scope.
+Explicitly skipping REST probes records only `create-append-reload-scan-core`;
+it cannot establish extended REST compatibility.
+
 The smoke test covers:
 
 - create or reuse the S3 bucket
@@ -62,10 +85,18 @@ The smoke test covers:
 - load the PyIceberg REST catalog
 - create namespace and table
 - append two rows through PyIceberg
-- reload and scan the table
+- reload and compare the complete scanned rows, not only the row count
 - probe direct REST catalog endpoints for metadata-location, table refs,
   Iceberg views, maintenance config, metadata maintenance, worker run, and
   catalog diagnostics
+- update namespace properties, reject overlapping update/removal keys without
+  changing persisted properties, and verify rename preserves table metadata
+- round-trip an encoded multi-level namespace and reject double-encoded aliases
+- check LoadTable does not vend credentials for missing or unknown delegation
+  tokens; when vending is required, check exact-token negotiation and scope
+- on both backings, check a successful maintenance dry-run and export against
+  the current pointer, token, and generation; in durable-strong mode, also
+  verify the direct metadata-maintenance rejection leaves commit state unchanged
 - optionally drop the table and namespace
 
 The default profile uses the canonical RustFS catalog URI:
@@ -139,7 +170,9 @@ temporary credentials:
   rejected.
 
 The direct REST catalog probes run by default after the PyIceberg append and
-scan. For deployments that intentionally expose only the core Iceberg REST
+scan. Both backings run maintenance control, diagnostics, and export probes.
+Durable-strong checks the direct metadata-maintenance rejection separately.
+For deployments that intentionally expose only the core Iceberg REST
 Catalog table path, skip those probes explicitly:
 
 ```bash

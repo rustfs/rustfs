@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::storage_api::context::EndpointServerPools;
 use super::super::storage_api::context::bucket::metadata_sys::BucketMetadataSys;
 use super::super::storage_api::context::runtime::{
     BucketBandwidthMonitor, DailyAllTierStats, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats,
     ScannerMetricsReport, StorageClassConfig, TierConfigMgr, TransitionState,
 };
+use super::super::storage_api::context::{ECStore, EndpointServerPools};
 use super::interfaces::{
     ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
     DeploymentIdInterface, EndpointsInterface, ExpiryStateInterface, FederatedIdentityInterface,
@@ -408,7 +408,13 @@ impl ActionCredentialInterface for ActionCredentialHandle {
     }
 }
 
-/// Default region interface adapter.
+impl RegionInterface for ECStore {
+    fn get(&self) -> Option<s3s::region::Region> {
+        self.region().map(Into::into)
+    }
+}
+
+/// Ambient region adapter for callers without an explicit application context.
 #[derive(Default)]
 pub struct RegionHandle;
 
@@ -613,6 +619,7 @@ pub fn federated_identity_runtime_interface(
     Arc::new(FederatedIdentityHandle::with_runtime(runtime))
 }
 
+/// Resolve the process-default region for ambient callers.
 pub fn default_region_interface() -> Arc<dyn RegionInterface> {
     Arc::new(RegionHandle)
 }

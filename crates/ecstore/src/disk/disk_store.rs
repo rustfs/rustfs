@@ -32,6 +32,7 @@ use crate::runtime::sources as runtime_sources;
 use bytes::Bytes;
 use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
+use rustfs_io_metrics::walk_metrics::LocalWalkGuard;
 use rustfs_madmin::{info_commands::DiskMetrics, metrics::TimedAction};
 #[cfg(not(test))]
 use std::sync::OnceLock;
@@ -174,6 +175,45 @@ impl AsyncWrite for SlowDiskWriter {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let result = Pin::new(&mut self.inner).poll_shutdown(cx);
         self.observe(cx, "shutdown", result)
+    }
+}
+
+struct ObservedLocalWalkWriter<'a, W> {
+    inner: &'a mut W,
+    observation: &'a mut LocalWalkGuard,
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for ObservedLocalWalkWriter<'_, W> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(&mut *self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(written)) = &result {
+            self.observation.written(*written);
+        }
+        result
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(&mut *self.inner).poll_write_vectored(cx, bufs);
+        if let Poll::Ready(Ok(written)) = &result {
+            self.observation.written(*written);
+        }
+        result
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
     }
 }
 
@@ -1582,6 +1622,16 @@ impl LocalDiskWrapper {
         self.disk.clone()
     }
 
+    /// Only suppresses idle monitoring; request paths still validate the format on disk.
+    pub(crate) async fn can_skip_background_probe(&self) -> bool {
+        if self.runtime_state() != RuntimeDriveHealthState::Online {
+            return false;
+        }
+        let observed = self.disk.format_info.read().await.id;
+        let expected = *self.disk_id.read().await;
+        observed.is_some_and(|id| !id.is_nil()) && observed == expected
+    }
+
     #[cfg(test)]
     pub(crate) fn background_io_admissions_for_tests(&self) -> usize {
         self.io_admission.background_admissions_for_tests()
@@ -1829,21 +1879,7 @@ impl LocalDiskWrapper {
             }
 
             // Clean up
-            disk.delete(
-                test_bucket,
-                test_filename,
-                DeleteOptions {
-                    recursive: false,
-                    immediate: false,
-                    undo_write: false,
-                    undo_delete: false,
-                    old_data_dir: None,
-                    expected_delete_marker: None,
-                    recoverable_delete: false,
-                    delete_recovery_bucket_incarnation: None,
-                },
-            )
-            .await?;
+            disk.delete(test_bucket, test_filename, DeleteOptions::default()).await?;
 
             Ok(())
         })
@@ -2418,6 +2454,14 @@ impl DiskAPI for LocalDiskWrapper {
         opts.recoverable_delete = true;
         self.delete_versions(volume, versions, opts).await
     }
+    async fn has_delete_transaction_evidence(&self, volume: &str, object: &str) -> Result<bool> {
+        self.track_disk_health_with_op(
+            "has_delete_transaction_evidence",
+            || async { self.disk.has_delete_transaction_evidence(volume, object).await },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
     async fn discover_delete_transactions(
         &self,
         volume: &str,
@@ -2654,23 +2698,30 @@ impl DiskAPI for LocalDiskWrapper {
     }
 
     async fn walk_dir<W: tokio::io::AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
+        let mut observation = LocalWalkGuard::start();
+        let mut writer = ObservedLocalWalkWriter {
+            inner: wr,
+            observation: &mut observation,
+        };
         let timeout_duration = if opts.skip_total_timeout {
             Duration::ZERO
         } else {
             opts.timeout_duration().unwrap_or_else(get_drive_walkdir_timeout)
         };
 
-        with_disk_io_context(
+        let result = with_disk_io_context(
             self.disk_walk_io_context(),
             self.track_disk_health_with_op_and_timeout_action(
                 "walk_dir",
-                || async { self.disk.walk_dir(opts, wr).await },
+                || async { self.disk.walk_dir(opts, &mut writer).await },
                 timeout_duration,
                 // Listing/scanner backpressure should fail only the current walk, not poison drive health.
                 TimeoutHealthAction::IgnoreFailure,
             ),
         )
-        .await
+        .await;
+        observation.finish(result.is_ok());
+        result
     }
 
     async fn delete_version(
@@ -4784,6 +4835,239 @@ mod tests {
         assert_eq!(result.expect_err("operation should time out"), DiskError::Timeout);
         assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
         assert!(!wrapper.health.is_faulty());
+    }
+
+    struct WalkMetricsGate(bool);
+
+    impl WalkMetricsGate {
+        fn enable() -> Self {
+            let previous = rustfs_io_metrics::metrics_enabled();
+            rustfs_io_metrics::set_metrics_enabled(true);
+            Self(previous)
+        }
+    }
+
+    impl Drop for WalkMetricsGate {
+        fn drop(&mut self) {
+            rustfs_io_metrics::set_metrics_enabled(self.0);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn local_walk_writer_forwards_vectored_flush_shutdown_and_pending() {
+        struct Writer {
+            bytes: Vec<u8>,
+            pending: bool,
+            vectored: bool,
+        }
+        impl AsyncWrite for Writer {
+            fn poll_write(mut self: Pin<&mut Self>, _: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+                if self.pending {
+                    return Poll::Pending;
+                }
+                let written = buf.len().min(3);
+                self.bytes.extend_from_slice(&buf[..written]);
+                Poll::Ready(Ok(written))
+            }
+            fn poll_write_vectored(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bufs: &[io::IoSlice<'_>],
+            ) -> Poll<io::Result<usize>> {
+                if self.pending {
+                    return Poll::Pending;
+                }
+                let mut written = 0;
+                for buf in bufs {
+                    let take = buf.len().min(3 - written);
+                    self.bytes.extend_from_slice(&buf[..take]);
+                    written += take;
+                }
+                Poll::Ready(Ok(written))
+            }
+            fn is_write_vectored(&self) -> bool {
+                self.vectored
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Err(io::Error::from(io::ErrorKind::PermissionDenied)))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+            }
+        }
+        let _gate = WalkMetricsGate::enable();
+        let recorder = crate::test_metrics::CapturingRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            let mut observation = LocalWalkGuard::start();
+            let mut downstream = Writer {
+                bytes: Vec::new(),
+                pending: true,
+                vectored: true,
+            };
+            {
+                let mut writer = ObservedLocalWalkWriter {
+                    inner: &mut downstream,
+                    observation: &mut observation,
+                };
+                let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                assert!(writer.is_write_vectored());
+                assert!(Pin::new(&mut writer).poll_write(&mut cx, b"abc").is_pending());
+                let bufs = [io::IoSlice::new(b"de"), io::IoSlice::new(b"fg")];
+                assert!(Pin::new(&mut writer).poll_write_vectored(&mut cx, &bufs).is_pending());
+                writer.inner.pending = false;
+                assert!(matches!(Pin::new(&mut writer).poll_write(&mut cx, b"abcdef"), Poll::Ready(Ok(3))));
+                assert!(matches!(Pin::new(&mut writer).poll_write_vectored(&mut cx, &bufs), Poll::Ready(Ok(3))));
+                assert!(matches!(Pin::new(&mut writer).poll_write(&mut cx, b""), Poll::Ready(Ok(0))));
+                assert!(
+                    matches!(Pin::new(&mut writer).poll_flush(&mut cx), Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::PermissionDenied)
+                );
+                assert!(
+                    matches!(Pin::new(&mut writer).poll_shutdown(&mut cx), Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::BrokenPipe)
+                );
+                writer.inner.vectored = false;
+                assert!(!writer.is_write_vectored());
+            }
+            assert_eq!(downstream.bytes, b"abcdef");
+        });
+        assert_eq!(recorder.counter_value("rustfs_local_walk_written_bytes_total", &[]), 6);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn local_walk_metrics_preserve_real_output_errors_cancellation_and_timeout() {
+        struct PrefixWriter {
+            bytes: Vec<u8>,
+            limit: usize,
+            pending: bool,
+            reached_limit: Arc<AtomicBool>,
+        }
+        impl AsyncWrite for PrefixWriter {
+            fn poll_write(mut self: Pin<&mut Self>, _: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+                if self.bytes.len() == self.limit {
+                    self.reached_limit.store(true, Ordering::Relaxed);
+                    return if self.pending {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+                    };
+                }
+                let written = buf.len().min(7).min(self.limit - self.bytes.len());
+                self.bytes.extend_from_slice(&buf[..written]);
+                Poll::Ready(Ok(written))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                self.poll_flush(cx)
+            }
+        }
+        let _gate = WalkMetricsGate::enable();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("local walk runtime");
+        let dir = tempfile::tempdir().expect("local walk directory");
+        let (wrapper, options, expected) = runtime.block_on(async {
+            let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 directory")).expect("local endpoint");
+            let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+            let wrapper = LocalDiskWrapper::new(disk, false);
+            let bucket = "walk-metrics-test";
+            wrapper.make_volume(bucket).await.expect("local walk bucket");
+            let mut file_info = FileInfo::new(&format!("{bucket}/object"), 1, 0);
+            file_info.volume = bucket.to_owned();
+            file_info.name = "object".to_owned();
+            file_info.mod_time = Some(::time::OffsetDateTime::now_utc());
+            file_info.erasure.index = 1;
+            wrapper
+                .write_metadata("", bucket, "object", file_info)
+                .await
+                .expect("local walk metadata");
+            let options = WalkDirOptions {
+                bucket: bucket.to_owned(),
+                recursive: true,
+                ..Default::default()
+            };
+            let mut expected = Vec::new();
+            wrapper
+                .walk_dir(options.clone(), &mut expected)
+                .await
+                .expect("reference local walk");
+            assert!(expected.len() > 7, "fixture must reach a partial downstream write");
+            (wrapper, options, expected)
+        });
+        for case in ["ok", "write_error", "cancelled", "timeout"] {
+            let recorder = crate::test_metrics::CapturingRecorder::default();
+            metrics::with_local_recorder(&recorder, || {
+                runtime.block_on(async {
+                    let reached_limit = Arc::new(AtomicBool::new(false));
+                    let mut writer = PrefixWriter {
+                        bytes: Vec::new(),
+                        limit: if case == "ok" { usize::MAX } else { 7 },
+                        pending: matches!(case, "cancelled" | "timeout"),
+                        reached_limit: Arc::clone(&reached_limit),
+                    };
+                    let mut options = options.clone();
+                    if case == "cancelled" {
+                        options.skip_total_timeout = true;
+                        let mut walk = Box::pin(wrapper.walk_dir(options, &mut writer));
+                        tokio::time::timeout(
+                            Duration::from_secs(10),
+                            futures::future::poll_fn(|cx| {
+                                use std::future::Future;
+                                assert!(walk.as_mut().poll(cx).is_pending(), "walk must reach downstream backpressure");
+                                if reached_limit.load(Ordering::Relaxed) {
+                                    Poll::Ready(())
+                                } else {
+                                    Poll::Pending
+                                }
+                            }),
+                        )
+                        .await
+                        .expect("walk must reach the writer before cancellation");
+                        drop(walk);
+                    } else {
+                        if case == "timeout" {
+                            options.timeout_ms = Some(100);
+                        }
+                        let result = wrapper.walk_dir(options, &mut writer).await;
+                        match case {
+                            "ok" => result.expect("short downstream writes preserve success"),
+                            "write_error" => {
+                                assert!(matches!(result, Err(DiskError::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe))
+                            }
+                            "timeout" => {
+                                assert_eq!(result.expect_err("backpressured walk must time out"), DiskError::Timeout);
+                                assert!(reached_limit.load(Ordering::Relaxed), "timeout must occur after downstream progress");
+                            }
+                            _ => unreachable!("bounded test cases"),
+                        }
+                    }
+                    let accepted = if case == "ok" { expected.len() } else { 7 };
+                    assert_eq!(writer.bytes, expected[..accepted], "exact accepted prefix for {case}");
+                    assert_eq!(
+                        recorder.counter_value("rustfs_local_walk_written_bytes_total", &[]),
+                        u64::try_from(accepted).expect("fixture length fits")
+                    );
+                    assert_eq!(wrapper.runtime_state(), RuntimeDriveHealthState::Online);
+                    assert!(!wrapper.health.is_faulty());
+                    assert_eq!(wrapper.health.waiting_count(), 0, "walk must release health tracking");
+                })
+            });
+            let outcome = match case {
+                "ok" => "ok",
+                "cancelled" => "cancelled",
+                _ => "error",
+            };
+            assert_eq!(recorder.counter_value("rustfs_local_walk_started_total", &[]), 1, "{case}");
+            assert_eq!(
+                recorder.counter_value("rustfs_local_walk_completed_total", &[("outcome", outcome)]),
+                1,
+                "{case}"
+            );
+            assert_eq!(recorder.histogram_sample_count("rustfs_local_walk_duration_seconds"), 1, "{case}");
+        }
     }
 
     #[tokio::test]

@@ -323,6 +323,13 @@ fn contextualize_admin_pool_api_error(
     }
 }
 
+/// A lock timeout, such as a start giving up on a gate that in-flight data
+/// movement holds, is transient contention: report it as retryable and name
+/// the lock instead of folding it into a generic internal error.
+fn is_lock_timeout(err: &crate::storage_api::error::StorageError) -> bool {
+    matches!(err, crate::storage_api::error::StorageError::Lock(rustfs_lock::LockError::Timeout { .. }))
+}
+
 fn decommission_start_api_error(err: crate::storage_api::error::StorageError) -> ApiError {
     if crate::storage_api::capacity::is_pool_activation_fleet_proof_error(&err) {
         return ApiError {
@@ -331,7 +338,39 @@ fn decommission_start_api_error(err: crate::storage_api::error::StorageError) ->
             source: Some(Box::new(err)),
         };
     }
+    if is_lock_timeout(&err) {
+        return ApiError {
+            code: S3ErrorCode::ServiceUnavailable.into(),
+            message: err.to_string(),
+            source: Some(Box::new(err)),
+        };
+    }
+    // Keep the reason: a start rejected because another one is running
+    // should say so, not just "Invalid Request".
+    if matches!(err, crate::storage_api::error::StorageError::DecommissionAlreadyRunning) {
+        return ApiError {
+            code: S3ErrorCode::InvalidRequest.into(),
+            message: err.to_string(),
+            source: Some(Box::new(err)),
+        };
+    }
     ApiError::from(err)
+}
+
+/// The leader-local pre-check refreshes rebalance metadata before the start.
+/// A busy gate there is the same retryable 503 the start itself reports, and
+/// a start already running is the same rejection; any other refresh failure
+/// stays an internal error.
+fn decommission_start_rebalance_refresh_error(err: crate::storage_api::error::StorageError, pools_indices: &[usize]) -> S3Error {
+    if is_lock_timeout(&err) || matches!(err, crate::storage_api::error::StorageError::DecommissionAlreadyRunning) {
+        S3Error::from(contextualize_admin_pool_api_error(
+            decommission_start_api_error(err),
+            "start decommission",
+            format!("pools {pools_indices:?}"),
+        ))
+    } else {
+        s3_error!(InternalError, "failed to refresh rebalance metadata before decommission start: {}", err)
+    }
 }
 
 fn decommission_admin_not_initialized_error_with_audit(operation: &str, audit: PoolAuditContext<'_>) -> S3Error {
@@ -774,9 +813,9 @@ impl Operation for StartDecommission {
                 .map_err(|err| contextualize_admin_pool_api_error(err, "start decommission", &pool_context))?;
         } else {
             store
-                .load_rebalance_meta()
+                .load_rebalance_meta_for_decommission_start()
                 .await
-                .map_err(|e| s3_error!(InternalError, "failed to refresh rebalance metadata before decommission start: {}", e))?;
+                .map_err(|err| decommission_start_rebalance_refresh_error(err, &pools_indices))?;
             let decommission_running = store.is_decommission_running().await;
             let rebalance_running = store.is_rebalance_started().await;
             if decommission_running {
@@ -1052,8 +1091,8 @@ mod pools_handler_tests {
         POOL_ACTIVATION_FLEET_PROOF_REQUIRED, Params, PoolAuditContext, S3ErrorCode, S3Request, StartDecommission,
         StatusDecommission, StatusPool, Uri, contextualize_admin_pool_api_error,
         decommission_admin_not_initialized_error_with_audit, decommission_peer_target, decommission_start_api_error,
-        has_duplicate_indices, parse_mutation_pool_query, parse_pool_idx_by_id, parse_status_pool_query,
-        pool_admin_missing_credentials_error, pool_admin_missing_credentials_error_with_request,
+        decommission_start_rebalance_refresh_error, has_duplicate_indices, parse_mutation_pool_query, parse_pool_idx_by_id,
+        parse_status_pool_query, pool_admin_missing_credentials_error, pool_admin_missing_credentials_error_with_request,
         pool_admin_pool_index_error_with_audit, pool_admin_pool_not_found_error_with_audit,
         pool_admin_pool_parse_error_with_audit, pool_admin_query_parse_error, pool_admin_query_parse_error_with_audit,
         validate_pool_mutation_leader, validate_start_decommission_guards,
@@ -1253,6 +1292,77 @@ mod pools_handler_tests {
         let unrelated = decommission_start_api_error(crate::storage_api::error::StorageError::other("disk read failed"));
         assert_eq!(unrelated.code, rustfs_s3_types::S3ErrorCode::InternalError.into());
         assert_eq!(unrelated.message, "We encountered an internal error, please try again.");
+    }
+
+    #[test]
+    fn test_decommission_start_api_error_names_a_busy_gate_as_retryable() {
+        let err = crate::storage_api::error::StorageError::Lock(rustfs_lock::LockError::timeout(
+            "data movement gate (decommission activation)",
+            std::time::Duration::from_secs(30),
+        ));
+
+        let err = decommission_start_api_error(err);
+
+        assert_eq!(err.code, s3s::S3ErrorCode::ServiceUnavailable);
+        assert!(err.message.contains("data movement gate (decommission activation)"), "{}", err.message);
+        let err = s3s::S3Error::from(contextualize_admin_pool_api_error(err, "start decommission", "pools [0]"));
+        assert_eq!(
+            err.headers().and_then(|headers| headers.get(http::header::RETRY_AFTER)),
+            Some(&http::HeaderValue::from_static("1")),
+            "a busy gate is advertised as retryable"
+        );
+    }
+
+    #[test]
+    fn test_decommission_start_rebalance_refresh_error_keeps_busy_gates_retryable() {
+        let busy = decommission_start_rebalance_refresh_error(
+            crate::storage_api::error::StorageError::Lock(rustfs_lock::LockError::timeout(
+                "data movement gate (rebalance metadata refresh)",
+                std::time::Duration::from_secs(20),
+            )),
+            &[0, 1],
+        );
+        assert_eq!(busy.code(), &S3ErrorCode::ServiceUnavailable);
+        assert!(
+            busy.message()
+                .is_some_and(|message| message.contains("pools [0, 1]") && message.contains("rebalance metadata refresh")),
+            "{:?}",
+            busy.message()
+        );
+        assert_eq!(
+            busy.headers().and_then(|headers| headers.get(http::header::RETRY_AFTER)),
+            Some(&http::HeaderValue::from_static("1")),
+            "a busy gate is advertised as retryable"
+        );
+
+        let running =
+            decommission_start_rebalance_refresh_error(crate::storage_api::error::StorageError::DecommissionAlreadyRunning, &[0]);
+        assert_eq!(running.code(), &S3ErrorCode::InvalidRequest);
+        assert!(
+            running
+                .message()
+                .is_some_and(|message| message.contains("pools [0]") && message.contains("already running")),
+            "{:?}",
+            running.message()
+        );
+
+        let failed = decommission_start_rebalance_refresh_error(
+            crate::storage_api::error::StorageError::other("rebalance metadata unreadable"),
+            &[0],
+        );
+        assert_eq!(failed.code(), &S3ErrorCode::InternalError);
+        assert!(
+            failed
+                .message()
+                .is_some_and(|message| message.starts_with("failed to refresh rebalance metadata before decommission start")),
+            "{:?}",
+            failed.message()
+        );
+        assert!(
+            failed
+                .headers()
+                .is_none_or(|headers| headers.get(http::header::RETRY_AFTER).is_none())
+        );
     }
 
     #[test]

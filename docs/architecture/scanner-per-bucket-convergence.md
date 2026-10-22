@@ -1,7 +1,7 @@
 # Scanner Per-Bucket Convergence Design
 
 **Use this when:** changing what makes a scanner cycle `Complete`, `Superseded`, or converged; adding or re-classifying a dirty-usage producer; deciding whether a background writeback may invalidate a scanner cycle; changing scanner worker concurrency or throttling; or activating scoped dirty acknowledgements.
-**Source of truth:** `classify_nsscanner_cycle`, `scanner_cycle_activity_status`, and `scoped_scan_scope_from_dirty_buckets` in `crates/scanner/src/scanner_io.rs`; `dirty_usage_snapshot_status` and `acknowledge_scoped_dirty_usage` in `crates/scanner/src/scanner_io/dirty_usage.rs`; `scanner_concurrency_limit` in `crates/scanner/src/scanner_io/guards.rs`; the per-disk worker loop in `crates/scanner/src/scanner_io/io_cache.rs`; `DynamicSleeper` in `crates/scanner/src/sleeper.rs`; `ScannerNodeActivity` in `crates/scanner/src/scanner/activity.rs`; `persist_replication_state_if_current` in `crates/ecstore/src/bucket/replication/replication_resyncer.rs`; the publication fences in [scanner-usage-publication.md](scanner-usage-publication.md).
+**Source of truth:** `classify_nsscanner_cycle`, `scanner_cycle_activity_status`, and `scoped_scan_scope_from_dirty_buckets` in `crates/scanner/src/scanner_io.rs`; `dirty_usage_snapshot_status` and `acknowledge_scoped_dirty_usage` in `crates/scanner/src/scanner_io/dirty_usage.rs`; `scanner_concurrency_limit` in `crates/scanner/src/scanner_io/guards.rs`; the per-disk worker loop and `carry_partial_bucket_values` in `crates/scanner/src/scanner_io/io_cache.rs`; `DynamicSleeper` in `crates/scanner/src/sleeper.rs`; `ScannerNodeActivity` in `crates/scanner/src/scanner/activity.rs`; `persist_replication_state_if_current` in `crates/ecstore/src/bucket/replication/replication_resyncer.rs`; the publication fences in [scanner-usage-publication.md](scanner-usage-publication.md).
 
 ## Decision
 
@@ -19,9 +19,9 @@ collection, because the problems and the known-good answers are the same.
    turn the cycle into `Superseded`.
 2. **The cluster activity probe stays, as a guardrail only.** It vetoes a
    publication when the heap it describes is not the heap that was walked:
-   topology, peer identity, protocol version, data movement, or a pending PUT
-   tail changed. Namespace and dirty-usage generation movement alone never
-   vetoes; it only shades buckets.
+   topology, peer identity, protocol version, or data movement changed.
+   Namespace and dirty-usage generation movement, and a pending ordinary PUT
+   commit, never veto; they only shade buckets.
 3. **Replication status writebacks are status-class barrier hits.** They
    shade a bucket for a scoped rescan but are not namespace activity. They
    never uncertify a walk and never block cycle completion. The scanner's own
@@ -63,8 +63,8 @@ the other:
 A third class sits beside these two and is easy to mistake for the first:
 
 - **Guardrail false positives**: the cycle is invalidated not by writes but
-  by the proof machinery itself. An in-flight PUT classified as data
-  movement, a journal lock timeout reported as an unavailable activity
+  by the proof machinery itself. An in-flight PUT counted as a publication
+  barrier, a journal lock timeout reported as an unavailable activity
   baseline, or one unreachable peer in a large cluster defers the whole
   cycle, and the dirty map is never cleared. Per-bucket certification does
   nothing for this class because the walk never reaches certification. The
@@ -137,6 +137,26 @@ Mutations after that point are the next cycle's work. This is what makes
 termination possible under continuous writes: the termination condition is
 "no grey bucket in the start snapshot", not "no mutation anywhere".
 
+The start snapshot is read after the bucket listing, not before it. The
+listing window is the gap between the listing cutoff (the dirty-usage
+generation read before `list_bucket_for_scanner`) and that read; under
+sustained writes some bucket is almost always written inside it, so the
+scope cannot require the whole dirty map to be quiet across the listing.
+`snapshot_dirty_usage_buckets_after_listing` keeps every entry recorded at or
+before the cutoff and every later entry for a listed bucket. The only entries
+it leaves out are buckets the listing did not return that became dirty after
+the cutoff: the walk cannot visit them, certification compares generations
+against the snapshot and so never clears them, and
+`pending_dirty_usage_buckets` reports them, so the next cycle lists and
+selects them. A scoped walk therefore needs only `covers_listed_pending`: no
+dirty entry was removed or overwritten by replay during the listing. A
+removal in the window may be a certification against a publication newer
+than the baseline the cycle loaded, and scoping would then reuse a stale
+baseline value for that bucket, so a removal still makes the cycle a full
+walk. The strict `covers_all_pending` (nothing moved at all) keeps gating
+segment-reuse evidence, which binds to an unchanged generation window; a
+cycle admitted only by the weaker rule walks its dirty buckets whole.
+
 Usage is a sum, not a reachability fixed point. A certified bucket's value
 plus an uncertified bucket's last certified value is a valid snapshot, so the
 collector does not need a globally consistent heap to publish. This is why a
@@ -152,6 +172,17 @@ compare-and-remove semantics of `acknowledge_scoped_dirty_usage`:
   never move it;
 - generation moved by a `Namespace` hit: stays grey with the newer
   generation and counts as pending;
+- walk stopped early (`Partial`): stays grey with its generation, like a
+  failed walk, and counts as pending; the value published for it is the
+  last certified one, never the partial walk's running total;
+- a sweep that spans two cycles resumes only under the same coverage
+  identity (`scanner_activity_coverage_digest` with the bucket's own dirty
+  generation, through `prepare_bucket_checkpoint_with_coverage`). A peer's
+  namespace and dirty generations stay in that identity while its dirty
+  buckets are acknowledged per cycle: a write there between the two halves
+  of a sweep restarts the sweep instead of being acknowledged unwalked. The
+  local node's generations are left out, because its buckets are certified
+  one by one; a completed sweep is stored under the reuse identity;
 - a peer reported the bucket dirty without a scoped entry the coordinator can
   verify: stays grey. This is the mixed-version and partial-peer fallback,
   and it is per bucket, not per cycle.
@@ -176,17 +207,40 @@ equality test to:
 
 - guardrail vetoed: `Superseded`;
 - otherwise: `Complete`, carrying `pending_dirty_buckets` as the count of
-  buckets left grey by `Namespace` hits.
+  buckets left grey by `Namespace` hits or by a walk that stopped early.
+
+A bucket walk that stops early without exhausting the cycle budget (a sweep
+resumed under a newer plan, unresolved objects) is `Partial`. The set scan
+stands in for it with the bucket's last certified value from the previous
+complete set cache (`carry_partial_bucket_values` in
+`crates/scanner/src/scanner_io/io_cache.rs`): usage is a sum, so the
+certified buckets plus that value are a valid snapshot. The cycle then
+completes with the bucket pending (`ScannerBucketScanStatus::PartialCarried`),
+and the next scoped cycle walks it because the pending buckets of the
+authoritative baseline join the dirty buckets in
+`scoped_scan_scope_from_dirty_buckets`. Only a bucket with no certified
+value on a set (its first walk, a changed incarnation, a hard failure) keeps
+that set, and with it the cycle, `Incomplete`.
 
 `usage_snapshot_converged` becomes `pending_dirty_buckets == 0`. A `Complete`
 cycle with pending buckets publishes an authoritative snapshot: certified
-buckets are current, pending buckets carry their last certified values in
-`buckets_usage`. `DataUsageInfo` in `crates/data-usage/src/data_usage.rs`
-gains an additive, map-encoded list of pending bucket names beside
-`usage_snapshot_set_states`, so readers can tell a certified value from a
-carried one without a schema break. This replaces the behaviour where a
-superseded result is published only as an observed snapshot and never
-becomes a baseline.
+buckets are current, pending buckets carry the value the walk produced,
+which is at least as recent as the previous certified value and may miss
+the write that shaded the bucket; the next cycle rescans them. `DataUsageInfo`
+in `crates/data-usage/src/data_usage.rs` gains additive fields beside
+`usage_snapshot_set_states`: the sorted list `usage_snapshot_pending_buckets`,
+its length `usage_snapshot_pending_bucket_count`, and the routing mark
+`usage_snapshot_observational` that a vetoed cycle sets so the observed
+object is selected by an explicit mark rather than by the convergence flag.
+Readers can tell a certified value from an uncertified one without a schema
+break. This replaces the behaviour where a superseded result is published
+only as an observed snapshot and never becomes a baseline.
+
+The pending set is read after the guardrail verdict and before publication.
+Certification at finalize still compares each bucket's generation against the
+start snapshot, so a write that lands between publication and finalize keeps
+its bucket dirty even though the published list does not name it; it is the
+next cycle's work, exactly as a write after a converged publication is today.
 
 ### Guardrail
 
@@ -196,13 +250,23 @@ walk. Field roles:
 | Field | Role |
 |---|---|
 | `instance_id`, `protocol_version`, `topology_digest` | veto: a peer restarted, changed version, or the topology changed |
-| `data_movement_active`, `movement_generation`, `publication_blocked` | veto: rebalance, decommission, or a pending PUT tail can make the walk describe a different generation |
-| `maintenance_generation` | veto only when the cycle published maintenance results; otherwise a shade signal |
+| `data_movement_active`, `movement_generation` | veto: rebalance or decommission can make the walk describe a different generation |
+| `publication_blocked` (a pending ordinary PUT commit) | shade signal only, and part of no plan identity: the write barrier records the bucket after the ACK and certification handles it |
+| `maintenance_generation` | veto: no cycle today records whether it published maintenance results, and the field is already part of the structural digest; it becomes a shade signal only once that distinction exists |
 | `namespace_generation`, `dirty_usage_generation`, `dirty_usage_pending` | shade signal: consumed per bucket; never a veto on their own |
 
-`scanner_activity_structural_digest` already separates the structural part
-of the snapshot from the generations. The guardrail is the structural digest
-plus the movement fields.
+The activity snapshot feeds two plan identities with different jobs. The
+coverage identity (bucket list and creation times, `topology_digest`,
+`protocol_version`, `data_movement_active`, `movement_generation`) decides
+whether a resumed bucket checkpoint still describes the same traversal; only
+it may mark a resumed sweep as mixed coverage. The reuse identity adds
+`instance_id` and `maintenance_generation` and decides whether a completed
+cache or a scoped baseline may be reused: a peer restart can lose dirty hints
+inside the journal's coalescing window and a maintenance change needs a fresh
+discovery walk, so both force a full walk, but neither changes what a
+full-walk checkpoint has already covered. `publication_blocked` belongs to
+neither identity. The guardrail compares the reuse identity plus the movement
+fields.
 
 The guardrail is bounded in three ways:
 
@@ -217,6 +281,13 @@ The guardrail is bounded in three ways:
   movement or topology veto, which describes the whole heap, defers the
   cycle. `ActivityBaselineUnavailable` therefore becomes a per-peer
   condition, not a cycle outcome, unless no peer answered at all.
+  Phase 2 ships attribution but not localisation: per-bucket certification
+  covers the local dirty map, and a remote peer whose `dirty_usage_generation`
+  or `dirty_usage_pending` moved during the walk still supersedes the whole
+  cycle (`scanner_peer_dirty_usage_moved`), because without a post-walk scoped
+  snapshot the coordinator cannot name the buckets that peer dirtied and would
+  otherwise claim convergence over them. The same rule is applied again after
+  remote leases are granted. Phase 5 lifts it with scoped acknowledgements.
 - **Retried on a bound.** A deferred cycle retries on the existing
   superseded backoff schedule with a cap, and `usage_freshness` reports the
   field and peer that caused the last deferral so the operator can tell a
@@ -253,15 +324,24 @@ for within-cycle reuse.
 
 ## Pacing and worker concurrency
 
-Today the number of bucket walkers per erasure set equals the number of
-disks in the set, capped by `max_concurrent_disk_scans`, and
-`scanner_concurrency_limit` takes the minimum of the configured value and the
+Before phase 3 the number of bucket walkers per erasure set equalled the
+number of disks in the set, capped by `max_concurrent_disk_scans`, and
+`scanner_concurrency_limit` took the minimum of the configured value and the
 disk count. Buckets queue on one channel per set and each walker takes one
 bucket at a time; inside a bucket the folder walk is sequential and
 `DynamicSleeper` sleeps after every object for the work time multiplied by
 the speed factor. On a single-disk deployment this is one walker, one bucket,
 one object at a time, at roughly one third duty cycle under the default
 speed. Walker count is therefore a property of topology, not of the work.
+
+Two later controls bound that walk per disk rather than per object.
+rustfs/rustfs#8389 added the local-disk foreground-priority admission gate,
+which orders scanner I/O behind foreground requests. rustfs/backlog#2905 added
+a per-disk token-bucket budget (operations and bytes per second, defaults by
+detected media) that `DynamicSleeper` charges before each directory listing
+and metadata read; it is a hard ceiling layered on admission and never lets
+the scanner exceed what admission allows. The operator view is in
+`docs/operations/scanner-runtime-controls.md`.
 
 A collector's pacer sets collector work from the mutator's rate under a
 resource ceiling. The scanner adopts the same shape:
@@ -273,7 +353,14 @@ resource ceiling. The scanner adopts the same shape:
   count multiplied by a per-disk walker factor. The factor defaults from disk
   type: 1 for rotational media, higher for flash, where xl.meta decode is CPU
   bound and there is no seek penalty. Disk count stays the floor so
-  distributed deployments keep at least today's parallelism.
+  distributed deployments keep at least today's parallelism. Shipped as
+  `scanner.walkers_per_disk` (`RUSTFS_SCANNER_WALKERS_PER_DISK`, `1` through
+  `16`): each local coordinator disk gets that many walkers, which share one
+  per-disk scanner admission so a peer still sees one scan session per
+  physical disk; remote disks keep one walker. The default is `1` everywhere
+  until a local disk can report its media type
+  (`rustfs_utils::os::Info::rotational` is never populated today); the flash
+  default above `1` remains the intent.
 - **Throttle**: the `DynamicSleeper` factor is the pacer's output, not a
   fixed preset. `ScannerSpeed` presets remain as operator overrides and as
   the initial value. Foreground workload backoff in `sleeper.rs` remains the
@@ -292,19 +379,21 @@ not tuning advice.
 |---|---|
 | Grey buckets are rescanned next cycle | A scoped cycle walks at most a configured number of buckets and objects. Grey buckets beyond that are ordered by waiting age, oldest first, so every bucket is walked within a bounded number of cycles. New names never reorder ahead of an older waiter. |
 | `Status` hits are not namespace activity | A `Status` hit costs one atomic OR on the writeback path and no scanner work. It never triggers a dirty-usage wake. A replication resync therefore adds nothing to scanner load beyond the full walk the cycle already performs. |
-| A `Complete` cycle with pending buckets is a baseline | When the pending set is the whole namespace (a mass write, a disk loss), the next cycle is declared a full sweep explicitly and uses the existing superseded retry backoff schedule. A full sweep is never run under the scoped cycle's wake cadence. |
+| A `Complete` cycle with pending buckets is a baseline | A cycle eligible for a dirty-bucket scope that walks the whole namespace instead (more dirty buckets than one scoped cycle may select, no usable baseline, a dirty entry removed during the listing, unverifiable peer dirty usage) is paced while dirty buckets remain after it: the next cycle waits on the capped retry schedule (5 s doubling) clamped to the configured cycle interval, with the dirty-usage wake disabled and cluster activity deferred. A full sweep is therefore never run under the scoped cycle's wake cadence, and a namespace that stays unscopable is still walked at the ordinary cycle cadence rather than starved. The paced timer wake still requests a scope, and any non-fallback cycle resets the schedule. |
 | Bounded remark | At most one remark pass per cycle, inside the remaining budget. |
 | Old-generation sweep every `M` cycles | The sweep is checkpointed and resumes; it does not restart on a `Namespace` hit. A hit only demotes the bucket to young for the following cycle. |
 | Pacer raises walkers and lowers sleep | CPU and I/O ceilings are absolute. Foreground admission backoff cannot be undercut. Walker count never exceeds the ceiling-derived maximum even when the target is missed. |
 | Faster convergence discovers heal and replication work sooner | Heal admission keeps its queue bounds and `queue_full` and `dropped` accounting in `crates/scanner/src/scanner_folder/ledger.rs`; replication MRF keeps its pending cap. Convergence speed does not change retry intervals. Discovered work is swept lazily under those bounds, in the sense of a lazy sweeper: discovery and execution are decoupled. |
 | Guardrail vetoes publication | A veto is attributed to a field and localised to a peer where the field allows it; only movement and topology defer the whole cycle. Deferred retries use the capped superseded backoff. A probe failure on one peer never costs more than that peer's dirtied buckets. |
-| One bucket walk may be large | Inside a bucket, the walk takes a per-prefix quantum: a prefix that exhausts it checkpoints and yields to the next prefix or bucket, and resumes under the existing cursor and page-index fences. No single prefix may consume the whole cycle budget. The walker's own bookkeeping must stay linear in entries per prefix; `RawEnumerationProgress::record_entry` in `crates/scanner/src/scanner_folder.rs` copies the accumulated entry list on every entry today and is a prerequisite fix for pacing. |
+| One bucket walk may be large | Inside a bucket, the walk takes a per-prefix quantum: a prefix that exhausts it checkpoints and yields to the next prefix or bucket, and resumes under the existing cursor and page-index fences. No single prefix may consume the whole cycle budget. The walker's own bookkeeping must stay linear in entries per prefix. `RawEnumerationProgress::record_entry` in `crates/scanner/src/scanner_folder.rs` once re-normalized the accumulated entry list on every entry (rustfs#8113: 8,000 entries cost about 40 s); since #8114 the page writer hashes each entry once when its page commits, and a regression test pins 20,000 entries in one prefix to that cost so pacing cannot be built on a quadratic walker. |
 
 ## What stays fail-closed
 
-- Quota authority is unchanged: an uncertified bucket keeps its last certified
-  value as the floor, as the usage floor does today. Live writes do not
-  advance it.
+- An uncertified bucket keeps its last certified value as its reported value.
+  Live writes do not advance it. Hard quota admission is owned by the
+  reservation ledger
+  ([scanner-usage-authority-decision.md](scanner-usage-authority-decision.md)),
+  so this value is reporting input, not an admission authority.
 - The storage publication epoch, leadership claim, CAS revision, publication
   lease, and tier registry fences are untouched. This design narrows what a
   generation movement means; it removes no fence.
@@ -328,7 +417,7 @@ require a scanner reset.
 
 | Artifact | Encoding and tolerance today | Rule in this design | Rollback behaviour |
 |---|---|---|---|
-| `.usage.v2.json` (`DataUsageInfo`) | JSON; every optional field is `serde(default)` and skipped when empty; unknown fields are ignored | The pending-bucket list is an additive optional field. `usage_snapshot_converged` keeps its meaning. No existing field changes type or semantics. | An older reader ignores the pending list and sees a complete snapshot with `usage_snapshot_converged = false`, which it already handles as an authoritative but unconverged publication. |
+| `.usage.v2.json` (`DataUsageInfo`) | JSON; every optional field is `serde(default)` and skipped when empty; unknown fields are ignored | The pending-bucket list, its count, and the observational routing mark are additive optional fields. `usage_snapshot_converged` keeps its meaning. No existing field changes type or semantics. | An older reader ignores the pending list and sees a complete snapshot with `usage_snapshot_converged = false`. Its admin and quota readers accept that as an authoritative publication; its scanner does not use it as a scoped-scan baseline and runs full walks until it publishes a converged snapshot of its own, which is today's behaviour, not a reset. |
 | `.usage-cache.bin` (`DataUsageCache`) | MessagePack; `DataUsageScanIdentity`, `DataUsageScanProgress`, and `DataUsageRawEnumerationCursor` deny unknown fields; the map-encoded cache metadata tolerates unknown keys | No field is added to a struct that denies unknown fields. Bucket color and start generation are process state in the dirty map, not cache fields. If a per-bucket value must persist, it goes into the map-encoded metadata as `scan_execution_digest` did. The old-generation sweep reuses the existing checkpoint, resume, and cursor fields unchanged. | An older reader ignores any added map key and treats the cache under its existing identity rules. |
 | `.bloomcycle.bin` and recovery markers | Versioned by `schema_version`; a mismatch is quarantined | No schema bump. Pending-bucket state is derived from the dirty map and the published snapshot, not stored in cycle state. | Unchanged. |
 | `scanner/durable-dirty-producer-replay/<owner>.json` | Strict schema; entries deny unknown fields | The barrier-hit class is not persisted. Replayed entries are treated as `Namespace` class, which can only cause an extra scoped rescan, never a missed one. | Unchanged. |
@@ -409,14 +498,31 @@ condition before merging.
 ## Surfaces
 
 - `usage_freshness` in the admin scanner status reports
-  `pending_dirty_buckets` (`Namespace` class only), plus the pacer target,
+  `dirty_pending_buckets` (`Namespace` class only; after certification the
+  dirty map holds the shaded pending buckets, and the published pending list
+  also names buckets whose walk stopped early), the attributed guardrail veto
+  (`guardrail_veto_total`, `last_guardrail_veto_unix_secs`,
+  `last_guardrail_veto_reason` as `<field>@<host>`), the scope fallback
+  (`scope_fallback_total`, `last_scope_fallback_unix_secs`,
+  `last_scope_fallback_reason`, one of `dirty_snapshot_incomplete`,
+  `dirty_generation_exhausted`, `dirty_bucket_overflow`,
+  `no_listed_dirty_buckets`, `baseline_unavailable`,
+  `peer_scope_unavailable`), plus the pacer target,
   achieved rate, and whether a ceiling is binding. The console marks usage
   stale only for that count or for a guardrail veto.
-- `last_cycle_result` reports `complete` for a cycle with pending buckets;
-  `superseded` is reserved for guardrail vetoes and should be rare.
-- The superseded retry schedule applies only to guardrail vetoes and to
-  explicit full sweeps. A `Complete` cycle with pending buckets uses the
-  ordinary dirty-usage wake and the next cycle is scoped to the pending set.
+- `last_cycle_result` reports `success`, its existing label for a completed
+  cycle, for a cycle with pending buckets; `superseded` is reserved for
+  guardrail vetoes and the phase-2 peer fallback and should be rare.
+- The superseded retry schedule applies only to guardrail vetoes. A
+  `Complete` scoped cycle with pending buckets uses the ordinary dirty-usage
+  wake and the next cycle is scoped to the pending set. While dirty buckets
+  remain after a full-namespace scope fallback, the next cycle uses the
+  capped retry schedule clamped to the cycle interval (see
+  [Boundedness constraints](#boundedness-constraints)), and the fallback
+  logs `scoped_scan_fallback` with its reason. Cycles that must walk
+  everything regardless (lifecycle or replication rules, deep scans, the
+  first cycle after leadership) are not scope fallbacks and are not
+  reported as such.
 - `rustfs_cluster_usage_objects_snapshot_converged` keeps its meaning.
 
 ## Delivery
@@ -436,7 +542,10 @@ modes.
    non-converged `Complete` publication as the structural baseline, order
    grey buckets by waiting age under a per-cycle quantum, give each prefix
    inside a bucket its own quantum, and attribute and localise guardrail
-   vetoes. Oracle: a single-node deployment with one bucket written every
+   vetoes. The first change of this phase ships the termination rule:
+   certification, `Complete` with pending buckets, the baseline bootstrap
+   and guardrail attribution. Bounded remark, aging order, the per-prefix
+   quantum and guardrail localisation follow as their own changes. Oracle: a single-node deployment with one bucket written every
    few seconds reaches `Complete` on the first full walk, reports exactly
    that bucket pending, and the next cycle walks only that bucket; a
    deployment with more buckets than the quantum walks every bucket within
@@ -444,10 +553,12 @@ modes.
    a hundred thousand entries no longer starves the buckets after it; a
    multi-node deployment with one peer's probe failing publishes every bucket
    that peer did not dirty.
-3. **Pacer and walker concurrency.** Fix the quadratic entry bookkeeping in
-   `RawEnumerationProgress::record_entry` first, then decouple walker count
-   from disk count and drive the throttle from the pacing target under CPU
-   and I/O ceilings. Oracle: on a single flash disk the same namespace
+3. **Pacer and walker concurrency.** Pin the entry bookkeeping in
+   `RawEnumerationProgress::record_entry` to linear cost first (the
+   clone-per-entry itself was removed by #8114; the regression test and the
+   in-place page writer are this phase's groundwork), then decouple walker
+   count from disk count (`walkers_per_disk`, shipped) and drive the throttle
+   from the pacing target under CPU and I/O ceilings (open). Oracle: on a single flash disk the same namespace
    converges in a fraction of today's cycle time with scanner CPU under the
    ceiling; on rotational media the default factor keeps today's I/O
    profile; a foreground write load at the admission threshold still backs
