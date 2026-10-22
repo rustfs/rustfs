@@ -13,9 +13,11 @@
 // limitations under the License.
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use rustfs_ecstore::api::disk::{Disk, DiskAPI, DiskOption, Endpoint, WalkDirOptions, new_disk};
 use rustfs_filemeta::{MetaCacheEntry, MetacacheReader, test_data::create_real_xlmeta};
 use std::hint::black_box;
+
+mod storage_api;
+use storage_api::local_walk_dir::{Disk, DiskAPI, DiskOption, Endpoint, WalkDirOptions, new_disk};
 
 const OBJECTS: usize = 1000;
 
