@@ -29,6 +29,7 @@ workspace = true
 
 [features]
 default = []
+test-util = []
 hotpath = ["hotpath/hotpath", "hotpath/tokio"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
