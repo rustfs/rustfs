@@ -151,6 +151,8 @@ impl Error {
                             | EcstoreError::VolumeNotFound
                             | EcstoreError::FaultyDisk
                             | EcstoreError::FaultyRemoteDisk
+                            | EcstoreError::TooManyOpenFiles
+                            | EcstoreError::OutdatedXLMeta
                             | EcstoreError::SlowDown
                             | EcstoreError::OperationCanceled
                             | EcstoreError::RemoteClientUnavailable(_)
@@ -167,6 +169,8 @@ impl Error {
                 matches!(
                     err,
                     DiskError::DiskNotFound
+                        | DiskError::TooManyOpenFiles
+                        | DiskError::OutdatedXLMeta
                         | DiskError::ErasureReadQuorum
                         | DiskError::ErasureWriteQuorum
                         | DiskError::Timeout
@@ -585,6 +589,18 @@ mod tests {
         assert!(Error::Storage(EcstoreError::VolumeNotFound).is_recoverable_heal());
         assert!(Error::Storage(EcstoreError::FaultyDisk).is_recoverable_heal());
         assert!(Error::Storage(EcstoreError::FaultyRemoteDisk).is_recoverable_heal());
+    }
+
+    #[test]
+    fn concurrent_metadata_and_capacity_errors_are_recoverable() {
+        for error in [
+            Error::Disk(DiskError::OutdatedXLMeta),
+            Error::Storage(EcstoreError::OutdatedXLMeta),
+            Error::Disk(DiskError::TooManyOpenFiles),
+            Error::Storage(EcstoreError::TooManyOpenFiles),
+        ] {
+            assert!(error.is_recoverable_heal(), "transient heal failure must be retried: {error:?}");
+        }
     }
 
     #[test]
