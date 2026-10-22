@@ -4120,27 +4120,28 @@ fn merge_file_meta_versions_inner(
         }
     };
 
-    let mut versions = versions.to_owned();
+    let mut streams: Vec<Vec<&FileMetaShallowVersion>> = versions.iter().map(|v| v.iter().collect()).collect();
+    let mut tops: Vec<&FileMetaShallowVersion> = Vec::with_capacity(streams.len());
 
     let mut n_versions = 0;
 
     let mut merged = Vec::new();
     loop {
-        let mut tops = Vec::new();
-        let mut top_sig = FileMetaVersionHeader::default();
+        tops.clear();
+        let mut top_sig: Option<&FileMetaVersionHeader> = None;
         let mut consistent = true;
-        for vers in versions.iter() {
-            if vers.is_empty() {
+        for vers in &streams {
+            let Some(&first) = vers.first() else {
                 consistent = false;
                 continue;
-            }
-            if tops.is_empty() {
-                consistent = true;
-                top_sig = vers[0].header.clone();
+            };
+            if let Some(sig) = top_sig {
+                consistent = consistent && &first.header == sig;
             } else {
-                consistent = consistent && vers[0].header == top_sig;
+                consistent = true;
+                top_sig = Some(&first.header);
             }
-            tops.push(vers[0].clone());
+            tops.push(first);
         }
 
         // check if done...
@@ -4148,77 +4149,74 @@ fn merge_file_meta_versions_inner(
             break;
         }
 
-        let mut latest = FileMetaShallowVersion::default();
+        let latest: &FileMetaShallowVersion;
         if consistent {
-            latest = tops[0].clone();
-            if tops.len() >= required_quorum(&latest) {
+            latest = tops[0];
+            if tops.len() >= required_quorum(latest) {
                 merged.push(latest.clone());
                 if !latest.header.free_version() {
                     n_versions += 1;
                 }
             }
         } else {
-            let mut latest_count = 0;
-            for (i, ver) in tops.iter().enumerate() {
-                if ver.header == latest.header {
+            let mut latest_ref = tops[0];
+            let mut latest_count = 1;
+            for &ver in &tops[1..] {
+                if ver.header == latest_ref.header {
                     latest_count += 1;
                     continue;
                 }
 
-                if i == 0 || ver.header.sorts_before(&latest.header) {
-                    if i == 0 || latest_count == 0 {
-                        latest_count = 1;
-                    } else if !strict && ver.header.matches_not_strict(&latest.header) {
+                if ver.header.sorts_before(&latest_ref.header) {
+                    if !strict && ver.header.matches_not_strict(&latest_ref.header) {
                         latest_count += 1;
                     } else {
                         latest_count = 1;
                     }
-                    latest = ver.clone();
+                    latest_ref = ver;
                     continue;
                 }
 
                 // Mismatch, but older.
-                if latest_count > 0 && !strict && ver.header.matches_not_strict(&latest.header) {
+                if !strict && ver.header.matches_not_strict(&latest_ref.header) {
                     latest_count += 1;
                     continue;
                 }
 
-                if latest_count > 0 && ver.header.version_id == latest.header.version_id {
+                if ver.header.version_id == latest_ref.header.version_id {
                     let mut x: HashMap<FileMetaVersionHeader, usize> = HashMap::new();
-                    for a in tops.iter() {
+                    for &a in &tops {
                         if a.header.version_id != ver.header.version_id {
                             continue;
                         }
-                        let mut a_clone = a.clone();
+                        let mut hdr = a.header.clone();
                         if !strict {
-                            a_clone.header.signature = [0; 4];
+                            hdr.signature = [0; 4];
                         }
-                        *x.entry(a_clone.header).or_insert(0) += 1;
+                        *x.entry(hdr).or_insert(0) += 1;
                     }
                     latest_count = 0;
                     for (k, v) in x.iter() {
-                        if *v < latest_count {
+                        if *v < latest_count || (*v == latest_count && latest_ref.header.sorts_before(k)) {
                             continue;
                         }
-                        if *v == latest_count && latest.header.sorts_before(k) {
-                            continue;
-                        }
-                        tops.iter().for_each(|a| {
+                        for &a in &tops {
                             let mut hdr = a.header.clone();
                             if !strict {
                                 hdr.signature = [0; 4];
                             }
                             if hdr == *k {
-                                latest = a.clone();
+                                latest_ref = a;
                             }
-                        });
+                        }
 
                         latest_count = *v;
                     }
                     break;
                 }
             }
-            if latest_count >= required_quorum(&latest) {
+            latest = latest_ref;
+            if latest_count >= required_quorum(latest) {
                 if !latest.header.free_version() {
                     n_versions += 1;
                 }
@@ -4227,36 +4225,20 @@ fn merge_file_meta_versions_inner(
         }
 
         // Remove from all streams up until latest modtime or if selected.
-        versions.iter_mut().for_each(|vers| {
-            // // Keep top entry (and remaining)...
-            let mut bre = false;
-            vers.retain(|ver| {
-                if bre {
-                    return true;
-                }
-                if let Ordering::Greater = ver.header.mod_time.cmp(&latest.header.mod_time) {
-                    bre = true;
-                    return false;
-                }
-                if ver.header == latest.header {
-                    bre = true;
-                    return false;
-                }
-                if let Ordering::Equal = latest.header.version_id.cmp(&ver.header.version_id) {
-                    bre = true;
-                    return false;
-                }
-                for merged_v in merged.iter() {
-                    if let Ordering::Equal = ver.header.version_id.cmp(&merged_v.header.version_id) {
-                        bre = true;
-                        return false;
-                    }
-                }
-                true
-            });
-        });
+        for vers in &mut streams {
+            if let Some(pos) = vers.iter().position(|ver| {
+                ver.header.mod_time > latest.header.mod_time
+                    || ver.header == latest.header
+                    || latest.header.version_id == ver.header.version_id
+                    || merged
+                        .iter()
+                        .any(|merged_v| ver.header.version_id == merged_v.header.version_id)
+            }) {
+                vers.remove(pos);
+            }
+        }
         if requested_versions > 0 && requested_versions == n_versions {
-            merged.append(&mut versions[0]);
+            merged.extend(streams[0].iter().map(|v| (*v).clone()));
             break;
         }
     }

@@ -302,15 +302,74 @@ impl FileMeta {
 
     #[inline]
     pub(crate) fn headers_match_strict(s_header: &FileMetaVersionHeader, o_header: &FileMetaVersionHeader) -> bool {
-        if s_header == o_header {
-            return true;
+        let FileMetaVersionHeader {
+            version_id,
+            mod_time,
+            signature,
+            ec_n,
+            ec_m,
+            version_type,
+            flags,
+        } = s_header;
+        *version_id == o_header.version_id
+            && *mod_time == o_header.mod_time
+            && *signature == o_header.signature
+            && *version_type == o_header.version_type
+            && *flags == o_header.flags
+            && (s_header.has_ec() != o_header.has_ec() || (*ec_n == o_header.ec_n && *ec_m == o_header.ec_m))
+    }
+
+    #[inline]
+    pub(crate) fn borrow_cached(&self) -> BorrowedFileMeta<'_> {
+        BorrowedFileMeta::from_file_meta(self)
+    }
+
+    pub(crate) fn decode_borrowed(buf: &[u8]) -> Result<BorrowedFileMeta<'_>> {
+        let (meta, inline_buf) = Self::parse_validated_xl_envelope(buf)?;
+        if meta.is_empty() {
+            return Ok(BorrowedFileMeta {
+                meta_ver: 0,
+                inline_buf,
+                versions: BorrowedVersions::Empty,
+            });
         }
-        if s_header.has_ec() != o_header.has_ec() {
-            let (mut a, mut b) = (s_header.clone(), o_header.clone());
-            (a.ec_n, a.ec_m, b.ec_n, b.ec_m) = (0, 0, 0, 0);
-            return a == b;
+        let (versions_len, header_ver, meta_ver, meta) = Self::decode_validated_xl_headers(meta)?;
+        let mut cur: Cursor<&[u8]> = Cursor::new(meta);
+        let versions = match versions_len {
+            0 => BorrowedVersions::Empty,
+            1 => BorrowedVersions::Single([Self::read_next_shallow_slice(meta, &mut cur, header_ver)?]),
+            n => {
+                let mut list = Vec::with_capacity(n);
+                for _ in 0..n {
+                    list.push(Self::read_next_shallow_slice(meta, &mut cur, header_ver)?);
+                }
+                BorrowedVersions::Multi(list)
+            }
+        };
+        Ok(BorrowedFileMeta {
+            meta_ver,
+            inline_buf,
+            versions,
+        })
+    }
+
+    pub(crate) fn validate_and_compare_borrowed<'a>(
+        buf: &'a [u8],
+        selected: &mut BorrowedFileMeta<'a>,
+        same_name: bool,
+        strict: bool,
+    ) -> Result<Option<bool>> {
+        let candidate = Self::decode_borrowed(buf)?;
+        let outcome = reconcile_headers(
+            candidate.versions.as_slice().iter().map(|(h, _)| h),
+            selected.versions.as_slice().iter().map(|(h, _)| h),
+            same_name,
+            strict,
+        );
+        if outcome == Some(true) {
+            *selected = candidate;
         }
-        false
+        Ok(outcome)
     }
 
     #[inline]
@@ -486,4 +545,105 @@ impl FileMeta {
 
     //     Ok(buf)
     // }
+}
+
+pub(crate) enum BorrowedVersions<'a> {
+    Empty,
+    Single([(FileMetaVersionHeader, &'a [u8]); 1]),
+    Multi(Vec<(FileMetaVersionHeader, &'a [u8])>),
+}
+
+impl<'a> BorrowedVersions<'a> {
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[(FileMetaVersionHeader, &'a [u8])] {
+        match self {
+            Self::Empty => &[],
+            Self::Single(one) => one.as_slice(),
+            Self::Multi(many) => many.as_slice(),
+        }
+    }
+}
+
+pub(crate) struct BorrowedFileMeta<'a> {
+    pub(crate) meta_ver: u8,
+    pub(crate) inline_buf: &'a [u8],
+    pub(crate) versions: BorrowedVersions<'a>,
+}
+
+impl<'a> BorrowedFileMeta<'a> {
+    pub(crate) fn from_file_meta(fm: &'a FileMeta) -> Self {
+        let versions = match fm.versions.as_slice() {
+            [] => BorrowedVersions::Empty,
+            [v0] => BorrowedVersions::Single([(v0.header.clone(), v0.meta.as_slice())]),
+            many => BorrowedVersions::Multi(many.iter().map(|v| (v.header.clone(), v.meta.as_slice())).collect()),
+        };
+        Self {
+            meta_ver: fm.meta_ver,
+            inline_buf: fm.data.as_slice(),
+            versions,
+        }
+    }
+
+    pub(crate) fn into_versions(self) -> Vec<FileMetaShallowVersion> {
+        self.versions
+            .as_slice()
+            .iter()
+            .map(|(header, meta)| FileMetaShallowVersion {
+                header: header.clone(),
+                meta: meta.to_vec(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn into_file_meta(self) -> FileMeta {
+        let mut fm = FileMeta {
+            meta_ver: self.meta_ver,
+            ..Default::default()
+        };
+        if !self.inline_buf.is_empty() {
+            fm.data.update(self.inline_buf);
+        }
+        fm.versions = self.into_versions();
+        fm
+    }
+
+    pub(crate) fn compare_cached(&mut self, fm: &'a FileMeta, same_name: bool, strict: bool) -> Option<bool> {
+        let outcome = reconcile_headers(
+            fm.versions.iter().map(|v| &v.header),
+            self.versions.as_slice().iter().map(|(h, _)| h),
+            same_name,
+            strict,
+        );
+        if outcome == Some(true) {
+            *self = Self::from_file_meta(fm);
+        }
+        outcome
+    }
+}
+
+/// Reconciles candidate version headers against selected headers: returns `None` on
+/// disagreement, `Some(true)` when the candidate replaces `selected`, or `Some(false)` when `selected` is kept.
+#[inline]
+pub(crate) fn reconcile_headers<'a>(
+    cand_headers: impl ExactSizeIterator<Item = &'a FileMetaVersionHeader>,
+    sel_headers: impl ExactSizeIterator<Item = &'a FileMetaVersionHeader>,
+    same_name: bool,
+    strict: bool,
+) -> Option<bool> {
+    if !same_name || cand_headers.len() != sel_headers.len() {
+        return None;
+    }
+    let mut prefer_self = None;
+    for (s_header, o_header) in cand_headers.zip(sel_headers) {
+        if FileMeta::headers_match_strict(s_header, o_header) {
+            continue;
+        } else if !strict && s_header.matches_not_strict(o_header) {
+            if prefer_self.is_none() {
+                prefer_self = Some(s_header.sorts_before(o_header));
+            }
+        } else {
+            return None;
+        }
+    }
+    Some(prefer_self.unwrap_or(true))
 }
