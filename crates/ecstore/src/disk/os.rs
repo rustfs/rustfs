@@ -2061,11 +2061,13 @@ pub async fn is_empty_dir(path: impl AsRef<Path>) -> bool {
 
 const READ_DIR_PROBE_RAW_LIMIT: usize = 256;
 
+#[cfg(test)]
 pub(crate) struct ReadDirProbe {
     pub entries: Vec<String>,
     pub complete: bool,
 }
 
+#[cfg(test)]
 pub(crate) fn read_dir_probe(path: impl AsRef<Path>, entry_limit: usize) -> io::Result<ReadDirProbe> {
     let mut dir = std::fs::read_dir(path)?;
     let mut entries = Vec::with_capacity(entry_limit.min(READ_DIR_PROBE_RAW_LIMIT));
@@ -2100,6 +2102,59 @@ pub(crate) fn read_dir_probe(path: impl AsRef<Path>, entry_limit: usize) -> io::
         entries,
         complete: false,
     })
+}
+
+pub(crate) fn has_non_data_dir_entry(path: impl AsRef<Path>, data_dirs: &[uuid::Uuid]) -> io::Result<bool> {
+    match has_non_data_dir_entry_inner(path.as_ref(), data_dirs) {
+        Ok(res) => Ok(res),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn has_non_data_dir_entry_inner(path: &Path, data_dirs: &[uuid::Uuid]) -> io::Result<bool> {
+    let mut dir = std::fs::read_dir(path)?;
+    let entry_limit = data_dirs.len().saturating_add(2);
+    let mut valid_entries = 0usize;
+
+    for _ in 0..READ_DIR_PROBE_RAW_LIMIT {
+        let Some(entry) = dir.next() else {
+            return Ok(false);
+        };
+        let entry = entry?;
+        let file_name = entry.file_name();
+        if file_name.is_empty() || file_name == "." || file_name == ".." {
+            continue;
+        }
+
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            let is_data_dir = file_name.len() == uuid::fmt::Hyphenated::LENGTH
+                && file_name
+                    .to_str()
+                    .and_then(|s| {
+                        let parsed = uuid::Uuid::try_parse(s).ok()?;
+                        let mut buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
+                        (parsed.hyphenated().encode_lower(&mut buf) == s && data_dirs.binary_search(&parsed).is_ok())
+                            .then_some(())
+                    })
+                    .is_some();
+            if !is_data_dir {
+                return Ok(true);
+            }
+            valid_entries += 1;
+        } else if file_type.is_file() {
+            valid_entries += 1;
+        } else {
+            continue;
+        }
+
+        if valid_entries == entry_limit {
+            return Ok(true);
+        }
+    }
+
+    Ok(true)
 }
 
 // read_dir  count read limit. when count == 0 unlimit.
@@ -5456,6 +5511,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn read_dir_probe_matches_uuid_namespace_probe() {
+        let data_dir = uuid::Uuid::from_u128(0xabcdef);
+        let canonical = data_dir.to_string();
+        let uppercase = canonical.to_uppercase();
+        let simple = data_dir.simple().to_string();
+        for (directories, file_count) in [
+            (vec![], 0),
+            (vec![], 1),
+            (vec![canonical.as_str()], 1),
+            (vec![canonical.as_str(), "child"], 1),
+            (vec![uppercase.as_str()], 1),
+            (vec![simple.as_str()], 1),
+            (vec![canonical.as_str()], 2),
+            (vec![canonical.as_str()], 3),
+        ] {
+            let root = tempdir().expect("create probe directory");
+            for name in &directories {
+                std::fs::create_dir(root.path().join(name)).expect("create test directory");
+            }
+            for i in 0..file_count {
+                std::fs::write(root.path().join(format!("file-{i}")), []).expect("create test file");
+            }
+            let probe = read_dir_probe(root.path(), 3).expect("reference probe");
+            let expected = !probe.complete
+                || probe
+                    .entries
+                    .iter()
+                    .any(|entry| entry.strip_suffix('/').is_some_and(|name| name != canonical));
+            assert_eq!(
+                has_non_data_dir_entry(root.path(), &[data_dir]).expect("UUID probe"),
+                expected,
+                "directories={directories:?}, files={file_count}"
+            );
+        }
+        let missing = tempdir().expect("missing probe parent");
+        assert!(!has_non_data_dir_entry(missing.path().join("absent"), &[]).expect("missing directory is not a child"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn read_dir_probe_bounds_unsupported_entries() {
@@ -5470,6 +5564,7 @@ mod tests {
 
         assert!(probe.entries.is_empty());
         assert!(!probe.complete, "a bounded probe must not claim that an oversized directory is complete");
+        assert!(has_non_data_dir_entry(temp_dir.path(), &[]).expect("probe directory"));
     }
 
     #[test]

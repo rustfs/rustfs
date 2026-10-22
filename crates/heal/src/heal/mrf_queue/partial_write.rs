@@ -210,6 +210,17 @@ struct Responsibility {
 }
 
 impl Responsibility {
+    fn generation_unobserved(&self) -> bool {
+        self.source_bucket_incarnation_id.is_none() && matches!(self.state, ResponsibilityState::Active)
+    }
+
+    fn is_parked(&self) -> bool {
+        // Legacy source identity cannot be reconstructed from a bucket name.
+        // Derive this hold from the existing durable fields so old checkpoints
+        // need no new state tag and replay cannot restart automatic retries.
+        self.state.is_parked() || self.generation_unobserved()
+    }
+
     fn defer_unverified_attempt(&mut self, now: Instant, base: Duration) {
         self.attempt_in_flight = false;
         self.consecutive_unverified_attempts = self.consecutive_unverified_attempts.saturating_add(1);
@@ -225,6 +236,16 @@ impl Responsibility {
         let ratio = f64::from(phase) / f64::from(u16::MAX);
         self.next_attempt = now + floor + (ceiling - floor).mul_f64(ratio);
     }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct PartialWriteLifecycleSummary {
+    pub held_count: usize,
+    pub legacy_generation_unknown_count: usize,
+    pub bucket_incarnation_changed_count: usize,
+    pub operator_accepted_count: usize,
+    pub oldest_unverified_legacy_enqueued_at_ms: Option<u64>,
+    pub oldest_operator_accepted_at_ms: Option<u64>,
 }
 
 /// Durable storage responsibilities have no guaranteed rediscovery producer.
@@ -289,7 +310,7 @@ impl PartialWrites {
         }
         let key = PartialWriteKey::new(&intent, source_bucket_incarnation_id);
         let previous = self.entries.get(&key);
-        let previous_was_held = previous.is_some_and(|entry| entry.state.is_parked());
+        let previous_was_held = previous.is_some_and(|entry| entry.is_parked());
         let mut retry_queued = previous.is_some_and(|entry| entry.retry_queued);
         let old_cost = previous.map_or(0, Self::entry_cost);
         let next_bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::cost(&intent));
@@ -342,7 +363,7 @@ impl PartialWrites {
     }
 
     pub(super) async fn note_retired_generation_proofs(&mut self, manager: &HealManager) {
-        let mut anchors_by_generation: HashMap<(Arc<str>, Uuid), Vec<MrfDurableRepairAnchor>> = HashMap::new();
+        let mut intents_by_generation: HashMap<(Arc<str>, Uuid), Vec<&MrfIntent>> = HashMap::new();
         for entry in self.entries.values() {
             if !entry.persisted {
                 continue;
@@ -350,21 +371,19 @@ impl PartialWrites {
             let Some(source_incarnation) = entry.source_bucket_incarnation_id else {
                 continue;
             };
-            let Some(anchor) = MrfDurableRepairAnchor::from_intent(&entry.intent, source_incarnation)
-                .filter(|anchor| anchor.bucket_incarnation_id == source_incarnation)
-            else {
+            if !MrfDurableRepairAnchor::is_eligible_for_source(&entry.intent, source_incarnation) {
                 continue;
-            };
-            anchors_by_generation
-                .entry((anchor.bucket.clone(), source_incarnation))
+            }
+            intents_by_generation
+                .entry((entry.intent.bucket.clone(), source_incarnation))
                 .or_default()
-                .push(anchor);
+                .push(&entry.intent);
         }
 
         self.retirement_checks
-            .retain(|generation, _| anchors_by_generation.contains_key(generation));
+            .retain(|generation, _| intents_by_generation.contains_key(generation));
         let now = Instant::now();
-        for ((bucket, incarnation), anchors) in anchors_by_generation {
+        for ((bucket, incarnation), intents) in intents_by_generation {
             let retired = match self.retirement_checks.get(&(bucket.clone(), incarnation)) {
                 Some((_, true)) => true,
                 Some((checked_at, false))
@@ -385,11 +404,16 @@ impl PartialWrites {
                 continue;
             }
 
-            for anchor in anchors {
+            for intent in intents {
+                let Some(anchor) = MrfDurableRepairAnchor::from_intent(intent, incarnation)
+                    .filter(|anchor| anchor.bucket_incarnation_id == incarnation)
+                else {
+                    continue;
+                };
                 rustfs_common::mrf_channel::note_mrf_verified_repair(MrfVerifiedRepairEvent {
                     kind: anchor.kind,
-                    bucket: anchor.bucket.clone(),
-                    object: anchor.object.clone(),
+                    bucket: anchor.bucket,
+                    object: anchor.object,
                     version_id: anchor.version_id,
                     scope: anchor.scope,
                     delete_marker_purge: anchor.delete_marker_purge,
@@ -407,7 +431,7 @@ impl PartialWrites {
             return false;
         };
         if entry.anchor.as_ref() != Some(anchor)
-            || entry.state.is_parked()
+            || entry.is_parked()
             || anchor.bucket_incarnation_id.is_nil()
             || entry.source_bucket_incarnation_id != Some(anchor.bucket_incarnation_id)
         {
@@ -422,52 +446,36 @@ impl PartialWrites {
         true
     }
 
-    pub(super) fn unverified_legacy_count(&self) -> usize {
-        self.entries
-            .values()
-            .filter(|entry| matches!(&entry.state, ResponsibilityState::HeldUnverifiedLegacy { .. }))
-            .count()
-    }
-
-    pub(super) fn bucket_incarnation_changed_count(&self) -> usize {
-        self.entries
-            .values()
-            .filter(|entry| matches!(&entry.state, ResponsibilityState::BucketIncarnationChanged { .. }))
-            .count()
-    }
-
-    pub(super) fn legacy_generation_unknown_count(&self) -> usize {
-        self.entries
-            .values()
-            .filter(|entry| matches!(&entry.state, ResponsibilityState::LegacyGenerationUnknown { .. }))
-            .count()
-    }
-
-    pub(super) fn operator_accepted_unverified_count(&self) -> usize {
-        self.entries
-            .values()
-            .filter(|entry| matches!(&entry.state, ResponsibilityState::OperatorAcceptedUnverified { .. }))
-            .count()
-    }
-
-    pub(super) fn oldest_unverified_legacy_enqueued_at_ms(&self) -> Option<u64> {
-        self.entries
-            .values()
-            .filter_map(|entry| match &entry.state {
-                ResponsibilityState::HeldUnverifiedLegacy { since_ms, .. } => Some(*since_ms),
-                _ => None,
-            })
-            .min()
-    }
-
-    pub(super) fn oldest_operator_accepted_at_ms(&self) -> Option<u64> {
-        self.entries
-            .values()
-            .filter_map(|entry| match &entry.state {
-                ResponsibilityState::OperatorAcceptedUnverified { accepted_at_ms, .. } => Some(*accepted_at_ms),
-                _ => None,
-            })
-            .min()
+    pub(super) fn lifecycle_summary(&self) -> PartialWriteLifecycleSummary {
+        let mut summary = PartialWriteLifecycleSummary::default();
+        for entry in self.entries.values() {
+            match &entry.state {
+                ResponsibilityState::Active => {
+                    if entry.generation_unobserved() {
+                        summary.legacy_generation_unknown_count += 1;
+                    }
+                }
+                ResponsibilityState::HeldUnverifiedLegacy { since_ms, .. } => {
+                    summary.held_count += 1;
+                    summary.oldest_unverified_legacy_enqueued_at_ms = Some(
+                        summary
+                            .oldest_unverified_legacy_enqueued_at_ms
+                            .map_or(*since_ms, |oldest| oldest.min(*since_ms)),
+                    );
+                }
+                ResponsibilityState::LegacyGenerationUnknown { .. } => summary.legacy_generation_unknown_count += 1,
+                ResponsibilityState::BucketIncarnationChanged { .. } => summary.bucket_incarnation_changed_count += 1,
+                ResponsibilityState::OperatorAcceptedUnverified { accepted_at_ms, .. } => {
+                    summary.operator_accepted_count += 1;
+                    summary.oldest_operator_accepted_at_ms = Some(
+                        summary
+                            .oldest_operator_accepted_at_ms
+                            .map_or(*accepted_at_ms, |oldest| oldest.min(*accepted_at_ms)),
+                    );
+                }
+            }
+        }
+        summary
     }
 
     pub(super) fn checkpoint_records(
@@ -502,7 +510,7 @@ impl PartialWrites {
         entry.last_operator_acceptance = record.last_operator_acceptance.clone();
         entry.state = record.state.clone();
         self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::entry_cost(entry));
-        if entry.state.is_parked() {
+        if entry.is_parked() {
             entry.retry_queued = false;
         }
         true
@@ -522,7 +530,7 @@ impl PartialWrites {
         self.entries
             .values()
             .find(|entry| entry.responsibility_id == responsibility_id)
-            .is_some_and(|entry| matches!(&entry.state, ResponsibilityState::Active))
+            .is_some_and(|entry| !entry.is_parked())
     }
 
     pub(super) fn last_operator_acceptance(&self, responsibility_id: Uuid) -> Option<MrfOperatorAcceptance> {
@@ -703,7 +711,7 @@ impl PartialWrites {
         entry.last_operator_acceptance = last_operator_acceptance;
         self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::entry_cost(entry));
         entry.persisted = true;
-        if entry.state.is_parked() {
+        if entry.is_parked() {
             entry.retry_queued = false;
         }
         true
@@ -717,23 +725,24 @@ impl PartialWrites {
         let mut selected = BTreeMap::new();
         for entry in self.entries.values() {
             let (status, bucket_incarnation_id, held_since_ms) = match &entry.state {
+                ResponsibilityState::Active if entry.generation_unobserved() => ("legacy_generation_unobserved", None, None),
                 ResponsibilityState::Active => continue,
                 ResponsibilityState::HeldUnverifiedLegacy {
                     bucket_incarnation_id,
                     since_ms,
-                } => ("held_unverified_legacy", *bucket_incarnation_id, Some(*since_ms)),
+                } => ("held_unverified_legacy", Some(*bucket_incarnation_id), Some(*since_ms)),
                 ResponsibilityState::LegacyGenerationUnknown {
                     observed_bucket_incarnation_id,
                     detected_at_ms,
-                } => ("legacy_generation_unknown", *observed_bucket_incarnation_id, Some(*detected_at_ms)),
+                } => ("legacy_generation_unknown", Some(*observed_bucket_incarnation_id), Some(*detected_at_ms)),
                 ResponsibilityState::BucketIncarnationChanged {
                     observed_bucket_incarnation_id,
                     detected_at_ms,
                     ..
-                } => ("bucket_incarnation_changed", *observed_bucket_incarnation_id, Some(*detected_at_ms)),
+                } => ("bucket_incarnation_changed", Some(*observed_bucket_incarnation_id), Some(*detected_at_ms)),
                 ResponsibilityState::OperatorAcceptedUnverified {
                     bucket_incarnation_id, ..
-                } => ("operator_accepted_unverified", *bucket_incarnation_id, None),
+                } => ("operator_accepted_unverified", Some(*bucket_incarnation_id), None),
             };
             if after.is_some_and(|after| entry.responsibility_id <= after) {
                 continue;
@@ -783,7 +792,7 @@ impl PartialWrites {
     pub(super) fn replace_observed_incarnation(
         &mut self,
         responsibility_id: Uuid,
-        expected_bucket_incarnation_id: Uuid,
+        expected_bucket_incarnation_id: Option<Uuid>,
         observed_bucket_incarnation_id: Uuid,
         source_bucket_incarnation_id: Option<Uuid>,
     ) -> Result<(ResponsibilityState, Option<MrfOperatorAcceptance>), &'static str> {
@@ -792,8 +801,15 @@ impl PartialWrites {
             .values_mut()
             .find(|entry| entry.responsibility_id == responsibility_id)
             .ok_or("responsibility not found or generation changed")?;
-        if entry.state.bucket_incarnation_id() != Some(expected_bucket_incarnation_id) {
+        if entry.state.bucket_incarnation_id() != expected_bucket_incarnation_id {
             return Err("responsibility changed; refresh the listing");
+        }
+        if observed_bucket_incarnation_id.is_nil()
+            || expected_bucket_incarnation_id.is_some_and(|id| id.is_nil())
+            || (expected_bucket_incarnation_id.is_none() && !entry.generation_unobserved())
+            || entry.source_bucket_incarnation_id != source_bucket_incarnation_id
+        {
+            return Err("responsibility identity changed; refresh the listing");
         }
         let previous = entry.state.clone();
         let previous_acceptance = entry.last_operator_acceptance.clone();
@@ -859,20 +875,6 @@ impl PartialWrites {
             // parked, so every dispatch must compare against a fresh identity.
             if let Some(anchor) = manager.durable_mrf_repair_anchor(&entry.intent).await {
                 entry.anchor = Some(anchor.clone());
-                if entry.source_bucket_incarnation_id.is_none() {
-                    let old_cost = Self::entry_cost(entry);
-                    let detected_at_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map_or(0, |duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
-                    entry.state = ResponsibilityState::LegacyGenerationUnknown {
-                        observed_bucket_incarnation_id: anchor.bucket_incarnation_id,
-                        detected_at_ms,
-                    };
-                    self.bytes = self.bytes.saturating_sub(old_cost).saturating_add(Self::entry_cost(entry));
-                    entry.retry_queued = false;
-                    lifecycle_changed = true;
-                    continue;
-                }
                 if let Some(source_bucket_incarnation_id) = entry.source_bucket_incarnation_id
                     && source_bucket_incarnation_id != anchor.bucket_incarnation_id
                 {
@@ -923,7 +925,7 @@ impl PartialWrites {
                 continue;
             };
             entry.retry_queued = false;
-            if entry.state.is_parked() {
+            if entry.is_parked() {
                 // Held obligations remain in the durable responsibility map,
                 // but leave the hot retry index until a new generation arrives.
                 continue;
@@ -981,7 +983,7 @@ pub struct MrfLegacyResponsibility {
     pub version_id: Option<String>,
     pub pool_index: Option<u32>,
     pub set_index: Option<u32>,
-    pub bucket_incarnation_id: Uuid,
+    pub bucket_incarnation_id: Option<Uuid>,
     pub enqueued_at_ms: u64,
     pub status: &'static str,
     pub held_since_ms: Option<u64>,
@@ -1017,6 +1019,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use uuid::Uuid;
+
+    mod retirement_tests;
 
     fn intent(object: &str) -> MrfIntent {
         let mut intent = MrfIntent {
@@ -1055,6 +1059,219 @@ mod tests {
             reference: reference.to_string(),
             request_id: Uuid::new_v4(),
         }
+    }
+
+    fn lifecycle_fixture(states: Vec<ResponsibilityState>) -> PartialWrites {
+        let mut writes = PartialWrites::default();
+        for (index, state) in states.into_iter().enumerate() {
+            let item = intent(&format!("lifecycle-{index}"));
+            let source = match &state {
+                ResponsibilityState::LegacyGenerationUnknown { .. } => None,
+                ResponsibilityState::BucketIncarnationChanged {
+                    source_bucket_incarnation_id,
+                    ..
+                } => Some(*source_bucket_incarnation_id),
+                _ => state.bucket_incarnation_id(),
+            };
+            writes
+                .admit_with_source_incarnation(item.clone(), source, usize::MAX, usize::MAX)
+                .expect("admit lifecycle responsibility");
+            let key = PartialWriteKey::new(&item, source);
+            let entry = writes.entries.get_mut(&key).expect("retained lifecycle responsibility");
+            entry.state = state;
+            entry.persisted = index % 2 == 0;
+            entry.next_attempt = Instant::now() + Duration::from_secs(60);
+            entry.attempt_in_flight = index % 2 != 0;
+        }
+        writes
+    }
+
+    fn accepted_state(incarnation: Uuid, accepted_at_ms: u64) -> ResponsibilityState {
+        ResponsibilityState::OperatorAcceptedUnverified {
+            bucket_incarnation_id: incarnation,
+            acknowledged_unknown_source_incarnation: false,
+            acknowledged_incarnation_mismatch: false,
+            accepted_at_ms,
+            actor: "operator".to_owned(),
+            reason: "test lifecycle summary".to_owned(),
+            reference: "test".to_owned(),
+            request_id: Uuid::new_v4(),
+        }
+    }
+
+    #[test]
+    fn lifecycle_summary_distinguishes_bound_and_unobserved_active_entries() {
+        let mut writes = PartialWrites::default();
+        assert_eq!(writes.lifecycle_summary(), PartialWriteLifecycleSummary::default());
+        writes
+            .admit_with_source_incarnation(intent("bound-active"), Some(Uuid::new_v4()), usize::MAX, usize::MAX)
+            .expect("admit bound active responsibility");
+        assert_eq!(writes.lifecycle_summary(), PartialWriteLifecycleSummary::default());
+        writes
+            .admit(intent("unobserved-active"), usize::MAX, usize::MAX)
+            .expect("admit unobserved legacy responsibility");
+        assert_eq!(writes.depth(), 2);
+        assert_eq!(
+            writes.lifecycle_summary(),
+            PartialWriteLifecycleSummary {
+                legacy_generation_unknown_count: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn lifecycle_summary_preserves_zero_and_maximum_timestamps() {
+        for timestamp in [0, u64::MAX] {
+            let incarnation = Uuid::new_v4();
+            let writes = lifecycle_fixture(vec![
+                ResponsibilityState::HeldUnverifiedLegacy {
+                    bucket_incarnation_id: incarnation,
+                    since_ms: timestamp,
+                },
+                accepted_state(incarnation, timestamp),
+            ]);
+            assert_eq!(
+                writes.lifecycle_summary(),
+                PartialWriteLifecycleSummary {
+                    held_count: 1,
+                    operator_accepted_count: 1,
+                    oldest_unverified_legacy_enqueued_at_ms: Some(timestamp),
+                    oldest_operator_accepted_at_ms: Some(timestamp),
+                    ..Default::default()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_summary_counts_mixed_states_without_changing_responsibilities() {
+        let incarnation = Uuid::new_v4();
+        let writes = lifecycle_fixture(vec![
+            ResponsibilityState::Active,
+            ResponsibilityState::HeldUnverifiedLegacy {
+                bucket_incarnation_id: incarnation,
+                since_ms: u64::MAX,
+            },
+            ResponsibilityState::HeldUnverifiedLegacy {
+                bucket_incarnation_id: incarnation,
+                since_ms: 17,
+            },
+            ResponsibilityState::LegacyGenerationUnknown {
+                observed_bucket_incarnation_id: incarnation,
+                detected_at_ms: 0,
+            },
+            ResponsibilityState::LegacyGenerationUnknown {
+                observed_bucket_incarnation_id: incarnation,
+                detected_at_ms: u64::MAX,
+            },
+            ResponsibilityState::BucketIncarnationChanged {
+                source_bucket_incarnation_id: incarnation,
+                observed_bucket_incarnation_id: Uuid::new_v4(),
+                detected_at_ms: 0,
+            },
+            accepted_state(incarnation, u64::MAX),
+            accepted_state(incarnation, 29),
+        ]);
+        let depth = writes.depth();
+        let bytes = writes.bytes();
+        let retry_order = writes.retry_order.clone();
+        let retry_index = writes.retry_index.clone();
+        let checkpoints = writes.checkpoint_records(|_| Some([3; 32]));
+        let schedule = || {
+            writes
+                .entries
+                .iter()
+                .map(|(key, entry)| {
+                    (
+                        key.clone(),
+                        (entry.persisted, entry.retry_queued, entry.next_attempt, entry.attempt_in_flight),
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        };
+        let scheduling = schedule();
+        let expected = PartialWriteLifecycleSummary {
+            held_count: 2,
+            legacy_generation_unknown_count: 3,
+            bucket_incarnation_changed_count: 1,
+            operator_accepted_count: 2,
+            oldest_unverified_legacy_enqueued_at_ms: Some(17),
+            oldest_operator_accepted_at_ms: Some(29),
+        };
+        for _ in 0..2 {
+            assert_eq!(writes.lifecycle_summary(), expected);
+            assert_eq!(writes.depth(), depth);
+            assert_eq!(writes.bytes(), bytes);
+            assert_eq!(writes.retry_order, retry_order);
+            assert_eq!(writes.retry_index, retry_index);
+            assert_eq!(writes.checkpoint_records(|_| Some([3; 32])), checkpoints);
+            assert_eq!(schedule(), scheduling);
+        }
+        assert_eq!(
+            checkpoints
+                .iter()
+                .filter(|record| record.source_bucket_incarnation_id.is_none())
+                .count(),
+            3,
+            "active and unknown source generations must remain unknown"
+        );
+    }
+
+    #[test]
+    fn unobserved_legacy_is_held_and_visible_after_checkpoint_replay() {
+        let original = intent("deleted-bucket-legacy");
+        let mut writes = PartialWrites::default();
+        writes.admit(original.clone(), 1, 8192).expect("retain legacy responsibility");
+        writes.mark_persisted();
+        assert!(writes.ready_keys(Instant::now() + Duration::from_secs(86400), 1).is_empty());
+        assert!(writes.retry_order.is_empty(), "unobserved legacy work must leave the hot retry queue");
+        let record = writes.checkpoint_records(|_| Some([7; 32])).remove(0);
+        assert!(record.is_valid());
+        assert!(matches!(record.state, ResponsibilityState::Active), "keep the legacy disk encoding");
+        assert_eq!(record.source_bucket_incarnation_id, None);
+        let (rows, next) = writes.list_unverified_legacy(None, 1);
+        assert_eq!(rows.len(), 1);
+        assert!(next.is_none());
+        assert_eq!(rows[0].status, "legacy_generation_unobserved");
+        assert_eq!(rows[0].bucket_incarnation_id, None);
+        assert_eq!(writes.lifecycle_summary().legacy_generation_unknown_count, 1);
+        assert!(!writes.is_active_responsibility(record.responsibility_id));
+        let json = serde_json::to_value(&rows[0]).expect("encode unknown observation");
+        assert!(json["bucketIncarnationId"].is_null());
+
+        let encoded = serde_json::to_vec(&record).expect("encode unchanged checkpoint schema");
+        let decoded: ResponsibilityCheckpoint = serde_json::from_slice(&encoded).expect("decode legacy schema");
+        let mut replay = PartialWrites::default();
+        replay.admit(original.clone(), 1, 8192).expect("replay intent");
+        assert!(replay.restore_state(&original, &decoded));
+        replay.mark_persisted();
+        assert!(replay.ready_keys(Instant::now() + Duration::from_secs(86400), 1).is_empty());
+        assert_eq!(replay.checkpoint_records(|_| Some([7; 32])), vec![record]);
+        assert_eq!(replay.list_unverified_legacy(None, 1).0[0].responsibility_id, rows[0].responsibility_id);
+    }
+
+    #[test]
+    fn unobserved_legacy_refresh_preserves_unknown_source_and_rejects_stale_actions() {
+        let original = intent("unobserved-refresh");
+        let mut writes = PartialWrites::default();
+        writes.admit(original, 1, 8192).expect("retain legacy responsibility");
+        let id = writes.list_unverified_legacy(None, 1).0[0].responsibility_id;
+        assert!(writes.replace_observed_incarnation(id, None, Uuid::nil(), None).is_err());
+        let observed = Uuid::new_v4();
+        writes
+            .replace_observed_incarnation(id, None, observed, None)
+            .expect("observe a current generation");
+        let row = writes.list_unverified_legacy(None, 1).0.remove(0);
+        assert_eq!(row.status, "legacy_generation_unknown");
+        assert_eq!(row.bucket_incarnation_id, Some(observed));
+        assert_eq!(row.source_bucket_incarnation_id, None);
+        assert!(writes.replace_observed_incarnation(id, None, Uuid::new_v4(), None).is_err());
+        assert!(
+            writes.recheck(id, observed).is_err(),
+            "observation cannot authorize repair of an unknown source"
+        );
+        assert!(writes.ready_keys(Instant::now() + Duration::from_secs(86400), 1).is_empty());
     }
 
     #[test]
@@ -1409,7 +1626,9 @@ mod tests {
     fn partial_write_retention_retries_rotate_past_a_failing_prefix() {
         let mut writes = PartialWrites::default();
         for object in ["a", "b", "c"] {
-            writes.admit(intent(object), 3, 8192).expect("bounded backlog should fit");
+            writes
+                .admit_with_source_incarnation(intent(object), Some(Uuid::new_v4()), 3, 8192)
+                .expect("bounded source-bound backlog should fit");
         }
         let now = Instant::now();
         assert!(writes.ready_keys(now, 2).is_empty(), "uncommitted responsibility must not be dispatched");
@@ -1442,7 +1661,7 @@ mod tests {
 
         assert!(writes.park_unverified_legacy(&anchor));
         assert!(!writes.park_unverified_legacy(&anchor), "duplicate notices are idempotent");
-        assert_eq!(writes.unverified_legacy_count(), 1);
+        assert_eq!(writes.lifecycle_summary().held_count, 1);
         assert_eq!(writes.depth(), 1, "holding the intent must preserve responsibility");
         assert!(writes.ready_keys(Instant::now() + Duration::from_secs(60), 1).is_empty());
         assert!(writes.retry_order.is_empty(), "held intents leave the retry index after one pass");
@@ -1452,7 +1671,7 @@ mod tests {
             .admit_with_source_incarnation(replacement, Some(incarnation), 1, 8192)
             .expect("a new generation should become retryable");
         writes.mark_persisted();
-        assert_eq!(writes.unverified_legacy_count(), 0);
+        assert_eq!(writes.lifecycle_summary().held_count, 0);
         assert_eq!(writes.ready_keys(Instant::now() + Duration::from_secs(60), 1).len(), 1);
 
         let mut restarted = PartialWrites::default();
@@ -1460,7 +1679,7 @@ mod tests {
             .admit_with_source_incarnation(original, Some(incarnation), 1, 8192)
             .expect("the unchanged journal re-arms the same responsibility after restart");
         restarted.mark_persisted();
-        assert_eq!(restarted.unverified_legacy_count(), 0);
+        assert_eq!(restarted.lifecycle_summary().held_count, 0);
         assert_eq!(restarted.ready_keys(Instant::now() + Duration::from_secs(60), 1).len(), 1);
     }
 
@@ -1497,7 +1716,7 @@ mod tests {
             .expect("replay journal intent before applying lifecycle state");
         assert!(restored.restore_state(&intent("legacy-lifecycle"), &checkpoint));
         restored.mark_persisted();
-        assert_eq!(restored.unverified_legacy_count(), 1);
+        assert_eq!(restored.lifecycle_summary().held_count, 1);
         assert!(restored.ready_keys(Instant::now() + Duration::from_secs(60), 1).is_empty());
 
         let (previous, _) = restored
@@ -1514,8 +1733,8 @@ mod tests {
             )
             .expect("explicit risk acceptance");
         assert!(matches!(previous, ResponsibilityState::HeldUnverifiedLegacy { .. }));
-        assert_eq!(restored.unverified_legacy_count(), 0);
-        assert_eq!(restored.operator_accepted_unverified_count(), 1);
+        assert_eq!(restored.lifecycle_summary().held_count, 0);
+        assert_eq!(restored.lifecycle_summary().operator_accepted_count, 1);
         let accepted_entry = restored
             .entries
             .get(&PartialWriteKey::new(&intent("legacy-lifecycle"), Some(incarnation)))
@@ -1545,7 +1764,7 @@ mod tests {
             .recheck(responsibility_id, incarnation)
             .expect("explicit targeted recheck");
         assert!(matches!(accepted, ResponsibilityState::OperatorAcceptedUnverified { .. }));
-        assert_eq!(restored.operator_accepted_unverified_count(), 0);
+        assert_eq!(restored.lifecycle_summary().operator_accepted_count, 0);
         let active_entry = restored
             .entries
             .get(&PartialWriteKey::new(&intent("legacy-lifecycle"), Some(incarnation)))
@@ -1597,7 +1816,7 @@ mod tests {
         let (previous, _) = restored
             .replace_observed_incarnation(
                 checkpoint.responsibility_id,
-                original_incarnation,
+                Some(original_incarnation),
                 recreated_incarnation,
                 Some(original_incarnation),
             )
@@ -1658,7 +1877,7 @@ mod tests {
                 .record_operator_acceptance(8192, risk_acceptance(id, incarnation, true, false, " ", "INC-1234"))
                 .is_err()
         );
-        assert_eq!(writes.unverified_legacy_count(), 1);
+        assert_eq!(writes.lifecycle_summary().held_count, 1);
     }
 
     #[test]
@@ -1955,11 +2174,12 @@ mod tests {
             .admit_with_source_incarnation(legacy.clone(), None, 2, 64 * 1024)
             .expect("retain a legacy responsibility without inventing its source");
         writes.mark_persisted();
-        assert!(writes.dispatch_collecting_lifecycle_change(&manager, &config).await);
-        assert_eq!(writes.legacy_generation_unknown_count(), 1);
+        assert!(!writes.dispatch_collecting_lifecycle_change(&manager, &config).await);
+        assert_eq!(writes.lifecycle_summary().legacy_generation_unknown_count, 1);
         let original_unknown = writes.checkpoint_records(super::super::intent_digest).remove(0);
         assert_eq!(original_unknown.source_bucket_incarnation_id, None);
-        assert!(matches!(original_unknown.state, ResponsibilityState::LegacyGenerationUnknown { .. }));
+        assert!(matches!(original_unknown.state, ResponsibilityState::Active));
+        assert_eq!(writes.list_unverified_legacy(None, 10).0[0].status, "legacy_generation_unobserved");
 
         let current = intent("same-object-unknown-source");
         assert_eq!(super::super::intent_digest(&legacy), super::super::intent_digest(&current));

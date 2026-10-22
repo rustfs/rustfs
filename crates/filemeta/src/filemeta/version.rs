@@ -23,8 +23,8 @@
 //! legacy (rmp_serde) format. `try_from` falls back to rmp_serde when hand-written decode fails.
 
 use super::msgp_decode::{
-    prealloc_hint, read_exact_vec, read_nil_or_array_len, read_nil_or_map_len, read_nil_or_submap_len, read_small_str,
-    skip_msgp_value,
+    prealloc_hint, read_bin_slice, read_exact_vec, read_nil_or_array_len, read_nil_or_map_len, read_nil_or_submap_len,
+    read_slice, read_small_str, read_str_bytes_slice, read_str_slice, skip_msgp_value,
 };
 use super::*;
 use crate::{ChecksumInfo, TransitionVersionState};
@@ -86,12 +86,44 @@ fn fold_signature(crc: u64) -> [u8; 4] {
     ((crc ^ (crc >> 32)) as u32).to_le_bytes()
 }
 
-struct Xxh64Writer(xxhash_rust::xxh64::Xxh64);
+struct Xxh64Writer {
+    buf: [u8; 256],
+    len: usize,
+    stream: Option<xxhash_rust::xxh64::Xxh64>,
+}
+
+impl Xxh64Writer {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            buf: [0u8; 256],
+            len: 0,
+            stream: None,
+        }
+    }
+
+    #[inline]
+    fn finish(self) -> u64 {
+        if let Some(mut stream) = self.stream {
+            stream.update(&self.buf[..self.len]);
+            stream.digest()
+        } else {
+            xxhash_rust::xxh64::xxh64(&self.buf[..self.len], XXHASH_SEED)
+        }
+    }
+}
 
 impl std::io::Write for Xxh64Writer {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.update(buf);
+        if self.len + buf.len() <= self.buf.len() {
+            self.buf[self.len..self.len + buf.len()].copy_from_slice(buf);
+            self.len += buf.len();
+        } else {
+            let stream = self.stream.get_or_insert_with(|| xxhash_rust::xxh64::Xxh64::new(XXHASH_SEED));
+            stream.update(&self.buf[..std::mem::take(&mut self.len)]);
+            stream.update(buf);
+        }
         Ok(buf.len())
     }
 
@@ -350,52 +382,67 @@ struct DerivedInternalMetadata<'a> {
 
 impl<'a> DerivedInternalMetadata<'a> {
     fn from_meta_sys(meta_sys: &'a HashMap<String, Vec<u8>>) -> Result<Self> {
+        Self::from_key_value_iter(meta_sys.iter().map(|(k, v)| (k.as_str(), v.as_slice())))
+    }
+
+    fn from_meta_sys_slices(meta_sys: &[(&'a str, &'a [u8])]) -> Result<Self> {
+        Self::from_key_value_iter(meta_sys.iter().copied())
+    }
+
+    fn from_key_value_iter<I>(iter: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = (&'a str, &'a [u8])>,
+    {
+        const _: () = {
+            assert!(SUFFIX_CRC.len() == 3);
+            assert!(SUFFIX_PART_CHECKSUMS.len() == 14);
+            assert!(SUFFIX_TRANSITION_TIER.len() == 15);
+            assert!(SUFFIX_TRANSITION_STATUS.len() == 17);
+            assert!(SUFFIX_TRANSITIONED_OBJECTNAME.len() == 19);
+            assert!(SUFFIX_TRANSITIONED_VERSION_ID.len() == 22);
+            assert!(SUFFIX_TRANSITIONED_VERSION_STATE.len() == 26);
+        };
         let mut canonical = Self::default();
         let mut legacy = Self::default();
-        for (key, value) in meta_sys {
+        for (key, value) in iter {
             let Some(suffix) = rustfs_utils::http::strip_internal_prefix_preserving_case(key) else {
                 continue;
             };
-            let (canonical_slot, legacy_slot, expected_suffix) = if suffix.eq_ignore_ascii_case(SUFFIX_CRC) {
-                (&mut canonical.checksum, &mut legacy.checksum, SUFFIX_CRC)
-            } else if suffix.eq_ignore_ascii_case(SUFFIX_PART_CHECKSUMS) {
-                (&mut canonical.part_checksums, &mut legacy.part_checksums, SUFFIX_PART_CHECKSUMS)
-            } else if suffix.eq_ignore_ascii_case(SUFFIX_TRANSITION_STATUS) {
-                (&mut canonical.transition_status, &mut legacy.transition_status, SUFFIX_TRANSITION_STATUS)
-            } else if suffix.eq_ignore_ascii_case(SUFFIX_TRANSITIONED_OBJECTNAME) {
-                (
+            let (canonical_slot, legacy_slot, expected_suffix) = match suffix.len() {
+                3 => (&mut canonical.checksum, &mut legacy.checksum, SUFFIX_CRC),
+                14 => (&mut canonical.part_checksums, &mut legacy.part_checksums, SUFFIX_PART_CHECKSUMS),
+                15 => (&mut canonical.transition_tier, &mut legacy.transition_tier, SUFFIX_TRANSITION_TIER),
+                17 => (&mut canonical.transition_status, &mut legacy.transition_status, SUFFIX_TRANSITION_STATUS),
+                19 => (
                     &mut canonical.transitioned_object,
                     &mut legacy.transitioned_object,
                     SUFFIX_TRANSITIONED_OBJECTNAME,
-                )
-            } else if suffix.eq_ignore_ascii_case(SUFFIX_TRANSITIONED_VERSION_ID) {
-                (
+                ),
+                22 => (
                     &mut canonical.transitioned_version,
                     &mut legacy.transitioned_version,
                     SUFFIX_TRANSITIONED_VERSION_ID,
-                )
-            } else if suffix.eq_ignore_ascii_case(SUFFIX_TRANSITIONED_VERSION_STATE) {
-                (
+                ),
+                26 => (
                     &mut canonical.transitioned_version_state,
                     &mut legacy.transitioned_version_state,
                     SUFFIX_TRANSITIONED_VERSION_STATE,
-                )
-            } else if suffix.eq_ignore_ascii_case(SUFFIX_TRANSITION_TIER) {
-                (&mut canonical.transition_tier, &mut legacy.transition_tier, SUFFIX_TRANSITION_TIER)
-            } else {
-                continue;
+                ),
+                _ => continue,
             };
             let slot = if suffix == expected_suffix
                 && (key.starts_with(RUSTFS_INTERNAL_PREFIX) || key.starts_with(rustfs_utils::http::MINIO_INTERNAL_PREFIX))
             {
                 canonical_slot
-            } else {
+            } else if rustfs_utils::http::eq_slice_ignore_ascii_case(suffix.as_bytes(), expected_suffix.as_bytes()) {
                 legacy_slot
+            } else {
+                continue;
             };
-            if slot.is_some_and(|current| current != value.as_slice()) {
+            if slot.is_some_and(|current| current != value) {
                 return Err(Error::FileCorrupt);
             }
-            *slot = Some(value.as_slice());
+            *slot = Some(value);
         }
         fn merge_consistent<'a>(canonical: Option<&'a [u8]>, legacy: Option<&'a [u8]>) -> Result<Option<&'a [u8]>> {
             if let (Some(canonical), Some(legacy)) = (canonical, legacy)
@@ -481,18 +528,21 @@ impl FileInfo {
     }
 }
 
+fn apply_transition_version_state(meta_sys: &mut HashMap<String, Vec<u8>>, state: TransitionVersionState, has_state_key: bool) {
+    if state == TransitionVersionState::Unknown && !has_state_key {
+        remove_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE);
+    } else {
+        insert_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE, state.as_str().as_bytes().to_vec());
+    }
+}
+
 fn set_transition_version_state(
     meta_sys: &mut HashMap<String, Vec<u8>>,
     state: TransitionVersionState,
     source_metadata: &HashMap<String, String>,
 ) {
-    if state == TransitionVersionState::Unknown
-        && !rustfs_utils::http::metadata_compat::contains_key_str(source_metadata, SUFFIX_TRANSITIONED_VERSION_STATE)
-    {
-        remove_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE);
-    } else {
-        insert_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE, state.as_str().as_bytes().to_vec());
-    }
+    let has_state_key = rustfs_utils::http::metadata_compat::contains_key_str(source_metadata, SUFFIX_TRANSITIONED_VERSION_STATE);
+    apply_transition_version_state(meta_sys, state, has_state_key);
 }
 
 fn transitioned_version_bytes(fi: &FileInfo) -> Option<Vec<u8>> {
@@ -592,21 +642,25 @@ impl FileMetaShallowVersion {
     }
 
     pub fn write_quorum(&self, fallback_quorum: usize) -> usize {
-        let header_quorum = self.header.write_quorum(fallback_quorum);
-        if self.header.has_ec() || !matches!(self.header.version_type, VersionType::Object | VersionType::Legacy) {
-            return header_quorum;
-        }
-
-        self.parse_version_meta()
-            .ok()
-            .and_then(|version| version.erasure_write_quorum())
-            .unwrap_or(header_quorum)
+        write_quorum_from_header_and_meta(&self.header, self.meta.as_slice(), fallback_quorum)
     }
 
     pub fn into_fileinfo(&self, volume: &str, path: &str, all_parts: bool) -> Result<FileInfo> {
-        self.parse_version_meta()?
-            .into_fileinfo_with_part_checksums(volume, path, all_parts, true)
+        FileMetaVersion::decode_fileinfo_from_slice(self.meta.as_slice(), volume, path, all_parts, true)
     }
+}
+
+#[inline]
+pub(crate) fn write_quorum_from_header_and_meta(header: &FileMetaVersionHeader, meta: &[u8], fallback_quorum: usize) -> usize {
+    let header_quorum = header.write_quorum(fallback_quorum);
+    if header.has_ec() || !matches!(header.version_type, VersionType::Object | VersionType::Legacy) {
+        return header_quorum;
+    }
+
+    FileMetaVersion::try_from(meta)
+        .ok()
+        .and_then(|version| version.erasure_write_quorum())
+        .unwrap_or(header_quorum)
 }
 
 impl TryFrom<FileMetaVersion> for FileMetaShallowVersion {
@@ -636,6 +690,20 @@ pub struct FileMetaVersion {
     pub uses_legacy_checksum: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static V2_OBJECT_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct V2ObjectSliceSummary {
+    pub version_id: Option<Uuid>,
+    pub data_dir: Option<Uuid>,
+    pub physical_data_dir: Option<Uuid>,
+    pub transition_complete: bool,
+    pub has_reconciled_transition: bool,
+}
+
 impl FileMetaVersion {
     fn erasure_write_quorum(&self) -> Option<usize> {
         let (data_blocks, parity_blocks) = match self.version_type {
@@ -654,63 +722,177 @@ impl FileMetaVersion {
         write_quorum_from_erasure(data_blocks, parity_blocks)
     }
 
-    fn decode_data_dir_from_v2_object(buf: &[u8]) -> Result<Option<Uuid>> {
+    /// Fast borrowed scanner for `V2Obj` slices. Returning `Ok` guarantees
+    /// `FileMetaVersion::try_from` would succeed with the identical summary fields;
+    /// any non-`V2Obj` or invalid input returns `Err` so callers fall back to `try_from`.
+    pub(super) fn inspect_v2_object_slice(buf: &[u8]) -> Result<V2ObjectSliceSummary> {
+        #[cfg(test)]
+        V2_OBJECT_SCAN_COUNT.with(|count| count.set(count.get() + 1));
+        #[derive(Default)]
+        struct RawV2Scan<'a> {
+            has_object: bool,
+            version_id: Option<Uuid>,
+            data_dir: Option<Uuid>,
+            erasure_algorithm: ErasureAlgo,
+            bitrot_checksum_algo: ChecksumAlgo,
+            has_mod_time: bool,
+            has_inline_data: bool,
+            has_transition_dest_id: bool,
+            has_transition_ver_state: bool,
+            rustfs_transition_status: Option<&'a [u8]>,
+            minio_transition_status: Option<&'a [u8]>,
+            restore_hdr: Option<&'a str>,
+        }
+
         let mut cur = std::io::Cursor::new(buf);
         let mut fields = rmp::decode::read_map_len(&mut cur)?;
         let mut version_type = VersionType::Invalid;
-        let mut inline_key = [0u8; MSGP_OBJECT_KEY_STACK_CAP];
-        let mut heap_key = Vec::new();
+        let mut s = RawV2Scan::default();
 
         while fields > 0 {
             fields -= 1;
-
-            let key = read_small_str(&mut cur, &mut inline_key, &mut heap_key)?;
-
-            match key {
-                "Type" => {
-                    let v: i64 = rmp::decode::read_int(&mut cur)?;
-                    version_type = VersionType::from_u8(v as u8);
-                }
-                "V2Obj" => {
-                    if version_type != VersionType::Object {
-                        skip_msgp_value(&mut cur)?;
-                        continue;
-                    }
-
+            match read_str_bytes_slice(&mut cur)? {
+                b"Type" => version_type = VersionType::from_u8(rmp::decode::read_int::<i64, _>(&mut cur)? as u8),
+                b"V2Obj" => {
                     let Some(mut obj_fields) = read_nil_or_submap_len(&mut cur)? else {
-                        return Ok(None);
+                        s.has_object = false;
+                        continue;
                     };
-                    let mut data_dir: Option<Uuid> = None;
+                    s = RawV2Scan {
+                        has_object: true,
+                        ..Default::default()
+                    };
 
                     while obj_fields > 0 {
                         obj_fields -= 1;
-
-                        let obj_key = read_small_str(&mut cur, &mut inline_key, &mut heap_key)?;
-
-                        if obj_key == "DDir" {
-                            let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
-                            if bin_len != 16 {
-                                return Err(Error::other(format!("DDir must be 16 bytes, got {bin_len}")));
+                        match read_str_bytes_slice(&mut cur)? {
+                            b"ID" => s.version_id = read_opt_uuid_slice(&mut cur)?,
+                            b"DDir" => s.data_dir = read_opt_uuid_slice(&mut cur)?,
+                            b"EcAlgo" => {
+                                s.erasure_algorithm = ErasureAlgo::from_u8(rmp::decode::read_int::<i64, _>(&mut cur)? as u8)
                             }
-                            let mut raw = [0u8; 16];
-                            cur.read_exact(&mut raw)?;
-                            let id = Uuid::from_bytes(raw);
-                            data_dir = if id.is_nil() { None } else { Some(id) };
-                            break;
+                            b"EcM" | b"EcN" | b"EcBSize" | b"EcIndex" | b"Size" => {
+                                let _: i64 = rmp::decode::read_int(&mut cur)?;
+                            }
+                            b"EcDist" | b"PartNums" | b"PartSizes" => {
+                                for _ in 0..rmp::decode::read_array_len(&mut cur)? {
+                                    let _: i64 = rmp::decode::read_int(&mut cur)?;
+                                }
+                            }
+                            b"CSumAlgo" => {
+                                s.bitrot_checksum_algo = ChecksumAlgo::from_u8(rmp::decode::read_int::<i64, _>(&mut cur)? as u8)
+                            }
+                            b"PartETags" => {
+                                for _ in 0..read_nil_or_array_len(&mut cur)?.unwrap_or(0) {
+                                    let _ = read_str_slice(&mut cur)?;
+                                }
+                            }
+                            b"PartASizes" => {
+                                for _ in 0..read_nil_or_array_len(&mut cur)?.unwrap_or(0) {
+                                    let _: i64 = rmp::decode::read_int(&mut cur)?;
+                                }
+                            }
+                            b"PartIdx" => {
+                                for _ in 0..rmp::decode::read_array_len(&mut cur)? {
+                                    let _ = read_bin_slice(&mut cur)?;
+                                }
+                            }
+                            b"MTime" => {
+                                let nanos: i64 = rmp::decode::read_int(&mut cur)?;
+                                s.has_mod_time =
+                                    OffsetDateTime::from_unix_timestamp_nanos(nanos as i128)? != OffsetDateTime::UNIX_EPOCH;
+                            }
+                            b"MetaSys" => {
+                                (
+                                    s.has_inline_data,
+                                    s.has_transition_dest_id,
+                                    s.has_transition_ver_state,
+                                    s.rustfs_transition_status,
+                                    s.minio_transition_status,
+                                ) = (false, false, false, None, None);
+                                for _ in 0..read_nil_or_map_len(&mut cur)?.unwrap_or(0) {
+                                    let k = read_str_bytes_slice(&mut cur)?;
+                                    let v = read_bin_slice(&mut cur)?;
+                                    match k {
+                                        b"x-rustfs-internal-inline-data" | b"x-minio-internal-inline-data" => {
+                                            s.has_inline_data = true;
+                                        }
+                                        b"x-rustfs-internal-transition-status" => s.rustfs_transition_status = Some(v),
+                                        b"x-minio-internal-transition-status" => s.minio_transition_status = Some(v),
+                                        b"x-rustfs-internal-transition-tier-destination-id"
+                                        | b"x-minio-internal-transition-tier-destination-id" => {
+                                            s.has_transition_dest_id = true;
+                                        }
+                                        b"x-rustfs-internal-transitioned-version-state"
+                                        | b"x-minio-internal-transitioned-version-state" => {
+                                            s.has_transition_ver_state = true;
+                                        }
+                                        other => {
+                                            std::str::from_utf8(other).map_err(|e| Error::FromUtf8(e.to_string()))?;
+                                        }
+                                    }
+                                }
+                            }
+                            b"MetaUsr" => {
+                                s.restore_hdr = None;
+                                for _ in 0..read_nil_or_map_len(&mut cur)?.unwrap_or(0) {
+                                    let k = read_str_bytes_slice(&mut cur)?;
+                                    let v = read_str_slice(&mut cur)?;
+                                    if k == metadata_keys::RESTORE.as_bytes() {
+                                        s.restore_hdr = Some(v);
+                                    } else {
+                                        std::str::from_utf8(k).map_err(|e| Error::FromUtf8(e.to_string()))?;
+                                    }
+                                }
+                            }
+                            other => {
+                                std::str::from_utf8(other).map_err(|e| Error::FromUtf8(e.to_string()))?;
+                                skip_msgp_value(&mut cur)?;
+                            }
                         }
-
-                        skip_msgp_value(&mut cur)?;
                     }
-
-                    return Ok(data_dir);
                 }
-                _ => {
+                b"V1Obj" | b"DelObj" => return Err(Error::other("non-V2Obj uses full decoder")),
+                b"v" => {
+                    if rmp::decode::read_int::<i64, _>(&mut cur)? < 0 {
+                        return Err(Error::other("negative write_version not supported"));
+                    }
+                }
+                other => {
+                    std::str::from_utf8(other).map_err(|e| Error::FromUtf8(e.to_string()))?;
                     skip_msgp_value(&mut cur)?;
                 }
             }
         }
 
-        Ok(None)
+        if version_type != VersionType::Object
+            || !s.has_object
+            || !s.erasure_algorithm.valid()
+            || !s.bitrot_checksum_algo.valid()
+            || !s.has_mod_time
+        {
+            return Err(Error::other("non-valid V2Obj uses full decoder"));
+        }
+
+        let transition_complete =
+            s.rustfs_transition_status.or(s.minio_transition_status) == Some(TRANSITION_COMPLETE.as_bytes());
+        let physical_data_dir = if s.has_inline_data
+            || (transition_complete
+                && !s.restore_hdr.is_some_and(|hdr| {
+                    crate::parse_restore_obj_status(hdr).is_ok_and(|st| crate::fileinfo::RestoreStatusOps::on_disk(&st))
+                })) {
+            None
+        } else {
+            s.data_dir
+        };
+
+        Ok(V2ObjectSliceSummary {
+            version_id: s.version_id,
+            data_dir: s.data_dir,
+            physical_data_dir,
+            transition_complete,
+            has_reconciled_transition: s.has_transition_dest_id && s.has_transition_ver_state,
+        })
     }
 
     pub fn valid(&self) -> bool {
@@ -764,6 +946,10 @@ impl FileMetaVersion {
             VersionType::Legacy => self.legacy_object.as_ref().and_then(|v| v.stat.mod_time),
             VersionType::Invalid => None,
         }
+    }
+
+    fn decode_data_dir_from_v2_object(buf: &[u8]) -> Result<Option<Uuid>> {
+        Ok(Self::inspect_v2_object_slice(buf)?.data_dir)
     }
 
     // decode_data_dir_from_meta reads data_dir from meta TODO: directly parse only data_dir from meta buf, msg.skip
@@ -903,6 +1089,21 @@ impl FileMetaVersion {
         self.to_fileinfo_with_part_checksums(volume, path, all_parts, true)
     }
 
+    pub(super) fn decode_fileinfo_from_slice(
+        value: &[u8],
+        volume: &str,
+        path: &str,
+        all_parts: bool,
+        include_part_checksums: bool,
+    ) -> Result<FileInfo> {
+        if all_parts && let Ok(mut borrowed) = BorrowedMetaObject::decode_version_slice(value) {
+            return borrowed.take_fileinfo_with_part_checksums(volume, path, include_part_checksums);
+        }
+
+        FileMetaVersion::try_from(value)
+            .and_then(|v| v.into_fileinfo_with_part_checksums(volume, path, all_parts, include_part_checksums))
+    }
+
     pub(super) fn into_fileinfo_with_part_checksums(
         self,
         volume: &str,
@@ -1014,6 +1215,371 @@ impl FileMetaVersion {
     }
 }
 
+const BORROWED_META_SYS_INLINE_CAP: usize = 16;
+
+struct BorrowedMetaObject<'a> {
+    version_id: Option<Uuid>,
+    data_dir: Option<Uuid>,
+    erasure_algorithm: ErasureAlgo,
+    erasure_m: usize,
+    erasure_n: usize,
+    erasure_block_size: usize,
+    erasure_index: usize,
+    erasure_dist: Vec<usize>,
+    bitrot_checksum_algo: ChecksumAlgo,
+    parts: Vec<ObjectPartInfo>,
+    part_mask: u8,
+    size: i64,
+    mod_time: Option<OffsetDateTime>,
+    meta_sys_inline: [(&'a str, &'a [u8]); BORROWED_META_SYS_INLINE_CAP],
+    meta_sys_len: usize,
+    meta_sys_overflow: Vec<(&'a str, &'a [u8])>,
+    meta_user: HashMap<String, String>,
+    user_has_internal: bool,
+}
+
+impl Default for BorrowedMetaObject<'_> {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            version_id: None,
+            data_dir: None,
+            erasure_algorithm: ErasureAlgo::default(),
+            erasure_m: 0,
+            erasure_n: 0,
+            erasure_block_size: 0,
+            erasure_index: 0,
+            erasure_dist: Vec::new(),
+            bitrot_checksum_algo: ChecksumAlgo::default(),
+            parts: Vec::new(),
+            part_mask: 0,
+            size: 0,
+            mod_time: None,
+            meta_sys_inline: [("", &[]); BORROWED_META_SYS_INLINE_CAP],
+            meta_sys_len: 0,
+            meta_sys_overflow: Vec::new(),
+            meta_user: HashMap::new(),
+            user_has_internal: false,
+        }
+    }
+}
+
+fn read_opt_uuid_slice(cur: &mut std::io::Cursor<&[u8]>) -> Result<Option<Uuid>> {
+    let bin_len = rmp::decode::read_bin_len(cur)? as usize;
+    if bin_len != 16 {
+        return Err(Error::other(format!("DDir must be 16 bytes, got {bin_len}")));
+    }
+    let id = Uuid::from_slice(read_slice(cur, 16)?).map_err(Error::from)?;
+    Ok((!id.is_nil()).then_some(id))
+}
+
+impl<'a> BorrowedMetaObject<'a> {
+    const PART_NUMS: u8 = 1 << 0;
+    const PART_ETAGS: u8 = 1 << 1;
+    const PART_SIZES: u8 = 1 << 2;
+    const PART_ASIZES: u8 = 1 << 3;
+    const PART_IDX: u8 = 1 << 4;
+
+    #[inline]
+    fn meta_sys_slice(&self) -> &[(&'a str, &'a [u8])] {
+        if self.meta_sys_overflow.is_empty() {
+            &self.meta_sys_inline[..self.meta_sys_len]
+        } else {
+            &self.meta_sys_overflow
+        }
+    }
+
+    fn mark_part_field(&mut self, bit: u8) -> Result<()> {
+        if self.part_mask & bit != 0 || (bit != Self::PART_NUMS && self.part_mask & Self::PART_NUMS == 0) {
+            return Err(Error::other("out-of-order or duplicate part field"));
+        }
+        self.part_mask |= bit;
+        Ok(())
+    }
+
+    fn decode_version_slice(buf: &'a [u8]) -> Result<Self> {
+        let mut cur = std::io::Cursor::new(buf);
+        let mut fields = rmp::decode::read_map_len(&mut cur)?;
+        let mut version_type = VersionType::Invalid;
+        let mut out: Option<Self> = None;
+
+        while fields > 0 {
+            fields -= 1;
+            match read_str_bytes_slice(&mut cur)? {
+                b"Type" => version_type = VersionType::from_u8(rmp::decode::read_int::<i64, _>(&mut cur)? as u8),
+                b"V2Obj" => {
+                    if let Some(obj_fields) = read_nil_or_submap_len(&mut cur)? {
+                        let obj = out.insert(Self::default());
+                        obj.decode_fields(&mut cur, obj_fields)?;
+                    } else {
+                        out = None;
+                    }
+                }
+                b"V1Obj" | b"DelObj" => return Err(Error::other("non-V2Obj uses full decoder")),
+                b"v" => {
+                    if rmp::decode::read_int::<i64, _>(&mut cur)? < 0 {
+                        return Err(Error::other("negative write_version not supported"));
+                    }
+                }
+                other => {
+                    std::str::from_utf8(other).map_err(|e| Error::FromUtf8(e.to_string()))?;
+                    skip_msgp_value(&mut cur)?;
+                }
+            }
+        }
+
+        let Some(out) = out else {
+            return Err(Error::other("non-valid V2Obj uses full decoder"));
+        };
+        let parts_valid = out.parts.is_empty()
+            || (out.part_mask & (Self::PART_SIZES | Self::PART_ASIZES)) == (Self::PART_SIZES | Self::PART_ASIZES);
+        if version_type == VersionType::Object
+            && parts_valid
+            && out.erasure_algorithm.valid()
+            && out.bitrot_checksum_algo.valid()
+            && out.mod_time.is_some()
+        {
+            Ok(out)
+        } else {
+            Err(Error::other("non-valid V2Obj uses full decoder"))
+        }
+    }
+
+    fn decode_fields(&mut self, cur: &mut std::io::Cursor<&'a [u8]>, mut fields: usize) -> Result<()> {
+        while fields > 0 {
+            fields -= 1;
+            match read_str_bytes_slice(cur)? {
+                b"ID" => self.version_id = read_opt_uuid_slice(cur)?,
+                b"DDir" => self.data_dir = read_opt_uuid_slice(cur)?,
+                b"EcAlgo" => self.erasure_algorithm = ErasureAlgo::from_u8(rmp::decode::read_int::<i64, _>(cur)? as u8),
+                b"EcM" => self.erasure_m = rmp::decode::read_int::<i64, _>(cur)? as usize,
+                b"EcN" => self.erasure_n = rmp::decode::read_int::<i64, _>(cur)? as usize,
+                b"EcBSize" => self.erasure_block_size = rmp::decode::read_int::<i64, _>(cur)? as usize,
+                b"EcIndex" => self.erasure_index = rmp::decode::read_int::<i64, _>(cur)? as usize,
+                b"EcDist" => {
+                    let len = rmp::decode::read_array_len(cur)? as usize;
+                    self.erasure_dist.clear();
+                    self.erasure_dist.reserve(prealloc_hint(len));
+                    for _ in 0..len {
+                        self.erasure_dist
+                            .push(usize::from(rmp::decode::read_int::<i64, _>(cur)? as u8));
+                    }
+                }
+                b"CSumAlgo" => self.bitrot_checksum_algo = ChecksumAlgo::from_u8(rmp::decode::read_int::<i64, _>(cur)? as u8),
+                b"PartNums" => {
+                    self.mark_part_field(Self::PART_NUMS)?;
+                    let len = rmp::decode::read_array_len(cur)? as usize;
+                    self.parts.reserve(prealloc_hint(len));
+                    for _ in 0..len {
+                        self.parts.push(ObjectPartInfo {
+                            etag: String::new(),
+                            number: rmp::decode::read_int::<i64, _>(cur)? as usize,
+                            size: 0,
+                            actual_size: 0,
+                            mod_time: None,
+                            index: None,
+                            checksums: None,
+                            error: None,
+                            integrity: None,
+                        });
+                    }
+                }
+                b"PartETags" => {
+                    self.mark_part_field(Self::PART_ETAGS)?;
+                    if let Some(len) = read_nil_or_array_len(cur)?
+                        && len != 0
+                    {
+                        if len != self.parts.len() {
+                            return Err(Error::other("PartETags length mismatch"));
+                        }
+                        for part in &mut self.parts {
+                            part.etag = read_str_slice(cur)?.to_owned();
+                        }
+                    }
+                }
+                b"PartSizes" => {
+                    self.mark_part_field(Self::PART_SIZES)?;
+                    if rmp::decode::read_array_len(cur)? as usize != self.parts.len() {
+                        return Err(Error::other("PartSizes length mismatch"));
+                    }
+                    for part in &mut self.parts {
+                        part.size = rmp::decode::read_int::<i64, _>(cur)? as usize;
+                    }
+                }
+                b"PartASizes" => {
+                    self.mark_part_field(Self::PART_ASIZES)?;
+                    if read_nil_or_array_len(cur)?.unwrap_or(0) != self.parts.len() {
+                        return Err(Error::other("PartASizes length mismatch"));
+                    }
+                    for part in &mut self.parts {
+                        part.actual_size = rmp::decode::read_int(cur)?;
+                    }
+                }
+                b"PartIdx" => {
+                    self.mark_part_field(Self::PART_IDX)?;
+                    let len = rmp::decode::read_array_len(cur)? as usize;
+                    if len != 0 {
+                        if len != self.parts.len() {
+                            return Err(Error::other("PartIdx length mismatch"));
+                        }
+                        for part in &mut self.parts {
+                            let b = read_bin_slice(cur)?;
+                            if !b.is_empty() {
+                                part.index = Some(Bytes::copy_from_slice(b));
+                            }
+                        }
+                    }
+                }
+                b"Size" => self.size = rmp::decode::read_int(cur)?,
+                b"MTime" => {
+                    let nanos: i64 = rmp::decode::read_int(cur)?;
+                    let time = OffsetDateTime::from_unix_timestamp_nanos(nanos as i128)?;
+                    self.mod_time = (time != OffsetDateTime::UNIX_EPOCH).then_some(time);
+                }
+                b"MetaSys" => {
+                    self.meta_sys_len = 0;
+                    self.meta_sys_overflow.clear();
+                    let Some(len) = read_nil_or_map_len(cur)? else {
+                        continue;
+                    };
+                    if len > 64 {
+                        return Err(Error::other("large MetaSys uses HashMap decoder"));
+                    }
+                    let use_overflow = len > BORROWED_META_SYS_INLINE_CAP;
+                    if use_overflow {
+                        self.meta_sys_overflow.reserve(len);
+                    }
+                    for _ in 0..len {
+                        let k = read_str_slice(cur)?;
+                        let v = read_bin_slice(cur)?;
+                        let active = if use_overflow {
+                            self.meta_sys_overflow.as_mut_slice()
+                        } else {
+                            &mut self.meta_sys_inline[..self.meta_sys_len]
+                        };
+                        if let Some((_, existing_v)) = active.iter_mut().find(|(ek, _)| *ek == k) {
+                            *existing_v = v;
+                        } else if use_overflow {
+                            self.meta_sys_overflow.push((k, v));
+                        } else {
+                            self.meta_sys_inline[self.meta_sys_len] = (k, v);
+                            self.meta_sys_len += 1;
+                        }
+                    }
+                }
+                b"MetaUsr" => {
+                    let Some(len) = read_nil_or_map_len(cur)? else {
+                        self.meta_user.clear();
+                        self.user_has_internal = false;
+                        continue;
+                    };
+                    self.meta_user.clear();
+                    self.user_has_internal = false;
+                    let mut saw_non_standard_storage_class = false;
+                    self.meta_user
+                        .reserve(prealloc_hint(len.saturating_add(self.meta_sys_slice().len())));
+                    for _ in 0..len {
+                        let k = read_str_slice(cur)?;
+                        let v = read_str_slice(cur)?;
+                        if k == AMZ_META_UNENCRYPTED_CONTENT_LENGTH || k == AMZ_META_UNENCRYPTED_CONTENT_MD5 {
+                            continue;
+                        }
+                        if k == metadata_keys::STORAGE_CLASS {
+                            if v == "STANDARD" {
+                                if saw_non_standard_storage_class {
+                                    self.meta_user.remove(metadata_keys::STORAGE_CLASS);
+                                    saw_non_standard_storage_class = false;
+                                }
+                                continue;
+                            }
+                            saw_non_standard_storage_class = true;
+                        }
+                        if !self.user_has_internal && is_internal_key(k) {
+                            self.user_has_internal = true;
+                        }
+                        self.meta_user.insert(k.to_owned(), v.to_owned());
+                    }
+                }
+                other => {
+                    std::str::from_utf8(other).map_err(|e| Error::FromUtf8(e.to_string()))?;
+                    skip_msgp_value(cur)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn take_fileinfo_with_part_checksums(&mut self, volume: &str, path: &str, include_part_checksums: bool) -> Result<FileInfo> {
+        let erasure = ErasureInfo {
+            algorithm: self.erasure_algorithm.as_str().to_owned(),
+            data_blocks: self.erasure_m,
+            parity_blocks: self.erasure_n,
+            block_size: self.erasure_block_size,
+            index: self.erasure_index,
+            distribution: std::mem::take(&mut self.erasure_dist),
+            checksums: Vec::new(),
+        };
+        let parts_len = self.parts.len();
+        let parts = std::mem::take(&mut self.parts);
+        let meta_user = std::mem::take(&mut self.meta_user);
+        let meta_sys = self.meta_sys_slice();
+        MetaObject::finish_fileinfo_from_meta_sys(
+            volume,
+            path,
+            self.version_id.filter(|&vid| !vid.is_nil()),
+            self.data_dir,
+            self.mod_time,
+            self.size,
+            erasure,
+            parts,
+            parts_len,
+            parts_len,
+            |i, parts| (parts[i].number, parts[i].size),
+            meta_user,
+            self.user_has_internal,
+            MetaSysSource::Borrowed(meta_sys),
+            true,
+            include_part_checksums,
+        )
+    }
+}
+
+enum MetaSysSource<'a> {
+    Borrowed(&'a [(&'a str, &'a [u8])]),
+    Owned(HashMap<String, Vec<u8>>),
+}
+
+enum MetaSysPair<'a> {
+    Borrowed(&'a str, &'a [u8]),
+    Owned(String, Vec<u8>),
+}
+
+impl MetaSysPair<'_> {
+    #[inline]
+    fn as_parts(&self) -> (&str, &[u8]) {
+        match self {
+            Self::Borrowed(k, v) => (k, v),
+            Self::Owned(k, v) => (k.as_str(), v.as_slice()),
+        }
+    }
+
+    #[inline]
+    fn into_key(self) -> String {
+        match self {
+            Self::Borrowed(k, _) => k.to_owned(),
+            Self::Owned(k, _) => k,
+        }
+    }
+
+    #[inline]
+    fn into_string_pair(self) -> (String, String) {
+        match self {
+            Self::Borrowed(k, v) => (k.to_owned(), std::str::from_utf8(v).map(str::to_owned).unwrap_or_default()),
+            Self::Owned(k, v) => (k, String::from_utf8(v).unwrap_or_default()),
+        }
+    }
+}
+
 impl TryFrom<&[u8]> for FileMetaVersion {
     type Error = Error;
 
@@ -1116,6 +1682,47 @@ pub struct FileMetaVersionHeader {
     pub flags: u8,
     pub ec_n: u8,
     pub ec_m: u8,
+}
+
+pub(crate) struct CanonicalV3HeaderFields {
+    pub(crate) uuid_bytes: [u8; 16],
+    pub(crate) unix_nanos: i64,
+    pub(crate) signature: [u8; 4],
+    pub(crate) version_type: VersionType,
+    pub(crate) flags: u8,
+    pub(crate) ec_n: u8,
+    pub(crate) ec_m: u8,
+}
+
+#[inline]
+pub(crate) fn ec_fields_match_strict(s_ec_m: u8, s_ec_n: u8, o_ec_m: u8, o_ec_n: u8) -> bool {
+    let s_has_ec = s_ec_m > 0 && s_ec_n > 0;
+    let o_has_ec = o_ec_m > 0 && o_ec_n > 0;
+    s_has_ec != o_has_ec || (s_ec_n == o_ec_n && s_ec_m == o_ec_m)
+}
+
+#[inline]
+pub(crate) fn parse_canonical_v3_header_fields(buf: &[u8]) -> Option<CanonicalV3HeaderFields> {
+    let chunk = buf.first_chunk::<38>()?;
+    if chunk[0] != 0x97 || chunk[1] != 0xc4 || chunk[2] != 0x10 || chunk[19] != 0xd3 || chunk[28] != 0xc4 || chunk[29] != 0x04 {
+        return None;
+    }
+    let [vt, flags, ec_n, ec_m] = [chunk[34], chunk[35], chunk[36], chunk[37]];
+    if (vt | flags | ec_n | ec_m) >= 0x80 {
+        return None;
+    }
+    let uuid_bytes: [u8; 16] = chunk[3..19].try_into().ok()?;
+    let unix_nanos = i64::from_be_bytes(chunk[20..28].try_into().ok()?);
+    let signature: [u8; 4] = chunk[30..34].try_into().ok()?;
+    Some(CanonicalV3HeaderFields {
+        uuid_bytes,
+        unix_nanos,
+        signature,
+        version_type: VersionType::from_u8(vt),
+        flags,
+        ec_n,
+        ec_m,
+    })
 }
 
 impl FileMetaVersionHeader {
@@ -1307,6 +1914,24 @@ impl FileMetaVersionHeader {
     }
 
     pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
+        if let Some(fields) = parse_canonical_v3_header_fields(buf) {
+            let mod_time = if fields.unix_nanos == 0 {
+                None
+            } else {
+                let secs = fields.unix_nanos.div_euclid(1_000_000_000);
+                let subsec_nanos = u32::try_from(fields.unix_nanos.rem_euclid(1_000_000_000)).unwrap_or(0);
+                Some(OffsetDateTime::from_unix_timestamp(secs)?.replace_nanosecond(subsec_nanos)?)
+            };
+            self.version_id = Some(Uuid::from_bytes(fields.uuid_bytes));
+            self.mod_time = mod_time;
+            self.signature = fields.signature;
+            self.version_type = fields.version_type;
+            self.flags = fields.flags;
+            self.ec_n = fields.ec_n;
+            self.ec_m = fields.ec_m;
+            return Ok(38);
+        }
+
         self.reset_for_unmarshal();
 
         let mut cur = Cursor::new(buf);
@@ -2073,10 +2698,10 @@ impl MetaObject {
         // Zero fields that legitimately vary per disk within an erasure set, and
         // treat an all-empty PartETags vector the same as an absent one so two
         // disks that encode `[]` vs `["", ""]` do not falsely diverge.
-        let mut hasher = Xxh64Writer(xxhash_rust::xxh64::Xxh64::new(XXHASH_SEED));
+        let mut hasher = Xxh64Writer::new();
         let include_part_etags = !self.part_etags.iter().all(String::is_empty);
         if self.encode_to_with_options(&mut hasher, 0, include_part_etags, false).is_ok() {
-            crc ^= hasher.0.finish();
+            crc ^= hasher.finish();
         }
 
         fold_signature(crc)
@@ -2583,7 +3208,6 @@ impl MetaObject {
     ) -> Result<FileInfo> {
         let version_id = self.version_id.filter(|&vid| !vid.is_nil());
         let meta_sys = std::mem::take(&mut self.meta_sys);
-        let derived_metadata = DerivedInternalMetadata::from_meta_sys(&meta_sys)?;
 
         let parts = if all_parts {
             let n = self.part_numbers.len();
@@ -2627,6 +3251,60 @@ impl MetaObject {
             metadata.remove(metadata_keys::STORAGE_CLASS);
         }
         let user_has_internal = metadata.keys().any(|k| is_internal_key(k));
+        let erasure = ErasureInfo {
+            algorithm: self.erasure_algorithm.as_str().to_owned(),
+            data_blocks: self.erasure_m,
+            parity_blocks: self.erasure_n,
+            block_size: self.erasure_block_size,
+            index: self.erasure_index,
+            distribution: self.erasure_dist.into_iter().map(usize::from).collect(),
+            ..Default::default()
+        };
+        let part_numbers = self.part_numbers;
+        let part_sizes = self.part_sizes;
+        Self::finish_fileinfo_from_meta_sys(
+            volume,
+            path,
+            version_id,
+            self.data_dir,
+            self.mod_time,
+            self.size,
+            erasure,
+            parts,
+            part_numbers.len(),
+            part_sizes.len(),
+            |i, _| (part_numbers[i], part_sizes[i]),
+            metadata,
+            user_has_internal,
+            MetaSysSource::Owned(meta_sys),
+            all_parts,
+            include_part_checksums,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_fileinfo_from_meta_sys(
+        volume: &str,
+        path: &str,
+        version_id: Option<Uuid>,
+        data_dir: Option<Uuid>,
+        mod_time: Option<OffsetDateTime>,
+        size: i64,
+        erasure: ErasureInfo,
+        parts: Vec<ObjectPartInfo>,
+        part_nums_len: usize,
+        part_sizes_len: usize,
+        part_num_and_size: impl Fn(usize, &[ObjectPartInfo]) -> (usize, usize),
+        mut metadata: HashMap<String, String>,
+        user_has_internal: bool,
+        meta_sys: MetaSysSource<'_>,
+        all_parts: bool,
+        include_part_checksums: bool,
+    ) -> Result<FileInfo> {
+        let derived_metadata = match &meta_sys {
+            MetaSysSource::Borrowed(s) => DerivedInternalMetadata::from_meta_sys_slices(s)?,
+            MetaSysSource::Owned(m) => DerivedInternalMetadata::from_meta_sys(m)?,
+        };
         let mut has_replication_candidate = user_has_internal;
         let mut has_part_checksums = user_has_internal || derived_metadata.part_checksums.is_some();
         let mut has_upload_integrity = user_has_internal;
@@ -2636,16 +3314,6 @@ impl MetaObject {
             .checksum
             .filter(|checksum| !checksum.is_empty())
             .map(Bytes::copy_from_slice);
-
-        let erasure = ErasureInfo {
-            algorithm: self.erasure_algorithm.to_string(),
-            data_blocks: self.erasure_m,
-            parity_blocks: self.erasure_n,
-            block_size: self.erasure_block_size,
-            index: self.erasure_index,
-            distribution: self.erasure_dist.into_iter().map(usize::from).collect(),
-            ..Default::default()
-        };
 
         let transition_status = derived_metadata
             .transition_status
@@ -2669,47 +3337,87 @@ impl MetaObject {
             .map(|v| String::from_utf8_lossy(v).to_string())
             .unwrap_or_default();
 
-        metadata.reserve(meta_sys.len());
-        for (k, v) in meta_sys {
-            if has_internal_suffix(&k, SUFFIX_TIER_FV_ID) || has_internal_suffix(&k, SUFFIX_TIER_FV_MARKER) {
-                continue;
-            }
-            let Some(suffix) = strip_internal_prefix_preserving_case(&k) else {
-                continue;
+        metadata.reserve(match &meta_sys {
+            MetaSysSource::Borrowed(s) => s.len(),
+            MetaSysSource::Owned(m) => m.len(),
+        });
+        let mut fold_entry = |pair: MetaSysPair<'_>| {
+            let (k, v) = pair.as_parts();
+            let Some(suffix) = strip_internal_prefix_preserving_case(k) else {
+                return;
             };
-            if suffix.eq_ignore_ascii_case(SUFFIX_TRANSITIONED_VERSION_ID) {
-                let val = transition_version_metadata_value(&v, transition_version.as_deref());
-                metadata.insert(k, val);
-                continue;
-            }
-            if !k.is_ascii() {
+            if !suffix.is_ascii() {
+                if has_internal_suffix(k, SUFFIX_TIER_FV_ID) || has_internal_suffix(k, SUFFIX_TIER_FV_MARKER) {
+                    return;
+                }
+                if rustfs_utils::http::eq_slice_ignore_ascii_case(suffix.as_bytes(), SUFFIX_TRANSITIONED_VERSION_ID.as_bytes()) {
+                    let val = transition_version_metadata_value(v, transition_version.as_deref());
+                    metadata.insert(pair.into_key(), val);
+                    return;
+                }
                 has_replication_candidate = true;
                 has_part_checksums = true;
                 has_upload_integrity = true;
                 has_shard_or_inline_integrity = true;
             } else {
                 match suffix.as_bytes().first().map(u8::to_ascii_lowercase) {
+                    Some(b't') => {
+                        if rustfs_utils::http::eq_slice_ignore_ascii_case(suffix.as_bytes(), SUFFIX_TIER_FV_MARKER.as_bytes()) {
+                            return;
+                        }
+                        if rustfs_utils::http::eq_slice_ignore_ascii_case(
+                            suffix.as_bytes(),
+                            SUFFIX_TRANSITIONED_VERSION_ID.as_bytes(),
+                        ) {
+                            let val = transition_version_metadata_value(v, transition_version.as_deref());
+                            metadata.insert(pair.into_key(), val);
+                            return;
+                        }
+                    }
                     Some(b'p') => {
-                        if suffix.eq_ignore_ascii_case(SUFFIX_PURGESTATUS) {
+                        if rustfs_utils::http::eq_slice_ignore_ascii_case(suffix.as_bytes(), SUFFIX_PURGESTATUS.as_bytes()) {
                             has_replication_candidate = true;
-                        } else if suffix.eq_ignore_ascii_case(SUFFIX_PART_CHECKSUMS) {
+                        } else if rustfs_utils::http::eq_slice_ignore_ascii_case(
+                            suffix.as_bytes(),
+                            SUFFIX_PART_CHECKSUMS.as_bytes(),
+                        ) {
                             has_part_checksums = true;
                         }
                     }
                     Some(b'r') => has_replication_candidate = true,
                     Some(b's') => {
-                        if suffix.eq_ignore_ascii_case(crate::shard_integrity::SUFFIX_UPLOAD_INTEGRITY) {
+                        if rustfs_utils::http::eq_slice_ignore_ascii_case(
+                            suffix.as_bytes(),
+                            crate::shard_integrity::SUFFIX_UPLOAD_INTEGRITY.as_bytes(),
+                        ) {
                             has_upload_integrity = true;
-                        } else if suffix.eq_ignore_ascii_case(crate::shard_integrity::SUFFIX_SHARD_INTEGRITY)
-                            || suffix.eq_ignore_ascii_case(crate::shard_integrity::SUFFIX_INLINE_INTEGRITY)
-                        {
+                        } else if rustfs_utils::http::eq_slice_ignore_ascii_case(
+                            suffix.as_bytes(),
+                            crate::shard_integrity::SUFFIX_SHARD_INTEGRITY.as_bytes(),
+                        ) || rustfs_utils::http::eq_slice_ignore_ascii_case(
+                            suffix.as_bytes(),
+                            crate::shard_integrity::SUFFIX_INLINE_INTEGRITY.as_bytes(),
+                        ) {
                             has_shard_or_inline_integrity = true;
                         }
                     }
                     _ => {}
                 }
             }
-            metadata.insert(k, String::from_utf8(v).unwrap_or_default());
+            let (k_str, v_str) = pair.into_string_pair();
+            metadata.insert(k_str, v_str);
+        };
+        match meta_sys {
+            MetaSysSource::Borrowed(s) => {
+                for &(k, v) in s {
+                    fold_entry(MetaSysPair::Borrowed(k, v));
+                }
+            }
+            MetaSysSource::Owned(m) => {
+                for (k, v) in m {
+                    fold_entry(MetaSysPair::Owned(k, v));
+                }
+            }
         }
 
         let replication_state_internal = if has_replication_candidate {
@@ -2734,12 +3442,12 @@ impl MetaObject {
         let mut file_info = FileInfo {
             version_id,
             erasure,
-            data_dir: self.data_dir,
-            mod_time: self.mod_time,
-            size: self.size,
+            data_dir,
+            mod_time,
+            size,
             name: path.to_string(),
             volume: volume.to_string(),
-            parts,
+            parts: if all_parts { parts } else { Vec::new() },
             metadata,
             replication_state_internal,
             deleted,
@@ -2755,7 +3463,7 @@ impl MetaObject {
         if all_parts && include_part_checksums && has_part_checksums {
             file_info.hydrate_data_movement_part_checksums()?;
         }
-        if !self.part_numbers.is_empty()
+        if part_nums_len != 0
             && has_upload_integrity
             && rustfs_utils::http::contains_key_str(&file_info.metadata, crate::shard_integrity::SUFFIX_UPLOAD_INTEGRITY)
         {
@@ -2765,18 +3473,19 @@ impl MetaObject {
             && let Some(commitments) = crate::shard_integrity::descriptor_from_metadata(&file_info.metadata)?
         {
             let layout = crate::shard_integrity::IntegrityLayout::new(
-                self.erasure_m,
-                self.erasure_n,
-                self.erasure_block_size,
+                file_info.erasure.data_blocks,
+                file_info.erasure.parity_blocks,
+                file_info.erasure.block_size,
                 file_info.uses_legacy_checksum,
             )?;
-            if commitments.len() != self.part_numbers.len() || commitments.len() != self.part_sizes.len() {
+            if commitments.len() != part_nums_len || commitments.len() != part_sizes_len {
                 return Err(Error::FileCorrupt);
             }
             for (i, commitment) in commitments.into_iter().enumerate() {
+                let (part_number, part_size) = part_num_and_size(i, &file_info.parts);
                 if commitment.layout != layout
-                    || usize::try_from(commitment.number).map_err(|_| Error::FileCorrupt)? != self.part_numbers[i]
-                    || usize::try_from(commitment.size).map_err(|_| Error::FileCorrupt)? != self.part_sizes[i]
+                    || usize::try_from(commitment.number).map_err(|_| Error::FileCorrupt)? != part_number
+                    || usize::try_from(commitment.size).map_err(|_| Error::FileCorrupt)? != part_size
                 {
                     return Err(Error::FileCorrupt);
                 }
@@ -2816,8 +3525,12 @@ impl MetaObject {
     }
 
     pub fn uses_data_dir(&self) -> bool {
-        if let Some(status) = get_bytes(&self.meta_sys, SUFFIX_TRANSITION_STATUS)
-            && status == TRANSITION_COMPLETE.as_bytes().to_vec()
+        if !self.meta_sys.is_empty()
+            && self
+                .meta_sys
+                .get("x-rustfs-internal-transition-status")
+                .or_else(|| self.meta_sys.get("x-minio-internal-transition-status"))
+                .is_some_and(|status| status.as_slice() == TRANSITION_COMPLETE.as_bytes())
         {
             return false;
         }
@@ -2826,7 +3539,7 @@ impl MetaObject {
     }
 
     pub fn inlinedata(&self) -> bool {
-        contains_key_bytes(&self.meta_sys, SUFFIX_INLINE_DATA)
+        !self.meta_sys.is_empty() && contains_key_bytes(&self.meta_sys, SUFFIX_INLINE_DATA)
     }
 
     pub fn reset_inline_data(&mut self) {
@@ -2853,7 +3566,7 @@ impl MetaObject {
             return Ok((FileMetaVersion::default(), false));
         }
         if let Some(status) = get_bytes(&self.meta_sys, SUFFIX_TRANSITION_STATUS)
-            && status == TRANSITION_COMPLETE.as_bytes().to_vec()
+            && status.as_slice() == TRANSITION_COMPLETE.as_bytes()
         {
             let vid = Uuid::parse_str(&fi.tier_free_version_id())?;
             let mut free_entry = FileMetaVersion {
@@ -2899,57 +3612,60 @@ impl MetaObject {
 
 impl From<FileInfo> for MetaObject {
     fn from(value: FileInfo) -> Self {
-        let part_etags = if !value.parts.is_empty() {
-            value.parts.iter().map(|v| v.etag.clone()).collect()
-        } else {
-            vec![]
-        };
+        let transition_version = transitioned_version_bytes(&value);
+        let has_transition_status = !value.transition_status.is_empty();
+        let has_transition_version_state_key = has_transition_status
+            && rustfs_utils::http::metadata_compat::contains_key_str(&value.metadata, SUFFIX_TRANSITIONED_VERSION_STATE);
 
-        let part_indices = if !value.parts.is_empty() {
-            value.parts.iter().map(|v| v.index.clone().unwrap_or_default()).collect()
-        } else {
-            vec![]
-        };
+        let parts_len = value.parts.len();
+        let mut part_numbers = Vec::with_capacity(parts_len);
+        let mut part_etags = Vec::with_capacity(parts_len);
+        let mut part_sizes = Vec::with_capacity(parts_len);
+        let mut part_actual_sizes = Vec::with_capacity(parts_len);
+        let mut part_indices = Vec::with_capacity(parts_len);
+        for part in value.parts {
+            part_numbers.push(part.number);
+            part_etags.push(part.etag);
+            part_sizes.push(part.size);
+            part_actual_sizes.push(part.actual_size);
+            part_indices.push(part.index.unwrap_or_default());
+        }
 
         let mut meta_sys = HashMap::new();
         let mut meta_user = HashMap::new();
-        for (k, v) in value.metadata.iter() {
-            if is_internal_key(k) {
-                if is_skip_meta_key(k) {
+        for (k, v) in value.metadata {
+            if is_internal_key(&k) {
+                if is_skip_meta_key(&k) {
                     continue;
                 }
 
-                meta_sys.insert(k.to_owned(), v.as_bytes().to_vec());
+                meta_sys.insert(k, v.into_bytes());
             } else {
-                meta_user.insert(k.to_owned(), v.to_owned());
+                meta_user.insert(k, v);
             }
         }
 
-        if !value.transition_status.is_empty() {
-            insert_bytes(&mut meta_sys, SUFFIX_TRANSITION_STATUS, value.transition_status.as_bytes().to_vec());
+        if has_transition_status {
+            insert_bytes(&mut meta_sys, SUFFIX_TRANSITION_STATUS, value.transition_status.into_bytes());
         }
 
         if !value.transitioned_objname.is_empty() {
-            insert_bytes(
-                &mut meta_sys,
-                SUFFIX_TRANSITIONED_OBJECTNAME,
-                value.transitioned_objname.as_bytes().to_vec(),
-            );
+            insert_bytes(&mut meta_sys, SUFFIX_TRANSITIONED_OBJECTNAME, value.transitioned_objname.into_bytes());
         }
 
-        if let Some(transition_version) = transitioned_version_bytes(&value) {
+        if let Some(transition_version) = transition_version {
             insert_bytes(&mut meta_sys, SUFFIX_TRANSITIONED_VERSION_ID, transition_version);
         }
-        if !value.transition_status.is_empty() {
-            set_transition_version_state(&mut meta_sys, value.transition_version_state, &value.metadata);
+        if has_transition_status {
+            apply_transition_version_state(&mut meta_sys, value.transition_version_state, has_transition_version_state_key);
         }
 
         if !value.transition_tier.is_empty() {
-            insert_bytes(&mut meta_sys, SUFFIX_TRANSITION_TIER, value.transition_tier.as_bytes().to_vec());
+            insert_bytes(&mut meta_sys, SUFFIX_TRANSITION_TIER, value.transition_tier.into_bytes());
         }
 
         if let Some(content_hash) = value.checksum {
-            insert_bytes(&mut meta_sys, SUFFIX_CRC, content_hash.to_vec());
+            insert_bytes(&mut meta_sys, SUFFIX_CRC, Vec::from(content_hash));
         }
 
         Self {
@@ -2964,10 +3680,10 @@ impl From<FileInfo> for MetaObject {
             erasure_index: value.erasure.index,
             erasure_dist: value.erasure.distribution.iter().map(|x| *x as u8).collect(),
             bitrot_checksum_algo: ChecksumAlgo::HighwayHash,
-            part_numbers: value.parts.iter().map(|v| v.number).collect(),
+            part_numbers,
             part_etags,
-            part_sizes: value.parts.iter().map(|v| v.size).collect(),
-            part_actual_sizes: value.parts.iter().map(|v| v.actual_size).collect(),
+            part_sizes,
+            part_actual_sizes,
             part_indices,
             meta_sys,
             meta_user,
@@ -3261,9 +3977,9 @@ impl MetaDeleteMarker {
     pub fn get_signature(&self) -> [u8; 4] {
         // MetaSys is order-unstable across disks; fold it in separately.
         let mut crc = hash_deterministic_bytes(&self.meta_sys);
-        let mut hasher = Xxh64Writer(xxhash_rust::xxh64::Xxh64::new(XXHASH_SEED));
+        let mut hasher = Xxh64Writer::new();
         if self.encode_to_with_meta(&mut hasher, false).is_ok() {
-            crc ^= hasher.0.finish();
+            crc ^= hasher.finish();
         }
 
         fold_signature(crc)
@@ -3412,46 +4128,49 @@ pub fn merge_file_meta_versions(
     requested_versions: usize,
     versions: &[Vec<FileMetaShallowVersion>],
 ) -> Vec<FileMetaShallowVersion> {
-    merge_file_meta_versions_inner(quorum, strict, requested_versions, false, 0, versions)
+    let streams: Vec<Vec<(&FileMetaVersionHeader, &[u8])>> = versions
+        .iter()
+        .map(|v| v.iter().map(|ver| (&ver.header, ver.meta.as_slice())).collect())
+        .collect();
+    merge_file_meta_borrowed_streams(quorum, strict, requested_versions, false, 0, streams)
 }
 
-pub(crate) fn merge_file_meta_versions_with_write_quorum(
-    quorum: usize,
-    strict: bool,
-    requested_versions: usize,
-    write_quorum_slack: usize,
-    versions: &[Vec<FileMetaShallowVersion>],
-) -> Vec<FileMetaShallowVersion> {
-    merge_file_meta_versions_inner(quorum, strict, requested_versions, true, write_quorum_slack, versions)
-}
-
-fn merge_file_meta_versions_inner(
+pub(crate) fn merge_file_meta_borrowed_streams(
     mut quorum: usize,
     mut strict: bool,
     requested_versions: usize,
     enforce_write_quorum: bool,
     write_quorum_slack: usize,
-    versions: &[Vec<FileMetaShallowVersion>],
+    mut streams: Vec<Vec<(&FileMetaVersionHeader, &[u8])>>,
 ) -> Vec<FileMetaShallowVersion> {
+    let to_shallow = |(header, meta): (&FileMetaVersionHeader, &[u8])| FileMetaShallowVersion {
+        header: header.clone(),
+        meta: meta.to_vec(),
+    };
+
     if quorum == 0 {
         quorum = 1;
     }
 
-    if versions.len() < quorum || versions.is_empty() {
+    if streams.len() < quorum || streams.is_empty() {
         return Vec::new();
     }
 
-    if versions.len() == 1 {
+    if streams.len() == 1 {
         if !enforce_write_quorum {
-            return versions[0].clone();
+            return streams[0].iter().copied().map(to_shallow).collect();
         }
 
-        let required_quorum = versions[0]
+        let required_quorum = streams[0]
             .first()
-            .map(|version| version.write_quorum(quorum).saturating_sub(write_quorum_slack).max(quorum))
+            .map(|&(hdr, meta)| {
+                write_quorum_from_header_and_meta(hdr, meta, quorum)
+                    .saturating_sub(write_quorum_slack)
+                    .max(quorum)
+            })
             .unwrap_or(quorum);
-        if versions.len() >= required_quorum {
-            return versions[0].clone();
+        if streams.len() >= required_quorum {
+            return streams[0].iter().copied().map(to_shallow).collect();
         }
         return Vec::new();
     }
@@ -3460,35 +4179,37 @@ fn merge_file_meta_versions_inner(
         strict = true;
     }
 
-    let required_quorum = |version: &FileMetaShallowVersion| {
+    let required_quorum = |(hdr, meta): (&FileMetaVersionHeader, &[u8])| {
         if enforce_write_quorum {
-            version.write_quorum(quorum).saturating_sub(write_quorum_slack).max(quorum)
+            write_quorum_from_header_and_meta(hdr, meta, quorum)
+                .saturating_sub(write_quorum_slack)
+                .max(quorum)
         } else {
             quorum
         }
     };
 
-    let mut versions = versions.to_owned();
+    let mut tops: Vec<(&FileMetaVersionHeader, &[u8])> = Vec::with_capacity(streams.len());
 
     let mut n_versions = 0;
 
     let mut merged = Vec::new();
     loop {
-        let mut tops = Vec::new();
-        let mut top_sig = FileMetaVersionHeader::default();
+        tops.clear();
+        let mut top_sig: Option<&FileMetaVersionHeader> = None;
         let mut consistent = true;
-        for vers in versions.iter() {
-            if vers.is_empty() {
+        for vers in &streams {
+            let Some(&first) = vers.first() else {
                 consistent = false;
                 continue;
-            }
-            if tops.is_empty() {
-                consistent = true;
-                top_sig = vers[0].header.clone();
+            };
+            if let Some(sig) = top_sig {
+                consistent = consistent && first.0 == sig;
             } else {
-                consistent = consistent && vers[0].header == top_sig;
+                consistent = true;
+                top_sig = Some(first.0);
             }
-            tops.push(vers[0].clone());
+            tops.push(first);
         }
 
         // check if done...
@@ -3496,115 +4217,96 @@ fn merge_file_meta_versions_inner(
             break;
         }
 
-        let mut latest = FileMetaShallowVersion::default();
+        let latest: (&FileMetaVersionHeader, &[u8]);
         if consistent {
-            latest = tops[0].clone();
-            if tops.len() >= required_quorum(&latest) {
-                merged.push(latest.clone());
-                if !latest.header.free_version() {
+            latest = tops[0];
+            if tops.len() >= required_quorum(latest) {
+                merged.push(to_shallow(latest));
+                if !latest.0.free_version() {
                     n_versions += 1;
                 }
             }
         } else {
-            let mut latest_count = 0;
-            for (i, ver) in tops.iter().enumerate() {
-                if ver.header == latest.header {
+            let mut latest_ref = tops[0];
+            let mut latest_count = 1;
+            for &ver in &tops[1..] {
+                if ver.0 == latest_ref.0 {
                     latest_count += 1;
                     continue;
                 }
 
-                if i == 0 || ver.header.sorts_before(&latest.header) {
-                    if i == 0 || latest_count == 0 {
-                        latest_count = 1;
-                    } else if !strict && ver.header.matches_not_strict(&latest.header) {
+                if ver.0.sorts_before(latest_ref.0) {
+                    if !strict && ver.0.matches_not_strict(latest_ref.0) {
                         latest_count += 1;
                     } else {
                         latest_count = 1;
                     }
-                    latest = ver.clone();
+                    latest_ref = ver;
                     continue;
                 }
 
                 // Mismatch, but older.
-                if latest_count > 0 && !strict && ver.header.matches_not_strict(&latest.header) {
+                if !strict && ver.0.matches_not_strict(latest_ref.0) {
                     latest_count += 1;
                     continue;
                 }
 
-                if latest_count > 0 && ver.header.version_id == latest.header.version_id {
+                if ver.0.version_id == latest_ref.0.version_id {
                     let mut x: HashMap<FileMetaVersionHeader, usize> = HashMap::new();
-                    for a in tops.iter() {
-                        if a.header.version_id != ver.header.version_id {
+                    for &a in &tops {
+                        if a.0.version_id != ver.0.version_id {
                             continue;
                         }
-                        let mut a_clone = a.clone();
+                        let mut hdr = a.0.clone();
                         if !strict {
-                            a_clone.header.signature = [0; 4];
+                            hdr.signature = [0; 4];
                         }
-                        *x.entry(a_clone.header).or_insert(0) += 1;
+                        *x.entry(hdr).or_insert(0) += 1;
                     }
                     latest_count = 0;
                     for (k, v) in x.iter() {
-                        if *v < latest_count {
+                        if *v < latest_count || (*v == latest_count && latest_ref.0.sorts_before(k)) {
                             continue;
                         }
-                        if *v == latest_count && latest.header.sorts_before(k) {
-                            continue;
-                        }
-                        tops.iter().for_each(|a| {
-                            let mut hdr = a.header.clone();
+                        for &a in &tops {
+                            let mut hdr = a.0.clone();
                             if !strict {
                                 hdr.signature = [0; 4];
                             }
                             if hdr == *k {
-                                latest = a.clone();
+                                latest_ref = a;
                             }
-                        });
+                        }
 
                         latest_count = *v;
                     }
                     break;
                 }
             }
-            if latest_count >= required_quorum(&latest) {
-                if !latest.header.free_version() {
+            latest = latest_ref;
+            if latest_count >= required_quorum(latest) {
+                if !latest.0.free_version() {
                     n_versions += 1;
                 }
-                merged.push(latest.clone());
+                merged.push(to_shallow(latest));
             }
         }
 
         // Remove from all streams up until latest modtime or if selected.
-        versions.iter_mut().for_each(|vers| {
-            // // Keep top entry (and remaining)...
-            let mut bre = false;
-            vers.retain(|ver| {
-                if bre {
-                    return true;
-                }
-                if let Ordering::Greater = ver.header.mod_time.cmp(&latest.header.mod_time) {
-                    bre = true;
-                    return false;
-                }
-                if ver.header == latest.header {
-                    bre = true;
-                    return false;
-                }
-                if let Ordering::Equal = latest.header.version_id.cmp(&ver.header.version_id) {
-                    bre = true;
-                    return false;
-                }
-                for merged_v in merged.iter() {
-                    if let Ordering::Equal = ver.header.version_id.cmp(&merged_v.header.version_id) {
-                        bre = true;
-                        return false;
-                    }
-                }
-                true
-            });
-        });
+        for vers in &mut streams {
+            if let Some(pos) = vers.iter().position(|ver| {
+                ver.0.mod_time > latest.0.mod_time
+                    || ver.0 == latest.0
+                    || latest.0.version_id == ver.0.version_id
+                    || merged
+                        .iter()
+                        .any(|merged_v: &FileMetaShallowVersion| ver.0.version_id == merged_v.header.version_id)
+            }) {
+                vers.remove(pos);
+            }
+        }
         if requested_versions > 0 && requested_versions == n_versions {
-            merged.append(&mut versions[0]);
+            merged.extend(streams[0].iter().copied().map(to_shallow));
             break;
         }
     }
@@ -5975,6 +6677,259 @@ mod tests {
 
         assert_eq!(decoded, stat);
         assert!(decoded.mod_time.is_none(), "absent mod_time must not become Some(UNIX_EPOCH)");
+    }
+
+    #[test]
+    fn inspect_v2_object_slice_matches_full_decoder_for_historical_and_mutated_records() {
+        fn assert_summary(bytes: &[u8]) {
+            let Ok(summary) = FileMetaVersion::inspect_v2_object_slice(bytes) else {
+                return;
+            };
+            let decoded = FileMetaVersion::try_from(bytes).expect("an accepted scan must fully decode");
+            let object = decoded.object.as_ref().expect("an accepted scan must be an object");
+            let transition_complete = get_bytes(&object.meta_sys, SUFFIX_TRANSITION_STATUS)
+                .is_some_and(|status| status == TRANSITION_COMPLETE.as_bytes());
+            let physical_dir =
+                if object.inlinedata() || (transition_complete && !crate::is_restored_object_on_disk(&object.meta_user)) {
+                    None
+                } else {
+                    object.data_dir
+                };
+            assert_eq!(summary.version_id, decoded.get_version_id());
+            assert_eq!(summary.data_dir, decoded.get_data_dir());
+            assert_eq!(summary.physical_data_dir, physical_dir);
+            assert_eq!(summary.transition_complete, transition_complete);
+            assert_eq!(
+                summary.has_reconciled_transition,
+                contains_key_bytes(&object.meta_sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID)
+                    && contains_key_bytes(&object.meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE)
+            );
+        }
+
+        let fixtures = [
+            crate::test_data::create_minio_small_object_xlmeta().expect("MinIO inline fixture"),
+            crate::test_data::create_minio_large_object_xlmeta().expect("MinIO physical fixture"),
+            crate::test_data::create_minio_versioned_object_xlmeta().expect("MinIO versioned fixture"),
+            crate::test_data::create_legacy_v1_object_xlmeta().expect("legacy V1 fixture"),
+            crate::test_data::create_issue_2288_legacy_xlmeta().expect("legacy xl.meta fixture"),
+            crate::test_data::create_issue_2265_legacy_meta_v2_object_xlmeta().expect("legacy V2 fixture"),
+        ];
+        let mut fast_objects = 0;
+        for raw in fixtures {
+            let metadata = FileMeta::load(&raw).expect("load historical fixture");
+            for version in metadata.versions {
+                let decoded = version.parse_version_meta().expect("decode historical version");
+                assert_eq!(
+                    FileMetaVersion::decode_data_dir_from_meta(&version.meta).expect("historical data directory"),
+                    decoded.get_data_dir()
+                );
+                if FileMetaVersion::inspect_v2_object_slice(&version.meta).is_ok() {
+                    fast_objects += 1;
+                }
+                assert_summary(&version.meta);
+            }
+        }
+        assert!(fast_objects > 0, "foreign fixtures must exercise the fast scanner");
+
+        let mut object = signed_object();
+        insert_bytes(&mut object.meta_sys, SUFFIX_TRANSITION_STATUS, TRANSITION_COMPLETE.as_bytes().to_vec());
+        insert_bytes(&mut object.meta_sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID, vec![b'a'; 64]);
+        insert_bytes(&mut object.meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE, b"exact".to_vec());
+        object.meta_user.insert(
+            metadata_keys::RESTORE.to_string(),
+            "ongoing-request=\"false\", expiry-date=\"9999-01-01T00:00:00Z\"".to_string(),
+        );
+        let bytes = FileMetaVersion {
+            version_type: VersionType::Object,
+            object: Some(object),
+            ..Default::default()
+        }
+        .marshal_msg()
+        .expect("encode mutation seed");
+        for end in 0..bytes.len() {
+            assert!(FileMetaVersion::inspect_v2_object_slice(&bytes[..end]).is_err(), "truncated at {end}");
+        }
+        for index in 0..bytes.len() {
+            for replacement in [0, 0x7f, 0xc0, 0xc1, 0xc2, 0xff] {
+                let mut mutated = bytes.clone();
+                mutated[index] = replacement;
+                assert_summary(&mutated);
+            }
+        }
+    }
+
+    #[test]
+    fn xxh64_writer_and_inspect_v2_object_slice_cover_boundaries_and_aliases() {
+        for total_len in [0_usize, 1, 63, 255, 256, 257, 600, 1024] {
+            let payload: Vec<u8> = (0..total_len).map(|i| (i * 31 + 7) as u8).collect();
+            let expected = xxhash_rust::xxh64::xxh64(&payload, XXHASH_SEED);
+            for chunk_size in [1_usize, 7, 64, 256, 512] {
+                let mut writer = Xxh64Writer::new();
+                for chunk in payload.chunks(chunk_size) {
+                    writer.write_all(chunk).expect("write chunk");
+                }
+                assert_eq!(writer.finish(), expected, "len={total_len}, chunk={chunk_size}");
+            }
+        }
+
+        let inspect = |obj: MetaObject| {
+            let bytes = FileMetaVersion {
+                version_type: VersionType::Object,
+                object: Some(obj),
+                ..Default::default()
+            }
+            .marshal_msg()
+            .expect("marshal V2Obj");
+            FileMetaVersion::inspect_v2_object_slice(&bytes)
+        };
+
+        let (vid, ddir) = (sample_version_id(), Uuid::new_v4());
+        let mut plain = signed_object();
+        plain.version_id = Some(vid);
+        plain.data_dir = Some(ddir);
+        let s = inspect(plain.clone()).expect("inspect plain");
+        assert_eq!((s.version_id, s.data_dir, s.physical_data_dir), (Some(vid), Some(ddir), Some(ddir)));
+        assert!(!s.transition_complete && !s.has_reconciled_transition);
+
+        for prefix in [RUSTFS_INTERNAL_PREFIX, rustfs_utils::http::MINIO_INTERNAL_PREFIX] {
+            let mut inlined = plain.clone();
+            inlined
+                .meta_sys
+                .insert(format!("{prefix}{SUFFIX_INLINE_DATA}"), b"true".to_vec());
+            assert_eq!(inspect(inlined).expect("inspect single inline alias").physical_data_dir, None);
+
+            let mut aliased = plain.clone();
+            aliased
+                .meta_sys
+                .insert(format!("{prefix}{SUFFIX_TRANSITION_STATUS}"), TRANSITION_COMPLETE.as_bytes().to_vec());
+            aliased
+                .meta_sys
+                .insert(format!("{prefix}{SUFFIX_TRANSITION_TIER_DESTINATION_ID}"), vec![b'a'; 64]);
+            aliased
+                .meta_sys
+                .insert(format!("{prefix}{SUFFIX_TRANSITIONED_VERSION_STATE}"), b"exact".to_vec());
+            let s = inspect(aliased.clone()).expect("inspect single alias");
+            assert!(s.physical_data_dir.is_none() && s.transition_complete && s.has_reconciled_transition);
+
+            aliased.meta_user.insert(
+                metadata_keys::RESTORE.to_string(),
+                "ongoing-request=\"false\", expiry-date=\"9999-01-01T00:00:00Z\"".to_string(),
+            );
+            assert_eq!(inspect(aliased).expect("inspect restored").physical_data_dir, Some(ddir));
+        }
+
+        let mut precedence = plain.clone();
+        precedence
+            .meta_sys
+            .insert(format!("{RUSTFS_INTERNAL_PREFIX}{SUFFIX_TRANSITION_STATUS}"), b"pending".to_vec());
+        precedence.meta_sys.insert(
+            format!("{}{SUFFIX_TRANSITION_STATUS}", rustfs_utils::http::MINIO_INTERNAL_PREFIX),
+            TRANSITION_COMPLETE.as_bytes().to_vec(),
+        );
+        let s = inspect(precedence).expect("inspect precedence");
+        assert!(!s.transition_complete && s.physical_data_dir == Some(ddir));
+
+        let mut neg_v = FileMetaVersion {
+            version_type: VersionType::Object,
+            object: Some(plain.clone()),
+            ..Default::default()
+        }
+        .marshal_msg()
+        .expect("marshal neg_v");
+        *neg_v.last_mut().expect("last byte") = 0xff;
+        assert!(FileMetaVersion::inspect_v2_object_slice(&neg_v).is_err());
+
+        let mut no_mtime = plain;
+        no_mtime.mod_time = None;
+        assert!(inspect(no_mtime).is_err());
+    }
+
+    #[test]
+    fn borrowed_meta_object_covers_inline_cap_overflow_and_duplicate_keys() {
+        for count in [
+            BORROWED_META_SYS_INLINE_CAP - 1,
+            BORROWED_META_SYS_INLINE_CAP,
+            BORROWED_META_SYS_INLINE_CAP + 1,
+            20,
+        ] {
+            let mut obj = signed_object();
+            obj.version_id = Some(sample_version_id());
+            obj.data_dir = Some(Uuid::new_v4());
+            for idx in 0..count {
+                obj.meta_sys
+                    .insert(format!("{RUSTFS_INTERNAL_PREFIX}custom-key-{idx}"), format!("val-{idx}").into_bytes());
+            }
+            let bytes = FileMetaVersion {
+                version_type: VersionType::Object,
+                object: Some(obj),
+                ..Default::default()
+            }
+            .marshal_msg()
+            .expect("marshal version");
+
+            assert!(
+                BorrowedMetaObject::decode_version_slice(&bytes).is_ok(),
+                "borrowed decode must succeed at count={count}"
+            );
+            let fast = FileMetaVersion::decode_fileinfo_from_slice(&bytes, "bucket", "object", true, true).expect("fast decode");
+            let full = FileMetaVersion::try_from(bytes.as_slice())
+                .expect("full decode")
+                .into_fileinfo_with_part_checksums("bucket", "object", true, true)
+                .expect("full into_fileinfo");
+            assert_eq!(fast.metadata, full.metadata, "mismatch at MetaSys count={count}");
+        }
+
+        let mut raw = Vec::new();
+        rmp::encode::write_map_len(&mut raw, 2).expect("outer map");
+        rmp::encode::write_str(&mut raw, "Type").expect("Type key");
+        rmp::encode::write_uint(&mut raw, 1).expect("Type=Object");
+        rmp::encode::write_str(&mut raw, "V2Obj").expect("V2Obj key");
+        rmp::encode::write_map_len(&mut raw, 4).expect("V2Obj map");
+        rmp::encode::write_str(&mut raw, "EcAlgo").expect("EcAlgo");
+        rmp::encode::write_uint(&mut raw, 1).expect("ReedSolomon");
+        rmp::encode::write_str(&mut raw, "CSumAlgo").expect("CSumAlgo");
+        rmp::encode::write_uint(&mut raw, 1).expect("HighwayHash");
+        rmp::encode::write_str(&mut raw, "MTime").expect("MTime");
+        rmp::encode::write_sint(&mut raw, 1_700_000_000_000_000_000).expect("mtime nanos");
+        rmp::encode::write_str(&mut raw, "MetaSys").expect("MetaSys");
+        rmp::encode::write_map_len(&mut raw, 17).expect("17 encoded MetaSys entries");
+        for idx in 0..16 {
+            let k = format!("{RUSTFS_INTERNAL_PREFIX}dup-key-{idx}");
+            let v = format!("first-{idx}");
+            rmp::encode::write_str(&mut raw, &k).expect("key");
+            rmp::encode::write_bin(&mut raw, v.as_bytes()).expect("val");
+        }
+        let dup_k = format!("{RUSTFS_INTERNAL_PREFIX}dup-key-0");
+        rmp::encode::write_str(&mut raw, &dup_k).expect("dup key");
+        rmp::encode::write_bin(&mut raw, b"overwritten-0").expect("dup val");
+
+        assert!(BorrowedMetaObject::decode_version_slice(&raw).is_ok());
+        let fast = FileMetaVersion::decode_fileinfo_from_slice(&raw, "bucket", "object", true, true).expect("fast dup decode");
+        let full = FileMetaVersion::try_from(raw.as_slice())
+            .expect("full dup decode")
+            .into_fileinfo_with_part_checksums("bucket", "object", true, true)
+            .expect("full dup into_fileinfo");
+        assert_eq!(fast.metadata, full.metadata);
+        assert_eq!(fast.metadata.get(&dup_k).map(String::as_str), Some("overwritten-0"));
+
+        let mut stale = Vec::new();
+        rmp::encode::write_map_len(&mut stale, 4).expect("outer map");
+        rmp::encode::write_str(&mut stale, "Type").expect("Type");
+        rmp::encode::write_uint(&mut stale, 1).expect("Type=Object");
+        rmp::encode::write_str(&mut stale, "V2Obj").expect("V2Obj 1");
+        rmp::encode::write_map_len(&mut stale, 3).expect("valid V2Obj");
+        rmp::encode::write_str(&mut stale, "EcAlgo").expect("EcAlgo");
+        rmp::encode::write_uint(&mut stale, 1).expect("EcAlgo=1");
+        rmp::encode::write_str(&mut stale, "CSumAlgo").expect("CSumAlgo");
+        rmp::encode::write_uint(&mut stale, 1).expect("CSumAlgo=1");
+        rmp::encode::write_str(&mut stale, "MTime").expect("MTime");
+        rmp::encode::write_sint(&mut stale, 1_700_000_000_000_000_000).expect("MTime=valid");
+        rmp::encode::write_str(&mut stale, "V2Obj").expect("V2Obj 2");
+        rmp::encode::write_nil(&mut stale).expect("nil V2Obj");
+        rmp::encode::write_str(&mut stale, "V2Obj").expect("V2Obj 3");
+        rmp::encode::write_map_len(&mut stale, 0).expect("empty V2Obj");
+        assert!(BorrowedMetaObject::decode_version_slice(&stale).is_err());
+        assert!(FileMetaVersion::try_from(stale.as_slice()).is_err());
     }
 }
 

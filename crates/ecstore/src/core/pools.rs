@@ -3486,7 +3486,13 @@ fn resolve_decommission_progress_save_result(result: Result<()>) -> Option<Error
 }
 
 fn resolve_decommission_preflight_heal_result<T>(bucket: &str, result: Result<T>) -> Result<T> {
-    result.map_err(|err| Error::other(format!("decommission preflight heal failed for bucket {bucket}: {err}")))
+    result.map_err(|err| match err {
+        // A peer whose movement gate has a queued writer refuses the bucket
+        // heal instead of waiting; the refusal crosses the disk layer as
+        // `TooManyOpenFiles`. Keep it retryable so the start answers 503.
+        Error::SlowDown | Error::TooManyOpenFiles => Error::SlowDown,
+        err => Error::other(format!("decommission preflight heal failed for bucket {bucket}: {err}")),
+    })
 }
 
 fn resolve_decommission_optional_bucket_config_result<T>(bucket: &str, stage: &str, result: Result<T>) -> Result<Option<T>> {
@@ -11515,7 +11521,7 @@ type DecommissionCapacityInfoOverrides =
 #[cfg(any(test, feature = "test-util"))]
 static DECOMMISSION_CAPACITY_INFO_OVERRIDES: std::sync::OnceLock<DecommissionCapacityInfoOverrides> = std::sync::OnceLock::new();
 
-/// Queues capacity snapshots consumed in order by `get_decommission_all_pool_capacity_infos`;
+/// Queues capacity snapshots consumed in order by decommission capacity sampling;
 /// the final snapshot is retained and replayed for every subsequent sample, so tests never
 /// fall back to the host's real disk statistics once an override is installed.
 #[cfg(any(test, feature = "test-util"))]
@@ -12288,10 +12294,7 @@ impl Drop for LifecycleDataMovementMutationBarrier {
 }
 
 #[cfg(test)]
-async fn pause_lifecycle_data_movement_mutation(bucket: &str, object: &str, has_run_fence_signal: bool) {
-    if !has_run_fence_signal {
-        return;
-    }
+async fn pause_lifecycle_data_movement_mutation(bucket: &str, object: &str) {
     let barrier = LIFECYCLE_DATA_MOVEMENT_MUTATION_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
@@ -12368,7 +12371,7 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
         }
         action if lifecycle_action_removes_data_movement_version(action) => {
             #[cfg(test)]
-            pause_lifecycle_data_movement_mutation(bucket, &version.name, lock_lost_signal.is_some()).await;
+            pause_lifecycle_data_movement_mutation(bucket, &version.name).await;
             if lifecycle_delete_all_versions_blocked_by_replication(store.clone(), bucket, &object_info.name, action).await? {
                 return Ok(false);
             }
@@ -12376,6 +12379,43 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
                 || match lock_lost_signal {
                     Some(signal) => {
                         apply_expiry_rule_for_data_movement(store, &event, event_source, &object_info, Some(signal)).await
+                    }
+                    // The source cleanup removes an expired version whether or
+                    // not its expiry ran. For a transitioned version, only an
+                    // applied expiry leaves the tier free version on the source
+                    // before that cleanup, so the entry moves it to a target
+                    // instead of leaving it behind for the post-check.
+                    None if !object_info.transitioned_object.status.is_empty() => {
+                        // A delete-all is a prefix delete that takes the bucket
+                        // lifecycle write lock, which the lifecycle read lock
+                        // held here and by the entry would block until timeout.
+                        let delete_all = action.delete_all();
+                        #[cfg(test)]
+                        let injected =
+                            decommission_test_wrap_result("lifecycle_expiry_apply", bucket, &version.name, 1, Ok(())).is_err();
+                        #[cfg(not(test))]
+                        let injected = false;
+                        if delete_all
+                            || injected
+                            || !apply_expiry_rule_for_data_movement(store, &event, event_source, &object_info, None).await
+                        {
+                            // The version is still live, so it moves like any
+                            // other version and lifecycle expires it on the
+                            // target.
+                            warn!(
+                                event = EVENT_DECOMMISSION_ENTRY,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_POOLS,
+                                state = "lifecycle_expiry_deferred",
+                                bucket = %bucket,
+                                object = %version.name,
+                                action = ?action,
+                                reason = if delete_all { "delete_all_needs_bucket_write_lock" } else { "not_applied" },
+                                "Data movement deferred a transitioned version's lifecycle expiry; moving the version"
+                            );
+                            return Ok(false);
+                        }
+                        true
                     }
                     None => apply_expiry_rule_in(store, &event, event_source, &object_info).await,
                 };
@@ -12747,6 +12787,19 @@ impl ECStore {
         let (pool_meta_guard, snapshot) = self
             .acquire_pool_meta_read_guard(&save_guard, "target capacity admission failed")
             .await?;
+        // A scanner publication must cover the complete durable membership.
+        // A smaller startup view could otherwise overwrite an expanded commit
+        // proof with its older stable rollback, even though every target is writable.
+        if matches!(admission, DecommissionCapacityAdmission::ScannerBacklog)
+            && !snapshot
+                .pools
+                .iter()
+                .enumerate()
+                .filter_map(|(index, _)| snapshot.scanner_pause_backlog_pool_writable(index).then_some(index))
+                .eq(target_pool_indices.iter().copied())
+        {
+            return Err(Error::SlowDown);
+        }
         for target_pool_index in target_pool_indices.iter().copied() {
             ensure_external_decommission_target_admission(&snapshot, target_pool_index, admission)?;
         }
@@ -13656,16 +13709,17 @@ impl ECStore {
                 .lock_lost_signal()
         };
 
-        let capacity_infos = if pending_added > 0 {
-            self.get_decommission_all_pool_capacity_infos().await?
+        // Intent persistence changes disk usage. Refresh the target baseline,
+        // while admission and finalization retain their global reservation checks.
+        let before_free = if pending_added > 0 {
+            self.get_decommission_prewrite_free_capacity(target_pool_index).await?
         } else {
             capacity_infos
+                .iter()
+                .find(|capacity| capacity.pool_index == target_pool_index)
+                .map(|capacity| capacity.physical_free)
+                .ok_or_else(|| decommission_capacity_blocked_error("target capacity snapshot is missing before mutation"))?
         };
-        let before_free = capacity_infos
-            .iter()
-            .find(|capacity| capacity.pool_index == target_pool_index)
-            .map(|capacity| capacity.physical_free)
-            .ok_or_else(|| decommission_capacity_blocked_error("target capacity snapshot is missing before mutation"))?;
 
         let result = operation.take().expect("capacity-admitted operation should run once")(capacity_lease).await;
         let clear_pending_on_temporary_release = result.as_ref().ok().is_some_and(&clear_pending_on_temporary_release);
@@ -14729,6 +14783,21 @@ impl ECStore {
         } else {
             Err(invalid_decommission_pool_index_error(self.pools.len(), idx))
         }
+    }
+
+    async fn get_decommission_prewrite_free_capacity(&self, target_pool_index: usize) -> Result<usize> {
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(capacity_infos) = take_decommission_capacity_info_override_for_test(self.id) {
+            return capacity_infos
+                .iter()
+                .find(|capacity| capacity.pool_index == target_pool_index)
+                .map(|capacity| capacity.physical_free)
+                .ok_or_else(|| decommission_capacity_blocked_error("target capacity snapshot is missing before mutation"));
+        }
+
+        self.get_decommission_pool_capacity_info(target_pool_index, false)
+            .await
+            .map(|capacity| capacity.physical_free)
     }
 
     async fn get_decommission_all_pool_capacity_infos(&self) -> Result<Vec<DecommissionPoolCapacityInfo>> {
@@ -16512,6 +16581,16 @@ impl ECStore {
         source_pool_index: usize,
         source_bytes: usize,
     ) -> Result<()> {
+        self.prepare_scanner_pause_backlog_retirement_targets_for_test(&[source_pool_index], source_bytes)
+            .await
+    }
+
+    #[cfg(feature = "test-util")]
+    pub async fn prepare_scanner_pause_backlog_retirement_targets_for_test(
+        &self,
+        source_pool_indices: &[usize],
+        source_bytes: usize,
+    ) -> Result<()> {
         let source_bytes = source_bytes.max(1);
         let total = source_bytes.saturating_mul(8).saturating_add(64 * 1024);
         let capacities = (0..self.pools.len())
@@ -16519,14 +16598,18 @@ impl ECStore {
                 DecommissionPoolCapacityInfo::for_test(
                     pool_index,
                     DecommissionErasureLayout { data: 1, parity: 0 },
-                    if pool_index == source_pool_index { 0 } else { total },
+                    if source_pool_indices.contains(&pool_index) { 0 } else { total },
                     total,
-                    if pool_index == source_pool_index { source_bytes } else { 0 },
+                    if source_pool_indices.contains(&pool_index) {
+                        source_bytes
+                    } else {
+                        0
+                    },
                 )
             })
             .collect();
         set_decommission_capacity_info_overrides_for_test(self.id, vec![capacities]);
-        self.save_current_pool_meta_for_decommission_start(&[source_pool_index], Vec::new())
+        self.save_current_pool_meta_for_decommission_start(source_pool_indices, Vec::new())
             .await
             .map(|_| ())
     }
@@ -16628,8 +16711,8 @@ impl ECStore {
         capacity_owner: Option<DecommissionCapacityOwner>,
     ) -> Result<DecommissionEntryAttemptOutcome> {
         use data_movement::scanner_backlog::{
-            SCANNER_PAUSE_BACKLOG_PATH, persist_native_scanner_pause_backlog_replica, plan_scanner_pause_backlog_retirement,
-            read_scanner_pause_backlog_retirement_replicas,
+            SCANNER_PAUSE_BACKLOG_PATH, ScannerPauseBacklogRetirementPhase, persist_native_scanner_pause_backlog_replica,
+            plan_scanner_pause_backlog_retirement, read_scanner_pause_backlog_retirement_replicas,
         };
 
         if expected.versions.is_empty() && expected.free_versions.is_empty() {
@@ -16684,19 +16767,32 @@ impl ECStore {
             .pools
             .iter()
             .enumerate()
-            .filter(|(pool_index, _)| *pool_index == idx || snapshot.scanner_pause_backlog_pool_writable(*pool_index))
-            .flat_map(|(_, pool)| pool.disk_set.iter().cloned())
+            // Queued pools can still carry members of the last native commit.
+            // Read their proof without admitting them as handoff destinations.
+            .filter(|(pool_index, _)| {
+                *pool_index == idx
+                    || snapshot
+                        .pools
+                        .get(*pool_index)
+                        .is_some_and(|pool| !pool.decommission.as_ref().is_some_and(|info| info.complete))
+            })
+            .flat_map(|(pool_index, pool)| {
+                let writable = snapshot.scanner_pause_backlog_pool_writable(pool_index);
+                pool.disk_set.iter().map(move |set| (Arc::clone(set), writable))
+            })
             .collect();
         let mut replicas = read_scanner_pause_backlog_retirement_replicas(idx, set.set_index, sets.clone()).await?;
-        if let Some(plan) = plan_scanner_pause_backlog_retirement(idx, &replicas)? {
+        if let Some(plan) =
+            plan_scanner_pause_backlog_retirement(idx, &replicas, ScannerPauseBacklogRetirementPhase::InitialRead)?
+        {
             let expected_stable_record = plan.stable_record.clone();
             let mut phases = Vec::with_capacity(3);
             if let Some(record) = plan.seed_record {
-                phases.push(("seed", record));
+                phases.push(("seed", ScannerPauseBacklogRetirementPhase::SeedReadback, record));
             }
-            phases.push(("commit", plan.commit_record));
-            phases.push(("stabilize", plan.stable_record));
-            for (phase, record) in phases {
+            phases.push(("commit", ScannerPauseBacklogRetirementPhase::CommitReadback, plan.commit_record));
+            phases.push(("stabilize", ScannerPauseBacklogRetirementPhase::StabilizeReadback, plan.stable_record));
+            for (phase, readback_phase, record) in phases {
                 if object_fence.is_lock_lost()
                     || pool_meta_guard.is_lock_lost()
                     || !reservation.admits_owner(owner, OffsetDateTime::now_utc())
@@ -16705,28 +16801,37 @@ impl ECStore {
                         "scanner pause backlog retirement fence expired during native repair",
                     ));
                 }
-                for read in replicas.iter().filter(|read| read.replica.pool_index != idx) {
+                for read in replicas
+                    .iter()
+                    .filter(|read| read.replica.pool_index != idx && read.replica.writable)
+                {
                     ensure_external_decommission_target_admission(
                         &snapshot,
                         read.replica.pool_index,
                         DecommissionCapacityAdmission::ScannerBacklog,
                     )?;
                 }
-                let results = join_all(replicas.iter().filter(|read| read.replica.pool_index != idx).map(|read| {
-                    let target = Arc::clone(&self.pools[read.replica.pool_index].disk_set[read.replica.set_index]);
-                    let record = record.clone();
-                    let object_fence = &object_fence;
-                    let pool_meta_guard = &pool_meta_guard;
-                    async move {
-                        let mut opts = ObjectOptions {
-                            no_lock: self.pools[0].disk_set[0].shares_namespace_lock_domain(&target).await,
-                            ..Default::default()
-                        };
-                        object_fence.add_namespace_lock_fence(&mut opts);
-                        opts.add_namespace_lock_guard(pool_meta_guard);
-                        persist_native_scanner_pause_backlog_replica(target, record, read.preconditions(), opts, phase).await
-                    }
-                }))
+                let results = join_all(
+                    replicas
+                        .iter()
+                        .filter(|read| read.replica.pool_index != idx && read.replica.writable)
+                        .map(|read| {
+                            let target = Arc::clone(&self.pools[read.replica.pool_index].disk_set[read.replica.set_index]);
+                            let record = record.clone();
+                            let object_fence = &object_fence;
+                            let pool_meta_guard = &pool_meta_guard;
+                            async move {
+                                let mut opts = ObjectOptions {
+                                    no_lock: self.pools[0].disk_set[0].shares_namespace_lock_domain(&target).await,
+                                    ..Default::default()
+                                };
+                                object_fence.add_namespace_lock_fence(&mut opts);
+                                opts.add_namespace_lock_guard(pool_meta_guard);
+                                persist_native_scanner_pause_backlog_replica(target, record, read.preconditions(), opts, phase)
+                                    .await
+                            }
+                        }),
+                )
                 .await;
                 // Every dispatched native CAS has finished before an error can
                 // release the owned task's object and durable membership fences.
@@ -16736,20 +16841,20 @@ impl ECStore {
                 replicas = read_scanner_pause_backlog_retirement_replicas(idx, set.set_index, sets.clone()).await?;
                 if replicas
                     .iter()
-                    .filter(|read| read.replica.pool_index != idx)
+                    .filter(|read| read.replica.pool_index != idx && read.replica.writable)
                     .any(|read| read.replica.data.as_deref() != Some(record.as_slice()))
                 {
                     return Err(Error::other(
                         "scanner pause backlog native repair did not persist every surviving replica",
                     ));
                 }
-                if let Some(next) = plan_scanner_pause_backlog_retirement(idx, &replicas)?
+                if let Some(next) = plan_scanner_pause_backlog_retirement(idx, &replicas, readback_phase)?
                     && next.stable_record != expected_stable_record
                 {
                     return Err(Error::other("scanner pause backlog native authority changed during repair"));
                 }
             }
-            if plan_scanner_pause_backlog_retirement(idx, &replicas)?.is_some() {
+            if plan_scanner_pause_backlog_retirement(idx, &replicas, ScannerPauseBacklogRetirementPhase::FinalCheck)?.is_some() {
                 return Err(Error::other("scanner pause backlog native repair is not fully committed and stable"));
             }
         }
@@ -24726,6 +24831,104 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_capacity_mutation_limits_prewrite_sampling_to_target() {
+        let (_temp_dirs, store, _other_store) =
+            crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
+        start_leftover_intent_test_decommission(&store, Vec::new(), DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION).await;
+        DECOMMISSION_CAPACITY_INFO_OVERRIDES
+            .get()
+            .expect("activation should install capacity snapshots")
+            .lock()
+            .expect("capacity overrides should not be poisoned")
+            .remove(&store.id)
+            .expect("use real disk probes for the mutation");
+        let owner = leftover_intent_test_owner(&store, uuid::Uuid::new_v4()).await;
+        let disk_info_calls = async || {
+            let mut pools = Vec::new();
+            for pool in &store.pools {
+                let mut counts = Vec::new();
+                for set in &pool.disk_set {
+                    for disk in set.disk_inventory().await.into_iter().flatten() {
+                        counts.push(
+                            disk.metrics_snapshot()
+                                .expect("fixture disks must expose local metrics")
+                                .api_calls
+                                .get("disk_info")
+                                .copied()
+                                .unwrap_or_default(),
+                        );
+                    }
+                }
+                pools.push(counts);
+            }
+            pools
+        };
+        let before = disk_info_calls().await;
+        store
+            .run_decommission_capacity_admitted_mutation(1, Some(owner), Some(16), || async { Ok(()) })
+            .await
+            .expect("the capacity-accounted mutation should commit");
+        let after = disk_info_calls().await;
+        for (pool_index, (before, after)) in before.iter().zip(&after).enumerate() {
+            assert!(!before.is_empty(), "pool {pool_index} must have real disks");
+            assert_eq!(before.len(), after.len());
+            let expected = if pool_index == 1 { 3 } else { 2 };
+            for (disk_index, (before, after)) in before.iter().zip(after).enumerate() {
+                assert_eq!(
+                    after - before,
+                    expected,
+                    "pool {pool_index} disk {disk_index}: admission/finalization check every pool; prewrite checks only the target"
+                );
+            }
+        }
+        let target = leftover_intent_test_target(&store, 1).await;
+        assert_eq!(target.pending_mutation_id, None, "the durable intent must be settled");
+        assert_eq!(target.consumed_physical_bytes, 16);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_prewrite_sampling_preserves_override_order_and_missing_target_error() {
+        let (_temp_dirs, store, _other_store) =
+            crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![
+                vec![DecommissionPoolCapacityInfo::for_test(1, layout, 70, 100, 30)],
+                vec![DecommissionPoolCapacityInfo::for_test(1, layout, 40, 100, 60)],
+                vec![DecommissionPoolCapacityInfo::for_test(0, layout, 90, 100, 10)],
+            ],
+        );
+        assert_eq!(
+            store
+                .get_decommission_prewrite_free_capacity(1)
+                .await
+                .expect("first injected sample"),
+            70
+        );
+        assert_eq!(
+            store
+                .get_decommission_prewrite_free_capacity(1)
+                .await
+                .expect("second injected sample"),
+            40
+        );
+        for _ in 0..2 {
+            let error = store
+                .get_decommission_prewrite_free_capacity(1)
+                .await
+                .expect_err("missing injected target must not fall back to host capacity");
+            assert!(matches!(
+                error,
+                Error::DecommissionCapacityBlocked { message }
+                    if message == "target capacity snapshot is missing before mutation"
+            ));
+        }
+    }
+
     async fn start_leftover_intent_test_decommission(
         store: &Arc<ECStore>,
         decom_buckets: Vec<DecomBucketInfo>,
@@ -27237,40 +27440,45 @@ mod tests {
 
     #[test]
     fn decommission_scanner_backlog_handoff_retry_is_typed_and_bounded() {
-        use data_movement::scanner_backlog::ScannerPauseBacklogRetirementError;
+        use data_movement::scanner_backlog::{ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPhase};
 
-        let handoff = data_movement::data_movement_context_error(
-            "scanner pause backlog retirement planner failed: competing proofs".to_string(),
-            ScannerPauseBacklogRetirementError::HandoffConflict {
-                reason: "competing maximum-membership commit proofs".to_string(),
-            },
-        );
-        assert!(is_decommission_scanner_backlog_handoff_conflict(&handoff));
-        assert_eq!(
-            decommission_scanner_backlog_retry_kind(&handoff, DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS - 1),
-            Some(DecommissionScannerBacklogRetryKind::HandoffConflict)
-        );
-        assert_eq!(
-            decommission_scanner_backlog_retry_kind(&handoff, DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS),
-            None,
-            "a divergent handoff must not retry forever"
-        );
-
-        for non_retryable in [
-            ScannerPauseBacklogRetirementError::AuthorityConflict {
-                reason: "larger source authority".to_string(),
-            },
-            ScannerPauseBacklogRetirementError::InvalidRecord {
-                reason: "unread member".to_string(),
-            },
+        for phase in [
+            ScannerPauseBacklogRetirementPhase::InitialRead,
+            ScannerPauseBacklogRetirementPhase::SeedReadback,
+            ScannerPauseBacklogRetirementPhase::CommitReadback,
+            ScannerPauseBacklogRetirementPhase::StabilizeReadback,
+            ScannerPauseBacklogRetirementPhase::FinalCheck,
         ] {
-            let err = data_movement::data_movement_context_error("planner failed".to_string(), non_retryable);
-            assert!(!is_decommission_scanner_backlog_handoff_conflict(&err));
+            let handoff = phase.planner_error(ScannerPauseBacklogRetirementError::HandoffConflict {
+                reason: "competing maximum-membership commit proofs".to_string(),
+            });
+            assert!(is_decommission_scanner_backlog_handoff_conflict(&handoff));
             assert_eq!(
-                decommission_scanner_backlog_retry_kind(&err, 0),
-                None,
-                "only a handoff conflict may be retried"
+                decommission_scanner_backlog_retry_kind(&handoff, DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS - 1),
+                Some(DecommissionScannerBacklogRetryKind::HandoffConflict)
             );
+            assert_eq!(
+                decommission_scanner_backlog_retry_kind(&handoff, DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS),
+                None,
+                "a divergent handoff must not retry forever"
+            );
+
+            for non_retryable in [
+                ScannerPauseBacklogRetirementError::AuthorityConflict {
+                    reason: "larger source authority".to_string(),
+                },
+                ScannerPauseBacklogRetirementError::InvalidRecord {
+                    reason: "unread member".to_string(),
+                },
+            ] {
+                let err = phase.planner_error(non_retryable);
+                assert!(!is_decommission_scanner_backlog_handoff_conflict(&err));
+                assert_eq!(
+                    decommission_scanner_backlog_retry_kind(&err, 0),
+                    None,
+                    "only a handoff conflict may be retried"
+                );
+            }
         }
     }
 
@@ -33346,12 +33554,21 @@ mod pools_tests {
 
     #[test]
     fn test_resolve_decommission_preflight_heal_result_wraps_error_context() {
-        let err = resolve_decommission_preflight_heal_result::<()>("bucket-a", Err(Error::SlowDown))
+        let err = resolve_decommission_preflight_heal_result::<()>("bucket-a", Err(Error::FaultyDisk))
             .expect_err("heal failure should carry preflight context");
         assert!(
             err.to_string()
                 .contains("decommission preflight heal failed for bucket bucket-a")
         );
+    }
+
+    #[test]
+    fn test_resolve_decommission_preflight_heal_result_keeps_busy_gate_retryable() {
+        for busy in [Error::SlowDown, Error::TooManyOpenFiles] {
+            let err = resolve_decommission_preflight_heal_result::<()>("bucket-a", Err(busy))
+                .expect_err("a refused heal must fail the start");
+            assert_eq!(err, Error::SlowDown);
+        }
     }
 
     #[test]

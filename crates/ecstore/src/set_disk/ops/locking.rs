@@ -318,6 +318,14 @@ impl SetDisks {
     }
 
     pub async fn connect_disks(&self) {
+        let active_monitoring = rustfs_utils::get_env_bool(
+            disk::disk_store::ENV_RUSTFS_DRIVE_ACTIVE_MONITORING,
+            disk::disk_store::DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING,
+        );
+        self.connect_disks_with_active_monitoring(active_monitoring).await;
+    }
+
+    async fn connect_disks_with_active_monitoring(&self, active_monitoring: bool) {
         let rl = self.disks.read().await;
 
         let disks = rl.clone();
@@ -327,6 +335,13 @@ impl SetDisks {
 
         for (i, opdisk) in disks.iter().enumerate() {
             if let Some(disk) = opdisk {
+                if !active_monitoring
+                    && disk.get_disk_location().set_idx.is_some()
+                    && let disk::Disk::Local(local) = disk.as_ref()
+                    && local.can_skip_background_probe().await
+                {
+                    continue;
+                }
                 if disk.is_online().await && disk.get_disk_location().set_idx.is_some() {
                     info!("Disk {:?} is online", disk.to_string());
                     continue;
@@ -646,6 +661,102 @@ mod tests {
             .expect("format should be saved");
 
         (dir, endpoint, disk)
+    }
+
+    #[tokio::test]
+    async fn quiet_monitor_skips_idle_format_stat_but_request_detects_removal() {
+        let format = FormatV3::new(1, 1);
+        let (dir, endpoint, disk) = make_formatted_local_disk(0, &format).await;
+        assert!(disk.is_online().await, "initialize the expected disk identity");
+        let disk::Disk::Local(wrapper) = disk.as_ref() else {
+            panic!("fixture must use a local disk");
+        };
+        let local = wrapper.get_disk();
+        let set = SetDisks::new(
+            "quiet-monitor".to_owned(),
+            Arc::new(RwLock::new(vec![Some(disk.clone())])),
+            1,
+            0,
+            0,
+            0,
+            vec![endpoint],
+            format,
+            Vec::new(),
+        )
+        .await;
+        let format_path = dir.path().join(disk::RUSTFS_META_BUCKET).join(disk::FORMAT_CONFIG_FILE);
+        let saved_path = dir.path().join("saved-format.json");
+        tokio::fs::rename(&format_path, &saved_path)
+            .await
+            .expect("hide format for the idle probe");
+        local.format_info.write().await.last_check = None;
+
+        set.connect_disks_with_active_monitoring(false).await;
+        assert!(
+            local.format_info.read().await.last_check.is_none(),
+            "idle monitoring must not stat format.json"
+        );
+        assert!(
+            local.format_info.read().await.id.is_some(),
+            "idle monitoring must leave the cache untouched"
+        );
+        assert!(
+            matches!(disk.disk_info(&DiskInfoOptions::default()).await, Err(DiskError::UnformattedDisk)),
+            "a foreground request must still reject the missing format"
+        );
+        assert!(
+            local.format_info.read().await.id.is_none(),
+            "the request must invalidate the stale identity"
+        );
+
+        tokio::fs::rename(&saved_path, &format_path)
+            .await
+            .expect("restore the same disk format");
+        set.connect_disks_with_active_monitoring(false).await;
+        assert!(
+            local.format_info.read().await.last_check.is_some(),
+            "invalidated disks must still be reprobed"
+        );
+        assert!(disk.is_online().await, "the restored disk must recover without a restart");
+    }
+
+    #[tokio::test]
+    async fn quiet_monitor_still_probes_unhealthy_disks_and_active_monitoring() {
+        use disk::health_state::RuntimeDriveHealthState;
+
+        let format = FormatV3::new(1, 1);
+        let (_dir, endpoint, disk) = make_formatted_local_disk(0, &format).await;
+        assert!(disk.is_online().await, "initialize the expected disk identity");
+        let disk::Disk::Local(wrapper) = disk.as_ref() else {
+            panic!("fixture must use a local disk");
+        };
+        let local = wrapper.get_disk();
+        let set = SetDisks::new(
+            "quiet-monitor".to_owned(),
+            Arc::new(RwLock::new(vec![Some(disk.clone())])),
+            1,
+            0,
+            0,
+            0,
+            vec![endpoint],
+            format,
+            Vec::new(),
+        )
+        .await;
+        for (active, state) in [
+            (true, RuntimeDriveHealthState::Online),
+            (false, RuntimeDriveHealthState::Suspect),
+            (false, RuntimeDriveHealthState::Offline),
+            (false, RuntimeDriveHealthState::Returning),
+        ] {
+            disk.force_runtime_state_for_test(state);
+            local.format_info.write().await.last_check = None;
+            set.connect_disks_with_active_monitoring(active).await;
+            assert!(
+                local.format_info.read().await.last_check.is_some(),
+                "probe required for active={active}, state={state:?}"
+            );
+        }
     }
 
     #[tokio::test]

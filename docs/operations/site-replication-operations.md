@@ -1,8 +1,8 @@
 # Site Replication Operations
 
 **Use this when:** operating a site-replication deployment, diagnosing a peer
-outage or incomplete topology change, pairing sites that already contain data,
-or planning an upgrade.
+outage or incomplete topology change, changing a site's address, pairing sites
+that already contain data, or planning an upgrade.
 
 **Source of truth:** `rustfs/src/admin/handlers/site_replication.rs`,
 `rustfs/src/site_replication/`, and the bucket-replication worker under
@@ -147,11 +147,98 @@ production starting point for a tighter recovery objective is
 `RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES=4`; `1` forces re-descent every cycle.
 Measure the additional disk and metadata load before lowering it further or
 tuning the scanner cadence. For an immediate operator-driven recovery, start a
-site resync with `mc admin replicate resync start` and monitor its status.
+site resync with `rc admin replicate resync start` and monitor it with
+`rc admin replicate resync status` (see [Changing a site's address](#changing-a-sites-address)
+for the arguments; `mc admin replicate resync` does not work against RustFS).
 Transfer time after discovery remains proportional to backlog size, bandwidth,
 worker capacity, and target latency. Use queue depth and the rate of
 `Metrics.errors` rather than the formula alone to decide whether convergence is
 progressing.
+
+## Changing a site's address
+
+Every site stores each peer's endpoint, its own included. The local entry is
+recorded once, when the site joins, from the address the setup request used to
+reach it. Nothing re-derives it: after a server's IP or port changes, every site
+keeps the old endpoint, and the bucket targets the other sites derive from it
+keep pointing there. Replication toward the moved site stops; replication from
+it keeps working.
+
+Reads can hide the break. A `HEAD` or `GET` on the moved site may still succeed
+because it proxies to a peer that holds the object. Confirm with
+`replicate status` (`Metrics.replMetrics` online state and `failed` counters) or
+by listing a recently written key on the moved site.
+
+An endpoint edit must reach every other peer at its stored endpoint before it
+changes anything. The edited site itself is tried at its stored endpoint and
+then at the new one, so only that one site may be unreachable at its old
+address. When another peer cannot be reached, the edit fails with
+`probe endpoint target refresh on peer ... failed` and leaves every site's
+state unchanged.
+
+### Planned change: one site at a time
+
+The commands below use the RustFS CLI `rc` (`admin replicate edit` and
+`admin replicate resync` exist since rc 0.1.30). `site-a` is the moved site and
+`site-b` stands for each other site. An alias for the moved site must use its
+new address: `rc alias set` connects to the server before saving the alias.
+`--site` takes the exact deployment ID or a site name that is unique in
+`rc admin replicate info`, and every change runs only with `--yes`.
+
+Repeat for each site:
+
+1. Change the server address and start the site on the new address.
+2. Update its endpoint from any site, including the moved site itself:
+
+   ```console
+   rc alias set site-a https://<new-address>:9000 <ACCESS_KEY> <SECRET_KEY>
+   rc admin replicate info site-a
+   rc admin replicate edit site-a --site <ID-or-name> --endpoint https://<new-address>:9000 --yes
+   ```
+
+   In the Console, use **Edit Site** on that site's row in **Site Replication**.
+   Consoles that predate local-site editing only offer it on remote rows; use a
+   peer site's Console or `rc`.
+
+   `mc admin replicate update <alias> --deployment-id <ID> --endpoint <URL>`
+   also changes the endpoint, but it sends no site name, and RustFS then renames
+   the site after the new endpoint's host. Restore the name afterwards with
+   `rc admin replicate edit <alias> --site <ID> --name <name> --yes`.
+3. Check `rc --json admin replicate info` on every site: all of them list the
+   new endpoint and none reports `pendingOperation`.
+4. From every other site, resync toward the moved site to recover the writes
+   that missed it while its stored endpoint was stale:
+
+   ```console
+   rc admin replicate resync start site-b --site <ID-or-name-of-site-a> --yes
+   rc admin replicate resync status site-b --site <ID-or-name-of-site-a>
+   ```
+
+   The alias is the site that sends the objects; `rc` refuses a resync toward
+   the alias's own site. Consoles with local-site editing also offer
+   **Start Resync** in the dialog shown after **Edit Site** saves a new peer
+   endpoint.
+   `mc admin replicate resync` cannot be used: it reads the target's
+   deployment ID from `admin info`, which RustFS nests under `info`, so mc
+   reports that the alias is not part of the replication cluster.
+
+Only then move the next site.
+
+### Every site already moved
+
+When all sites changed address together, each edit needs the other peers'
+old addresses, so every edit fails. Make the old addresses reachable again for
+the duration of the repair, for example by keeping the old IP as a secondary
+address on each host or by forwarding the old address and port to the new one.
+Then, from any one site, update every site's endpoint (its own included) with
+`rc admin replicate edit`, confirm that all sites agree, remove the temporary
+addresses, and resync from each site toward every other site.
+
+Do not change a site-replication bucket target directly with bucket-level
+remote-target edits (`mc admin bucket remote edit` or the Console's bucket
+replication form). Those targets are derived from the site topology; RustFS
+rejects a connection change on them, and the endpoint must be updated through
+the site edit above.
 
 ## Pairing sites that already contain data
 

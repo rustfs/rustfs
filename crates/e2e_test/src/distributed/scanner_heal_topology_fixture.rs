@@ -69,6 +69,9 @@ pub(crate) const SEED_POOL: usize = 0;
 const TOPOLOGY_ENV: &[(&str, &str)] = &[
     ("RUSTFS_DURABILITY_MODE", "strict"),
     ("RUSTFS_NEW_BUCKET_DURABILITY_MODE", "strict"),
+    // Match the four-worker CI workload instead of scaling contention with
+    // the host's CPU count; bucket and entry migration remain concurrent.
+    ("RUSTFS_DECOMMISSION_ENTRY_CONCURRENCY", "4"),
     ("RUSTFS_SCANNER_ENABLED", "true"),
     ("RUSTFS_HEAL_ENABLED", "true"),
     ("RUSTFS_HEAL_AUTO_HEAL_ENABLE", "true"),

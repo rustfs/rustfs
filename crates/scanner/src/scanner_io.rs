@@ -1510,7 +1510,7 @@ fn scanner_results_form_complete_snapshot(results: &[DataUsageCache], expected_s
         && scanner_results_match_scan_scope(results, expected_sources)
 }
 
-fn checked_bucket_usage_info(entry: &DataUsageEntry) -> Option<BucketUsageInfo> {
+fn checked_bucket_usage_info(entry: DataUsageEntry) -> Option<BucketUsageInfo> {
     let mut usage = BucketUsageInfo {
         size: u64::try_from(entry.size).ok()?,
         versions_count: u64::try_from(entry.versions).ok()?,
@@ -1521,12 +1521,12 @@ fn checked_bucket_usage_info(entry: &DataUsageEntry) -> Option<BucketUsageInfo> 
         ..Default::default()
     };
 
-    if let Some(replication) = &entry.replication_stats {
+    if let Some(replication) = entry.replication_stats {
         usage.replica_size = replication.replica_size;
         usage.replica_count = replication.replica_count;
-        for (target, stats) in &replication.targets {
+        for (target, stats) in replication.targets {
             usage.replication_info.insert(
-                target.clone(),
+                target,
                 BucketTargetUsageInfo {
                     replication_pending_size: stats.pending_size,
                     replicated_size: stats.replicated_size,

@@ -204,6 +204,398 @@ fn bench_delete_inline_versions(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_metacache_stream_page(c: &mut Criterion) {
+    let xl_bytes = create_real_xlmeta().expect("create_real_xlmeta failed");
+    let mut entries = Vec::with_capacity(2000);
+    for i in 0..1000 {
+        entries.push(MetaCacheEntry {
+            name: format!("prefix/subprefix/object-{i:04}"),
+            metadata: xl_bytes.clone(),
+            cached: None,
+            reusable: false,
+        });
+        entries.push(MetaCacheEntry {
+            name: format!("prefix/subprefix/object-{i:04}/"),
+            metadata: Vec::new(),
+            cached: None,
+            reusable: false,
+        });
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current_thread runtime");
+
+    let encoded_stream = rt.block_on(async {
+        let mut cursor = std::io::Cursor::new(Vec::with_capacity(512 * 1024));
+        let mut writer = rustfs_filemeta::MetacacheWriter::new(&mut cursor);
+        writer.write(&entries).await.expect("encode entries");
+        writer.close().await.expect("close stream");
+        cursor.into_inner()
+    });
+
+    let mut group = c.benchmark_group("metacache_stream_page");
+
+    group.bench_function("reader_read_all/1000_objects", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let mut reader =
+                    rustfs_filemeta::MetacacheReader::new(std::io::Cursor::new(black_box(encoded_stream.as_slice())));
+                let out = reader.read_all().await.expect("read_all");
+                black_box(out.len());
+            });
+        });
+    });
+
+    group.bench_function("duplex_4k_write_and_read/1000_objects", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let (rd, mut wr) = tokio::io::duplex(4096);
+                let entries_ref = &entries;
+                let writer_fut = async move {
+                    let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
+                    for chunk in entries_ref.chunks(64) {
+                        out.write(chunk).await.expect("write");
+                    }
+                    out.close().await.expect("close");
+                };
+                let reader_fut = async move {
+                    let mut reader = rustfs_filemeta::MetacacheReader::new(rd);
+                    let out = reader.read_all().await.expect("read_all");
+                    black_box(out.len());
+                };
+                tokio::join!(writer_fut, reader_fut);
+            });
+        });
+    });
+
+    group.bench_function("duplex_4k_write_obj_and_read/1000_objects", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let (rd, mut wr) = tokio::io::duplex(4096);
+                let entries_ref = &entries;
+                let writer_fut = async move {
+                    let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
+                    for entry in entries_ref {
+                        out.write_obj(entry).await.expect("write_obj");
+                    }
+                    out.close().await.expect("close");
+                };
+                let reader_fut = async move {
+                    let mut reader = rustfs_filemeta::MetacacheReader::new(rd);
+                    let out = reader.read_all().await.expect("read_all");
+                    black_box(out.len());
+                };
+                tokio::join!(writer_fut, reader_fut);
+            });
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_metacache_resolve(c: &mut Criterion) {
+    use rustfs_filemeta::{FileMetaVersion, MetaCacheEntries, MetadataResolutionParams};
+
+    const N: u64 = 1_000;
+    let current_data = create_realistic_object_xlmeta().expect("realistic xl.meta");
+    let stale_data = create_real_xlmeta().expect("stale xl.meta");
+
+    // Build realistic per-disk xl.meta buffers with distinct `erasure_index` values so raw bytes
+    // and CRCs differ across disks while version headers remain identical.
+    let base_fm = FileMeta::load(&current_data).expect("load current_data");
+    let per_disk_data: Vec<Vec<u8>> = (1..=8usize)
+        .map(|disk_idx| {
+            let mut fm = base_fm.clone();
+            let mut ver = FileMetaVersion::try_from(fm.versions[0].meta.as_slice()).expect("decode version");
+            ver.object.as_mut().expect("object").erasure_index = disk_idx;
+            fm.versions[0].meta = ver.marshal_msg().expect("marshal version");
+            fm.marshal_msg().expect("marshal fm")
+        })
+        .collect();
+    assert_ne!(per_disk_data[0], per_disk_data[1]);
+
+    let sets_4_agree: Vec<MetaCacheEntries> = (0..N)
+        .map(|i| {
+            let name = format!("prefix/object-{i:08}");
+            MetaCacheEntries(
+                (0..4)
+                    .map(|disk| {
+                        Some(MetaCacheEntry {
+                            name: name.clone(),
+                            metadata: per_disk_data[disk].clone(),
+                            cached: None,
+                            reusable: false,
+                        })
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+
+    let sets_8_agree: Vec<MetaCacheEntries> = (0..N)
+        .map(|i| {
+            let name = format!("prefix/object-{i:08}");
+            MetaCacheEntries(
+                (0..8)
+                    .map(|disk| {
+                        Some(MetaCacheEntry {
+                            name: name.clone(),
+                            metadata: per_disk_data[disk].clone(),
+                            cached: None,
+                            reusable: false,
+                        })
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+
+    let sets_8_disagree: Vec<MetaCacheEntries> = (0..N)
+        .map(|i| {
+            let name = format!("prefix/object-{i:08}");
+            let stale_slot = (i as usize) % 8;
+            MetaCacheEntries(
+                (0..8)
+                    .map(|disk| {
+                        Some(MetaCacheEntry {
+                            name: name.clone(),
+                            metadata: if disk == stale_slot {
+                                stale_data.clone()
+                            } else {
+                                per_disk_data[disk].clone()
+                            },
+                            cached: None,
+                            reusable: false,
+                        })
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+
+    // Also build a realistic 13-version per-disk corpus (`create_complex_xlmeta`) with distinct
+    // `erasure_index` per drive to measure versioned bucket quorum resolution and steady-state `matches_strict`.
+    let complex_data = create_complex_xlmeta().expect("complex xl.meta");
+    let complex_base_fm = FileMeta::load(&complex_data).expect("load complex_data");
+    let per_disk_complex: Vec<Vec<u8>> = (1..=8usize)
+        .map(|disk_idx| {
+            let mut fm = complex_base_fm.clone();
+            for shallow in &mut fm.versions {
+                let mut ver = FileMetaVersion::try_from(shallow.meta.as_slice()).expect("decode version");
+                if let Some(obj) = ver.object.as_mut() {
+                    obj.erasure_index = disk_idx;
+                    shallow.meta = ver.marshal_msg().expect("marshal version");
+                }
+            }
+            fm.marshal_msg().expect("marshal complex fm")
+        })
+        .collect();
+    assert_ne!(per_disk_complex[0], per_disk_complex[1]);
+
+    let sets_8_agree_13v: Vec<MetaCacheEntries> = (0..N)
+        .map(|i| {
+            let name = format!("prefix/versioned-{i:08}");
+            MetaCacheEntries(
+                (0..8)
+                    .map(|disk| {
+                        Some(MetaCacheEntry {
+                            name: name.clone(),
+                            metadata: per_disk_complex[disk].clone(),
+                            cached: None,
+                            reusable: false,
+                        })
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+
+    let sets_8_disagree_13v: Vec<MetaCacheEntries> = (0..N)
+        .map(|i| {
+            let name = format!("prefix/versioned-{i:08}");
+            let stale_slot = (i as usize) % 8;
+            MetaCacheEntries(
+                (0..8)
+                    .map(|disk| {
+                        Some(MetaCacheEntry {
+                            name: name.clone(),
+                            metadata: if disk == stale_slot {
+                                stale_data.clone()
+                            } else {
+                                per_disk_complex[disk].clone()
+                            },
+                            cached: None,
+                            reusable: false,
+                        })
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    let mut group = c.benchmark_group("metacache_resolve");
+    group.throughput(Throughput::Elements(N));
+
+    group.bench_function("4_disks_agree/1000_objects", |b| {
+        b.iter(|| {
+            for entries in &sets_4_agree {
+                let resolved = entries.resolve(MetadataResolutionParams {
+                    dir_quorum: 2,
+                    obj_quorum: 2,
+                    requested_versions: 1,
+                    bucket: "bucket".to_string(),
+                    strict: false,
+                    write_quorum_slack: 0,
+                    candidates: Vec::new(),
+                });
+                black_box(resolved);
+            }
+        });
+    });
+
+    group.bench_function("8_disks_agree/1000_objects", |b| {
+        b.iter(|| {
+            for entries in &sets_8_agree {
+                let resolved = entries.resolve(MetadataResolutionParams {
+                    dir_quorum: 4,
+                    obj_quorum: 4,
+                    requested_versions: 1,
+                    bucket: "bucket".to_string(),
+                    strict: false,
+                    write_quorum_slack: 0,
+                    candidates: Vec::new(),
+                });
+                black_box(resolved);
+            }
+        });
+    });
+
+    group.bench_function("8_disks_write_quorum/1000_objects", |b| {
+        b.iter(|| {
+            for entries in &sets_8_agree {
+                let resolved = entries.resolve_with_write_quorum(MetadataResolutionParams {
+                    dir_quorum: 4,
+                    obj_quorum: 4,
+                    requested_versions: 1,
+                    bucket: "bucket".to_string(),
+                    strict: true,
+                    write_quorum_slack: 0,
+                    candidates: Vec::new(),
+                });
+                black_box(resolved);
+            }
+        });
+    });
+
+    group.bench_function("8_disks_disagree_merge/1000_objects", |b| {
+        b.iter(|| {
+            for entries in &sets_8_disagree {
+                let resolved = entries.resolve_with_write_quorum(MetadataResolutionParams {
+                    dir_quorum: 4,
+                    obj_quorum: 4,
+                    requested_versions: 1,
+                    bucket: "bucket".to_string(),
+                    strict: true,
+                    write_quorum_slack: 0,
+                    candidates: Vec::new(),
+                });
+                black_box(resolved);
+            }
+        });
+    });
+
+    group.bench_function("8_disks_agree_13_versions/1000_objects", |b| {
+        b.iter(|| {
+            for entries in &sets_8_agree_13v {
+                let resolved = entries.resolve_with_write_quorum(MetadataResolutionParams {
+                    dir_quorum: 4,
+                    obj_quorum: 4,
+                    requested_versions: 1,
+                    bucket: "bucket".to_string(),
+                    strict: true,
+                    write_quorum_slack: 0,
+                    candidates: Vec::new(),
+                });
+                black_box(resolved);
+            }
+        });
+    });
+
+    group.bench_function("8_disks_disagree_13_versions/1000_objects", |b| {
+        b.iter(|| {
+            for entries in &sets_8_disagree_13v {
+                let resolved = entries.resolve_with_write_quorum(MetadataResolutionParams {
+                    dir_quorum: 4,
+                    obj_quorum: 4,
+                    requested_versions: 1,
+                    bucket: "bucket".to_string(),
+                    strict: true,
+                    write_quorum_slack: 0,
+                    candidates: Vec::new(),
+                });
+                black_box(resolved);
+            }
+        });
+    });
+
+    group.bench_function("8_disks_matches_strict_1v/1000_objects", |b| {
+        let mut sets = sets_8_agree
+            .iter()
+            .map(|entries| {
+                entries
+                    .as_ref()
+                    .iter()
+                    .map(|opt| opt.as_ref().expect("entry").clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        b.iter(|| {
+            for set in &mut sets {
+                let (first, rest) = set.split_first_mut().expect("non-empty");
+                first.cached = None;
+                let mut agree = 1usize;
+                for other in rest.iter() {
+                    if first.matches_strict(other) {
+                        agree += 1;
+                    }
+                }
+                assert_eq!(agree, 8);
+                black_box(&first.cached);
+            }
+        });
+    });
+
+    group.bench_function("8_disks_matches_strict_13v/1000_objects", |b| {
+        let mut sets = sets_8_agree_13v
+            .iter()
+            .map(|entries| {
+                entries
+                    .as_ref()
+                    .iter()
+                    .map(|opt| opt.as_ref().expect("entry").clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        b.iter(|| {
+            for set in &mut sets {
+                let (first, rest) = set.split_first_mut().expect("non-empty");
+                first.cached = None;
+                let mut agree = 1usize;
+                for other in rest.iter() {
+                    if first.matches_strict(other) {
+                        agree += 1;
+                    }
+                }
+                assert_eq!(agree, 8);
+                black_box(&first.cached);
+            }
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_create_real_xlmeta,
@@ -218,7 +610,9 @@ criterion_group!(
     bench_validate_integrity,
     bench_into_fileinfo_realistic,
     bench_list_page_to_fileinfo,
-    bench_delete_inline_versions
+    bench_delete_inline_versions,
+    bench_metacache_stream_page,
+    bench_metacache_resolve
 );
 
 criterion_main!(benches);

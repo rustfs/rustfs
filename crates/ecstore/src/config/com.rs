@@ -48,13 +48,18 @@ use rustfs_filemeta::FileInfo;
 use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::LazyLock;
 use std::sync::{Arc, RwLock};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{OwnedRwLockWriteGuard, RwLock as AsyncRwLock};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
+
+#[cfg(test)]
+mod compatibility_tests;
+mod diagnostics;
+
+use diagnostics::{CompatibilityDiagnostics, DecodeFailure, report_decode_failure};
 
 pub const CONFIG_PREFIX: &str = "config";
 const SERVER_CONFIG_OBJECT: &str = "config/config.json";
@@ -75,8 +80,18 @@ where
     F::Output: Send + 'static,
 {
     // Capture before spawning; detached transactions outlive their request waiter.
-    let context = rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context();
-    tokio::spawn(rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(context, future))
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let future = crate::cluster::rpc::runtime_sources::with_read_version_diagnostic_context(
+        crate::cluster::rpc::runtime_sources::ReadVersionDiagnosticContext::capture(),
+        rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::ConfigTask,
+        future,
+    );
+    #[cfg(not(feature = "diagnostic-read-version-caller"))]
+    let future = rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(
+        rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context(),
+        future,
+    );
+    tokio::spawn(future)
 }
 
 /// Runs one complete server-config transaction while holding both the local
@@ -179,7 +194,7 @@ const EVENT_SERVER_CONFIG_READ_FAILED: &str = "server_config_read_failed";
 const EVENT_SERVER_CONFIG_HEAL_RESULT: &str = "server_config_heal_result";
 const EVENT_SERVER_CONFIG_RECOVERED: &str = "server_config_recovered_after_heal";
 const EVENT_SERVER_CONFIG_FALLBACK: &str = "server_config_corruption_fallback";
-const EVENT_SERVER_CONFIG_SCALAR_SECTION_IGNORED: &str = "server_config_scalar_section_ignored";
+const EVENT_SERVER_CONFIG_COMPATIBILITY_IGNORED: &str = "server_config_compatibility_ignored";
 
 fn config_corruption_recovery_enabled() -> bool {
     rustfs_utils::get_env_bool(ENV_CONFIG_RECOVER_ON_CORRUPTION, DEFAULT_CONFIG_RECOVER_ON_CORRUPTION)
@@ -230,55 +245,6 @@ fn server_config_decrypt_fn() -> Option<ServerConfigDecryptFn> {
     SERVER_CONFIG_DECRYPT_FN.read().ok().and_then(|guard| guard.clone())
 }
 
-/// Dedup set for [`warn_ignored_scalar_section`], keyed by (subsystem, value)
-/// hash. The persisted config is re-read on a short interval (event-notifier
-/// reconcile runs every 5s), so an undeduplicated warn would flood the log with
-/// one line per cycle for the same unchanged remnant.
-static IGNORED_SCALAR_SECTION_WARNED: LazyLock<RwLock<HashSet<u64>>> = LazyLock::new(|| RwLock::new(HashSet::new()));
-const IGNORED_SCALAR_SECTION_WARNED_CAP: usize = 64;
-
-fn should_warn_ignored_scalar_section(subsystem_key: &str, config_value: &Value) -> bool {
-    let mut hasher = DefaultHasher::new();
-    subsystem_key.hash(&mut hasher);
-    config_value.to_string().hash(&mut hasher);
-    let digest = hasher.finish();
-
-    let Ok(mut seen) = IGNORED_SCALAR_SECTION_WARNED.write() else {
-        return true;
-    };
-    if seen.contains(&digest) {
-        return false;
-    }
-    if seen.len() >= IGNORED_SCALAR_SECTION_WARNED_CAP {
-        seen.clear();
-    }
-    seen.insert(digest);
-    true
-}
-
-fn warn_ignored_scalar_section(subsystem_key: &str, config_value: &Value) {
-    if !should_warn_ignored_scalar_section(subsystem_key, config_value) {
-        return;
-    }
-    let mut rendered = config_value.to_string();
-    if rendered.len() > 128 {
-        let mut cut = 128;
-        while !rendered.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        rendered.truncate(cut);
-        rendered.push('…');
-    }
-    warn!(
-        event = EVENT_SERVER_CONFIG_SCALAR_SECTION_IGNORED,
-        component = LOG_COMPONENT_CONFIG,
-        subsystem = LOG_SUBSYSTEM_CONFIG,
-        config_subsystem = subsystem_key,
-        ignored_value = %rendered,
-        "Ignoring persisted {subsystem_key} config with a legacy scalar shape; it carries no decodable settings and is dropped on the next config save"
-    );
-}
-
 #[cfg(test)]
 fn replace_server_config_decrypt_fn_for_test(decrypt_fn: Option<ServerConfigDecryptFn>) -> Option<ServerConfigDecryptFn> {
     SERVER_CONFIG_DECRYPT_FN
@@ -313,6 +279,19 @@ fn scanner_config_descriptor() -> ScalarConfigDescriptor {
         subsystem_key: SCANNER_SUB_SYS,
         default_kvs: &scanner::DEFAULT_KVS,
         valid_keys: SCANNER_KEYS,
+    }
+}
+
+fn storage_class_config_descriptor() -> ScalarConfigDescriptor {
+    ScalarConfigDescriptor {
+        subsystem_key: STORAGE_CLASS_SUB_SYS,
+        default_kvs: &storageclass::DEFAULT_KVS,
+        valid_keys: &[
+            storageclass::CLASS_STANDARD,
+            storageclass::CLASS_RRS,
+            storageclass::OPTIMIZE,
+            storageclass::INLINE_BLOCK,
+        ],
     }
 }
 
@@ -1016,12 +995,16 @@ fn parse_target_scalar_value(key: &str, value: &Value) -> Option<String> {
     }
 }
 
-fn decode_scalar_config_object(config_obj: &Map<String, Value>, descriptor: ScalarConfigDescriptor) -> Result<KVS> {
+fn decode_scalar_config_object(
+    config_obj: &Map<String, Value>,
+    descriptor: ScalarConfigDescriptor,
+    diagnostics: &mut CompatibilityDiagnostics,
+) -> Result<KVS> {
     let mut overrides = KVS::new();
     for (key, value) in config_obj {
         if !descriptor.valid_keys.contains(&key.as_str()) || key == COMMENT_KEY {
             if key != "default" && key != DEFAULT_DELIMITER && key != COMMENT_KEY {
-                warn!(config_key = %format!("{}.{key}", descriptor.subsystem_key), "Ignoring unknown persisted scalar config key");
+                diagnostics.unknown_key(descriptor.subsystem_key, key);
             }
             continue;
         }
@@ -1038,14 +1021,18 @@ fn decode_scalar_config_object(config_obj: &Map<String, Value>, descriptor: Scal
     Ok(overrides)
 }
 
-fn decode_scalar_config_value(config_value: &Value, descriptor: ScalarConfigDescriptor) -> Result<KVS> {
+fn decode_scalar_config_value(
+    config_value: &Value,
+    descriptor: ScalarConfigDescriptor,
+    diagnostics: &mut CompatibilityDiagnostics,
+) -> Result<KVS> {
     match config_value {
         Value::Object(config_obj) => {
             let mut overrides = match config_obj.get("default").or_else(|| config_obj.get(DEFAULT_DELIMITER)) {
-                Some(value) => decode_scalar_config_value(value, descriptor)?,
+                Some(value) => decode_scalar_config_value(value, descriptor, diagnostics)?,
                 None => KVS::new(),
             };
-            let direct = decode_scalar_config_object(config_obj, descriptor)?;
+            let direct = decode_scalar_config_object(config_obj, descriptor, diagnostics)?;
             if !direct.is_empty() {
                 overrides.extend(direct);
             }
@@ -1062,7 +1049,7 @@ fn decode_scalar_config_value(config_value: &Value, descriptor: ScalarConfigDesc
                 })?;
                 if !descriptor.valid_keys.contains(&key) || key == COMMENT_KEY {
                     if key != COMMENT_KEY {
-                        warn!(config_key = %format!("{}.{key}", descriptor.subsystem_key), "Ignoring unknown persisted scalar config key");
+                        diagnostics.unknown_key(descriptor.subsystem_key, key);
                     }
                     continue;
                 }
@@ -1085,12 +1072,12 @@ fn decode_scalar_config_value(config_value: &Value, descriptor: ScalarConfigDesc
         // every consumer of the persisted config (startup falls back to the
         // default config, the admin config API cannot read-modify-write, and
         // the notify reconciler retries forever). Ignore them with a deduped
-        // warning instead; the next config save scrubs them (see
+        // compatibility diagnostic instead; the next config save scrubs them (see
         // `normalize_scalar_section_seed`). Malformed values inside object or
         // KVS-array shapes stay hard errors above — those shapes are where
         // data (including fields from newer versions) can live.
         _ => {
-            warn_ignored_scalar_section(descriptor.subsystem_key, config_value);
+            diagnostics.legacy_shape(descriptor.subsystem_key, config_value);
             Ok(KVS::new())
         }
     }
@@ -1100,6 +1087,7 @@ fn apply_external_scalar_config_map(
     cfg: &mut Config,
     root: &Map<String, Value>,
     descriptor: ScalarConfigDescriptor,
+    diagnostics: &mut CompatibilityDiagnostics,
 ) -> Result<bool> {
     let Some(config_value) = root.get(descriptor.subsystem_key) else {
         return Ok(false);
@@ -1107,7 +1095,7 @@ fn apply_external_scalar_config_map(
     if descriptor.subsystem_key == HEAL_SUB_SYS && config_value.is_null() {
         return Ok(false);
     }
-    let overrides = decode_scalar_config_value(config_value, descriptor)?;
+    let overrides = decode_scalar_config_value(config_value, descriptor, diagnostics)?;
 
     if overrides.is_empty() {
         return Ok(false);
@@ -1246,14 +1234,20 @@ fn apply_external_audit_map(cfg: &mut Config, root: &Map<String, Value>) -> bool
     apply_external_target_descriptors(cfg, audit_obj, &audit_target_descriptors())
 }
 
-fn apply_external_storage_class_map(cfg: &mut Config, root: &Map<String, Value>) -> bool {
+fn apply_external_storage_class_map(cfg: &mut Config, root: &Map<String, Value>) -> Result<bool> {
     let sc = root.get("storageclass").or_else(|| root.get("storage_class"));
     let Some(Value::Object(sc_obj)) = sc else {
-        return false;
+        return Ok(false);
     };
 
     let mut applied = false;
     let kvs = storage_class_kvs_mut(cfg);
+    if let Some(nested) = sc_obj.get("default").or_else(|| sc_obj.get(DEFAULT_DELIMITER)) {
+        let values =
+            decode_scalar_config_value(nested, storage_class_config_descriptor(), &mut CompatibilityDiagnostics::default())?;
+        applied = !values.is_empty();
+        kvs.extend(values);
+    }
 
     if let Some(v) = sc_obj.get("standard").and_then(parse_storage_class_value) {
         kvs.insert(storageclass::CLASS_STANDARD.to_string(), v);
@@ -1274,7 +1268,7 @@ fn apply_external_storage_class_map(cfg: &mut Config, root: &Map<String, Value>)
         applied = true;
     }
 
-    applied
+    Ok(applied)
 }
 
 fn decode_server_config_blob(data: &[u8]) -> Result<Config> {
@@ -1288,9 +1282,10 @@ fn decode_server_config_blob(data: &[u8]) -> Result<Config> {
     };
 
     let mut cfg = Config::new();
-    let has_storage = apply_external_storage_class_map(&mut cfg, &root);
-    let has_scanner = apply_external_scalar_config_map(&mut cfg, &root, scanner_config_descriptor())?;
-    let has_heal = apply_external_scalar_config_map(&mut cfg, &root, heal_config_descriptor())?;
+    let mut diagnostics = CompatibilityDiagnostics::default();
+    let has_storage = apply_external_storage_class_map(&mut cfg, &root)?;
+    let has_scanner = apply_external_scalar_config_map(&mut cfg, &root, scanner_config_descriptor(), &mut diagnostics)?;
+    let has_heal = apply_external_scalar_config_map(&mut cfg, &root, heal_config_descriptor(), &mut diagnostics)?;
     let has_oidc = apply_external_oidc_map(&mut cfg, &root);
     let has_notify = apply_external_notify_map(&mut cfg, &root);
     let has_audit = apply_external_audit_map(&mut cfg, &root);
@@ -1298,6 +1293,7 @@ fn decode_server_config_blob(data: &[u8]) -> Result<Config> {
     if !has_storage && !has_scanner && !has_heal && !has_oidc && !has_notify && !has_audit && !has_header {
         return Err(Error::other("unrecognized external server config shape"));
     }
+    diagnostics.report();
     Ok(cfg)
 }
 
@@ -1370,6 +1366,8 @@ fn build_scalar_config_object(cfg: &Config, descriptor: ScalarConfigDescriptor) 
 
 fn rendered_scalar_config_kvs_entries(rendered: &HashMap<String, String>) -> Vec<Value> {
     let mut entries = Vec::with_capacity(rendered.len());
+    let mut rendered = rendered.iter().collect::<Vec<_>>();
+    rendered.sort_by_key(|(key, _)| *key);
     for (key, value) in rendered {
         let mut entry = Map::new();
         entry.insert("key".to_string(), Value::String(key.clone()));
@@ -1378,6 +1376,12 @@ fn rendered_scalar_config_kvs_entries(rendered: &HashMap<String, String>) -> Vec
         entries.push(Value::Object(entry));
     }
     entries
+}
+
+fn has_extra_kvs_attributes(entry: &Map<String, Value>) -> bool {
+    entry
+        .keys()
+        .any(|key| !matches!(key.as_str(), "key" | "value" | "hidden_if_empty" | "hiddenIfEmpty"))
 }
 
 fn sync_rendered_scalar_config_value(
@@ -1400,15 +1404,20 @@ fn sync_rendered_scalar_config_value(
                 config_obj.remove(*key);
             }
 
-            if let Some(nested_key) = nested_key {
-                let nested = config_obj.remove(nested_key);
-                let synced = if direct_had_known {
-                    sync_rendered_scalar_config_value(nested, &Map::new(), descriptor)?
-                } else {
-                    sync_rendered_scalar_config_value(nested, rendered, descriptor)?
+            // Clear shadow overrides too: removing the preferred branch must
+            // never expose a stale value from the other default alias.
+            for alias in ["default", DEFAULT_DELIMITER] {
+                let Some(nested) = config_obj.remove(alias) else {
+                    continue;
                 };
-                if let Some(value) = synced {
-                    config_obj.insert(nested_key.to_string(), value);
+                let empty = Map::new();
+                let desired = if !direct_had_known && Some(alias) == nested_key {
+                    rendered
+                } else {
+                    &empty
+                };
+                if let Some(value) = sync_rendered_scalar_config_value(Some(nested), desired, descriptor)? {
+                    config_obj.insert(alias.to_string(), value);
                 }
             }
 
@@ -1432,6 +1441,7 @@ fn sync_rendered_scalar_config_value(
                         })
                 })
                 .collect::<Result<HashMap<_, _>>>()?;
+            let desired = pending.clone();
             let mut updated = Vec::with_capacity(entries.len().saturating_add(pending.len()));
             for entry in entries {
                 let Some(entry_obj) = entry.as_object() else {
@@ -1446,7 +1456,12 @@ fn sync_rendered_scalar_config_value(
                     updated.push(entry);
                     continue;
                 }
-                let Some(value) = pending.remove(key) else {
+                pending.remove(key);
+                let value = desired
+                    .get(key)
+                    .cloned()
+                    .or_else(|| has_extra_kvs_attributes(entry_obj).then(|| descriptor.default_kvs.get(key)));
+                let Some(value) = value else {
                     continue;
                 };
                 let mut entry_obj = entry_obj.clone();
@@ -1558,6 +1573,7 @@ fn sync_rendered_oidc_provider(existing: Value, rendered: Option<&Value>) -> Opt
                         .collect::<HashMap<_, _>>()
                 })
                 .unwrap_or_default();
+            let desired = pending.clone();
             let mut updated = Vec::with_capacity(entries.len().saturating_add(pending.len()));
             for entry in entries {
                 let Some(entry_obj) = entry.as_object() else {
@@ -1572,7 +1588,12 @@ fn sync_rendered_oidc_provider(existing: Value, rendered: Option<&Value>) -> Opt
                     updated.push(entry);
                     continue;
                 }
-                let Some(value) = pending.remove(key) else {
+                pending.remove(key);
+                let value = desired
+                    .get(key)
+                    .cloned()
+                    .or_else(|| has_extra_kvs_attributes(entry_obj).then(|| oidc::DEFAULT_IDENTITY_OPENID_KVS.get(key)));
+                let Some(value) = value else {
                     continue;
                 };
                 let mut entry_obj = entry_obj.clone();
@@ -1594,7 +1615,14 @@ fn sync_rendered_oidc_object(existing: Option<Value>, rendered: &Map<String, Val
     };
     let mut merged = Map::new();
     for (provider_key, provider) in existing {
-        if let Some(provider) = sync_rendered_oidc_provider(provider, rendered.get(&provider_key)) {
+        if let Some(provider) = sync_rendered_oidc_provider(
+            provider,
+            rendered.get(if provider_key == DEFAULT_DELIMITER {
+                "default"
+            } else {
+                &provider_key
+            }),
+        ) {
             merged.insert(provider_key, provider);
         }
     }
@@ -1789,7 +1817,12 @@ fn build_audit_object(cfg: &Config) -> Map<String, Value> {
     build_target_object(cfg, &audit_target_descriptors())
 }
 
-fn sync_rendered_target_instance(existing: Value, rendered: Option<&Value>, valid_keys: &[&str]) -> Option<Value> {
+fn sync_rendered_target_instance(
+    existing: Value,
+    rendered: Option<&Value>,
+    valid_keys: &[&str],
+    baseline: &KVS,
+) -> Option<Value> {
     match existing {
         Value::Object(mut instance) => {
             for key in valid_keys {
@@ -1810,6 +1843,7 @@ fn sync_rendered_target_instance(existing: Value, rendered: Option<&Value>, vali
                         .collect::<HashMap<_, _>>()
                 })
                 .unwrap_or_default();
+            let desired = pending.clone();
             let mut updated = Vec::with_capacity(entries.len().saturating_add(pending.len()));
             for entry in entries {
                 let Some(entry_obj) = entry.as_object() else {
@@ -1824,7 +1858,12 @@ fn sync_rendered_target_instance(existing: Value, rendered: Option<&Value>, vali
                     updated.push(entry);
                     continue;
                 }
-                let Some(value) = pending.remove(key) else {
+                pending.remove(key);
+                let value = desired
+                    .get(key)
+                    .cloned()
+                    .or_else(|| has_extra_kvs_attributes(entry_obj).then(|| baseline.get(key)));
+                let Some(value) = value else {
                     continue;
                 };
                 let mut entry_obj = entry_obj.clone();
@@ -1843,90 +1882,108 @@ fn sync_rendered_target_object(
     target_obj: &mut Map<String, Value>,
     rendered_target: &Map<String, Value>,
     descriptors: &[TargetConfigDescriptor],
+    cfg: &Config,
 ) {
     for descriptor in descriptors {
-        let existing = target_obj.remove(descriptor.external_key);
-        let alias = target_obj.remove(descriptor.subsystem_key);
-        let mut section = existing
-            .or(alias)
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
-        let rendered = rendered_target.get(descriptor.external_key).and_then(Value::as_object);
-
-        if is_target_instance_shorthand(&section, descriptor.valid_keys) {
-            let has_named_instances = rendered.is_some_and(|instances| instances.keys().any(|name| name != "default"));
-            if !has_named_instances {
-                if let Some(section) = sync_rendered_target_instance(
-                    Value::Object(section),
-                    rendered.and_then(|instances| instances.get("default")),
-                    descriptor.valid_keys,
-                ) {
-                    target_obj.insert(descriptor.external_key.to_string(), section);
-                }
+        let effective_default = cfg
+            .0
+            .get(descriptor.subsystem_key)
+            .map(|subsystem| merged_target_default_kvs(subsystem, descriptor.default_kvs))
+            .unwrap_or_else(|| (**descriptor.default_kvs).clone());
+        for key in [descriptor.external_key, descriptor.subsystem_key] {
+            let existing = target_obj.remove(key);
+            if existing.is_none() && key != descriptor.external_key {
                 continue;
             }
-
-            let mut nested = Map::new();
-            if let Some(default) = sync_rendered_target_instance(
-                Value::Object(section),
-                rendered.and_then(|instances| instances.get("default")),
-                descriptor.valid_keys,
+            let rendered = rendered_target.get(descriptor.external_key).and_then(Value::as_object);
+            if let Some(section) = sync_rendered_target_section(
+                existing,
+                rendered,
+                *descriptor,
+                &effective_default,
+                cfg.0.get(descriptor.subsystem_key),
             ) {
-                nested.insert("default".to_string(), default);
+                target_obj.insert(key.to_string(), section);
             }
-            if let Some(rendered) = rendered {
-                for (instance_name, instance) in rendered {
-                    if instance_name != "default" {
-                        nested.insert(instance_name.clone(), instance.clone());
-                    }
-                }
-            }
-            if !nested.is_empty() {
-                target_obj.insert(descriptor.external_key.to_string(), Value::Object(nested));
-            }
-            continue;
-        }
-
-        if let Some(default_alias) = section.remove(DEFAULT_DELIMITER) {
-            if let Some(default) = section.get_mut("default") {
-                if let Some(alias) = sync_rendered_target_instance(default_alias, None, descriptor.valid_keys) {
-                    match (default, alias) {
-                        (Value::Object(default), Value::Object(alias)) => {
-                            for (key, value) in alias {
-                                default.entry(key).or_insert(value);
-                            }
-                        }
-                        (Value::Array(default), Value::Array(alias)) => default.extend(alias),
-                        _ => {}
-                    }
-                }
-            } else {
-                section.insert("default".to_string(), default_alias);
-            }
-        }
-
-        let mut merged = Map::new();
-        for (instance_name, instance) in section {
-            if let Some(instance) = sync_rendered_target_instance(
-                instance,
-                rendered.and_then(|instances| instances.get(&instance_name)),
-                descriptor.valid_keys,
-            ) {
-                merged.insert(instance_name, instance);
-            }
-        }
-        if let Some(rendered) = rendered {
-            for (instance_name, instance) in rendered {
-                if !merged.contains_key(instance_name) {
-                    merged.insert(instance_name.clone(), instance.clone());
-                }
-            }
-        }
-
-        if !merged.is_empty() {
-            target_obj.insert(descriptor.external_key.to_string(), Value::Object(merged));
         }
     }
+}
+
+fn sync_rendered_target_section(
+    existing: Option<Value>,
+    rendered: Option<&Map<String, Value>>,
+    descriptor: TargetConfigDescriptor,
+    effective_default: &KVS,
+    configured: Option<&HashMap<String, KVS>>,
+) -> Option<Value> {
+    let section = match existing {
+        Some(Value::Object(section)) => section,
+        Some(value) if rendered.is_none_or(Map::is_empty) => return Some(value),
+        _ => Map::new(),
+    };
+    if is_target_instance_shorthand(&section, descriptor.valid_keys) {
+        let has_named = rendered.is_some_and(|instances| instances.keys().any(|name| name != "default"));
+        let default = sync_rendered_target_instance(
+            Value::Object(section),
+            rendered.and_then(|instances| instances.get("default")),
+            descriptor.valid_keys,
+            descriptor.default_kvs,
+        );
+        if !has_named {
+            return default;
+        }
+        let mut nested = rendered.cloned().unwrap_or_default();
+        if let Some(default) = default {
+            nested.insert("default".to_string(), default);
+        }
+        return Some(Value::Object(nested));
+    }
+    let mut merged = Map::new();
+    for (instance_name, instance) in section {
+        let rendered_name = if instance_name == DEFAULT_DELIMITER {
+            "default"
+        } else {
+            &instance_name
+        };
+        let removed = rendered_name != "default" && configured.is_none_or(|instances| !instances.contains_key(&instance_name));
+        if let Some(mut instance) = sync_rendered_target_instance(
+            instance,
+            rendered.and_then(|instances| instances.get(rendered_name)),
+            descriptor.valid_keys,
+            if rendered_name == "default" || removed {
+                descriptor.default_kvs
+            } else {
+                effective_default
+            },
+        ) {
+            // A retained KVS attribute must not turn a deleted target into an
+            // active instance through inheritance from an enabled default.
+            if removed
+                && let Value::Array(entries) = &mut instance
+                && entries.iter().any(|entry| {
+                    entry
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .is_some_and(|key| descriptor.valid_keys.contains(&key))
+                })
+                && !entries
+                    .iter()
+                    .any(|entry| entry.get("key").and_then(Value::as_str) == Some(ENABLE_KEY))
+            {
+                entries.extend(rendered_scalar_config_kvs_entries(&HashMap::from([(
+                    ENABLE_KEY.to_string(),
+                    "off".to_string(),
+                )])));
+            }
+            merged.insert(instance_name, instance);
+        }
+    }
+    if let Some(rendered) = rendered {
+        for (instance_name, instance) in rendered {
+            merged.entry(instance_name.clone()).or_insert_with(|| instance.clone());
+        }
+    }
+    (!merged.is_empty()).then_some(Value::Object(merged))
 }
 
 fn encode_server_config_blob(cfg: &Config, seed: Option<&[u8]>) -> Result<Vec<u8>> {
@@ -1939,23 +1996,21 @@ fn encode_server_config_blob(cfg: &Config, seed: Option<&[u8]>) -> Result<Vec<u8
         root.insert("region".to_string(), Value::String(RUSTFS_REGION.to_string()));
     }
 
-    let mut sc_obj = match root.remove("storageclass") {
-        Some(Value::Object(v)) => v,
-        _ => Map::new(),
-    };
-    for key in [
-        storageclass::CLASS_STANDARD,
-        storageclass::CLASS_RRS,
-        storageclass::OPTIMIZE,
-        storageclass::INLINE_BLOCK,
-    ] {
-        sc_obj.remove(key);
+    let sc_seed = root.remove("storageclass").filter(Value::is_object);
+    let sc_rendered = build_storageclass_object(cfg);
+    if let Some(value) = sync_rendered_scalar_config_value(sc_seed, &sc_rendered, storage_class_config_descriptor())? {
+        root.insert("storageclass".to_string(), value);
     }
-    for (k, v) in build_storageclass_object(cfg) {
-        sc_obj.insert(k, v);
+    if let Some(existing) = root.remove("storage_class") {
+        let descriptor = storage_class_config_descriptor();
+        let mut rendered = build_storageclass_object(cfg);
+        rendered
+            .entry(storageclass::INLINE_BLOCK)
+            .or_insert_with(|| Value::String(storageclass::DEFAULT_KVS.get(storageclass::INLINE_BLOCK)));
+        if let Some(value) = sync_rendered_scalar_config_value(Some(existing), &rendered, descriptor)? {
+            root.insert("storage_class".to_string(), value);
+        }
     }
-    root.insert("storageclass".to_string(), Value::Object(sc_obj));
-    root.remove("storage_class");
 
     for descriptor in [scanner_config_descriptor(), heal_config_descriptor()] {
         let existing = normalize_scalar_section_seed(root.remove(descriptor.subsystem_key));
@@ -1965,41 +2020,55 @@ fn encode_server_config_blob(cfg: &Config, seed: Option<&[u8]>) -> Result<Vec<u8
         }
     }
 
-    let existing_oidc = root.remove("openid").or_else(|| root.remove(IDENTITY_OPENID_SUB_SYS));
-    if let Some(oidc_value) = sync_rendered_oidc_object(existing_oidc, &build_oidc_object(cfg)) {
-        root.insert("openid".to_string(), oidc_value);
+    let rendered_oidc = build_oidc_object(cfg);
+    for key in ["openid", IDENTITY_OPENID_SUB_SYS] {
+        let existing = root.remove(key);
+        if existing.is_none() && key != "openid" {
+            continue;
+        }
+        if key == "openid"
+            && rendered_oidc.is_empty()
+            && let Some(value @ (Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_))) =
+                existing.as_ref()
+        {
+            root.insert(key.to_string(), value.clone());
+            continue;
+        }
+        if let Some(oidc_value) = sync_rendered_oidc_object(existing, &rendered_oidc) {
+            root.insert(key.to_string(), oidc_value);
+        }
     }
-    root.remove(IDENTITY_OPENID_SUB_SYS);
 
     let mut notify_obj = match root.remove("notify") {
         Some(Value::Object(v)) => v,
         _ => Map::new(),
     };
     let rendered_notify = build_notify_object(cfg);
-    sync_rendered_target_object(&mut notify_obj, &rendered_notify, &notify_target_descriptors());
+    sync_rendered_target_object(&mut notify_obj, &rendered_notify, &notify_target_descriptors(), cfg);
     if notify_obj.is_empty() {
         root.remove("notify");
     } else {
         root.insert("notify".to_string(), Value::Object(notify_obj));
     }
-    for descriptor in notify_target_descriptors() {
-        root.remove(descriptor.subsystem_key);
-    }
 
-    let mut logger_obj = match root.remove("logger") {
-        Some(Value::Object(v)) => v,
-        _ => Map::new(),
-    };
     let rendered_audit = build_audit_object(cfg);
-    sync_rendered_target_object(&mut logger_obj, &rendered_audit, &audit_target_descriptors());
-    if logger_obj.is_empty() {
-        root.remove("logger");
-    } else {
-        root.insert("logger".to_string(), Value::Object(logger_obj));
-    }
-    root.remove("audit");
-    for descriptor in audit_target_descriptors() {
-        root.remove(descriptor.subsystem_key);
+    for key in ["logger", "audit"] {
+        let existing = root.remove(key);
+        if existing.is_none() && key != "logger" {
+            continue;
+        }
+        let mut logger_obj = match existing {
+            Some(Value::Object(value)) => value,
+            Some(value) if rendered_audit.is_empty() => {
+                root.insert(key.to_string(), value);
+                continue;
+            }
+            _ => Map::new(),
+        };
+        sync_rendered_target_object(&mut logger_obj, &rendered_audit, &audit_target_descriptors(), cfg);
+        if !logger_obj.is_empty() {
+            root.insert(key.to_string(), Value::Object(logger_obj));
+        }
     }
 
     Ok(serde_json::to_vec(&Value::Object(root))?)
@@ -2015,8 +2084,41 @@ fn is_standard_object_server_config(data: &[u8]) -> bool {
     matches!(root.get("version"), Some(Value::String(v)) if !v.trim().is_empty())
         && matches!(root.get("storageclass"), Some(Value::Object(_)))
         && !root.contains_key("storage_class")
+        && !root.contains_key("audit")
+        && !root.contains_key(IDENTITY_OPENID_SUB_SYS)
+        && !has_nested_config_aliases(&root)
         && !matches!(root.get(HEAL_SUB_SYS), Some(value) if scalar_section_shape_is_ignorable(value))
         && !matches!(root.get(SCANNER_SUB_SYS), Some(value) if scalar_section_shape_is_ignorable(value))
+}
+
+fn has_nested_config_aliases(root: &Map<String, Value>) -> bool {
+    let dual_default = |value: &Value| {
+        value
+            .as_object()
+            .is_some_and(|value| value.contains_key("default") && value.contains_key(DEFAULT_DELIMITER))
+    };
+    if [SCANNER_SUB_SYS, HEAL_SUB_SYS, "openid"]
+        .iter()
+        .filter_map(|key| root.get(*key))
+        .any(dual_default)
+    {
+        return true;
+    }
+    for (name, descriptors) in [
+        ("notify", notify_target_descriptors()),
+        ("logger", audit_target_descriptors()),
+    ] {
+        if let Some(section) = root.get(name).and_then(Value::as_object) {
+            for descriptor in descriptors {
+                if section.contains_key(descriptor.subsystem_key)
+                    || section.get(descriptor.external_key).is_some_and(dual_default)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn configs_semantically_equal(lhs: &Config, rhs: &Config) -> bool {
@@ -2311,41 +2413,19 @@ fn decode_persisted_server_config_with_seed(data: &[u8]) -> Result<(Config, Vec<
         Ok(cfg) => Ok((cfg, data.to_vec())),
         Err(raw_decode_err) => {
             let Some(decrypt) = server_config_decrypt_fn() else {
-                error!(
-                    event = EVENT_SERVER_CONFIG_DECODE_FAILED,
-                    component = LOG_COMPONENT_CONFIG,
-                    subsystem = LOG_SUBSYSTEM_CONFIG,
-                    size = data.len(),
-                    error = %raw_decode_err,
-                    "persisted server config cannot be decoded, object is corrupt"
-                );
+                report_decode_failure(data, DecodeFailure::Corrupt, None);
                 return Err(Error::other(ServerConfigCorruptError(raw_decode_err.to_string())));
             };
 
             let Some(decrypted) = decrypt(data) else {
-                error!(
-                    event = EVENT_SERVER_CONFIG_DECRYPT_FAILED,
-                    component = LOG_COMPONENT_CONFIG,
-                    subsystem = LOG_SUBSYSTEM_CONFIG,
-                    size = data.len(),
-                    error = %raw_decode_err,
-                    "persisted server config cannot be decoded or decrypted"
-                );
+                report_decode_failure(data, DecodeFailure::Decrypt, None);
                 return Err(Error::other(ServerConfigDecryptError(raw_decode_err.to_string())));
             };
 
             decode_server_config_blob(&decrypted)
                 .map(|config| (config, decrypted.clone()))
                 .map_err(|err| {
-                    error!(
-                        event = EVENT_SERVER_CONFIG_DECODE_FAILED,
-                        component = LOG_COMPONENT_CONFIG,
-                        subsystem = LOG_SUBSYSTEM_CONFIG,
-                        size = decrypted.len(),
-                        encrypted_size = data.len(),
-                        error = %err,
-                        "decrypted persisted server config cannot be decoded, object is corrupt"
-                    );
+                    report_decode_failure(&decrypted, DecodeFailure::Corrupt, Some(data.len()));
                     Error::other(ServerConfigCorruptError(err.to_string()))
                 })
         }
@@ -2841,7 +2921,7 @@ mod tests {
         new_and_save_server_config, read_config, read_config_no_lock_preserve_empty_with_metadata, read_config_preserve_empty,
         read_config_with_metadata, read_config_without_migrate, read_server_config_snapshot, save_config_with_opts_inner,
         save_server_config, save_server_config_snapshot, save_server_config_snapshot_with_generation,
-        server_config_transaction_lock_path, should_warn_ignored_scalar_section, storage_class_kvs_mut,
+        server_config_transaction_lock_path, storage_class_kvs_mut,
     };
     use crate::config::{audit, heal, notify, oidc, scanner};
     use crate::disk::{RUSTFS_META_BUCKET, endpoint::Endpoint};
@@ -2928,6 +3008,110 @@ mod tests {
         finished_rx.await.expect("detached transaction finished");
         assert_eq!(admission.available_permits(), 1);
         assert_eq!(current_s3_http_operation_name(), None);
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn diagnostic_config_tasks_preserve_first_owner_across_nested_spawns() {
+        use crate::cluster::rpc::runtime_sources::{
+            current_read_version_entry_source, current_read_version_request_caller, with_read_version_entry,
+            with_read_version_request_caller,
+        };
+        use rustfs_io_metrics::internode_metrics::{ReadVersionEntrySource, ReadVersionRequestCaller};
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, current_s3_http_operation_name, observe_s3_http_operation,
+            with_s3_http_operation_context,
+        };
+
+        let mut request = S3HttpRequestGuard::new("PUT");
+        let operation = request.in_scope(|| {
+            observe_s3_http_operation(rustfs_s3_ops::S3Operation::CreateBucket);
+            current_s3_http_operation_context().expect("captured bucket operation")
+        });
+        let task = with_s3_http_operation_context(Some(operation), async {
+            with_read_version_request_caller(ReadVersionRequestCaller::Object, async {
+                with_read_version_entry(ReadVersionEntrySource::TierConfigReload, async {
+                    super::spawn_config_task(async {
+                        assert_eq!(current_s3_http_operation_name(), Some("s3:CreateBucket"));
+                        assert_eq!(current_read_version_request_caller(), Some(ReadVersionRequestCaller::Object));
+                        assert_eq!(current_read_version_entry_source(), Some(ReadVersionEntrySource::TierConfigReload));
+                        with_read_version_entry(ReadVersionEntrySource::ConfigRead, async {
+                            super::spawn_config_task(async {
+                                assert_eq!(current_s3_http_operation_name(), Some("s3:CreateBucket"));
+                                assert_eq!(current_read_version_request_caller(), Some(ReadVersionRequestCaller::Object));
+                                assert_eq!(current_read_version_entry_source(), Some(ReadVersionEntrySource::TierConfigReload));
+                                Err::<(), _>("config failure")
+                            })
+                            .await
+                            .expect("nested config task joins")
+                        })
+                        .await
+                    })
+                })
+                .await
+            })
+            .await
+        })
+        .await;
+        drop(request);
+        assert_eq!(task.await.expect("config task joins"), Err("config failure"));
+        assert_eq!(current_s3_http_operation_name(), None);
+        assert_eq!(current_read_version_request_caller(), None);
+        assert_eq!(current_read_version_entry_source(), None);
+        super::spawn_config_task(async {
+            assert_eq!(current_s3_http_operation_name(), None);
+            assert_eq!(current_read_version_request_caller(), None);
+            assert_eq!(current_read_version_entry_source(), None, "internal work invents no entry owner");
+            with_read_version_entry(ReadVersionEntrySource::ConfigRead, async {
+                assert_eq!(current_read_version_entry_source(), Some(ReadVersionEntrySource::ConfigRead));
+            })
+            .await;
+        })
+        .await
+        .expect("unscoped config task joins");
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn diagnostic_config_tasks_keep_context_and_permit_after_waiter_drop() {
+        use crate::cluster::rpc::runtime_sources::{
+            current_read_version_entry_source, current_read_version_request_caller, with_read_version_entry,
+            with_read_version_request_caller,
+        };
+        use rustfs_io_metrics::internode_metrics::{ReadVersionEntrySource, ReadVersionRequestCaller};
+
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = admission.clone().acquire_owned().await.expect("config task permit");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let task = with_read_version_request_caller(ReadVersionRequestCaller::MetadataRead, async {
+            with_read_version_entry(ReadVersionEntrySource::ServerInfoPools, async {
+                super::spawn_config_task(async move {
+                    entered_tx.send(()).expect("waiter is present");
+                    release_rx.await.expect("config task may finish");
+                    let observed = (current_read_version_request_caller(), current_read_version_entry_source());
+                    drop(permit);
+                    finished_tx.send(observed).expect("completion observer is present");
+                })
+            })
+            .await
+        })
+        .await;
+        entered_rx.await.expect("config task started");
+        drop(task);
+        assert_eq!(admission.available_permits(), 0, "dropping the waiter keeps admission owned");
+        release_tx.send(()).expect("detached config task remains alive");
+        assert_eq!(
+            finished_rx.await.expect("detached config task completes"),
+            (
+                Some(ReadVersionRequestCaller::MetadataRead),
+                Some(ReadVersionEntrySource::ServerInfoPools)
+            )
+        );
+        assert_eq!(admission.available_permits(), 1);
+        assert_eq!(current_read_version_request_caller(), None);
+        assert_eq!(current_read_version_entry_source(), None);
     }
 
     #[test]
@@ -4001,15 +4185,6 @@ mod tests {
     }
 
     #[test]
-    fn ignored_scalar_section_warning_dedups_by_content() {
-        let value = Value::String("dedup-probe".to_string());
-        assert!(should_warn_ignored_scalar_section("dedup-test-subsystem", &value));
-        assert!(!should_warn_ignored_scalar_section("dedup-test-subsystem", &value));
-        let changed = Value::String("dedup-probe-changed".to_string());
-        assert!(should_warn_ignored_scalar_section("dedup-test-subsystem", &changed));
-    }
-
-    #[test]
     fn valid_heal_object_and_kvs_array_shapes_remain_accepted() {
         let empty_object = br#"{"version":"33","storageclass":{"standard":"","rrs":""},"heal":{}}"#;
         let cfg = decode_server_config_blob(empty_object).expect("empty heal object should decode as no override");
@@ -4195,7 +4370,7 @@ mod tests {
     }
 
     #[test]
-    fn target_default_alias_is_canonicalized_without_losing_unknown_fields() {
+    fn target_default_aliases_keep_unknown_fields_at_their_original_paths() {
         let seed = br#"{
           "version":"33",
           "storageclass":{"standard":"","rrs":""},
@@ -4214,9 +4389,9 @@ mod tests {
         let value: Value = serde_json::from_slice(&encoded).expect("encoded config should be valid json");
         let webhook = value["notify"]["webhook"].as_object().expect("webhook section");
 
-        assert!(webhook.get(DEFAULT_DELIMITER).is_none());
+        assert_eq!(webhook[DEFAULT_DELIMITER]["endpoint"].as_str(), Some(expected_endpoint.as_str()));
         assert_eq!(webhook["default"]["endpoint"].as_str(), Some(expected_endpoint.as_str()));
-        assert_eq!(webhook["default"]["future_alias"].as_str(), Some("keep"));
+        assert_eq!(webhook[DEFAULT_DELIMITER]["future_alias"].as_str(), Some("keep"));
         assert_eq!(webhook["default"]["future_default"].as_str(), Some("keep"));
     }
 
@@ -5404,6 +5579,43 @@ mod tests {
                 .get(SCANNER_CYCLE),
             "61"
         );
+    }
+
+    #[tokio::test]
+    async fn alias_snapshot_reset_is_conditional_and_second_save_does_not_write() {
+        let seed =
+            br#"{"version":"33","scanner":{"default":{"cycle":"61","future":"preferred"},"_":{"cycle":"59","future":"shadow"}}}"#
+                .to_vec();
+        let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(seed), None));
+        let snapshot = read_server_config_snapshot(store.clone()).await.expect("read alias snapshot");
+        let mut reset = snapshot.config.clone();
+        reset.0.remove(SCANNER_SUB_SYS);
+        assert!(
+            save_server_config_snapshot(store.clone(), &reset, &snapshot)
+                .await
+                .expect("save reset")
+        );
+        assert_eq!(
+            store
+                .last_put_preconditions
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .if_match_value(),
+            Some("config-1")
+        );
+        drop(snapshot);
+        let snapshot = read_server_config_snapshot(store.clone())
+            .await
+            .expect("reload reset snapshot");
+        assert!(build_scalar_config_object(&snapshot.config, super::scanner_config_descriptor()).is_empty());
+        assert!(
+            !save_server_config_snapshot(store.clone(), &snapshot.config, &snapshot)
+                .await
+                .expect("save unchanged aliases")
+        );
+        assert_eq!(store.write_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

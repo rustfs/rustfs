@@ -346,6 +346,46 @@ fn heal_writer_rule_requires_all_targets_and_retains_legacy_messages() {
 }
 
 #[test]
+fn server_config_corrupt_matches_current_and_legacy_failures_only() {
+    let engine = engine();
+    for (sample, expected) in [
+        (msg("Persisted server config could not be decoded; the read remains failed"), true),
+        (
+            Sample {
+                fields: &[("event", "server_config_decode_failed")],
+                ..msg("config read failed")
+            },
+            true,
+        ),
+        (
+            Sample {
+                fields: &[("event", "server_config_decrypt_failed")],
+                ..msg("config read failed")
+            },
+            true,
+        ),
+        (msg("persisted server config cannot be decoded, object is corrupt"), true),
+        (msg("server config corrupt: invalid JSON"), true),
+        (msg("server config is corrupt after heal"), true),
+        (
+            Sample {
+                level: Some(LogLevel::Warn),
+                fields: &[("event", "server_config_compatibility_ignored"), ("state", "ignored")],
+                ..msg("Persisted server config contains unsupported settings; unknown fields are retained but not applied")
+            },
+            false,
+        ),
+        (msg("config read failed"), false),
+    ] {
+        let matched = engine
+            .matches(&event(&sample))
+            .iter()
+            .any(|&index| engine.rules()[index].id == "server-config-corrupt");
+        assert_eq!(matched, expected, "sample: {} ({:?})", sample.message, sample.fields);
+    }
+}
+
+#[test]
 fn smoke_samples_hit_exact_rule_sets() {
     let engine = engine();
     let exact = |sample: &Sample, expected: &[&str]| {

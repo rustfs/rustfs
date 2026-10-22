@@ -3095,6 +3095,7 @@ where
         }
         let cycle_ctx = ctx.child_token();
         let cycle_budget = ScannerCycleBudget::new_with_runtime_progress_tracking(&cycle_ctx, scanner_cycle_budget_config());
+        record_scanner_cycle_attempt(None);
         let initial_outcome = match await_scanner_cycle_with_budget_fence(
             &cycle_ctx,
             &cycle_budget,
@@ -3335,6 +3336,7 @@ where
             || probe_scanner_activity(storeapi.as_ref(), distributed),
         )
         .await;
+        record_scanner_cycle_wakeup(wake_reason);
         scanner_activity_backoff_blocked =
             scanner_activity_backoff_blocked_after_wake(scanner_activity_backoff_blocked, wake_reason);
         match wake_reason {
@@ -3423,6 +3425,7 @@ where
         let dirty_generation_before_cycle = dirty_usage_generation();
         let cycle_ctx = ctx.child_token();
         let cycle_budget = ScannerCycleBudget::new_with_runtime_progress_tracking(&cycle_ctx, scanner_cycle_budget_config());
+        record_scanner_cycle_attempt(Some(wake_reason));
         let outcome = match await_scanner_cycle_with_budget_fence(
             &cycle_ctx,
             &cycle_budget,

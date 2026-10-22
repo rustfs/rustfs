@@ -1615,7 +1615,7 @@ pub struct BackgroundHealStatusHandler {}
 struct MrfLegacyResponsibilityActionRequest {
     action: MrfLegacyResponsibilityAction,
     responsibility_id: uuid::Uuid,
-    expected_bucket_incarnation_id: uuid::Uuid,
+    expected_bucket_incarnation_id: Option<uuid::Uuid>,
     #[serde(default)]
     acknowledge_unverified_data_risk: Option<bool>,
     #[serde(default)]
@@ -1639,8 +1639,11 @@ enum MrfLegacyResponsibilityAction {
 }
 
 fn validate_mrf_legacy_responsibility_action(action: &MrfLegacyResponsibilityActionRequest) -> Result<(), &'static str> {
-    if action.responsibility_id.is_nil() || action.expected_bucket_incarnation_id.is_nil() {
+    if action.responsibility_id.is_nil() || action.expected_bucket_incarnation_id.is_some_and(|id| id.is_nil()) {
         return Err("responsibility and bucket incarnation IDs must be non-nil");
+    }
+    if action.expected_bucket_incarnation_id.is_none() && !matches!(action.action, MrfLegacyResponsibilityAction::Refresh) {
+        return Err("a known bucket incarnation is required for recheck and risk acceptance");
     }
     match action.action {
         MrfLegacyResponsibilityAction::Refresh | MrfLegacyResponsibilityAction::Recheck => {
@@ -1797,7 +1800,9 @@ impl Operation for MrfLegacyResponsibilitiesActionHandler {
                     Duration::from_secs(30),
                     rustfs_heal::heal::mrf_queue::recheck_legacy_responsibility(
                         action.responsibility_id,
-                        action.expected_bucket_incarnation_id,
+                        action
+                            .expected_bucket_incarnation_id
+                            .ok_or_else(|| admin_error(S3ErrorCode::InvalidRequest, "expectedBucketIncarnationId is required"))?,
                     ),
                 )
                 .await
@@ -1820,7 +1825,9 @@ impl Operation for MrfLegacyResponsibilitiesActionHandler {
                     rustfs_heal::heal::mrf_queue::accept_unverified_legacy_risk(
                         rustfs_heal::heal::mrf_queue::MrfLegacyRiskAcceptanceRequest {
                             responsibility_id: action.responsibility_id,
-                            expected_bucket_incarnation_id: action.expected_bucket_incarnation_id,
+                            expected_bucket_incarnation_id: action.expected_bucket_incarnation_id.ok_or_else(|| {
+                                admin_error(S3ErrorCode::InvalidRequest, "expectedBucketIncarnationId is required")
+                            })?,
                             acknowledge_unknown_source_incarnation: action.acknowledge_unknown_source_incarnation == Some(true),
                             acknowledge_incarnation_mismatch: action.acknowledge_bucket_incarnation_mismatch == Some(true),
                             actor,
@@ -1973,6 +1980,26 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
+    fn mrf_legacy_only_refresh_accepts_an_unobserved_incarnation() {
+        for action in ["refresh", "recheck", "acceptUnverifiedRisk"] {
+            let request: MrfLegacyResponsibilityActionRequest = serde_json::from_value(json!({
+                "action": action,
+                "responsibilityId": Uuid::new_v4(),
+                "expectedBucketIncarnationId": null,
+            }))
+            .expect("decode explicit unknown observation");
+            assert_eq!(validate_mrf_legacy_responsibility_action(&request).is_ok(), action == "refresh");
+        }
+        let request: MrfLegacyResponsibilityActionRequest = serde_json::from_value(json!({
+            "action": "refresh",
+            "responsibilityId": Uuid::new_v4(),
+            "expectedBucketIncarnationId": Uuid::nil(),
+        }))
+        .expect("decode nil identity");
+        assert!(validate_mrf_legacy_responsibility_action(&request).is_err());
+    }
+
+    #[test]
     fn mrf_legacy_risk_action_requires_explicit_acknowledgment_and_audit_fields() {
         let base = json!({
             "action": "acceptUnverifiedRisk",
@@ -2021,7 +2048,7 @@ mod tests {
         let recheck = MrfLegacyResponsibilityActionRequest {
             action: MrfLegacyResponsibilityAction::Recheck,
             responsibility_id: Uuid::new_v4(),
-            expected_bucket_incarnation_id: Uuid::new_v4(),
+            expected_bucket_incarnation_id: Some(Uuid::new_v4()),
             acknowledge_unverified_data_risk: None,
             acknowledge_unknown_source_incarnation: None,
             acknowledge_bucket_incarnation_mismatch: None,

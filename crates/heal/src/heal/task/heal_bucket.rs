@@ -801,9 +801,14 @@ impl HealTask {
                                             &mut bytes,
                                             u64::try_from(storage_result.item.object_size).unwrap_or(u64::MAX),
                                         );
-                                        recorded_authoritative_outcome = self
-                                            .record_verified_storage_receipt(identity.clone(), storage_result.receipt)
-                                            .await;
+                                        recorded_authoritative_outcome =
+                                            self.record_verified_storage_receipt(&identity, storage_result.receipt).await;
+                                        if !recorded_authoritative_outcome
+                                            && !heal_opts.dry_run
+                                            && !storage_result.item.detail.is_empty()
+                                        {
+                                            detail = Some(storage_result.item.detail.clone());
+                                        }
                                         self.record_result_item(storage_result.item).await;
                                         None
                                     }

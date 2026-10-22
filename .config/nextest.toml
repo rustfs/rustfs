@@ -83,6 +83,13 @@ threads-required = "num-test-threads"
 filter = '(package(rustfs-ecstore) & test(=core::pools_test::decommission_lock_order_tests::active_decommission_migration_does_not_invert_capacity_and_delete_object_tag_locks)) | (package(rustfs-heal) & test(=heal::mrf_queue::partial_write::tests::durable_retry_submission_error_keeps_checkpoint_and_uses_backoff))'
 threads-required = "num-test-threads"
 
+# These eight-disk decommission fixtures exercise concurrent retries,
+# free-version cleanup, and real capacity probes under production lock deadlines.
+# Reserve the run's capacity so unrelated IO cannot exhaust those budgets.
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & (test(/^store::init::tests::decommission_entry_(retries_source_changed_without_canceling_other_bucket|skips_cleanup_only_marker_when_free_version_is_present)$/) | test(=core::pools::tests::decommission_capacity_mutation_limits_prewrite_sampling_to_target))'
+threads-required = "num-test-threads"
+
 # This registration/backup lock probe uses an isolated eight-disk store.
 # Reserve capacity so sibling disk-heavy tests cannot consume its 2s
 # registration budget; retain the queued backup and deadlock assertions.
@@ -94,8 +101,11 @@ threads-required = "num-test-threads"
 filter = 'package(rustfs-heal) & (binary(mrf_partial_write_test) | (binary(mrf_pipeline_test) & test(/^journal_replay_survives_/)) | test(=admin_selector_survives_sigkill_with_original_scope_and_receipts))'
 threads-required = "num-test-threads"
 
+# Native scanner backlog fixtures include 24-set and pool-expansion cases.
+# Reserve capacity across test processes while preserving each scenario's fixed
+# budget, assertions, and internal concurrency.
 [[profile.default.overrides]]
-filter = 'package(rustfs-scanner) & (test(/^scanner::backlog::tests::native_(writer|retirement)_/) | test(=scanner_folder::tests::mrf_ownership::mrf_ownership_manager_completion_preserves_scanner_pending) | test(/^scanner_io::tests::service_cohort::/))'
+filter = 'package(rustfs-scanner) & (test(/^scanner::backlog::tests::native_/) | test(=scanner_folder::tests::mrf_ownership::mrf_ownership_manager_completion_preserves_scanner_pending) | test(/^scanner_io::tests::service_cohort::/))'
 threads-required = "num-test-threads"
 
 [[profile.default.scripts]]
@@ -356,6 +366,13 @@ threads-required = "num-test-threads"
 filter = '(package(rustfs-ecstore) & test(=core::pools_test::decommission_lock_order_tests::active_decommission_migration_does_not_invert_capacity_and_delete_object_tag_locks)) | (package(rustfs-heal) & test(=heal::mrf_queue::partial_write::tests::durable_retry_submission_error_keeps_checkpoint_and_uses_backoff))'
 threads-required = "num-test-threads"
 
+# These eight-disk decommission fixtures exercise concurrent retries,
+# free-version cleanup, and real capacity probes under production lock deadlines.
+# Reserve the run's capacity so unrelated IO cannot exhaust those budgets.
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & (test(/^store::init::tests::decommission_entry_(retries_source_changed_without_canceling_other_bucket|skips_cleanup_only_marker_when_free_version_is_present)$/) | test(=core::pools::tests::decommission_capacity_mutation_limits_prewrite_sampling_to_target))'
+threads-required = "num-test-threads"
+
 # This registration/backup lock probe uses an isolated eight-disk store.
 # Reserve capacity so sibling disk-heavy tests cannot consume its 2s
 # registration budget; retain the queued backup and deadlock assertions.
@@ -367,8 +384,11 @@ threads-required = "num-test-threads"
 filter = 'package(rustfs-heal) & (binary(mrf_partial_write_test) | (binary(mrf_pipeline_test) & test(/^journal_replay_survives_/)) | test(=admin_selector_survives_sigkill_with_original_scope_and_receipts))'
 threads-required = "num-test-threads"
 
+# Native scanner backlog fixtures include 24-set and pool-expansion cases.
+# Reserve capacity across test processes while preserving each scenario's fixed
+# budget, assertions, and internal concurrency.
 [[profile.ci.overrides]]
-filter = 'package(rustfs-scanner) & (test(/^scanner::backlog::tests::native_(writer|retirement)_/) | test(=scanner_folder::tests::mrf_ownership::mrf_ownership_manager_completion_preserves_scanner_pending) | test(/^scanner_io::tests::service_cohort::/))'
+filter = 'package(rustfs-scanner) & (test(/^scanner::backlog::tests::native_/) | test(=scanner_folder::tests::mrf_ownership::mrf_ownership_manager_completion_preserves_scanner_pending) | test(/^scanner_io::tests::service_cohort::/))'
 threads-required = "num-test-threads"
 
 [[profile.ci.scripts]]

@@ -49,6 +49,7 @@ mod quota_reset_preservation;
 
 mod recovery_control;
 mod scoped_ack_publication;
+mod wakeup_metrics;
 
 async fn setup_scanner_cycle_store() -> (tempfile::TempDir, Arc<ECStore>) {
     setup_scanner_cycle_store_with_usage_baseline(true).await

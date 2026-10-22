@@ -53,6 +53,10 @@ const PRE_ACK_REACH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Cancel and stop are acknowledged before every in-flight entry finishes its
 /// cleanup; terminal state and placement are polled within this budget.
 const TERMINAL_TRANSITION_TIMEOUT: Duration = Duration::from_secs(90);
+/// Recovery includes the fleet-proof retry before migration can resume. A
+/// healthy CI restart completed after 253 s while still making progress; keep
+/// this recovery budget below the distributed profile's 720 s process limit.
+const DECOMMISSION_RESUME_COMPLETE_TIMEOUT: Duration = Duration::from_secs(360);
 
 fn pools(ids: &[usize]) -> BTreeSet<usize> {
     ids.iter().copied().collect()
@@ -131,6 +135,7 @@ fn timeouts() -> Value {
     json!({
         "movement_active_secs": MOVEMENT_ACTIVE_TIMEOUT.as_secs(),
         "movement_complete_secs": MOVEMENT_COMPLETE_TIMEOUT.as_secs(),
+        "decommission_resume_complete_secs": DECOMMISSION_RESUME_COMPLETE_TIMEOUT.as_secs(),
         "barrier_reach_secs": MOVEMENT_COMPLETE_TIMEOUT.as_secs(),
         "terminal_transition_secs": TERMINAL_TRANSITION_TIMEOUT.as_secs(),
     })
@@ -426,8 +431,13 @@ async fn scanner_heal_topology_decommission_queue_cancel_resume_and_last_pool_gu
 /// Outcome of a fault case: the worker result and the data verdict are
 /// reported separately so a fail-closed worker and a lost version never hide
 /// each other.
-async fn settle_decommission(run: &TopologyRun, manifest: &TopologyManifest, label: &str) -> TestResult<Value> {
-    let completion = wait_for_decommission_complete(&run.dist.cluster, DECOMMISSION_POOL_ID, MOVEMENT_COMPLETE_TIMEOUT).await;
+async fn settle_decommission(
+    run: &TopologyRun,
+    manifest: &TopologyManifest,
+    label: &str,
+    completion_timeout: Duration,
+) -> TestResult<Value> {
+    let completion = wait_for_decommission_complete(&run.dist.cluster, DECOMMISSION_POOL_ID, completion_timeout).await;
     let allowed = if completion.is_ok() {
         pools(&TARGET_POOLS)
     } else {
@@ -518,7 +528,7 @@ async fn scanner_heal_topology_decommission_kill_before_source_cleanup_resumes_w
     run.movement_barrier.disarm()?;
     let restarted_pid = run.restart_killed_node(SEED_POOL).await?;
     let label = "after the killed leader resumed decommission";
-    let outcome = settle_decommission(&run, &manifest, label).await;
+    let outcome = settle_decommission(&run, &manifest, label, MOVEMENT_COMPLETE_TIMEOUT).await;
     let strict_nodes = assert_process_durability_strict(&run.node_log_paths());
     record(
         &run,
@@ -573,7 +583,7 @@ async fn scanner_heal_topology_decommission_target_commit_failure_retains_source
     run.movement_barrier.release_movement_with_io_error()?;
 
     let label = "after the failed target commit was retried";
-    let outcome = settle_decommission(&run, &manifest, label).await;
+    let outcome = settle_decommission(&run, &manifest, label, MOVEMENT_COMPLETE_TIMEOUT).await;
     let strict_nodes = assert_process_durability_strict(&run.node_log_paths());
     record(
         &run,
@@ -667,7 +677,7 @@ async fn scanner_heal_topology_decommission_kill_after_responsibility_persisted_
     let label = "after the persisted decommission resumed";
     let resumed = wait_for_decommission_active(&run.dist.cluster, DECOMMISSION_POOL_ID, Duration::from_secs(60)).await;
     let outcome = match resumed {
-        Ok(()) => settle_decommission(&run, &manifest, label).await,
+        Ok(()) => settle_decommission(&run, &manifest, label, DECOMMISSION_RESUME_COMPLETE_TIMEOUT).await,
         Err(error) => Err(format!("{label}: the persisted decommission did not become active after the restart: {error}").into()),
     };
     let strict_nodes = assert_process_durability_strict(&run.node_log_paths());

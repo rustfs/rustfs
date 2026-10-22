@@ -997,6 +997,160 @@ fn completed_data_usage_info_adds_same_bucket_across_unique_sets() {
 }
 
 #[test]
+fn checked_bucket_usage_info_moves_replication_keys_and_preserves_the_snapshot() {
+    let first_target = "arn:rustfs:replication:local::target-a".to_string();
+    let zero_target = "arn:rustfs:replication:local::zero-counters".to_string();
+    let mut entry = DataUsageEntry {
+        size: 32768,
+        objects: 9,
+        versions: 14,
+        delete_markers: 2,
+        replication_stats: Some(ReplicationAllStats {
+            replica_size: 777,
+            replica_count: 3,
+            targets: HashMap::from([
+                (
+                    first_target.clone(),
+                    ReplicationTargetUsage {
+                        pending_size: 101,
+                        replicated_size: 102,
+                        failed_size: 103,
+                        failed_count: 104,
+                        pending_count: 105,
+                        missed_threshold_size: 106,
+                        after_threshold_size: 107,
+                        missed_threshold_count: 108,
+                        after_threshold_count: 109,
+                        replicated_count: 110,
+                    },
+                ),
+                (zero_target.clone(), ReplicationTargetUsage::default()),
+            ]),
+        }),
+        ..Default::default()
+    };
+    entry.obj_sizes.add(2048);
+    entry.obj_sizes.add(32768);
+    entry.obj_versions.add(0);
+    entry.obj_versions.add(3);
+    let target_allocations = entry
+        .replication_stats
+        .as_ref()
+        .expect("replication fixture")
+        .targets
+        .keys()
+        .map(|target| (target.clone(), target.as_ptr()))
+        .collect::<Vec<_>>();
+
+    let usage = checked_bucket_usage_info(entry).expect("owned usage entry remains representable");
+    for (target, allocation) in target_allocations {
+        assert_eq!(
+            usage
+                .replication_info
+                .get_key_value(&target)
+                .expect("retained replication target")
+                .0
+                .as_ptr(),
+            allocation,
+            "the target key must move from the consumed entry without cloning its allocation"
+        );
+    }
+    let expected = BucketUsageInfo {
+        size: 32768,
+        replication_pending_size_v1: 0,
+        replication_failed_size_v1: 0,
+        replicated_size_v1: 0,
+        replication_pending_count_v1: 0,
+        replication_failed_count_v1: 0,
+        objects_count: 9,
+        object_size_histogram: HashMap::from([
+            ("LESS_THAN_1024_B".to_string(), 0),
+            ("BETWEEN_1024_B_AND_64_KB".to_string(), 2),
+            ("BETWEEN_64_KB_AND_256_KB".to_string(), 0),
+            ("BETWEEN_256_KB_AND_512_KB".to_string(), 0),
+            ("BETWEEN_512_KB_AND_1_MB".to_string(), 0),
+            ("BETWEEN_1024B_AND_1_MB".to_string(), 2),
+            ("BETWEEN_1_MB_AND_10_MB".to_string(), 0),
+            ("BETWEEN_10_MB_AND_64_MB".to_string(), 0),
+            ("BETWEEN_64_MB_AND_128_MB".to_string(), 0),
+            ("BETWEEN_128_MB_AND_512_MB".to_string(), 0),
+            ("GREATER_THAN_512_MB".to_string(), 0),
+        ]),
+        object_versions_histogram: HashMap::from([
+            ("UNVERSIONED".to_string(), 1),
+            ("SINGLE_VERSION".to_string(), 0),
+            ("BETWEEN_2_AND_10".to_string(), 1),
+            ("BETWEEN_10_AND_100".to_string(), 0),
+            ("BETWEEN_100_AND_1000".to_string(), 0),
+            ("BETWEEN_1000_AND_10000".to_string(), 0),
+            ("GREATER_THAN_10000".to_string(), 0),
+        ]),
+        versions_count: 14,
+        delete_markers_count: 2,
+        replica_size: 777,
+        replica_count: 3,
+        replication_info: HashMap::from([
+            (
+                first_target,
+                BucketTargetUsageInfo {
+                    replication_pending_size: 101,
+                    replication_failed_size: 103,
+                    replicated_size: 102,
+                    replica_size: 0,
+                    replication_pending_count: 105,
+                    replication_failed_count: 104,
+                    replicated_count: 110,
+                },
+            ),
+            (zero_target, BucketTargetUsageInfo::default()),
+        ]),
+    };
+    assert_eq!(usage, expected);
+    assert_eq!(
+        serde_json::to_value(&usage).expect("serialize owned usage"),
+        serde_json::to_value(&expected).expect("serialize expected snapshot")
+    );
+}
+
+#[test]
+fn checked_bucket_usage_info_keeps_missing_empty_and_zero_replication_values() {
+    for replication_stats in [
+        None,
+        Some(ReplicationAllStats::default()),
+        Some(ReplicationAllStats {
+            targets: HashMap::from([(String::new(), ReplicationTargetUsage::default())]),
+            ..Default::default()
+        }),
+    ] {
+        let has_empty_target = replication_stats.as_ref().is_some_and(|stats| !stats.targets.is_empty());
+        let usage = checked_bucket_usage_info(DataUsageEntry {
+            replication_stats,
+            ..Default::default()
+        })
+        .expect("zero usage remains representable");
+        assert_eq!(usage.object_size_histogram.len(), 11);
+        assert!(usage.object_size_histogram.values().all(|value| *value == 0));
+        assert_eq!(usage.object_versions_histogram.len(), 7);
+        assert!(usage.object_versions_histogram.values().all(|value| *value == 0));
+        let expected = BucketUsageInfo {
+            object_size_histogram: usage.object_size_histogram.clone(),
+            object_versions_histogram: usage.object_versions_histogram.clone(),
+            replication_info: if has_empty_target {
+                HashMap::from([(String::new(), BucketTargetUsageInfo::default())])
+            } else {
+                HashMap::new()
+            },
+            ..Default::default()
+        };
+        assert_eq!(usage, expected);
+        assert_eq!(
+            serde_json::to_value(&usage).expect("serialize zero usage"),
+            serde_json::to_value(&expected).expect("serialize expected zero snapshot")
+        );
+    }
+}
+
+#[test]
 fn completed_data_usage_info_flattens_nested_bucket_entries() {
     let all_buckets = vec!["bucket".to_string()];
     let mut first_set = completed_root_cache("bucket", 1, 10, DataUsageCacheSource::new(0, 0));
@@ -1030,7 +1184,8 @@ fn completed_data_usage_info_flattens_nested_bucket_entries() {
     first_set.replace("bucket/prefix", "bucket", nested);
     let second_set = completed_root_cache("bucket", 3, 20, DataUsageCacheSource::new(1, 0));
 
-    let (data_usage_info, _) = completed_data_usage_info_for_test(&[first_set, second_set], &all_buckets, false, false)
+    let mut results = [first_set, second_set];
+    let (data_usage_info, _) = completed_data_usage_info_for_test(&results, &all_buckets, false, false)
         .expect("nested bucket entries should be flattened before aggregation");
     let bucket = data_usage_info.buckets_usage.get("bucket").expect("merged bucket usage");
 
@@ -1044,6 +1199,30 @@ fn completed_data_usage_info_flattens_nested_bucket_entries() {
     assert_eq!(bucket.replica_count, 2);
     assert_eq!(bucket.replication_info["arn:target"].replicated_size, 2048);
     assert_eq!(bucket.replication_info["arn:target"].replicated_count, 2);
+
+    let sources = results.iter().filter_map(|result| result.info.source).collect::<HashSet<_>>();
+    let (observed, _) = observational_data_usage_info(&results, &sources, &all_buckets, &[], TEST_PLAN_DIGEST, 0, 0)
+        .expect("current snapshots retain the same bucket usage on the observational path");
+    assert_eq!(observed.buckets_usage, data_usage_info.buckets_usage);
+    assert_eq!(observed.bucket_sizes, data_usage_info.bucket_sizes);
+    assert!(!observed.usage_snapshot_complete);
+    assert_eq!(observed.usage_snapshot_converged, Some(false));
+
+    for result in &mut results {
+        result.info.snapshot_complete = false;
+        result.info.lkg_snapshot_complete = true;
+        result.info.lkg_next_cycle = Some(0);
+        result.info.lkg_leader_epoch = Some(0);
+        result.info.lkg_last_update = result.info.last_update;
+        result.info.lkg_scan_plan_digest = Some(TEST_PLAN_DIGEST);
+    }
+    let (observed_lkg, _) = observational_data_usage_info(&results, &sources, &all_buckets, &[], TEST_PLAN_DIGEST, 1, 1)
+        .expect("LKG snapshots retain the same bucket usage after leader change");
+    assert_eq!(observed_lkg.buckets_usage, data_usage_info.buckets_usage);
+    assert_eq!(observed_lkg.bucket_sizes, data_usage_info.bucket_sizes);
+    assert!(!observed_lkg.usage_snapshot_complete);
+    assert_eq!(observed_lkg.usage_snapshot_converged, Some(false));
+    assert!(observed_lkg.usage_snapshot_set_states.iter().all(|state| !state.complete));
 }
 
 #[test]
@@ -1629,3 +1808,6 @@ fn replication_execution_digest_is_canonical_and_tracks_statistics() {
         .failed_count = 1;
     assert_ne!(super::cache::scanner_replication_execution_digest(execution, &cache), digest);
 }
+
+#[path = "usage_candidate_metrics_tests.rs"]
+mod usage_candidate_metrics_tests;

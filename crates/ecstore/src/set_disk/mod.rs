@@ -6559,6 +6559,16 @@ fn should_force_delete_marker_for_missing_version(opts: &ObjectOptions) -> bool 
     opts.delete_marker || ((opts.versioned || opts.version_suspended) && opts.version_id.is_none() && !opts.data_movement)
 }
 
+fn republishes_data_movement_delete_marker(opts: &ObjectOptions, goi: &ObjectInfo, version_found: bool) -> bool {
+    opts.data_movement
+        && opts.delete_marker
+        && version_found
+        && goi.delete_marker
+        && opts.version_purge_status().is_empty()
+        && goi.version_purge_status.is_empty()
+        && opts.version_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()) == Some(goi.version_id.unwrap_or_else(Uuid::nil))
+}
+
 /// Whether a plain client delete addressed to an explicit version removed an
 /// existing delete marker, so the response must carry delete-marker semantics
 /// (`x-amz-delete-marker: true` / `DeleteMarker` in `DeleteObjects` entries).
@@ -6574,6 +6584,7 @@ fn should_force_delete_marker_for_missing_version(opts: &ObjectOptions) -> bool 
 /// `resolve_delete_version_state` that clear `delete_marker` for them.
 fn explicit_delete_removed_marker(opts: &ObjectOptions, goi: &ObjectInfo, version_found: bool) -> bool {
     opts.version_id.is_some()
+        && !republishes_data_movement_delete_marker(opts, goi, version_found)
         && version_found
         && goi.delete_marker
         && goi.version_purge_status.is_empty()
@@ -6582,6 +6593,9 @@ fn explicit_delete_removed_marker(opts: &ObjectOptions, goi: &ObjectInfo, versio
 }
 
 fn resolve_delete_version_state(opts: &ObjectOptions, goi: &ObjectInfo, version_found: bool) -> (bool, bool) {
+    if republishes_data_movement_delete_marker(opts, goi, version_found) {
+        return (true, true);
+    }
     let mut mark_delete = goi.version_id.is_some() || ((opts.versioned || opts.version_suspended) && opts.version_id.is_none());
     let mut delete_marker = opts.versioned;
 
@@ -6636,6 +6650,29 @@ fn resolve_delete_version_state(opts: &ObjectOptions, goi: &ObjectInfo, version_
 }
 
 impl SetDisks {
+    pub(crate) async fn verify_data_movement_delete_marker_write_quorum(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+    ) -> Result<()> {
+        let requested_version = Uuid::parse_str(version_id)?;
+        let disks = self.disk_inventory().await;
+        let (metadata, errors) = Self::read_all_fileinfo(&disks, "", bucket, object, version_id, false, false, false).await?;
+        // Match delete_object_version_with_purge, independently of data parity or online inventory size.
+        let quorum = self.set_drive_count / 2 + 1;
+        let (_, marker, _) = Self::select_valid_fileinfo(&disks, &metadata, &errors, version_id, quorum, quorum)
+            .map_err(|error| to_object_err(error.into(), vec![bucket, object, version_id]))?;
+        if !marker.deleted || marker.tier_free_version() || marker.version_id.unwrap_or_else(Uuid::nil) != requested_version {
+            return Err(Error::DataMovementOverwriteErr(
+                bucket.to_owned(),
+                object.to_owned(),
+                version_id.to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Publish an internal tier free-version record without changing its
     /// delete-marker shape or remote-tier identity. The caller holds the
     /// source and target object locks; a write quorum is required before the
@@ -7691,18 +7728,25 @@ fn get_complete_multipart_md5(parts: &[CompletePart]) -> String {
     format!("{}-{}", etag_hex, parts.len())
 }
 
-fn completed_multipart_object_part(part_num: usize, ext_part: &ObjectPartInfo) -> ObjectPartInfo {
-    ObjectPartInfo {
-        etag: ext_part.etag.clone(),
-        number: part_num,
-        size: ext_part.size,
-        mod_time: ext_part.mod_time,
-        actual_size: ext_part.actual_size,
-        index: ext_part.index.clone(),
-        checksums: ext_part.checksums.clone(),
-        integrity: ext_part.integrity.clone(),
-        ..Default::default()
+fn prepare_complete_multipart_parts(fi: &mut FileInfo, parts: Vec<ObjectPartInfo>) -> Vec<usize> {
+    // Preserve legacy cleanup ordering, including replacement-only manifests.
+    let capacity = fi.parts.len() + parts.len();
+    let mut staged_part_numbers = Vec::with_capacity(capacity);
+    staged_part_numbers.extend(fi.parts.iter().map(|part| part.number));
+    let mut seen = HashSet::with_capacity(capacity);
+    seen.extend(staged_part_numbers.iter().copied());
+    let mut inserted = false;
+    for part in &parts {
+        if seen.insert(part.number) {
+            staged_part_numbers.push(part.number);
+            inserted = true;
+        }
     }
+    if inserted {
+        staged_part_numbers.sort_unstable();
+    }
+    fi.parts = parts;
+    staged_part_numbers
 }
 
 fn complete_part_checksum(part: &CompletePart, checksum_type: rustfs_rio::ChecksumType) -> Option<Option<String>> {
@@ -9134,6 +9178,56 @@ mod tests {
     }
 
     #[test]
+    fn data_movement_marker_republication_preserves_creation_and_exact_identity() {
+        for version in [Uuid::nil(), Uuid::new_v4()] {
+            for replica in [false, true] {
+                let opts = ObjectOptions {
+                    versioned: !version.is_nil(),
+                    version_suspended: version.is_nil(),
+                    version_id: Some(version.to_string()),
+                    data_movement: true,
+                    delete_marker: true,
+                    delete_replication: replica.then(|| ReplicationState {
+                        replica_status: ReplicationStatusType::Replica,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let current = ObjectInfo {
+                    version_id: (!version.is_nil()).then_some(version),
+                    delete_marker: true,
+                    ..Default::default()
+                };
+                assert_eq!(resolve_delete_version_state(&opts, &current, true), (true, true));
+                assert!(!explicit_delete_removed_marker(&opts, &current, true));
+                let mut changed = current.clone();
+                changed.version_id = Some(Uuid::new_v4());
+                assert!(!republishes_data_movement_delete_marker(&opts, &changed, true));
+                changed.version_id = current.version_id;
+                changed.delete_marker = false;
+                assert!(!republishes_data_movement_delete_marker(&opts, &changed, true));
+                changed = current.clone();
+                changed.version_purge_status = VersionPurgeStatusType::Complete;
+                assert!(!republishes_data_movement_delete_marker(&opts, &changed, true));
+                let purging = ObjectOptions {
+                    delete_replication: Some(ReplicationState {
+                        version_purge_status_internal: Some("target=PENDING;".to_string()),
+                        purge_targets: version_purge_statuses_map("target=PENDING;"),
+                        ..Default::default()
+                    }),
+                    ..opts.clone()
+                };
+                assert!(!republishes_data_movement_delete_marker(&purging, &current, true));
+                let ordinary = ObjectOptions {
+                    data_movement: false,
+                    ..opts
+                };
+                assert!(!republishes_data_movement_delete_marker(&ordinary, &current, true));
+            }
+        }
+    }
+
+    #[test]
     fn resolve_delete_version_state_keeps_delete_marker_for_replica_marker_creation() {
         let opts = ObjectOptions {
             versioned: true,
@@ -9338,30 +9432,61 @@ mod tests {
     }
 
     #[test]
-    fn test_completed_multipart_object_part_preserves_checksums() {
+    fn prepare_complete_multipart_parts_preserves_metadata_and_cleanup_order() {
         let checksums = HashMap::from([
-            (rustfs_rio::ChecksumType::CRC32.to_string(), "crc32-value".to_string()),
-            (rustfs_rio::ChecksumType::CRC32C.to_string(), "crc32c-value".to_string()),
+            (rustfs_rio::ChecksumType::CRC32.to_string(), "crc32-value".to_owned()),
+            (rustfs_rio::ChecksumType::CRC32C.to_string(), "crc32c-value".to_owned()),
         ]);
-        let ext_part = ObjectPartInfo {
+        let part = ObjectPartInfo {
             number: 7,
-            etag: "etag-7".to_string(),
+            etag: "etag-7".to_owned(),
             size: 123,
             actual_size: 456,
             mod_time: Some(OffsetDateTime::UNIX_EPOCH),
             index: Some(Bytes::from_static(&[1, 2, 3])),
-            checksums: Some(checksums.clone()),
+            checksums: Some(checksums),
+            integrity: Some(
+                rustfs_filemeta::shard_integrity::PartIntegrity::new(
+                    rustfs_filemeta::shard_integrity::IntegrityLayout::new(2, 2, 1024 * 1024, false).expect("valid layout"),
+                    7,
+                )
+                .expect("valid integrity"),
+            ),
             ..Default::default()
         };
-
-        let completed = completed_multipart_object_part(7, &ext_part);
-
-        assert_eq!(completed.number, 7);
-        assert_eq!(completed.etag, ext_part.etag);
-        assert_eq!(completed.size, ext_part.size);
-        assert_eq!(completed.actual_size, ext_part.actual_size);
-        assert_eq!(completed.index, ext_part.index);
-        assert_eq!(completed.checksums, Some(checksums));
+        let incoming = vec![part.clone()];
+        let pointer = incoming.as_ptr();
+        let mut fi = FileInfo {
+            parts: vec![
+                ObjectPartInfo {
+                    number: 9,
+                    ..Default::default()
+                },
+                ObjectPartInfo {
+                    number: 7,
+                    etag: "stale".to_owned(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(prepare_complete_multipart_parts(&mut fi, incoming), vec![9, 7]);
+        assert_eq!(fi.parts, vec![part.clone()]);
+        assert_eq!(fi.parts.as_ptr(), pointer, "move the existing allocation");
+        let mut fi = FileInfo {
+            parts: vec![
+                ObjectPartInfo {
+                    number: 9,
+                    ..Default::default()
+                },
+                ObjectPartInfo {
+                    number: 1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(prepare_complete_multipart_parts(&mut fi, vec![part]), vec![1, 7, 9]);
     }
 
     #[test]

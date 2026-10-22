@@ -828,8 +828,6 @@ impl DefaultObjectUsecase {
             .await;
 
         let _manager = get_concurrency_manager();
-        let _bucket_clone = bucket.clone();
-        let _deleted_objects = dobjs.clone();
         if !errs.is_empty() && errs.iter().all(|err| err.as_ref().is_some_and(is_err_bucket_not_found)) {
             let result = Err(S3Error::with_message(S3ErrorCode::NoSuchBucket, "Bucket not found".to_string()));
             let _ = helper.complete(&result);
@@ -1139,8 +1137,7 @@ impl DefaultObjectUsecase {
         let replicate_force_delete = force_delete && !replica && has_active_delete_rule(&delete_config_snapshot, &key);
         let mut force_delete_intent = None;
 
-        let get_opts = opts.clone();
-        let existing_object_info = match store.get_object_info_for_delete(&bucket, &key, &get_opts).await {
+        let existing_object_info = match store.get_object_info_for_delete(&bucket, &key, &opts).await {
             Ok(obj_info) => Some(obj_info),
             Err(err) => {
                 // If object not found, allow deletion to proceed (will return 204 No Content)

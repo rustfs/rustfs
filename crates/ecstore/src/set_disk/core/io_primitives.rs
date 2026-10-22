@@ -5242,6 +5242,8 @@ impl SetDisks {
                         transaction_parts.insert(part_number);
                     }
                 }
+                // UploadPart creates this directory; an empty upload has no transactions to recover.
+                Err(DiskError::FileNotFound) => errs.push(None),
                 Err(err) => errs.push(Some(err)),
             }
         }
