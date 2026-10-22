@@ -24,7 +24,7 @@
 
 use super::msgp_decode::{
     prealloc_hint, read_bin_slice, read_exact_vec, read_nil_or_array_len, read_nil_or_map_len, read_nil_or_submap_len,
-    read_slice, read_small_str, read_str_slice, skip_msgp_value,
+    read_slice, read_small_str, read_str_bytes_slice, read_str_slice, skip_msgp_value,
 };
 use super::*;
 use crate::{ChecksumInfo, TransitionVersionState};
@@ -86,12 +86,44 @@ fn fold_signature(crc: u64) -> [u8; 4] {
     ((crc ^ (crc >> 32)) as u32).to_le_bytes()
 }
 
-struct Xxh64Writer(xxhash_rust::xxh64::Xxh64);
+struct Xxh64Writer {
+    buf: [u8; 256],
+    len: usize,
+    stream: Option<xxhash_rust::xxh64::Xxh64>,
+}
+
+impl Xxh64Writer {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            buf: [0u8; 256],
+            len: 0,
+            stream: None,
+        }
+    }
+
+    #[inline]
+    fn finish(self) -> u64 {
+        if let Some(mut stream) = self.stream {
+            stream.update(&self.buf[..self.len]);
+            stream.digest()
+        } else {
+            xxhash_rust::xxh64::xxh64(&self.buf[..self.len], XXHASH_SEED)
+        }
+    }
+}
 
 impl std::io::Write for Xxh64Writer {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.update(buf);
+        if self.len + buf.len() <= self.buf.len() {
+            self.buf[self.len..self.len + buf.len()].copy_from_slice(buf);
+            self.len += buf.len();
+        } else {
+            let stream = self.stream.get_or_insert_with(|| xxhash_rust::xxh64::Xxh64::new(XXHASH_SEED));
+            stream.update(&self.buf[..std::mem::take(&mut self.len)]);
+            stream.update(buf);
+        }
         Ok(buf.len())
     }
 
@@ -492,18 +524,21 @@ impl FileInfo {
     }
 }
 
+fn apply_transition_version_state(meta_sys: &mut HashMap<String, Vec<u8>>, state: TransitionVersionState, has_state_key: bool) {
+    if state == TransitionVersionState::Unknown && !has_state_key {
+        remove_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE);
+    } else {
+        insert_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE, state.as_str().as_bytes().to_vec());
+    }
+}
+
 fn set_transition_version_state(
     meta_sys: &mut HashMap<String, Vec<u8>>,
     state: TransitionVersionState,
     source_metadata: &HashMap<String, String>,
 ) {
-    if state == TransitionVersionState::Unknown
-        && !rustfs_utils::http::metadata_compat::contains_key_str(source_metadata, SUFFIX_TRANSITIONED_VERSION_STATE)
-    {
-        remove_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE);
-    } else {
-        insert_bytes(meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE, state.as_str().as_bytes().to_vec());
-    }
+    let has_state_key = rustfs_utils::http::metadata_compat::contains_key_str(source_metadata, SUFFIX_TRANSITIONED_VERSION_STATE);
+    apply_transition_version_state(meta_sys, state, has_state_key);
 }
 
 fn transitioned_version_bytes(fi: &FileInfo) -> Option<Vec<u8>> {
@@ -646,6 +681,20 @@ pub struct FileMetaVersion {
     pub uses_legacy_checksum: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static V2_OBJECT_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct V2ObjectSliceSummary {
+    pub version_id: Option<Uuid>,
+    pub data_dir: Option<Uuid>,
+    pub physical_data_dir: Option<Uuid>,
+    pub transition_complete: bool,
+    pub has_reconciled_transition: bool,
+}
+
 impl FileMetaVersion {
     fn erasure_write_quorum(&self) -> Option<usize> {
         let (data_blocks, parity_blocks) = match self.version_type {
@@ -664,63 +713,177 @@ impl FileMetaVersion {
         write_quorum_from_erasure(data_blocks, parity_blocks)
     }
 
-    fn decode_data_dir_from_v2_object(buf: &[u8]) -> Result<Option<Uuid>> {
+    /// Fast borrowed scanner for `V2Obj` slices. Returning `Ok` guarantees
+    /// `FileMetaVersion::try_from` would succeed with the identical summary fields;
+    /// any non-`V2Obj` or invalid input returns `Err` so callers fall back to `try_from`.
+    pub(super) fn inspect_v2_object_slice(buf: &[u8]) -> Result<V2ObjectSliceSummary> {
+        #[cfg(test)]
+        V2_OBJECT_SCAN_COUNT.with(|count| count.set(count.get() + 1));
+        #[derive(Default)]
+        struct RawV2Scan<'a> {
+            has_object: bool,
+            version_id: Option<Uuid>,
+            data_dir: Option<Uuid>,
+            erasure_algorithm: ErasureAlgo,
+            bitrot_checksum_algo: ChecksumAlgo,
+            has_mod_time: bool,
+            has_inline_data: bool,
+            has_transition_dest_id: bool,
+            has_transition_ver_state: bool,
+            rustfs_transition_status: Option<&'a [u8]>,
+            minio_transition_status: Option<&'a [u8]>,
+            restore_hdr: Option<&'a str>,
+        }
+
         let mut cur = std::io::Cursor::new(buf);
         let mut fields = rmp::decode::read_map_len(&mut cur)?;
         let mut version_type = VersionType::Invalid;
-        let mut inline_key = [0u8; MSGP_OBJECT_KEY_STACK_CAP];
-        let mut heap_key = Vec::new();
+        let mut s = RawV2Scan::default();
 
         while fields > 0 {
             fields -= 1;
-
-            let key = read_small_str(&mut cur, &mut inline_key, &mut heap_key)?;
-
-            match key {
-                "Type" => {
-                    let v: i64 = rmp::decode::read_int(&mut cur)?;
-                    version_type = VersionType::from_u8(v as u8);
-                }
-                "V2Obj" => {
-                    if version_type != VersionType::Object {
-                        skip_msgp_value(&mut cur)?;
-                        continue;
-                    }
-
+            match read_str_bytes_slice(&mut cur)? {
+                b"Type" => version_type = VersionType::from_u8(rmp::decode::read_int::<i64, _>(&mut cur)? as u8),
+                b"V2Obj" => {
                     let Some(mut obj_fields) = read_nil_or_submap_len(&mut cur)? else {
-                        return Ok(None);
+                        s.has_object = false;
+                        continue;
                     };
-                    let mut data_dir: Option<Uuid> = None;
+                    s = RawV2Scan {
+                        has_object: true,
+                        ..Default::default()
+                    };
 
                     while obj_fields > 0 {
                         obj_fields -= 1;
-
-                        let obj_key = read_small_str(&mut cur, &mut inline_key, &mut heap_key)?;
-
-                        if obj_key == "DDir" {
-                            let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
-                            if bin_len != 16 {
-                                return Err(Error::other(format!("DDir must be 16 bytes, got {bin_len}")));
+                        match read_str_bytes_slice(&mut cur)? {
+                            b"ID" => s.version_id = read_opt_uuid_slice(&mut cur)?,
+                            b"DDir" => s.data_dir = read_opt_uuid_slice(&mut cur)?,
+                            b"EcAlgo" => {
+                                s.erasure_algorithm = ErasureAlgo::from_u8(rmp::decode::read_int::<i64, _>(&mut cur)? as u8)
                             }
-                            let mut raw = [0u8; 16];
-                            cur.read_exact(&mut raw)?;
-                            let id = Uuid::from_bytes(raw);
-                            data_dir = if id.is_nil() { None } else { Some(id) };
-                            break;
+                            b"EcM" | b"EcN" | b"EcBSize" | b"EcIndex" | b"Size" => {
+                                let _: i64 = rmp::decode::read_int(&mut cur)?;
+                            }
+                            b"EcDist" | b"PartNums" | b"PartSizes" => {
+                                for _ in 0..rmp::decode::read_array_len(&mut cur)? {
+                                    let _: i64 = rmp::decode::read_int(&mut cur)?;
+                                }
+                            }
+                            b"CSumAlgo" => {
+                                s.bitrot_checksum_algo = ChecksumAlgo::from_u8(rmp::decode::read_int::<i64, _>(&mut cur)? as u8)
+                            }
+                            b"PartETags" => {
+                                for _ in 0..read_nil_or_array_len(&mut cur)?.unwrap_or(0) {
+                                    let _ = read_str_slice(&mut cur)?;
+                                }
+                            }
+                            b"PartASizes" => {
+                                for _ in 0..read_nil_or_array_len(&mut cur)?.unwrap_or(0) {
+                                    let _: i64 = rmp::decode::read_int(&mut cur)?;
+                                }
+                            }
+                            b"PartIdx" => {
+                                for _ in 0..rmp::decode::read_array_len(&mut cur)? {
+                                    let _ = read_bin_slice(&mut cur)?;
+                                }
+                            }
+                            b"MTime" => {
+                                let nanos: i64 = rmp::decode::read_int(&mut cur)?;
+                                s.has_mod_time =
+                                    OffsetDateTime::from_unix_timestamp_nanos(nanos as i128)? != OffsetDateTime::UNIX_EPOCH;
+                            }
+                            b"MetaSys" => {
+                                (
+                                    s.has_inline_data,
+                                    s.has_transition_dest_id,
+                                    s.has_transition_ver_state,
+                                    s.rustfs_transition_status,
+                                    s.minio_transition_status,
+                                ) = (false, false, false, None, None);
+                                for _ in 0..read_nil_or_map_len(&mut cur)?.unwrap_or(0) {
+                                    let k = read_str_bytes_slice(&mut cur)?;
+                                    let v = read_bin_slice(&mut cur)?;
+                                    match k {
+                                        b"x-rustfs-internal-inline-data" | b"x-minio-internal-inline-data" => {
+                                            s.has_inline_data = true;
+                                        }
+                                        b"x-rustfs-internal-transition-status" => s.rustfs_transition_status = Some(v),
+                                        b"x-minio-internal-transition-status" => s.minio_transition_status = Some(v),
+                                        b"x-rustfs-internal-transition-tier-destination-id"
+                                        | b"x-minio-internal-transition-tier-destination-id" => {
+                                            s.has_transition_dest_id = true;
+                                        }
+                                        b"x-rustfs-internal-transitioned-version-state"
+                                        | b"x-minio-internal-transitioned-version-state" => {
+                                            s.has_transition_ver_state = true;
+                                        }
+                                        other => {
+                                            std::str::from_utf8(other).map_err(|e| Error::FromUtf8(e.to_string()))?;
+                                        }
+                                    }
+                                }
+                            }
+                            b"MetaUsr" => {
+                                s.restore_hdr = None;
+                                for _ in 0..read_nil_or_map_len(&mut cur)?.unwrap_or(0) {
+                                    let k = read_str_bytes_slice(&mut cur)?;
+                                    let v = read_str_slice(&mut cur)?;
+                                    if k == metadata_keys::RESTORE.as_bytes() {
+                                        s.restore_hdr = Some(v);
+                                    } else {
+                                        std::str::from_utf8(k).map_err(|e| Error::FromUtf8(e.to_string()))?;
+                                    }
+                                }
+                            }
+                            other => {
+                                std::str::from_utf8(other).map_err(|e| Error::FromUtf8(e.to_string()))?;
+                                skip_msgp_value(&mut cur)?;
+                            }
                         }
-
-                        skip_msgp_value(&mut cur)?;
                     }
-
-                    return Ok(data_dir);
                 }
-                _ => {
+                b"V1Obj" | b"DelObj" => return Err(Error::other("non-V2Obj uses full decoder")),
+                b"v" => {
+                    if rmp::decode::read_int::<i64, _>(&mut cur)? < 0 {
+                        return Err(Error::other("negative write_version not supported"));
+                    }
+                }
+                other => {
+                    std::str::from_utf8(other).map_err(|e| Error::FromUtf8(e.to_string()))?;
                     skip_msgp_value(&mut cur)?;
                 }
             }
         }
 
-        Ok(None)
+        if version_type != VersionType::Object
+            || !s.has_object
+            || !s.erasure_algorithm.valid()
+            || !s.bitrot_checksum_algo.valid()
+            || !s.has_mod_time
+        {
+            return Err(Error::other("non-valid V2Obj uses full decoder"));
+        }
+
+        let transition_complete =
+            s.rustfs_transition_status.or(s.minio_transition_status) == Some(TRANSITION_COMPLETE.as_bytes());
+        let physical_data_dir = if s.has_inline_data
+            || (transition_complete
+                && !s.restore_hdr.is_some_and(|hdr| {
+                    crate::parse_restore_obj_status(hdr).is_ok_and(|st| crate::fileinfo::RestoreStatusOps::on_disk(&st))
+                })) {
+            None
+        } else {
+            s.data_dir
+        };
+
+        Ok(V2ObjectSliceSummary {
+            version_id: s.version_id,
+            data_dir: s.data_dir,
+            physical_data_dir,
+            transition_complete,
+            has_reconciled_transition: s.has_transition_dest_id && s.has_transition_ver_state,
+        })
     }
 
     pub fn valid(&self) -> bool {
@@ -774,6 +937,10 @@ impl FileMetaVersion {
             VersionType::Legacy => self.legacy_object.as_ref().and_then(|v| v.stat.mod_time),
             VersionType::Invalid => None,
         }
+    }
+
+    fn decode_data_dir_from_v2_object(buf: &[u8]) -> Result<Option<Uuid>> {
+        Ok(Self::inspect_v2_object_slice(buf)?.data_dir)
     }
 
     // decode_data_dir_from_meta reads data_dir from meta TODO: directly parse only data_dir from meta buf, msg.skip
@@ -1060,7 +1227,10 @@ struct BorrowedMetaObject<'a> {
 }
 
 fn read_opt_uuid_slice(cur: &mut std::io::Cursor<&[u8]>) -> Result<Option<Uuid>> {
-    let _ = rmp::decode::read_bin_len(cur)?;
+    let bin_len = rmp::decode::read_bin_len(cur)? as usize;
+    if bin_len != 16 {
+        return Err(Error::other(format!("DDir must be 16 bytes, got {bin_len}")));
+    }
     let id = Uuid::from_slice(read_slice(cur, 16)?).map_err(Error::from)?;
     Ok((!id.is_nil()).then_some(id))
 }
@@ -2401,10 +2571,10 @@ impl MetaObject {
         // Zero fields that legitimately vary per disk within an erasure set, and
         // treat an all-empty PartETags vector the same as an absent one so two
         // disks that encode `[]` vs `["", ""]` do not falsely diverge.
-        let mut hasher = Xxh64Writer(xxhash_rust::xxh64::Xxh64::new(XXHASH_SEED));
+        let mut hasher = Xxh64Writer::new();
         let include_part_etags = !self.part_etags.iter().all(String::is_empty);
         if self.encode_to_with_options(&mut hasher, 0, include_part_etags, false).is_ok() {
-            crc ^= hasher.0.finish();
+            crc ^= hasher.finish();
         }
 
         fold_signature(crc)
@@ -3215,8 +3385,12 @@ impl MetaObject {
     }
 
     pub fn uses_data_dir(&self) -> bool {
-        if let Some(status) = get_bytes(&self.meta_sys, SUFFIX_TRANSITION_STATUS)
-            && status == TRANSITION_COMPLETE.as_bytes().to_vec()
+        if !self.meta_sys.is_empty()
+            && self
+                .meta_sys
+                .get("x-rustfs-internal-transition-status")
+                .or_else(|| self.meta_sys.get("x-minio-internal-transition-status"))
+                .is_some_and(|status| status.as_slice() == TRANSITION_COMPLETE.as_bytes())
         {
             return false;
         }
@@ -3225,7 +3399,7 @@ impl MetaObject {
     }
 
     pub fn inlinedata(&self) -> bool {
-        contains_key_bytes(&self.meta_sys, SUFFIX_INLINE_DATA)
+        !self.meta_sys.is_empty() && contains_key_bytes(&self.meta_sys, SUFFIX_INLINE_DATA)
     }
 
     pub fn reset_inline_data(&mut self) {
@@ -3252,7 +3426,7 @@ impl MetaObject {
             return Ok((FileMetaVersion::default(), false));
         }
         if let Some(status) = get_bytes(&self.meta_sys, SUFFIX_TRANSITION_STATUS)
-            && status == TRANSITION_COMPLETE.as_bytes().to_vec()
+            && status.as_slice() == TRANSITION_COMPLETE.as_bytes()
         {
             let vid = Uuid::parse_str(&fi.tier_free_version_id())?;
             let mut free_entry = FileMetaVersion {
@@ -3298,57 +3472,60 @@ impl MetaObject {
 
 impl From<FileInfo> for MetaObject {
     fn from(value: FileInfo) -> Self {
-        let part_etags = if !value.parts.is_empty() {
-            value.parts.iter().map(|v| v.etag.clone()).collect()
-        } else {
-            vec![]
-        };
+        let transition_version = transitioned_version_bytes(&value);
+        let has_transition_status = !value.transition_status.is_empty();
+        let has_transition_version_state_key = has_transition_status
+            && rustfs_utils::http::metadata_compat::contains_key_str(&value.metadata, SUFFIX_TRANSITIONED_VERSION_STATE);
 
-        let part_indices = if !value.parts.is_empty() {
-            value.parts.iter().map(|v| v.index.clone().unwrap_or_default()).collect()
-        } else {
-            vec![]
-        };
+        let parts_len = value.parts.len();
+        let mut part_numbers = Vec::with_capacity(parts_len);
+        let mut part_etags = Vec::with_capacity(parts_len);
+        let mut part_sizes = Vec::with_capacity(parts_len);
+        let mut part_actual_sizes = Vec::with_capacity(parts_len);
+        let mut part_indices = Vec::with_capacity(parts_len);
+        for part in value.parts {
+            part_numbers.push(part.number);
+            part_etags.push(part.etag);
+            part_sizes.push(part.size);
+            part_actual_sizes.push(part.actual_size);
+            part_indices.push(part.index.unwrap_or_default());
+        }
 
         let mut meta_sys = HashMap::new();
         let mut meta_user = HashMap::new();
-        for (k, v) in value.metadata.iter() {
-            if is_internal_key(k) {
-                if is_skip_meta_key(k) {
+        for (k, v) in value.metadata {
+            if is_internal_key(&k) {
+                if is_skip_meta_key(&k) {
                     continue;
                 }
 
-                meta_sys.insert(k.to_owned(), v.as_bytes().to_vec());
+                meta_sys.insert(k, v.into_bytes());
             } else {
-                meta_user.insert(k.to_owned(), v.to_owned());
+                meta_user.insert(k, v);
             }
         }
 
-        if !value.transition_status.is_empty() {
-            insert_bytes(&mut meta_sys, SUFFIX_TRANSITION_STATUS, value.transition_status.as_bytes().to_vec());
+        if has_transition_status {
+            insert_bytes(&mut meta_sys, SUFFIX_TRANSITION_STATUS, value.transition_status.into_bytes());
         }
 
         if !value.transitioned_objname.is_empty() {
-            insert_bytes(
-                &mut meta_sys,
-                SUFFIX_TRANSITIONED_OBJECTNAME,
-                value.transitioned_objname.as_bytes().to_vec(),
-            );
+            insert_bytes(&mut meta_sys, SUFFIX_TRANSITIONED_OBJECTNAME, value.transitioned_objname.into_bytes());
         }
 
-        if let Some(transition_version) = transitioned_version_bytes(&value) {
+        if let Some(transition_version) = transition_version {
             insert_bytes(&mut meta_sys, SUFFIX_TRANSITIONED_VERSION_ID, transition_version);
         }
-        if !value.transition_status.is_empty() {
-            set_transition_version_state(&mut meta_sys, value.transition_version_state, &value.metadata);
+        if has_transition_status {
+            apply_transition_version_state(&mut meta_sys, value.transition_version_state, has_transition_version_state_key);
         }
 
         if !value.transition_tier.is_empty() {
-            insert_bytes(&mut meta_sys, SUFFIX_TRANSITION_TIER, value.transition_tier.as_bytes().to_vec());
+            insert_bytes(&mut meta_sys, SUFFIX_TRANSITION_TIER, value.transition_tier.into_bytes());
         }
 
         if let Some(content_hash) = value.checksum {
-            insert_bytes(&mut meta_sys, SUFFIX_CRC, content_hash.to_vec());
+            insert_bytes(&mut meta_sys, SUFFIX_CRC, Vec::from(content_hash));
         }
 
         Self {
@@ -3363,10 +3540,10 @@ impl From<FileInfo> for MetaObject {
             erasure_index: value.erasure.index,
             erasure_dist: value.erasure.distribution.iter().map(|x| *x as u8).collect(),
             bitrot_checksum_algo: ChecksumAlgo::HighwayHash,
-            part_numbers: value.parts.iter().map(|v| v.number).collect(),
+            part_numbers,
             part_etags,
-            part_sizes: value.parts.iter().map(|v| v.size).collect(),
-            part_actual_sizes: value.parts.iter().map(|v| v.actual_size).collect(),
+            part_sizes,
+            part_actual_sizes,
             part_indices,
             meta_sys,
             meta_user,
@@ -3660,9 +3837,9 @@ impl MetaDeleteMarker {
     pub fn get_signature(&self) -> [u8; 4] {
         // MetaSys is order-unstable across disks; fold it in separately.
         let mut crc = hash_deterministic_bytes(&self.meta_sys);
-        let mut hasher = Xxh64Writer(xxhash_rust::xxh64::Xxh64::new(XXHASH_SEED));
+        let mut hasher = Xxh64Writer::new();
         if self.encode_to_with_meta(&mut hasher, false).is_ok() {
-            crc ^= hasher.0.finish();
+            crc ^= hasher.finish();
         }
 
         fold_signature(crc)
@@ -6374,6 +6551,171 @@ mod tests {
 
         assert_eq!(decoded, stat);
         assert!(decoded.mod_time.is_none(), "absent mod_time must not become Some(UNIX_EPOCH)");
+    }
+
+    #[test]
+    fn inspect_v2_object_slice_matches_full_decoder_for_historical_and_mutated_records() {
+        fn assert_summary(bytes: &[u8]) {
+            let Ok(summary) = FileMetaVersion::inspect_v2_object_slice(bytes) else {
+                return;
+            };
+            let decoded = FileMetaVersion::try_from(bytes).expect("an accepted scan must fully decode");
+            let object = decoded.object.as_ref().expect("an accepted scan must be an object");
+            let transition_complete = get_bytes(&object.meta_sys, SUFFIX_TRANSITION_STATUS)
+                .is_some_and(|status| status == TRANSITION_COMPLETE.as_bytes());
+            let physical_dir =
+                if object.inlinedata() || (transition_complete && !crate::is_restored_object_on_disk(&object.meta_user)) {
+                    None
+                } else {
+                    object.data_dir
+                };
+            assert_eq!(summary.version_id, decoded.get_version_id());
+            assert_eq!(summary.data_dir, decoded.get_data_dir());
+            assert_eq!(summary.physical_data_dir, physical_dir);
+            assert_eq!(summary.transition_complete, transition_complete);
+            assert_eq!(
+                summary.has_reconciled_transition,
+                contains_key_bytes(&object.meta_sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID)
+                    && contains_key_bytes(&object.meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE)
+            );
+        }
+
+        let fixtures = [
+            crate::test_data::create_minio_small_object_xlmeta().expect("MinIO inline fixture"),
+            crate::test_data::create_minio_large_object_xlmeta().expect("MinIO physical fixture"),
+            crate::test_data::create_minio_versioned_object_xlmeta().expect("MinIO versioned fixture"),
+            crate::test_data::create_legacy_v1_object_xlmeta().expect("legacy V1 fixture"),
+            crate::test_data::create_issue_2288_legacy_xlmeta().expect("legacy xl.meta fixture"),
+            crate::test_data::create_issue_2265_legacy_meta_v2_object_xlmeta().expect("legacy V2 fixture"),
+        ];
+        let mut fast_objects = 0;
+        for raw in fixtures {
+            let metadata = FileMeta::load(&raw).expect("load historical fixture");
+            for version in metadata.versions {
+                let decoded = version.parse_version_meta().expect("decode historical version");
+                assert_eq!(
+                    FileMetaVersion::decode_data_dir_from_meta(&version.meta).expect("historical data directory"),
+                    decoded.get_data_dir()
+                );
+                if FileMetaVersion::inspect_v2_object_slice(&version.meta).is_ok() {
+                    fast_objects += 1;
+                }
+                assert_summary(&version.meta);
+            }
+        }
+        assert!(fast_objects > 0, "foreign fixtures must exercise the fast scanner");
+
+        let mut object = signed_object();
+        insert_bytes(&mut object.meta_sys, SUFFIX_TRANSITION_STATUS, TRANSITION_COMPLETE.as_bytes().to_vec());
+        insert_bytes(&mut object.meta_sys, SUFFIX_TRANSITION_TIER_DESTINATION_ID, vec![b'a'; 64]);
+        insert_bytes(&mut object.meta_sys, SUFFIX_TRANSITIONED_VERSION_STATE, b"exact".to_vec());
+        object.meta_user.insert(
+            metadata_keys::RESTORE.to_string(),
+            "ongoing-request=\"false\", expiry-date=\"9999-01-01T00:00:00Z\"".to_string(),
+        );
+        let bytes = FileMetaVersion {
+            version_type: VersionType::Object,
+            object: Some(object),
+            ..Default::default()
+        }
+        .marshal_msg()
+        .expect("encode mutation seed");
+        for end in 0..bytes.len() {
+            assert!(FileMetaVersion::inspect_v2_object_slice(&bytes[..end]).is_err(), "truncated at {end}");
+        }
+        for index in 0..bytes.len() {
+            for replacement in [0, 0x7f, 0xc0, 0xc1, 0xc2, 0xff] {
+                let mut mutated = bytes.clone();
+                mutated[index] = replacement;
+                assert_summary(&mutated);
+            }
+        }
+    }
+
+    #[test]
+    fn xxh64_writer_and_inspect_v2_object_slice_cover_boundaries_and_aliases() {
+        for total_len in [0_usize, 1, 63, 255, 256, 257, 600, 1024] {
+            let payload: Vec<u8> = (0..total_len).map(|i| (i * 31 + 7) as u8).collect();
+            let expected = xxhash_rust::xxh64::xxh64(&payload, XXHASH_SEED);
+            for chunk_size in [1_usize, 7, 64, 256, 512] {
+                let mut writer = Xxh64Writer::new();
+                for chunk in payload.chunks(chunk_size) {
+                    writer.write_all(chunk).expect("write chunk");
+                }
+                assert_eq!(writer.finish(), expected, "len={total_len}, chunk={chunk_size}");
+            }
+        }
+
+        let inspect = |obj: MetaObject| {
+            let bytes = FileMetaVersion {
+                version_type: VersionType::Object,
+                object: Some(obj),
+                ..Default::default()
+            }
+            .marshal_msg()
+            .expect("marshal V2Obj");
+            FileMetaVersion::inspect_v2_object_slice(&bytes)
+        };
+
+        let (vid, ddir) = (sample_version_id(), Uuid::new_v4());
+        let mut plain = signed_object();
+        plain.version_id = Some(vid);
+        plain.data_dir = Some(ddir);
+        let s = inspect(plain.clone()).expect("inspect plain");
+        assert_eq!((s.version_id, s.data_dir, s.physical_data_dir), (Some(vid), Some(ddir), Some(ddir)));
+        assert!(!s.transition_complete && !s.has_reconciled_transition);
+
+        for prefix in [RUSTFS_INTERNAL_PREFIX, rustfs_utils::http::MINIO_INTERNAL_PREFIX] {
+            let mut inlined = plain.clone();
+            inlined
+                .meta_sys
+                .insert(format!("{prefix}{SUFFIX_INLINE_DATA}"), b"true".to_vec());
+            assert_eq!(inspect(inlined).expect("inspect single inline alias").physical_data_dir, None);
+
+            let mut aliased = plain.clone();
+            aliased
+                .meta_sys
+                .insert(format!("{prefix}{SUFFIX_TRANSITION_STATUS}"), TRANSITION_COMPLETE.as_bytes().to_vec());
+            aliased
+                .meta_sys
+                .insert(format!("{prefix}{SUFFIX_TRANSITION_TIER_DESTINATION_ID}"), vec![b'a'; 64]);
+            aliased
+                .meta_sys
+                .insert(format!("{prefix}{SUFFIX_TRANSITIONED_VERSION_STATE}"), b"exact".to_vec());
+            let s = inspect(aliased.clone()).expect("inspect single alias");
+            assert!(s.physical_data_dir.is_none() && s.transition_complete && s.has_reconciled_transition);
+
+            aliased.meta_user.insert(
+                metadata_keys::RESTORE.to_string(),
+                "ongoing-request=\"false\", expiry-date=\"9999-01-01T00:00:00Z\"".to_string(),
+            );
+            assert_eq!(inspect(aliased).expect("inspect restored").physical_data_dir, Some(ddir));
+        }
+
+        let mut precedence = plain.clone();
+        precedence
+            .meta_sys
+            .insert(format!("{RUSTFS_INTERNAL_PREFIX}{SUFFIX_TRANSITION_STATUS}"), b"pending".to_vec());
+        precedence.meta_sys.insert(
+            format!("{}{SUFFIX_TRANSITION_STATUS}", rustfs_utils::http::MINIO_INTERNAL_PREFIX),
+            TRANSITION_COMPLETE.as_bytes().to_vec(),
+        );
+        let s = inspect(precedence).expect("inspect precedence");
+        assert!(!s.transition_complete && s.physical_data_dir == Some(ddir));
+
+        let mut neg_v = FileMetaVersion {
+            version_type: VersionType::Object,
+            object: Some(plain.clone()),
+            ..Default::default()
+        }
+        .marshal_msg()
+        .expect("marshal neg_v");
+        *neg_v.last_mut().expect("last byte") = 0xff;
+        assert!(FileMetaVersion::inspect_v2_object_slice(&neg_v).is_err());
+
+        let mut no_mtime = plain;
+        no_mtime.mod_time = None;
+        assert!(inspect(no_mtime).is_err());
     }
 }
 
