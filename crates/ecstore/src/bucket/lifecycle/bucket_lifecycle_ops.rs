@@ -3042,14 +3042,7 @@ fn spawn_tier_free_version_recovery_once_with_options(
                         move |bucket_marker, object_marker, recovery_cancel| {
                             let api = Arc::clone(&api);
                             async move {
-                                recover_tier_free_versions_with_cancel(
-                                    api,
-                                    DEFAULT_FREE_VERSION_RECOVERY_LIMIT,
-                                    bucket_marker,
-                                    object_marker,
-                                    recovery_cancel,
-                                )
-                                .await
+                                recover_configured_tier_free_versions(api, bucket_marker, object_marker, recovery_cancel).await
                             }
                         },
                     )
@@ -3059,6 +3052,39 @@ fn spawn_tier_free_version_recovery_once_with_options(
         )
         .await;
     }))
+}
+
+async fn recover_configured_tier_free_versions(
+    api: Arc<ECStore>,
+    bucket_marker: Option<String>,
+    object_marker: Option<String>,
+    cancel_token: CancellationToken,
+) -> crate::error::Result<FreeVersionRecoveryStats> {
+    let tier_config_mgr = api.tier_config_mgr();
+    let has_tiers = select! {
+        biased;
+        _ = cancel_token.cancelled() => {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "tier free-version recovery cancelled").into());
+        }
+        manager = tier_config_mgr.read() => !manager.empty(),
+    };
+    // Startup can launch recovery before tier configuration is loaded. Keep
+    // polling, but release the manager lock before any namespace I/O.
+    if !has_tiers {
+        return Ok(FreeVersionRecoveryStats {
+            scanned: 0,
+            enqueued: 0,
+            failed: 0,
+            next_bucket_marker: None,
+            next_object_marker: None,
+            scanned_entries: 0,
+            buckets_scanned: 0,
+            truncated: false,
+        });
+    }
+
+    recover_tier_free_versions_with_cancel(api, DEFAULT_FREE_VERSION_RECOVERY_LIMIT, bucket_marker, object_marker, cancel_token)
+        .await
 }
 
 fn tier_free_version_recovery_leader_retry_delay() -> StdDuration {
@@ -14730,8 +14756,211 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn tier_free_version_recovery_without_tiers_skips_listing_and_resets_cursor() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let manager = ecstore.tier_config_mgr();
+        let saved_tiers = std::mem::take(&mut manager.write().await.tiers);
+        let runtime_state = install_unconsumed_runtime_expiry_worker(&ecstore, 1).await;
+        let recovery_rx = Arc::clone(&runtime_state.read().await.tasks_rx[0]);
+        let bucket = format!("recovery-no-tiers-{}", Uuid::new_v4());
+        let object = "free-version";
+        create_test_bucket(&ecstore, &bucket).await;
+        seed_recoverable_free_version(&disk_paths, &bucket, object, None, None).await;
+        let metadata_path = disk_paths[0].join(&bucket).join(object).join(STORAGE_FORMAT_FILE);
+        let metadata_before = fs::read(&metadata_path).await.expect("seeded metadata should be readable");
+
+        let list_started = Arc::new(tokio::sync::Notify::new());
+        let list_wait = set_recovery_bucket_list_wait_hook(Arc::clone(&list_started));
+        let walk_calls = Arc::new(AtomicUsize::new(0));
+        let counted_walks = Arc::clone(&walk_calls);
+        let walk_hook = set_recovery_walk_test_hook(move |_| {
+            counted_walks.fetch_add(1, Ordering::SeqCst);
+            None
+        });
+        let mut schedule = super::TierFreeVersionRecoverySchedule::default();
+        schedule.record_success(&free_version_recovery_stats(1, 0, true));
+        let stats = tokio::select! {
+            biased;
+            _ = list_started.notified() => panic!("empty tier configuration must not list buckets"),
+            result = super::recover_configured_tier_free_versions(
+                Arc::clone(&ecstore),
+                schedule.bucket_marker.clone(),
+                schedule.object_marker.clone(),
+                CancellationToken::new(),
+            ) => result.expect("empty tier configuration should be an idle recovery result"),
+        };
+        assert_eq!(
+            stats,
+            FreeVersionRecoveryStats {
+                scanned: 0,
+                enqueued: 0,
+                failed: 0,
+                next_bucket_marker: None,
+                next_object_marker: None,
+                scanned_entries: 0,
+                buckets_scanned: 0,
+                truncated: false,
+            }
+        );
+        schedule.record_success(&stats);
+        assert!(schedule.bucket_marker.is_none());
+        assert!(schedule.object_marker.is_none());
+        assert!(!schedule.follow_up_sweep);
+        assert_eq!(walk_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            recovery_rx.lock().await.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            fs::read(&metadata_path).await.expect("paused recovery must retain metadata"),
+            metadata_before
+        );
+        drop(list_wait);
+        drop(walk_hook);
+
+        remove_seeded_free_version(&disk_paths, &bucket, object).await;
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("test bucket should be removed");
+        manager.write().await.tiers = saved_tiers;
+        reset_runtime_expiry_state(&ecstore).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_tier_snapshot_wait_is_cancellable() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let manager = ecstore.tier_config_mgr();
+        let _write_guard = manager.write().await;
+        let cancel = CancellationToken::new();
+        let recovery = super::recover_configured_tier_free_versions(ecstore, None, None, cancel.clone());
+        tokio::pin!(recovery);
+        assert!(
+            futures::poll!(&mut recovery).is_pending(),
+            "recovery should wait for the tier manager lock"
+        );
+        cancel.cancel();
+        let err = recovery
+            .await
+            .expect_err("cancellation must not wait for the tier manager writer");
+        assert!(matches!(err, crate::error::Error::Io(ref err) if err.kind() == std::io::ErrorKind::Interrupted));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tier_free_version_recovery_loop_observes_tier_configuration_changes() {
+        let (disk_paths, ecstore) = setup_test_env().await;
+        let manager = ecstore.tier_config_mgr();
+        let saved_tiers = std::mem::take(&mut manager.write().await.tiers);
+        let runtime_state = install_unconsumed_runtime_expiry_worker(&ecstore, 1).await;
+        let recovery_rx = Arc::clone(&runtime_state.read().await.tasks_rx[0]);
+        let bucket = format!("recovery-dynamic-tier-{}", Uuid::new_v4());
+        let object = "free-version";
+        create_test_bucket(&ecstore, &bucket).await;
+        seed_recoverable_free_version(&disk_paths, &bucket, object, None, None).await;
+
+        let (page_tx, mut page_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let loop_cancel = cancel.clone();
+        let recovery_store = Arc::clone(&ecstore);
+        let worker = tokio::spawn(async move {
+            run_tier_free_version_recovery_loop(
+                loop_cancel,
+                runtime_state,
+                std::convert::identity,
+                move |bucket, object, cancel| {
+                    let api = Arc::clone(&recovery_store);
+                    let page_tx = page_tx.clone();
+                    async move {
+                        let stats =
+                            super::recover_configured_tier_free_versions(api, bucket.clone(), object.clone(), cancel).await?;
+                        page_tx
+                            .send((bucket, object, stats.clone()))
+                            .expect("test should observe each recovery result");
+                        Ok(stats)
+                    }
+                },
+            )
+            .await;
+        });
+        let (_, _, idle) = page_rx
+            .recv()
+            .await
+            .expect("worker should check the initially empty configuration");
+        assert_eq!(idle.buckets_scanned, 0);
+        assert!(matches!(
+            recovery_rx.lock().await.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        let tier = format!("RECOVERY{}", Uuid::new_v4().simple()).to_uppercase();
+        crate::services::tier::test_util::register_mock_tier(&manager, &tier).await;
+        tokio::time::pause();
+        tokio::task::yield_now().await;
+        tokio::time::advance(TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL).await;
+        tokio::time::resume();
+        let (bucket_marker, object_marker, active) = tokio::time::timeout(StdDuration::from_secs(30), page_rx.recv())
+            .await
+            .expect("new tier should enable the next recovery page")
+            .expect("worker should remain running");
+        assert!(bucket_marker.is_none());
+        assert!(object_marker.is_none());
+        assert_eq!(active.enqueued, 1);
+        let task = recovery_rx
+            .lock()
+            .await
+            .try_recv()
+            .expect("new tier should enable discovery")
+            .expect("queue item should exist");
+        let recovered = task
+            .as_any()
+            .downcast_ref::<FreeVersionTask>()
+            .expect("seeded free version should be queued");
+        assert_eq!(recovered.0.bucket, bucket);
+        assert_eq!(recovered.0.name, object);
+
+        // Simulate a historical or temporarily missing configuration without
+        // bypassing the admin removal path's persisted-reference proof.
+        let configured_tiers = std::mem::take(&mut manager.write().await.tiers);
+        tokio::time::pause();
+        tokio::task::yield_now().await;
+        tokio::time::advance(TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL).await;
+        tokio::time::resume();
+        let (_, _, idle_again) = tokio::time::timeout(StdDuration::from_secs(30), page_rx.recv())
+            .await
+            .expect("empty configuration should still produce an idle check")
+            .expect("worker should remain running");
+        assert_eq!(idle_again.buckets_scanned, 0);
+        assert_eq!(idle_again.enqueued, 0);
+        assert!(matches!(
+            recovery_rx.lock().await.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        cancel.cancel();
+        worker.await.expect("worker should exit on cancellation");
+        manager.write().await.tiers = configured_tiers;
+        manager
+            .write()
+            .await
+            .remove(&tier, true)
+            .await
+            .expect("mock tier should be removed");
+        manager.write().await.tiers = saved_tiers;
+        remove_seeded_free_version(&disk_paths, &bucket, object).await;
+        ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("test bucket should be removed");
+        reset_runtime_expiry_state(&ecstore).await;
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn tier_free_version_recovery_production_entrypoint_enqueues_seeded_item() {
         let (disk_paths, ecstore) = setup_test_env().await;
+        let tier = format!("RECOVERY{}", Uuid::new_v4().simple()).to_uppercase();
+        crate::services::tier::test_util::register_mock_tier(&ecstore.tier_config_mgr(), &tier).await;
         let runtime_state = install_unconsumed_runtime_expiry_worker(&ecstore, 1).await;
         let recovery_rx = {
             let state = runtime_state.read().await;
@@ -14767,6 +14996,13 @@ mod tests {
             .await
             .expect_err("aborted production recovery task should report cancellation");
         assert!(join_error.is_cancelled());
+        ecstore
+            .tier_config_mgr()
+            .write()
+            .await
+            .remove(&tier, true)
+            .await
+            .expect("mock tier should be removed");
         remove_seeded_free_version(&disk_paths, &bucket, object).await;
         ecstore
             .delete_bucket(&bucket, &DeleteBucketOptions::default())
