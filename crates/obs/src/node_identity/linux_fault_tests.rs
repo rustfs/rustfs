@@ -157,22 +157,23 @@ async fn contended_identity_uses_denied_netlink_fallback_then_recovers() {
 
     let action = libc::SECCOMP_RET_ERRNO | u32::try_from(libc::EPERM).expect("EPERM fits seccomp errno data");
     let (unavailable, resolved_while_contended, reader_result, published) = with_faulted_worker("node-a:9000", action, || {
-        let mut writer = rustfs_common::GLOBAL_LOCAL_NODE_NAME.blocking_write();
-        *writer = "node-b:9000".to_string();
-        let unavailable = rustfs_common::try_get_global_local_node_name().is_none();
-        let (resolved_tx, resolved_rx) = mpsc::channel();
-        let reader = std::thread::spawn(move || {
-            let address_missing = rustfs_utils::get_local_ip().is_none();
-            let identity = current_local_node_identity();
-            resolved_tx
-                .send((address_missing, identity))
-                .expect("identity test must retain its result receiver");
-        });
+        let (unavailable, resolved_while_contended, reader) =
+            rustfs_common::with_local_node_name_write_lock_for_test("node-b:9000", || {
+                let unavailable = rustfs_common::try_get_global_local_node_name().is_none();
+                let (resolved_tx, resolved_rx) = mpsc::channel();
+                let reader = std::thread::spawn(move || {
+                    let address_missing = rustfs_utils::get_local_ip().is_none();
+                    let identity = current_local_node_identity();
+                    resolved_tx
+                        .send((address_missing, identity))
+                        .expect("identity test must retain its result receiver");
+                });
 
-        let resolved_while_contended = resolved_rx.recv_timeout(Duration::from_secs(30));
-        // Release the writer before joining even if a regression blocks the
-        // reader, so the failed test can restore the global identity and exit.
-        drop(writer);
+                let resolved_while_contended = resolved_rx.recv_timeout(Duration::from_secs(30));
+                (unavailable, resolved_while_contended, reader)
+            });
+        // The helper releases the writer before joining even if the reader
+        // times out, so restoration and worker cleanup can still complete.
         let reader_result = reader.join();
         (unavailable, resolved_while_contended, reader_result, current_local_node_identity())
     })
