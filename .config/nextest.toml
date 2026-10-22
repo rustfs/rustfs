@@ -334,6 +334,12 @@ threads-required = "num-test-threads"
 filter = 'package(rustfs-ecstore) & test(=store::init::tests::dispatch_manifest_rollback_bounded_concurrency_reaches_tail_behind_slow_member)'
 threads-required = "num-test-threads"
 
+# These short-deadline real-disk progress probes need the test run's capacity
+# for scanner and object-lock handoffs; keep their assertions and deadlines.
+[[profile.default.overrides]]
+filter = '(package(rustfs-scanner) & (test(=scanner::tests::cycle_persist_failure::later_cycle_post_commit_failure_reloads_durable_state) | test(=scanner::tests::running_main_loop_catches_up_pause_cleared_after_startup_observe))) | (package(rustfs-ecstore) & test(=store::init::tests::restored_transitioned_delete_causally_enqueues_free_version))'
+threads-required = "num-test-threads"
+
 # ---------------------------------------------------------------------------
 # ci profile — the strict CI gate (ci.yml `cargo nextest run --profile ci`)
 # ---------------------------------------------------------------------------
@@ -389,6 +395,12 @@ threads-required = "num-test-threads"
 # budget, assertions, and internal concurrency.
 [[profile.ci.overrides]]
 filter = 'package(rustfs-scanner) & (test(/^scanner::backlog::tests::native_/) | test(=scanner_folder::tests::mrf_ownership::mrf_ownership_manager_completion_preserves_scanner_pending) | test(/^scanner_io::tests::service_cohort::/))'
+threads-required = "num-test-threads"
+
+# Keep short-deadline real-disk progress probes from competing with unrelated
+# tests for scanner and object-lock capacity. Assertions and deadlines stay on.
+[[profile.ci.overrides]]
+filter = '(package(rustfs-scanner) & (test(=scanner::tests::cycle_persist_failure::later_cycle_post_commit_failure_reloads_durable_state) | test(=scanner::tests::running_main_loop_catches_up_pause_cleared_after_startup_observe))) | (package(rustfs-ecstore) & test(=store::init::tests::restored_transitioned_delete_causally_enqueues_free_version))'
 threads-required = "num-test-threads"
 
 [[profile.ci.scripts]]
