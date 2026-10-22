@@ -7891,10 +7891,27 @@ mod decommission_lock_order_tests {
                 .expect("read the entire retained source");
             assert_eq!(actual, body);
 
+            // A new publication captures the surviving membership even while
+            // the storage handle retains its old node-local metadata.
+            let surviving_pools: Arc<[usize]> = Arc::from([1, 2]);
             for set in &writer.pools[2].disk_set {
+                let stale = writer
+                    .save_scanner_pause_backlog_replica(
+                        2,
+                        set.set_index,
+                        b"late stale-cohort target update".to_vec(),
+                        crate::storage_api_contracts::object::HTTPPreconditions {
+                            if_none_match: Some("*".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect_err("the stale cohort must also fence publication on a healthy target");
+                assert!(matches!(stale, crate::error::Error::SlowDown));
+
                 let target_body = format!("surviving native scanner set {}", set.set_index).into_bytes();
                 let committed = writer
-                    .save_scanner_pause_backlog_replica(
+                    .save_scanner_pause_backlog_replica_for_membership(
                         2,
                         set.set_index,
                         target_body.clone(),
@@ -7902,11 +7919,12 @@ mod decommission_lock_order_tests {
                             if_none_match: Some("*".to_string()),
                             ..Default::default()
                         },
+                        Arc::clone(&surviving_pools),
                     )
                     .await
-                    .expect("every reserved healthy target set must still accept scanner replicas");
+                    .expect("the current surviving cohort must admit every reserved healthy target set");
                 let conflict = writer
-                    .save_scanner_pause_backlog_replica(
+                    .save_scanner_pause_backlog_replica_for_membership(
                         2,
                         set.set_index,
                         b"must not bypass CAS".to_vec(),
@@ -7914,6 +7932,7 @@ mod decommission_lock_order_tests {
                             if_match: Some("stale-native-revision".to_string()),
                             ..Default::default()
                         },
+                        Arc::clone(&surviving_pools),
                     )
                     .await
                     .expect_err("capacity admission must retain the native writer's CAS");
@@ -7930,6 +7949,10 @@ mod decommission_lock_order_tests {
                     .expect("read the complete native target");
                 assert_eq!(actual, target_body);
             }
+            assert!(
+                writer.pool_meta.read().await.pools[0].decommission.is_none(),
+                "valid captured membership must work without refreshing the writer's stale snapshot"
+            );
             for (pool_index, set_index) in [(writer.pools.len(), 0), (0, writer.pools[0].disk_set.len())] {
                 assert!(matches!(
                     writer
