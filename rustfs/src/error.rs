@@ -668,6 +668,8 @@ impl From<ApiError> for S3Error {
         let mut s3e = S3Error::with_message(err.code, err.message);
         if let Some(cause) = cause {
             let mut headers = http::HeaderMap::new();
+            // s3s replaces the generated headers when a custom map is supplied.
+            headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/xml"));
             headers.insert("x-rustfs-error-cause", http::HeaderValue::from_static(cause));
             if cause == NAMESPACE_LOCK_TIMEOUT_CAUSE {
                 headers.insert(http::header::RETRY_AFTER, http::HeaderValue::from_static("1"));
@@ -929,6 +931,7 @@ mod tests {
         assert!(error_chain_has_type::<LockError>(source));
         let response = error.to_http_response().expect("serialize lock timeout response");
         assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[http::header::CONTENT_TYPE], "application/xml");
         assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
         assert_eq!(response.headers()["x-rustfs-error-cause"], "namespace_lock_timeout");
         let body = response
@@ -1026,6 +1029,7 @@ mod tests {
                 let source = error.source().expect("preserve wrapped lock timeout");
                 assert!(error_chain_has_type::<LockError>(source));
                 let response = error.to_http_response().expect("serialize wrapped timeout");
+                assert_eq!(response.headers()[http::header::CONTENT_TYPE], "application/xml");
                 assert_eq!(response.headers().contains_key(http::header::RETRY_AFTER), should_advise_retry);
                 assert_eq!(response.headers().contains_key("x-rustfs-error-cause"), should_advise_retry);
                 if should_advise_retry {
@@ -1074,6 +1078,7 @@ mod tests {
             assert_eq!(source.code(), expected_code);
             let response = error.to_http_response().expect("serialize typed unavailable response");
             assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[http::header::CONTENT_TYPE], "application/xml");
             assert_eq!(response.headers()["x-rustfs-error-cause"], cause);
             assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
             let body = response.into_body().collect().await.expect("read S3 error XML").to_bytes();
