@@ -1289,7 +1289,6 @@ impl ScannerIOCache for SetDisks {
                         "Scanner disk bucket cache ready"
                     );
 
-                    let before = cache.info.last_update;
                     let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel::<DataUsageCache>(1);
 
                     let scan_ctx = ctx_clone.child_token();
@@ -1297,7 +1296,7 @@ impl ScannerIOCache for SetDisks {
                         scan_ctx.clone(),
                         budget_clone.clone(),
                         set_disk_inventory_clone.as_ref().clone(),
-                        cache.clone(),
+                        cache,
                         None,
                         ScannerDiskScanOptions {
                             scan_mode,
@@ -1453,40 +1452,11 @@ impl ScannerIOCache for SetDisks {
                                 );
                             }
 
-                            if !cache_guard.is_lock_lost()
-                                && let (Some(last_update), Some(before_update)) = (cache.info.last_update, before)
-                                && last_update > before_update
-                            {
-                                let done_save = Metrics::time(Metric::SaveUsage);
-                                if let Err(e) = cache
-                                    .save_with_revisions_for_epoch(
-                                        store_clone_clone.clone(),
-                                        cache_name.as_str(),
-                                        &revisions,
-                                        expected_publication_epoch_clone,
-                                    )
-                                    .await
-                                {
-                                    error!(
-                                        target: "rustfs::scanner::io",
-                                        event = EVENT_SCANNER_CACHE_PERSIST_STATE,
-                                        component = LOG_COMPONENT_SCANNER,
-                                        subsystem = LOG_SUBSYSTEM_IO,
-                                        bucket = %bucket.name,
-                                        cache_name = %cache_name,
-                                        state = "save_failed",
-                                        error = %e,
-                                        "Scanner bucket cache save failed"
-                                    );
-                                }
-                                done_save();
-                            }
-
                             continue;
                         }
                     };
 
-                    let partial = match scan_outcome {
+                    let (cache, partial) = match scan_outcome {
                         ScannerDiskScanOutcome::Complete(mut completed_cache) => {
                             // The sweep finished under its coverage plan; the
                             // complete cache is current under the reuse plan,
@@ -1495,10 +1465,9 @@ impl ScannerIOCache for SetDisks {
                             if completed_cache.info.snapshot_complete {
                                 completed_cache.info.scan_plan_digest = Some(bucket_scan_plan_digest);
                             }
-                            cache = completed_cache;
-                            None
+                            (completed_cache, false)
                         }
-                        ScannerDiskScanOutcome::Partial(partial_cache) => Some((partial_cache, &partial_dirty_buckets_clone)),
+                        ScannerDiskScanOutcome::Partial(partial_cache) => (partial_cache, true),
                         ScannerDiskScanOutcome::NamespaceNotFound(_) => {
                             if requeue_bucket_work(&bucket_tx_clone, &bucket, &mut work_guard).await {
                                 increment_disk_bucket_scans_queued(
@@ -1521,13 +1490,13 @@ impl ScannerIOCache for SetDisks {
                             break;
                         }
                     };
-                    if let Some((partial_cache, failure_buckets)) = partial {
-                        record_partial_dirty_bucket(failure_buckets, &bucket.name).await;
+                    if partial {
+                        record_partial_dirty_bucket(&partial_dirty_buckets_clone, &bucket.name).await;
                         let done_save = Metrics::time(Metric::SaveUsage);
                         let partial_saved = if cache_guard.is_lock_lost() {
                             false
                         } else {
-                            match partial_cache
+                            match cache
                                 .save_with_revisions_for_epoch(
                                     store_clone_clone.clone(),
                                     cache_name.as_str(),
@@ -1558,7 +1527,7 @@ impl ScannerIOCache for SetDisks {
                             record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
                         }
                         if partial_saved {
-                            log_saved_partial_bucket_cache(&partial_cache, &cache_name);
+                            log_saved_partial_bucket_cache(&cache, &cache_name);
                         }
 
                         continue;
