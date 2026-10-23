@@ -33554,12 +33554,15 @@ mod pools_tests {
 
     #[test]
     fn test_resolve_decommission_preflight_heal_result_wraps_error_context() {
-        let err = resolve_decommission_preflight_heal_result::<()>("bucket-a", Err(Error::FaultyDisk))
-            .expect_err("heal failure should carry preflight context");
-        assert!(
-            err.to_string()
-                .contains("decommission preflight heal failed for bucket bucket-a")
-        );
+        for failure in [Error::FaultyDisk, Error::ErasureWriteQuorum] {
+            let err = resolve_decommission_preflight_heal_result::<()>("bucket-a", Err(failure))
+                .expect_err("heal failure should carry preflight context");
+            assert!(
+                err.to_string()
+                    .contains("decommission preflight heal failed for bucket bucket-a")
+            );
+            assert_ne!(err, Error::SlowDown, "non-busy failures must not become a retryable start");
+        }
     }
 
     #[test]

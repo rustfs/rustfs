@@ -186,21 +186,18 @@ fn same_user_defined_identity(left: &ObjectInfo, right: &ObjectInfo) -> bool {
     }
 }
 
-/// Pool-specific erasure geometry and data-movement rewrites are intentionally
-/// excluded. The selected winner still carries the chosen pool's layout, while
-/// the remaining read-visible fields must agree before the pool index can
-/// provide a deterministic tie-break.
+/// Pool-specific erasure geometry, version history, and data-movement rewrites
+/// are intentionally excluded. A copied version can be the target's latest
+/// while the source still holds newer versions. The selected winner keeps its
+/// pool's layout; the version's read-visible identity must still agree.
 pub(super) fn same_latest_object_info_identity(left: &ObjectInfo, right: &ObjectInfo) -> bool {
     let same_read_surface = left.bucket == right.bucket
         && left.name == right.name
         && left.is_dir == right.is_dir
         && left.restore_ongoing == right.restore_ongoing
         && left.restore_expires == right.restore_expires
-        && left.is_latest == right.is_latest
         && left.content_type == right.content_type
         && left.content_encoding == right.content_encoding
-        && left.num_versions == right.num_versions
-        && left.successor_mod_time == right.successor_mod_time
         && left.inlined == right.inlined
         && left.metadata_only == right.metadata_only
         && left.version_only == right.version_only
@@ -250,7 +247,13 @@ pub(super) fn same_latest_object_info_identity(left: &ObjectInfo, right: &Object
 }
 
 pub(super) fn validate_prepared_pool_refetch_identity(expected: &ObjectInfo, refetched: &ObjectInfo) -> Result<()> {
-    if same_latest_object_info_identity(expected, refetched) {
+    // A refetch stays in the same pool, so its history must still match the
+    // snapshot even though cross-pool copies may have different inventories.
+    if expected.is_latest == refetched.is_latest
+        && expected.num_versions == refetched.num_versions
+        && expected.successor_mod_time == refetched.successor_mod_time
+        && same_latest_object_info_identity(expected, refetched)
+    {
         Ok(())
     } else {
         Err(Error::ErasureReadQuorum)
@@ -346,6 +349,34 @@ mod tests {
             .expect_err("refetched metadata from a changed generation must fail closed");
 
         assert_eq!(error, Error::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn prepared_pool_refetch_identity_fails_closed_on_version_history_change() {
+        let expected = ObjectInfo {
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(10).expect("test timestamp should be valid")),
+            version_id: Some(uuid::Uuid::from_u128(1)),
+            etag: Some("etag-a".to_string()),
+            ..Default::default()
+        };
+        for refetched in [
+            ObjectInfo {
+                is_latest: !expected.is_latest,
+                ..expected.clone()
+            },
+            ObjectInfo {
+                num_versions: expected.num_versions + 1,
+                ..expected.clone()
+            },
+            ObjectInfo {
+                successor_mod_time: Some(OffsetDateTime::from_unix_timestamp(20).expect("successor timestamp should be valid")),
+                ..expected.clone()
+            },
+        ] {
+            let error = validate_prepared_pool_refetch_identity(&expected, &refetched)
+                .expect_err("a changed same-pool history must invalidate the prepared snapshot");
+            assert_eq!(error, Error::ErasureReadQuorum);
+        }
     }
 
     #[test]
