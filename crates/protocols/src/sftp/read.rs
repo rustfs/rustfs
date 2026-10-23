@@ -23,8 +23,11 @@ use super::paths::parse_s3_path;
 use super::state::HandleState;
 use crate::common::client::s3::StorageBackend;
 use crate::common::gateway::S3Action;
-use futures_util::StreamExt;
+use futures_util::future::poll_fn;
 use russh_sftp::protocol::{Data, Handle, StatusCode};
+use rustfs_gateway_stream::{PayloadRead, PayloadStream};
+use std::collections::HashMap;
+use std::pin::Pin;
 
 impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
     /// Read-side OPEN: authorise GetObject, HEAD the object to capture
@@ -51,9 +54,12 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         let size = head.content_length.unwrap_or(0).max(0) as u64;
         let mtime = timestamp_to_mtime(head.last_modified);
         let mut attrs = s3_attrs_to_sftp(size, mtime, false);
-        if let Some(metadata) = head.metadata {
-            apply_user_metadata_to_sftp_attrs(&mut attrs, &metadata);
-        }
+        let metadata: HashMap<_, _> = head
+            .metadata
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        apply_user_metadata_to_sftp_attrs(&mut attrs, &metadata);
 
         let read_cache = self.new_read_cache();
         let handle = self.allocate_handle(HandleState::File {
@@ -174,7 +180,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         let mut buf = Vec::with_capacity(usize::try_from(fetch_len).unwrap_or(0));
         loop {
             let chunk_timeout = std::time::Duration::from_secs(self.backend_op_timeout_secs);
-            let next = match tokio::time::timeout(chunk_timeout, body.next()).await {
+            let next = match tokio::time::timeout(chunk_timeout, poll_fn(|cx| Pin::new(&mut body).poll_read(cx))).await {
                 Ok(next) => next,
                 Err(_elapsed) => {
                     return Err(s3_error_to_sftp(
@@ -183,9 +189,10 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                     ));
                 }
             };
-            let Some(chunk) = next else { break };
-            let bytes = chunk.map_err(|e| s3_error_to_sftp("get_object_stream", e))?;
-            buf.extend_from_slice(&bytes);
+            match next.map_err(|e| s3_error_to_sftp("get_object_stream", e))? {
+                PayloadRead::Chunk(bytes) => buf.extend_from_slice(&bytes),
+                PayloadRead::Eof { .. } => break,
+            }
         }
         Ok(buf)
     }
@@ -260,7 +267,7 @@ mod tests {
         let backend = Arc::new(DummyBackend::new());
         let mut driver = build_driver(backend, TEST_PART_SIZE);
         let handle_id = driver
-            .allocate_handle(file_handle("b", "k", 100, FileAttributes::default()))
+            .allocate_handle(file_handle("bucket", "k", 100, FileAttributes::default()))
             .expect("allocate");
         let err = driver
             .read(1, handle_id, 0, 0)
@@ -274,7 +281,7 @@ mod tests {
         let backend = Arc::new(DummyBackend::new());
         let mut driver = build_driver(backend.clone(), TEST_PART_SIZE);
         let handle_id = driver
-            .allocate_handle(file_handle("b", "k", 10, FileAttributes::default()))
+            .allocate_handle(file_handle("bucket", "k", 10, FileAttributes::default()))
             .expect("allocate");
         let err = driver
             .read(2, handle_id, 10, 4)
@@ -289,7 +296,7 @@ mod tests {
         backend.queue_get_object_range_bytes(b"hello".to_vec());
         let mut driver = build_driver(backend, TEST_PART_SIZE);
         let handle_id = driver
-            .allocate_handle(file_handle("b", "k", 5, FileAttributes::default()))
+            .allocate_handle(file_handle("bucket", "k", 5, FileAttributes::default()))
             .expect("allocate");
 
         let data = with_test_auth_override(|_, _, _| true, driver.read(3, handle_id, 0, 1024))
@@ -307,7 +314,7 @@ mod tests {
         let backend = Arc::new(DummyBackend::new());
         let mut driver = build_driver(backend, TEST_PART_SIZE);
         let handle_id = driver
-            .allocate_handle(file_handle("b", "k", 10, FileAttributes::default()))
+            .allocate_handle(file_handle("bucket", "k", 10, FileAttributes::default()))
             .expect("allocate");
 
         let (result, captured) = capture_tracing_at(Level::ERROR, async { driver.read(11, handle_id, 10, 4).await }).await;
@@ -332,7 +339,7 @@ mod tests {
         backend.queue_get_object_range_err(DummyError::Injected("backend exploded".into()));
         let mut driver = build_driver(Arc::clone(&backend), TEST_PART_SIZE);
         let handle_id = driver
-            .allocate_handle(file_handle("b", "k", 1024, FileAttributes::default()))
+            .allocate_handle(file_handle("bucket", "k", 1024, FileAttributes::default()))
             .expect("allocate");
 
         let (result, captured) =
@@ -366,7 +373,7 @@ mod tests {
         let timeout_secs: u64 = 1;
         let mut driver = build_driver_with_timeout(Arc::clone(&backend), TEST_PART_SIZE, timeout_secs);
         let handle_id = driver
-            .allocate_handle(file_handle("b", "k", 4096, FileAttributes::default()))
+            .allocate_handle(file_handle("bucket", "k", 4096, FileAttributes::default()))
             .expect("allocate");
 
         let start = Instant::now();
@@ -410,7 +417,7 @@ mod tests {
 
         let mut driver = build_driver_with_read_cache(Arc::clone(&backend), TEST_PART_SIZE, window, 1024 * 1024 * 1024);
         let handle_id = driver
-            .allocate_handle(file_handle("b", "k", object_size, FileAttributes::default()))
+            .allocate_handle(file_handle("bucket", "k", object_size, FileAttributes::default()))
             .expect("allocate");
 
         let chunk: u32 = 8 * 1024;
@@ -450,7 +457,7 @@ mod tests {
 
         let mut driver = build_driver_with_read_cache(Arc::clone(&backend), TEST_PART_SIZE, window, 1024 * 1024 * 1024);
         let handle_id = driver
-            .allocate_handle(file_handle("b", "k", object_size, FileAttributes::default()))
+            .allocate_handle(file_handle("bucket", "k", object_size, FileAttributes::default()))
             .expect("allocate");
 
         // First read fetches from the backend and populates window 1.
@@ -500,7 +507,7 @@ mod tests {
 
         let mut driver = build_driver_with_read_cache(Arc::clone(&backend), TEST_PART_SIZE, window, 1024 * 1024 * 1024);
         let handle_id = driver
-            .allocate_handle(file_handle("b", "k", object_size, FileAttributes::default()))
+            .allocate_handle(file_handle("bucket", "k", object_size, FileAttributes::default()))
             .expect("allocate");
 
         // Populate window 1 with a full read.
@@ -540,7 +547,7 @@ mod tests {
         let mut driver =
             build_driver_with_read_cache(Arc::clone(&backend), TEST_PART_SIZE, READ_CACHE_DISABLED, 1024 * 1024 * 1024);
         let handle_id = driver
-            .allocate_handle(file_handle("b", "k", object_size, FileAttributes::default()))
+            .allocate_handle(file_handle("bucket", "k", object_size, FileAttributes::default()))
             .expect("allocate");
 
         for i in 0..read_count {

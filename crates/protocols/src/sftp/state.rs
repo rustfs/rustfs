@@ -20,7 +20,7 @@
 
 use super::read_cache::ReadCache;
 use russh_sftp::protocol::FileAttributes;
-use s3s::dto::ETag;
+use rustfs_gateway_types::ETag;
 
 /// State held per open handle.
 ///

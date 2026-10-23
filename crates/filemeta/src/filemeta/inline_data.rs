@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use super::*;
-use rustfs_utils::http::{SUFFIX_TRANSITION_STATUS, get_bytes};
+use rustfs_utils::http::{
+    RESTORE_COPYBACK_PROTOCOL_V1, SUFFIX_RESTORE_COPYBACK, SUFFIX_TRANSITION_STATUS, get_bytes, get_consistent_bytes,
+};
 
 fn physical_data_dir(version: &FileMetaShallowVersion) -> Result<Option<Uuid>> {
     if version.header.version_type != VersionType::Object {
@@ -35,6 +37,7 @@ fn physical_data_dir(version: &FileMetaShallowVersion) -> Result<Option<Uuid>> {
 
     if let Some(status) = get_bytes(&obj.meta_sys, SUFFIX_TRANSITION_STATUS)
         && status.as_slice() == TRANSITION_COMPLETE.as_bytes()
+        && get_consistent_bytes(&obj.meta_sys, SUFFIX_RESTORE_COPYBACK) != Some(RESTORE_COPYBACK_PROTOCOL_V1.as_bytes())
         && !is_restored_object_on_disk(&obj.meta_user)
     {
         return Ok(None);
@@ -914,5 +917,26 @@ mod tests {
 
         assert_eq!(meta.find_unshared_data_dir_for_version(Some(target_version)), None);
         assert_eq!(meta.shared_data_dir_count(Some(target_version), Some(target_data_dir)), 1);
+    }
+
+    #[test]
+    fn find_unshared_data_dir_for_version_keeps_pending_copyback_data_dir() {
+        let target_version = Uuid::new_v4();
+        let target_data_dir = Uuid::new_v4();
+        let mut fi = make_plain_file_info(target_version, target_data_dir);
+        fi.transition_status = TRANSITION_COMPLETE.to_string();
+        fi.metadata
+            .insert(metadata_keys::RESTORE.to_string(), "ongoing-request=\"true\"".to_string());
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut fi.metadata,
+            SUFFIX_RESTORE_COPYBACK,
+            RESTORE_COPYBACK_PROTOCOL_V1.to_string(),
+        );
+
+        let mut meta = FileMeta::new();
+        meta.add_version(fi).expect("seed pending copyback version");
+
+        let got = meta.find_unshared_data_dir_for_version(Some(target_version));
+        assert_eq!(got, Some(target_data_dir));
     }
 }

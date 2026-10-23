@@ -16438,6 +16438,109 @@ mod test {
         );
     }
 
+    #[tokio::test]
+    async fn rename_data_pending_restore_requires_parts_only_from_multipart_staging() {
+        let dir = tempfile::tempdir().expect("disk directory should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("disk path should be UTF-8")).expect("disk endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "restore-rename-controls";
+        ensure_test_volume(&disk, bucket).await;
+        for (case, source_volume, pending, requires_parts) in [
+            ("remote", RUSTFS_META_TMP_BUCKET, false, false),
+            ("pending-remote", RUSTFS_META_TMP_BUCKET, true, false),
+            ("pending-multipart", crate::disk::RUSTFS_META_MULTIPART_BUCKET, true, true),
+        ] {
+            ensure_test_volume(&disk, source_volume).await;
+            let staging = dir.path().join(source_volume).join(case);
+            fs::create_dir_all(&staging).await.expect("staging parent should be created");
+            let data_dir = Uuid::new_v4();
+            let mut fi = test_file_info(case, Uuid::nil(), Some(data_dir), None);
+            fi.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_string();
+            fi.transition_tier = "WARM".to_string();
+            fi.transitioned_objname = "remote/object".to_string();
+            if pending {
+                fi.metadata.insert(
+                    rustfs_filemeta::metadata_keys::RESTORE.to_string(),
+                    "ongoing-request=\"true\"".to_string(),
+                );
+            }
+            let result = disk.rename_data(source_volume, case, fi, bucket, case).await;
+            let destination = dir.path().join(bucket).join(case);
+            if requires_parts {
+                assert!(result.is_err(), "missing multipart restore parts must reject the physical commit");
+                assert!(
+                    !destination.join(STORAGE_FORMAT_FILE).exists(),
+                    "failed multipart restore must not publish metadata for absent local parts"
+                );
+            } else {
+                result.expect("remote-only metadata commits must not require local staged parts");
+                let stored = fs::read(destination.join(STORAGE_FORMAT_FILE))
+                    .await
+                    .expect("remote-only metadata should be committed");
+                let restored = FileMeta::load(&stored)
+                    .expect("committed metadata should decode")
+                    .into_fileinfo(bucket, case, "", false, false, false)
+                    .expect("committed version should decode");
+                assert!(restored.is_remote(), "remote-only commits must retain remote read routing");
+                assert!(
+                    !destination.join(data_dir.to_string()).exists(),
+                    "remote-only metadata commit must not create a local payload directory"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_data_pending_multipart_restore_rejects_absent_data_directory() {
+        assert_pending_multipart_restore_rejects_directory(None).await;
+    }
+
+    #[tokio::test]
+    async fn rename_data_pending_multipart_restore_rejects_nil_data_directory() {
+        assert_pending_multipart_restore_rejects_directory(Some(Uuid::nil())).await;
+    }
+
+    async fn assert_pending_multipart_restore_rejects_directory(data_dir: Option<Uuid>) {
+        let dir = tempfile::tempdir().expect("disk directory should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("disk path should be UTF-8")).expect("disk endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let source_volume = crate::disk::RUSTFS_META_MULTIPART_BUCKET;
+        let bucket = "restore-invalid-directory";
+        let object = "object.bin";
+        ensure_test_volume(&disk, source_volume).await;
+        ensure_test_volume(&disk, bucket).await;
+        let staging = dir.path().join(source_volume).join(object);
+        fs::create_dir_all(&staging).await.expect("staging parent should be created");
+        if let Some(data_dir) = data_dir {
+            let data_path = staging.join(data_dir.to_string());
+            fs::create_dir_all(&data_path)
+                .await
+                .expect("invalid staging directory should be created");
+            fs::write(data_path.join("part.1"), b"x")
+                .await
+                .expect("nil directory fixture must contain a real part");
+        }
+        let mut fi = test_file_info(object, Uuid::nil(), data_dir, None);
+        fi.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_string();
+        fi.transition_tier = "WARM".to_string();
+        fi.transitioned_objname = "remote/object".to_string();
+        fi.metadata.insert(
+            rustfs_filemeta::metadata_keys::RESTORE.to_string(),
+            "ongoing-request=\"true\"".to_string(),
+        );
+        let result = disk.rename_data(source_volume, object, fi, bucket, object).await;
+        assert!(
+            matches!(result, Err(DiskError::FileCorrupt)),
+            "pending multipart restore must reject absent or nil staging identity as corrupt: {result:?}"
+        );
+        assert!(
+            !dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE).exists(),
+            "invalid staging identity must fail before metadata publication"
+        );
+    }
+
     // Seed a first PUT of `object` (no prior version) through the non-inline
     // rename_data path and return (disk, tempdir). The object dir and any prefix
     // dirs are created during the commit.

@@ -32,7 +32,9 @@
 //! Advisory: <https://github.com/rustfs/rustfs/security/advisories/GHSA-3p3x-734c-h5vx>
 
 use crate::common::rustfs_binary_path_with_features;
-use crate::common::{AdminTransport, admin_add_canned_policy_via, admin_attach_user_policy_via, admin_create_user_via};
+use crate::common::{
+    AdminTransport, admin_add_canned_policy_via, admin_attach_user_policy_via, admin_create_user_via, signed_s3_request,
+};
 use crate::common::{FAST_DATA_USAGE_SCANNER_ENV, admin_request};
 use crate::protocols::test_env::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, ProtocolTestEnvironment};
 use anyhow::Result;
@@ -772,6 +774,81 @@ pub async fn test_webdav_core_operations() -> Result<()> {
 #[tokio::test]
 async fn test_webdav_core_operations_direct() -> Result<()> {
     test_webdav_core_operations().await
+}
+
+#[tokio::test]
+async fn test_webdav_content_type_directory_marker() -> Result<()> {
+    let env = ProtocolTestEnvironment::new().map_err(|e| anyhow::anyhow!("{}", e))?;
+    let admin_base_url = format!("http://{}", S3_TEST_ADDRESS);
+    let binary_path = rustfs_binary_path_with_features(Some("webdav"));
+    let mut server_process = Command::new(&binary_path)
+        .arg("--address")
+        .arg(S3_TEST_ADDRESS)
+        .env("RUSTFS_CONSOLE_ENABLE", "false")
+        .env("RUSTFS_WEBDAV_ENABLE", "true")
+        .env("RUSTFS_WEBDAV_ADDRESS", WEBDAV_ADDRESS)
+        .env("RUSTFS_WEBDAV_TLS_ENABLED", "false")
+        .arg(&env.temp_dir)
+        .spawn()?;
+
+    let result = async {
+        ProtocolTestEnvironment::wait_for_port_ready(WEBDAV_PORT, 30)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        let client = create_client();
+        let bucket_name = "webdav-content-type-bucket";
+        let directory_name = "content-type-directory";
+        let webdav_base_url = format!("http://{}", WEBDAV_ADDRESS);
+        let mkcol_bucket = client
+            .request(
+                reqwest::Method::from_bytes(b"MKCOL").expect("MKCOL is a valid HTTP method"),
+                format!("{}/{}", webdav_base_url, bucket_name),
+            )
+            .header("Authorization", basic_auth_header())
+            .send()
+            .await?;
+        anyhow::ensure!(
+            mkcol_bucket.status().is_success() || mkcol_bucket.status().as_u16() == 201,
+            "MKCOL bucket should succeed, got: {}",
+            mkcol_bucket.status()
+        );
+
+        let mkcol_directory = client
+            .request(
+                reqwest::Method::from_bytes(b"MKCOL").expect("MKCOL is a valid HTTP method"),
+                format!("{}/{}/{}", webdav_base_url, bucket_name, directory_name),
+            )
+            .header("Authorization", basic_auth_header())
+            .send()
+            .await?;
+        anyhow::ensure!(
+            mkcol_directory.status().is_success() || mkcol_directory.status().as_u16() == 201,
+            "MKCOL directory should succeed, got: {}",
+            mkcol_directory.status()
+        );
+
+        let head_url = format!("{}/{}/{}/", admin_base_url, bucket_name, directory_name);
+        let head = signed_s3_request(http::Method::HEAD, &head_url, None, None, DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        anyhow::ensure!(head.status().is_success(), "HEAD directory marker should succeed, got: {}", head.status());
+        let content_type = head
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        anyhow::ensure!(
+            content_type == "application/x-directory",
+            "WebDAV directory marker must preserve its content type, got: {content_type}"
+        );
+        Ok(())
+    }
+    .await;
+
+    let _ = server_process.kill().await;
+    let _ = server_process.wait().await;
+    result
 }
 
 /// Extract the numeric value of the first occurrence of a DAV property in a

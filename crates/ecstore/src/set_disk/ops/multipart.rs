@@ -38,13 +38,13 @@ use super::super::{
     ObjectLockDiagGuard, ObjectOptions, ObjectPartInfo, OffsetDateTime, PartInfo, PutObjReader, RUSTFS_META_MULTIPART_BUCKET,
     RUSTFS_META_TMP_BUCKET, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, Result, SLASH_SEPARATOR,
     SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE, SUFFIX_BUCKET_INCARNATION_ID, SUFFIX_COMPRESSION_SIZE,
-    SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK, SetDisks, SmallWritePath, StorageError,
-    Uuid, WriteLayout, check_object_lock_for_deletion_with_state, classify_multipart_part_write_path, coding,
-    complete_multipart_part_error, complete_multipart_part_error_result, complete_part_checksum, contains_key_str,
-    create_bitrot_writer, debug, disk, error, get_complete_multipart_md5, get_header_map, get_str, insert_str,
-    is_err_object_not_found, is_err_version_not_found, is_min_allowed_part_size, log_multipart_write_quorum_failure,
-    parts_after_marker, path_join_buf, prepare_complete_multipart_parts, record_compression_total_memory,
-    reduce_read_quorum_errs, reduce_write_quorum_errs, remove_header_map, resolve_write_layout,
+    SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_RESTORE_COPYBACK, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK, SetDisks,
+    SmallWritePath, StorageError, Uuid, WriteLayout, check_object_lock_for_deletion_with_state,
+    classify_multipart_part_write_path, coding, complete_multipart_part_error, complete_multipart_part_error_result,
+    complete_part_checksum, contains_key_str, create_bitrot_writer, debug, disk, error, get_complete_multipart_md5,
+    get_header_map, get_str, insert_str, is_err_object_not_found, is_err_version_not_found, is_min_allowed_part_size,
+    log_multipart_write_quorum_failure, parts_after_marker, path_join_buf, prepare_complete_multipart_parts,
+    record_compression_total_memory, reduce_read_quorum_errs, reduce_write_quorum_errs, remove_header_map, resolve_write_layout,
     restore_commit_operation_id_from_metadata, should_persist_encryption_original_size, strip_internal_multipart_metadata,
     to_object_err, warn,
 };
@@ -2835,7 +2835,14 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             crate::object_api::ENCRYPTED_PART_LAYOUT_CANDIDATE_SUFFIX,
         );
         rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, crate::object_api::ENCRYPTED_PART_LAYOUT_QUORUM_SUFFIX);
-        if expected_restore_operation_id.is_some() {
+        // Pending copy-back keeps its recovery identity until finalization.
+        if expected_restore_operation_id.is_some()
+            && !fi
+                .metadata
+                .get(metadata_keys::RESTORE)
+                .and_then(|value| rustfs_filemeta::parse_restore_obj_status(value).ok())
+                .is_some_and(|status| status.is_restore_in_progress == Some(true))
+        {
             rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, SUFFIX_RESTORE_OPERATION_ID);
             rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, SUFFIX_RESTORE_WORKER_LOCK);
         }
@@ -3213,6 +3220,13 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         fi.metadata.remove(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM);
         fi.metadata.remove(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE);
         strip_internal_multipart_metadata(&mut fi.metadata);
+        if opts.restore_copyback {
+            insert_str(
+                &mut fi.metadata,
+                SUFFIX_RESTORE_COPYBACK,
+                rustfs_utils::http::metadata_compat::RESTORE_COPYBACK_PROTOCOL_V1.to_string(),
+            );
+        }
 
         fi.size = object_size as i64;
         fi.mod_time = opts.mod_time;

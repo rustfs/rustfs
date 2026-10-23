@@ -69,6 +69,9 @@ pub const SUFFIX_RESTORE_OPERATION_ID: &str = "restore-operation-id";
 /// liveness lock for the duration of the asynchronous copy-back.
 pub const SUFFIX_RESTORE_WORKER_LOCK: &str = "restore-worker-lock";
 pub const RESTORE_WORKER_LOCK_PROTOCOL_V1: &str = "v1";
+/// Marks a restore generation after its local copy-back payload has committed.
+pub const SUFFIX_RESTORE_COPYBACK: &str = "restore-copyback";
+pub const RESTORE_COPYBACK_PROTOCOL_V1: &str = "v1";
 pub const SUFFIX_BUCKET_INCARNATION_ID: &str = "bucket-incarnation-id";
 /// Upload ID of the multipart completion that published this object version.
 /// A retried CompleteMultipartUpload matches it after the staging directory is gone.

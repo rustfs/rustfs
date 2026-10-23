@@ -30,9 +30,10 @@ use super::*;
 use crate::{ChecksumInfo, TransitionVersionState};
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::{
-    RUSTFS_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_FREE_VERSION, SUFFIX_INLINE_DATA, SUFFIX_PART_CHECKSUMS, SUFFIX_PURGESTATUS,
-    SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX, SUFFIX_REPLICATION_RESET_ARN_PREFIX, SUFFIX_RESTORE_OPERATION_ID,
-    SUFFIX_RESTORE_WORKER_LOCK, SUFFIX_TIER_FV_ID, SUFFIX_TIER_FV_MARKER, SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER,
+    RESTORE_COPYBACK_PROTOCOL_V1, RUSTFS_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_FREE_VERSION, SUFFIX_INLINE_DATA,
+    SUFFIX_PART_CHECKSUMS, SUFFIX_PURGESTATUS, SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX,
+    SUFFIX_REPLICATION_RESET_ARN_PREFIX, SUFFIX_RESTORE_COPYBACK, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK,
+    SUFFIX_TIER_FV_ID, SUFFIX_TIER_FV_MARKER, SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER,
     SUFFIX_TRANSITION_TIER_DESTINATION_ID, SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID,
     SUFFIX_TRANSITIONED_VERSION_STATE, contains_key_bytes, get_bytes, get_consistent_bytes, get_str, has_internal_suffix,
     insert_bytes, is_internal_key, remove_bytes, strip_internal_prefix, strip_internal_prefix_preserving_case,
@@ -741,6 +742,10 @@ impl FileMetaVersion {
             has_transition_ver_state: bool,
             rustfs_transition_status: Option<&'a [u8]>,
             minio_transition_status: Option<&'a [u8]>,
+            // Mirrors get_consistent_bytes: every copyback alias must agree
+            // and be non-empty, otherwise the marker counts as absent.
+            restore_copyback: Option<&'a [u8]>,
+            restore_copyback_conflict: bool,
             restore_hdr: Option<&'a str>,
         }
 
@@ -809,7 +814,9 @@ impl FileMetaVersion {
                                     s.has_transition_ver_state,
                                     s.rustfs_transition_status,
                                     s.minio_transition_status,
-                                ) = (false, false, false, None, None);
+                                    s.restore_copyback,
+                                    s.restore_copyback_conflict,
+                                ) = (false, false, false, None, None, None, false);
                                 for _ in 0..read_nil_or_map_len(&mut cur)?.unwrap_or(0) {
                                     let k = read_str_bytes_slice(&mut cur)?;
                                     let v = read_bin_slice(&mut cur)?;
@@ -828,7 +835,15 @@ impl FileMetaVersion {
                                             s.has_transition_ver_state = true;
                                         }
                                         other => {
-                                            std::str::from_utf8(other).map_err(|e| Error::FromUtf8(e.to_string()))?;
+                                            let key = std::str::from_utf8(other).map_err(|e| Error::FromUtf8(e.to_string()))?;
+                                            if strip_internal_prefix_preserving_case(key)
+                                                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(SUFFIX_RESTORE_COPYBACK))
+                                            {
+                                                if v.is_empty() || s.restore_copyback.is_some_and(|seen| seen != v) {
+                                                    s.restore_copyback_conflict = true;
+                                                }
+                                                s.restore_copyback = Some(v);
+                                            }
                                         }
                                     }
                                 }
@@ -876,8 +891,11 @@ impl FileMetaVersion {
 
         let transition_complete =
             s.rustfs_transition_status.or(s.minio_transition_status) == Some(TRANSITION_COMPLETE.as_bytes());
+        let restore_copyback_pending =
+            !s.restore_copyback_conflict && s.restore_copyback == Some(RESTORE_COPYBACK_PROTOCOL_V1.as_bytes());
         let physical_data_dir = if s.has_inline_data
             || (transition_complete
+                && !restore_copyback_pending
                 && !s.restore_hdr.is_some_and(|hdr| {
                     crate::parse_restore_obj_status(hdr).is_ok_and(|st| crate::fileinfo::RestoreStatusOps::on_disk(&st))
                 })) {
@@ -3520,6 +3538,7 @@ impl MetaObject {
         self.meta_user.remove(metadata_keys::RESTORE);
         self.meta_user.remove(metadata_keys::RESTORE_EXPIRY_DAYS);
         self.meta_user.remove(metadata_keys::RESTORE_REQUEST_DATE);
+        remove_bytes(&mut self.meta_sys, SUFFIX_RESTORE_COPYBACK);
         remove_bytes(&mut self.meta_sys, SUFFIX_RESTORE_OPERATION_ID);
         remove_bytes(&mut self.meta_sys, SUFFIX_RESTORE_WORKER_LOCK);
     }
@@ -3531,6 +3550,7 @@ impl MetaObject {
                 .get("x-rustfs-internal-transition-status")
                 .or_else(|| self.meta_sys.get("x-minio-internal-transition-status"))
                 .is_some_and(|status| status.as_slice() == TRANSITION_COMPLETE.as_bytes())
+            && get_consistent_bytes(&self.meta_sys, SUFFIX_RESTORE_COPYBACK) != Some(RESTORE_COPYBACK_PROTOCOL_V1.as_bytes())
         {
             return false;
         }

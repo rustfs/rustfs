@@ -352,6 +352,10 @@ impl DefaultObjectUsecase {
         // Scopes the accept-guarded metadata write: everything below runs
         // inside the accept critical section, which is released right after.
         {
+            if !already_restored {
+                store.check_restore_copyback_compatibility().await.map_err(ApiError::from)?;
+            }
+
             obj_info.metadata_only = true;
             metadata.insert(AMZ_RESTORE_EXPIRY_DAYS.to_string(), rreq.days.unwrap_or(1).to_string());
             let request_date = OffsetDateTime::now_utc().format(&Rfc3339).map_err(|e| {

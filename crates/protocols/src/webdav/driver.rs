@@ -20,13 +20,16 @@ use dav_server::davpath::DavPath;
 use dav_server::fs::{
     DavDirEntry, DavFile, DavFileSystem, DavMetaData, FsError, FsFuture, FsResult, FsStream, OpenOptions, ReadDirMeta,
 };
-use futures_util::{FutureExt, StreamExt, stream};
+use futures_util::{FutureExt, stream};
 use percent_encoding::percent_decode_str;
 use rustfs_credentials::Credentials;
+use rustfs_gateway_stream::ByteStream;
+use rustfs_gateway_stream::{PayloadRead, PayloadStream};
+use rustfs_gateway_types::dto::*;
+use rustfs_gateway_types::{BucketName, ETag, ObjectKey, Timestamp};
 use rustfs_s3_types::S3ErrorCode;
 use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::path;
-use s3s::dto::*;
 use std::fmt::Debug;
 use std::io::SeekFrom;
 use std::sync::Arc;
@@ -51,12 +54,22 @@ const EVENT_WEBDAV_OBJECT_DELETE_STATE: &str = "webdav_object_delete_state";
 const EVENT_WEBDAV_RENAME_STATE: &str = "webdav_rename_state";
 const EVENT_WEBDAV_QUOTA_VIEW_FAILED: &str = "webdav_quota_view_failed";
 
-/// Convert s3s ETag enum to string
+fn copy_content_length(content_length: Option<i64>, remaining_length: Option<u64>) -> i64 {
+    content_length
+        .or_else(|| remaining_length.and_then(|length| i64::try_from(length).ok()))
+        .unwrap_or(-1)
+}
+
+/// Convert a gateway ETag to string
 fn etag_to_string(etag: &ETag) -> String {
-    match etag {
-        ETag::Strong(s) => s.clone(),
-        ETag::Weak(s) => s.clone(),
-    }
+    etag.opaque_tag().to_owned()
+}
+
+fn timestamp_to_system_time(timestamp: Timestamp) -> SystemTime {
+    time::OffsetDateTime::from_unix_timestamp(timestamp.secs())
+        .and_then(|value| value.replace_nanosecond(timestamp.subsec_nanos()))
+        .map(SystemTime::from)
+        .unwrap_or_else(|_| SystemTime::UNIX_EPOCH)
 }
 
 /// WebDAV metadata implementation
@@ -205,10 +218,7 @@ where
                     let size = output.content_length.unwrap_or(0) as u64;
                     let modified = output
                         .last_modified
-                        .map(|dt| {
-                            let offset_dt: time::OffsetDateTime = dt.into();
-                            SystemTime::from(offset_dt)
-                        })
+                        .map(timestamp_to_system_time)
                         .unwrap_or_else(SystemTime::now);
 
                     Ok(Box::new(WebDavMetaData {
@@ -289,9 +299,10 @@ where
                     if let Some(body) = output.body {
                         let mut data = Vec::new();
                         let mut stream = body;
-                        while let Some(chunk_result) = stream.next().await {
-                            match chunk_result {
-                                Ok(bytes) => data.extend_from_slice(&bytes),
+                        loop {
+                            match futures_util::future::poll_fn(|cx| std::pin::Pin::new(&mut stream).poll_read(cx)).await {
+                                Ok(PayloadRead::Chunk(bytes)) => data.extend_from_slice(&bytes),
+                                Ok(PayloadRead::Eof { .. }) => break,
                                 Err(e) => {
                                     error!(
                                         event = EVENT_WEBDAV_STREAM_READ_FAILED,
@@ -383,16 +394,14 @@ where
             let data_bytes = Bytes::from(std::mem::take(&mut *buffer));
             drop(buffer);
 
-            let stream = stream::once(async move { Ok::<Bytes, std::io::Error>(data_bytes) });
-            let streaming_blob = StreamingBlob::wrap(stream);
+            let streaming_blob = ByteStream::from_bytes(data_bytes);
 
             let put_input = PutObjectInput::builder()
-                .bucket(bucket.clone())
-                .key(key.clone())
-                .content_length(Some(file_size as i64))
-                .body(Some(streaming_blob))
-                .build()
-                .map_err(|_| FsError::GeneralFailure)?;
+                .bucket(BucketName::new(bucket.clone()).map_err(|_| FsError::GeneralFailure)?)
+                .key(ObjectKey::new(key.clone()).map_err(|_| FsError::GeneralFailure)?)
+                .content_length(file_size as i64)
+                .body(streaming_blob)
+                .build();
 
             match storage.put_object(put_input, session_context.credentials()).await {
                 Ok(_) => {
@@ -520,11 +529,10 @@ where
     async fn prefix_has_entries(&self, bucket: &str, prefix: &str) -> FsResult<bool> {
         let credentials = self.credentials();
         let list_input = ListObjectsV2Input::builder()
-            .bucket(bucket.to_string())
-            .prefix(Some(prefix.to_string()))
-            .max_keys(Some(1))
-            .build()
-            .map_err(|_| FsError::GeneralFailure)?;
+            .bucket(BucketName::new(bucket.to_string()).map_err(|_| FsError::GeneralFailure)?)
+            .prefix(prefix.to_string())
+            .max_keys(1)
+            .build();
 
         self.storage
             .authorize_list_objects(&self.session_context, &list_input)
@@ -544,8 +552,7 @@ where
             FsError::GeneralFailure
         })?;
 
-        Ok(output.contents.map(|c| !c.is_empty()).unwrap_or(false)
-            || output.common_prefixes.map(|c| !c.is_empty()).unwrap_or(false))
+        Ok(!output.contents.is_empty() || !output.common_prefixes.is_empty())
     }
 
     async fn copy_object_streaming(&self, src_bucket: &str, src_key: &str, dst_bucket: &str, dst_key: &str) -> FsResult<()> {
@@ -591,20 +598,21 @@ where
             FsError::GeneralFailure
         })?;
 
+        // PutObject's gateway DTO requires an i64, so use -1 as the unknown
+        // length sentinel. The storage adapter turns it back into an absent
+        // Content-Length instead of advertising a zero-byte body.
+        let content_length = copy_content_length(content_length, body.remaining_length().get());
         let mut put_builder = PutObjectInput::builder()
-            .bucket(dst_bucket.to_string())
-            .key(dst_key.to_string())
-            .body(Some(body));
-
-        if let Some(content_length) = content_length {
-            put_builder = put_builder.content_length(Some(content_length));
-        }
+            .bucket(BucketName::new(dst_bucket.to_string()).map_err(|_| FsError::GeneralFailure)?)
+            .key(ObjectKey::new(dst_key.to_string()).map_err(|_| FsError::GeneralFailure)?)
+            .content_length(content_length)
+            .body(body);
 
         if let Some(content_type) = content_type {
-            put_builder = put_builder.content_type(Some(content_type));
+            put_builder = put_builder.content_type(content_type);
         }
 
-        let put_input = put_builder.build().map_err(|_| FsError::GeneralFailure)?;
+        let put_input = put_builder.build();
 
         self.storage.put_object(put_input, credentials).await.map_err(|e| {
             error!(
@@ -851,18 +859,11 @@ where
     fn bucket_entries(output: ListBucketsOutput) -> Vec<WebDavDirEntry> {
         output
             .buckets
-            .unwrap_or_default()
             .into_iter()
-            .filter_map(|bucket| {
-                let name = bucket.name?;
-                let modified = bucket
-                    .creation_date
-                    .map(|date| {
-                        let date: time::OffsetDateTime = date.into();
-                        SystemTime::from(date)
-                    })
-                    .unwrap_or_else(SystemTime::now);
-                Some(WebDavDirEntry {
+            .map(|bucket| {
+                let name = bucket.name.as_str().to_owned();
+                let modified = timestamp_to_system_time(bucket.creation_date);
+                WebDavDirEntry {
                     name,
                     metadata: WebDavMetaData {
                         size: 0,
@@ -872,7 +873,7 @@ where
                         etag: None,
                         content_type: None,
                     },
-                })
+                }
             })
             .collect()
     }
@@ -882,11 +883,10 @@ where
         let prefix_with_slash = prefix.map(|p| if p.ends_with('/') { p.to_string() } else { format!("{}/", p) });
 
         let list_input = ListObjectsV2Input::builder()
-            .bucket(bucket.to_string())
-            .prefix(prefix_with_slash.clone())
-            .delimiter(Some("/".to_string()))
-            .build()
-            .map_err(|_| FsError::GeneralFailure)?;
+            .bucket(BucketName::new(bucket.to_string()).map_err(|_| FsError::GeneralFailure)?)
+            .prefix(prefix_with_slash.clone().unwrap_or_default())
+            .delimiter("/".to_string())
+            .build();
 
         self.storage
             .authorize_list_objects(&self.session_context, &list_input)
@@ -900,98 +900,79 @@ where
                 // Collect common prefix base names for filtering
                 let common_prefix_names: std::collections::HashSet<String> = output
                     .common_prefixes
-                    .as_ref()
-                    .map(|prefixes| {
-                        prefixes
-                            .iter()
-                            .filter_map(|p| p.prefix.as_ref())
-                            .map(|p| {
-                                std::path::PathBuf::from(p.trim_end_matches('/'))
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| p.clone())
-                            })
-                            .collect()
+                    .iter()
+                    .map(|p| {
+                        std::path::PathBuf::from(p.prefix.trim_end_matches('/'))
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| p.prefix.clone())
                     })
-                    .unwrap_or_default();
+                    .collect();
 
                 // Add files (objects)
-                if let Some(objects) = output.contents {
-                    for obj in objects {
-                        if let Some(key) = obj.key {
-                            // Filter: only show files directly in current directory
-                            let should_show = if prefix.is_none() {
-                                !key.contains('/')
-                            } else {
-                                key.starts_with(&prefix_with_slash.clone().unwrap_or_default())
-                            };
+                for obj in output.contents {
+                    let key = obj.key.as_str().to_owned();
+                    // Filter: only show files directly in current directory
+                    let should_show = if prefix.is_none() {
+                        !key.contains('/')
+                    } else {
+                        key.starts_with(&prefix_with_slash.clone().unwrap_or_default())
+                    };
 
-                            if !should_show {
-                                continue;
-                            }
-
-                            let filename = std::path::PathBuf::from(key.as_str())
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| key.clone());
-
-                            let size = obj.size.unwrap_or(0) as u64;
-
-                            // Skip directory markers (keys ending with /)
-                            if key.ends_with('/') {
-                                continue;
-                            }
-
-                            // Skip 0-byte objects that match a directory name (Windows WebDAV duplicates)
-                            if size == 0 && common_prefix_names.contains(&filename) {
-                                continue;
-                            }
-
-                            let modified = obj
-                                .last_modified
-                                .map(|dt| {
-                                    let offset_dt: time::OffsetDateTime = dt.into();
-                                    SystemTime::from(offset_dt)
-                                })
-                                .unwrap_or_else(SystemTime::now);
-
-                            entries.push(WebDavDirEntry {
-                                name: filename,
-                                metadata: WebDavMetaData {
-                                    size,
-                                    modified,
-                                    created: modified,
-                                    is_dir: false,
-                                    etag: obj.e_tag.as_ref().map(etag_to_string),
-                                    content_type: None,
-                                },
-                            });
-                        }
+                    if !should_show {
+                        continue;
                     }
+
+                    let filename = std::path::PathBuf::from(key.as_str())
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| key.clone());
+
+                    let size = obj.size as u64;
+
+                    // Skip directory markers (keys ending with /)
+                    if key.ends_with('/') {
+                        continue;
+                    }
+
+                    // Skip 0-byte objects that match a directory name (Windows WebDAV duplicates)
+                    if size == 0 && common_prefix_names.contains(&filename) {
+                        continue;
+                    }
+
+                    let modified = timestamp_to_system_time(obj.last_modified);
+
+                    entries.push(WebDavDirEntry {
+                        name: filename,
+                        metadata: WebDavMetaData {
+                            size,
+                            modified,
+                            created: modified,
+                            is_dir: false,
+                            etag: Some(etag_to_string(&obj.e_tag)),
+                            content_type: None,
+                        },
+                    });
                 }
 
                 // Add directories (common prefixes)
-                if let Some(common_prefixes) = output.common_prefixes {
-                    for prefix in common_prefixes {
-                        if let Some(prefix_str) = prefix.prefix {
-                            let dir_name = std::path::PathBuf::from(prefix_str.as_str().trim_end_matches('/'))
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| prefix_str.clone());
+                for prefix in output.common_prefixes {
+                    let dir_name = std::path::PathBuf::from(prefix.prefix.trim_end_matches('/'))
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| prefix.prefix.clone());
 
-                            entries.push(WebDavDirEntry {
-                                name: dir_name,
-                                metadata: WebDavMetaData {
-                                    size: 0,
-                                    modified: SystemTime::now(),
-                                    created: SystemTime::now(),
-                                    is_dir: true,
-                                    etag: None,
-                                    content_type: None,
-                                },
-                            });
-                        }
-                    }
+                    entries.push(WebDavDirEntry {
+                        name: dir_name,
+                        metadata: WebDavMetaData {
+                            size: 0,
+                            modified: SystemTime::now(),
+                            created: SystemTime::now(),
+                            is_dir: true,
+                            etag: None,
+                            content_type: None,
+                        },
+                    });
                 }
 
                 Ok(entries)
@@ -1019,13 +1000,14 @@ where
         // First, delete all objects in the bucket (with pagination)
         let mut continuation_token = None;
         loop {
-            let mut list_input = ListObjectsV2Input::builder().bucket(bucket.to_string());
+            let mut list_input =
+                ListObjectsV2Input::builder().bucket(BucketName::new(bucket.to_string()).map_err(|_| FsError::GeneralFailure)?);
 
             if let Some(token) = continuation_token {
                 list_input = list_input.continuation_token(token);
             }
 
-            let list_input = list_input.build().map_err(|_| FsError::GeneralFailure)?;
+            let list_input = list_input.build();
 
             self.storage
                 .authorize_list_objects(&self.session_context, &list_input)
@@ -1034,24 +1016,21 @@ where
 
             if let Ok(output) = self.storage.list_objects_v2(list_input, self.credentials()).await {
                 // Delete all objects in this page
-                if let Some(objects) = output.contents {
-                    for obj in objects {
-                        if let Some(obj_key) = obj.key {
-                            self.storage
-                                .authorize_operation(&self.session_context, &S3Action::DeleteObject, bucket, Some(&obj_key))
-                                .await
-                                .map_err(|_| FsError::Forbidden)?;
+                for obj in output.contents {
+                    let obj_key = obj.key.as_str();
+                    self.storage
+                        .authorize_operation(&self.session_context, &S3Action::DeleteObject, bucket, Some(obj_key))
+                        .await
+                        .map_err(|_| FsError::Forbidden)?;
 
-                            let _ = self.storage.delete_object(bucket, &obj_key, self.credentials()).await;
-                        }
-                    }
+                    let _ = self.storage.delete_object(bucket, obj_key, self.credentials()).await;
                 }
 
                 // Check if there are more objects
-                if !output.is_truncated.unwrap_or(false) {
+                if !output.is_truncated {
                     break;
                 }
-                continuation_token = Some(output.next_continuation_token);
+                continuation_token = output.next_continuation_token;
             } else {
                 break;
             }
@@ -1191,10 +1170,7 @@ where
                         let size = output.content_length.unwrap_or(0) as u64;
                         let modified = output
                             .last_modified
-                            .map(|dt| {
-                                let offset_dt: time::OffsetDateTime = dt.into();
-                                SystemTime::from(offset_dt)
-                            })
+                            .map(timestamp_to_system_time)
                             .unwrap_or_else(SystemTime::now);
 
                         Ok(Box::new(WebDavMetaData {
@@ -1210,10 +1186,7 @@ where
                         let modified = metadata
                             .as_ref()
                             .and_then(|output| output.last_modified.as_ref())
-                            .map(|dt| {
-                                let offset_dt: time::OffsetDateTime = dt.clone().into();
-                                SystemTime::from(offset_dt)
-                            })
+                            .map(|dt| timestamp_to_system_time(*dt))
                             .unwrap_or_else(SystemTime::now);
 
                         Ok(Box::new(WebDavMetaData {
@@ -1282,17 +1255,15 @@ where
                     .map_err(|_| FsError::Forbidden)?;
 
                 // Create empty streaming blob for directory marker
-                let stream = futures_util::stream::once(async { Ok::<Bytes, std::io::Error>(Bytes::new()) });
-                let streaming_blob = s3s::dto::StreamingBlob::wrap(stream);
+                let streaming_blob = ByteStream::from_bytes(Bytes::new());
 
-                let put_input = s3s::dto::PutObjectInput::builder()
-                    .bucket(bucket.clone())
-                    .key(dir_key.clone())
-                    .content_length(Some(0))
-                    .content_type(Some("application/x-directory".to_string()))
-                    .body(Some(streaming_blob))
-                    .build()
-                    .map_err(|_| FsError::GeneralFailure)?;
+                let put_input = PutObjectInput::builder()
+                    .bucket(BucketName::new(bucket.clone()).map_err(|_| FsError::GeneralFailure)?)
+                    .key(ObjectKey::new(dir_key.clone()).map_err(|_| FsError::GeneralFailure)?)
+                    .content_length(0)
+                    .content_type("application/x-directory".to_string())
+                    .body(streaming_blob)
+                    .build();
 
                 match self.storage.put_object(put_input, self.credentials()).await {
                     Ok(_) => {
@@ -1387,14 +1358,14 @@ where
                 let mut continuation_token = None;
                 loop {
                     let mut list_input = ListObjectsV2Input::builder()
-                        .bucket(bucket.clone())
-                        .prefix(Some(prefix_with_slash.clone()));
+                        .bucket(BucketName::new(bucket.clone()).map_err(|_| FsError::GeneralFailure)?)
+                        .prefix(prefix_with_slash.clone());
 
                     if let Some(token) = continuation_token {
                         list_input = list_input.continuation_token(token);
                     }
 
-                    let list_input = list_input.build().map_err(|_| FsError::GeneralFailure)?;
+                    let list_input = list_input.build();
 
                     self.storage
                         .authorize_list_objects(&self.session_context, &list_input)
@@ -1402,28 +1373,20 @@ where
                         .map_err(|_| FsError::Forbidden)?;
 
                     if let Ok(output) = self.storage.list_objects_v2(list_input, self.credentials()).await {
-                        if let Some(objects) = output.contents {
-                            for obj in objects {
-                                if let Some(obj_key) = obj.key {
-                                    self.storage
-                                        .authorize_operation(
-                                            &self.session_context,
-                                            &S3Action::DeleteObject,
-                                            &bucket,
-                                            Some(&obj_key),
-                                        )
-                                        .await
-                                        .map_err(|_| FsError::Forbidden)?;
+                        for obj in output.contents {
+                            let obj_key = obj.key.as_str();
+                            self.storage
+                                .authorize_operation(&self.session_context, &S3Action::DeleteObject, &bucket, Some(obj_key))
+                                .await
+                                .map_err(|_| FsError::Forbidden)?;
 
-                                    let _ = self.storage.delete_object(&bucket, &obj_key, self.credentials()).await;
-                                }
-                            }
+                            let _ = self.storage.delete_object(&bucket, obj_key, self.credentials()).await;
                         }
 
-                        if !output.is_truncated.unwrap_or(false) {
+                        if !output.is_truncated {
                             break;
                         }
-                        continuation_token = Some(output.next_continuation_token);
+                        continuation_token = output.next_continuation_token;
                     } else {
                         break;
                     }
@@ -1568,10 +1531,9 @@ where
             let dst_prefix = format!("{}/", dst_key);
 
             let mut list_input = ListObjectsV2Input::builder()
-                .bucket(src_bucket.clone())
-                .prefix(Some(src_prefix.clone()))
-                .build()
-                .map_err(|_| FsError::GeneralFailure)?;
+                .bucket(BucketName::new(src_bucket.clone()).map_err(|_| FsError::GeneralFailure)?)
+                .prefix(src_prefix.clone())
+                .build();
             self.storage
                 .authorize_list_objects(&self.session_context, &list_input)
                 .await
@@ -1624,13 +1586,10 @@ where
                     })?;
 
                 let mut page_pairs: Vec<(String, String)> = Vec::new();
-                if let Some(objects) = output.contents {
-                    for obj in objects {
-                        if let Some(obj_key) = obj.key {
-                            let new_key = obj_key.replacen(&src_prefix, &dst_prefix, 1);
-                            page_pairs.push((obj_key, new_key));
-                        }
-                    }
+                for obj in output.contents {
+                    let obj_key = obj.key.as_str().to_owned();
+                    let new_key = obj_key.replacen(&src_prefix, &dst_prefix, 1);
+                    page_pairs.push((obj_key, new_key));
                 }
 
                 if !page_pairs.is_empty() {
@@ -1654,7 +1613,7 @@ where
                     renamed_any = true;
                 }
 
-                if !output.is_truncated.unwrap_or(false) {
+                if !output.is_truncated {
                     break;
                 }
                 list_input.continuation_token = output.next_continuation_token;
@@ -1726,7 +1685,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{WebDavDriver, aggregate_session_capacity};
+    use super::{WebDavDriver, aggregate_session_capacity, copy_content_length};
     use crate::common::client::s3::{BucketCapacity, SessionCapacityView, StorageBackend as S3StorageBackend};
     use crate::common::dummy_storage::DummyBackend;
     use crate::common::gateway::{S3Action, with_test_auth_override, with_test_iam_unavailable};
@@ -1735,15 +1694,24 @@ mod tests {
     use bytes::Bytes;
     use dav_server::davpath::DavPath;
     use dav_server::fs::{DavFileSystem, FsError};
-    use futures_util::StreamExt;
+    use futures_util::future::poll_fn;
     use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
     use rustfs_credentials::Credentials;
+    use rustfs_gateway_stream::{ByteStream, PayloadRead, PayloadStream};
+    use rustfs_gateway_types::dto::*;
+    use rustfs_gateway_types::{BucketName, ObjectKey};
     use rustfs_policy::auth::UserIdentity;
-    use s3s::dto::*;
     use std::collections::{HashMap, HashSet};
     use std::fmt::{Debug, Formatter};
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn copy_content_length_preserves_unknown_length() {
+        assert_eq!(copy_content_length(None, None), -1);
+        assert_eq!(copy_content_length(None, Some(12)), 12);
+        assert_eq!(copy_content_length(Some(8), Some(12)), 8);
+    }
 
     #[tokio::test]
     async fn listing_authorizes_normalized_prefix_and_delimiter() {
@@ -1932,10 +1900,10 @@ mod tests {
     async fn session_bucket_listing_does_not_require_global_list_permission() {
         let storage = DummyBackend::new();
         storage.queue_session_list_buckets_ok(ListBucketsOutput {
-            buckets: Some(vec![Bucket {
-                name: Some("allowed-bucket".to_string()),
+            buckets: vec![Bucket {
+                name: BucketName::new("allowed-bucket").expect("bucket"),
                 ..Default::default()
-            }]),
+            }],
             ..Default::default()
         });
         let driver = WebDavDriver::new(storage.clone(), Arc::new(test_session(Protocol::WebDav))).with_request_context(
@@ -1994,10 +1962,10 @@ mod tests {
     async fn global_list_permission_keeps_the_legacy_backend_path() {
         let storage = DummyBackend::new();
         storage.queue_list_buckets_ok(ListBucketsOutput {
-            buckets: Some(vec![Bucket {
-                name: Some("legacy-bucket".to_string()),
+            buckets: vec![Bucket {
+                name: BucketName::new("legacy-bucket").expect("bucket"),
                 ..Default::default()
-            }]),
+            }],
             ..Default::default()
         });
         let driver = WebDavDriver::new(storage.clone(), Arc::new(test_session(Protocol::WebDav)));
@@ -2100,8 +2068,7 @@ mod tests {
                 .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing object"))?;
 
             let content_length = data.len() as i64;
-            let body =
-                StreamingBlob::wrap(futures_util::stream::once(async move { Ok::<Bytes, std::io::Error>(Bytes::from(data)) }));
+            let body = ByteStream::from_bytes(Bytes::from(data));
 
             Ok(GetObjectOutput {
                 body: Some(body),
@@ -2126,13 +2093,15 @@ mod tests {
             mut input: PutObjectInput,
             _credentials: &Credentials,
         ) -> Result<PutObjectOutput, Self::Error> {
-            let bucket = input.bucket.clone();
-            let key = input.key.clone();
+            let bucket = input.bucket.as_str().to_owned();
+            let key = input.key.as_str().to_owned();
             let mut bytes = Vec::new();
 
             if let Some(mut body) = input.body.take() {
-                while let Some(chunk) = body.next().await {
-                    let chunk = chunk.map_err(|e| std::io::Error::other(e.to_string()))?;
+                while let PayloadRead::Chunk(chunk) = poll_fn(|cx| std::pin::Pin::new(&mut body).poll_read(cx))
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                {
                     bytes.extend_from_slice(&chunk);
                 }
             }
@@ -2184,21 +2153,20 @@ mod tests {
                 .expect("recording storage lock poisoned")
                 .objects
                 .keys()
-                .filter(|(bucket, key)| *bucket == input.bucket && key.starts_with(&prefix))
+                .filter(|(bucket, key)| bucket.as_str() == input.bucket.as_str() && key.starts_with(&prefix))
                 .map(|(_, key)| key.clone())
                 .collect();
             keys.sort();
 
             Ok(ListObjectsV2Output {
-                contents: Some(
-                    keys.into_iter()
-                        .map(|key| Object {
-                            key: Some(ObjectKey::from(key)),
-                            ..Default::default()
-                        })
-                        .collect(),
-                ),
-                is_truncated: Some(false),
+                contents: keys
+                    .into_iter()
+                    .map(|key| Object {
+                        key: ObjectKey::new(key).expect("object key"),
+                        ..Default::default()
+                    })
+                    .collect(),
+                is_truncated: false,
                 ..Default::default()
             })
         }

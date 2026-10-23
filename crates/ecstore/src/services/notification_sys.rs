@@ -659,6 +659,28 @@ pub async fn acquire_legacy_transition_state_reconcile_fleet_proof() -> Option<L
     .then_some(proof)
 }
 
+pub async fn require_restore_copyback_fleet_capability() -> Result<()> {
+    let Some(topology) = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() else {
+        #[cfg(any(test, feature = "test-util"))]
+        return Ok(());
+        #[cfg(not(any(test, feature = "test-util")))]
+        return Err(Error::other("restore copy-back capability topology is unavailable"));
+    };
+    let Some(notification_sys) = get_global_notification_sys() else {
+        #[cfg(any(test, feature = "test-util"))]
+        return Ok(());
+        #[cfg(not(any(test, feature = "test-util")))]
+        return Err(Error::other("restore copy-back capability probe is unavailable"));
+    };
+    timeout(
+        REMOTE_VERSION_STATE_PROBE_TIMEOUT,
+        notification_sys.probe_restore_copyback_fleet(topology),
+    )
+    .await
+    .map_err(|_| Error::other("restore copy-back capability fleet probe timed out"))??;
+    Ok(())
+}
+
 fn acquire_legacy_transition_state_reconcile_fleet_proof_from(
     state: &FleetCapabilityProofState,
     expected_topology: &str,
@@ -1557,6 +1579,30 @@ impl NotificationSys {
         for result in join_all(probes).await {
             let (peer, epoch) = result?;
             insert_remote_version_state_peer(&mut peer_epochs, peer, epoch)?;
+        }
+        Ok(peer_epochs)
+    }
+
+    async fn probe_restore_copyback_fleet(&self, topology_fingerprint: &str) -> Result<BTreeMap<String, Uuid>> {
+        if self.peer_clients.len() != self.peer_topology_hosts.len() {
+            return Err(Error::other("restore copy-back capability fleet membership is incomplete"));
+        }
+        let probes = self.peer_clients.iter().map(|client| async {
+            let client = client
+                .as_ref()
+                .ok_or_else(|| Error::other("restore copy-back capability peer is unreachable"))?;
+            client
+                .probe_restore_copyback_capability(topology_fingerprint.to_string())
+                .await
+        });
+        let mut peer_epochs = BTreeMap::new();
+        for result in join_all(probes).await {
+            let (peer, epoch) = result?;
+            insert_remote_version_state_peer(&mut peer_epochs, peer, epoch)?;
+        }
+        let expected = self.peer_topology_hosts.iter().cloned().collect::<BTreeSet<_>>();
+        if expected.len() != self.peer_topology_hosts.len() || peer_epochs.keys().ne(expected.iter()) {
+            return Err(Error::other("restore copy-back capability fleet membership does not match topology"));
         }
         Ok(peer_epochs)
     }

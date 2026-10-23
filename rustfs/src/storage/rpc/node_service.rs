@@ -1229,11 +1229,13 @@ impl heal_control_service_server::HealControlService for HealControlRpcService {
             }));
         }
         let remote_version_state_probe = rustfs_protos::is_remote_version_state_capability_probe(&request.get_ref().command);
+        let restore_copyback_probe = rustfs_protos::is_restore_copyback_capability_probe(&request.get_ref().command);
         let cross_pool_fence_probe = rustfs_protos::is_cross_pool_fence_capability_probe(&request.get_ref().command);
         let recovery_export_probe = rustfs_protos::is_ilm_recovery_export_capability_probe(&request.get_ref().command);
         let transition_transaction_compaction_probe =
             rustfs_protos::is_transition_transaction_compaction_capability_probe(&request.get_ref().command);
         if remote_version_state_probe
+            || restore_copyback_probe
             || cross_pool_fence_probe
             || recovery_export_probe
             || transition_transaction_compaction_probe
@@ -1249,7 +1251,7 @@ impl heal_control_service_server::HealControlService for HealControlRpcService {
             }
             let result = encode_heal_capability_response(
                 &topology_member,
-                remote_version_state_probe,
+                remote_version_state_probe || restore_copyback_probe,
                 recovery_export_probe,
                 transition_transaction_compaction_probe,
             )?;

@@ -138,7 +138,7 @@ async fn validate_internal_write_target(key: &str, bucket: &str, headers: &Heade
         headers.get("content-type").and_then(|value| value.to_str().ok()),
         headers.get("content-encoding").and_then(|value| value.to_str().ok()),
     )
-    .map_err(api_error_from_s3)
+    .map_err(|err| api_error_from_s3(err.into()))
 }
 
 fn internal_events_wanted() -> bool {

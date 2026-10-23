@@ -147,6 +147,7 @@ rustfs-zip = { path = "./crates/zip", version = "1.0.2" }
 # gateway in this workspace; no crate may enable a `compat-s3s*` feature except
 # the s3s-facing edge of the rustfs binary.
 rustfs-gateway-types = { git = "https://github.com/rustfs/gateway.git", rev = "21283e874c2381bab611e9347acbc5b92e9e2b3c", version = "0.32.0", default-features = false }
+rustfs-gateway-stream = { git = "https://github.com/rustfs/gateway.git", rev = "21283e874c2381bab611e9347acbc5b92e9e2b3c", version = "0.2.0", default-features = false }
 
 # Async Runtime and Networking
 async-channel = "2.5.0"

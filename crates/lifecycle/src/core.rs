@@ -873,6 +873,7 @@ impl Lifecycle for PersistedLifecycleConfiguration {
                     && let Some(storage_class) = noncurrent_version_transition.storage_class.as_ref()
                     && !storage_class.as_str().is_empty()
                     && !obj.delete_marker
+                    && !obj.restore_ongoing
                     && obj.transition_status != TRANSITION_COMPLETE
                 {
                     let due = noncurrent_version_transition.next_due(obj);
@@ -956,7 +957,8 @@ impl Lifecycle for PersistedLifecycleConfiguration {
                         debug!("eval_inner: rule.expiration is None");
                     }
 
-                    if obj.transition_status != TRANSITION_COMPLETE
+                    if !obj.restore_ongoing
+                        && obj.transition_status != TRANSITION_COMPLETE
                         && let Some(transition) = rule
                             .transitions
                             .as_ref()
@@ -2395,6 +2397,79 @@ mod tests {
         assert_eq!(event.action, IlmAction::TransitionAction);
         assert_eq!(event.rule_id, "transition-days");
         assert_eq!(event.storage_class, "COLDTIER44");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn eval_inner_does_not_transition_while_restore_is_ongoing() {
+        let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let lc = PersistedLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("transition-during-restore".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: Some(vec![PersistedTransition {
+                    days: Some(1),
+                    date: None,
+                    storage_class: Some("COLDTIER44".to_owned()),
+                }]),
+            }],
+        };
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(base_time),
+            is_latest: true,
+            transition_status: TRANSITION_PENDING.to_string(),
+            restore_ongoing: true,
+            ..Default::default()
+        };
+
+        let event = lc.eval_inner(&opts, base_time + Duration::days(2), 0).await;
+        assert_eq!(event.action, IlmAction::NoneAction);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn eval_inner_does_not_transition_noncurrent_version_while_restore_is_ongoing() {
+        let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let lc = PersistedLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("noncurrent-transition-during-restore".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: Some(vec![PersistedNoncurrentVersionTransition {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: None,
+                    storage_class: Some("COLDTIER44".to_owned()),
+                }]),
+                prefix: None,
+                transitions: None,
+            }],
+        };
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(base_time - Duration::days(2)),
+            successor_mod_time: Some(base_time - Duration::days(2)),
+            is_latest: false,
+            transition_status: TRANSITION_PENDING.to_string(),
+            restore_ongoing: true,
+            ..Default::default()
+        };
+
+        let event = lc.eval_inner(&opts, base_time, 0).await;
+        assert_eq!(event.action, IlmAction::NoneAction);
     }
 
     #[tokio::test]
@@ -5819,7 +5894,8 @@ mod tests {
                         }
                     }
                 }
-                if obj.transition_status != TRANSITION_COMPLETE
+                if !obj.restore_ongoing
+                    && obj.transition_status != TRANSITION_COMPLETE
                     && let Some(transition) = rule.transitions.as_ref().and_then(|transitions| transitions.first())
                     && transition.storage_class.as_ref().is_some_and(|sc| !sc.as_str().is_empty())
                 {
