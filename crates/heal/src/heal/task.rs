@@ -915,6 +915,39 @@ impl HealTask {
         Duration::from_millis(jitter_seed % 500).saturating_add(base)
     }
 
+    pub(crate) fn should_log_failure(&self, error: &Error) -> bool {
+        if !matches!(error, Error::Storage(crate::heal::StorageError::DeleteRecoveryLegacyAmbiguous)) {
+            return true;
+        }
+        let (bucket, object, version_id) = match &self.heal_type {
+            HealType::Object {
+                bucket,
+                object,
+                version_id,
+            }
+            | HealType::ECDecode {
+                bucket,
+                object,
+                version_id,
+            } => (bucket.as_str(), object.as_str(), version_id.as_deref()),
+            HealType::Metadata { bucket, object } => (bucket.as_str(), object.as_str(), None),
+            HealType::DeleteMarkerPurge {
+                bucket,
+                object,
+                version_id,
+                ..
+            } => (bucket.as_str(), object.as_str(), Some(version_id.as_str())),
+            _ => return true,
+        };
+        crate::heal::failure_logging::log_legacy_ambiguity(
+            bucket,
+            object,
+            version_id,
+            self.options.pool_index,
+            self.options.set_index,
+        )
+    }
+
     fn should_return_typed_heal_error(err: &Error) -> bool {
         matches!(err, Error::Storage(_) | Error::Disk(_))
     }

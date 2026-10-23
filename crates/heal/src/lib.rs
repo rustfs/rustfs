@@ -94,6 +94,47 @@ pub struct ReplacementRecoverySnapshot {
     pub reason: Option<String>,
 }
 
+/// Read-only recovery evidence from this node's local disks. It is never
+/// merged with peer status and does not certify completion.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalHealRecoveryDiagnostics {
+    pub scope: &'static str,
+    pub definitive: bool,
+    pub reason: Option<String>,
+    pub root_blocked: Vec<RootHealRecoveryBlock>,
+    pub checkpoint_blocked: Vec<BlockedCheckpointRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RootHealRecoveryBlock {
+    pub task_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedCheckpointRecord {
+    pub task_id: String,
+    pub disk_id: Option<uuid::Uuid>,
+    pub reason: String,
+    pub blocked_at: Option<u64>,
+    pub revalidate_after: Option<u64>,
+}
+
+impl LocalHealRecoveryDiagnostics {
+    fn unavailable(reason: &str) -> Self {
+        Self {
+            scope: "local_disks",
+            definitive: false,
+            reason: Some(reason.to_owned()),
+            root_blocked: Vec::new(),
+            checkpoint_blocked: Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Default)]
 struct HealRuntimeInitTestHook {
@@ -275,6 +316,15 @@ pub fn current_replacement_recovery_blocks() -> Vec<ReplacementRecoveryBlock> {
     get_heal_manager()
         .map(|manager| manager.replacement_recovery_blocks())
         .unwrap_or_default()
+}
+
+/// List local root and checkpoint blocks without repairing records or
+/// revalidating, resetting or removing checkpoint markers.
+pub async fn current_local_heal_recovery_diagnostics() -> LocalHealRecoveryDiagnostics {
+    match get_heal_manager() {
+        Some(manager) => manager.local_recovery_diagnostics().await,
+        None => LocalHealRecoveryDiagnostics::unavailable("heal_runtime_not_initialized"),
+    }
 }
 
 /// Read all local survivor-disk replacement records without conflating an I/O

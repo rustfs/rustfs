@@ -288,18 +288,17 @@ impl HealManager {
                                     "Heal scheduler task retrying"
                                 });
                             } else {
-                                error!(
-                                    target: "rustfs::heal::manager",
+                                demote_to_debug_when!(!task.should_log_failure(e), error, target: "rustfs::heal::manager", {
                                     event = EVENT_HEAL_SCHEDULER_STATE,
                                     component = LOG_COMPONENT_HEAL,
                                     subsystem = LOG_SUBSYSTEM_MANAGER,
+                                    state = "task_failed",
                                     task_id,
                                     heal_type = %task_type_label_for_spawn,
                                     set = %task_set_label_for_spawn,
-                                    state = "task_failed",
                                     error = %e,
                                     "Heal scheduler task failed"
-                                );
+                                });
                             }
                         }
                     }
