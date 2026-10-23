@@ -2834,7 +2834,14 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             crate::object_api::ENCRYPTED_PART_LAYOUT_CANDIDATE_SUFFIX,
         );
         rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, crate::object_api::ENCRYPTED_PART_LAYOUT_QUORUM_SUFFIX);
-        if expected_restore_operation_id.is_some() {
+        // Pending copy-back keeps its recovery identity until finalization.
+        if expected_restore_operation_id.is_some()
+            && !fi
+                .metadata
+                .get(metadata_keys::RESTORE)
+                .and_then(|value| rustfs_filemeta::parse_restore_obj_status(value).ok())
+                .is_some_and(|status| status.is_restore_in_progress == Some(true))
+        {
             rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, SUFFIX_RESTORE_OPERATION_ID);
             rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, SUFFIX_RESTORE_WORKER_LOCK);
         }

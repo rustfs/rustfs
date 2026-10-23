@@ -274,3 +274,225 @@ async fn prepared_snapshot_transition_duplicate_and_late_get_use_committed_remot
         "late GET must route to the remote generation instead of reopening the released local source"
     );
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn single_part_restore_copyback_stays_pending_before_finalization() {
+    restore_copyback_stays_pending_before_finalization(false).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn multipart_restore_copyback_stays_pending_before_finalization() {
+    restore_copyback_stays_pending_before_finalization(true).await;
+}
+
+async fn restore_copyback_stays_pending_before_finalization(multipart: bool) {
+    use crate::bucket::lifecycle::bucket_lifecycle_ops::LifecycleOps as _;
+    use crate::set_disk::replication::RestoreFinalizeBarrier;
+    use crate::storage_api_contracts::multipart::{CompletePart, MultipartOperations as _};
+    use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration;
+    use rustfs_lifecycle::Lifecycle as _;
+
+    let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+    let bucket = "restore-before-finalization-bucket";
+    let object = "object.bin";
+    let payload = vec![0x5au8; 6 * 1024 * 1024];
+    set_disks
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("bucket should be created");
+    let write_opts = ObjectOptions {
+        write_completion: WriteCompletion::TailDrained,
+        ..Default::default()
+    };
+    let original = if multipart {
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &write_opts)
+            .await
+            .expect("source multipart upload should be created");
+        let mut parts = Vec::new();
+        for (index, bytes) in payload.chunks(5 * 1024 * 1024).enumerate() {
+            let mut reader = PutObjReader::from_vec(bytes.to_vec());
+            let part = set_disks
+                .put_object_part(bucket, object, &upload.upload_id, index + 1, &mut reader, &write_opts)
+                .await
+                .expect("source part should be written");
+            parts.push(CompletePart {
+                part_num: part.part_num,
+                etag: part.etag,
+                ..Default::default()
+            });
+        }
+        set_disks
+            .clone()
+            .complete_multipart_upload(bucket, object, &upload.upload_id, parts, &write_opts)
+            .await
+            .expect("source multipart upload should complete")
+    } else {
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, object, &mut reader, &write_opts)
+            .await
+            .expect("source object should be written")
+    };
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let backend = register_mock_tier(&set_disks.instance_ctx().tier_config_mgr(), &tier_name).await;
+    set_disks
+        .transition_object(
+            bucket,
+            object,
+            &ObjectOptions {
+                transition: TransitionOptions {
+                    status: TRANSITION_PENDING.to_string(),
+                    tier: tier_name,
+                    etag: original.etag.clone().expect("source ETag should be present"),
+                    ..Default::default()
+                },
+                version_id: original.version_id.map(|version| version.to_string()),
+                mod_time: original.mod_time,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("source should transition before restore");
+
+    let operation_id = Uuid::new_v4().to_string();
+    let mut operation_metadata = std::collections::HashMap::new();
+    rustfs_utils::http::metadata_compat::insert_str(
+        &mut operation_metadata,
+        rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+        operation_id.clone(),
+    );
+    rustfs_utils::http::metadata_compat::insert_str(
+        &mut operation_metadata,
+        rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_WORKER_LOCK,
+        rustfs_utils::http::metadata_compat::RESTORE_WORKER_LOCK_PROTOCOL_V1.to_string(),
+    );
+    operation_metadata.insert(
+        rustfs_filemeta::metadata_keys::RESTORE.to_string(),
+        "ongoing-request=\"true\"".to_string(),
+    );
+    set_disks
+        .put_object_metadata(
+            bucket,
+            object,
+            &ObjectOptions {
+                eval_metadata: Some(operation_metadata.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the restore operation generation should be installed");
+    let barrier = RestoreFinalizeBarrier::install_before_lock(bucket, object);
+    let restore_set = Arc::clone(&set_disks);
+    let restore = tokio::spawn(async move {
+        let mut opts = ObjectOptions {
+            user_defined: operation_metadata,
+            ..Default::default()
+        };
+        opts.transition.restore_request.days = Some(1);
+        restore_set.restore_transitioned_object(bucket, object, &opts).await
+    });
+    tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+        .await
+        .expect("copy-back must reach the gap before finalization acquires its lock");
+    let pending = set_disks
+        .get_object_info(bucket, object, &ObjectOptions::default())
+        .await
+        .expect("HEAD must remain available before finalization");
+    let status = parse_restore_obj_status(
+        pending
+            .user_defined
+            .get(rustfs_filemeta::metadata_keys::RESTORE)
+            .expect("copy-back must retain restore metadata"),
+    )
+    .expect("pending restore status should parse");
+    // Evaluate beyond any pre-copy deadline without sleeping or advancing the
+    // process clock. Pending copy-back must never become a restore-expiry candidate.
+    let lifecycle = PersistedLifecycleConfiguration::default();
+    let expiry_evaluation_time = OffsetDateTime::now_utc() + time::Duration::days(2);
+    let action = lifecycle
+        .eval_inner(&pending.to_lifecycle_opts(), expiry_evaluation_time, 0)
+        .await
+        .action;
+    barrier.release();
+    tokio::time::timeout(Duration::from_secs(30), restore)
+        .await
+        .expect("released restore should complete promptly")
+        .expect("restore task should join")
+        .expect("copy-back should finalize successfully");
+
+    assert!(status.on_going(), "copy-back must not advertise completion before metadata finalization");
+    assert!(status.expiry().is_none(), "pending copy-back must not expose a completed expiry");
+    assert!(
+        !action.delete_restored(),
+        "scanner must not reclaim copy-back before metadata finalization"
+    );
+
+    for (suffix, expected) in [
+        (rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID, operation_id.as_str()),
+        (
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_WORKER_LOCK,
+            rustfs_utils::http::metadata_compat::RESTORE_WORKER_LOCK_PROTOCOL_V1,
+        ),
+    ] {
+        for prefix in [
+            rustfs_utils::http::RUSTFS_INTERNAL_PREFIX,
+            rustfs_utils::http::MINIO_INTERNAL_PREFIX,
+        ] {
+            assert_eq!(
+                pending.user_defined.get(&format!("{prefix}{suffix}")).map(String::as_str),
+                Some(expected),
+                "pending copy-back must retain each recovery marker alias"
+            );
+        }
+    }
+
+    let completed = set_disks
+        .get_object_info(bucket, object, &ObjectOptions::default())
+        .await
+        .expect("finalized metadata should be readable");
+    let completed_status = parse_restore_obj_status(
+        completed
+            .user_defined
+            .get(rustfs_filemeta::metadata_keys::RESTORE)
+            .expect("finalized restore status should be present"),
+    )
+    .expect("finalized restore status should parse");
+    assert!(!completed_status.on_going(), "finalization must publish completion");
+    assert!(completed_status.expiry().is_some(), "finalization must publish the completed expiry");
+    for suffix in [
+        rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+        rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_WORKER_LOCK,
+    ] {
+        for prefix in [
+            rustfs_utils::http::RUSTFS_INTERNAL_PREFIX,
+            rustfs_utils::http::MINIO_INTERNAL_PREFIX,
+        ] {
+            assert!(
+                !completed.user_defined.contains_key(&format!("{prefix}{suffix}")),
+                "finalization must remove every recovery marker alias"
+            );
+        }
+    }
+    let completed_action = lifecycle
+        .eval_inner(&completed.to_lifecycle_opts(), expiry_evaluation_time, 0)
+        .await
+        .action;
+    assert!(
+        completed_action.delete_restored(),
+        "the same lifecycle evaluator must expire a completed restore beyond its deadline"
+    );
+    backend.set_unreachable(true).await;
+    let mut restored = Vec::new();
+    set_disks
+        .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+        .await
+        .expect("completed restore must be readable with the remote tier unavailable")
+        .stream
+        .read_to_end(&mut restored)
+        .await
+        .expect("local restored body should drain");
+    assert_eq!(restored, payload, "finalized local copy must preserve every byte");
+}

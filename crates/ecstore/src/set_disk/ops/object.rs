@@ -4202,7 +4202,13 @@ impl SetDisks {
             // state.
             merge_replication_metadata_lww(&mut user_defined, &HashMap::new(), opts);
         }
-        if expected_restore_operation_id.is_some() {
+        // Pending copy-back keeps its recovery identity until finalization.
+        if expected_restore_operation_id.is_some()
+            && !user_defined
+                .get(metadata_keys::RESTORE)
+                .and_then(|value| rustfs_filemeta::parse_restore_obj_status(value).ok())
+                .is_some_and(|status| status.is_restore_in_progress == Some(true))
+        {
             rustfs_utils::http::metadata_compat::remove_str(&mut user_defined, SUFFIX_RESTORE_OPERATION_ID);
             rustfs_utils::http::metadata_compat::remove_str(&mut user_defined, SUFFIX_RESTORE_WORKER_LOCK);
         }
@@ -18272,7 +18278,7 @@ mod transition_upload_integrity_tests {
                 },
             )
             .await
-            .expect("matching restore commit should consume its operation id")
+            .expect("matching restore copy-back should retain its pending operation id")
     }
 
     fn restore_finalize_options(operation_id: Uuid) -> ObjectOptions {
@@ -18289,17 +18295,35 @@ mod transition_upload_integrity_tests {
         }
     }
 
-    async fn assert_committed_restore_remains_pending(set_disks: &Arc<SetDisks>, bucket: &str, object: &str) {
+    async fn assert_committed_restore_remains_pending(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, operation_id: Uuid) {
         let current = set_disks
             .get_object_info(bucket, object, &ObjectOptions::default())
             .await
             .expect("pending restore metadata should remain readable");
-        assert!(
-            restore_operation_id_from_metadata(current.user_defined.as_ref())
-                .expect("operation id metadata should parse")
-                .is_none(),
-            "successful restore commit must have consumed the operation id"
+        assert_eq!(
+            restore_operation_id_from_metadata(current.user_defined.as_ref()).expect("operation id metadata should parse"),
+            Some(operation_id),
+            "unfinished restore copy-back must retain its exact operation id"
         );
+        let operation_id = operation_id.to_string();
+        for (suffix, expected) in [
+            (rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID, operation_id.as_str()),
+            (
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_WORKER_LOCK,
+                rustfs_utils::http::metadata_compat::RESTORE_WORKER_LOCK_PROTOCOL_V1,
+            ),
+        ] {
+            for prefix in [
+                rustfs_utils::http::RUSTFS_INTERNAL_PREFIX,
+                rustfs_utils::http::MINIO_INTERNAL_PREFIX,
+            ] {
+                assert_eq!(
+                    current.user_defined.get(&format!("{prefix}{suffix}")).map(String::as_str),
+                    Some(expected),
+                    "unfinished restore copy-back must retain each recovery marker alias"
+                );
+            }
+        }
         assert!(
             rustfs_filemeta::parse_restore_obj_status(
                 current
@@ -18357,7 +18381,7 @@ mod transition_upload_integrity_tests {
                 if error.kind() == std::io::ErrorKind::Other
                     && error.to_string() == "restore finalization lock lost before metadata update"
         ));
-        assert_committed_restore_remains_pending(&set_disks, bucket, object).await;
+        assert_committed_restore_remains_pending(&set_disks, bucket, object, operation_id).await;
     }
 
     #[tokio::test]
@@ -18394,7 +18418,7 @@ mod transition_upload_integrity_tests {
                 ..
             }
         ));
-        assert_committed_restore_remains_pending(&set_disks, bucket, object).await;
+        assert_committed_restore_remains_pending(&set_disks, bucket, object, operation_id).await;
     }
 
     async fn assert_local_source_intact(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, payload: &[u8]) {

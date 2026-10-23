@@ -27,6 +27,7 @@ use std::sync::Arc;
 struct RestoreFinalizeBarrierState {
     bucket: String,
     object: String,
+    before_lock: bool,
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -43,9 +44,18 @@ pub(in crate::set_disk) struct RestoreFinalizeBarrier {
 #[cfg(all(test, feature = "test-util"))]
 impl RestoreFinalizeBarrier {
     pub(in crate::set_disk) fn install(bucket: &str, object: &str) -> Self {
+        Self::install_at(bucket, object, false)
+    }
+
+    pub(in crate::set_disk) fn install_before_lock(bucket: &str, object: &str) -> Self {
+        Self::install_at(bucket, object, true)
+    }
+
+    fn install_at(bucket: &str, object: &str, before_lock: bool) -> Self {
         let state = Arc::new(RestoreFinalizeBarrierState {
             bucket: bucket.to_string(),
             object: object.to_string(),
+            before_lock,
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
         });
@@ -81,13 +91,13 @@ impl Drop for RestoreFinalizeBarrier {
 }
 
 #[cfg(all(test, feature = "test-util"))]
-async fn maybe_pause_restore_finalize(bucket: &str, object: &str) {
+async fn maybe_pause_restore_finalize(bucket: &str, object: &str, before_lock: bool) {
     let barrier = RESTORE_FINALIZE_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
         .expect("restore finalize barrier mutex should not poison")
         .as_ref()
-        .filter(|barrier| barrier.bucket == bucket && barrier.object == object)
+        .filter(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.before_lock == before_lock)
         .cloned();
     if let Some(barrier) = barrier {
         barrier.arrived.notify_one();
@@ -150,6 +160,8 @@ impl SetDisks {
         obj_info: &ObjectInfo,
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
+        #[cfg(all(test, feature = "test-util"))]
+        maybe_pause_restore_finalize(bucket, object, true).await;
         let expected = RestoreCleanupIdentity::from_object_info(obj_info);
         let expected_operation_id = restore_operation_id_from_metadata(&opts.user_defined)?;
         let expected_etag = obj_info
@@ -208,7 +220,7 @@ impl SetDisks {
             return Err(Error::other("restored object changed before restore metadata finalization"));
         }
         #[cfg(all(test, feature = "test-util"))]
-        maybe_pause_restore_finalize(bucket, object).await;
+        maybe_pause_restore_finalize(bucket, object, false).await;
         let restore_expiry =
             lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), opts.transition.restore_request.days.unwrap_or(1));
         fi.metadata.insert(

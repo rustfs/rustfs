@@ -5372,16 +5372,16 @@ pub async fn put_restore_opts(
         meta.insert(k.to_string(), v.clone());
     }
     rustfs_utils::http::metadata_compat::remove_str(&mut meta, rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID);
-    rustfs_utils::http::metadata_compat::remove_str(&mut meta, rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_WORKER_LOCK);
     if !oi.user_tags.is_empty() {
         meta.insert(AMZ_OBJECT_TAGGING.to_string(), (*oi.user_tags).clone());
     }
-    let restore_expiry = lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), rreq.days.unwrap_or(1));
+    // Finalization publishes completion and its expiry under the object lock.
+    // The local copy-back commit must not make unfinished work eligible for expiry.
     meta.insert(
         metadata_keys::RESTORE.to_string(),
         RestoreStatus {
-            is_restore_in_progress: Some(false),
-            restore_expiry_date: Some(restore_expiry),
+            is_restore_in_progress: Some(true),
+            restore_expiry_date: None,
         }
         .to_string(),
     );
