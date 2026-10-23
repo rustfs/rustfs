@@ -238,6 +238,7 @@ impl SetDisks {
             lifecycle::TRANSITION_COMPLETE.to_string(),
         );
         for suffix in [
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_COPYBACK,
             rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
             rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_WORKER_LOCK,
         ] {
@@ -337,6 +338,10 @@ impl SetDisks {
         fi.metadata.remove(metadata_keys::RESTORE);
         fi.metadata.remove(metadata_keys::RESTORE_EXPIRY_DAYS);
         fi.metadata.remove(metadata_keys::RESTORE_REQUEST_DATE);
+        rustfs_utils::http::metadata_compat::remove_str(
+            &mut fi.metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_COPYBACK,
+        );
         rustfs_utils::http::metadata_compat::remove_str(
             &mut fi.metadata,
             rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,

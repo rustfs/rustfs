@@ -412,6 +412,17 @@ async fn restore_copyback_stays_pending_before_finalization(multipart: bool) {
         pending.transitioned_object.status, TRANSITION_COMPLETE,
         "copy-back must retain the remote identity needed by recovery and cleanup"
     );
+    backend.set_unreachable(true).await;
+    let mut restored_before_finalization = Vec::new();
+    set_disks
+        .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+        .await
+        .expect("pending copy-back must be readable locally before metadata finalization")
+        .stream
+        .read_to_end(&mut restored_before_finalization)
+        .await
+        .expect("pending local body should drain");
+    assert_eq!(restored_before_finalization, payload, "pending local copy must preserve every byte");
     set_disks
         .transition_object(
             bucket,

@@ -18,10 +18,10 @@ use bytes::Bytes;
 use rmp_serde::Serializer;
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::{
-    AMZ_OBJECT_TAGGING, SUFFIX_COMPRESSION, SUFFIX_DATA_MOVED, SUFFIX_DATA_MOVED_TAGS, SUFFIX_FREE_VERSION, SUFFIX_HEALING,
-    SUFFIX_INLINE_DATA, SUFFIX_OBJECT_TRANSACTION_EPOCH, SUFFIX_TIER_FV_ID, SUFFIX_TIER_FV_MARKER, SUFFIX_TIER_SKIP_FV_ID,
-    contains_key_str, get_consistent_str, get_str, has_internal_suffix, insert_str, is_encryption_metadata_key,
-    starts_with_ignore_ascii_case,
+    AMZ_OBJECT_TAGGING, RESTORE_COPYBACK_PROTOCOL_V1, SUFFIX_COMPRESSION, SUFFIX_DATA_MOVED, SUFFIX_DATA_MOVED_TAGS,
+    SUFFIX_FREE_VERSION, SUFFIX_HEALING, SUFFIX_INLINE_DATA, SUFFIX_OBJECT_TRANSACTION_EPOCH, SUFFIX_RESTORE_COPYBACK,
+    SUFFIX_TIER_FV_ID, SUFFIX_TIER_FV_MARKER, SUFFIX_TIER_SKIP_FV_ID, contains_key_str, get_consistent_str, get_str,
+    has_internal_suffix, insert_str, is_encryption_metadata_key, starts_with_ignore_ascii_case,
 };
 use serde::de::{self, MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer};
 use serde::ser::SerializeMap;
@@ -1264,6 +1264,15 @@ impl FileInfo {
     /// Check if the object is remote (transitioned to another tier)
     pub fn is_remote(&self) -> bool {
         if self.transition_status != TRANSITION_COMPLETE {
+            return false;
+        }
+        if get_consistent_str(&self.metadata, SUFFIX_RESTORE_COPYBACK) == Some(RESTORE_COPYBACK_PROTOCOL_V1)
+            && self
+                .metadata
+                .get(metadata_keys::RESTORE)
+                .and_then(|value| parse_restore_obj_status(value).ok())
+                .is_some_and(|status| status.is_restore_in_progress == Some(true))
+        {
             return false;
         }
         !is_restored_object_on_disk(&self.metadata)

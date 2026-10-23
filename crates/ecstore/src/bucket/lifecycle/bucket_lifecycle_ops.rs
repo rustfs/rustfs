@@ -5417,6 +5417,18 @@ impl LifecycleOps for ObjectInfo {
         if self.transitioned_object.status != lifecycle::TRANSITION_COMPLETE {
             return false;
         }
+        if rustfs_utils::http::metadata_compat::get_consistent_str(
+            &self.user_defined,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_COPYBACK,
+        ) == Some(rustfs_utils::http::metadata_compat::RESTORE_COPYBACK_PROTOCOL_V1)
+            && self
+                .user_defined
+                .get(metadata_keys::RESTORE)
+                .and_then(|value| rustfs_filemeta::parse_restore_obj_status(value).ok())
+                .is_some_and(|status| status.is_restore_in_progress == Some(true))
+        {
+            return false;
+        }
         !is_restored_object_on_disk(&self.user_defined)
     }
 }

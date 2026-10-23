@@ -41,25 +41,26 @@ use super::super::{
     ObjectKey, ObjectLockConfigSnapshot, ObjectLockConfigState, ObjectOptions, ObjectReader, ObjectToDelete, OffsetDateTime,
     Ordering, Pin, PutObjReader, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, ReadPathPlan, ReaderImpl, ReplicateDecision,
     ReplicationObjectBridge, Result, SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS, SLASH_SEPARATOR, SUFFIX_ACTUAL_SIZE,
-    SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK, SetDisks,
-    SmallWritePath, StorageError, TRANSITION_COMPLETE, UpdateMetadataOpts, Uuid, WriteLayout, adaptive_duplex_buffer_size,
-    build_get_object_info, build_inline_bitrot_readers, build_inline_bitrot_readers_from_refs, can_try_inline_data_shards_direct,
-    check_object_lock_delete, check_object_lock_for_deletion_with_state, check_object_lock_retention_update,
-    classify_get_codec_streaming_object_class, classify_put_write_path, classify_storage_error,
-    collect_inline_data_shard_fileinfos_by_index, contains_key_str, create_bitrot_writer, debug, delete_file_info_version_id,
-    disk, ensure_delete_commit_locks_held, error, explicit_delete_removed_marker, finish_set_disk_read_lock,
-    get_codec_streaming_reader_gate_with_plan, get_object_body_cache_hook, get_raw_etag,
-    get_small_object_direct_memory_decision_with_threshold_and_plan, get_small_object_direct_memory_threshold,
-    get_stage_timer_if_enabled, get_str, get_transitioned_object_reader_with_tier_manager, inline_admission_shard_size,
-    inline_erasure_shard_file_offset, inline_erasure_shard_size, insert_str, is_deadlock_detection_enabled,
-    is_err_object_not_found, is_err_version_not_found, is_explicit_null_version, is_get_codec_streaming_base_enabled,
-    is_get_small_object_direct_memory_enabled, is_lock_optimization_enabled, issue3031_diag_enabled, join_all,
-    known_put_object_storage_size, path_join_buf, put_restore_opts, record_compression_total_memory,
-    record_get_codec_streaming_gate_decision, record_get_direct_memory_decision, record_get_object_pipeline_failure,
-    record_get_object_pipeline_failure_for_path, record_get_object_reader_path_observation, record_get_stage_duration_if_enabled,
-    record_lock_acquire, reduce_write_quorum_errs, release_materialized_read_lock, replication_write_may_pass_worm_gate,
-    require_restore_operation_id, resolve_delete_version_state, resolve_tiered_decommission_write_quorum_result,
-    resolve_write_layout, restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata, send_event,
+    SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_RESTORE_COPYBACK, SUFFIX_RESTORE_OPERATION_ID,
+    SUFFIX_RESTORE_WORKER_LOCK, SetDisks, SmallWritePath, StorageError, TRANSITION_COMPLETE, UpdateMetadataOpts, Uuid,
+    WriteLayout, adaptive_duplex_buffer_size, build_get_object_info, build_inline_bitrot_readers,
+    build_inline_bitrot_readers_from_refs, can_try_inline_data_shards_direct, check_object_lock_delete,
+    check_object_lock_for_deletion_with_state, check_object_lock_retention_update, classify_get_codec_streaming_object_class,
+    classify_put_write_path, classify_storage_error, collect_inline_data_shard_fileinfos_by_index, contains_key_str,
+    create_bitrot_writer, debug, delete_file_info_version_id, disk, ensure_delete_commit_locks_held, error,
+    explicit_delete_removed_marker, finish_set_disk_read_lock, get_codec_streaming_reader_gate_with_plan,
+    get_object_body_cache_hook, get_raw_etag, get_small_object_direct_memory_decision_with_threshold_and_plan,
+    get_small_object_direct_memory_threshold, get_stage_timer_if_enabled, get_str,
+    get_transitioned_object_reader_with_tier_manager, inline_admission_shard_size, inline_erasure_shard_file_offset,
+    inline_erasure_shard_size, insert_str, is_deadlock_detection_enabled, is_err_object_not_found, is_err_version_not_found,
+    is_explicit_null_version, is_get_codec_streaming_base_enabled, is_get_small_object_direct_memory_enabled,
+    is_lock_optimization_enabled, issue3031_diag_enabled, join_all, known_put_object_storage_size, path_join_buf,
+    put_restore_opts, record_compression_total_memory, record_get_codec_streaming_gate_decision,
+    record_get_direct_memory_decision, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
+    record_get_object_reader_path_observation, record_get_stage_duration_if_enabled, record_lock_acquire,
+    reduce_write_quorum_errs, release_materialized_read_lock, replication_write_may_pass_worm_gate, require_restore_operation_id,
+    resolve_delete_version_state, resolve_tiered_decommission_write_quorum_result, resolve_write_layout,
+    restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata, send_event,
     set_disk_delete_creates_delete_marker, should_force_delete_marker_for_missing_version,
     should_persist_encryption_original_size, should_preserve_delete_replication_state, should_use_inline_fast_path_with_plan,
     take_prepared_get_object_metadata, to_object_err, try_read_inline_data_shards_direct, warn,
@@ -2296,6 +2297,8 @@ fn is_restore_control_metadata(key: &str) -> bool {
         || rustfs_utils::http::internal_key_strip_suffix_prefix(key, SUFFIX_RESTORE_OPERATION_ID)
             .is_some_and(|remainder| remainder.is_empty())
         || rustfs_utils::http::internal_key_strip_suffix_prefix(key, SUFFIX_RESTORE_WORKER_LOCK)
+            .is_some_and(|remainder| remainder.is_empty())
+        || rustfs_utils::http::internal_key_strip_suffix_prefix(key, SUFFIX_RESTORE_COPYBACK)
             .is_some_and(|remainder| remainder.is_empty())
 }
 
@@ -4584,6 +4587,13 @@ impl SetDisks {
                     &mut user_defined,
                     rustfs_filemeta::shard_integrity::SUFFIX_INLINE_INTEGRITY,
                     inline_proof.to_owned(),
+                );
+            }
+            if opts.restore_copyback {
+                insert_str(
+                    &mut user_defined,
+                    SUFFIX_RESTORE_COPYBACK,
+                    rustfs_utils::http::metadata_compat::RESTORE_COPYBACK_PROTOCOL_V1.to_string(),
                 );
             }
             fi.metadata = user_defined;
@@ -11806,6 +11816,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     bucket_lifecycle_lock_fence: opts.bucket_lifecycle_lock_fence.clone(),
                     user_defined: restore_commit_metadata,
                     no_lock: false,
+                    restore_copyback: true,
                     decommission_capacity_admission: opts.decommission_capacity_admission.clone(),
                     // The composite ETag would otherwise be recomputed from the
                     // parts as they were written back, which for an encrypted or
