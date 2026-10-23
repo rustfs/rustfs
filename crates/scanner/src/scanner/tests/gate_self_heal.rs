@@ -698,7 +698,7 @@ fn recovery_backoff_cap_hot_update_changes_the_next_retry_and_status() {
         assert_eq!(retry.attempt, attempt);
         assert_eq!(recovery.state, "backoff");
         assert!(recovery.retryable);
-        assert_eq!(recovery.retry_count, attempt);
+        assert_eq!(recovery.retry_count, u64::from(attempt));
         let next = recovery.next_attempt_at_unix_secs.expect("next retry is observable");
         assert!((before + cap..=after + cap).contains(&next));
         assert!(recovery.reason.expect("retry reason").contains(&format!("(in {cap}s)")));
