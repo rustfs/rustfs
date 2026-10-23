@@ -229,7 +229,7 @@ async fn transient_cycle_state_outage_exhausting_the_budget_stays_retryable() {
             seed_transient_cycle_read_failure().await;
             let retry = record_scanner_cycle_recovery_retry(attempt, Duration::from_secs(1));
             assert_eq!(retry.attempt, attempt);
-            assert!(retry.delay <= SCANNER_CYCLE_RECOVERY_BACKOFF_CAP);
+            assert!(retry.delay <= Duration::from_secs(rustfs_config::DEFAULT_SCANNER_RECOVERY_BACKOFF_CAP_SECS));
             let status = scanner_cycle_recovery_status();
             assert!(status.retryable, "attempt {attempt} must stay retryable: {status:?}");
             assert!(status.next_attempt_at_unix_secs.is_some(), "attempt {attempt}: {status:?}");
@@ -600,20 +600,114 @@ async fn cycle_state_save_yields_to_a_newer_epoch_without_retrying() {
 /// The retry schedule is bounded: it grows from the transient base (or the
 /// shorter configured interval) and never exceeds the ten-minute cap.
 #[test]
+#[serial]
 fn recovery_backoff_delay_is_capped() {
-    assert_eq!(scanner_cycle_recovery_backoff_delay(1, Duration::from_secs(60)), Duration::from_secs(5));
-    assert_eq!(scanner_cycle_recovery_backoff_delay(2, Duration::from_secs(60)), Duration::from_secs(10));
-    assert_eq!(scanner_cycle_recovery_backoff_delay(5, Duration::from_secs(60)), Duration::from_secs(80));
+    temp_env::with_var_unset(rustfs_config::ENV_SCANNER_RECOVERY_BACKOFF_CAP_SECS, || {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        assert_eq!(scanner_cycle_recovery_backoff_delay(1, Duration::from_secs(60)), Duration::from_secs(5));
+        assert_eq!(scanner_cycle_recovery_backoff_delay(2, Duration::from_secs(60)), Duration::from_secs(10));
+        assert_eq!(scanner_cycle_recovery_backoff_delay(5, Duration::from_secs(60)), Duration::from_secs(80));
+        assert_eq!(
+            scanner_cycle_recovery_backoff_delay(8, Duration::from_secs(60)),
+            Duration::from_secs(rustfs_config::DEFAULT_SCANNER_RECOVERY_BACKOFF_CAP_SECS)
+        );
+        assert_eq!(
+            scanner_cycle_recovery_backoff_delay(u32::MAX, Duration::from_secs(60)),
+            Duration::from_secs(rustfs_config::DEFAULT_SCANNER_RECOVERY_BACKOFF_CAP_SECS)
+        );
+        assert_eq!(scanner_cycle_recovery_backoff_delay(1, Duration::from_secs(1)), Duration::from_secs(1));
+        assert_eq!(scanner_cycle_recovery_backoff_delay(0, Duration::ZERO), Duration::from_secs(1));
+    });
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+}
+
+#[test]
+#[serial]
+fn recovery_backoff_cap_configuration_controls_the_retry_schedule() {
+    let (retry, status, before, after) = temp_env::with_var("RUSTFS_SCANNER_RECOVERY_BACKOFF_CAP_SECS", Some("17"), || {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        reset_recovery_status();
+        record_scanner_usage_floor_failure("retryable fixture outage".to_string());
+        let before = unix_now_for_test();
+        let retry = record_scanner_cycle_recovery_retry(12, Duration::from_secs(60));
+        let status = scanner_cycle_recovery_status();
+        (retry, status, before, unix_now_for_test())
+    });
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+    reset_recovery_status();
+
     assert_eq!(
-        scanner_cycle_recovery_backoff_delay(8, Duration::from_secs(60)),
-        SCANNER_CYCLE_RECOVERY_BACKOFF_CAP
+        retry.delay,
+        Duration::from_secs(17),
+        "the configured cap must reach the production retry schedule"
     );
-    assert_eq!(
-        scanner_cycle_recovery_backoff_delay(u32::MAX, Duration::from_secs(60)),
-        SCANNER_CYCLE_RECOVERY_BACKOFF_CAP
-    );
-    assert_eq!(scanner_cycle_recovery_backoff_delay(1, Duration::from_secs(1)), Duration::from_secs(1));
-    assert_eq!(scanner_cycle_recovery_backoff_delay(0, Duration::ZERO), Duration::from_secs(1));
+    assert_eq!(retry.attempt, 12);
+    assert_eq!(status.state, "backoff");
+    assert!(status.retryable, "a configured cap cannot make an outage terminal");
+    let next = status.next_attempt_at_unix_secs.expect("retry deadline is observable");
+    assert!((before + 17..=after + 17).contains(&next));
+    assert!(status.reason.expect("retry reason").contains("(in 17s)"));
+}
+
+#[test]
+#[serial]
+fn recovery_backoff_cap_hot_update_changes_the_next_retry_and_status() {
+    use rustfs_config::server_config::{Config, KVS};
+    use rustfs_config::{
+        DEFAULT_DELIMITER, ENV_SCANNER_RECOVERY_BACKOFF_CAP_SECS, SCANNER_RECOVERY_BACKOFF_CAP, SCANNER_SUB_SYS,
+    };
+
+    crate::init_ecstore_config_for_scanner_tests();
+    let observations = temp_env::with_var_unset(ENV_SCANNER_RECOVERY_BACKOFF_CAP_SECS, || {
+        reset_recovery_status();
+        record_scanner_usage_floor_failure("retryable fixture outage".to_string());
+        [17_u64, 1200, 1]
+            .into_iter()
+            .enumerate()
+            .map(|(index, cap)| {
+                let mut config = Config::new();
+                let mut kvs = KVS::new();
+                kvs.insert(SCANNER_RECOVERY_BACKOFF_CAP.to_string(), cap.to_string());
+                config.0.insert(
+                    SCANNER_SUB_SYS.to_string(),
+                    std::collections::HashMap::from([(DEFAULT_DELIMITER.to_string(), kvs)]),
+                );
+                let generation = crate::runtime_config::scanner_runtime_config_generation();
+                crate::runtime_config::apply_scanner_runtime_config(&config).expect("valid hot update");
+                assert!(crate::runtime_config::scanner_runtime_config_generation() > generation);
+                let before = unix_now_for_test();
+                let attempt = 12 + u32::try_from(index).expect("small fixture index");
+                let retry = record_scanner_cycle_recovery_retry(attempt, Duration::from_secs(60));
+                (
+                    cap,
+                    attempt,
+                    retry,
+                    scanner_cycle_recovery_status(),
+                    crate::runtime_config::scanner_runtime_config_status(),
+                    before,
+                    unix_now_for_test(),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+    reset_recovery_status();
+
+    for (cap, attempt, retry, recovery, runtime, before, after) in observations {
+        assert_eq!(retry.delay, Duration::from_secs(cap));
+        assert_eq!(retry.attempt, attempt);
+        assert_eq!(recovery.state, "backoff");
+        assert!(recovery.retryable);
+        assert_eq!(recovery.retry_count, attempt);
+        let next = recovery.next_attempt_at_unix_secs.expect("next retry is observable");
+        assert!((before + cap..=after + cap).contains(&next));
+        assert!(recovery.reason.expect("retry reason").contains(&format!("(in {cap}s)")));
+        assert_eq!(runtime.recovery_backoff_cap_seconds.value, cap);
+        assert_eq!(
+            runtime.recovery_backoff_cap_seconds.source,
+            crate::runtime_config::ScannerRuntimeConfigSource::Config
+        );
+    }
 }
 
 /// An observation older than the daily window restarts its retry budget so

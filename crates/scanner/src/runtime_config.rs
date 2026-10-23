@@ -20,19 +20,21 @@ use rustfs_config::{
     DEFAULT_SCANNER_ALERT_EXCESS_VERSION_SIZE, DEFAULT_SCANNER_ALERT_EXCESS_VERSIONS, DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS,
     DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES, DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS, DEFAULT_SCANNER_CYCLE_MAX_OBJECTS,
     DEFAULT_SCANNER_DISK_IO_BUDGET, DEFAULT_SCANNER_IDLE_MODE, DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS,
-    DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS, DEFAULT_SCANNER_SPEED, DEFAULT_SCANNER_WALKERS_PER_DISK,
-    DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS, ENV_SCANNER_ALERT_EXCESS_FOLDERS, ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE,
-    ENV_SCANNER_ALERT_EXCESS_VERSIONS, ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, ENV_SCANNER_CYCLE,
-    ENV_SCANNER_CYCLE_MAX_DIRECTORIES, ENV_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_DELAY,
+    DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS, DEFAULT_SCANNER_RECOVERY_BACKOFF_CAP_SECS, DEFAULT_SCANNER_SPEED,
+    DEFAULT_SCANNER_WALKERS_PER_DISK, DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS, ENV_SCANNER_ALERT_EXCESS_FOLDERS,
+    ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE, ENV_SCANNER_ALERT_EXCESS_VERSIONS, ENV_SCANNER_BITROT_CYCLE_SECS,
+    ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, ENV_SCANNER_CYCLE, ENV_SCANNER_CYCLE_MAX_DIRECTORIES,
+    ENV_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_DELAY,
     ENV_SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC, ENV_SCANNER_DISK_IO_BUDGET_IOPS, ENV_SCANNER_IDLE_MODE,
-    ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, ENV_SCANNER_MAX_WAIT_SECS, ENV_SCANNER_SPEED,
-    ENV_SCANNER_START_DELAY_SECS, ENV_SCANNER_WALKERS_PER_DISK, ENV_SCANNER_YIELD_EVERY_N_OBJECTS, HEAL_BITROT_CYCLE,
-    HEAL_SUB_SYS, MAX_SCANNER_WALKERS_PER_DISK, SCANNER_ALERT_EXCESS_FOLDERS, SCANNER_ALERT_EXCESS_VERSION_SIZE,
-    SCANNER_ALERT_EXCESS_VERSIONS, SCANNER_BITROT_CYCLE, SCANNER_CACHE_SAVE_TIMEOUT, SCANNER_CYCLE,
-    SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY,
-    SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC, SCANNER_DISK_IO_BUDGET_IOPS, SCANNER_IDLE_MODE, SCANNER_MAX_CONCURRENT_DISK_SCANS,
-    SCANNER_MAX_CONCURRENT_SET_SCANS, SCANNER_MAX_WAIT, SCANNER_SPEED, SCANNER_START_DELAY, SCANNER_SUB_SYS,
-    SCANNER_WALKERS_PER_DISK, SCANNER_YIELD_EVERY_N_OBJECTS, ScannerSpeed,
+    ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, ENV_SCANNER_MAX_WAIT_SECS,
+    ENV_SCANNER_RECOVERY_BACKOFF_CAP_SECS, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS, ENV_SCANNER_WALKERS_PER_DISK,
+    ENV_SCANNER_YIELD_EVERY_N_OBJECTS, HEAL_BITROT_CYCLE, HEAL_SUB_SYS, MAX_SCANNER_WALKERS_PER_DISK,
+    SCANNER_ALERT_EXCESS_FOLDERS, SCANNER_ALERT_EXCESS_VERSION_SIZE, SCANNER_ALERT_EXCESS_VERSIONS, SCANNER_BITROT_CYCLE,
+    SCANNER_CACHE_SAVE_TIMEOUT, SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION,
+    SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY, SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC, SCANNER_DISK_IO_BUDGET_IOPS,
+    SCANNER_IDLE_MODE, SCANNER_MAX_CONCURRENT_DISK_SCANS, SCANNER_MAX_CONCURRENT_SET_SCANS, SCANNER_MAX_WAIT,
+    SCANNER_RECOVERY_BACKOFF_CAP, SCANNER_SPEED, SCANNER_START_DELAY, SCANNER_SUB_SYS, SCANNER_WALKERS_PER_DISK,
+    SCANNER_YIELD_EVERY_N_OBJECTS, ScannerSpeed,
     server_config::{Config as ServerConfig, KVS},
 };
 use serde::Serialize;
@@ -96,6 +98,8 @@ pub(crate) struct ScannerRuntimeConfig {
     pub(crate) cycle_max_directories_source: ScannerRuntimeConfigSource,
     pub(crate) cache_save_timeout: Duration,
     pub(crate) cache_save_timeout_source: ScannerRuntimeConfigSource,
+    pub(crate) recovery_backoff_cap: Duration,
+    pub(crate) recovery_backoff_cap_source: ScannerRuntimeConfigSource,
     pub(crate) max_concurrent_set_scans: usize,
     pub(crate) max_concurrent_set_scans_source: ScannerRuntimeConfigSource,
     pub(crate) max_concurrent_disk_scans: usize,
@@ -144,6 +148,8 @@ impl Default for ScannerRuntimeConfig {
             cycle_max_directories_source: ScannerRuntimeConfigSource::Default,
             cache_save_timeout: Duration::from_secs(DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS),
             cache_save_timeout_source: ScannerRuntimeConfigSource::Default,
+            recovery_backoff_cap: Duration::from_secs(DEFAULT_SCANNER_RECOVERY_BACKOFF_CAP_SECS),
+            recovery_backoff_cap_source: ScannerRuntimeConfigSource::Default,
             max_concurrent_set_scans: DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS,
             max_concurrent_set_scans_source: ScannerRuntimeConfigSource::Default,
             max_concurrent_disk_scans: DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS,
@@ -195,6 +201,7 @@ pub struct ScannerRuntimeConfigStatus {
     pub cycle_max_objects: ScannerRuntimeConfigValue<Option<u64>>,
     pub cycle_max_directories: ScannerRuntimeConfigValue<Option<u64>>,
     pub cache_save_timeout_seconds: ScannerRuntimeConfigValue<u64>,
+    pub recovery_backoff_cap_seconds: ScannerRuntimeConfigValue<u64>,
     pub max_concurrent_set_scans: ScannerRuntimeConfigValue<usize>,
     pub max_concurrent_disk_scans: ScannerRuntimeConfigValue<usize>,
     pub walkers_per_disk: ScannerRuntimeConfigValue<usize>,
@@ -428,6 +435,9 @@ fn validate_persisted_scanner_runtime_config(config: &ServerConfig) -> Result<()
         parse_config_bitrot_cycle(SCANNER_BITROT_CYCLE, value)?;
     }
     validate_optional_config_u64(scanner_kvs, SCANNER_CACHE_SAVE_TIMEOUT, DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS)?;
+    if let Some(value) = config_value(scanner_kvs, SCANNER_RECOVERY_BACKOFF_CAP, DEFAULT_SCANNER_RECOVERY_BACKOFF_CAP_SECS) {
+        recovery_backoff_cap_from_secs(SCANNER_RECOVERY_BACKOFF_CAP, parse_config_u64(SCANNER_RECOVERY_BACKOFF_CAP, value)?)?;
+    }
     validate_optional_config_usize(scanner_kvs, SCANNER_MAX_CONCURRENT_SET_SCANS, DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS)?;
     validate_optional_config_usize(scanner_kvs, SCANNER_MAX_CONCURRENT_DISK_SCANS, DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS)?;
     if let Some(value) = config_value(scanner_kvs, SCANNER_WALKERS_PER_DISK, DEFAULT_SCANNER_WALKERS_PER_DISK) {
@@ -529,6 +539,47 @@ fn cycle_duration_from_secs(key: &'static str, secs: u64) -> Result<Option<Durat
         return Err(invalid_value(key, "<overflow>", "duration exceeds the timer range"));
     }
     Ok(Some(duration))
+}
+
+fn recovery_backoff_cap_from_secs(key: &'static str, secs: u64) -> Result<Duration, ScannerRuntimeConfigError> {
+    if secs == 0 {
+        return Err(invalid_value(key, "0", "expected positive integer seconds"));
+    }
+    let duration = Duration::from_secs(secs);
+    if std::time::Instant::now().checked_add(duration).is_none() {
+        return Err(invalid_value(key, "<overflow>", "duration exceeds the timer range"));
+    }
+    Ok(duration)
+}
+
+fn lookup_recovery_backoff_cap(kvs: Option<&KVS>) -> Result<(Duration, ScannerRuntimeConfigSource), ScannerRuntimeConfigError> {
+    // Validate durable input even when an environment override takes precedence.
+    let persisted = config_value(kvs, SCANNER_RECOVERY_BACKOFF_CAP, DEFAULT_SCANNER_RECOVERY_BACKOFF_CAP_SECS)
+        .map(|value| {
+            recovery_backoff_cap_from_secs(SCANNER_RECOVERY_BACKOFF_CAP, parse_config_u64(SCANNER_RECOVERY_BACKOFF_CAP, value)?)
+        })
+        .transpose()?;
+    match rustfs_utils::get_env_parse_outcome::<u64>(ENV_SCANNER_RECOVERY_BACKOFF_CAP_SECS) {
+        rustfs_utils::EnvParseOutcome::Parsed(secs) => {
+            return recovery_backoff_cap_from_secs(ENV_SCANNER_RECOVERY_BACKOFF_CAP_SECS, secs)
+                .map(|duration| (duration, ScannerRuntimeConfigSource::Env));
+        }
+        rustfs_utils::EnvParseOutcome::Invalid => {
+            return Err(invalid_value(
+                ENV_SCANNER_RECOVERY_BACKOFF_CAP_SECS,
+                "<invalid>",
+                "expected positive integer seconds",
+            ));
+        }
+        rustfs_utils::EnvParseOutcome::Absent => {}
+    }
+    if let Some(duration) = persisted {
+        return Ok((duration, ScannerRuntimeConfigSource::Config));
+    }
+    Ok((
+        Duration::from_secs(DEFAULT_SCANNER_RECOVERY_BACKOFF_CAP_SECS),
+        ScannerRuntimeConfigSource::Default,
+    ))
 }
 
 fn walkers_per_disk_from_count(key: &'static str, count: usize) -> Result<usize, ScannerRuntimeConfigError> {
@@ -707,6 +758,7 @@ pub(crate) fn lookup_scanner_runtime_config(
         ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS,
         DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS,
     )?;
+    let (recovery_backoff_cap, recovery_backoff_cap_source) = lookup_recovery_backoff_cap(scanner_kvs)?;
     let (max_concurrent_set_scans, max_concurrent_set_scans_source) = lookup_usize(
         scanner_kvs,
         SCANNER_MAX_CONCURRENT_SET_SCANS,
@@ -773,6 +825,8 @@ pub(crate) fn lookup_scanner_runtime_config(
         cycle_max_directories_source,
         cache_save_timeout: Duration::from_secs(cache_save_timeout.max(1)),
         cache_save_timeout_source,
+        recovery_backoff_cap,
+        recovery_backoff_cap_source,
         max_concurrent_set_scans,
         max_concurrent_set_scans_source,
         max_concurrent_disk_scans,
@@ -916,6 +970,10 @@ pub fn scanner_runtime_config_status() -> ScannerRuntimeConfigStatus {
             value: config.cache_save_timeout.as_secs(),
             source: config.cache_save_timeout_source,
         },
+        recovery_backoff_cap_seconds: ScannerRuntimeConfigValue {
+            value: config.recovery_backoff_cap.as_secs(),
+            source: config.recovery_backoff_cap_source,
+        },
         max_concurrent_set_scans: ScannerRuntimeConfigValue {
             value: config.max_concurrent_set_scans,
             source: config.max_concurrent_set_scans_source,
@@ -975,6 +1033,10 @@ pub(crate) fn scanner_cache_save_timeout() -> Duration {
     current_scanner_runtime_config().cache_save_timeout
 }
 
+pub(crate) fn scanner_recovery_backoff_cap() -> Duration {
+    current_scanner_runtime_config().recovery_backoff_cap
+}
+
 pub(crate) fn scanner_max_concurrent_set_scans_configured() -> usize {
     current_scanner_runtime_config().max_concurrent_set_scans
 }
@@ -1006,12 +1068,14 @@ mod tests {
     use crate::sleeper::ScannerIoBudgetLimit;
     use rustfs_config::server_config::{Config as ServerConfig, KVS};
     use rustfs_config::{
-        DEFAULT_DELIMITER, DEFAULT_HEAL_BITROT_CYCLE_SECS, ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS,
-        ENV_SCANNER_CYCLE, ENV_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_DELAY,
-        ENV_SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC, ENV_SCANNER_DISK_IO_BUDGET_IOPS, ENV_SCANNER_MAX_WAIT_SECS, ENV_SCANNER_SPEED,
-        ENV_SCANNER_WALKERS_PER_DISK, HEAL_BITROT_CYCLE, HEAL_SUB_SYS, SCANNER_BITROT_CYCLE, SCANNER_CACHE_SAVE_TIMEOUT,
-        SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES, SCANNER_CYCLE_MAX_DURATION, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY,
-        SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC, SCANNER_DISK_IO_BUDGET_IOPS, SCANNER_IDLE_MODE, SCANNER_SPEED, SCANNER_SUB_SYS,
+        DEFAULT_DELIMITER, DEFAULT_HEAL_BITROT_CYCLE_SECS, DEFAULT_SCANNER_RECOVERY_BACKOFF_CAP_SECS,
+        ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, ENV_SCANNER_CYCLE,
+        ENV_SCANNER_CYCLE_MAX_DURATION_SECS, ENV_SCANNER_CYCLE_MAX_OBJECTS, ENV_SCANNER_DELAY,
+        ENV_SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC, ENV_SCANNER_DISK_IO_BUDGET_IOPS, ENV_SCANNER_MAX_WAIT_SECS,
+        ENV_SCANNER_RECOVERY_BACKOFF_CAP_SECS, ENV_SCANNER_SPEED, ENV_SCANNER_WALKERS_PER_DISK, HEAL_BITROT_CYCLE, HEAL_SUB_SYS,
+        SCANNER_BITROT_CYCLE, SCANNER_CACHE_SAVE_TIMEOUT, SCANNER_CYCLE, SCANNER_CYCLE_MAX_DIRECTORIES,
+        SCANNER_CYCLE_MAX_DURATION, SCANNER_CYCLE_MAX_OBJECTS, SCANNER_DELAY, SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC,
+        SCANNER_DISK_IO_BUDGET_IOPS, SCANNER_IDLE_MODE, SCANNER_RECOVERY_BACKOFF_CAP, SCANNER_SPEED, SCANNER_SUB_SYS,
         SCANNER_WALKERS_PER_DISK, ScannerSpeed,
     };
     use serial_test::serial;
@@ -1122,6 +1186,89 @@ mod tests {
         });
         let config = server_config_with_scanner(&[(SCANNER_CYCLE_MAX_DURATION, "not-a-duration")]);
         assert!(lookup_scanner_runtime_config(Some(&config)).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn recovery_backoff_cap_defaults_and_persisted_values() {
+        with_var_unset(ENV_SCANNER_RECOVERY_BACKOFF_CAP_SECS, || {
+            let default = lookup_scanner_runtime_config(None).expect("default scanner runtime config");
+            assert_eq!(default.recovery_backoff_cap, Duration::from_secs(600));
+            assert_eq!(default.recovery_backoff_cap_source, ScannerRuntimeConfigSource::Default);
+            assert_eq!(super::ScannerRuntimeConfig::default().recovery_backoff_cap, default.recovery_backoff_cap);
+
+            for (value, secs, source) in [
+                ("1", 1, ScannerRuntimeConfigSource::Config),
+                (" 17 ", 17, ScannerRuntimeConfigSource::Config),
+                ("1200", 1200, ScannerRuntimeConfigSource::Config),
+                ("600", DEFAULT_SCANNER_RECOVERY_BACKOFF_CAP_SECS, ScannerRuntimeConfigSource::Default),
+            ] {
+                let config = server_config_with_scanner(&[(SCANNER_RECOVERY_BACKOFF_CAP, value)]);
+                validate_scanner_runtime_config(&config).expect("valid persisted cap");
+                let resolved = lookup_scanner_runtime_config(Some(&config)).expect("persisted scanner runtime config");
+                assert_eq!(resolved.recovery_backoff_cap, Duration::from_secs(secs), "persisted {value}");
+                assert_eq!(resolved.recovery_backoff_cap_source, source, "persisted {value}");
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn recovery_backoff_cap_env_precedes_config_and_reports_source() {
+        let config = server_config_with_scanner(&[(SCANNER_RECOVERY_BACKOFF_CAP, "1200")]);
+        with_var(ENV_SCANNER_RECOVERY_BACKOFF_CAP_SECS, Some("17"), || {
+            super::apply_scanner_runtime_config(&config).expect("valid env override");
+            assert_eq!(super::scanner_recovery_backoff_cap(), Duration::from_secs(17));
+            let status = super::scanner_runtime_config_status();
+            assert_eq!(status.recovery_backoff_cap_seconds.value, 17);
+            assert_eq!(status.recovery_backoff_cap_seconds.source, ScannerRuntimeConfigSource::Env);
+        });
+        super::refresh_scanner_runtime_config_for_tests();
+    }
+
+    #[test]
+    #[serial]
+    fn recovery_backoff_cap_invalid_environment_is_rejected() {
+        let config = server_config_with_scanner(&[(SCANNER_RECOVERY_BACKOFF_CAP, "17")]);
+        for value in ["0", "-1", "1.5", "not-a-cap", "18446744073709551616", "18446744073709551615"] {
+            with_var(ENV_SCANNER_RECOVERY_BACKOFF_CAP_SECS, Some(value), || {
+                let err = lookup_scanner_runtime_config(Some(&config)).expect_err("invalid env must not fall back to config");
+                assert!(matches!(
+                    err,
+                    super::ScannerRuntimeConfigError::InvalidValue { key, .. } if key == ENV_SCANNER_RECOVERY_BACKOFF_CAP_SECS
+                ));
+            });
+        }
+        with_var(ENV_SCANNER_RECOVERY_BACKOFF_CAP_SECS, Some("sensitive-invalid-value"), || {
+            let err = lookup_scanner_runtime_config(None).expect_err("invalid env cap");
+            assert!(err.to_string().contains("<invalid>"));
+            assert!(!err.to_string().contains("sensitive-invalid-value"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn recovery_backoff_cap_invalid_persisted_value_cannot_be_hidden_by_environment() {
+        with_var(ENV_SCANNER_RECOVERY_BACKOFF_CAP_SECS, Some("17"), || {
+            let before = super::current_scanner_runtime_config();
+            let generation = super::scanner_runtime_config_generation();
+            for value in ["0", "-1", "1.5", "not-a-cap", "18446744073709551616", "18446744073709551615"] {
+                let config = server_config_with_scanner(&[(SCANNER_RECOVERY_BACKOFF_CAP, value)]);
+                let err = validate_scanner_runtime_config(&config).expect_err("invalid persisted cap must be validated");
+                assert!(matches!(
+                    err,
+                    super::ScannerRuntimeConfigError::InvalidValue { key, .. } if key == SCANNER_RECOVERY_BACKOFF_CAP
+                ));
+                assert!(lookup_scanner_runtime_config(Some(&config)).is_err(), "persisted {value}");
+                assert!(super::apply_scanner_runtime_config(&config).is_err(), "persisted {value}");
+                assert_eq!(
+                    super::current_scanner_runtime_config(),
+                    before,
+                    "a rejected update must not change runtime state"
+                );
+                assert_eq!(super::scanner_runtime_config_generation(), generation);
+            }
+        });
     }
 
     #[test]

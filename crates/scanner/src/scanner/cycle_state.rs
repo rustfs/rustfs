@@ -26,10 +26,6 @@ use tokio::io::AsyncReadExt as _;
 const SCANNER_CYCLE_RECOVERY_SCHEMA_VERSION: u16 = 1;
 const MAX_SCANNER_CYCLE_STATE_BYTES: u64 = 1024 * 1024;
 pub(super) const MAX_SCANNER_CYCLE_RECOVERY_RETRIES: u32 = 5;
-/// Longest automatic wait between two leader iterations while a retryable
-/// recovery observation persists. It replaces the former terminal pause: a
-/// fault that outlives the short retry budget keeps retrying at this cadence.
-pub(super) const SCANNER_CYCLE_RECOVERY_BACKOFF_CAP: Duration = Duration::from_secs(10 * 60);
 const SCANNER_CYCLE_RECOVERY_BACKOFF_BASE: Duration = Duration::from_secs(5);
 /// A retryable observation older than this restarts its retry budget so the
 /// visible count and the backoff schedule do not grow without bound.
@@ -507,12 +503,13 @@ pub(super) struct ScannerCycleRecoveryRetry {
 
 /// Bounded exponential backoff for retryable recovery observations: it starts
 /// at the transient retry base (or the configured cycle interval when that is
-/// shorter) and never exceeds [`SCANNER_CYCLE_RECOVERY_BACKOFF_CAP`].
+/// shorter) and never exceeds the current recovery backoff cap.
 pub(super) fn scanner_cycle_recovery_backoff_delay(attempt: u32, cycle_interval: Duration) -> Duration {
     let exponent = attempt.saturating_sub(1).min(31);
     let multiplier = 1u32.checked_shl(exponent).unwrap_or(u32::MAX);
     let base = cycle_interval.clamp(Duration::from_secs(1), SCANNER_CYCLE_RECOVERY_BACKOFF_BASE);
-    base.saturating_mul(multiplier).min(SCANNER_CYCLE_RECOVERY_BACKOFF_CAP)
+    base.saturating_mul(multiplier)
+        .min(crate::runtime_config::scanner_recovery_backoff_cap())
 }
 
 fn reason_with_next_attempt(reason: Option<String>, next_attempt_at_unix_secs: u64, delay: Duration) -> String {
