@@ -503,12 +503,19 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let key = input.key.as_str().to_owned();
         let uri = build_object_uri(&bucket, &key, &[])?;
 
+        let content_length = input.content_length;
         let mut headers = HeaderMap::default();
-        if let Ok(header_value) = input.content_length.to_string().parse() {
+        if content_length >= 0
+            && let Ok(header_value) = content_length.to_string().parse()
+        {
             headers.insert("content-length", header_value);
         }
 
-        let input = gateway_s3s_compat::put_object::input_to_s3s(input).map_err(|e| conversion_error("PutObject input", e))?;
+        let mut input =
+            gateway_s3s_compat::put_object::input_to_s3s(input).map_err(|e| conversion_error("PutObject input", e))?;
+        if content_length < 0 {
+            input.content_length = None;
+        }
 
         let req = Self::create_request(
             input,

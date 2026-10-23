@@ -54,6 +54,12 @@ const EVENT_WEBDAV_OBJECT_DELETE_STATE: &str = "webdav_object_delete_state";
 const EVENT_WEBDAV_RENAME_STATE: &str = "webdav_rename_state";
 const EVENT_WEBDAV_QUOTA_VIEW_FAILED: &str = "webdav_quota_view_failed";
 
+fn copy_content_length(content_length: Option<i64>, remaining_length: Option<u64>) -> i64 {
+    content_length
+        .or_else(|| remaining_length.and_then(|length| i64::try_from(length).ok()))
+        .unwrap_or(-1)
+}
+
 /// Convert a gateway ETag to string
 fn etag_to_string(etag: &ETag) -> String {
     etag.opaque_tag().to_owned()
@@ -592,7 +598,10 @@ where
             FsError::GeneralFailure
         })?;
 
-        let content_length = content_length.unwrap_or_else(|| body.remaining_length().get().map_or(0, |len| len as i64));
+        // PutObject's gateway DTO requires an i64, so use -1 as the unknown
+        // length sentinel. The storage adapter turns it back into an absent
+        // Content-Length instead of advertising a zero-byte body.
+        let content_length = copy_content_length(content_length, body.remaining_length().get());
         let mut put_builder = PutObjectInput::builder()
             .bucket(BucketName::new(dst_bucket.to_string()).map_err(|_| FsError::GeneralFailure)?)
             .key(ObjectKey::new(dst_key.to_string()).map_err(|_| FsError::GeneralFailure)?)
@@ -1676,7 +1685,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{WebDavDriver, aggregate_session_capacity};
+    use super::{WebDavDriver, aggregate_session_capacity, copy_content_length};
     use crate::common::client::s3::{BucketCapacity, SessionCapacityView, StorageBackend as S3StorageBackend};
     use crate::common::dummy_storage::DummyBackend;
     use crate::common::gateway::{S3Action, with_test_auth_override, with_test_iam_unavailable};
@@ -1696,6 +1705,13 @@ mod tests {
     use std::fmt::{Debug, Formatter};
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn copy_content_length_preserves_unknown_length() {
+        assert_eq!(copy_content_length(None, None), -1);
+        assert_eq!(copy_content_length(None, Some(12)), 12);
+        assert_eq!(copy_content_length(Some(8), Some(12)), 8);
+    }
 
     #[tokio::test]
     async fn listing_authorizes_normalized_prefix_and_delimiter() {

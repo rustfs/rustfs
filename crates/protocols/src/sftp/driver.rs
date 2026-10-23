@@ -27,7 +27,7 @@ use super::attrs;
 use super::constants::limits::S3_COPY_OBJECT_MAX_SIZE;
 use super::errors::{SftpError, auth_err, auth_err_unreachable, is_no_such_upload_error, ok_status, s3_error_to_sftp};
 use super::lifecycle::SessionDiag;
-use super::paths::{parse_s3_path, sanitise_control_bytes};
+use super::paths::{format_copy_source, parse_s3_path, sanitise_control_bytes};
 use super::state::{HandleState, WritePhase};
 use super::write::{build_write_tombstone, fstat_reported_size, rejects_excl_or_trunc_without_create, should_abort_on_drop};
 use crate::common::client::s3::StorageBackend;
@@ -919,7 +919,7 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
         if content_length <= S3_COPY_OBJECT_MAX_SIZE {
             self.authorize(&S3Action::CopyObject, &dst_bucket, Some(&dst_object)).await?;
             let input = CopyObjectInput::builder()
-                .copy_source(format!("/{src_bucket}/{src_object}"))
+                .copy_source(format_copy_source(&src_bucket, &src_object))
                 .bucket(BucketName::new(dst_bucket.clone()).map_err(|e| s3_error_to_sftp("build_copy_object", e))?)
                 .key(ObjectKey::new(dst_object.clone()).map_err(|e| s3_error_to_sftp("build_copy_object", e))?)
                 .build();

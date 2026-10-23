@@ -25,7 +25,7 @@ use super::constants::limits::{
 };
 use super::driver::SftpDriver;
 use super::errors::{SftpError, is_not_found_error, s3_error_to_sftp};
-use super::paths::{parse_s3_path, sanitise_control_bytes};
+use super::paths::{format_copy_source, parse_s3_path, sanitise_control_bytes};
 use super::state::{CompletedPart, HandleState, MultipartUpload, WritePhase};
 use crate::common::client::s3::StorageBackend;
 use crate::common::gateway::S3Action;
@@ -1056,7 +1056,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                     .key(object_key(dst_key, "build_upload_part_copy")?)
                     .upload_id(upload_claim(&mp.upload_id))
                     .part_number(part_number)
-                    .copy_source(format!("/{src_bucket}/{src_key}"))
+                    .copy_source(format_copy_source(src_bucket, src_key))
                     .copy_source_range(range)
                     .build();
 
