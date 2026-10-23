@@ -112,6 +112,45 @@ pub(crate) fn log_legacy_ambiguity(
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Arc, Mutex};
+    use tracing::{Level, Subscriber};
+
+    #[derive(Clone, Default)]
+    pub(crate) struct FailureLogCapture(Arc<Mutex<Vec<(Level, &'static str)>>>);
+
+    impl FailureLogCapture {
+        pub(crate) fn count(&self, level: Level, target: Option<&str>) -> usize {
+            self.0
+                .lock()
+                .expect("captured failure logs")
+                .iter()
+                .filter(|(seen_level, seen_target)| *seen_level == level && target.is_none_or(|target| target == *seen_target))
+                .count()
+        }
+    }
+
+    impl Subscriber for FailureLogCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            self.0
+                .lock()
+                .expect("capture event")
+                .push((*event.metadata().level(), event.metadata().target()));
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -13,36 +13,15 @@
 // limitations under the License.
 
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use tracing::{Subscriber, instrument::WithSubscriber};
-
-#[derive(Clone, Default)]
-struct ErrorCapture(Arc<AtomicUsize>);
-
-impl Subscriber for ErrorCapture {
-    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-        true
-    }
-    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-    fn event(&self, event: &tracing::Event<'_>) {
-        if *event.metadata().level() == tracing::Level::ERROR {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-    fn enter(&self, _span: &tracing::span::Id) {}
-    fn exit(&self, _span: &tracing::span::Id) {}
-}
+use crate::heal::failure_logging::test_support::FailureLogCapture;
+use tracing::instrument::WithSubscriber;
 
 #[tokio::test]
 async fn legacy_ambiguity_execution_logs_once_but_each_new_task_remains_failed() {
     for kind in ["object", "metadata", "ec_decode"] {
         for outer in [false, true] {
             let object = format!("legacy-ambiguity-{kind}-{outer}-{}", Uuid::new_v4());
-            let capture = ErrorCapture::default();
+            let capture = FailureLogCapture::default();
             let storage = Arc::new(MockStorage::default());
             let mut scheduler_would_repeat = false;
             for _ in 0..3 {
@@ -80,7 +59,7 @@ async fn legacy_ambiguity_execution_logs_once_but_each_new_task_remains_failed()
                 assert_eq!(task.get_outcome().await.counters.failed, 1);
             }
             assert_eq!(
-                capture.0.load(Ordering::SeqCst),
+                capture.count(tracing::Level::ERROR, None),
                 1,
                 "only the first failure is ERROR for {kind}, outer={outer}"
             );

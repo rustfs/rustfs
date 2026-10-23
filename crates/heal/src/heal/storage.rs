@@ -758,6 +758,53 @@ impl ECStoreHealStorage {
         Self { ecstore }
     }
 
+    fn adapt_object_heal_result(
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        opts: &HealOpts,
+        backend_result: std::result::Result<(HealResultItem, Option<StorageError>), StorageError>,
+    ) -> Result<(HealResultItem, Option<Error>)> {
+        match backend_result {
+            Ok((result, ecstore_error)) => {
+                let error = ecstore_error.map(Error::Storage);
+                debug!(
+                    target: "rustfs::heal::storage",
+                    event = EVENT_HEAL_STORAGE_REPAIR_OP,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_STORAGE,
+                    result = "ok",
+                    operation = "heal_object",
+                    bucket,
+                    object,
+                    version_id = ?version_id,
+                    drives_after = result.after.drives.len(),
+                    has_error = error.is_some(),
+                    "Heal storage object repair completed"
+                );
+                Ok((result, error))
+            }
+            Err(e) => {
+                crate::heal::task::demote_to_debug_when!(
+                    matches!(&e, StorageError::DeleteRecoveryLegacyAmbiguous)
+                        && !crate::heal::failure_logging::log_legacy_ambiguity(bucket, object, version_id, opts.pool, opts.set),
+                    error, target: "rustfs::heal::storage", {
+                    event = EVENT_HEAL_STORAGE_REPAIR_OP,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_STORAGE,
+                    result = "failed",
+                    operation = "heal_object",
+                    bucket,
+                    object,
+                    version_id = ?version_id,
+                    error = %e,
+                    "Heal storage repair failed"
+                });
+                Err(Error::Storage(e))
+            }
+        }
+    }
+
     async fn resume_disk_inventory(&self, set_disk_id: &str) -> Result<Vec<DiskStore>> {
         let (pool_idx, set_idx) = crate::heal::utils::parse_set_disk_id(set_disk_id)?;
         let disks = StorageAdminApi::disk_set_inventory(self.ecstore.as_ref(), DiskSetSelector::new(pool_idx, set_idx))
@@ -1461,44 +1508,13 @@ impl HealStorageAPI for ECStoreHealStorage {
 
         let version_id_str = version_id.unwrap_or("");
 
-        match self.ecstore.heal_object(bucket, object, version_id_str, opts).await {
-            Ok((result, ecstore_error)) => {
-                let error = ecstore_error.map(Error::Storage);
-                debug!(
-                    target: "rustfs::heal::storage",
-                    event = EVENT_HEAL_STORAGE_REPAIR_OP,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_STORAGE,
-                    operation = "heal_object",
-                    bucket,
-                    object,
-                    version_id = ?version_id,
-                    drives_after = result.after.drives.len(),
-                    has_error = error.is_some(),
-                    result = "ok",
-                    "Heal storage object repair completed"
-                );
-                Ok((result, error))
-            }
-            Err(e) => {
-                crate::heal::task::demote_to_debug_when!(
-                    matches!(&e, StorageError::DeleteRecoveryLegacyAmbiguous)
-                        && !crate::heal::failure_logging::log_legacy_ambiguity(bucket, object, version_id, opts.pool, opts.set),
-                    error, target: "rustfs::heal::storage", {
-                    event = EVENT_HEAL_STORAGE_REPAIR_OP,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_STORAGE,
-                    result = "failed",
-                    operation = "heal_object",
-                    bucket,
-                    object,
-                    version_id = ?version_id,
-                    error = %e,
-                    "Heal storage repair failed"
-                });
-                Err(Error::Storage(e))
-            }
-        }
+        Self::adapt_object_heal_result(
+            bucket,
+            object,
+            version_id,
+            opts,
+            self.ecstore.heal_object(bucket, object, version_id_str, opts).await,
+        )
     }
 
     async fn heal_object_with_receipt(
@@ -2123,6 +2139,56 @@ mod tests {
         next_heal_listing_token, replacement_resume_conflict_for_other_tasks,
     };
     use std::collections::HashSet;
+
+    #[test]
+    fn legacy_ambiguity_storage_adapter_suppresses_repeated_errors_without_erasing_them() {
+        use super::{ECStoreHealStorage, Error, HealOpts};
+        use crate::heal::failure_logging::test_support::FailureLogCapture;
+        let capture = FailureLogCapture::default();
+        let _subscriber = tracing::subscriber::set_default(capture.clone());
+        let object = format!("adapter-ambiguity-{}", uuid::Uuid::new_v4());
+        let opts = HealOpts {
+            pool: Some(0),
+            set: Some(1),
+            ..Default::default()
+        };
+        for version in [None, Some(""), None] {
+            let error = ECStoreHealStorage::adapt_object_heal_result(
+                "bucket",
+                &object,
+                version,
+                &opts,
+                Err(StorageError::DeleteRecoveryLegacyAmbiguous),
+            )
+            .expect_err("the actual storage result adapter must preserve every failure");
+            assert!(matches!(error, Error::Storage(StorageError::DeleteRecoveryLegacyAmbiguous)));
+        }
+        assert_eq!(capture.count(tracing::Level::ERROR, Some("rustfs::heal::storage")), 1);
+        assert_eq!(capture.count(tracing::Level::DEBUG, Some("rustfs::heal::storage")), 2);
+        for _ in 0..2 {
+            let error = ECStoreHealStorage::adapt_object_heal_result("bucket", &object, None, &opts, Err(StorageError::SlowDown))
+                .expect_err("other typed failures remain unchanged");
+            assert!(matches!(error, Error::Storage(StorageError::SlowDown)));
+        }
+        assert_eq!(capture.count(tracing::Level::ERROR, Some("rustfs::heal::storage")), 3);
+        let (item, error) = ECStoreHealStorage::adapt_object_heal_result(
+            "bucket",
+            &object,
+            None,
+            &opts,
+            Ok((
+                super::HealResultItem {
+                    object_size: 42,
+                    ..Default::default()
+                },
+                Some(StorageError::SlowDown),
+            )),
+        )
+        .expect("successful backend results keep their item and optional error");
+        assert_eq!(item.object_size, 42);
+        assert!(matches!(error, Some(Error::Storage(StorageError::SlowDown))));
+        assert_eq!(capture.count(tracing::Level::ERROR, Some("rustfs::heal::storage")), 3);
+    }
 
     #[test]
     fn object_receipt_requires_integrity_and_resolved_version_evidence() {

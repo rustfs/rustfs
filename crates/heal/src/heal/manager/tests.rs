@@ -31,6 +31,7 @@ mod root_recovery;
 use uuid::Uuid;
 mod auto_scan;
 mod disposition;
+mod legacy_ambiguity_logging;
 mod running_mainline;
 
 use super::super::{DiskOption, DiskStore, Endpoint, new_disk, storage_api::status::BucketInfo};
@@ -633,7 +634,9 @@ impl HealStorageAPI for MockStorage {
             hook.execute.notified().await;
             return Ok(true);
         }
-        Ok(bucket == "retry-transition" || bucket.starts_with("legacy-held-"))
+        Ok(bucket == "retry-transition"
+            || bucket.starts_with("legacy-held-")
+            || bucket.starts_with("legacy-ambiguity-scheduler-"))
     }
 
     async fn heal_object(
@@ -647,6 +650,9 @@ impl HealStorageAPI for MockStorage {
             let hook = COMPLETED_RETENTION_HOOKS.lock().await[bucket].clone();
             hook.started.notify_one();
             std::future::pending::<()>().await;
+        }
+        if bucket.starts_with("legacy-ambiguity-scheduler-") {
+            return Err(Error::Storage(EcstoreError::DeleteRecoveryLegacyAmbiguous));
         }
         if bucket == "completed-retention-failed" {
             return Err(Error::TaskExecutionFailed {
