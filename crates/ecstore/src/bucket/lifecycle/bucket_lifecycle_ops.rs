@@ -5371,13 +5371,8 @@ pub async fn put_restore_opts(
     for (k, v) in oi.user_defined.iter() {
         meta.insert(k.to_string(), v.clone());
     }
-    // Publish the copy-back as local data to older peers too: their commit
-    // path treats a completed transition as remote even while restore is ongoing.
-    rustfs_utils::http::metadata_compat::insert_str(
-        &mut meta,
-        rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_STATUS,
-        lifecycle::TRANSITION_PENDING.to_string(),
-    );
+    // The fleet capability gate guarantees physical copy-back support. Keep
+    // the completed transition identity for orphan recovery and remote cleanup.
     rustfs_utils::http::metadata_compat::remove_str(&mut meta, rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID);
     if !oi.user_tags.is_empty() {
         meta.insert(AMZ_OBJECT_TAGGING.to_string(), (*oi.user_tags).clone());

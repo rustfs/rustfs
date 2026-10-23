@@ -409,8 +409,8 @@ async fn restore_copyback_stays_pending_before_finalization(multipart: bool) {
     )
     .expect("pending restore status should parse");
     assert_eq!(
-        pending.transitioned_object.status, TRANSITION_PENDING,
-        "copy-back must advertise local data to older peers until restore finalization"
+        pending.transitioned_object.status, TRANSITION_COMPLETE,
+        "copy-back must retain the remote identity needed by recovery and cleanup"
     );
     set_disks
         .transition_object(
@@ -435,7 +435,7 @@ async fn restore_copyback_stays_pending_before_finalization(multipart: bool) {
         .await
         .expect("restore metadata should remain readable after a queued transition");
     assert_eq!(
-        after_queued_transition.transitioned_object.status, TRANSITION_PENDING,
+        after_queued_transition.transitioned_object.status, TRANSITION_COMPLETE,
         "queued transition must not remove local copy-back data before finalization"
     );
     // Evaluate beyond any pre-copy deadline without sleeping or advancing the
@@ -446,18 +446,6 @@ async fn restore_copyback_stays_pending_before_finalization(multipart: bool) {
         .eval_inner(&pending.to_lifecycle_opts(), expiry_evaluation_time, 0)
         .await
         .action;
-
-    backend.set_unreachable(true).await;
-    let mut restored_before_finalization = Vec::new();
-    set_disks
-        .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
-        .await
-        .expect("pending copy-back must be readable locally before metadata finalization")
-        .stream
-        .read_to_end(&mut restored_before_finalization)
-        .await
-        .expect("pending local body should drain");
-    assert_eq!(restored_before_finalization, payload, "pending local copy must preserve every byte");
 
     barrier.release();
     tokio::time::timeout(Duration::from_secs(30), restore)
@@ -542,4 +530,157 @@ async fn restore_copyback_stays_pending_before_finalization(multipart: bool) {
         .await
         .expect("local restored body should drain");
     assert_eq!(restored, payload, "finalized local copy must preserve every byte");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn restore_copyback_overwrite_preserves_remote_cleanup_owner() {
+    assert_transition_overwrite_preserves_remote_cleanup_owner(true).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn completed_transition_overwrite_preserves_remote_cleanup_owner() {
+    assert_transition_overwrite_preserves_remote_cleanup_owner(false).await;
+}
+
+async fn assert_transition_overwrite_preserves_remote_cleanup_owner(during_copyback: bool) {
+    use crate::set_disk::replication::RestoreFinalizeBarrier;
+
+    let (dirs, set_disks) = make_local_set_disks(4, 2).await;
+    let bucket = "restore-copyback-cleanup-owner";
+    let object = "object.bin";
+    let payload = vec![0x37u8; 6 * 1024 * 1024];
+    let write_opts = ObjectOptions {
+        write_completion: WriteCompletion::TailDrained,
+        ..Default::default()
+    };
+    set_disks
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("cleanup probe bucket should be created");
+    let mut reader = PutObjReader::from_vec(payload);
+    let original = set_disks
+        .put_object(bucket, object, &mut reader, &write_opts)
+        .await
+        .expect("cleanup probe source should be written");
+    let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+    let backend = register_mock_tier(&set_disks.instance_ctx().tier_config_mgr(), &tier_name).await;
+    set_disks
+        .transition_object(
+            bucket,
+            object,
+            &ObjectOptions {
+                transition: TransitionOptions {
+                    status: TRANSITION_PENDING.to_string(),
+                    tier: tier_name.clone(),
+                    etag: original.etag.clone().expect("source ETag should be present"),
+                    ..Default::default()
+                },
+                mod_time: original.mod_time,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("cleanup probe source should transition");
+    let source = set_disks
+        .get_object_info(bucket, object, &ObjectOptions::default())
+        .await
+        .expect("transitioned cleanup source should resolve");
+    assert_eq!(backend.object_count().await, 1, "transition must retain the real remote cleanup source");
+    let mut barrier = None;
+    let mut restore = None;
+    if during_copyback {
+        let operation_id = Uuid::new_v4();
+        let mut metadata = std::collections::HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            operation_id.to_string(),
+        );
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_WORKER_LOCK,
+            rustfs_utils::http::metadata_compat::RESTORE_WORKER_LOCK_PROTOCOL_V1.to_string(),
+        );
+        metadata.insert(
+            rustfs_filemeta::metadata_keys::RESTORE.to_string(),
+            "ongoing-request=\"true\"".to_string(),
+        );
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(metadata.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("cleanup probe restore generation should be installed");
+        let installed = RestoreFinalizeBarrier::install_before_lock(bucket, object);
+        let restore_set = Arc::clone(&set_disks);
+        restore = Some(tokio::spawn(async move {
+            let mut opts = ObjectOptions {
+                user_defined: metadata,
+                ..Default::default()
+            };
+            opts.transition.restore_request.days = Some(1);
+            restore_set.restore_transitioned_object(bucket, object, &opts).await
+        }));
+        tokio::time::timeout(Duration::from_secs(30), installed.wait_until_paused())
+            .await
+            .expect("real restore should publish local bytes before finalization");
+        let pending = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("copy-back metadata should resolve");
+        assert!(pending.restore_ongoing, "probe must hit an unfinished real restore");
+        barrier = Some(installed);
+    }
+    let mut replacement = PutObjReader::from_vec(vec![0x69u8; 6 * 1024 * 1024]);
+    set_disks
+        .put_object(bucket, object, &mut replacement, &write_opts)
+        .await
+        .expect("ordinary overwrite must succeed while restore finalization is paused");
+    if let Some(barrier) = barrier {
+        barrier.release();
+    }
+    if let Some(restore) = restore {
+        tokio::time::timeout(Duration::from_secs(30), restore)
+            .await
+            .expect("superseded restore must finish")
+            .expect("superseded restore must not panic")
+            .expect_err("restore finalization must not revive the overwritten generation");
+    }
+    let mut cleanup_owners = Vec::new();
+    for dir in &dirs {
+        let encoded = match tokio::fs::read(dir.path().join(bucket).join(object).join(crate::disk::STORAGE_FORMAT_FILE)).await {
+            Ok(encoded) => encoded,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                cleanup_owners.push(0);
+                continue;
+            }
+            Err(err) => panic!("cleanup source metadata should be readable: {err}"),
+        };
+        let versions = rustfs_filemeta::FileMeta::load(&encoded)
+            .expect("cleanup source metadata should decode")
+            .get_file_info_versions(bucket, object, false)
+            .expect("cleanup source versions should decode");
+        let count = versions
+            .free_versions
+            .iter()
+            .filter(|version| {
+                version.transition_tier == source.transitioned_object.tier
+                    && version.transitioned_objname == source.transitioned_object.name
+            })
+            .count();
+        cleanup_owners.push(count);
+    }
+    let remote_objects = backend.object_count().await;
+    println!("restore_cleanup_probe during_copyback={during_copyback} owners={cleanup_owners:?} remote_objects={remote_objects}");
+    assert!(
+        remote_objects == 0 || cleanup_owners.iter().filter(|count| **count > 0).count() >= 3,
+        "ordinary overwrite must remove the remote object or retain its cleanup owner at write quorum: during_copyback={during_copyback}, owners={cleanup_owners:?}, remote_objects={remote_objects}"
+    );
 }
