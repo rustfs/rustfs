@@ -1366,11 +1366,7 @@ impl DefaultObjectUsecase {
 
         let delete_marker = obj_info.delete_marker;
         let version_id = obj_info.version_id;
-        let response_version_id = delete_marker_response_version_id(
-            version_id,
-            delete_marker && opts.version_suspended && version_id_clone.is_none(),
-            synthetic_version_id,
-        );
+        let response_version_id = delete_response_version_id(version_id, synthetic_version_id);
 
         let output = DeleteObjectOutput {
             delete_marker: Some(delete_marker),
