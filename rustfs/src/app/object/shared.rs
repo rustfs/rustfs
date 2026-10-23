@@ -1784,13 +1784,11 @@ mod tests {
 
     #[test]
     fn s3s_body_error_to_io_preserves_upload_stream_error_source() {
-        let error = s3s_body_error_to_io(Box::new(MockUploadStreamSha256Mismatch));
+        let error = s3s_body_error_to_io(Box::new(UploadStreamError::Sha256Mismatch));
 
         assert!(matches!(
-            error
-                .get_ref()
-                .and_then(|source| source.downcast_ref::<MockUploadStreamSha256Mismatch>()),
-            Some(MockUploadStreamSha256Mismatch)
+            error.get_ref().and_then(|source| source.downcast_ref::<UploadStreamError>()),
+            Some(UploadStreamError::Sha256Mismatch)
         ));
     }
 

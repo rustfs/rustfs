@@ -276,6 +276,33 @@ fn site_endpoint_for(endpoint: &str, secure: bool) -> String {
     }
 }
 
+/// A site-replication peer's bucket target follows the site topology: the
+/// operator never knows the site replicator's credentials, and the endpoint is
+/// rewritten by a site-replication edit. Reject a connection update on such a
+/// target instead of acknowledging it and keeping the stored values, and name
+/// the evidence that made the target peer-owned.
+fn reject_site_replication_peer_connection_update(
+    target: &BucketTarget,
+    matched_peer_deployment_id: Option<&str>,
+) -> S3Result<()> {
+    let stored_deployment_id = target.deployment_id.trim();
+    let evidence = if !stored_deployment_id.is_empty() {
+        format!("it records site-replication peer deployment id {stored_deployment_id}")
+    } else if let Some(deployment_id) = matched_peer_deployment_id {
+        format!("its endpoint {} is site-replication peer {deployment_id}", target.endpoint)
+    } else {
+        return Ok(());
+    };
+    Err(S3Error::with_message(
+        S3ErrorCode::InvalidRequest,
+        format!(
+            "cannot change the connection settings of remote target {}: {evidence}; \
+             update the peer endpoint with a site-replication edit instead",
+            target.arn
+        ),
+    ))
+}
+
 fn map_bucket_target_error(err: BucketTargetError) -> S3Error {
     match err {
         BucketTargetError::BucketRemoteTargetNotFound { .. }
@@ -893,31 +920,30 @@ impl Operation for SetRemoteTargetHandler {
             for op in &update_ops {
                 match op {
                     TargetUpdateOp::Credentials => {
-                        // Mirror MinIO: an operator never knows the site
-                        // replicator's credentials, so overwriting a peer-owned
-                        // target's connection settings would silently break sync.
-                        // Peer ownership is probed three ways — either scheme
-                        // derivation of the stored endpoint (a stale `secure` flag
-                        // must not bypass the guard via a default-port mismatch)
-                        // and the stored deployment id (covers peers registered
-                        // under an alternate NAT/rewritten address).
-                        let https_endpoint = site_endpoint_for(&target.endpoint, true);
-                        let http_endpoint = site_endpoint_for(&target.endpoint, false);
-                        let peer_owned = !target.deployment_id.trim().is_empty()
-                            || site_replication_peer_deployment_id_for_endpoint(&https_endpoint)
+                        // An operator never knows the site replicator's
+                        // credentials, so overwriting a peer-owned target's
+                        // connection settings would break sync. MinIO drops the
+                        // change and still reports success; reject it so the
+                        // caller learns the edit did not apply. Peer ownership
+                        // is probed three ways — the stored deployment id
+                        // (covers peers registered under an alternate
+                        // NAT/rewritten address) and either scheme derivation
+                        // of the stored endpoint (a stale `secure` flag must not
+                        // bypass the guard via a default-port mismatch).
+                        let matched_peer_deployment_id = if target.deployment_id.trim().is_empty() {
+                            match site_replication_peer_deployment_id_for_endpoint(&site_endpoint_for(&target.endpoint, true))
                                 .await
-                                .is_some()
-                            || site_replication_peer_deployment_id_for_endpoint(&http_endpoint)
-                                .await
-                                .is_some();
-                        if peer_owned {
-                            warn!(
-                                bucket = %bucket,
-                                arn = %target.arn,
-                                "skip credentials update for site-replication peer target"
-                            );
-                            continue;
-                        }
+                            {
+                                Some(deployment_id) => Some(deployment_id),
+                                None => {
+                                    site_replication_peer_deployment_id_for_endpoint(&site_endpoint_for(&target.endpoint, false))
+                                        .await
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        reject_site_replication_peer_connection_update(&target, matched_peer_deployment_id.as_deref())?;
                         target.credentials = remote_target.credentials.clone();
                         target.endpoint = remote_target.endpoint.clone();
                         target.secure = remote_target.secure;
@@ -1777,8 +1803,8 @@ mod tests {
     use super::{
         REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
         RemoteTargetCredentialsRequest, RemoteTargetRequest, ReplicationDiffEntry, SUPPORTED_REMOTE_TARGET_API, TargetUpdateOp,
-        build_mrf_response, extract_query_params, parse_remote_target_update_ops, render_mrf_backlog, render_replication_diff,
-        unique_replication_peers, validate_remote_target_tls_settings,
+        build_mrf_response, extract_query_params, parse_remote_target_update_ops, reject_site_replication_peer_connection_update,
+        render_mrf_backlog, render_replication_diff, unique_replication_peers, validate_remote_target_tls_settings,
     };
     use crate::admin::storage_api::bucket::target::{BucketTarget, Credentials as TargetCredentials, LatencyStat};
     use crate::admin::storage_api::replication::{BucketStats, DurableMrfBacklog, MrfOpKind, MrfReplicateEntry};
@@ -2278,6 +2304,56 @@ mod tests {
 
         assert_eq!(params.get("bucket"), Some(&"foo/bar".to_string()));
         assert_eq!(params.get("flag"), Some(&"a b".to_string()));
+    }
+
+    #[test]
+    fn peer_connection_update_rejects_target_recording_a_peer_deployment_id() {
+        let err = reject_site_replication_peer_connection_update(
+            &BucketTarget {
+                arn: "arn:rustfs:replication::peer-b:bucket".to_string(),
+                endpoint: "10.0.0.2:9000".to_string(),
+                deployment_id: "peer-b".to_string(),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect_err("a target recording a peer deployment id must not take a connection update");
+
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
+        let message = err.message().unwrap_or_default();
+        assert!(message.contains("arn:rustfs:replication::peer-b:bucket"), "{message}");
+        assert!(message.contains("deployment id peer-b"), "{message}");
+        assert!(message.contains("site-replication edit"), "{message}");
+    }
+
+    #[test]
+    fn peer_connection_update_rejects_target_whose_endpoint_is_a_peer() {
+        let err = reject_site_replication_peer_connection_update(
+            &BucketTarget {
+                arn: "arn:rustfs:replication::peer-c:bucket".to_string(),
+                endpoint: "10.0.0.3:9000".to_string(),
+                ..Default::default()
+            },
+            Some("peer-c"),
+        )
+        .expect_err("a target whose endpoint is a peer must not take a connection update");
+
+        let message = err.message().unwrap_or_default();
+        assert!(message.contains("endpoint 10.0.0.3:9000 is site-replication peer peer-c"), "{message}");
+    }
+
+    #[test]
+    fn peer_connection_update_allows_ordinary_targets() {
+        reject_site_replication_peer_connection_update(
+            &BucketTarget {
+                arn: "arn:rustfs:replication::external:bucket".to_string(),
+                endpoint: "s3.example.com".to_string(),
+                deployment_id: "  ".to_string(),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("a target outside the site topology accepts connection updates");
     }
 
     #[test]

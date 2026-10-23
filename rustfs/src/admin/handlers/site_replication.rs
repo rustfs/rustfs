@@ -819,6 +819,18 @@ fn apply_public_peer_edit_tls_presence(state: &SiteReplicationState, incoming: &
     }
 }
 
+/// An edit that omits the name keeps the stored one. Filled before the edit
+/// is planned so the fan-out and the endpoint-refresh journal carry the name
+/// too: a receiver that infers it from the new endpoint would rename the site.
+fn fill_omitted_peer_edit_name(state: &SiteReplicationState, incoming: &mut PeerInfo) {
+    if !incoming.name.is_empty() || incoming.deployment_id.is_empty() {
+        return;
+    }
+    if let Some(existing) = state.peers.get(&incoming.deployment_id) {
+        incoming.name = existing.name.clone();
+    }
+}
+
 fn peer_deployment_id_for_endpoint(state: &SiteReplicationState, endpoint: &str) -> Option<String> {
     existing_peer_for_endpoint(state, endpoint)
         .map(|peer| peer.deployment_id)
@@ -2973,6 +2985,7 @@ fn merge_add_sites(
 }
 
 fn update_peer(mut state: SiteReplicationState, incoming: PeerInfo, ilm_expiry_override: Option<bool>) -> SiteReplicationState {
+    let name_omitted = incoming.name.is_empty();
     let mut peer = normalize_peer_info(incoming);
     // An older sender may still hold a placeholder after this site has
     // learned the real ID. Do not let that delivery downgrade the identity.
@@ -2983,6 +2996,15 @@ fn update_peer(mut state: SiteReplicationState, incoming: PeerInfo, ilm_expiry_o
         })
     {
         peer.deployment_id = existing.deployment_id.clone();
+    }
+    // An edit that omits the name (e.g. `mc admin replicate update --endpoint`)
+    // changes the endpoint only. Keep the stored name instead of the one
+    // inferred from the new endpoint, or the site is renamed after its host.
+    if name_omitted
+        && let Some(existing) = state.peers.get(&peer.deployment_id)
+        && !existing.name.is_empty()
+    {
+        peer.name = existing.name.clone();
     }
     // Remove the placeholder before persistence normalizes duplicate
     // endpoints; otherwise map ordering can discard the real identity.
@@ -7753,6 +7775,7 @@ impl Operation for SiteReplicationEditHandler {
         // must not run under the state-object lock.
         let current_state = load_site_replication_state().await?;
         apply_public_peer_edit_tls_presence(&current_state, &mut incoming, tls_presence);
+        fill_omitted_peer_edit_name(&current_state, &mut incoming);
         if !incoming.deployment_id.is_empty() || !incoming.endpoint.is_empty() || !incoming.name.is_empty() {
             validate_proposed_peer(&incoming)?;
         }
@@ -13133,6 +13156,97 @@ mod tests {
         let edited = edit_state(state, PeerInfo::default(), Some(true));
 
         assert!(edited.peers.values().all(|peer| peer.replicate_ilm_expiry));
+    }
+
+    fn endpoint_only_edit_fixture() -> (SiteReplicationState, PeerInfo, PeerInfo) {
+        let local = PeerInfo {
+            deployment_id: "local".to_string(),
+            ..peer("sr3-a", "https://site-a.example.com")
+        };
+        let edited = PeerInfo {
+            deployment_id: "edited".to_string(),
+            ..peer("sr3-c", "https://site-c.example.com")
+        };
+        let state = SiteReplicationState {
+            name: "sr3-a".to_string(),
+            peers: BTreeMap::from([("local".to_string(), local.clone()), ("edited".to_string(), edited)]),
+            ..Default::default()
+        };
+        // What `mc admin replicate update --deployment-id <ID> --endpoint <URL>`
+        // sends: the deployment ID and the new endpoint, no name.
+        let incoming = PeerInfo {
+            deployment_id: "edited".to_string(),
+            ..peer("", "https://moved-c.example.com")
+        };
+        (state, local, incoming)
+    }
+
+    #[test]
+    fn test_endpoint_only_edit_keeps_stored_peer_name_on_editing_site() {
+        let (state, _, incoming) = endpoint_only_edit_fixture();
+
+        let edited = edit_state(state, incoming, None);
+
+        let peer = &edited.peers["edited"];
+        assert_eq!(peer.name, "sr3-c");
+        assert_eq!(peer.endpoint, "https://moved-c.example.com");
+        assert_eq!(edited.name, "sr3-a");
+        assert_eq!(edited.peers.len(), 2);
+    }
+
+    #[test]
+    fn test_endpoint_only_edit_keeps_stored_peer_name_on_receivers() {
+        let (state, local, incoming) = endpoint_only_edit_fixture();
+
+        let updated = apply_internal_peer_edit(state, &local, incoming, None).expect("endpoint-only edit");
+
+        assert_eq!(updated.peers["edited"].name, "sr3-c");
+        assert_eq!(updated.peers["edited"].endpoint, "https://moved-c.example.com");
+        assert_eq!(updated.name, "sr3-a");
+    }
+
+    #[test]
+    fn test_endpoint_only_edit_keeps_name_on_the_edited_site_itself() {
+        let (mut state, _, incoming) = endpoint_only_edit_fixture();
+        state.name = "sr3-c".to_string();
+        let edited_local = PeerInfo {
+            deployment_id: "edited".to_string(),
+            ..peer("sr3-c", "https://moved-c.example.com")
+        };
+
+        let updated = apply_internal_peer_edit(state, &edited_local, incoming, None).expect("endpoint-only edit");
+
+        assert_eq!(updated.peers["edited"].name, "sr3-c");
+        assert_eq!(updated.name, "sr3-c");
+    }
+
+    #[test]
+    fn test_public_endpoint_only_edit_carries_stored_name_to_peers() {
+        let (state, _, mut incoming) = endpoint_only_edit_fixture();
+
+        fill_omitted_peer_edit_name(&state, &mut incoming);
+
+        assert_eq!(incoming.name, "sr3-c");
+        assert_eq!(normalize_peer_info(incoming).name, "sr3-c");
+    }
+
+    #[test]
+    fn test_peer_edit_name_rules_for_renames_and_unknown_peers() {
+        let (state, local, mut incoming) = endpoint_only_edit_fixture();
+        incoming.name = "renamed".to_string();
+        let renamed = apply_internal_peer_edit(state.clone(), &local, incoming, None).expect("rename");
+        assert_eq!(renamed.peers["edited"].name, "renamed");
+
+        // A peer this site does not know yet still gets its name inferred
+        // from the endpoint, as add and join have always done.
+        let mut unknown = PeerInfo {
+            deployment_id: "new".to_string(),
+            ..peer("", "http://new-site.example.com:9000")
+        };
+        fill_omitted_peer_edit_name(&state, &mut unknown);
+        assert!(unknown.name.is_empty());
+        let added = update_peer(state, unknown, None);
+        assert_eq!(added.peers["new"].name, "new-site.example.com");
     }
 
     #[test]

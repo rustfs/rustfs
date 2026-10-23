@@ -338,7 +338,9 @@ fn decommission_start_api_error(err: crate::storage_api::error::StorageError) ->
             source: Some(Box::new(err)),
         };
     }
-    if is_lock_timeout(&err) {
+    // `SlowDown` is a peer refusing the start-time bucket heal while its
+    // movement gate has a queued writer: the same transient contention.
+    if is_lock_timeout(&err) || matches!(err, crate::storage_api::error::StorageError::SlowDown) {
         return ApiError {
             code: S3ErrorCode::ServiceUnavailable.into(),
             message: err.to_string(),
@@ -1311,6 +1313,15 @@ mod pools_handler_tests {
             Some(&http::HeaderValue::from_static("1")),
             "a busy gate is advertised as retryable"
         );
+    }
+
+    #[test]
+    fn test_decommission_start_api_error_reports_a_refused_preflight_heal_as_retryable() {
+        let err = decommission_start_api_error(crate::storage_api::error::StorageError::SlowDown);
+
+        assert_eq!(err.code, s3s::S3ErrorCode::ServiceUnavailable);
+        let err = s3s::S3Error::from(contextualize_admin_pool_api_error(err, "start decommission", "pools [0]"));
+        assert_eq!(err.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
     }
 
     #[test]

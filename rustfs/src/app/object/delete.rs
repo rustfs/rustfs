@@ -1137,8 +1137,7 @@ impl DefaultObjectUsecase {
         let replicate_force_delete = force_delete && !replica && has_active_delete_rule(&delete_config_snapshot, &key);
         let mut force_delete_intent = None;
 
-        let get_opts = opts.clone();
-        let existing_object_info = match store.get_object_info_for_delete(&bucket, &key, &get_opts).await {
+        let existing_object_info = match store.get_object_info_for_delete(&bucket, &key, &opts).await {
             Ok(obj_info) => Some(obj_info),
             Err(err) => {
                 // If object not found, allow deletion to proceed (will return 204 No Content)

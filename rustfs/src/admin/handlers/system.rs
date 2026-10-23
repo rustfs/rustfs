@@ -32,6 +32,7 @@ use crate::admin::storage_api::cluster::{
     CapabilityState, CapabilityStatus, ObservabilitySnapshotProvider, TopologySnapshot, TopologySnapshotProvider,
 };
 use crate::admin::storage_api::storageclass as storage_class_contract;
+use crate::admin::utils::is_compat_admin_request;
 use crate::runtime_capabilities::{EndpointTopologySnapshotProvider, RustFsObservabilitySnapshotProvider};
 use crate::server::ADMIN_PREFIX;
 use crate::workload_admission::workload_admission_registry_snapshot;
@@ -428,6 +429,27 @@ struct StorageInfoResponse {
     admin_discovery: SystemAdminDiscovery,
 }
 
+/// madmin clients (`mc admin info`, `mc admin replicate resync`) reach these
+/// routes through the `/minio/admin` prefix and decode the body directly as
+/// `InfoMessage`, so the RustFS envelope is only served on `/rustfs/admin`.
+fn encode_server_info_response(path: &str, response: &ServerInfoResponse) -> serde_json::Result<Vec<u8>> {
+    if is_compat_admin_request(path) {
+        serde_json::to_vec(&response.info)
+    } else {
+        serde_json::to_vec(response)
+    }
+}
+
+/// Same split as [`encode_server_info_response`]: madmin decodes `StorageInfo`
+/// from the bare body.
+fn encode_storage_info_response(path: &str, response: &StorageInfoResponse) -> serde_json::Result<Vec<u8>> {
+    if is_compat_admin_request(path) {
+        serde_json::to_vec(&response.info)
+    } else {
+        serde_json::to_vec(response)
+    }
+}
+
 fn system_admin_discovery(usecase: &DefaultAdminUsecase) -> SystemAdminDiscovery {
     SystemAdminDiscovery {
         runtime_capabilities: usecase.runtime_capabilities_route().to_string(),
@@ -466,7 +488,7 @@ impl Operation for ServerInfoHandler {
             bitrot_selftest: bitrot_selftest_status_str(),
         };
 
-        let data = serde_json::to_vec(&response).map_err(|e| {
+        let data = encode_server_info_response(req.uri.path(), &response).map_err(|e| {
             log_system_request_failed!("query_server_info", "serialize_server_info_failed", e);
             S3Error::with_message(S3ErrorCode::InternalError, "parse serverInfo failed")
         })?;
@@ -587,7 +609,7 @@ impl Operation for StorageInfoHandler {
             admin_discovery: system_admin_discovery(&usecase),
         };
 
-        let data = serde_json::to_vec(&response).map_err(|e| {
+        let data = encode_storage_info_response(req.uri.path(), &response).map_err(|e| {
             log_system_request_failed!("query_storage_info", "serialize_storage_info_failed", e);
             S3Error::with_message(S3ErrorCode::InternalError, "failed to serialize storage info")
         })?;
@@ -1801,6 +1823,83 @@ mod tests {
         assert_eq!(value["admin_discovery"]["runtimeCapabilities"], "/rustfs/admin/v4/runtime/capabilities");
         assert_eq!(value["admin_discovery"]["clusterSnapshot"], "/rustfs/admin/v4/cluster/snapshot");
         assert_eq!(value["admin_discovery"]["extensionsCatalog"], "/rustfs/admin/v4/extensions/catalog");
+    }
+
+    fn server_info_response_with_deployment_id(deployment_id: &str) -> ServerInfoResponse {
+        ServerInfoResponse {
+            info: InfoMessage {
+                mode: Some("online".to_string()),
+                domain: None,
+                region: None,
+                sqs_arn: None,
+                deployment_id: Some(deployment_id.to_string()),
+                buckets: None,
+                objects: None,
+                versions: None,
+                delete_markers: None,
+                usage: None,
+                services: None,
+                backend: None,
+                servers: None,
+                pools: None,
+            },
+            admin_discovery: system_admin_discovery(&DefaultAdminUsecase::without_context()),
+            bitrot_selftest: "passed",
+        }
+    }
+
+    /// madmin's `ServerInfo` decodes the body directly as `InfoMessage`; an
+    /// envelope leaves `deploymentID` empty, which blanks `mc admin info` and
+    /// makes `mc admin replicate resync` reject every alias as "not part of
+    /// cluster replication".
+    #[test]
+    fn server_info_on_minio_prefix_is_a_bare_madmin_info_message() {
+        let response = server_info_response_with_deployment_id("deployment-123");
+
+        let body = super::encode_server_info_response("/minio/admin/v3/info", &response).expect("server info should encode");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("server info must be json");
+        assert_eq!(value["deploymentID"], "deployment-123");
+        assert_eq!(value["mode"], "online");
+        for envelope_key in ["info", "admin_discovery", "bitrotSelftest"] {
+            assert!(value.get(envelope_key).is_none(), "madmin body must not carry `{envelope_key}`: {value}");
+        }
+
+        let decoded: InfoMessage = serde_json::from_slice(&body).expect("body must decode as InfoMessage");
+        assert_eq!(decoded.deployment_id.as_deref(), Some("deployment-123"));
+    }
+
+    /// rc and the console read `/rustfs/admin/v3/info` through the `info`
+    /// envelope; rc's decoder requires the key.
+    #[test]
+    fn server_info_on_rustfs_prefix_keeps_the_envelope() {
+        let response = server_info_response_with_deployment_id("deployment-123");
+
+        let body = super::encode_server_info_response("/rustfs/admin/v3/info", &response).expect("server info should encode");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("server info must be json");
+        assert_eq!(value["info"]["deploymentID"], "deployment-123");
+        assert_eq!(value["admin_discovery"]["clusterSnapshot"], "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(value["bitrotSelftest"], "passed");
+        assert!(value.get("deploymentID").is_none(), "envelope must not duplicate the message: {value}");
+    }
+
+    #[test]
+    fn storage_info_wire_shape_depends_on_admin_prefix() {
+        let response = super::StorageInfoResponse {
+            info: StorageInfo::default(),
+            admin_discovery: system_admin_discovery(&DefaultAdminUsecase::without_context()),
+        };
+
+        let body =
+            super::encode_storage_info_response("/minio/admin/v3/storageinfo", &response).expect("storage info should encode");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("storage info must be json");
+        assert!(value["disks"].is_array(), "madmin body must be a bare StorageInfo: {value}");
+        assert!(value.get("info").is_none() && value.get("admin_discovery").is_none());
+
+        let body =
+            super::encode_storage_info_response("/rustfs/admin/v3/storageinfo", &response).expect("storage info should encode");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("storage info must be json");
+        assert!(value["info"]["disks"].is_array(), "RustFS body must keep the envelope: {value}");
+        assert_eq!(value["admin_discovery"]["clusterSnapshot"], "/rustfs/admin/v4/cluster/snapshot");
     }
 
     #[test]

@@ -3487,7 +3487,13 @@ fn resolve_decommission_progress_save_result(result: Result<()>) -> Option<Error
 }
 
 fn resolve_decommission_preflight_heal_result<T>(bucket: &str, result: Result<T>) -> Result<T> {
-    result.map_err(|err| Error::other(format!("decommission preflight heal failed for bucket {bucket}: {err}")))
+    result.map_err(|err| match err {
+        // A peer whose movement gate has a queued writer refuses the bucket
+        // heal instead of waiting; the refusal crosses the disk layer as
+        // `TooManyOpenFiles`. Keep it retryable so the start answers 503.
+        Error::SlowDown | Error::TooManyOpenFiles => Error::SlowDown,
+        err => Error::other(format!("decommission preflight heal failed for bucket {bucket}: {err}")),
+    })
 }
 
 fn resolve_decommission_optional_bucket_config_result<T>(bucket: &str, stage: &str, result: Result<T>) -> Result<Option<T>> {
@@ -12782,6 +12788,19 @@ impl ECStore {
         let (pool_meta_guard, snapshot) = self
             .acquire_pool_meta_read_guard(&save_guard, "target capacity admission failed")
             .await?;
+        // A scanner publication must cover the complete durable membership.
+        // A smaller startup view could otherwise overwrite an expanded commit
+        // proof with its older stable rollback, even though every target is writable.
+        if matches!(admission, DecommissionCapacityAdmission::ScannerBacklog)
+            && !snapshot
+                .pools
+                .iter()
+                .enumerate()
+                .filter_map(|(index, _)| snapshot.scanner_pause_backlog_pool_writable(index).then_some(index))
+                .eq(target_pool_indices.iter().copied())
+        {
+            return Err(Error::SlowDown);
+        }
         for target_pool_index in target_pool_indices.iter().copied() {
             ensure_external_decommission_target_admission(&snapshot, target_pool_index, admission)?;
         }
@@ -33536,12 +33555,21 @@ mod pools_tests {
 
     #[test]
     fn test_resolve_decommission_preflight_heal_result_wraps_error_context() {
-        let err = resolve_decommission_preflight_heal_result::<()>("bucket-a", Err(Error::SlowDown))
+        let err = resolve_decommission_preflight_heal_result::<()>("bucket-a", Err(Error::FaultyDisk))
             .expect_err("heal failure should carry preflight context");
         assert!(
             err.to_string()
                 .contains("decommission preflight heal failed for bucket bucket-a")
         );
+    }
+
+    #[test]
+    fn test_resolve_decommission_preflight_heal_result_keeps_busy_gate_retryable() {
+        for busy in [Error::SlowDown, Error::TooManyOpenFiles] {
+            let err = resolve_decommission_preflight_heal_result::<()>("bucket-a", Err(busy))
+                .expect_err("a refused heal must fail the start");
+            assert_eq!(err, Error::SlowDown);
+        }
     }
 
     #[test]
