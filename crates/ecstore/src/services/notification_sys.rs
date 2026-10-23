@@ -638,15 +638,15 @@ pub async fn acquire_legacy_transition_state_reconcile_fleet_proof() -> Option<L
 
 pub async fn require_restore_copyback_fleet_capability() -> Result<()> {
     let Some(topology) = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() else {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         return Ok(());
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-util")))]
         return Err(Error::other("restore copy-back capability topology is unavailable"));
     };
     let Some(notification_sys) = get_global_notification_sys() else {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         return Ok(());
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-util")))]
         return Err(Error::other("restore copy-back capability probe is unavailable"));
     };
     timeout(
