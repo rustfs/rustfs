@@ -1892,6 +1892,15 @@ impl PeerRestClient {
         Ok((self.topology_member.clone(), epoch))
     }
 
+    pub async fn probe_restore_copyback_capability(&self, topology_fingerprint: String) -> Result<(String, Uuid)> {
+        let probe = rustfs_protos::restore_copyback_capability_probe(Uuid::new_v4().as_bytes());
+        let result = self
+            .heal_control(rustfs_protos::HEAL_CONTROL_PROTOCOL_VERSION, topology_fingerprint, probe)
+            .await?;
+        let epoch = decode_remote_version_state_capability(&self.topology_member, &result)?;
+        Ok((self.topology_member.clone(), epoch))
+    }
+
     pub async fn probe_cross_pool_fence(&self, topology_fingerprint: String) -> Result<(String, u32, Uuid)> {
         let mut probe = rustfs_protos::CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX.to_vec();
         probe.extend_from_slice(Uuid::new_v4().as_bytes());

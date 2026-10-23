@@ -430,7 +430,18 @@ impl LocalDisk {
         // data_dir path
         let has_data_dir_path = {
             let has_data_dir = {
-                if !fi.is_remote() {
+                // Multipart restore completion has validated staged local parts,
+                // while its public status stays pending until finalization.
+                let pending_multipart_restore = src_volume == crate::disk::RUSTFS_META_MULTIPART_BUCKET
+                    && fi
+                        .metadata
+                        .get(rustfs_filemeta::metadata_keys::RESTORE)
+                        .and_then(|value| rustfs_filemeta::parse_restore_obj_status(value).ok())
+                        .is_some_and(|status| status.is_restore_in_progress == Some(true));
+                if pending_multipart_restore && fi.data_dir.is_none_or(|dir| dir.is_nil()) {
+                    return Err(DiskError::FileCorrupt);
+                }
+                if !fi.is_remote() || pending_multipart_restore {
                     fi.data_dir
                         .map(|dir| rustfs_utils::path::retain_slash(dir.to_string().as_str()))
                 } else {

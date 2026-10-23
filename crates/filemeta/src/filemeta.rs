@@ -26,8 +26,9 @@ use rustfs_utils::http::headers::{AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_
 use rustfs_utils::http::{
     MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_DATA_MOV, SUFFIX_HEALING, SUFFIX_PURGESTATUS,
     SUFFIX_REPLICA_STATUS, SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX,
-    SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_RESTORE_OPERATION_ID,
-    SUFFIX_RESTORE_WORKER_LOCK, contains_key_str, has_internal_suffix, insert_bytes, is_internal_key, remove_bytes,
+    SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_RESTORE_COPYBACK,
+    SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK, contains_key_str, has_internal_suffix, insert_bytes,
+    is_internal_key, remove_bytes,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -404,7 +405,11 @@ impl FileMeta {
                         if let Some(ref mut obj) = ver.object {
                             if replace_user_metadata {
                                 obj.meta_user.clear();
-                                for suffix in [SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK] {
+                                for suffix in [
+                                    SUFFIX_RESTORE_COPYBACK,
+                                    SUFFIX_RESTORE_OPERATION_ID,
+                                    SUFFIX_RESTORE_WORKER_LOCK,
+                                ] {
                                     if !contains_key_str(&fi.metadata, suffix) {
                                         remove_bytes(&mut obj.meta_sys, suffix);
                                     }
