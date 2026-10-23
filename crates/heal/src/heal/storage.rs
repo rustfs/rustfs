@@ -1481,19 +1481,21 @@ impl HealStorageAPI for ECStoreHealStorage {
                 Ok((result, error))
             }
             Err(e) => {
-                error!(
-                    target: "rustfs::heal::storage",
+                crate::heal::task::demote_to_debug_when!(
+                    matches!(&e, StorageError::DeleteRecoveryLegacyAmbiguous)
+                        && !crate::heal::failure_logging::log_legacy_ambiguity(bucket, object, version_id, opts.pool, opts.set),
+                    error, target: "rustfs::heal::storage", {
                     event = EVENT_HEAL_STORAGE_REPAIR_OP,
                     component = LOG_COMPONENT_HEAL,
                     subsystem = LOG_SUBSYSTEM_STORAGE,
+                    result = "failed",
                     operation = "heal_object",
                     bucket,
                     object,
                     version_id = ?version_id,
-                    result = "failed",
                     error = %e,
                     "Heal storage repair failed"
-                );
+                });
                 Err(Error::Storage(e))
             }
         }
