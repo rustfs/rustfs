@@ -356,14 +356,11 @@ impl DummyBackend {
         }
         let mut bytes = Vec::new();
         if let Some(mut stream) = body.take() {
-            loop {
-                match futures_util::future::poll_fn(|cx| Pin::new(&mut stream).poll_read(cx))
-                    .await
-                    .map_err(|e| DummyError::Injected(e.to_string()))?
-                {
-                    PayloadRead::Chunk(chunk) => bytes.extend_from_slice(&chunk),
-                    PayloadRead::Eof { .. } => break,
-                }
+            while let PayloadRead::Chunk(chunk) = futures_util::future::poll_fn(|cx| Pin::new(&mut stream).poll_read(cx))
+                .await
+                .map_err(|e| DummyError::Injected(e.to_string()))?
+            {
+                bytes.extend_from_slice(&chunk);
             }
         }
         self.inner.lock().expect("lock").upload_bodies.push(bytes);

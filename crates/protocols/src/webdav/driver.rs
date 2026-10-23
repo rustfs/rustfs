@@ -1170,7 +1170,7 @@ where
                         let size = output.content_length.unwrap_or(0) as u64;
                         let modified = output
                             .last_modified
-                            .map(|dt| timestamp_to_system_time(dt))
+                            .map(timestamp_to_system_time)
                             .unwrap_or_else(SystemTime::now);
 
                         Ok(Box::new(WebDavMetaData {
@@ -2098,14 +2098,11 @@ mod tests {
             let mut bytes = Vec::new();
 
             if let Some(mut body) = input.body.take() {
-                loop {
-                    match poll_fn(|cx| std::pin::Pin::new(&mut body).poll_read(cx))
-                        .await
-                        .map_err(|e| std::io::Error::other(e.to_string()))?
-                    {
-                        PayloadRead::Chunk(chunk) => bytes.extend_from_slice(&chunk),
-                        PayloadRead::Eof { .. } => break,
-                    }
+                while let PayloadRead::Chunk(chunk) = poll_fn(|cx| std::pin::Pin::new(&mut body).poll_read(cx))
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                {
+                    bytes.extend_from_slice(&chunk);
                 }
             }
 
