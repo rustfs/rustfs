@@ -1917,10 +1917,7 @@ async fn exhausted_replacement_deferral_reserves_one_bounded_retry() {
         .await
         .expect("compatibility deferral should persist");
     manager
-        .record_replacement_failure(
-            &Error::transient_skip("Replacement erasure set heal incomplete: target readiness deferred retry"),
-            99,
-        )
+        .record_replacement_failure(&Error::ReplacementTargetNotReady("target is restarting".to_string()), 99)
         .await
         .expect("task-level persistence must preserve a readiness deferral");
     let state = ResumeManager::load_replacement_intent(disk, &task_id)
@@ -3481,6 +3478,34 @@ async fn repeated_target_outages_never_consume_the_rebuild_budget() {
     assert_eq!(state.retry_count, 1, "ten outages must leave the single real failure");
     assert!(state.replacement_retry_waiting_for_target);
     assert!(state.can_retry());
+}
+
+#[tokio::test]
+async fn replacement_retry_does_not_treat_error_text_as_target_readiness() {
+    let (_temp_dir, disk, manager) = budget_fixture().await;
+    let identities = manager.get_state().await.replacement_target_identities;
+    manager
+        .mark_replacement_rebuilding(identities)
+        .await
+        .expect("format admitted");
+    manager
+        .defer_retry_until_target_ready()
+        .await
+        .expect("target readiness deferral persists");
+    let failure = Error::transient_skip("object named target readiness deferred retry failed during rebuild");
+    manager
+        .record_replacement_failure(&failure, 2)
+        .await
+        .expect("rebuild failure persists");
+
+    let task_id = manager.get_state().await.task_id;
+    let state = ResumeManager::load_replacement_intent(disk, &task_id)
+        .await
+        .expect("failed intent remains loadable")
+        .get_state()
+        .await;
+    assert_eq!(state.retry_count, 2, "error text must not bypass the rebuild retry budget");
+    assert_eq!(state.error_message.as_deref(), Some(failure.to_string().as_str()));
 }
 
 fn blocked_marker_path(task_id: &str) -> String {

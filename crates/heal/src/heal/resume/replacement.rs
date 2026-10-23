@@ -282,6 +282,7 @@ pub(crate) fn replacement_retry_is_exhausted_active(state: &ResumeState) -> bool
 /// as an ordinary transient-skip retry.  Such a state is recoverable once
 /// after the same generation is rediscovered, but must not reopen an already
 /// bounded generation on every scanner tick.
+// RUSTFS_COMPAT_TODO(backlog-2900-replacement-retry-display): decode readiness-unaware persisted retry text until supported upgrades require the one-shot marker and retained legacy intents are resolved.
 pub(crate) fn replacement_retry_is_legacy_transient_skip(state: &ResumeState) -> bool {
     !state.replacement_legacy_retry_compatibility_done
         && state.error_message.as_deref().is_some_and(|message| {
@@ -607,10 +608,7 @@ impl ResumeManager {
             drop(state);
             return self.save_state_strict().await;
         }
-        let readiness_deferred = matches!(error, Error::ReplacementTargetNotReady(_))
-            || (state.replacement_retry_waiting_for_target
-                && matches!(error, Error::TransientSkip { message } if message.contains("target readiness deferred retry")));
-        if readiness_deferred {
+        if matches!(error, Error::ReplacementTargetNotReady(_)) {
             if state.retry_count >= state.max_retries && state.max_retries > 0 {
                 state.retry_count = state.max_retries.saturating_sub(1);
             }
