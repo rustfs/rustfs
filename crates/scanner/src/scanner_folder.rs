@@ -912,12 +912,26 @@ fn prune_size_reconciliation(info: &mut DataUsageCacheInfo, now: u64) {
     }
 }
 
-async fn wait_for_scanner_io(ctx: &CancellationToken, wait: impl std::future::Future<Output = ()>) -> Result<(), ScannerError> {
+async fn wait_for_scanner_io<T>(ctx: &CancellationToken, wait: impl std::future::Future<Output = T>) -> Result<T, ScannerError> {
     select! {
         biased;
         _ = ctx.cancelled() => Err(ScannerError::Other("Operation cancelled".to_string())),
-        _ = wait => Ok(()),
+        result = wait => Ok(result),
     }
+}
+
+async fn next_scanner_dir_entry(
+    ctx: &CancellationToken,
+    sleeper: &DynamicSleeper,
+    entries: &mut tokio::fs::ReadDir,
+) -> Result<Option<tokio::fs::DirEntry>, ScannerError> {
+    let entry = wait_for_scanner_io(ctx, entries.next_entry()).await??;
+    if entry.is_some() {
+        // Tokio prefetches bounded chunks. Pacing consumption also paces the
+        // next refill, without charging an extra entry for EOF.
+        wait_for_scanner_io(ctx, sleeper.admit_disk_io(1, 0)).await?;
+    }
+    Ok(entry)
 }
 
 impl FolderScanner {
@@ -1717,7 +1731,7 @@ impl FolderScanner {
             // directory that vanished during iteration instead of failing the
             // whole parent subtree. The bucket root (no parent) still propagates
             // NotFound so namespace removal is detected by the caller.
-            let mut dir_reader = match tokio::fs::read_dir(&dir_path).await {
+            let mut dir_reader = match wait_for_scanner_io(&ctx, tokio::fs::read_dir(&dir_path)).await? {
                 Ok(dir_reader) => Some(dir_reader),
                 Err(e) if e.kind() == ErrorKind::NotFound && folder.parent.is_some() => {
                     debug!(
@@ -1744,13 +1758,13 @@ impl FolderScanner {
                     raw_enumeration_complete = true;
                     break;
                 };
-                let entry = match reader.next_entry().await {
+                let entry = match next_scanner_dir_entry(&ctx, &self.sleeper, reader).await {
                     Ok(Some(entry)) => entry,
                     Ok(None) => {
                         raw_enumeration_complete = true;
                         break;
                     }
-                    Err(e) if e.kind() == ErrorKind::NotFound => {
+                    Err(ScannerError::Io(e)) if e.kind() == ErrorKind::NotFound => {
                         debug!(
                             target: "rustfs::scanner::folder",
                             event = EVENT_SCANNER_FOLDER_STATE,
@@ -1764,7 +1778,7 @@ impl FolderScanner {
                         raw_enumeration_complete = true;
                         break;
                     }
-                    Err(e) if e.kind() == ErrorKind::NotADirectory => {
+                    Err(ScannerError::Io(e)) if e.kind() == ErrorKind::NotADirectory => {
                         warn!(
                             target: "rustfs::scanner::folder",
                             event = EVENT_SCANNER_FOLDER_STATE,
@@ -1778,13 +1792,8 @@ impl FolderScanner {
                         raw_enumeration_complete = true;
                         break;
                     }
-                    Err(e) => return Err(ScannerError::Io(e)),
+                    Err(e) => return Err(e),
                 };
-                // Tokio's ReadDir fetches entries in bounded chunks. Charge
-                // each returned entry before processing it; consuming a
-                // chunk at the configured rate paces the request that fetches
-                // the next one. sleep_folder admits the initial directory read.
-                wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, 0)).await?;
                 let file_name = entry.file_name().to_string_lossy().to_string();
                 if file_name.is_empty() || file_name == "." || file_name == ".." {
                     continue;
@@ -1818,7 +1827,7 @@ impl FolderScanner {
 
                 // Ignore entries that disappeared during traversal or hit symlink
                 // loops, but propagate other walk errors.
-                let mut entry_type = match entry.file_type().await {
+                let mut entry_type = match wait_for_scanner_io(&ctx, entry.file_type()).await? {
                     Ok(entry_type) => entry_type,
                     Err(e) if e.kind() == ErrorKind::NotFound => {
                         debug!(
@@ -1860,7 +1869,7 @@ impl FolderScanner {
                 let mut entry_metadata_len = None;
                 if entry_type.is_symlink() {
                     wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, 0)).await?;
-                    let metadata = match tokio::fs::metadata(&file_path).await {
+                    let metadata = match wait_for_scanner_io(&ctx, tokio::fs::metadata(&file_path)).await? {
                         Ok(metadata) => metadata,
                         Err(e) if e.kind() == ErrorKind::NotFound => {
                             debug!(
@@ -2007,8 +2016,8 @@ impl FolderScanner {
                         len
                     } else {
                         wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, 0)).await?;
-                        tokio::fs::metadata(&item.path)
-                            .await
+                        wait_for_scanner_io(&ctx, tokio::fs::metadata(&item.path))
+                            .await?
                             .map(|metadata| metadata.len())
                             .unwrap_or(0)
                     }
@@ -2158,7 +2167,7 @@ impl FolderScanner {
             let mut found_erasure_data_directory = false;
             if self.is_erasure_mode && !found_object_metadata {
                 for (_, _, path) in &erasure_data_directory_candidates {
-                    if contains_erasure_part_file(path).await? {
+                    if contains_erasure_part_file(path, &ctx, &self.sleeper).await? {
                         found_erasure_data_directory = true;
                         break;
                     }

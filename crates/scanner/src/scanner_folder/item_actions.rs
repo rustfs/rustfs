@@ -1296,19 +1296,26 @@ pub(super) fn classify_get_size_failure(item: &ScannerItem, err: &StorageError) 
     GetSizeFailureAction::RecordFailed
 }
 
-pub(super) async fn contains_erasure_part_file(path: &str) -> Result<bool, ScannerError> {
-    let mut entries = match tokio::fs::read_dir(path).await {
+pub(super) async fn contains_erasure_part_file(
+    path: &str,
+    ctx: &CancellationToken,
+    sleeper: &DynamicSleeper,
+) -> Result<bool, ScannerError> {
+    wait_for_scanner_io(ctx, sleeper.admit_disk_io(1, 0)).await?;
+    let mut entries = match wait_for_scanner_io(ctx, tokio::fs::read_dir(path)).await? {
         Ok(entries) => entries,
         Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => return Ok(false),
         Err(err) => return Err(ScannerError::Io(err)),
     };
 
     for _ in 0..ERASURE_DATA_DIR_PROBE_ENTRY_LIMIT {
-        let entry = match entries.next_entry().await {
+        let entry = match next_scanner_dir_entry(ctx, sleeper, &mut entries).await {
             Ok(Some(entry)) => entry,
             Ok(None) => return Ok(false),
-            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => return Ok(false),
-            Err(err) => return Err(ScannerError::Io(err)),
+            Err(ScannerError::Io(err)) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                return Ok(false);
+            }
+            Err(err) => return Err(err),
         };
         let file_name = entry.file_name();
         let Some(part_number) = file_name
@@ -1322,7 +1329,7 @@ pub(super) async fn contains_erasure_part_file(path: &str) -> Result<bool, Scann
             continue;
         }
 
-        match entry.file_type().await {
+        match wait_for_scanner_io(ctx, entry.file_type()).await? {
             Ok(file_type) if file_type.is_file() => return Ok(true),
             Ok(_) => {}
             Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::TooManyLinks) => {}
