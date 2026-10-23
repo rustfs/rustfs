@@ -677,7 +677,7 @@ async fn dual_recovery_preserves_the_independent_usage_marker_fence() {
         .await
         .expect("bootstrap must not be older than the independent marker");
     assert_eq!(floor.leader_epoch, 101);
-    assert_eq!(startup, PersistedUsageFloorStartup::BootstrapPending);
+    assert_eq!(startup, PersistedUsageFloorStartup::RecoveredLegacyIncompleteFence);
     assert_eq!(
         read_config(store, DATA_USAGE_RECOVERY_PATH.as_str())
             .await
