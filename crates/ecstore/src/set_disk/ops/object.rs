@@ -26732,6 +26732,75 @@ mod batch_delete_marker_tests {
     }
 
     #[tokio::test]
+    async fn batch_delete_indexed_marker_history_unblocks_bucket_delete() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "batch-indexed-marker-history";
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create versioned bucket");
+        let uploaded = store
+            .put_object(
+                bucket,
+                "object",
+                &mut PutObjReader::from_vec(vec![42; 1024 * 1024]),
+                &ObjectOptions {
+                    versioned: true,
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write a physical data version behind the markers");
+        let mut requests = Vec::with_capacity(17);
+        requests.push(ObjectToDelete {
+            object_name: "object".to_string(),
+            version_id: Some(uploaded.version_id.expect("data version")),
+            ..Default::default()
+        });
+        for _ in 0..16 {
+            let marker = store
+                .delete_object(
+                    bucket,
+                    "object",
+                    ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("append a marker to the same key");
+            requests.push(ObjectToDelete {
+                object_name: "object".to_string(),
+                version_id: Some(marker.version_id.expect("marker version")),
+                ..Default::default()
+            });
+        }
+        let (deleted, errors) = store.delete_objects(bucket, requests, ObjectOptions::default()).await;
+        assert_eq!(deleted.len(), 17);
+        assert!(errors.iter().all(Option::is_none), "indexed marker batch must commit: {errors:?}");
+        assert!(!deleted[0].delete_marker);
+        assert!(deleted[1..].iter().all(|result| result.delete_marker));
+        let listed = store
+            .clone()
+            .list_object_versions(bucket, "", None, None, None, 100)
+            .await
+            .expect("list immediately after indexed deletion");
+        assert!(listed.objects.is_empty());
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("indexed deletion leaves an immediately deletable bucket");
+    }
+
+    #[tokio::test]
     async fn batch_delete_explicit_marker_does_not_wait_for_pending_replication() {
         use s3s::dto::{
             BucketVersioningStatus, DeleteReplication, DeleteReplicationStatus, Destination, ReplicationConfiguration,

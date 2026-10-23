@@ -55,9 +55,6 @@ fn build_meta_with_versions(version_count: usize) -> FileMeta {
 
 fn bench_rename_data_meta_path(c: &mut Criterion) {
     let mut group = c.benchmark_group("rename_data_meta");
-    group.sample_size(20);
-    group.warm_up_time(Duration::from_millis(300));
-    group.measurement_time(Duration::from_secs(1));
 
     for &version_count in VERSION_COUNT_CASES {
         let seeded = build_meta_with_versions(version_count);
@@ -122,13 +119,13 @@ fn bench_rename_data_meta_path(c: &mut Criterion) {
 
 fn bench_delete_version_batches(c: &mut Criterion) {
     let mut group = c.benchmark_group("delete_version_batch");
-    group.sample_size(20);
-    group.warm_up_time(Duration::from_millis(300));
-    group.measurement_time(Duration::from_secs(1));
     for (kind, inline_size) in [
         ("physical", None),
         ("inline-64", Some(64_usize)),
         ("inline-9k", Some(9 * 1024)),
+        ("markers", None),
+        ("mixed-markers-physical", None),
+        ("mixed-markers-inline", Some(64)),
     ] {
         for (versions, requested) in [(1_usize, 1), (8, 8), (32, 32), (128, 128), (1000, 1000), (1000, 32)] {
             let mut meta = FileMeta::new();
@@ -141,15 +138,24 @@ fn bench_delete_version_batches(c: &mut Criterion) {
                     i64::try_from(size).expect("object size"),
                     base_time + time::Duration::seconds(i64::try_from(id).expect("version time")),
                 );
-                info.parts.push(ObjectPartInfo {
-                    number: 1,
-                    size,
-                    actual_size: info.size,
-                    ..Default::default()
-                });
-                if inline_size.is_some() {
-                    info.set_inline_data();
-                    info.data = Some(Bytes::from(vec![42; size]));
+                if kind == "markers" || (kind.starts_with("mixed-markers-") && id % 2 == 0) {
+                    info = FileInfo {
+                        deleted: true,
+                        version_id: info.version_id,
+                        mod_time: info.mod_time,
+                        ..Default::default()
+                    };
+                } else {
+                    info.parts.push(ObjectPartInfo {
+                        number: 1,
+                        size,
+                        actual_size: info.size,
+                        ..Default::default()
+                    });
+                    if inline_size.is_some() {
+                        info.set_inline_data();
+                        info.data = Some(Bytes::from(vec![42; size]));
+                    }
                 }
                 meta.add_version(info).expect("seed batch metadata");
             }
@@ -174,5 +180,12 @@ fn bench_delete_version_batches(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_rename_data_meta_path, bench_delete_version_batches);
+criterion_group! {
+    name = benches;
+    config = Criterion::default()
+        .sample_size(20)
+        .warm_up_time(Duration::from_millis(300))
+        .measurement_time(Duration::from_secs(1));
+    targets = bench_rename_data_meta_path, bench_delete_version_batches
+}
 criterion_main!(benches);
