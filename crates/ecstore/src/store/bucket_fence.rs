@@ -458,7 +458,7 @@ mod tests {
         let registry = Arc::new(BucketFenceRegistry::default());
         let lock = NamespaceLock::new("cancelled-validation".to_owned(), Arc::new(LocalClient::new()));
         let mut guard = test_fence(registry.clone(), &lock, true).await;
-        let mut cancelled = Box::pin(async move { guard.validate(true, || std::future::pending::<Result<Uuid>>()).await });
+        let mut cancelled = Box::pin(async move { guard.validate(true, std::future::pending::<Result<Uuid>>).await });
         assert!(futures::poll!(&mut cancelled).is_pending());
         assert_eq!(registry.entries.lock().expect("registry")["b"].guards.len(), 1);
         drop(cancelled);
