@@ -912,6 +912,14 @@ fn prune_size_reconciliation(info: &mut DataUsageCacheInfo, now: u64) {
     }
 }
 
+async fn wait_for_scanner_io(ctx: &CancellationToken, wait: impl std::future::Future<Output = ()>) -> Result<(), ScannerError> {
+    select! {
+        biased;
+        _ = ctx.cancelled() => Err(ScannerError::Other("Operation cancelled".to_string())),
+        _ = wait => Ok(()),
+    }
+}
+
 impl FolderScanner {
     fn now_secs() -> u64 {
         SystemTime::now()
@@ -1683,7 +1691,7 @@ impl FolderScanner {
             };
             let active_object_lock = self.old_cache.info.object_lock.clone();
 
-            self.sleeper.sleep_folder().await;
+            wait_for_scanner_io(&ctx, self.sleeper.sleep_folder()).await?;
 
             let mut existing_folders: Vec<CachedFolder> = Vec::new();
             let mut new_folders: Vec<CachedFolder> = Vec::new();
@@ -1776,10 +1784,7 @@ impl FolderScanner {
                 // each returned entry before processing it; consuming a
                 // chunk at the configured rate paces the request that fetches
                 // the next one. sleep_folder admits the initial directory read.
-                select! {
-                    _ = ctx.cancelled() => return Err(ScannerError::Other("Operation cancelled".to_string())),
-                    _ = self.sleeper.admit_disk_io(1, 0) => {}
-                }
+                wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, 0)).await?;
                 let file_name = entry.file_name().to_string_lossy().to_string();
                 if file_name.is_empty() || file_name == "." || file_name == ".." {
                     continue;
@@ -1852,11 +1857,9 @@ impl FolderScanner {
                     found_object_metadata = true;
                 }
 
+                let mut entry_metadata_len = None;
                 if entry_type.is_symlink() {
-                    select! {
-                        _ = ctx.cancelled() => return Err(ScannerError::Other("Operation cancelled".to_string())),
-                        _ = self.sleeper.admit_disk_io(1, 0) => {}
-                    }
+                    wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, 0)).await?;
                     let metadata = match tokio::fs::metadata(&file_path).await {
                         Ok(metadata) => metadata,
                         Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -1902,6 +1905,7 @@ impl FolderScanner {
                     }
 
                     entry_type = metadata.file_type();
+                    entry_metadata_len = Some(metadata.len());
                     if is_storage_format_entry {
                         found_object_metadata = true;
                     }
@@ -1957,6 +1961,12 @@ impl FolderScanner {
                     continue;
                 }
 
+                // Only xl.meta contributes object accounting. Payload files
+                // must not incur a size stat or a metadata-read reservation.
+                if !is_storage_format_entry {
+                    continue;
+                }
+
                 let timer = self.sleeper.timer();
 
                 let heal_enabled = this_hash.mod_alt(
@@ -1990,25 +2000,22 @@ impl FolderScanner {
                     continue;
                 }
 
-                // Charge both the optional size stat and the metadata read.
-                // The stat is needed only when the byte budget can use its
-                // length, and must be admitted before the syscall itself.
+                // Reuse a resolved symlink's size; otherwise admit the size
+                // stat only when the byte budget needs it.
                 let budgeted_bytes = if self.sleeper.budgets_disk_io_bytes() {
-                    select! {
-                        _ = ctx.cancelled() => return Err(ScannerError::Other("Operation cancelled".to_string())),
-                        _ = self.sleeper.admit_disk_io(1, 0) => {}
+                    if let Some(len) = entry_metadata_len {
+                        len
+                    } else {
+                        wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, 0)).await?;
+                        tokio::fs::metadata(&item.path)
+                            .await
+                            .map(|metadata| metadata.len())
+                            .unwrap_or(0)
                     }
-                    tokio::fs::metadata(&item.path)
-                        .await
-                        .map(|metadata| metadata.len())
-                        .unwrap_or(0)
                 } else {
                     0
                 };
-                select! {
-                    _ = ctx.cancelled() => return Err(ScannerError::Other("Operation cancelled".to_string())),
-                    _ = self.sleeper.admit_disk_io(1, budgeted_bytes) => {}
-                }
+                wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, budgeted_bytes)).await?;
 
                 let sz = match self
                     .local_disk

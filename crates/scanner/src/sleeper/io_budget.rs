@@ -308,7 +308,7 @@ impl ScannerDiskIoBudget {
         self.limits().bytes_per_sec.is_some()
     }
 
-    fn reconfigure(&self, limits: ScannerDiskIoBudgetLimits) {
+    pub(super) fn reconfigure(&self, limits: ScannerDiskIoBudgetLimits) {
         let now = Instant::now();
         self.state
             .lock()
@@ -338,7 +338,7 @@ impl ScannerDiskIoBudget {
     }
 
     /// Charge and wait out the budget. Runs regardless of idle mode or
-    /// speed preset: the budget is a ceiling, not a preset sleep.
+    /// speed preset, independently of the preset sleep.
     pub async fn admit(&self, ops: u64, bytes: u64) {
         let wait = self.charge(ops, bytes);
         if wait.is_zero() {

@@ -2354,6 +2354,136 @@ async fn scan_folder_charges_each_enumerated_entry_to_the_disk_budget() {
 
 #[tokio::test]
 #[serial]
+async fn scan_folder_budgets_payload_entries_without_metadata_io() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+    let bucket_dir = temp_dir.join("bucket");
+    tokio::fs::create_dir_all(&bucket_dir).await.expect("create bucket");
+    for index in 0..33 {
+        tokio::fs::write(bucket_dir.join(format!("part.{index}")), b"payload")
+            .await
+            .expect("create payload entry");
+    }
+    scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest).for_disk_with_budget_for_tests(
+        &temp_dir,
+        crate::sleeper::ScannerDiskIoBudgetLimits {
+            iops: Some(1_000_000),
+            bytes_per_sec: Some(1_000_000),
+        },
+    );
+    let mut into = DataUsageEntry::default();
+    scanner
+        .scan_folder(
+            CancellationToken::new(),
+            CachedFolder {
+                name: "bucket".to_string(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+            &mut into,
+        )
+        .await
+        .expect("scan payload entries across a directory prefetch boundary");
+
+    let status = crate::sleeper::scanner_disk_io_budget_status()
+        .into_iter()
+        .find(|status| status.disk == temp_dir.to_string_lossy())
+        .expect("bound disk budget");
+    assert_eq!(status.charged_ops, 34, "one directory open and 33 entries, without size stats or reads");
+    assert_eq!(status.charged_bytes, 0);
+    assert_eq!(into.objects, 0);
+    assert_eq!(into.failed_objects, 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn scan_folder_reuses_symlink_size_without_bypassing_disk_validation() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+    let object_dir = temp_dir.join("bucket/object");
+    tokio::fs::create_dir_all(&object_dir).await.expect("create object directory");
+    let metadata = metadata_for_object("bucket", "object");
+    let target = temp_dir.join("metadata-target");
+    tokio::fs::write(&target, &metadata).await.expect("write metadata target");
+    symlink(&target, object_dir.join(STORAGE_FORMAT_FILE)).expect("create metadata symlink");
+    scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest).for_disk_with_budget_for_tests(
+        &temp_dir,
+        crate::sleeper::ScannerDiskIoBudgetLimits {
+            iops: Some(1_000_000),
+            bytes_per_sec: Some(1_000_000),
+        },
+    );
+    let mut into = DataUsageEntry::default();
+    scanner
+        .scan_folder(
+            CancellationToken::new(),
+            CachedFolder {
+                name: "bucket/object".to_string(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+            &mut into,
+        )
+        .await
+        .expect("scan symlinked object metadata");
+
+    let status = crate::sleeper::scanner_disk_io_budget_status()
+        .into_iter()
+        .find(|status| status.disk == temp_dir.to_string_lossy())
+        .expect("bound disk budget");
+    assert_eq!(
+        status.charged_ops, 4,
+        "directory, entry, target stat, and read reservation without a second stat"
+    );
+    assert_eq!(status.charged_bytes, u64::try_from(metadata.len()).expect("metadata length fits u64"));
+    assert_eq!(into.objects, 0, "the disk must continue rejecting symlinked metadata");
+    assert_eq!(into.failed_objects, 1);
+    assert!(
+        scanner
+            .new_cache
+            .info
+            .failed_objects
+            .contains_key(object_dir.join(STORAGE_FORMAT_FILE).to_string_lossy().as_ref())
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn scanner_io_budget_wait_cancels_without_waiting_for_the_rate_delay() {
+    let path = std::env::temp_dir().join(format!("scanner-cancel-budget-{}", Uuid::new_v4()));
+    let sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest).for_disk_with_budget_for_tests(
+        &path,
+        crate::sleeper::ScannerDiskIoBudgetLimits {
+            iops: Some(0),
+            bytes_per_sec: None,
+        },
+    );
+    sleeper.admit_disk_io(1, 0).await;
+    let ctx = CancellationToken::new();
+    let cancel = ctx.clone();
+    let task = tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        cancel.cancel();
+    });
+    let started = tokio::time::Instant::now();
+    assert!(wait_for_scanner_io(&ctx, sleeper.admit_disk_io(1, 0)).await.is_err());
+    task.await.expect("cancellation task");
+    assert_eq!(
+        started.elapsed(),
+        Duration::ZERO,
+        "cancellation must interrupt the one-second budget wait"
+    );
+
+    assert!(wait_for_scanner_io(&ctx, sleeper.admit_disk_io(1, 0)).await.is_err());
+    let status = crate::sleeper::scanner_disk_io_budget_status()
+        .into_iter()
+        .find(|status| status.disk == path.to_string_lossy())
+        .expect("bound disk budget");
+    assert_eq!(status.charged_ops, 2, "an already cancelled wait must not charge another operation");
+}
+
+#[tokio::test]
+#[serial]
 async fn test_scan_folder_missing_bucket_root_still_reports_not_found() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(60, 0, &mut scanner, temp_dir.clone());

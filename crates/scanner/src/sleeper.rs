@@ -134,7 +134,7 @@ pub static SCANNER_SLEEPER: LazyLock<DynamicSleeper> = LazyLock::new(|| {
 /// For folder-level gaps, [`sleep_folder`] uses `MIN_SLEEP * factor`,
 /// clamped only by `max_sleep`. All sleeps are gated on [`SCANNER_IDLE_MODE`];
 /// the per-disk background I/O budget bound with [`DynamicSleeper::for_disk`]
-/// is a hard ceiling that applies regardless of idle mode or preset.
+/// applies regardless of idle mode or preset.
 #[derive(Clone)]
 pub struct DynamicSleeper {
     inner: Arc<SleeperParams>,
@@ -164,6 +164,15 @@ impl DynamicSleeper {
             inner: self.inner.clone(),
             disk_io_budget: Some(io_budget::disk_io_budget_for(disk_path)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_disk_with_budget_for_tests(&self, disk_path: &Path, limits: ScannerDiskIoBudgetLimits) -> Self {
+        let sleeper = self.for_disk(disk_path);
+        if let Some(budget) = &sleeper.disk_io_budget {
+            budget.reconfigure(limits);
+        }
+        sleeper
     }
 
     /// Whether byte charges can change pacing on the bound disk.
@@ -477,7 +486,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     #[serial]
-    async fn sleeper_bound_to_a_disk_charges_folder_and_object_io_as_a_hard_ceiling() {
+    async fn sleeper_bound_to_a_disk_paces_folder_and_object_io() {
         let prev_mode = SCANNER_IDLE_MODE.load(Ordering::Relaxed);
         // Sleeps are disabled and the preset is `fastest`: only the explicit
         // budget can pace this walk.
