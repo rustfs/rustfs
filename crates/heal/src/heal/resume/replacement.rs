@@ -282,7 +282,7 @@ pub(crate) fn replacement_retry_is_exhausted_active(state: &ResumeState) -> bool
 /// as an ordinary transient-skip retry.  Such a state is recoverable once
 /// after the same generation is rediscovered, but must not reopen an already
 /// bounded generation on every scanner tick.
-// RUSTFS_COMPAT_TODO(backlog-2900-replacement-retry-display): decode readiness-unaware persisted retry text until supported upgrades require the one-shot marker and retained legacy intents are resolved.
+// RUSTFS_COMPAT_TODO(backlog-2900-replacement-retry-display): decode readiness-unaware persisted retry text. Remove after supported upgrades require the one-shot marker and retained legacy intents are resolved.
 pub(crate) fn replacement_retry_is_legacy_transient_skip(state: &ResumeState) -> bool {
     !state.replacement_legacy_retry_compatibility_done
         && state.error_message.as_deref().is_some_and(|message| {
