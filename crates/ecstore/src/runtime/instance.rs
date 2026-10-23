@@ -114,12 +114,50 @@ impl Drop for NamespaceCommitGuard {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DecommissionPauseRecord {
     pub(crate) reason: String,
-    /// Decommissioned plus failed items when the pool paused.
-    pub(crate) counted_items: usize,
-    /// Consecutive pauses on `reason` without a counted item in between.
+    /// The pool's settled progress when it paused; see
+    /// [`DecommissionCountLedger::progress`].
+    pub(crate) progress: u64,
+    /// Consecutive pauses on `reason` without progress in between.
     pub(crate) repeats: u32,
     /// The watchdog does not relaunch the pool before this instant.
     pub(crate) relaunch_after: Instant,
+}
+
+/// What this instance counted for one decommission generation of a pool.
+///
+/// Progress counters persist only at checkpoints and a resumed pass relists
+/// the bucket, so a retained entry (one whose source stays) is seen again on
+/// every pass. The ledger keeps its counted versions so a relist in the same
+/// process does not count them twice.
+#[derive(Debug, Default)]
+pub(crate) struct DecommissionCountLedger {
+    generation: Option<time::OffsetDateTime>,
+    /// (bucket, object, version id, delete marker) of retained versions.
+    retained: HashSet<(String, String, Option<uuid::Uuid>, bool)>,
+    /// Entries whose source was cleaned up. Only moving an entry off the pool
+    /// advances it; a relisted retained entry cannot.
+    cleaned_entries: u64,
+}
+
+impl DecommissionCountLedger {
+    /// Whether this version is counted now: a retained version once, and a
+    /// cleaned-up version unless it was already counted while retained.
+    pub(crate) fn admit(&mut self, bucket: &str, object: &str, version: (Option<uuid::Uuid>, bool), cleaned: bool) -> bool {
+        let key = (bucket.to_owned(), object.to_owned(), version.0, version.1);
+        if cleaned {
+            !self.retained.remove(&key)
+        } else {
+            self.retained.insert(key)
+        }
+    }
+
+    pub(crate) fn record_cleaned_entry(&mut self) {
+        self.cleaned_entries = self.cleaned_entries.saturating_add(1);
+    }
+
+    pub(crate) fn progress(&self) -> u64 {
+        self.cleaned_entries
+    }
 }
 
 /// Runtime state owned by a single `ECStore` instance.
@@ -237,6 +275,8 @@ pub struct InstanceContext {
     /// index. The worker watchdog backs off relaunching a pool that keeps
     /// pausing on the same cause without progress.
     decommission_pauses: std::sync::Mutex<HashMap<usize, DecommissionPauseRecord>>,
+    /// Per-pool counting ledger of the current decommission generation.
+    decommission_count_ledgers: std::sync::Mutex<HashMap<usize, DecommissionCountLedger>>,
     /// Remote scanner publication leases own a read guard until explicit
     /// release or bounded expiry.  Keeping the guard in storage-owned state
     /// makes a remote movement transition wait on the same fence as a local
@@ -312,6 +352,7 @@ impl InstanceContext {
             data_movement_operation_gate: Arc::new(RwLock::new(())),
             decommission_start_in_flight: AtomicBool::new(false),
             decommission_pauses: std::sync::Mutex::new(HashMap::new()),
+            decommission_count_ledgers: std::sync::Mutex::new(HashMap::new()),
             scanner_publication_leases: Arc::new(Mutex::new(HashMap::new())),
             data_movement_operation_epoch: AtomicU64::new(0),
             data_movement_operation_epoch_exhausted: AtomicBool::new(false),
@@ -411,6 +452,28 @@ impl InstanceContext {
         let record = update(pauses.get(&pool_index));
         pauses.insert(pool_index, record.clone());
         record
+    }
+
+    /// Run `update` on `pool_index`'s counting ledger for `generation`,
+    /// starting a fresh ledger when the generation changed.
+    pub(crate) fn with_decommission_count_ledger<T>(
+        &self,
+        pool_index: usize,
+        generation: time::OffsetDateTime,
+        update: impl FnOnce(&mut DecommissionCountLedger) -> T,
+    ) -> T {
+        let mut ledgers = self
+            .decommission_count_ledgers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ledger = ledgers.entry(pool_index).or_default();
+        if ledger.generation != Some(generation) {
+            *ledger = DecommissionCountLedger {
+                generation: Some(generation),
+                ..Default::default()
+            };
+        }
+        update(ledger)
     }
 
     pub(crate) fn decommission_pause(&self, pool_index: usize) -> Option<DecommissionPauseRecord> {

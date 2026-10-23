@@ -202,20 +202,20 @@ const DECOMMISSION_CANCEL_TARGET_LOCK_MAX_ATTEMPTS: usize = 3;
 const DECOMMISSION_PAUSE_RELAUNCH_BASE: std::time::Duration = std::time::Duration::from_secs(30);
 const DECOMMISSION_PAUSE_RELAUNCH_MAX: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// The pause record after `reason` paused a pool that had counted
-/// `counted_items` items. A pause keeps its exit: the pool is relaunched after
-/// the returned delay, never failed. Only a repeat of the same cause with no
-/// counted item in between grows the delay.
+/// The pause record after `reason` paused a pool whose settled progress is
+/// `progress`. A pause keeps its exit: the pool is relaunched after the
+/// returned delay, never failed. Only a repeat of the same cause without
+/// progress in between grows the delay. Progress is what a resumed pass cannot
+/// redo: completed buckets and entries moved off the pool. Item counters are
+/// not, because a relisted retained entry is seen again on every pass.
 fn next_decommission_pause_record(
     previous: Option<&crate::runtime::instance::DecommissionPauseRecord>,
     reason: &str,
-    counted_items: usize,
+    progress: u64,
     now: tokio::time::Instant,
 ) -> crate::runtime::instance::DecommissionPauseRecord {
     let repeats = match previous {
-        Some(previous) if previous.reason == reason && previous.counted_items == counted_items => {
-            previous.repeats.saturating_add(1)
-        }
+        Some(previous) if previous.reason == reason && previous.progress == progress => previous.repeats.saturating_add(1),
         _ => 1,
     };
     let delay = if repeats < 2 {
@@ -227,7 +227,7 @@ fn next_decommission_pause_record(
     };
     crate::runtime::instance::DecommissionPauseRecord {
         reason: reason.to_owned(),
-        counted_items,
+        progress,
         repeats,
         relaunch_after: now + delay,
     }
@@ -767,6 +767,25 @@ pub(crate) fn local_decommission_queue_prefix(endpoints: &EndpointServerPools, i
     }
 
     Ok(local)
+}
+
+/// Carry `current`'s progress counters for pool `idx` into `snapshot` when
+/// both describe the same decommission generation. Counters only grow within
+/// a generation, so the larger value of each is the newer one.
+fn carry_decommission_progress_counters(snapshot: &mut PoolMeta, current: &PoolMeta, idx: usize) {
+    let (Some(target), Some(source)) = (
+        snapshot.pools.get_mut(idx).and_then(|pool| pool.decommission.as_mut()),
+        current.pools.get(idx).and_then(|pool| pool.decommission.as_ref()),
+    ) else {
+        return;
+    };
+    if target.start_time.is_none() || target.start_time != source.start_time {
+        return;
+    }
+    target.items_decommissioned = target.items_decommissioned.max(source.items_decommissioned);
+    target.items_decommission_failed = target.items_decommission_failed.max(source.items_decommission_failed);
+    target.bytes_done = target.bytes_done.max(source.bytes_done);
+    target.bytes_failed = target.bytes_failed.max(source.bytes_failed);
 }
 
 fn resumable_decommission_queue_indices(meta: &PoolMeta) -> Vec<usize> {
@@ -15790,6 +15809,14 @@ impl ECStore {
         let (pool_meta_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "decommission capacity pause failed")
             .await?;
+        // The pause is a checkpoint too. Without carrying the counters of this
+        // generation, everything counted since the last progress save would
+        // be dropped, and the relisted pass could not tell a version it
+        // already counted from one it never did.
+        {
+            let pool_meta = self.pool_meta.read().await;
+            carry_decommission_progress_counters(&mut snapshot, &pool_meta, idx);
+        }
         snapshot.mark_decommission_capacity_blocked(idx, decommission_pause_reason(err), OffsetDateTime::now_utc())?;
         let outcome = snapshot
             .save_no_lock_armed(
@@ -15800,22 +15827,27 @@ impl ECStore {
             )
             .await?;
         ensure_pool_meta_write_fence(&pool_meta_guard, "decommission capacity pause failed")?;
-        let counted_items = {
+        let (generation, completed_buckets) = {
             let mut pool_meta = self.pool_meta.write().await;
             publish_pool_meta_updates(&mut pool_meta, &outcome.committed, &[idx]);
             pool_meta
                 .pools
                 .get(idx)
                 .and_then(|pool| pool.decommission.as_ref())
-                .map_or(0, PoolDecommissionInfo::counted_items)
+                .map_or((None, 0), |info| (info.start_time, info.decommissioned_buckets.len()))
         };
+        let cleaned_entries = generation.map_or(0, |generation| {
+            self.ctx
+                .with_decommission_count_ledger(idx, generation, |ledger| ledger.progress())
+        });
+        let progress = cleaned_entries.saturating_add(u64::try_from(completed_buckets).unwrap_or(u64::MAX));
         ensure_pool_meta_write_fence(&pool_meta_guard, "decommission capacity pause failed")?;
         outcome.disarm();
         let reason = decommission_pause_reason(err);
         let now = tokio::time::Instant::now();
         let record = self
             .ctx
-            .record_decommission_pause(idx, |previous| next_decommission_pause_record(previous, &reason, counted_items, now));
+            .record_decommission_pause(idx, |previous| next_decommission_pause_record(previous, &reason, progress, now));
         if record.repeats > 1 {
             warn!(
                 event = EVENT_DECOMMISSION_STATE,
@@ -17375,6 +17407,7 @@ impl ECStore {
         let mut cleanup_preflight_vanished = Vec::new();
         let mut cleanup_transferred_tier_versions = Vec::new();
         let mut entry_blocked = false;
+        let mut source_cleaned = false;
 
         for version in fivs.versions.iter() {
             if self.decommission_cancel_requested(idx, &rx).await {
@@ -18221,7 +18254,7 @@ impl ECStore {
                 })
                 .await;
             match cleanup_result {
-                Ok(_) => {}
+                Ok(_) => source_cleaned = true,
                 Err(data_movement::SourceCleanupError::Storage(err)) => {
                     resolve_decommission_entry_cleanup_delete_result(
                         Err::<(), Error>(err),
@@ -18303,9 +18336,19 @@ impl ECStore {
 
             // Versions are counted once their entry settles: copied and cleaned
             // up, or retained. An attempt that is retried, deferred or resumed
-            // after a pause or restart recounts nothing it already counted,
-            // because nothing of it was counted (rustfs/backlog#2873).
-            for (version, size, failure) in pending_counts {
+            // after a pause recounted nothing, because nothing of it was
+            // counted. A retained entry is relisted by every resumed pass; the
+            // ledger counts its versions once per process (rustfs/backlog#2873).
+            let admitted = self.ctx.with_decommission_count_ledger(idx, generation, |ledger| {
+                if source_cleaned {
+                    ledger.record_cleaned_entry();
+                }
+                pending_counts
+                    .into_iter()
+                    .filter(|(version, _, _)| ledger.admit(bucket.as_str(), entry.name.as_str(), *version, source_cleaned))
+                    .collect::<Vec<_>>()
+            });
+            for (version, size, failure) in admitted {
                 if counted_versions.insert(version)
                     && let Err(err) = count_decommission_item(&mut pool_meta, idx, size, failure)
                 {
