@@ -878,37 +878,39 @@ impl DefaultObjectUsecase {
             }
         }
 
-        let deleted = delete_results
-            .iter()
-            .filter_map(|result| result.delete_object.as_ref().map(|object| (result, object)))
-            .map(|(result, object)| DeletedObject {
-                delete_marker: { if object.delete_marker { Some(true) } else { None } },
-                delete_marker_version_id: delete_marker_response_version_id(
-                    object.delete_marker_version_id,
-                    object.delete_marker && result.version_suspended && result.requested_version_id.is_none(),
-                    result.synthetic_version_id,
-                ),
-                key: Some(object.object_name.clone()),
-                version_id: delete_entry_response_version_id(
-                    object.version_id,
-                    object.delete_marker,
-                    result.requested_version_id,
-                    result.synthetic_version_id,
-                ),
-            })
-            .collect();
-        let deleted_cache_keys = delete_results
-            .iter()
-            .filter_map(|result| result.delete_object.as_ref().map(|deleted| deleted.object_name.clone()))
-            .collect::<Vec<_>>();
-        invalidate_object_data_cache_objects_after_delete_success(&cache_adapter, &bucket, deleted_cache_keys.iter()).await;
+        let deleted = (!delete.quiet.unwrap_or_default()).then(|| {
+            delete_results
+                .iter()
+                .filter_map(|result| result.delete_object.as_ref().map(|object| (result, object)))
+                .map(|(result, object)| DeletedObject {
+                    delete_marker: { if object.delete_marker { Some(true) } else { None } },
+                    delete_marker_version_id: delete_marker_response_version_id(
+                        object.delete_marker_version_id,
+                        object.delete_marker && result.version_suspended && result.requested_version_id.is_none(),
+                        result.synthetic_version_id,
+                    ),
+                    key: Some(object.object_name.clone()),
+                    version_id: delete_entry_response_version_id(
+                        object.version_id,
+                        object.delete_marker,
+                        result.requested_version_id,
+                        result.synthetic_version_id,
+                    ),
+                })
+                .collect()
+        });
+        for result in &delete_results {
+            if let Some(deleted) = &result.delete_object {
+                let _ = invalidate_object_data_cache_after_delete_success(&cache_adapter, &bucket, &deleted.object_name).await;
+            }
+        }
 
         let errors = delete_results
             .iter()
             .filter_map(|v| v.error.clone())
             .collect::<Vec<s3s::dto::Error>>();
         let output = DeleteObjectsOutput {
-            deleted: (!delete.quiet.unwrap_or_default()).then_some(deleted),
+            deleted,
             errors: Some(errors),
             ..Default::default()
         };
@@ -992,11 +994,11 @@ impl DefaultObjectUsecase {
                     let event_args = EventArgsBuilder::new(
                         event_name,
                         notify_bucket.clone(),
-                        convert_ecstore_object_info(ObjectInfo {
-                            name: dobj.object_name.clone(),
+                        rustfs_notify::NotifyObjectInfo {
+                            name: dobj.object_name,
                             bucket: notify_bucket.clone(),
                             ..Default::default()
-                        }),
+                        },
                     )
                     .version_id(version_id.unwrap_or_default())
                     .req_params(req_params.clone())
