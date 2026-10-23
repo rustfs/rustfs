@@ -122,17 +122,6 @@ pub(crate) async fn invalidate_object_data_cache_objects_before_mutation<'a, I>(
     invalidate_object_data_cache_objects(adapter, bucket, keys, ObjectDataCacheInvalidationReason::BeforeMutation).await;
 }
 
-/// Invalidates many object identities after successful deletes.
-pub(crate) async fn invalidate_object_data_cache_objects_after_delete_success<'a, I>(
-    adapter: &ObjectDataCacheAdapter,
-    bucket: &str,
-    keys: I,
-) where
-    I: IntoIterator<Item = &'a String>,
-{
-    invalidate_object_data_cache_objects(adapter, bucket, keys, ObjectDataCacheInvalidationReason::AfterDeleteSuccess).await;
-}
-
 /// Invalidates many object identities through the app-layer cache adapter.
 pub(crate) async fn invalidate_object_data_cache_objects<'a, I>(
     adapter: &ObjectDataCacheAdapter,

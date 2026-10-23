@@ -24,6 +24,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::{debug, info, warn};
 
 mod integrity;
+mod validation;
 use integrity::CheckpointJson;
 
 use super::super::storage_api::owner::{EcstoreConditionalFileUpdate, EcstoreDiskAPI, EcstoreDiskBytes};
@@ -350,6 +351,7 @@ impl CheckpointManager {
         };
         let suffix = format!("_{RESUME_CHECKPOINT_BLOCKED_FILE}");
         let mut records = Vec::new();
+        let mut budget = validation::DiagnosticBudget::default();
         for entry in entries {
             let Some(task_id) = entry.strip_suffix(&suffix) else {
                 continue;
@@ -361,6 +363,7 @@ impl CheckpointManager {
                     reason: "invalid_checkpoint_task_id".to_owned(),
                     blocked_at: None,
                     revalidate_after: None,
+                    validation: validation::inspect(disk, task_id, &mut budget).await,
                 });
                 continue;
             }
@@ -386,6 +389,7 @@ impl CheckpointManager {
                     .unwrap_or_else(|| "legacy_or_unreadable_blocked_marker".to_owned()),
                 blocked_at: marker.as_ref().map(|marker| marker.blocked_at),
                 revalidate_after: marker.as_ref().map(|marker| marker.revalidate_after),
+                validation: validation::inspect(disk, task_id, &mut budget).await,
             });
         }
         records.sort_by(|left, right| left.task_id.cmp(&right.task_id));
@@ -612,97 +616,42 @@ impl CheckpointManager {
 
     async fn load_from_data(disk: DiskStore, task_id: &str, checkpoint_data: Vec<u8>) -> Result<Self> {
         validate_resume_task_id(task_id)?;
-        let (mut persisted, mut checkpoint) = match serde_json::from_slice::<ResumeCheckpoint>(&checkpoint_data)
-            .and_then(|checkpoint| serde_json::from_slice::<CheckpointJson>(&checkpoint_data).map(|value| (value, checkpoint)))
-        {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                let error = Error::TaskExecutionFailed {
-                    message: format!("Failed to deserialize checkpoint: {error}"),
-                };
-                Self::block_invalid_snapshot(&disk, task_id, &error.to_string()).await;
-                return Err(error);
+        let prepared = match validation::PreparedCheckpoint::decode(task_id, &checkpoint_data) {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                if failure.block_snapshot {
+                    Self::block_invalid_snapshot(&disk, task_id, &failure.error.to_string()).await;
+                }
+                return Err(failure.error);
             }
         };
-        if checkpoint.task_id != task_id {
-            let error = Error::TaskExecutionFailed {
-                message: "Resume checkpoint task id does not match filename".to_string(),
-            };
-            Self::block_invalid_snapshot(&disk, task_id, &error.to_string()).await;
-            return Err(error);
-        }
-        if checkpoint
-            .dangling_delete_retry_not_before
-            .is_some_and(|deadline| !dangling_delete_deadline_is_representable(deadline))
-        {
-            let error = Error::InvalidCheckpoint("Unrepresentable dangling-delete grace deadline".to_string());
-            Self::block_invalid_snapshot(&disk, task_id, &error.to_string()).await;
-            return Err(error);
-        }
-
-        // Older checkpoints can contain identities that are not comparable to
-        // the current keys or lack their corresponding aggregate counters.
-        // Discard the stale sets and position so the scan restarts cleanly.
-        let supported_schema = if checkpoint.admin.is_some() {
-            ADMIN_CHECKPOINT_SCHEMA
-        } else {
-            CURRENT_CHECKPOINT_SCHEMA
-        };
-        if checkpoint.admin.is_some() && checkpoint.schema_version < ADMIN_CHECKPOINT_SCHEMA {
-            return Err(Error::InvalidCheckpoint("Administrator outcome requires checkpoint schema 8".to_string()));
-        }
-        if checkpoint.schema_version > supported_schema {
-            let error = Error::TaskExecutionFailed {
-                message: format!(
-                    "Checkpoint schema {} is newer than supported schema {supported_schema}",
-                    checkpoint.schema_version
-                ),
-            };
-            Self::block_invalid_snapshot(&disk, task_id, &error.to_string()).await;
-            return Err(error);
-        }
-
-        let integrity_verified = if let Some(expected) = checkpoint.integrity_digest.as_deref() {
-            // Verify the persisted fields: typed defaults can add fields that
-            // were absent from an otherwise intact older signed checkpoint.
-            let mut actual = Self::checkpoint_digest(&persisted.unsigned_bytes()?);
-            if expected != actual {
-                // RUSTFS_COMPAT_TODO(#2871): retain until snapshots whose
-                // payload order differs from their digest order are retired.
-                persisted.sort_all_objects();
-                actual = Self::checkpoint_digest(&persisted.unsigned_bytes()?);
-            }
-            if expected != actual {
-                let error = Error::InvalidCheckpoint(format!("Resume checkpoint digest does not match task {task_id}"));
-                Self::block_invalid_snapshot(&disk, task_id, &error.to_string()).await;
-                return Err(error);
-            }
-            true
-        } else if checkpoint.schema_version >= CHECKPOINT_PER_VERSION_SCHEMA {
-            let error = Error::InvalidCheckpoint(format!("Resume checkpoint digest is missing for task {task_id}"));
-            Self::block_invalid_snapshot(&disk, task_id, &error.to_string()).await;
-            return Err(error);
-        } else {
+        let legacy_digest = if prepared.needs_legacy_digest() {
             let digest_path = Self::digest_path(task_id);
             let digest_path = path_to_str(&digest_path)?;
             match HealDiskExt::read_all(disk.as_ref(), RUSTFS_META_BUCKET, digest_path).await {
-                Ok(expected) => {
-                    let actual = Self::checkpoint_digest(&checkpoint_data);
-                    if expected.as_ref() != actual.as_bytes() {
-                        let error = Error::InvalidCheckpoint(format!("Resume checkpoint digest does not match task {task_id}"));
-                        Self::block_invalid_snapshot(&disk, task_id, &error.to_string()).await;
-                        return Err(error);
-                    }
-                    true
-                }
-                Err(crate::heal::DiskError::FileNotFound) => false,
+                Ok(bytes) => Some(bytes),
+                Err(crate::heal::DiskError::FileNotFound) => None,
                 Err(error) => {
                     return Err(Error::TaskExecutionFailed {
                         message: format!("Failed to read checkpoint digest: {error}"),
                     });
                 }
             }
+        } else {
+            None
         };
+        let validated = match prepared.verify(task_id, &checkpoint_data, legacy_digest.as_deref()) {
+            Ok(validated) => validated,
+            Err(failure) => {
+                if failure.block_snapshot {
+                    Self::block_invalid_snapshot(&disk, task_id, &failure.error.to_string()).await;
+                }
+                return Err(failure.error);
+            }
+        };
+        let mut checkpoint = validated.checkpoint;
+        let supported_schema = validated.supported_schema;
+        let integrity_verified = validated.summary.signature_valid == Some(true);
 
         if checkpoint.schema_version < CHECKPOINT_PER_VERSION_SCHEMA || !integrity_verified {
             warn!(

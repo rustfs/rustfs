@@ -1607,7 +1607,7 @@ impl FolderScanner {
             && let Some(ref updates) = self.updates
         {
             // Try to send without blocking
-            if let Err(e) = updates.send(flat.clone()).await {
+            if let Err(e) = updates.send(flat).await {
                 error!(
                     target: "rustfs::scanner::folder",
                     event = EVENT_SCANNER_FOLDER_STATE,
