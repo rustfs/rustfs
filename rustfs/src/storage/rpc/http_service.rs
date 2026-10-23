@@ -2330,7 +2330,10 @@ mod tests {
             let challenge = uuid::Uuid::new_v4();
             let response = super::ns_scanner_capability_response(challenge, tier, coverage);
             assert_eq!(response.status(), StatusCode::OK);
-            let body = response.into_body().collect().await.expect("capability body").to_bytes();
+            let body = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .expect("capability body")
+                .to_bytes();
             let capability: NsScannerCapabilityResponse = rmp_serde::from_slice(&body).expect("capability response");
             crate::storage::storage_api::ecstore_rpc::verify_ns_scanner_capability_with_checkpoint_coverage(
                 challenge,
