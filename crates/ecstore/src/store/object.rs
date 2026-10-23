@@ -5465,7 +5465,11 @@ impl ECStore {
             if opts.delete_marker && should_check_data_movement_resume_target(opts.src_pool_idx, target_pool_idx) {
                 let source = self
                     .find_data_movement_target_info(bucket, object, opts.src_pool_idx, &opts)
-                    .await?;
+                    .await;
+                #[cfg(test)]
+                let source =
+                    crate::core::pools::decommission_test_wrap_result("delete_marker_source_recheck", bucket, object, 0, source);
+                let source = source.map_err(|err| crate::data_movement::data_movement_source_read_error(bucket, object, err))?;
                 let Some(source) = source else {
                     return Err(StorageError::DataMovementOverwriteErr(
                         bucket.to_owned(),
