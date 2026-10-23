@@ -231,6 +231,11 @@ impl SetDisks {
             }
             .to_string(),
         );
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut fi.metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_STATUS,
+            lifecycle::TRANSITION_COMPLETE.to_string(),
+        );
         for suffix in [
             rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
             rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_WORKER_LOCK,

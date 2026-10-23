@@ -408,6 +408,10 @@ async fn restore_copyback_stays_pending_before_finalization(multipart: bool) {
             .expect("copy-back must retain restore metadata"),
     )
     .expect("pending restore status should parse");
+    assert_eq!(
+        pending.transitioned_object.status, TRANSITION_PENDING,
+        "copy-back must advertise local data to older peers until restore finalization"
+    );
     // Evaluate beyond any pre-copy deadline without sleeping or advancing the
     // process clock. Pending copy-back must never become a restore-expiry candidate.
     let lifecycle = PersistedLifecycleConfiguration::default();
@@ -416,6 +420,19 @@ async fn restore_copyback_stays_pending_before_finalization(multipart: bool) {
         .eval_inner(&pending.to_lifecycle_opts(), expiry_evaluation_time, 0)
         .await
         .action;
+
+    backend.set_unreachable(true).await;
+    let mut restored_before_finalization = Vec::new();
+    set_disks
+        .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+        .await
+        .expect("pending copy-back must be readable locally before metadata finalization")
+        .stream
+        .read_to_end(&mut restored_before_finalization)
+        .await
+        .expect("pending local body should drain");
+    assert_eq!(restored_before_finalization, payload, "pending local copy must preserve every byte");
+
     barrier.release();
     tokio::time::timeout(Duration::from_secs(30), restore)
         .await
@@ -453,6 +470,10 @@ async fn restore_copyback_stays_pending_before_finalization(multipart: bool) {
         .get_object_info(bucket, object, &ObjectOptions::default())
         .await
         .expect("finalized metadata should be readable");
+    assert_eq!(
+        completed.transitioned_object.status, TRANSITION_COMPLETE,
+        "finalization must restore the completed transition state"
+    );
     let completed_status = parse_restore_obj_status(
         completed
             .user_defined
