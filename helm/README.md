@@ -176,6 +176,7 @@ behavior.
 | config.rustfs.scanner.bitrot_cycle_secs | string | `""` | Override periodic deep bitrot cycle with `RUSTFS_SCANNER_BITROT_CYCLE_SECS`; `false`, `off`, `no`, or `disabled` disables it. |
 | config.rustfs.scanner.idle_mode | string | `""` | Override scanner idle throttling flag (`RUSTFS_SCANNER_IDLE_MODE`). |
 | config.rustfs.scanner.cache_save_timeout_secs | string | `""` | Override scanner cache save timeout in seconds with `RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS` (minimum `1`). |
+| config.rustfs.scanner.recovery_backoff_cap_secs | string | `""` | Cap the wait between automatic scanner startup recovery retries in seconds with `RUSTFS_SCANNER_RECOVERY_BACKOFF_CAP_SECS` (positive integer; default `600`). |
 | config.rustfs.scanner.max_concurrent_set_scans | string | `""` | Cap concurrent scanner set tasks with `RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS` (`0` keeps topology-derived concurrency). |
 | config.rustfs.scanner.max_concurrent_disk_scans | string | `""` | Cap concurrent scanner disk bucket walks per set with `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` (`0` keeps disk-count-derived concurrency). |
 | config.rustfs.scanner.walkers_per_disk | string | `""` | Bucket walkers per local disk with `RUSTFS_SCANNER_WALKERS_PER_DISK` (`1` to `16`; the default `1` keeps one bucket walk per disk, raise it on flash so one disk walks several buckets concurrently). |

@@ -124,6 +124,9 @@ data:
     {{- if ne (toString .cache_save_timeout_secs) "" }}
   RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS: {{ .cache_save_timeout_secs | quote }}
     {{- end }}
+    {{- if ne (toString .recovery_backoff_cap_secs) "" }}
+  RUSTFS_SCANNER_RECOVERY_BACKOFF_CAP_SECS: {{ .recovery_backoff_cap_secs | quote }}
+    {{- end }}
     {{- if ne (toString .max_concurrent_set_scans) "" }}
   RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS: {{ .max_concurrent_set_scans | quote }}
     {{- end }}

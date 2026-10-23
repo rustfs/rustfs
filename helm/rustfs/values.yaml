@@ -191,6 +191,8 @@ config:
       idle_mode: ""
       # Timeout for scanner cache saves in seconds (minimum 1 second)
       cache_save_timeout_secs: ""
+      # Cap on the wait between automatic scanner startup recovery retries in seconds (positive; default 600)
+      recovery_backoff_cap_secs: ""
       # Cap concurrent scanner set tasks (0 keeps topology-derived concurrency)
       max_concurrent_set_scans: ""
       # Cap concurrent scanner disk bucket walks per set (0 keeps disk-count-derived concurrency)

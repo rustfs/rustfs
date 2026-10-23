@@ -34,8 +34,27 @@ env -u CARGO_TARGET_DIR bash "$RUNNER" \
   --sha256 "$VALID_SHA" \
   --repository rustfs/rustfs >"$TMP_DIR/dry-run.out"
 
-rg -q "upgrade_compatibility_test::rolling_upgrade_from_rc2_preserves_mixed_version_contracts" "$TMP_DIR/dry-run.out"
-rg -q "upgrade_compatibility_test::rollback_to_previous_release_reads_current_bucket_metadata" "$TMP_DIR/dry-run.out"
+python3 - "$PROJECT_ROOT/crates/e2e_test/src/upgrade_compatibility_test.rs" "$TMP_DIR/dry-run.out" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+source = Path(sys.argv[1])
+declarations = re.findall(
+    r"(?m)^#\[tokio::test\]\n((?:#\[[^\n]*\]\n)*)async fn (\w+)\(\)",
+    source.read_text(),
+)
+plan = Path(sys.argv[2]).read_text()
+filter_section = plan.split("test_filters:\n", 1)[1].split("required_artifacts:\n", 1)[0]
+filters = re.findall(r"(?m)^  [^:\n]+: (\S+)$", filter_section)
+if len(filters) != 2:
+    raise SystemExit("G09 all-case plan must select two tests")
+for selector in filters:
+    matches = [attributes for attributes, name in declarations if selector == f"{source.stem}::{name}"]
+    if len(matches) != 1 or not re.search(r"(?m)^#\[ignore(?:\s*=|\])", matches[0]):
+        raise SystemExit(f"G09 filter does not select exactly one ignored test: {selector}")
+    print(f"PASS: G09 filter selects an ignored test: {selector}")
+PY
 rg -q "$TMP_DIR/evidence/mixed-version-upgrade/G09-mixed_version_writer_evidence.json" "$TMP_DIR/dry-run.out"
 rg -q "target_dir=$PROJECT_ROOT/target" "$TMP_DIR/dry-run.out"
 rg -q "https://github.com/rustfs/rustfs/releases/download/1.2.3/rustfs-linux-x86_64-gnu-v1.2.3.zip" "$TMP_DIR/dry-run.out"

@@ -291,7 +291,7 @@ pub(crate) struct DataUsageCacheReuseOptions {
     pub(crate) checkpoint_identity: Option<crate::DataUsageScanIdentity>,
     /// The coverage plan a sweep is started and resumed under
     /// (`scanner_activity_coverage_digest`); `None` resumes under the reuse
-    /// plan itself, as a remote worker does with the single digest on the wire.
+    /// plan itself for requests from older remote coordinators.
     pub(crate) checkpoint_plan_digest: Option<DataUsageScanPlanDigest>,
 }
 

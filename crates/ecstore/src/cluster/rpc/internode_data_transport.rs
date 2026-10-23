@@ -13,18 +13,19 @@
 // limitations under the License.
 
 use crate::cluster::rpc::{
-    build_auth_headers, build_put_file_auth_trailer, verify_ns_scanner_capability_with_tier_registry_generation,
-    verify_put_file_capability,
+    build_auth_headers, build_put_file_auth_trailer, verify_ns_scanner_capability_with_checkpoint_coverage,
+    verify_ns_scanner_capability_with_tier_registry_generation, verify_put_file_capability,
 };
 use crate::disk::error::{Error, Result};
 use crate::disk::{FileReader, FileWriter};
 use crate::storage_api_contracts::internode::{
-    NS_SCANNER_BODY_SHA256_QUERY, NS_SCANNER_CAPABILITY_CHALLENGE_QUERY, NS_SCANNER_CYCLE_QUERY, NS_SCANNER_LEADER_EPOCH_QUERY,
-    NS_SCANNER_PROTOCOL_VERSION, NS_SCANNER_PROTOCOL_VERSION_QUERY, NS_SCANNER_REQUEST_ID_QUERY, NS_SCANNER_SERVER_EPOCH_QUERY,
-    NS_SCANNER_SESSION_ID_QUERY, NS_SCANNER_SESSION_SEQUENCE_QUERY, NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY,
-    NsScannerCapabilityResponse, PUT_FILE_AUTH_QUERY, PUT_FILE_AUTH_V1, PUT_FILE_CAPABILITY_CHALLENGE_QUERY,
-    PUT_FILE_CAPABILITY_QUERY, PUT_FILE_CAPABILITY_VERSION, PUT_FILE_NONCE_QUERY, PUT_FILE_SERVER_EPOCH_QUERY,
-    PutFileCapabilityResponse, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_STREAM_COMPLETION_QUERY, WALK_DIR_STREAM_COMPLETION_V1,
+    NS_SCANNER_BODY_SHA256_QUERY, NS_SCANNER_CAPABILITY_CHALLENGE_QUERY, NS_SCANNER_CHECKPOINT_COVERAGE_QUERY,
+    NS_SCANNER_CYCLE_QUERY, NS_SCANNER_LEADER_EPOCH_QUERY, NS_SCANNER_PROTOCOL_VERSION, NS_SCANNER_PROTOCOL_VERSION_QUERY,
+    NS_SCANNER_REQUEST_ID_QUERY, NS_SCANNER_SERVER_EPOCH_QUERY, NS_SCANNER_SESSION_ID_QUERY, NS_SCANNER_SESSION_SEQUENCE_QUERY,
+    NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY, NsScannerCapabilityResponse, PUT_FILE_AUTH_QUERY, PUT_FILE_AUTH_V1,
+    PUT_FILE_CAPABILITY_CHALLENGE_QUERY, PUT_FILE_CAPABILITY_QUERY, PUT_FILE_CAPABILITY_VERSION, PUT_FILE_NONCE_QUERY,
+    PUT_FILE_SERVER_EPOCH_QUERY, PutFileCapabilityResponse, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_STREAM_COMPLETION_QUERY,
+    WALK_DIR_STREAM_COMPLETION_V1,
 };
 use async_trait::async_trait;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
@@ -250,6 +251,7 @@ pub struct NsScannerStreamRequest {
 pub struct NsScannerCapabilityRequest {
     pub endpoint: String,
     pub supports_tier_registry_generation: bool,
+    pub supports_checkpoint_coverage: bool,
 }
 
 /// Data-plane stream opener used by `RemoteDisk`.
@@ -289,6 +291,7 @@ pub trait InternodeDataTransport: Send + Sync + std::fmt::Debug {
             server_epoch,
             proof: Vec::new(),
             supports_tier_registry_generation: None,
+            supports_checkpoint_coverage: None,
         })
     }
     // Interface facet nobody calls yet: every transport implements both, but no
@@ -379,6 +382,18 @@ impl InternodeDataTransport for TcpHttpInternodeDataTransport {
     }
 
     async fn probe_ns_scanner_capability(&self, request: NsScannerCapabilityRequest) -> Result<NsScannerCapabilityResponse> {
+        let request = if request.supports_checkpoint_coverage {
+            match self.probe_ns_scanner_capability_once(&request).await {
+                Ok(response) => return Ok(response),
+                Err(error) if ns_scanner_capability_error_allows_legacy(&error) => NsScannerCapabilityRequest {
+                    supports_checkpoint_coverage: false,
+                    ..request
+                },
+                Err(error) => return Err(error),
+            }
+        } else {
+            request
+        };
         if request.supports_tier_registry_generation {
             return match self.probe_ns_scanner_capability_once(&request).await {
                 Ok(response) => Ok(response),
@@ -390,6 +405,7 @@ impl InternodeDataTransport for TcpHttpInternodeDataTransport {
                     let legacy_request = NsScannerCapabilityRequest {
                         endpoint: request.endpoint.clone(),
                         supports_tier_registry_generation: false,
+                        supports_checkpoint_coverage: false,
                     };
                     match self.probe_ns_scanner_capability_once(&legacy_request).await {
                         Ok(mut response) => {
@@ -447,18 +463,32 @@ impl TcpHttpInternodeDataTransport {
         if response.version != NS_SCANNER_PROTOCOL_VERSION || response.server_epoch.is_nil() {
             return Err(Error::other("incompatible remote namespace scanner capability response"));
         }
-        if let Err(err) = verify_ns_scanner_capability_with_tier_registry_generation(
+        if let Err(err) = verify_ns_scanner_capability_with_checkpoint_coverage(
             challenge,
             response.server_epoch,
             &response.proof,
             request.supports_tier_registry_generation,
+            request.supports_checkpoint_coverage,
         ) {
+            if request.supports_checkpoint_coverage
+                && verify_ns_scanner_capability_with_tier_registry_generation(
+                    challenge,
+                    response.server_epoch,
+                    &response.proof,
+                    request.supports_tier_registry_generation,
+                )
+                .is_ok()
+            {
+                normalize_ns_scanner_capability_response(&mut response, request.supports_tier_registry_generation, false);
+                return Ok(response);
+            }
             // A permissive older peer can ignore the additive marker and
             // return a valid legacy-scope proof with HTTP 200. Accept that
             // response only after independently authenticating the legacy
             // scope; all other verification failures remain fail-closed.
             if request.supports_tier_registry_generation && ns_scanner_capability_legacy_proof_is_valid(challenge, &response) {
                 response.supports_tier_registry_generation = None;
+                response.supports_checkpoint_coverage = None;
                 return Ok(response);
             }
             return Err(Error::other(format!("remote namespace scanner capability authentication failed: {err}")));
@@ -468,7 +498,11 @@ impl TcpHttpInternodeDataTransport {
         // verified scope so an intermediary cannot strip or rewrite the field
         // and force a silent downgrade after a successful generation-bound
         // handshake.
-        normalize_ns_scanner_capability_response(&mut response, request.supports_tier_registry_generation);
+        normalize_ns_scanner_capability_response(
+            &mut response,
+            request.supports_tier_registry_generation,
+            request.supports_checkpoint_coverage,
+        );
         Ok(response)
     }
 
@@ -798,8 +832,13 @@ fn build_walk_dir_url(request: &WalkDirStreamRequest) -> String {
     )
 }
 
-fn normalize_ns_scanner_capability_response(response: &mut NsScannerCapabilityResponse, requested_generation_support: bool) {
+fn normalize_ns_scanner_capability_response(
+    response: &mut NsScannerCapabilityResponse,
+    requested_generation_support: bool,
+    requested_checkpoint_coverage: bool,
+) {
     response.supports_tier_registry_generation = requested_generation_support.then_some(true);
+    response.supports_checkpoint_coverage = requested_checkpoint_coverage.then_some(true);
 }
 
 fn ns_scanner_capability_legacy_proof_is_valid(challenge: Uuid, response: &NsScannerCapabilityResponse) -> bool {
@@ -832,7 +871,7 @@ fn build_ns_scanner_url(request: &NsScannerStreamRequest) -> String {
 
 fn build_ns_scanner_capability_url(request: &NsScannerCapabilityRequest, challenge: Uuid) -> String {
     format!(
-        "{}{}?{}={}&{}={}{}",
+        "{}{}?{}={}&{}={}{}{}",
         request.endpoint,
         NS_SCANNER_PATH,
         NS_SCANNER_PROTOCOL_VERSION_QUERY,
@@ -841,6 +880,11 @@ fn build_ns_scanner_capability_url(request: &NsScannerCapabilityRequest, challen
         challenge,
         if request.supports_tier_registry_generation {
             format!("&{}=true", NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY)
+        } else {
+            String::new()
+        },
+        if request.supports_checkpoint_coverage {
+            format!("&{}=true", NS_SCANNER_CHECKPOINT_COVERAGE_QUERY)
         } else {
             String::new()
         }
@@ -1001,6 +1045,7 @@ mod tests {
             .probe_ns_scanner(NsScannerCapabilityRequest {
                 endpoint: "http://node1:9000".to_string(),
                 supports_tier_registry_generation: false,
+                supports_checkpoint_coverage: false,
             })
             .await
             .expect_err("legacy transport should report namespace scanner as unsupported");
@@ -1025,6 +1070,97 @@ mod tests {
             Err(err) => err,
         };
         assert!(matches!(open_err, Error::MethodNotAllowed));
+    }
+
+    #[tokio::test]
+    async fn namespace_scanner_checkpoint_capability_authenticates_new_and_legacy_peers() {
+        crate::runtime::sources::ensure_test_rpc_secret();
+        for peer in ["current", "strict-old", "permissive-old", "invalid-proof", "missing-proof"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("capability listener");
+            let address = listener.local_addr().expect("capability listener address");
+            let server_epoch = Uuid::new_v4();
+            let server = tokio::spawn(async move {
+                let requests = if peer == "strict-old" { 2 } else { 1 };
+                for index in 0..requests {
+                    let (mut socket, _) = listener.accept().await.expect("capability request");
+                    let mut bytes = Vec::new();
+                    while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let mut chunk = [0; 1024];
+                        let read = socket.read(&mut chunk).await.expect("capability headers");
+                        assert!(read > 0 && bytes.len() < 16 * 1024, "bounded complete capability headers");
+                        bytes.extend_from_slice(&chunk[..read]);
+                    }
+                    let request = std::str::from_utf8(&bytes).expect("HTTP headers");
+                    let target = request.split_whitespace().nth(1).expect("HTTP request target");
+                    let url = reqwest::Url::parse(&format!("http://{address}{target}")).expect("capability URL");
+                    let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+                    assert_eq!(query.get(NS_SCANNER_TIER_REGISTRY_GENERATION_QUERY).map(String::as_str), Some("true"));
+                    assert_eq!(query.contains_key(NS_SCANNER_CHECKPOINT_COVERAGE_QUERY), index == 0);
+                    if peer == "strict-old" && index == 0 {
+                        socket
+                            .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                            .await
+                            .expect("legacy parser rejection");
+                        continue;
+                    }
+                    let challenge = query[NS_SCANNER_CAPABILITY_CHALLENGE_QUERY].parse().expect("challenge UUID");
+                    let proof = match peer {
+                        "invalid-proof" => vec![0; 32],
+                        "missing-proof" => Vec::new(),
+                        _ => crate::cluster::rpc::sign_ns_scanner_capability_with_checkpoint_coverage(
+                            challenge,
+                            server_epoch,
+                            true,
+                            peer == "current",
+                        )
+                        .expect("server capability proof"),
+                    };
+                    let body = rmp_serde::to_vec_named(&NsScannerCapabilityResponse {
+                        version: NS_SCANNER_PROTOCOL_VERSION,
+                        server_epoch,
+                        proof,
+                        supports_tier_registry_generation: Some(true),
+                        // Strip a supported bit, or forge it for an older peer.
+                        supports_checkpoint_coverage: (peer != "current").then_some(true),
+                    })
+                    .expect("capability response");
+                    socket
+                        .write_all(
+                            format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes(),
+                        )
+                        .await
+                        .expect("capability response headers");
+                    socket.write_all(&body).await.expect("capability response body");
+                }
+                requests
+            });
+            let response = tokio::time::timeout(
+                Duration::from_secs(10),
+                TcpHttpInternodeDataTransport.probe_ns_scanner_capability(NsScannerCapabilityRequest {
+                    endpoint: format!("http://{address}"),
+                    supports_tier_registry_generation: true,
+                    supports_checkpoint_coverage: true,
+                }),
+            )
+            .await
+            .expect("bounded capability probe");
+            if peer.ends_with("proof") {
+                assert!(
+                    response
+                        .expect_err("unverified capability must fail closed")
+                        .to_string()
+                        .contains("authentication failed")
+                );
+            } else {
+                let response = response.expect("authenticated capability");
+                assert_eq!(response.server_epoch, server_epoch);
+                assert_eq!(response.supports_tier_registry_generation, Some(true));
+                assert_eq!(response.supports_checkpoint_coverage, (peer == "current").then_some(true));
+            }
+            assert_eq!(server.await.expect("capability server"), if peer == "strict-old" { 2 } else { 1 });
+        }
     }
 
     #[tokio::test]
@@ -1769,6 +1905,7 @@ mod tests {
             &NsScannerCapabilityRequest {
                 endpoint: "http://node1:9000".to_string(),
                 supports_tier_registry_generation: false,
+                supports_checkpoint_coverage: false,
             },
             challenge,
         );
@@ -1788,6 +1925,7 @@ mod tests {
             &NsScannerCapabilityRequest {
                 endpoint: "http://node1:9000".to_string(),
                 supports_tier_registry_generation: true,
+                supports_checkpoint_coverage: false,
             },
             challenge,
         );
@@ -1826,13 +1964,14 @@ mod tests {
             server_epoch: Uuid::new_v4(),
             proof: Vec::new(),
             supports_tier_registry_generation: None,
+            supports_checkpoint_coverage: None,
         };
 
-        normalize_ns_scanner_capability_response(&mut response, true);
+        normalize_ns_scanner_capability_response(&mut response, true, true);
         assert_eq!(response.supports_tier_registry_generation, Some(true));
 
         response.supports_tier_registry_generation = Some(false);
-        normalize_ns_scanner_capability_response(&mut response, false);
+        normalize_ns_scanner_capability_response(&mut response, false, false);
         assert_eq!(response.supports_tier_registry_generation, None);
     }
 
@@ -1846,6 +1985,7 @@ mod tests {
             proof: crate::cluster::rpc::sign_ns_scanner_capability(challenge, Uuid::new_v4())
                 .expect("placeholder proof should be generated"),
             supports_tier_registry_generation: None,
+            supports_checkpoint_coverage: None,
         };
         // A proof bound to a different challenge cannot authorize the legacy
         // fallback, even though the response has the expected shape.

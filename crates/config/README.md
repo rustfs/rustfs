@@ -134,6 +134,7 @@ when restoring `/rustfs/console` for a custom OEM build.
 - `RUSTFS_DATA_SCANNER_START_DELAY_SECS` (deprecated alias for compatibility)
 - `RUSTFS_SCANNER_IDLE_MODE` (canonical)
 - `RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS` (canonical)
+- `RUSTFS_SCANNER_RECOVERY_BACKOFF_CAP_SECS` (canonical)
 - `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` (canonical)
 - `RUSTFS_SCANNER_CYCLE_MAX_OBJECTS` (canonical)
 - `RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES` (canonical)
@@ -145,6 +146,12 @@ Scanner cycle budget controls:
 
 - When `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` is unset, the finite default is 1800 seconds (30 minutes), matching the scanner benchmark guidance.
 - An explicit `0` preserves the compatibility behavior of an unbounded runtime budget. Object and directory budgets likewise remain unbounded when explicitly set to `0`.
+
+Scanner recovery retry controls:
+
+- `RUSTFS_SCANNER_RECOVERY_BACKOFF_CAP_SECS` caps the wait between automatic startup recovery retries. The persistent admin key is `scanner.recovery_backoff_cap`; the environment takes precedence over the persistent value, and the unset default remains 600 seconds (10 minutes). Values must be positive integer seconds within the platform timer range; `0`, malformed values, and overflow are rejected. A valid environment override does not hide an invalid persistent value from `admin config set` validation.
+- The cap bounds the existing exponential retry schedule. Updating the persistent value applies to the next computed retry; it does not reschedule a wait already in progress. Retryable observations continue retrying after the short retry budget. Admin scanner status reports the effective value and source at `runtime_config.recovery_backoff_cap_seconds`.
+
 Scanner walker controls:
 
 - `RUSTFS_SCANNER_WALKERS_PER_DISK` sets how many bucket walkers each local disk of an erasure set runs; the default `1` walks one bucket per disk at a time, which is the right value for rotational media. On flash, `2` to `4` lets one disk walk several buckets concurrently, which matters most for single-disk deployments with many buckets, where the walk is otherwise fully serial. Values outside `1` through `16` are rejected by `admin config set`; an out-of-range or non-numeric environment value is logged as a scanner runtime config error (`state = "startup_apply_failed"`) and the scanner keeps the default. The walkers of one disk share that disk's scanner admission, so peers still see one scan session per physical disk, and `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` still caps the total.

@@ -128,7 +128,7 @@ artifact_for() {
 test_filter_for() {
     case "$1" in
         mixed-version)
-            echo "upgrade_compatibility_test::rolling_upgrade_from_rc2_preserves_mixed_version_contracts"
+            echo "upgrade_compatibility_test::rolling_upgrade_from_previous_release_preserves_mixed_version_contracts"
             ;;
         rollback)
             echo "upgrade_compatibility_test::rollback_to_previous_release_reads_current_bucket_metadata"

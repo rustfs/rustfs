@@ -275,9 +275,9 @@ use crate::app::object_data_cache::{
     fill_get_object_body_cache_from_buffered_body, fill_get_object_body_cache_from_materialized_body,
     invalidate_object_data_cache_after_copy_success, invalidate_object_data_cache_after_delete_success,
     invalidate_object_data_cache_after_put_success, invalidate_object_data_cache_before_mutation,
-    invalidate_object_data_cache_objects_after_delete_success, invalidate_object_data_cache_objects_before_mutation,
-    invalidate_object_data_cache_prefix_after_delete, invalidate_object_data_cache_prefix_before_mutation,
-    lookup_get_object_body_cache_hit, lookup_preplanned_get_object_body_cache_hook,
+    invalidate_object_data_cache_objects_before_mutation, invalidate_object_data_cache_prefix_after_delete,
+    invalidate_object_data_cache_prefix_before_mutation, lookup_get_object_body_cache_hit,
+    lookup_preplanned_get_object_body_cache_hook,
 };
 #[cfg(test)]
 use crate::app::object_data_cache::{ColdFillRole, ColdFillWaitOutcome, scope_cold_fill_disk_permit_owner_for_test};

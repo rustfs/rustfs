@@ -53,6 +53,9 @@ pub const SCANNER_IDLE_MODE: &str = "idle_mode";
 /// Scanner config key controlling scanner cache save timeout in seconds.
 pub const SCANNER_CACHE_SAVE_TIMEOUT: &str = "cache_save_timeout";
 
+/// Scanner config key capping automatic recovery retry waits in seconds.
+pub const SCANNER_RECOVERY_BACKOFF_CAP: &str = "recovery_backoff_cap";
+
 /// Scanner config key capping concurrent scanner set tasks.
 pub const SCANNER_MAX_CONCURRENT_SET_SCANS: &str = "max_concurrent_set_scans";
 
@@ -93,6 +96,7 @@ pub const SCANNER_KEYS: &[&str] = &[
     SCANNER_BITROT_CYCLE,
     SCANNER_IDLE_MODE,
     SCANNER_CACHE_SAVE_TIMEOUT,
+    SCANNER_RECOVERY_BACKOFF_CAP,
     SCANNER_MAX_CONCURRENT_SET_SCANS,
     SCANNER_MAX_CONCURRENT_DISK_SCANS,
     SCANNER_WALKERS_PER_DISK,
@@ -215,6 +219,14 @@ pub const ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS: &str = "RUSTFS_SCANNER_CACHE_SAVE
 
 /// Default scanner cache save timeout in seconds.
 pub const DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS: u64 = 14;
+
+/// Environment variable that caps automatic scanner recovery retry waits.
+/// The value must be a positive integer number of seconds within the timer range.
+/// - Example: `export RUSTFS_SCANNER_RECOVERY_BACKOFF_CAP_SECS=600`
+pub const ENV_SCANNER_RECOVERY_BACKOFF_CAP_SECS: &str = "RUSTFS_SCANNER_RECOVERY_BACKOFF_CAP_SECS";
+
+/// Default maximum wait between automatic scanner recovery retries.
+pub const DEFAULT_SCANNER_RECOVERY_BACKOFF_CAP_SECS: u64 = 10 * 60;
 
 /// Environment variable that caps concurrent scanner set tasks.
 /// A value of `0` keeps the existing topology-based concurrency.

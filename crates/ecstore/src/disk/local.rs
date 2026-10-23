@@ -273,6 +273,169 @@ fn read_all_data_std(
     Ok((bytes, modtime))
 }
 
+fn read_metadata_only_std(opened: std::io::Result<std::fs::File>) -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
+    let mut f = opened.map_err(to_file_error)?;
+
+    let meta = f.metadata().map_err(to_file_error)?;
+
+    if meta.is_dir() {
+        return Err(Error::FileNotFound);
+    }
+
+    let size = usize::try_from(meta.len()).map_err(Error::other)?;
+
+    let data = read_xl_meta_no_data_sync(&mut f, size)?;
+
+    let modtime = match meta.modified() {
+        Ok(md) => Some(OffsetDateTime::from(md)),
+        Err(_) => None,
+    };
+
+    Ok((data, modtime))
+}
+
+const MAX_METADATA_READ_WORKERS_PER_DISK: usize = 2;
+
+type ReadAllDataResult = core::result::Result<(Vec<u8>, Option<OffsetDateTime>), ReadAllError>;
+type ReadMetadataOnlyResult = Result<(Vec<u8>, Option<OffsetDateTime>)>;
+
+enum MetadataReadOp {
+    ReadAll {
+        tx: tokio::sync::oneshot::Sender<ReadAllDataResult>,
+    },
+    ReadMetadataOnly {
+        tx: tokio::sync::oneshot::Sender<ReadMetadataOnlyResult>,
+    },
+    #[cfg(test)]
+    TestCustom {
+        is_closed: Box<dyn Fn() -> bool + Send>,
+        run: Box<dyn FnOnce() + Send>,
+    },
+}
+
+struct MetadataReadJob {
+    path: PathBuf,
+    io_permit: Option<DiskIoPermit>,
+    op: MetadataReadOp,
+}
+
+impl MetadataReadJob {
+    #[inline]
+    fn is_cancelled(&self) -> bool {
+        match &self.op {
+            MetadataReadOp::ReadAll { tx } => tx.is_closed(),
+            MetadataReadOp::ReadMetadataOnly { tx } => tx.is_closed(),
+            #[cfg(test)]
+            MetadataReadOp::TestCustom { is_closed, .. } => is_closed(),
+        }
+    }
+
+    #[inline]
+    fn execute(self, root: &os::PublicationRoot) {
+        if self.is_cancelled() {
+            return;
+        }
+        let _io_permit = self.io_permit;
+        match self.op {
+            MetadataReadOp::ReadAll { tx } => {
+                let _ = tx.send(read_all_data_std(root.open_readonly(&self.path)));
+            }
+            MetadataReadOp::ReadMetadataOnly { tx } => {
+                let _ = tx.send(read_metadata_only_std(root.open_readonly(&self.path)));
+            }
+            #[cfg(test)]
+            MetadataReadOp::TestCustom { run, .. } => run(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct MetadataReadQueueState {
+    jobs: std::collections::VecDeque<MetadataReadJob>,
+    active_workers: usize,
+}
+
+struct MetadataReadQueue {
+    root: os::PublicationRoot,
+    state: ParkingLotMutex<MetadataReadQueueState>,
+}
+
+struct MetadataReadWorkerGuard {
+    queue: Arc<MetadataReadQueue>,
+    disarmed: bool,
+}
+
+impl Drop for MetadataReadWorkerGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        let should_respawn = {
+            let mut state = self.queue.state.lock();
+            state.active_workers = state.active_workers.saturating_sub(1);
+            if !state.jobs.is_empty() && state.active_workers < MAX_METADATA_READ_WORKERS_PER_DISK {
+                state.active_workers += 1;
+                true
+            } else {
+                false
+            }
+        };
+        if should_respawn {
+            MetadataReadQueue::spawn_worker(Arc::clone(&self.queue));
+        }
+    }
+}
+
+impl MetadataReadQueue {
+    fn new(root: os::PublicationRoot) -> Arc<Self> {
+        Arc::new(Self {
+            root,
+            state: ParkingLotMutex::new(MetadataReadQueueState::default()),
+        })
+    }
+
+    fn enqueue(self: &Arc<Self>, job: MetadataReadJob) {
+        let should_spawn = {
+            let mut state = self.state.lock();
+            state.jobs.push_back(job);
+            if state.active_workers < MAX_METADATA_READ_WORKERS_PER_DISK {
+                state.active_workers += 1;
+                true
+            } else {
+                false
+            }
+        };
+        if should_spawn {
+            Self::spawn_worker(Arc::clone(self));
+        }
+    }
+
+    fn spawn_worker(queue: Arc<Self>) {
+        drop(tokio::task::spawn_blocking(move || {
+            let mut guard = MetadataReadWorkerGuard {
+                queue: Arc::clone(&queue),
+                disarmed: false,
+            };
+            loop {
+                let Some(job) = ({
+                    let mut state = queue.state.lock();
+                    match state.jobs.pop_front() {
+                        Some(job) => Some(job),
+                        None => {
+                            state.active_workers = state.active_workers.saturating_sub(1);
+                            guard.disarmed = true;
+                            None
+                        }
+                    }
+                }) else {
+                    return;
+                };
+                job.execute(&queue.root);
+            }
+        }));
+    }
+}
+
 /// Reads the `xl.meta` header/metadata envelope and 5-byte CRC for directory
 /// walks (matching `read_xl_meta_no_data_sync`) without reading trailing
 /// `InlineData` object bodies. If the header or metadata envelope is corrupt or
@@ -5586,6 +5749,7 @@ pub struct LocalDisk {
     exit_signal: Option<tokio::sync::broadcast::Sender<()>>,
     io_backend: Arc<dyn LocalIoBackend>,
     file_sync_permits: Arc<Semaphore>,
+    metadata_read_queue: Arc<MetadataReadQueue>,
     snapshot_leases: Arc<ParkingLotMutex<SnapshotLeaseRegistry>>,
 }
 
@@ -6041,6 +6205,7 @@ impl LocalDisk {
 
         // TODO(backlog): add O_DIRECT I/O support for performance-critical paths
         // TODO(backlog): populate DiskInfo in constructor
+        let metadata_read_queue = MetadataReadQueue::new(publication_root.clone());
         let mut disk = Self {
             root: root.clone(),
             publication_root,
@@ -6071,6 +6236,7 @@ impl LocalDisk {
             exit_signal: None,
             io_backend: build_local_io_backend(io_root.clone()).await,
             file_sync_permits: os::disk_file_sync_limiter(&root),
+            metadata_read_queue,
             snapshot_leases: Arc::new(ParkingLotMutex::new(SnapshotLeaseRegistry::default())),
         };
         let (info, _root) = get_disk_info(root.clone()).await.inspect_err(|err| {
@@ -6561,6 +6727,26 @@ impl LocalDisk {
         }
         #[cfg(not(target_os = "linux"))]
         self.io_get_object_path(bucket, key)
+    }
+
+    /// Only for operations that open through PublicationRoot or a commit guard:
+    /// containment and symlink checks happen with the actual open, off the runtime.
+    fn io_get_bucket_and_object_open_path(&self, bucket: &str, key: &str) -> Result<(PathBuf, PathBuf)> {
+        #[cfg(target_os = "linux")]
+        {
+            let (bucket_path, path) = build_local_disk_object_path(self.io_root(), bucket, key);
+            let normalized = check_local_disk_object_path_components(self.io_root(), &bucket_path, &path)?;
+            if matches!(normalized, std::borrow::Cow::Owned(_)) {
+                reject_local_disk_symlink_components_at(self.io_root(), &self.mount_lease, &normalized)?;
+            }
+            Ok((bucket_path, path))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let path = self.io_get_object_path(bucket, key)?;
+            let bucket_path = self.io_get_bucket_path(bucket)?;
+            Ok((bucket_path, path))
+        }
     }
 
     fn io_get_bucket_path(&self, bucket: &str) -> Result<PathBuf> {
@@ -7984,32 +8170,13 @@ impl LocalDisk {
         //  - metadata failure -> to_file_error
         //  - parse failure    -> propagated verbatim from read_xl_meta_no_data_sync (`?`)
         let path = file_path.as_ref().to_path_buf();
-        let root = self.publication_root.clone();
-        let (data, modtime) =
-            spawn_blocking_with_disk_io_permit(io_permit, move || -> Result<(Vec<u8>, Option<OffsetDateTime>)> {
-                // Read-only open, equivalent to O_RDONLY (get_readonly_options only sets read(true)).
-                let mut f = root.open_readonly(&path).map_err(to_file_error)?;
-
-                let meta = f.metadata().map_err(to_file_error)?;
-
-                if meta.is_dir() {
-                    // fix use io::Error
-                    return Err(Error::FileNotFound);
-                }
-
-                let size = meta.len() as usize;
-
-                let data = read_xl_meta_no_data_sync(&mut f, size)?;
-
-                let modtime = match meta.modified() {
-                    Ok(md) => Some(OffsetDateTime::from(md)),
-                    Err(_) => None,
-                };
-
-                Ok((data, modtime))
-            })
-            .await
-            .map_err(DiskError::from)??;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.metadata_read_queue.enqueue(MetadataReadJob {
+            path,
+            io_permit,
+            op: MetadataReadOp::ReadMetadataOnly { tx },
+        });
+        let (data, modtime) = rx.await.map_err(|_| DiskError::other("metadata read worker cancelled"))??;
 
         Ok((data, modtime))
     }
@@ -8180,10 +8347,13 @@ impl LocalDisk {
         // gating the volume fallback on the open error alone is equivalent to
         // the original code, where the fallback lived solely in the open match arm.
         let path = file_path.as_ref().to_path_buf();
-        let root = self.publication_root.clone();
-        let res = spawn_blocking_with_disk_io_permit(io_permit, move || read_all_data_std(root.open_readonly(&path)))
-            .await
-            .map_err(DiskError::from)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.metadata_read_queue.enqueue(MetadataReadJob {
+            path,
+            io_permit,
+            op: MetadataReadOp::ReadAll { tx },
+        });
+        let res = rx.await.map_err(|_| DiskError::other("metadata read worker cancelled"))?;
 
         let (bytes, modtime) = self.resolve_read_all_result(volume, volume_dir.as_ref(), res).await?;
 
@@ -10127,19 +10297,23 @@ fn check_local_disk_valid_path(root: &Path, path: impl AsRef<Path>) -> Result<()
 
 #[cfg(target_os = "linux")]
 fn check_local_disk_valid_object_path_at(root: &Path, root_fd: &std::fs::File, bucket_path: &Path, path: &Path) -> Result<()> {
-    check_local_disk_object_path_components(root, bucket_path, path)?;
-    reject_local_disk_symlink_components_at(root, root_fd, &normalize_path_components(path))
+    let normalized_path = check_local_disk_object_path_components(root, bucket_path, path)?;
+    reject_local_disk_symlink_components_at(root, root_fd, &normalized_path)
 }
 
 #[cfg(target_os = "linux")]
-fn check_local_disk_object_path_components(root: &Path, bucket_path: &Path, path: &Path) -> Result<()> {
-    let bucket_path = normalize_path_components(bucket_path);
-    let path = normalize_path_components(path);
+fn check_local_disk_object_path_components<'a>(
+    root: &Path,
+    bucket_path: &Path,
+    path: &'a Path,
+) -> Result<std::borrow::Cow<'a, Path>> {
+    let bucket_path = normalize_path_cow(bucket_path);
+    let path = normalize_path_cow(path);
     if !bucket_path.starts_with(root) || !path.starts_with(&bucket_path) {
         return Err(DiskError::InvalidPath);
     }
 
-    Ok(())
+    Ok(path)
 }
 
 #[cfg(target_os = "linux")]
@@ -10224,6 +10398,18 @@ fn reject_local_disk_symlink_components(root: &Path, path: &Path) -> Result<()> 
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn normalize_path_cow(path: &Path) -> std::borrow::Cow<'_, Path> {
+    if !path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
+    {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    std::borrow::Cow::Owned(normalize_path_components(path))
 }
 
 // Lightweight path normalization without filesystem calls
@@ -12428,8 +12614,7 @@ impl DiskAPI for LocalDisk {
         }
 
         let path_resolve_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        let file_path = self.io_get_object_path(volume, path)?;
-        let volume_dir = self.io_get_bucket_path(volume)?;
+        let (volume_dir, file_path) = self.io_get_bucket_and_object_open_path(volume, path)?;
         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READ_VERSION_PATH_RESOLVE, path_resolve_start);
 
         let path_check_start = get_stage_timer_if_enabled(stage_metrics_enabled);
@@ -12439,7 +12624,7 @@ impl DiskAPI for LocalDisk {
         let read_data = opts.read_data;
 
         let xlmeta_read_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        let raw_read_result = self.read_raw(volume, volume_dir.clone(), file_path, read_data).await;
+        let raw_read_result = self.read_raw(volume, &volume_dir, &file_path, read_data).await;
         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READ_VERSION_XLMETA_READ, xlmeta_read_start);
         let (data, _) = raw_read_result.map_err(|e| {
             if e == DiskError::FileNotFound && !version_id.is_empty() {
@@ -25521,6 +25706,156 @@ mod test {
         symlink(&outside_file, root_dir.path().join("bucket/object")).expect("object symlink should be created");
 
         assert!(matches!(disk.get_object_path_for_io("bucket", "object"), Err(DiskError::InvalidPath)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_version_rejects_symlink_prefix_and_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let root_dir = tempfile::tempdir().expect("temp dir should be created");
+        let outside_dir = tempfile::tempdir().expect("outside temp dir should be created");
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        disk.make_volume("bucket").await.expect("bucket should be created");
+
+        let valid_meta = test_meta(test_file_info("object", Uuid::new_v4(), None, Some(Bytes::from_static(b"inline"))));
+        fs::create_dir_all(outside_dir.path().join("object"))
+            .await
+            .expect("outside object dir should be created");
+        fs::write(outside_dir.path().join("object").join(STORAGE_FORMAT_FILE), &valid_meta)
+            .await
+            .expect("outside prefix xl.meta should be written");
+        fs::write(outside_dir.path().join(STORAGE_FORMAT_FILE), &valid_meta)
+            .await
+            .expect("outside leaf xl.meta should be written");
+
+        symlink(outside_dir.path(), root_dir.path().join("bucket/symlink-prefix")).expect("prefix symlink should be created");
+        symlink(outside_dir.path(), root_dir.path().join("bucket/symlink-leaf")).expect("leaf symlink should be created");
+
+        for read_data in [false, true] {
+            let opts = ReadOptions {
+                read_data,
+                ..Default::default()
+            };
+            assert!(matches!(
+                disk.read_version("", "bucket", "symlink-prefix/object", "", &opts).await,
+                Err(DiskError::InvalidPath)
+            ));
+            assert!(matches!(
+                disk.read_version("", "bucket", "symlink-leaf", "", &opts).await,
+                Err(DiskError::InvalidPath)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_read_queue_bounds_concurrency_skips_cancelled_and_recovers_from_panic() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let root = os::PublicationRoot::new(dir.path()).expect("publication root should be created");
+        let queue = MetadataReadQueue::new(root);
+
+        // 1. Concurrency bound + cancelled job skip:
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let executed_cancelled = Arc::new(AtomicBool::new(false));
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(ParkingLotMutex::new(release_rx));
+
+        for _ in 0..MAX_METADATA_READ_WORKERS_PER_DISK {
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            let entered_tx = entered_tx.clone();
+            let release_rx = Arc::clone(&release_rx);
+            queue.enqueue(MetadataReadJob {
+                path: PathBuf::new(),
+                io_permit: None,
+                op: MetadataReadOp::TestCustom {
+                    is_closed: Box::new(|| false),
+                    run: Box::new(move || {
+                        let cur = active.fetch_add(1, Ordering::AcqRel) + 1;
+                        max_active.fetch_max(cur, Ordering::AcqRel);
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.lock().recv();
+                        active.fetch_sub(1, Ordering::AcqRel);
+                    }),
+                },
+            });
+        }
+
+        for _ in 0..MAX_METADATA_READ_WORKERS_PER_DISK {
+            tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+                .await
+                .expect("initial workers should enter")
+                .expect("channel should stay open");
+        }
+        assert_eq!(queue.state.lock().active_workers, MAX_METADATA_READ_WORKERS_PER_DISK);
+
+        // Enqueue a cancelled production ReadMetadataOnly job and a cancelled TestCustom job while workers are busy.
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        drop(cancelled_rx);
+        queue.enqueue(MetadataReadJob {
+            path: dir.path().join("cancelled-never-opened"),
+            io_permit: None,
+            op: MetadataReadOp::ReadMetadataOnly { tx: cancelled_tx },
+        });
+        let executed_cancelled_clone = Arc::clone(&executed_cancelled);
+        queue.enqueue(MetadataReadJob {
+            path: PathBuf::new(),
+            io_permit: None,
+            op: MetadataReadOp::TestCustom {
+                is_closed: Box::new(|| true),
+                run: Box::new(move || {
+                    executed_cancelled_clone.store(true, Ordering::Release);
+                }),
+            },
+        });
+
+        // Enqueue a panicking job followed by a normal completion job to verify panic respawn.
+        queue.enqueue(MetadataReadJob {
+            path: PathBuf::new(),
+            io_permit: None,
+            op: MetadataReadOp::TestCustom {
+                is_closed: Box::new(|| false),
+                run: Box::new(|| panic!("synthetic worker panic")),
+            },
+        });
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let active_trailing = Arc::clone(&active);
+        let max_active_trailing = Arc::clone(&max_active);
+        queue.enqueue(MetadataReadJob {
+            path: PathBuf::new(),
+            io_permit: None,
+            op: MetadataReadOp::TestCustom {
+                is_closed: Box::new(|| false),
+                run: Box::new(move || {
+                    let cur = active_trailing.fetch_add(1, Ordering::AcqRel) + 1;
+                    max_active_trailing.fetch_max(cur, Ordering::AcqRel);
+                    active_trailing.fetch_sub(1, Ordering::AcqRel);
+                    let _ = done_tx.send(());
+                }),
+            },
+        });
+
+        assert_eq!(
+            queue.state.lock().active_workers,
+            MAX_METADATA_READ_WORKERS_PER_DISK,
+            "extra queued jobs must not exceed per-disk worker cap"
+        );
+
+        // Release only one blocked worker so the panicking job must trigger a respawn
+        // to execute the trailing completion job while the other worker stays blocked.
+        release_tx.send(()).expect("release one blocked worker");
+        tokio::time::timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("trailing job should finish after worker panic recovery")
+            .expect("trailing job sender should complete");
+        for _ in 1..MAX_METADATA_READ_WORKERS_PER_DISK {
+            release_tx.send(()).expect("release remaining blocked worker");
+        }
+        assert!(!executed_cancelled.load(Ordering::Acquire), "cancelled job must be skipped");
+        assert!(max_active.load(Ordering::Acquire) <= MAX_METADATA_READ_WORKERS_PER_DISK);
     }
 
     #[tokio::test]

@@ -169,3 +169,133 @@ async fn checkpoint_resumes_across_a_maintenance_publication() {
     assert!(dirty_usage_buckets_for_tests().is_empty());
     clear_dirty_usage_buckets_for_tests();
 }
+
+#[tokio::test]
+#[serial]
+async fn remote_checkpoint_resumes_across_restart_and_maintenance_identity_changes() {
+    #[derive(serde::Serialize)]
+    struct WorkerRequest<'a> {
+        version: u16,
+        request_id: uuid::Uuid,
+        server_epoch: uuid::Uuid,
+        session_id: uuid::Uuid,
+        session_sequence: u64,
+        bucket: &'a str,
+        next_cycle: u64,
+        leader_epoch: u64,
+        scan_plan_digest: DataUsageScanPlanDigest,
+        checkpoint_plan_digest: DataUsageScanPlanDigest,
+        skip_healing: bool,
+        scan_mode: HealScanMode,
+        budget: serde_json::Value,
+    }
+    let (_temp_dir, store) = setup_local_scanner_store(1, 1).await;
+    let resolved = Arc::downgrade(&store);
+    assert!(crate::storage_api::owner::ecstore_set_object_store_resolver(Arc::new(
+        move || resolved.upgrade()
+    )));
+    rustfs_credentials::set_global_rpc_secret("remote-checkpoint-test-secret".to_string()).expect("test RPC secret");
+    let bucket = "remote-checkpoint";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("remote bucket");
+    for object in HOT_OBJECTS {
+        put_fixture_object(&store, bucket, object).await;
+    }
+    wait_for_namespace_commit_tails(store.as_ref()).await;
+    let set = store.pools[0].disk_set[0].clone();
+    let disk = scanner_set_disk_inventory(&set).await.pop().expect("local worker disk");
+    let cache_name = path_join_buf(&[bucket, DATA_USAGE_CACHE_NAME]);
+
+    for (index, restart) in [true, false].into_iter().enumerate() {
+        let before = if restart {
+            std::collections::BTreeMap::from([(
+                "<local>".to_string(),
+                crate::scanner::scanner_node_activity_for_tests("instance-before", 0, 0, false),
+            )])
+        } else {
+            crate::scanner::probe_scanner_activity(store.as_ref(), false)
+                .await
+                .expect("activity before maintenance")
+        };
+        let coverage = DataUsageScanPlanDigest(crate::scanner::scanner_activity_coverage_digest(&before));
+        let reuse = DataUsageScanPlanDigest(crate::scanner::scanner_activity_structural_digest(&before));
+        let cycle = 100 + u64::try_from(index).expect("fixture index") * 2;
+        for resumed in [false, true] {
+            let activity = if resumed && restart {
+                std::collections::BTreeMap::from([(
+                    "<local>".to_string(),
+                    crate::scanner::scanner_node_activity_for_tests("instance-after", 0, 0, false),
+                )])
+            } else if resumed {
+                record_scanner_maintenance_change(bucket);
+                crate::scanner::probe_scanner_activity(store.as_ref(), false)
+                    .await
+                    .expect("activity after maintenance")
+            } else {
+                before.clone()
+            };
+            let requested_reuse = DataUsageScanPlanDigest(crate::scanner::scanner_activity_structural_digest(&activity));
+            assert_eq!(
+                coverage,
+                DataUsageScanPlanDigest(crate::scanner::scanner_activity_coverage_digest(&activity))
+            );
+            if resumed {
+                assert_ne!(reuse, requested_reuse, "the event must invalidate completed cache reuse");
+            }
+            let next_cycle = cycle + u64::from(resumed);
+            save_config(
+                store.clone(),
+                DATA_USAGE_BLOOM_NAME_PATH.as_str(),
+                crate::scanner::encode_scanner_cycle_fence_for_test(next_cycle, LEADER_EPOCH),
+            )
+            .await
+            .expect("remote request cycle fence");
+            let body = WorkerRequest {
+                version: crate::storage_api::owner::NS_SCANNER_PROTOCOL_VERSION,
+                request_id: uuid::Uuid::new_v4(),
+                server_epoch: uuid::Uuid::new_v4(),
+                session_id: uuid::Uuid::new_v4(),
+                session_sequence: 0,
+                bucket,
+                next_cycle,
+                leader_epoch: LEADER_EPOCH,
+                scan_plan_digest: requested_reuse,
+                checkpoint_plan_digest: coverage,
+                skip_healing: true,
+                scan_mode: HealScanMode::Normal,
+                budget: serde_json::json!({"max_objects": if resumed { None } else { Some(2_u64) }}),
+            };
+            let body = rmp_serde::to_vec_named(&body).expect("remote worker request body");
+            let request = crate::decode_remote_scanner_request(&body).expect("remote worker decodes coverage identity");
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                crate::serve_remote_scanner_request(disk.clone(), request, tokio::io::sink(), CancellationToken::new()),
+            )
+            .await
+            .expect("bounded remote worker")
+            .expect("remote worker stream");
+            let mut cache = DataUsageCache::default();
+            cache
+                .load(set.clone(), &cache_name)
+                .await
+                .expect("durable remote worker cache");
+            if resumed {
+                assert!(
+                    cache.info.snapshot_complete,
+                    "a resumed remote sweep must complete without mixed coverage"
+                );
+                assert!(cache.info.scan_progress.is_none());
+                assert_eq!(cache.info.scan_plan_digest, Some(requested_reuse));
+                assert_eq!(cache.flatten(cache.find(bucket).expect("bucket root")).objects, 6);
+            } else {
+                assert!(!cache.info.snapshot_complete);
+                assert!(cache.has_scan_position(), "budget must leave real checkpoint progress");
+                let progress = cache.info.scan_progress.expect("interrupted worker records coverage");
+                assert_eq!(progress.started_plan, coverage);
+                assert_eq!(progress.requested_plan, coverage);
+            }
+        }
+    }
+}
