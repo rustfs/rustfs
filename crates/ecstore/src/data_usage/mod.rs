@@ -176,6 +176,9 @@ static USAGE_CACHE_UPDATING: OnceLock<CacheUpdating> = OnceLock::new();
 static LIVE_BUCKET_USAGE_CACHE: OnceLock<LiveBucketUsageCache> = OnceLock::new();
 static USAGE_MEMORY_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// Compatibility input for snapshot-protocol quota admission and capacity
+/// reporting. Durable quota checks and statistics do not consult this floor.
+///
 /// Best-available persisted usage for `bucket` when no authoritative source
 /// exists yet (issue #5716): after an upgrade from a pre-v2 release the only
 /// persisted usage data is the legacy `.usage.json`, which is demoted to
@@ -228,7 +231,8 @@ struct CachedDataUsageSnapshot {
     loaded_at: tokio::time::Instant,
     /// Pre-discard per-bucket sizes from the same load, retained even when the
     /// snapshot is incomplete and its bucket data is discarded. Consumed only
-    /// by [`lookup_degraded_bucket_usage_baseline`] for quota admission.
+    /// by [`lookup_degraded_bucket_usage_baseline`] for snapshot-protocol
+    /// admission and capacity reporting until their compatibility windows end.
     degraded_baseline: HashMap<String, u64>,
 }
 

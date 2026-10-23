@@ -11,16 +11,17 @@ Hard quota admission is owned by the durable reservation ledger, not by scanner
 data usage. `QuotaLedger::accounted_usage` is initialised and reconciled by
 `exact_bucket_usage`, a `list_object_versions` walk of the bucket, and
 `QuotaContext::reserve` admits a write against `admitted_usage + growth <=
-quota_limit`; neither reads a scanner snapshot. Every quota saved through the
-admin API carries `reservation_protocol = V2`.
+quota_limit`; neither reads a scanner snapshot. The admin API defaults to
+reservation protocol v1 through `BucketQuota::new`. Protocol v2 is selected
+explicitly or by quota migration; both protocols use durable reservations.
 
-Scanner data usage is best-effort reporting input: admin info, Console,
-metrics, and the degraded fallback of `QuotaChecker::get_real_time_usage` for
-buckets whose quota predates the reservation protocol. It must not be able to
-fail a write on a bucket the ledger admits. The known violation is
-`map_quota_check_outcome`, which turns `QuotaError::UsageUnavailable` into
-`ServiceUnavailable` even when `QuotaCheckResult::uses_durable_reservations`
-is true and `apply_quota_admission` already admits unconditionally.
+Scanner data usage is best-effort reporting input for durable quota buckets:
+`QuotaChecker::report_only_usage` returns a known memory value or `None`, without
+consulting the persisted degraded floor. Both quota checks and quota statistics
+use this optional report. `apply_quota_admission` leaves admission to the ledger
+when `QuotaCheckResult::uses_durable_reservations` is true. Buckets whose quota
+predates reservation protocols retain `QuotaChecker::get_real_time_usage` and
+its degraded fallback until their quota is migrated.
 
 ## Rationale
 
@@ -81,11 +82,67 @@ correctness after this decision.
 
 | Surface | Readers today | Meaning after D3 | Retirement condition | Compatibility window |
 |---|---|---|---|---|
-| `usage_snapshot_complete` (`DataUsageInfo::is_complete_bucket_usage_snapshot`) | quota-facing loader `discard_incomplete_bucket_usage`, `normalize_loaded_data_usage`, `replace_bucket_usage_memory_from_info_if_generation`, `get_bucket_usage_memory` in `crates/ecstore/src/data_usage/mod.rs`; server/pool info in `crates/ecstore/src/diagnostics/admin_server_info.rs`; `narrow_data_usage_snapshot_to_measured_buckets` in `rustfs/src/app/admin_usecase.rs`; decommission capacity in `crates/ecstore/src/core/pools.rs`; obs metrics, heal progress baseline; scanner `data_usage_info_is_cold`, `complete_scanner_cache_snapshot_plan_digest`, `reject_incomplete_snapshot` | A completeness mark for reporting (admin, Console, metrics, heal progress). For quota it only decides whether a memory value exists, which can no longer fail a durable write. | No bucket with `reservation_protocol = None` remains (lazy trigger plus admin sweep), so the loader's discard is no longer an admission gate; the mark itself stays as the reporting contract. | Until every quota is migrated, plus one release in which the snapshot-protocol admission path is still compiled. |
-| `lookup_degraded_bucket_usage_baseline` / `degraded_baseline` (`crates/ecstore/src/data_usage/mod.rs`) | `QuotaChecker::get_real_time_usage` (`crates/ecstore/src/bucket/quota/checker.rs`); `session_capacity_view` in `rustfs/src/protocols/client.rs`; fed by `load_data_usage_from_backend_with_baseline`, `backfill_degraded_baseline_from_observed`, `cache_data_usage_snapshot_result` | Admission input only for snapshot-protocol buckets; for durable buckets it only shapes the reported `current_usage`. | Same as above; afterwards it is a reporting fallback that can be dropped together with the capacity view's choice of source. | Same as above. |
+| `usage_snapshot_complete` (`DataUsageInfo::is_complete_bucket_usage_snapshot`) | quota-facing loader `discard_incomplete_bucket_usage`, `normalize_loaded_data_usage`, `replace_bucket_usage_memory_from_info_if_generation`, `get_bucket_usage_memory` in `crates/ecstore/src/data_usage/mod.rs`; server/pool info in `crates/ecstore/src/diagnostics/admin_server_info.rs`; `narrow_data_usage_snapshot_to_measured_buckets` in `rustfs/src/app/admin_usecase.rs`; decommission capacity in `crates/ecstore/src/core/pools.rs`; obs metrics, heal progress baseline; scanner `data_usage_info_is_cold`, `complete_scanner_cache_snapshot_plan_digest`, `reject_incomplete_snapshot` | A completeness mark for reporting (admin, Console, metrics, heal progress). For quota it only decides whether a memory value exists, which can no longer fail a durable write. | No configured finite quota with `reservation_protocol = None` remains (lazy trigger plus admin sweep), so the loader's discard is no longer an admission gate; the mark itself stays as the reporting contract. | Until every quota is migrated, plus one release in which the snapshot-protocol admission path is still compiled. |
+| `lookup_degraded_bucket_usage_baseline` / `degraded_baseline` (`crates/ecstore/src/data_usage/mod.rs`) | `QuotaChecker::get_real_time_usage` for snapshot-protocol admission and explicit non-durable reporting; `session_capacity_view` in `rustfs/src/protocols/client.rs`; fed by `load_data_usage_from_backend_with_baseline`, `backfill_degraded_baseline_from_observed`, `cache_data_usage_snapshot_result` | Retired from durable-v1/v2 quota checks and statistics: an unknown memory value is reported as `None`. Still an admission input for `reservation_protocol = None` and a capacity-reporting fallback. | Retire the remaining quota consumer only after every configured snapshot-protocol quota and every quota-setting node has migrated; capacity reporting remains a separate source-selection contract. | Durable reporting can roll node by node among D3-capable readers. The snapshot-protocol fallback stays for the migration window plus one release with its admission path compiled. |
 | Usage floor identity (the `scanner_epoch`/`scanner_cycle` identity of `buckets/.usage.v2.json` and `buckets/.usage.json` under `.rustfs.sys`, each with a `.bkp`; there is no separate floor object) | `persisted_usage_floor_for_startup`, `persisted_usage_floor`, `apply_persisted_usage_floor`, `reset_scanner_cycle_recovery_for_intent`, the rc.1–rc.3 `legacy_*_usage_fence` readers in `crates/scanner/src/scanner/cycle_state.rs`; `data_usage_info_has_persisted_baseline_identity` in `crates/scanner/src/scanner.rs`; `usage_snapshot_for_epoch_fence` in `crates/scanner/src/scanner/leadership.rs`; `read_data_usage_persist_baseline` in `crates/scanner/src/scanner/usage_store.rs`; `UsageSnapshotSource` resolution in `crates/ecstore/src/data_usage/mod.rs` | The scanner's own monotonic cycle fence for leadership and cycle recovery. It is no longer a quota proof: an unreadable floor stopping the leader iteration (`usage_floor_load_failed`) is a scanner-availability choice, not a quota requirement. | The quota fallback no longer reads the legacy `.usage.json` baseline; then "floor unreadable stops the scanner" can become "report and rebuild", and the rc.1–rc.3 fences (`RUSTFS_COMPAT_TODO` backlog-2102 / backlog-2122) retire on their own schedule. Cycle monotonicity stays. | One release after the compat markers' own deadline. |
 | Observed-versus-authoritative routing (`.usage.observed.json` versus `.usage.v2.json`) | decision in `classify_nsscanner_cycle`, `apply_scanner_cycle_publication_marks`, `publish_observational_snapshot`, `scanner_cycle_activity_status` (`crates/scanner/src/scanner_io.rs`); write routing in `crates/scanner/src/scanner/usage_store.rs`; readers `load_observed_data_usage_snapshot`, `select_admin_data_usage_snapshot`, `merge_partial_observation_for_admin` and the degraded-baseline backfill (`crates/ecstore/src/data_usage/mod.rs`); scanner cold-start and cache reuse; `ScannerCyclePublicationPlan::for_result` | A completeness-marked report. "Never a hard-quota authority" is moot for durable buckets; the distinction remains a reporting mark (`usage_snapshot_observational`, `converged`). | The quota fallback stops distinguishing the two objects; then the pair can collapse into one snapshot carrying the marks, after a reader-first migration of the observed-object consumers (admin, Console, obs). | Readers accept both layouts for one release before the writer changes. |
-| Publication-lease strict mode (`purpose == Authoritative && namespace_commits_pending()`) | `acquire_scanner_publication_lease_with_purpose`, `validate_scanner_publication_lease_with_purpose`, `acquire_scanner_publication_lease_guard_with_target`, `scanner_data_usage_publication_blocked` in `crates/ecstore/src/store/mod.rs`; `namespace_commits_pending` in `crates/ecstore/src/runtime/instance.rs`; `scanner_local_publication_defer_reason` in `crates/scanner/src/scanner.rs`; lease RPCs and the lease token on `RenameData`/`Delete` in `crates/protos/src/node.proto` | A pending ordinary PUT commit is a write-barrier event (the cycle is superseded or the bucket pending), not a reason to deny an authoritative lease. Data-movement and generation checks stay. | Drop the pending-commit rejection and its two revalidation twins, and the pending-commit term of the local barrier; keep the movement fence and the lease token on writes. The local barrier's term is handled by the scanner cycle-termination work; the remote lease follows once that lands. | Mixed versions are safe: an old peer still rejects and the coordinator treats that as retryable (`scanner_publication_lease_error_is_retryable`), so the removal rolls out node by node. |
+| Publication-lease strict mode (`purpose == Authoritative && namespace_commits_pending()`) | Former acquire/validate/guard and local-barrier rejection sites; current leases still protect movement generations, purpose, expiry and publication writes | The ordinary-PUT veto is already removed: lease handling fences data movement, and cycle termination no longer treats ordinary PUT as data movement (`rustfs/rustfs#8696`). Namespace counters retained for diagnostics and ownership are not a quota veto. | No remaining pending-ordinary-commit rejection to remove at this baseline. Retain movement/epoch exhaustion checks, terminal movement debt, token purpose and lease-token validation on writes. | An older rejecting peer remains retryable through `scanner_publication_lease_error_is_retryable`. Keep lease RPC fields and purpose readers during mixed-version rollout; this retirement does not authorize deleting them. |
+
+### Durable reporting fallback retirement
+
+`check_quota_with_usage_reporting` and `get_quota_stats` no longer call
+`usage_or_degraded_baseline` through `report_only_usage`. A missing,
+incomplete, legacy-only or observed-only snapshot can therefore change a
+durable bucket's `current_usage` and `remaining` from a cached floor to `None`.
+Unknown is never reported as zero. The admin quota-check preview uses the
+existing unknown-usage branch, so its advisory `allowed` can change from false
+to true when only a degraded floor had exceeded the limit; it does not reserve
+capacity or override the ledger decision on an actual write. Each unavailable
+report increments
+`rustfs_quota_usage_report_unavailable_total`; admission still uses the same
+reservation ledger and exact baseline. Quota-free admission keeps its existing
+zero-usage-I/O path.
+
+This consumer removal needs no format change, writer activation or quota
+migration. Among D3-capable nodes, an older node can report the old floor while
+a newer node reports unknown; both keep ledger admission and return a successful
+best-effort report. Snapshot-protocol buckets (`reservation_protocol = None`)
+still take `get_real_time_usage`, including early refresh, the legacy and
+observed degraded baseline, and fail-closed admission when no grounded value
+exists. Earlier nodes that still make scanner availability a durable-write
+veto must first reach the D3 baseline; this change does not prove that earlier
+fleet safe.
+
+Rollback to a D3 reader before this consumer removal restores floor-based
+optional reporting. No scanner snapshot, backup, quota record or reservation
+record is removed or rewritten to enable either direction. Limits, quota types,
+incarnations and reservation protocols remain unchanged.
+
+The other retirement items keep independent compatibility boundaries and must
+be delivered separately:
+
+- **Completeness:** keep `usage_snapshot_complete` for reporting, heal progress
+  and movement consumers. Its quota-only discard cannot disappear until no
+  configured snapshot-protocol quota remains and all quota-setting nodes use
+  durable protocols, followed by one release retaining the old admission path.
+  Reader changes must first preserve unknown/incomplete reporting explicitly;
+  accepting an incomplete report cannot certify a complete snapshot.
+- **Floor identity:** retain monotonic epoch/cycle and leadership recovery
+  checks. The quota fallback must first stop reading legacy usage, and the
+  `backlog-2102` / `backlog-2122` readers stay while rc.1-rc.3 remain supported
+  direct-upgrade sources, plus their documented retirement window. A reader
+  must first accept and classify the retained legacy/current floor forms
+  without resetting cycle identity before a later writer or startup policy
+  changes. Removing a quota consumer alone does not satisfy this boundary.
+- **Observed routing:** keep both snapshot layouts and their reporting marks.
+  Readers for admin, Console and observability must accept both layouts for
+  one release before any writer collapses them; snapshot-protocol admission
+  must already have migrated. Rollback during that window keeps the dual
+  readers and both persisted objects. No object is deleted to force selection.
+- **Publication leases:** the ordinary-PUT veto is already retired. Retained
+  purpose, movement/epoch fences and write tokens protect publication and
+  movement. Future cleanup of the wire shape requires its own reader-first
+  compatibility change and cannot follow merely from D3.
 
 ## Superseded decision (2026-09-03)
 
