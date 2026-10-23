@@ -16,8 +16,8 @@ reservation protocol v1 through `BucketQuota::new`. Protocol v2 is selected
 explicitly or by quota migration; both protocols use durable reservations.
 
 Scanner data usage is best-effort reporting input for durable quota buckets:
-`QuotaChecker::report_only_usage` returns a known memory value or `None`, without
-consulting the persisted degraded floor. Both quota checks and quota statistics
+`QuotaChecker::report_only_usage` returns the existing usage lookup's value or
+`None`, without explicitly consulting the persisted degraded floor. Both quota checks and quota statistics
 use this optional report. `apply_quota_admission` leaves admission to the ledger
 when `QuotaCheckResult::uses_durable_reservations` is true. Buckets whose quota
 predates reservation protocols retain `QuotaChecker::get_real_time_usage` and
@@ -102,6 +102,12 @@ report increments
 `rustfs_quota_usage_report_unavailable_total`; admission still uses the same
 reservation ledger and exact baseline. Quota-free admission keeps its existing
 zero-usage-I/O path.
+
+The existing `get_bucket_usage_memory` lookup retains its cache-refresh
+semantics: a distributed persisted-usage lookup or an expired local cache can
+still load the backend. Retiring the explicit degraded-floor consumer does not
+make durable reporting a zero-I/O operation. The no-early-reload regression
+covers the separate `reload_unknown_bucket_usage` trigger only.
 
 This consumer removal needs no format change, writer activation or quota
 migration. Among D3-capable nodes, an older node can report the old floor while
