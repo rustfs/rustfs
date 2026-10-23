@@ -25,6 +25,9 @@ use rustfs_scanner_metrics::metrics::global_metrics;
 use tokio::time::Duration;
 
 mod io_budget;
+mod pacing;
+
+pub(crate) use pacing::PacingDebt;
 
 pub use io_budget::{
     SCANNER_DISK_IO_BUDGET_MAX_WAIT, ScannerDiskIoBudget, ScannerDiskIoBudgetConfig, ScannerDiskIoBudgetLimits,
@@ -131,6 +134,8 @@ pub static SCANNER_SLEEPER: LazyLock<DynamicSleeper> = LazyLock::new(|| {
 ///
 /// For operations timed via [`SleepTimer`], sleeps are computed as
 /// `elapsed_work_time * factor`, clamped to `[MIN_SLEEP, max_sleep]`.
+/// Folder walkers accumulate proportional object waits without the per-object
+/// floor, paying bounded batches and the final bucket tail.
 /// For folder-level gaps, [`sleep_folder`] uses `MIN_SLEEP * factor`,
 /// clamped only by `max_sleep`. All sleeps are gated on [`SCANNER_IDLE_MODE`];
 /// the per-disk background I/O budget bound with [`DynamicSleeper::for_disk`]
@@ -142,16 +147,27 @@ pub struct DynamicSleeper {
 }
 
 struct SleeperParams {
-    factor: RwLock<f64>,
-    max_sleep: RwLock<Duration>,
+    config: RwLock<PacingConfig>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Clone, Copy)]
+struct PacingConfig {
+    factor: f64,
+    max_sleep: Duration,
+    reset_generation: u64,
 }
 
 impl DynamicSleeper {
     pub fn new(speed: ScannerSpeed) -> Self {
         Self {
             inner: Arc::new(SleeperParams {
-                factor: RwLock::new(speed.sleep_factor()),
-                max_sleep: RwLock::new(speed.max_sleep()),
+                config: RwLock::new(PacingConfig {
+                    factor: speed.sleep_factor(),
+                    max_sleep: speed.max_sleep(),
+                    reset_generation: 0,
+                }),
+                changed: tokio::sync::Notify::new(),
             }),
             disk_io_budget: None,
         }
@@ -213,9 +229,12 @@ impl DynamicSleeper {
     }
 
     fn read_params(&self) -> (f64, Duration) {
-        let factor = *self.inner.factor.read().unwrap_or_else(|e| e.into_inner());
-        let max_sleep = *self.inner.max_sleep.read().unwrap_or_else(|e| e.into_inner());
-        (factor, max_sleep)
+        let config = self.read_config();
+        (config.factor, config.max_sleep)
+    }
+
+    fn read_config(&self) -> PacingConfig {
+        *self.inner.config.read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Pace one directory listing: the preset folder gap, then one
@@ -260,10 +279,22 @@ impl DynamicSleeper {
     }
 
     fn update_params(&self, factor: f64, max_sleep: Duration) {
-        let mut f = self.inner.factor.write().unwrap_or_else(|e| e.into_inner());
-        *f = factor;
-        let mut m = self.inner.max_sleep.write().unwrap_or_else(|e| e.into_inner());
-        *m = max_sleep;
+        self.configure_pacing(factor, max_sleep, None);
+    }
+
+    fn configure_pacing(&self, factor: f64, max_sleep: Duration, idle_mode: Option<bool>) {
+        {
+            let mut config = self.inner.config.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(idle_mode) = idle_mode {
+                SCANNER_IDLE_MODE.store(idle_mode, Ordering::Relaxed);
+            }
+            if factor == 0.0 || max_sleep.is_zero() || idle_mode == Some(false) {
+                config.reset_generation = config.reset_generation.wrapping_add(1);
+            }
+            config.factor = factor;
+            config.max_sleep = max_sleep;
+        }
+        self.inner.changed.notify_waiters();
     }
 
     /// Swap in parameters from a new speed preset (for runtime reconfiguration).
@@ -286,8 +317,7 @@ impl DynamicSleeper {
         idle_mode: bool,
         yield_every_n_objects: u64,
     ) {
-        self.update_params(sleep_factor, max_sleep);
-        SCANNER_IDLE_MODE.store(idle_mode, Ordering::Relaxed);
+        self.configure_pacing(sleep_factor, max_sleep, Some(idle_mode));
         self.record_throttle_config_with_yield(yield_every_n_objects);
     }
 
