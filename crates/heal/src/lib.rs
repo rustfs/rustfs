@@ -121,6 +121,67 @@ pub struct BlockedCheckpointRecord {
     pub reason: String,
     pub blocked_at: Option<u64>,
     pub revalidate_after: Option<u64>,
+    pub validation: CheckpointValidation,
+}
+
+/// A bounded, read-only observation of the execution reader's validation.
+/// Acceptance proves neither a live owner/fence nor permission to execute.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointValidation {
+    schema_version: Option<u32>,
+    stage: CheckpointValidationStage,
+    signature_present: Option<bool>,
+    signature_valid: Option<bool>,
+    task_identity_matches: Option<bool>,
+    legacy_rewind: Option<bool>,
+    reader_accepted: Option<bool>,
+    recovery_status: CheckpointRecoveryStatus,
+    owner_fence: &'static str,
+    execution_authorized: bool,
+}
+
+impl Default for CheckpointValidation {
+    fn default() -> Self {
+        Self {
+            schema_version: None,
+            stage: CheckpointValidationStage::ReadUnavailable,
+            signature_present: None,
+            signature_valid: None,
+            task_identity_matches: None,
+            legacy_rewind: None,
+            reader_accepted: None,
+            recovery_status: CheckpointRecoveryStatus::Unknown,
+            owner_fence: "unknown",
+            execution_authorized: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CheckpointValidationStage {
+    InvalidTaskId,
+    SnapshotMissing,
+    ReadUnavailable,
+    TooLarge,
+    BudgetExhausted,
+    Malformed,
+    IdentityConflict,
+    InvalidDeadline,
+    InvalidAdminSchema,
+    FutureSchema,
+    SignatureMissing,
+    DigestMismatch,
+    Validated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CheckpointRecoveryStatus {
+    Unknown,
+    Rejected,
+    CandidateExecutionUnauthorized,
 }
 
 impl LocalHealRecoveryDiagnostics {

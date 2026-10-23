@@ -16,6 +16,8 @@ use super::checkpoint::CURRENT_CHECKPOINT_SCHEMA;
 use super::replacement::ReplacementCompletionProof;
 use super::*;
 
+mod checkpoint_diagnostics;
+
 pub(super) async fn schema_test_disk() -> (tempfile::TempDir, DiskStore) {
     use super::super::{DiskOption, Endpoint, new_disk};
 
