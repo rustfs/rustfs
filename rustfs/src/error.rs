@@ -27,6 +27,7 @@ const MAX_VERSIONS_EXCEEDED_CODE: &str = "MaxVersionsExceeded";
 const MAX_VERSIONS_EXCEEDED_MESSAGE: &str = "You've exceeded the limit on the number of versions you can create on this object";
 const SLOW_DOWN_READ_CODE: &str = "SlowDownRead";
 const SLOW_DOWN_READ_MESSAGE: &str = "Resource requested is unreadable, please reduce your request rate";
+const NAMESPACE_LOCK_TIMEOUT_CAUSE: &str = "namespace_lock_timeout";
 /// Public message for `StorageError::UnsupportedDisk` on a request path. The
 /// only request-time producer is the delete-transaction protocol when a
 /// participant answers Unimplemented (a peer still on a release without the
@@ -630,22 +631,49 @@ fn is_hyper_body_eof(err: &(dyn std::error::Error + 'static)) -> bool {
         .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::UnexpectedEof)
 }
 
+/// A nested lock timeout retains its retry advice even when an outer lock
+/// failure supplies a less specific cause. Share one bounded source walk.
+fn service_unavailable_cause(source: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+    let mut cause = None;
+    let timeout = error_chain_find(source, |error| match error.downcast_ref::<LockError>() {
+        Some(LockError::Timeout { .. }) => Some(NAMESPACE_LOCK_TIMEOUT_CAUSE),
+        Some(_) => {
+            cause.get_or_insert("namespace_lock_unavailable");
+            None
+        }
+        None => {
+            if cause.is_none() {
+                cause = match error.downcast_ref::<StorageError>() {
+                    Some(StorageError::NamespaceLockQuorumUnavailable { .. }) => Some("namespace_lock_unavailable"),
+                    Some(StorageError::ErasureWriteQuorum | StorageError::InsufficientWriteQuorum(_, _)) => {
+                        Some("storage_write_quorum")
+                    }
+                    _ => None,
+                };
+            }
+            None
+        }
+    });
+    timeout.or(cause)
+}
+
 impl From<ApiError> for S3Error {
     fn from(err: ApiError) -> Self {
         let status = custom_error_status(&err.code);
-        // A typed lock acquisition timeout is transient contention. Keep its
-        // existing S3 code while advising a minimum delay before another attempt.
-        let lock_timeout = err.code == S3ErrorCode::ServiceUnavailable
-            && err.source.as_deref().is_some_and(|source| {
-                error_chain_find(source, |error| {
-                    matches!(error.downcast_ref::<LockError>(), Some(LockError::Timeout { .. })).then_some(())
-                })
-                .is_some()
-            });
+        let cause = if err.code == S3ErrorCode::ServiceUnavailable {
+            err.source.as_deref().and_then(|source| service_unavailable_cause(source))
+        } else {
+            None
+        };
         let mut s3e = S3Error::with_message(err.code, err.message);
-        if lock_timeout {
+        if let Some(cause) = cause {
             let mut headers = http::HeaderMap::new();
-            headers.insert(http::header::RETRY_AFTER, http::HeaderValue::from_static("1"));
+            // s3s replaces the generated headers when a custom map is supplied.
+            headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/xml"));
+            headers.insert("x-rustfs-error-cause", http::HeaderValue::from_static(cause));
+            if cause == NAMESPACE_LOCK_TIMEOUT_CAUSE {
+                headers.insert(http::header::RETRY_AFTER, http::HeaderValue::from_static("1"));
+            }
             s3e.set_headers(headers);
         }
         if let Some(status) = status {
@@ -903,7 +931,9 @@ mod tests {
         assert!(error_chain_has_type::<LockError>(source));
         let response = error.to_http_response().expect("serialize lock timeout response");
         assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[http::header::CONTENT_TYPE], "application/xml");
         assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
+        assert_eq!(response.headers()["x-rustfs-error-cause"], "namespace_lock_timeout");
         let body = response
             .into_body()
             .collect()
@@ -983,19 +1013,94 @@ mod tests {
     fn lock_timeout_response_preserves_wrapped_source_and_requires_503() {
         for code in [S3ErrorCode::ServiceUnavailable, S3ErrorCode::RequestTimeout] {
             let should_advise_retry = code == S3ErrorCode::ServiceUnavailable;
-            let error = S3Error::from(ApiError {
-                message: ApiError::error_code_to_message(&code),
-                code: code.clone(),
-                source: Some(Box::new(IoError::other(LockError::timeout(
-                    "bucket/object@latest",
-                    std::time::Duration::from_secs(5),
-                )))),
-            });
-            assert_eq!(error.code(), &code);
-            let source = error.source().expect("preserve wrapped lock timeout");
-            assert!(error_chain_has_type::<LockError>(source));
-            let response = error.to_http_response().expect("serialize wrapped timeout");
-            assert_eq!(response.headers().contains_key(http::header::RETRY_AFTER), should_advise_retry);
+            for source in [
+                IoError::other(LockError::timeout("bucket/object@latest", std::time::Duration::from_secs(5))),
+                IoError::other(LockError::Network {
+                    message: "private-peer".to_owned(),
+                    source: Box::new(LockError::timeout("bucket/object@latest", std::time::Duration::from_secs(5))),
+                }),
+            ] {
+                let error = S3Error::from(ApiError {
+                    message: ApiError::error_code_to_message(&code),
+                    code: code.clone(),
+                    source: Some(Box::new(source)),
+                });
+                assert_eq!(error.code(), &code);
+                let source = error.source().expect("preserve wrapped lock timeout");
+                assert!(error_chain_has_type::<LockError>(source));
+                let response = error.to_http_response().expect("serialize wrapped timeout");
+                assert_eq!(response.headers()[http::header::CONTENT_TYPE], "application/xml");
+                assert_eq!(response.headers().contains_key(http::header::RETRY_AFTER), should_advise_retry);
+                assert_eq!(response.headers().contains_key("x-rustfs-error-cause"), should_advise_retry);
+                if should_advise_retry {
+                    assert_eq!(response.headers()["x-rustfs-error-cause"], "namespace_lock_timeout");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_response_attributes_typed_causes_without_exposing_resources() {
+        use http_body_util::BodyExt as _;
+
+        for (failure, cause) in [
+            (
+                StorageError::NamespaceLockQuorumUnavailable {
+                    mode: "quota_capability",
+                    bucket: "private-bucket".to_owned(),
+                    object: "private-object".to_owned(),
+                    required: 3,
+                    achieved: 2,
+                },
+                "namespace_lock_unavailable",
+            ),
+            (
+                StorageError::Lock(LockError::QuorumNotReached {
+                    required: 3,
+                    achieved: 2,
+                }),
+                "namespace_lock_unavailable",
+            ),
+            (StorageError::ErasureWriteQuorum, "storage_write_quorum"),
+            (
+                StorageError::InsufficientWriteQuorum("private-bucket".to_owned(), "private-object".to_owned()),
+                "storage_write_quorum",
+            ),
+        ] {
+            let expected_code = failure.code();
+            let error = S3Error::from(ApiError::from(failure));
+            assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+            assert_eq!(error.message(), Some("The service is unavailable. Please retry."));
+            let source = error
+                .source()
+                .and_then(|source| source.downcast_ref::<StorageError>())
+                .expect("retain the original storage failure");
+            assert_eq!(source.code(), expected_code);
+            let response = error.to_http_response().expect("serialize typed unavailable response");
+            assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[http::header::CONTENT_TYPE], "application/xml");
+            assert_eq!(response.headers()["x-rustfs-error-cause"], cause);
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+            let body = response.into_body().collect().await.expect("read S3 error XML").to_bytes();
+            let xml = std::str::from_utf8(&body).expect("S3 XML is UTF-8");
+            assert!(xml.contains("<Code>ServiceUnavailable</Code>"));
+            assert!(!xml.contains("private-bucket"));
+            assert!(!xml.contains("private-object"));
+        }
+    }
+
+    #[test]
+    fn unavailable_response_does_not_infer_a_cause_from_timeout_text() {
+        for failure in [
+            StorageError::Timeout,
+            StorageError::DiskFull,
+            StorageError::DiskNotFound,
+            StorageError::Io(IoError::other("Lock acquisition timeout for private-bucket/private-object after 5s")),
+            StorageError::Io(IoError::new(std::io::ErrorKind::TimedOut, "body stalled")),
+        ] {
+            let error = S3Error::from(ApiError::from(failure));
+            let response = error.to_http_response().expect("serialize unattributed failure");
+            assert!(!response.headers().contains_key("x-rustfs-error-cause"));
         }
     }
 
@@ -1158,6 +1263,14 @@ mod tests {
         };
         assert!(error.diagnostic().truncated);
         assert!(!format!("{:?}", error.diagnostic()).contains("secret"));
+        let error = S3Error::from(ApiError {
+            code: S3ErrorCode::ServiceUnavailable,
+            message: "safe".into(),
+            source: Some(Box::new(Cycle)),
+        });
+        let response = error.to_http_response().expect("serialize cyclic unavailable source");
+        assert!(!response.headers().contains_key("x-rustfs-error-cause"));
+        assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
     }
 
     #[derive(Debug)]
