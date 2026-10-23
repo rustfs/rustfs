@@ -9,7 +9,7 @@
 # the PR that adds tests; lowering one is a reviewed statement that tests were
 # intentionally removed. Regenerate with:
 #   scripts/check_test_count_ratchet.sh --update
-e2e_test	908	18
+e2e_test	909	18
 rustfs	5712	63
 rustfs-audit	70	0
 rustfs-checksums	26	0
@@ -40,7 +40,7 @@ rustfs-object-capacity	92	0
 rustfs-object-data-cache	140	0
 rustfs-obs	367	0
 rustfs-policy	704	0
-rustfs-protocols	736	1
+rustfs-protocols	738	1
 rustfs-protos	64	0
 rustfs-replication	207	0
 rustfs-rio	200	0

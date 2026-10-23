@@ -22,6 +22,11 @@ use crate::storage_api::protocols::client::{FS, ReqInfo, RequestContext, authori
 use http::{HeaderMap, Method};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustfs_credentials;
+use rustfs_gateway_types::compat::s3s_5761ddfe::{
+    self as gateway_s3s_compat, leaf::RequestWire, request_context::GatewayRequestContext,
+};
+use rustfs_gateway_types::dto as gateway_dto;
+use rustfs_gateway_types::{BucketName, OpaqueString};
 use rustfs_protocols::common::SessionContext;
 #[cfg(feature = "webdav")]
 use rustfs_protocols::common::client::s3::{BucketCapacity, SessionCapacityView};
@@ -30,7 +35,7 @@ use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::MaskedAccessKey;
 use s3s::dto::*;
 use s3s::{S3, S3Request, S3Result};
-use tokio_stream::Stream;
+use std::fmt::Display;
 use tracing::trace;
 
 const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
@@ -86,6 +91,57 @@ fn append_query_param(uri: &mut String, first: &mut bool, key: &str, value: Opti
 fn parse_protocol_uri(uri: String, context: String) -> S3Result<http::Uri> {
     uri.parse()
         .map_err(|e| s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("invalid URI for {context}: {e}")))
+}
+
+fn conversion_error(operation: &str, error: impl Display) -> rustfs_s3_types::S3Error {
+    rustfs_s3_types::S3Error::with_message(
+        rustfs_s3_types::S3ErrorCode::InternalError,
+        format!("failed to convert {operation} through the gateway compatibility seam: {error}"),
+    )
+}
+
+fn list_buckets_output_from_s3s(output: s3s::dto::ListBucketsOutput) -> Result<gateway_dto::ListBucketsOutput, String> {
+    let s3s::dto::ListBucketsOutput {
+        buckets,
+        continuation_token,
+        owner,
+        prefix,
+    } = output;
+
+    // The storage inventory also contains RustFS-internal names such as
+    // `sftp_host_keys`. They were representable by s3s but cannot be emitted
+    // as gateway bucket names, so keep them out of protocol listings.
+    let buckets = buckets
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|bucket| {
+            let valid_name = bucket.name.as_ref().is_some_and(|name| BucketName::new(name.clone()).is_ok());
+            valid_name.then_some(bucket)
+        })
+        .map(|bucket| gateway_s3s_compat::generated::shapes::bucket::bucket_from_s3s(bucket).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let owner = owner
+        .ok_or_else(|| "owner: the gateway shape requires this member".to_owned())
+        .and_then(|owner| gateway_s3s_compat::generated::shapes::owner::owner_from_s3s(owner).map_err(|e| e.to_string()))?;
+
+    Ok(gateway_dto::ListBucketsOutput {
+        buckets,
+        owner,
+        continuation_token: continuation_token.map(OpaqueString::from),
+        prefix,
+    })
+}
+
+fn gateway_request_context(method: Method, uri: &http::Uri, headers: HeaderMap) -> GatewayRequestContext {
+    GatewayRequestContext {
+        method,
+        raw_path: uri.path().to_owned(),
+        raw_query: uri.query().unwrap_or_default().to_owned(),
+        headers,
+        principal: None,
+        host_region: None,
+        declares_trailers: false,
+    }
 }
 
 fn trace_protocol_request(operation: &str, bucket: Option<&str>, object: Option<&str>) {
@@ -209,20 +265,20 @@ fn build_object_uri(bucket: &str, key: &str, query: &[(&str, Option<&str>)]) -> 
     parse_protocol_uri(uri, format!("bucket={bucket} key={key}"))
 }
 
-fn build_list_objects_uri(input: &ListObjectsV2Input) -> S3Result<http::Uri> {
+fn build_list_objects_uri(input: &gateway_dto::ListObjectsV2Input) -> S3Result<http::Uri> {
     let max_keys = input.max_keys.map(|value| value.to_string());
     let query: Vec<_> = [
         ("list-type", Some("2")),
         ("prefix", input.prefix.as_deref()),
         ("delimiter", input.delimiter.as_deref()),
         ("max-keys", max_keys.as_deref()),
-        ("continuation-token", input.continuation_token.as_deref()),
+        ("continuation-token", input.continuation_token.as_ref().map(|value| value.as_str())),
         ("start-after", input.start_after.as_deref()),
     ]
     .into_iter()
     .filter(|(_, value)| value.is_some())
     .collect();
-    build_bucket_uri(&input.bucket, &query)
+    build_bucket_uri(input.bucket.as_str(), &query)
 }
 
 /// Request parameters for creating S3 requests
@@ -252,7 +308,7 @@ impl ProtocolStorageClient {
         action: &S3Action,
         bucket: &str,
         object: Option<&str>,
-        listing: Option<&ListObjectsV2Input>,
+        listing: Option<&gateway_dto::ListObjectsV2Input>,
     ) -> S3Result<()> {
         let context = self.fs.server_ctx().installed_app_context().ok_or_else(|| {
             s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, "protocol server application context is not initialized")
@@ -338,7 +394,7 @@ impl ProtocolStorageClient {
 
 #[async_trait::async_trait]
 impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageClient {
-    type Error = s3s::S3Error;
+    type Error = rustfs_s3_types::S3Error;
 
     async fn authorize_operation(
         &self,
@@ -362,12 +418,12 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
     async fn authorize_list_objects(
         &self,
         session: &SessionContext,
-        input: &ListObjectsV2Input,
+        input: &gateway_dto::ListObjectsV2Input,
     ) -> Result<(), AuthorizationError> {
         if !is_operation_supported(session.protocol, &S3Action::ListBucket) {
             return Err(AuthorizationError::AccessDenied);
         }
-        self.authorize_protocol_request(session, &S3Action::ListBucket, &input.bucket, None, Some(input))
+        self.authorize_protocol_request(session, &S3Action::ListBucket, input.bucket.as_str(), None, Some(input))
             .await
             .map_err(|error| match error.code() {
                 s3s::S3ErrorCode::AccessDenied | s3s::S3ErrorCode::InvalidAccessKeyId => AuthorizationError::AccessDenied,
@@ -381,7 +437,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         key: &str,
         credentials: &rustfs_credentials::Credentials,
         start_pos: Option<u64>,
-    ) -> Result<GetObjectOutput, Self::Error> {
+    ) -> Result<gateway_dto::GetObjectOutput, Self::Error> {
         trace_protocol_request("get_object", Some(bucket), Some(key));
         trace!(
             event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
@@ -422,39 +478,43 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         )?;
 
         match self.fs.get_object(req).await {
-            Ok(response) => Ok(response.output),
-            Err(e) => Err(e),
+            Ok(response) => gateway_s3s_compat::generated::ops::get_object::output_from_s3s(response.output)
+                .map_err(|e| conversion_error("GetObject output", e)),
+            Err(e) => Err(e.into()),
         }
     }
 
     async fn put_object(
         &self,
-        input: PutObjectInput,
+        input: gateway_dto::PutObjectInput,
         credentials: &rustfs_credentials::Credentials,
-    ) -> Result<PutObjectOutput, Self::Error> {
+    ) -> Result<gateway_dto::PutObjectOutput, Self::Error> {
         trace!(
             event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
             component = LOG_COMPONENT_PROTOCOLS,
             subsystem = LOG_SUBSYSTEM_STORAGE_CLIENT,
             operation = "put_object",
-            bucket = %input.bucket,
-            object = %input.key,
+            bucket = %input.bucket.as_str(),
+            object = %input.key.as_str(),
             "Protocol storage client request"
         );
 
-        let bucket = input.bucket.clone();
-        let key = input.key.clone();
+        let bucket = input.bucket.as_str().to_owned();
+        let key = input.key.as_str().to_owned();
         let uri = build_object_uri(&bucket, &key, &[])?;
 
+        let content_length = input.content_length;
         let mut headers = HeaderMap::default();
-        if let Some(ref body) = input.body {
-            let (lower, upper) = body.size_hint();
-            let resolved_len = upper.or(if lower > 0 { Some(lower) } else { None });
-            if let Some(len) = resolved_len
-                && let Ok(header_value) = len.to_string().parse()
-            {
-                headers.insert("content-length", header_value);
-            }
+        if content_length >= 0
+            && let Ok(header_value) = content_length.to_string().parse()
+        {
+            headers.insert("content-length", header_value);
+        }
+
+        let mut input =
+            gateway_s3s_compat::put_object::input_to_s3s(input).map_err(|e| conversion_error("PutObject input", e))?;
+        if content_length < 0 {
+            input.content_length = None;
         }
 
         let req = Self::create_request(
@@ -470,8 +530,9 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let req = S3Request { headers, ..req };
 
         match self.fs.put_object(req).await {
-            Ok(response) => Ok(response.output),
-            Err(e) => Err(e),
+            Ok(response) => gateway_s3s_compat::put_object::output_from_s3s(response.output)
+                .map_err(|e| conversion_error("PutObject output", e)),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -480,7 +541,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         bucket: &str,
         key: &str,
         credentials: &rustfs_credentials::Credentials,
-    ) -> Result<DeleteObjectOutput, Self::Error> {
+    ) -> Result<gateway_dto::DeleteObjectOutput, Self::Error> {
         trace_protocol_request("delete_object", Some(bucket), Some(key));
 
         let input = DeleteObjectInput::builder()
@@ -504,8 +565,9 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         )?;
 
         match self.fs.delete_object(req).await {
-            Ok(response) => Ok(response.output),
-            Err(e) => Err(e),
+            Ok(response) => gateway_s3s_compat::generated::ops::delete_object::output_from_s3s(response.output)
+                .map_err(|e| conversion_error("DeleteObject output", e)),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -514,7 +576,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         bucket: &str,
         key: &str,
         credentials: &rustfs_credentials::Credentials,
-    ) -> Result<HeadObjectOutput, Self::Error> {
+    ) -> Result<gateway_dto::HeadObjectOutput, Self::Error> {
         trace_protocol_request("head_object", Some(bucket), Some(key));
 
         let input = HeadObjectInput::builder()
@@ -538,8 +600,9 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         )?;
 
         match self.fs.head_object(req).await {
-            Ok(response) => Ok(response.output),
-            Err(e) => Err(e),
+            Ok(response) => gateway_s3s_compat::generated::ops::head_object::output_from_s3s(response.output)
+                .map_err(|e| conversion_error("HeadObject output", e)),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -547,7 +610,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         &self,
         bucket: &str,
         credentials: &rustfs_credentials::Credentials,
-    ) -> Result<HeadBucketOutput, Self::Error> {
+    ) -> Result<gateway_dto::HeadBucketOutput, Self::Error> {
         trace_protocol_request("head_bucket", Some(bucket), None);
 
         let input = HeadBucketInput::builder().bucket(bucket.to_string()).build().map_err(|e| {
@@ -567,20 +630,23 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         )?;
 
         match self.fs.head_bucket(req).await {
-            Ok(response) => Ok(response.output),
-            Err(e) => Err(e),
+            Ok(response) => gateway_s3s_compat::generated::ops::head_bucket::output_from_s3s(response.output)
+                .map_err(|e| conversion_error("HeadBucket output", e)),
+            Err(e) => Err(e.into()),
         }
     }
 
     async fn list_objects_v2(
         &self,
-        input: ListObjectsV2Input,
+        input: gateway_dto::ListObjectsV2Input,
         credentials: &rustfs_credentials::Credentials,
-    ) -> Result<ListObjectsV2Output, Self::Error> {
-        trace_protocol_request("list_objects_v2", Some(&input.bucket), None);
+    ) -> Result<gateway_dto::ListObjectsV2Output, Self::Error> {
+        trace_protocol_request("list_objects_v2", Some(input.bucket.as_str()), None);
 
-        let bucket = input.bucket.clone();
+        let bucket = input.bucket.as_str().to_owned();
         let uri = build_list_objects_uri(&input)?;
+        let input = gateway_s3s_compat::generated::ops::list_objects_v2::input_to_s3s(input)
+            .map_err(|e| conversion_error("ListObjectsV2 input", e))?;
         let req = Self::create_request(
             input,
             Method::GET,
@@ -593,12 +659,16 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         )?;
 
         match self.fs.list_objects_v2(req).await {
-            Ok(response) => Ok(response.output),
-            Err(e) => Err(e),
+            Ok(response) => gateway_s3s_compat::generated::ops::list_objects_v2::output_from_s3s(response.output)
+                .map_err(|e| conversion_error("ListObjectsV2 output", e)),
+            Err(e) => Err(e.into()),
         }
     }
 
-    async fn list_buckets(&self, credentials: &rustfs_credentials::Credentials) -> Result<ListBucketsOutput, Self::Error> {
+    async fn list_buckets(
+        &self,
+        credentials: &rustfs_credentials::Credentials,
+    ) -> Result<gateway_dto::ListBucketsOutput, Self::Error> {
         trace!(
             event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
             component = LOG_COMPONENT_PROTOCOLS,
@@ -624,8 +694,8 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         )?;
 
         match self.fs.list_buckets(req).await {
-            Ok(response) => Ok(response.output),
-            Err(e) => Err(e),
+            Ok(response) => list_buckets_output_from_s3s(response.output).map_err(|e| conversion_error("ListBuckets output", e)),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -635,7 +705,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         session_context: &SessionContext,
         request_headers: &HeaderMap,
         secure_transport: bool,
-    ) -> rustfs_s3_types::S3Result<ListBucketsOutput> {
+    ) -> rustfs_s3_types::S3Result<gateway_dto::ListBucketsOutput> {
         trace!(
             event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
             component = LOG_COMPONENT_PROTOCOLS,
@@ -649,11 +719,8 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build ListBucketsInput: {}", e))
         })?;
         let request = session_list_buckets_request(input, session_context, request_headers, secure_transport);
-        self.fs
-            .list_buckets(request)
-            .await
-            .map(|response| response.output)
-            .map_err(Into::into)
+        let response = self.fs.list_buckets(request).await?;
+        list_buckets_output_from_s3s(response.output).map_err(|e| conversion_error("ListBuckets output", e))
     }
 
     /// Every input is a cache or snapshot read: quota reporting never triggers
@@ -672,12 +739,13 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         })?;
         let request = session_list_buckets_request(input, session_context, request_headers, secure_transport);
         let listing = self.fs.list_buckets(request).await?.output;
+        let listing = list_buckets_output_from_s3s(listing).map_err(|e| conversion_error("ListBuckets output", e))?;
 
         let store = current_object_store_handle();
-        let listed = listing.buckets.unwrap_or_default();
+        let listed = listing.buckets;
         let mut buckets = Vec::with_capacity(listed.len());
         for bucket in listed {
-            let Some(name) = bucket.name else { continue };
+            let name = bucket.name.as_str().to_owned();
             let quota_limit = match capacity::get_quota_config(&name).await {
                 Ok((config, _)) => config.get_quota_limit(),
                 // No quota configured, or the bucket was deleted between the
@@ -717,7 +785,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         &self,
         bucket: &str,
         credentials: &rustfs_credentials::Credentials,
-    ) -> Result<CreateBucketOutput, Self::Error> {
+    ) -> Result<gateway_dto::CreateBucketOutput, Self::Error> {
         trace_protocol_request("create_bucket", Some(bucket), None);
 
         let input = CreateBucketInput::builder().bucket(bucket.to_string()).build().map_err(|e| {
@@ -737,8 +805,9 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         )?;
 
         match self.fs.create_bucket(req).await {
-            Ok(response) => Ok(response.output),
-            Err(e) => Err(e),
+            Ok(response) => gateway_s3s_compat::generated::ops::create_bucket::output_from_s3s(response.output)
+                .map_err(|e| conversion_error("CreateBucket output", e)),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -749,7 +818,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         credentials: &rustfs_credentials::Credentials,
         start_pos: u64,
         length: u64,
-    ) -> Result<GetObjectOutput, Self::Error> {
+    ) -> Result<gateway_dto::GetObjectOutput, Self::Error> {
         trace_protocol_request("get_object_range", Some(bucket), Some(key));
         trace!(
             event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
@@ -790,29 +859,36 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         )?;
 
         match self.fs.get_object(req).await {
-            Ok(response) => Ok(response.output),
-            Err(e) => Err(e),
+            Ok(response) => gateway_s3s_compat::generated::ops::get_object::output_from_s3s(response.output)
+                .map_err(|e| conversion_error("GetObject output", e)),
+            Err(e) => Err(e.into()),
         }
     }
 
     async fn copy_object(
         &self,
-        input: CopyObjectInput,
+        input: gateway_dto::CopyObjectInput,
         credentials: &rustfs_credentials::Credentials,
-    ) -> Result<CopyObjectOutput, Self::Error> {
+    ) -> Result<gateway_dto::CopyObjectOutput, Self::Error> {
         trace!(
             event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
             component = LOG_COMPONENT_PROTOCOLS,
             subsystem = LOG_SUBSYSTEM_STORAGE_CLIENT,
             operation = "copy_object",
-            bucket = %input.bucket,
-            object = %input.key,
+            bucket = %input.bucket.as_str(),
+            object = %input.key.as_str(),
             "Protocol storage client request"
         );
 
-        let bucket = input.bucket.clone();
-        let key = input.key.clone();
+        let bucket = input.bucket.as_str().to_owned();
+        let key = input.key.as_str().to_owned();
         let uri = build_object_uri(&bucket, &key, &[])?;
+        let copy_source =
+            s3s::dto::CopySource::parse(&input.copy_source).map_err(|e| conversion_error("CopyObject copy_source", e))?;
+        let context = gateway_request_context(Method::PUT, &uri, HeaderMap::new());
+        let wire = RequestWire::of(&context);
+        let input = gateway_s3s_compat::generated::ops::copy_object::input_to_s3s(input, copy_source, &wire)
+            .map_err(|e| conversion_error("CopyObject input", e))?;
 
         let req = Self::create_request(
             input,
@@ -826,8 +902,9 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         )?;
 
         match self.fs.copy_object(req).await {
-            Ok(response) => Ok(response.output),
-            Err(e) => Err(e),
+            Ok(response) => gateway_s3s_compat::generated::ops::copy_object::output_from_s3s(response.output)
+                .map_err(|e| conversion_error("CopyObject output", e)),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -835,14 +912,19 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         &self,
         bucket: &str,
         credentials: &rustfs_credentials::Credentials,
-    ) -> Result<DeleteBucketOutput, Self::Error> {
+    ) -> Result<gateway_dto::DeleteBucketOutput, Self::Error> {
         trace_protocol_request("delete_bucket", Some(bucket), None);
 
-        let input = DeleteBucketInput::builder().bucket(bucket.to_string()).build().map_err(|e| {
-            s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build DeleteBucketInput: {}", e))
-        })?;
-
         let uri = build_bucket_uri(bucket, &[])?;
+        let gateway_input = gateway_dto::DeleteBucketInput {
+            bucket: rustfs_gateway_types::BucketName::new(bucket.to_owned())
+                .map_err(|e| conversion_error("DeleteBucket bucket", e))?,
+            expected_bucket_owner: None,
+        };
+        let context = gateway_request_context(Method::DELETE, &uri, HeaderMap::new());
+        let wire = RequestWire::of(&context);
+        let input = gateway_s3s_compat::generated::ops::delete_bucket::input_to_s3s(gateway_input, &wire)
+            .map_err(|e| conversion_error("DeleteBucket input", e))?;
         let req = Self::create_request(
             input,
             Method::DELETE,
@@ -855,29 +937,34 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         )?;
 
         match self.fs.delete_bucket(req).await {
-            Ok(response) => Ok(response.output),
-            Err(e) => Err(e),
+            Ok(response) => gateway_s3s_compat::generated::ops::delete_bucket::output_from_s3s(response.output)
+                .map_err(|e| conversion_error("DeleteBucket output", e)),
+            Err(e) => Err(e.into()),
         }
     }
 
     async fn create_multipart_upload(
         &self,
-        input: CreateMultipartUploadInput,
+        input: gateway_dto::CreateMultipartUploadInput,
         credentials: &rustfs_credentials::Credentials,
-    ) -> Result<CreateMultipartUploadOutput, Self::Error> {
+    ) -> Result<gateway_dto::CreateMultipartUploadOutput, Self::Error> {
         trace!(
             event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
             component = LOG_COMPONENT_PROTOCOLS,
             subsystem = LOG_SUBSYSTEM_STORAGE_CLIENT,
             operation = "create_multipart_upload",
-            bucket = %input.bucket,
-            object = %input.key,
+            bucket = %input.bucket.as_str(),
+            object = %input.key.as_str(),
             "Protocol storage client request"
         );
 
-        let bucket = input.bucket.clone();
-        let key = input.key.clone();
+        let bucket = input.bucket.as_str().to_owned();
+        let key = input.key.as_str().to_owned();
         let uri = build_object_uri(&bucket, &key, &[("uploads", None)])?;
+        let context = gateway_request_context(Method::POST, &uri, HeaderMap::new());
+        let wire = RequestWire::of(&context);
+        let input = gateway_s3s_compat::generated::ops::create_multipart_upload::input_to_s3s(input, &wire)
+            .map_err(|e| conversion_error("CreateMultipartUpload input", e))?;
 
         let req = Self::create_request(
             input,
@@ -891,29 +978,33 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         )?;
 
         match self.fs.create_multipart_upload(req).await {
-            Ok(response) => Ok(response.output),
-            Err(e) => Err(e),
+            Ok(response) => gateway_s3s_compat::generated::ops::create_multipart_upload::output_from_s3s(response.output)
+                .map_err(|e| conversion_error("CreateMultipartUpload output", e)),
+            Err(e) => Err(e.into()),
         }
     }
 
     async fn upload_part(
         &self,
-        input: UploadPartInput,
+        input: gateway_dto::UploadPartInput,
         credentials: &rustfs_credentials::Credentials,
-    ) -> Result<UploadPartOutput, Self::Error> {
+    ) -> Result<gateway_dto::UploadPartOutput, Self::Error> {
         trace!(
             event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
             component = LOG_COMPONENT_PROTOCOLS,
             subsystem = LOG_SUBSYSTEM_STORAGE_CLIENT,
             operation = "upload_part",
-            bucket = %input.bucket,
-            object = %input.key,
+            bucket = %input.bucket.as_str(),
+            object = %input.key.as_str(),
             part_number = input.part_number,
             "Protocol storage client request"
         );
 
-        let bucket = input.bucket.clone();
-        let key = input.key.clone();
+        let bucket = input.bucket.as_str().to_owned();
+        let key = input.key.as_str().to_owned();
+        let content_length = input.content_length;
+        let input = gateway_s3s_compat::generated::ops::upload_part::input_to_s3s(input)
+            .map_err(|e| conversion_error("UploadPart input", e))?;
         let part_number = input.part_number;
         let upload_id = input.upload_id.clone();
         let part_number = part_number.to_string();
@@ -926,24 +1017,9 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             ],
         )?;
 
-        // Set content-length from the body size hint so ecfs can bound
-        // the read and validate the part size. Prefer the exact upper
-        // bound when the producer knows it (the common case for an
-        // owned-buffer body). Fall back to the lower bound for truly
-        // streaming bodies of unknown length. Omit the header when the
-        // size is wholly unknown. The request then goes chunked and
-        // ecfs reads until EOF. The parse step cannot fail for ASCII
-        // digit strings, but an if-let keeps the code panic-free if a
-        // future refactor changes the source of the length value.
         let mut headers = HeaderMap::default();
-        if let Some(ref body) = input.body {
-            let (lower, upper) = body.size_hint();
-            let resolved_len = upper.or(if lower > 0 { Some(lower) } else { None });
-            if let Some(len) = resolved_len
-                && let Ok(header_value) = len.to_string().parse()
-            {
-                headers.insert("content-length", header_value);
-            }
+        if let Ok(header_value) = content_length.to_string().parse() {
+            headers.insert("content-length", header_value);
         }
 
         let req = Self::create_request(
@@ -959,28 +1035,31 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         let req = S3Request { headers, ..req };
 
         match self.fs.upload_part(req).await {
-            Ok(response) => Ok(response.output),
-            Err(e) => Err(e),
+            Ok(response) => gateway_s3s_compat::generated::ops::upload_part::output_from_s3s(response.output)
+                .map_err(|e| conversion_error("UploadPart output", e)),
+            Err(e) => Err(e.into()),
         }
     }
 
     async fn complete_multipart_upload(
         &self,
-        input: CompleteMultipartUploadInput,
+        input: gateway_dto::CompleteMultipartUploadInput,
         credentials: &rustfs_credentials::Credentials,
-    ) -> Result<CompleteMultipartUploadOutput, Self::Error> {
+    ) -> Result<gateway_dto::CompleteMultipartUploadOutput, Self::Error> {
         trace!(
             event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
             component = LOG_COMPONENT_PROTOCOLS,
             subsystem = LOG_SUBSYSTEM_STORAGE_CLIENT,
             operation = "complete_multipart_upload",
-            bucket = %input.bucket,
-            object = %input.key,
+            bucket = %input.bucket.as_str(),
+            object = %input.key.as_str(),
             "Protocol storage client request"
         );
 
-        let bucket = input.bucket.clone();
-        let key = input.key.clone();
+        let bucket = input.bucket.as_str().to_owned();
+        let key = input.key.as_str().to_owned();
+        let input = gateway_s3s_compat::generated::ops::complete_multipart_upload::input_to_s3s(input)
+            .map_err(|e| conversion_error("CompleteMultipartUpload input", e))?;
         let upload_id = input.upload_id.clone();
         let uri = build_object_uri(&bucket, &key, &[("uploadId", Some(upload_id.as_str()))])?;
 
@@ -996,29 +1075,31 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         )?;
 
         match self.fs.complete_multipart_upload(req).await {
-            Ok(response) => Ok(response.output),
-            Err(e) => Err(e),
+            Ok(response) => gateway_s3s_compat::generated::ops::complete_multipart_upload::output_from_s3s(response.output)
+                .map_err(|e| conversion_error("CompleteMultipartUpload output", e)),
+            Err(e) => Err(e.into()),
         }
     }
 
     async fn abort_multipart_upload(
         &self,
-        input: AbortMultipartUploadInput,
+        input: gateway_dto::AbortMultipartUploadInput,
         credentials: &rustfs_credentials::Credentials,
-    ) -> Result<AbortMultipartUploadOutput, Self::Error> {
+    ) -> Result<gateway_dto::AbortMultipartUploadOutput, Self::Error> {
         trace!(
             event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
             component = LOG_COMPONENT_PROTOCOLS,
             subsystem = LOG_SUBSYSTEM_STORAGE_CLIENT,
             operation = "abort_multipart_upload",
-            bucket = %input.bucket,
-            object = %input.key,
-            upload_id = %input.upload_id,
+            bucket = %input.bucket.as_str(),
+            object = %input.key.as_str(),
             "Protocol storage client request"
         );
 
-        let bucket = input.bucket.clone();
-        let key = input.key.clone();
+        let bucket = input.bucket.as_str().to_owned();
+        let key = input.key.as_str().to_owned();
+        let input = gateway_s3s_compat::generated::ops::abort_multipart_upload::input_to_s3s(input)
+            .map_err(|e| conversion_error("AbortMultipartUpload input", e))?;
         let upload_id = input.upload_id.clone();
         let uri = build_object_uri(&bucket, &key, &[("uploadId", Some(upload_id.as_str()))])?;
 
@@ -1034,29 +1115,34 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         )?;
 
         match self.fs.abort_multipart_upload(req).await {
-            Ok(response) => Ok(response.output),
-            Err(e) => Err(e),
+            Ok(response) => gateway_s3s_compat::generated::ops::abort_multipart_upload::output_from_s3s(response.output)
+                .map_err(|e| conversion_error("AbortMultipartUpload output", e)),
+            Err(e) => Err(e.into()),
         }
     }
 
     async fn upload_part_copy(
         &self,
-        input: UploadPartCopyInput,
+        input: gateway_dto::UploadPartCopyInput,
         credentials: &rustfs_credentials::Credentials,
-    ) -> Result<UploadPartCopyOutput, Self::Error> {
+    ) -> Result<gateway_dto::UploadPartCopyOutput, Self::Error> {
         trace!(
             event = EVENT_PROTOCOL_STORAGE_CLIENT_REQUEST,
             component = LOG_COMPONENT_PROTOCOLS,
             subsystem = LOG_SUBSYSTEM_STORAGE_CLIENT,
             operation = "upload_part_copy",
-            bucket = %input.bucket,
-            object = %input.key,
+            bucket = %input.bucket.as_str(),
+            object = %input.key.as_str(),
             part_number = input.part_number,
             "Protocol storage client request"
         );
 
-        let bucket = input.bucket.clone();
-        let key = input.key.clone();
+        let bucket = input.bucket.as_str().to_owned();
+        let key = input.key.as_str().to_owned();
+        let copy_source =
+            s3s::dto::CopySource::parse(&input.copy_source).map_err(|e| conversion_error("UploadPartCopy copy_source", e))?;
+        let input = gateway_s3s_compat::generated::ops::upload_part_copy::input_to_s3s(input, copy_source)
+            .map_err(|e| conversion_error("UploadPartCopy input", e))?;
         let part_number = input.part_number;
         let upload_id = input.upload_id.clone();
         let part_number = part_number.to_string();
@@ -1081,8 +1167,9 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         )?;
 
         match self.fs.upload_part_copy(req).await {
-            Ok(response) => Ok(response.output),
-            Err(e) => Err(e),
+            Ok(response) => gateway_s3s_compat::generated::ops::upload_part_copy::output_from_s3s(response.output)
+                .map_err(|e| conversion_error("UploadPartCopy output", e)),
+            Err(e) => Err(e.into()),
         }
     }
 }
