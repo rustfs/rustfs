@@ -204,12 +204,12 @@ jobs:
           persist-credentials: false
 
       - name: Initialize validation evidence
+        env:
+          VALIDATION_TOOLS_ONLY: ${{ inputs.validation_tools_only }}
         run: |
           set -euo pipefail
           umask 077
-          VALIDATION_ROOT="${RUNNER_TEMP}/rustfs-validation-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          mkdir -- "${VALIDATION_ROOT}"
-          printf 'VALIDATION_ROOT=%s\n' "${VALIDATION_ROOT}" >> "${GITHUB_ENV}"
+          python3 -B scripts/initialize_validation_evidence.py
 
       - name: Resolve immutable candidate
         id: candidate
@@ -535,11 +535,11 @@ jobs:
           fi
 
       - name: Upload validation evidence
-        if: ${{ always() }}
+        if: ${{ always() && env.VALIDATION_ROOT != '' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rustfs-validation-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/rustfs-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.VALIDATION_ROOT }}
           if-no-files-found: error
 
   validation-tools:

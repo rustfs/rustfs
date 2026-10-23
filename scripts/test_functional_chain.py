@@ -14,6 +14,93 @@ import zipfile
 
 import functional_chain_evidence as evidence
 import resolve_functional_candidate as candidate
+import initialize_validation_evidence as validation_storage
+
+
+class ValidationStorageTests(unittest.TestCase):
+    def fixture(self, root, *, tools_only=False):
+        temporary = root / '_work/_temp'
+        temporary.mkdir(parents=True)
+        return dict(RUNNER_TEMP=str(temporary.resolve()), GITHUB_RUN_ID='77', GITHUB_RUN_ATTEMPT='1',
+                    VALIDATION_TOOLS_ONLY=str(tools_only).lower(), GITHUB_ENV=str(root / 'env'))
+
+    def usage(self, *, available=None, inodes=None):
+        return mock.Mock(f_bavail=validation_storage.MINIMUM_FREE_BYTES if available is None else available,
+                         f_frsize=1, f_favail=validation_storage.MINIMUM_FREE_INODES if inodes is None else inodes)
+
+    def test_self_hosted_evidence_survives_temp_cleanup_and_refuses_reuse(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            env = self.fixture(root)
+            with mock.patch.object(validation_storage.os, 'statvfs', return_value=self.usage()):
+                evidence_root = validation_storage.initialize(env)
+                with self.assertRaises(FileExistsError):
+                    validation_storage.initialize(env)
+            self.assertEqual(evidence_root, Path(env['RUNNER_TEMP']).parent /
+                             'rustfs-validation-evidence/rustfs-validation-77-1')
+            self.assertEqual(evidence_root.parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(evidence_root.stat().st_mode & 0o777, 0o700)
+            Path(env['RUNNER_TEMP']).rmdir()
+            self.assertTrue((evidence_root / 'runner-storage-preflight.json').is_file())
+            self.assertEqual(Path(env['GITHUB_ENV']).read_text(), 'VALIDATION_ROOT=' + str(evidence_root) + chr(10))
+
+    def test_each_filesystem_byte_and_inode_budget_fails_before_candidate_execution(self):
+        for position in (0, 1):
+            for kind in ('bytes', 'inodes'):
+                with self.subTest(position=position, kind=kind), tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp)
+                    env = self.fixture(root)
+                    usage = [self.usage(), self.usage()]
+                    usage[position] = self.usage(available=validation_storage.MINIMUM_FREE_BYTES - 1) if kind == 'bytes' \
+                        else self.usage(inodes=validation_storage.MINIMUM_FREE_INODES - 1)
+                    with mock.patch.object(validation_storage.os, 'statvfs', side_effect=usage):
+                        with self.assertRaisesRegex(ValueError, 'at least 10 GiB'):
+                            validation_storage.initialize(env)
+                    evidence_root = Path(Path(env['GITHUB_ENV']).read_text().strip().split('=', 1)[1])
+                    report = json.loads((evidence_root / 'runner-storage-preflight.json').read_text())
+                    self.assertFalse(report['ready'])
+                    self.assertFalse(report['automaticEvidenceDeletion'])
+                    self.assertEqual(len(report['storage']), 2)
+
+    def test_tools_resolver_keeps_its_disposable_hosted_location(self):
+        with tempfile.TemporaryDirectory() as temp:
+            env = self.fixture(Path(temp), tools_only=True)
+            with mock.patch.object(validation_storage.os, 'statvfs', return_value=self.usage()):
+                root = validation_storage.initialize(env)
+            self.assertEqual(root.parent, Path(env['RUNNER_TEMP']))
+            self.assertFalse(json.loads((root / 'runner-storage-preflight.json').read_text())
+                             ['persistentOutsideRunnerTemp'])
+
+    def test_rejects_unsafe_parent_and_untrusted_identities(self):
+        for kind in ('symlink', 'public', 'run', 'attempt', 'selection'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                env = self.fixture(root)
+                parent = Path(env['RUNNER_TEMP']).parent / 'rustfs-validation-evidence'
+                if kind == 'symlink':
+                    other = root / 'other'
+                    other.mkdir(mode=0o700)
+                    parent.symlink_to(other, target_is_directory=True)
+                elif kind == 'public':
+                    parent.mkdir(mode=0o755)
+                    parent.chmod(0o755)
+                else:
+                    env[{'run': 'GITHUB_RUN_ID', 'attempt': 'GITHUB_RUN_ATTEMPT',
+                         'selection': 'VALIDATION_TOOLS_ONLY'}[kind]] = '../foreign'
+                with self.assertRaises(ValueError):
+                    validation_storage.initialize(env)
+                self.assertFalse(Path(env['GITHUB_ENV']).exists())
+                self.assertFalse((parent / 'rustfs-validation-77-1').exists())
+
+    def test_workflow_uploads_persistent_evidence_and_preflights_before_resolution(self):
+        source = (candidate.ROOT / '.github/workflows/rustfs-functional-chain.yml').read_text()
+        initialize = source.index('      - name: Initialize validation evidence')
+        self.assertLess(initialize, source.index('      - name: Resolve immutable candidate'))
+        self.assertIn('python3 -B scripts/initialize_validation_evidence.py', source)
+        self.assertIn('VALIDATION_TOOLS_ONLY: ${{ inputs.validation_tools_only }}', source)
+        upload = source.split('      - name: Upload validation evidence', 1)[1].split('  validation-tools:', 1)[0]
+        self.assertIn("if: ${{ always() && env.VALIDATION_ROOT != '' }}", upload)
+        self.assertIn('path: ${{ env.VALIDATION_ROOT }}', upload)
 
 
 class RaceNativeToolsWorkflowTests(unittest.TestCase):
