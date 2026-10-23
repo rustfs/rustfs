@@ -168,6 +168,7 @@ requires a compatibility window and a dedicated cleanup entry.
 | `.usage.observed.json` | scanner observation path | Written when an authoritative publication cannot be proven but a diagnostic snapshot is still useful. It is never a hard-quota authority. |
 | `bucket-metadata/.usage.json` | scanner usage floor | Carries the persisted per-bucket floor used by quota during a degraded authoritative-usage window. It is static until the next complete scanner publication. |
 | `.bloomcycle.bin.recovery-required.json` | scanner cycle recovery | Quarantines invalid cycle state with retry evidence. Only scanner recovery code updates or clears it. |
+| `.bloomcycle.bin.dual-recovery/<sha(marker)>/` (`cycle.bin`, `<sha(identity)>/usage-N.bin`, `expected-cycle.bin`) | scanner dual-corruption recovery | Written once per recovery attempt with an `If-None-Match` precondition and confirmed by read-back: the original cycle bytes, the original usage-slot bytes, and the exact replacement counter expected against the observed revisions. Immutable. A restart after the counter commit resumes only when `expected-cycle.bin` and every source binding match. Never deleted automatically; one set accumulates per incident. It is diagnostic evidence and never usage or quota authority. |
 | `.scanner-cycle.lock` | scanner runtime lock | Serializes cycle-level work. A missing lock object is not itself usage evidence. |
 | `.scanner-pause-backlog.json` | scanner pause and catch-up ledger | Tracks dirty usage, discovered lifecycle work, and full-scan catch-up while authoritative publication is fenced by data movement. It never grants publication admission. |
 
@@ -275,6 +276,19 @@ usage-floor fences:
   baseline and epoch 1 exactly as a missing floor does, and quota-bearing
   buckets keep failing closed until the rebuilt baseline publishes. A corrupt
   cycle state must still be rebuilt first.
+- When both the cycle body and every usage slot are corrupt, the leader
+  rebuilds without an operator reset only if the cycle revision still carries a
+  recognized fencing header and a matching strict quarantine marker. It first
+  retains the original bytes and the expected replacement counter under
+  `.bloomcycle.bin.dual-recovery/`, then CAS-rebuilds the counter above the
+  surviving epoch and cycle bounds and CAS-publishes the `bootstrap-pending`
+  marker, so quota-bearing buckets keep failing closed until a complete
+  baseline publishes. Scanner code never deletes or rewrites the evidence
+  objects, and operators must not delete them to force startup; they are kept
+  for diagnosis. A usable usage
+  slot, an unknown structured usage format, a `future_schema` counter, a
+  `cleanup-pending` reset, or an unreadable fencing header keeps the existing
+  fail-closed paths.
 - A cycle-state save that fails without revealing a newer leadership epoch is
   retried under the same epoch: inside the save by reconciling against durable
   state (a committed write is confirmed from the read-back, a failed write is
