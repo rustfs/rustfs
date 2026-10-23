@@ -14860,6 +14860,8 @@ mod tests {
         create_test_bucket(&ecstore, &bucket).await;
         seed_recoverable_free_version(&disk_paths, &bucket, object, None, None).await;
 
+        let page_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let worker_permits = Arc::clone(&page_permits);
         let (page_tx, mut page_rx) = tokio::sync::mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
         let loop_cancel = cancel.clone();
@@ -14872,7 +14874,16 @@ mod tests {
                 move |bucket, object, cancel| {
                     let api = Arc::clone(&recovery_store);
                     let page_tx = page_tx.clone();
+                    let page_permits = Arc::clone(&worker_permits);
                     async move {
+                        // Advance the scheduler clock only while real disk I/O is
+                        // parked. Otherwise its timeout can win while the blocking
+                        // filesystem operation is still running on wall-clock time.
+                        let permit = tokio::select! {
+                            _ = cancel.cancelled() => return Err(crate::error::Error::other("test recovery canceled")),
+                            permit = page_permits.acquire() => permit.expect("test controls page admission"),
+                        };
+                        permit.forget();
                         let stats =
                             super::recover_configured_tier_free_versions(api, bucket.clone(), object.clone(), cancel).await?;
                         page_tx
@@ -14900,13 +14911,14 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL).await;
         tokio::time::resume();
+        page_permits.add_permits(1);
         let (bucket_marker, object_marker, active) = tokio::time::timeout(StdDuration::from_secs(30), page_rx.recv())
             .await
             .expect("new tier should enable the next recovery page")
             .expect("worker should remain running");
         assert!(bucket_marker.is_none());
         assert!(object_marker.is_none());
-        assert_eq!(active.enqueued, 1);
+        assert_eq!(active.enqueued, 1, "recovery page: {active:?}");
         let task = recovery_rx
             .lock()
             .await
@@ -14927,6 +14939,7 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(TIER_FREE_VERSION_RECOVERY_BASE_INTERVAL).await;
         tokio::time::resume();
+        page_permits.add_permits(1);
         let (_, _, idle_again) = tokio::time::timeout(StdDuration::from_secs(30), page_rx.recv())
             .await
             .expect("empty configuration should still produce an idle check")
