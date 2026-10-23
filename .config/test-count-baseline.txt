@@ -40,7 +40,7 @@ rustfs-object-capacity	92	0
 rustfs-object-data-cache	140	0
 rustfs-obs	367	0
 rustfs-policy	704	0
-rustfs-protocols	736	1
+rustfs-protocols	738	1
 rustfs-protos	64	0
 rustfs-replication	207	0
 rustfs-rio	200	0
