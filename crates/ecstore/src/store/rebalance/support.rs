@@ -211,8 +211,9 @@ pub(super) fn same_latest_object_info_identity(left: &ObjectInfo, right: &Object
     // partially moved entry keeps every version on its source and only some
     // on its target, so copies of one version legitimately disagree here
     // (rustfs/backlog#2873, defect F). A version id names one version, so an
-    // exact copy of an identified version needs no matching list; a null
-    // version does not, and keeps the full comparison.
+    // exact copy of an identified version needs no matching list. A tiered
+    // null copy identifies the same remote object; an ordinary null version
+    // keeps the full comparison.
     let same_version_history = left.is_latest == right.is_latest
         && left.num_versions == right.num_versions
         && left.successor_mod_time == right.successor_mod_time;
@@ -237,7 +238,13 @@ pub(super) fn same_latest_object_info_identity(left: &ObjectInfo, right: &Object
         && left.version_purge_status == right.version_purge_status
         && left.checksum == right.checksum;
 
-    if exact_identity && (same_version_history || identified_version) {
+    let tiered_null_version = !identified_version
+        && !left.delete_marker
+        && !left.transitioned_object.free_version
+        && left.transitioned_object.status == rustfs_filemeta::TRANSITION_COMPLETE
+        && !left.transitioned_object.tier.is_empty()
+        && !left.transitioned_object.name.is_empty();
+    if exact_identity && (same_version_history || identified_version || tiered_null_version) {
         return true;
     }
 

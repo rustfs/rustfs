@@ -3545,9 +3545,12 @@ fn is_decommission_source_cleanup_retryable_error(err: &Error) -> bool {
 /// its in-place retries, kept typed so the entry failure policy defers it.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
-struct DecommissionCopyQuorumFailure(Error);
+struct DecommissionCopyQuorumFailure(#[source] Error);
 
 fn is_decommission_copy_quorum_error(err: &Error) -> bool {
+    if data_movement::is_data_movement_source_read_error(err) {
+        return false;
+    }
     let err = data_movement::data_movement_stage_source(err).unwrap_or(err);
     matches!(
         err,
@@ -3556,6 +3559,11 @@ fn is_decommission_copy_quorum_error(err: &Error) -> bool {
             | Error::InsufficientReadQuorum(_, _)
             | Error::InsufficientWriteQuorum(_, _)
     )
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) fn is_decommission_copy_quorum_error_for_test(err: &Error) -> bool {
+    is_decommission_copy_quorum_error(err)
 }
 
 /// A drive quorum failure while copying a version leaves the source intact:
@@ -5701,7 +5709,7 @@ impl Drop for DecommissionTestFaultGuard {
 }
 
 #[cfg(test)]
-fn decommission_test_wrap_result<T>(
+pub(crate) fn decommission_test_wrap_result<T>(
     stage: &'static str,
     bucket: &str,
     object: &str,
@@ -27437,12 +27445,66 @@ mod tests {
             Error::VersionNotFound("bucket-a".to_string(), "object-a".to_string(), "version-a".to_string()),
         ] {
             assert!(is_decommission_copy_cleanup_safe_error(&missing_target));
+            let wrapped = wrap(missing_target);
             assert!(
-                !is_decommission_copy_cleanup_safe_error(&wrap(missing_target)),
+                !is_decommission_copy_cleanup_safe_error(&wrapped),
                 "a missing target part must never authorize source cleanup"
             );
+            assert!(!is_decommission_copy_quorum_error(&wrapped));
         }
         assert!(is_decommission_target_capacity_error(&wrap(Error::DiskFull)));
+    }
+
+    #[test]
+    fn decommission_copy_quorum_classifier_distinguishes_source_and_target_errors() {
+        for quorum in [
+            Error::ErasureReadQuorum,
+            Error::ErasureWriteQuorum,
+            Error::InsufficientReadQuorum("bucket-a".to_owned(), "object-a".to_owned()),
+            Error::InsufficientWriteQuorum("bucket-a".to_owned(), "object-a".to_owned()),
+        ] {
+            assert!(is_decommission_copy_quorum_error(&quorum));
+            let target = data_movement::data_movement_stage_error_for_test(
+                "decommission_object",
+                "put_object",
+                "bucket-a",
+                "object-a",
+                quorum.clone(),
+            );
+            assert!(is_decommission_copy_quorum_error(&target));
+
+            let source = data_movement::data_movement_source_read_error("bucket-a", "object-a", quorum.clone());
+            assert!(!is_decommission_copy_quorum_error(&source));
+            assert!(!is_decommission_copy_cleanup_safe_error(&source));
+
+            for stage in ["put_object_part", "read_part", "prepare_part"] {
+                let part = data_movement::data_movement_part_stage_error_for_test(
+                    "decommission_object",
+                    stage,
+                    "bucket-a",
+                    "object-a",
+                    1,
+                    quorum.clone(),
+                );
+                assert_eq!(is_decommission_copy_quorum_error(&part), stage == "put_object_part", "{part}");
+                assert!(!is_decommission_copy_cleanup_safe_error(&part));
+                if stage != "put_object_part" {
+                    assert!(data_movement::data_movement_stage_source(&part).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decommission_copy_quorum_deferral_keeps_the_original_error_chain() {
+        let deferred = decommission_copy_quorum_deferral("put_object", "bucket-a", "object-a", Error::ErasureWriteQuorum);
+        assert!(is_decommission_copy_quorum_deferral(&deferred));
+        let failure = data_movement::data_movement_stage_source_as::<DecommissionCopyQuorumFailure>(&deferred)
+            .expect("the deferred error must keep its copy-quorum origin");
+        assert!(matches!(
+            std::error::Error::source(failure).and_then(|source| source.downcast_ref::<Error>()),
+            Some(Error::ErasureWriteQuorum)
+        ));
     }
 
     #[test]

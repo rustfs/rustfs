@@ -2242,6 +2242,131 @@ mod tests {
         assert!(info.delete_marker);
     }
 
+    fn tiered_null_version_file_info() -> FileInfo {
+        FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: None,
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(10).expect("test timestamp should be valid")),
+            size: 1024,
+            metadata: std::collections::HashMap::from([("etag".to_string(), "tiered-etag".to_string())]),
+            transition_status: rustfs_filemeta::TRANSITION_COMPLETE.to_string(),
+            transition_tier: "WARM".to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version: Some("remote-version".to_string()),
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            num_versions: 3,
+            is_latest: false,
+            successor_mod_time: Some(OffsetDateTime::from_unix_timestamp(20).expect("test timestamp should be valid")),
+            ..FileInfo::new("bucket/object", 2, 2)
+        }
+    }
+
+    /// Tiered migration publishes metadata without a data-moved marker. The
+    /// same null version can be historical on the source and latest on a
+    /// partially populated target.
+    #[test]
+    fn resolve_latest_object_info_candidates_accepts_a_tiered_null_version_with_a_shorter_history() {
+        use rustfs_filemeta::TransitionVersionState;
+
+        for (remote_version, state) in [
+            (Some("remote-version"), TransitionVersionState::Exact),
+            (None, TransitionVersionState::KnownDisabled),
+            (Some("null"), TransitionVersionState::SuspendedNull),
+            (Some("legacy-version"), TransitionVersionState::Unknown),
+            (None, TransitionVersionState::Unknown),
+        ] {
+            let mut source_file = tiered_null_version_file_info();
+            source_file.transition_version = remote_version.map(str::to_string);
+            source_file.transition_version_state = state;
+            let mut target_file = source_file.clone();
+            crate::data_movement::prepare_tiered_data_movement_file_info(&mut target_file)
+                .expect("tiered metadata preparation should preserve the remote tuple");
+            target_file.num_versions = 1;
+            target_file.is_latest = true;
+            target_file.successor_mod_time = None;
+
+            for versioned in [false, true] {
+                let source = ObjectInfo::from_file_info(&source_file, "bucket", "object", versioned);
+                let target = ObjectInfo::from_file_info(&target_file, "bucket", "object", versioned);
+                assert_eq!(source.version_id, versioned.then_some(Uuid::nil()));
+                assert!(!rustfs_utils::http::contains_key_str(
+                    &target.user_defined,
+                    rustfs_utils::http::SUFFIX_DATA_MOVED
+                ));
+
+                let (info, idx) = resolve_latest_object_info_candidates(
+                    vec![
+                        LatestObjectInfoCandidate {
+                            info: Some(source),
+                            idx: 0,
+                            err: None,
+                        },
+                        LatestObjectInfoCandidate {
+                            info: Some(target),
+                            idx: 1,
+                            err: None,
+                        },
+                    ],
+                    "bucket",
+                    "object",
+                    &ObjectOptions {
+                        version_id: Some("null".to_string()),
+                        versioned,
+                        ..Default::default()
+                    },
+                )
+                .expect("an exact tiered null-version copy must remain readable before source cleanup");
+
+                assert_eq!(idx, 1);
+                assert_eq!(info.version_id, versioned.then_some(Uuid::nil()));
+                assert_eq!(info.transitioned_object.status, rustfs_filemeta::TRANSITION_COMPLETE);
+                assert_eq!(info.transitioned_object.tier, "WARM");
+                assert_eq!(info.transitioned_object.name, "remote/object");
+                assert_eq!(info.transitioned_object.version_id, remote_version.unwrap_or_default());
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_tiered_null_version_identity_conflicts() {
+        let source = ObjectInfo::from_file_info(&tiered_null_version_file_info(), "bucket", "object", true);
+        let changes: [fn(&mut ObjectInfo); 5] = [
+            |info| info.transitioned_object.tier = "OTHER".to_string(),
+            |info| info.transitioned_object.name = "remote/other".to_string(),
+            |info| info.transitioned_object.version_id = "other-version".to_string(),
+            |info| info.size += 1,
+            |info| info.etag = Some("other-etag".to_string()),
+        ];
+
+        for change in changes {
+            let mut target = source.clone();
+            target.num_versions = 1;
+            change(&mut target);
+            assert_equal_time_identity_conflict(source.clone(), target);
+        }
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_tiered_null_history_without_a_complete_remote_tuple() {
+        let source = ObjectInfo::from_file_info(&tiered_null_version_file_info(), "bucket", "object", true);
+        let changes: [fn(&mut ObjectInfo); 5] = [
+            |info| info.transitioned_object.status.clear(),
+            |info| info.transitioned_object.status = "pending".to_string(),
+            |info| info.transitioned_object.tier.clear(),
+            |info| info.transitioned_object.name.clear(),
+            |info| info.transitioned_object.free_version = true,
+        ];
+
+        for change in changes {
+            let mut source = source.clone();
+            change(&mut source);
+            let mut target = source.clone();
+            target.num_versions = 1;
+            assert_equal_time_identity_conflict(source, target);
+        }
+    }
+
     /// A null version has no id to prove both pools hold the same version, so
     /// a differing version list still fails closed.
     #[test]
