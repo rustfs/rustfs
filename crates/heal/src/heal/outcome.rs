@@ -17,95 +17,26 @@
 
 use rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL;
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, time::SystemTime};
+use std::collections::VecDeque;
+#[cfg(test)]
 use uuid::Uuid;
 
 const MAX_OUTCOME_ITEMS: usize = 128;
 const MAX_OUTCOME_BYTES: usize = 64 * 1024;
 const MAX_OUTCOME_DETAIL_BYTES: usize = 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HealObjectKind {
-    Object,
-    Metadata,
-    Decode,
-    DeleteMarkerPurge,
+pub use rustfs_heal_contracts::outcome::{
+    HealAbortReason, HealDeferredReason, HealExecutionOutcome, HealFailureClass, HealObjectDisposition, HealObjectIdentity,
+    HealObjectKind, HealObjectReceipt,
+};
+
+/// Repair responsibility policy stays private to the heal executor.
+pub(crate) trait HealObjectReceiptExt {
+    fn verified_for(&self, expected: &HealObjectIdentity) -> bool;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct HealObjectIdentity {
-    pub kind: HealObjectKind,
-    pub bucket: String,
-    pub object: String,
-    /// The requested version; None remains unresolved, never an absence proof.
-    pub version_id: Option<String>,
-    pub bucket_incarnation_id: Option<Uuid>,
-    pub pool_index: Option<usize>,
-    pub set_index: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HealDeferredReason {
-    DanglingDeleteGrace,
-    RetiredMarkerProof,
-    TransientUsageCache,
-    TransientExistenceCheck,
-    Deadline,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HealFailureClass {
-    Recoverable,
-    RetryExhausted,
-    Permanent,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "state",
-    content = "details",
-    rename_all = "snake_case",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
-pub enum HealObjectDisposition {
-    /// The legacy storage response does not prove the requested check or commit.
-    Unknown,
-    Repaired,
-    VerifiedHealthy,
-    /// Authoritative metadata/presence proof only. This does not certify
-    /// payload integrity.
-    MetadataHealthy,
-    AuthoritativelyAbsent,
-    Deferred {
-        reason: HealDeferredReason,
-        retry_not_before: Option<SystemTime>,
-    },
-    Failed(HealFailureClass),
-    Cancelled,
-    DryRunObserved,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct HealObjectOutcome {
-    pub identity: HealObjectIdentity,
-    pub disposition: HealObjectDisposition,
-    pub detail: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HealObjectReceipt {
-    pub identity: HealObjectIdentity,
-    pub disposition: HealObjectDisposition,
-}
-
-impl HealObjectReceipt {
-    pub(crate) fn verified_for(&self, expected: &HealObjectIdentity) -> bool {
+impl HealObjectReceiptExt for HealObjectReceipt {
+    fn verified_for(&self, expected: &HealObjectIdentity) -> bool {
         let disposition_verifies = match self.disposition {
             HealObjectDisposition::Repaired
             | HealObjectDisposition::VerifiedHealthy
@@ -127,6 +58,14 @@ impl HealObjectReceipt {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HealObjectOutcome {
+    pub identity: HealObjectIdentity,
+    pub disposition: HealObjectDisposition,
+    pub detail: Option<String>,
+}
+
 impl HealObjectOutcome {
     fn retained_bytes(&self) -> usize {
         size_of::<Self>()
@@ -144,25 +83,6 @@ pub enum HealTraversalCoverage {
     Unknown,
     Partial,
     Complete,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HealAbortReason {
-    Cancelled,
-    Deadline,
-    Untraversable,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", content = "reason", rename_all = "snake_case")]
-pub enum HealExecutionOutcome {
-    #[default]
-    Pending,
-    Running,
-    Completed,
-    CompletedWithErrors,
-    Aborted(HealAbortReason),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

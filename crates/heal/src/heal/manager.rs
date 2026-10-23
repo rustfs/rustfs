@@ -315,6 +315,27 @@ async fn publish_completed_heal(
         aliases.retain(|alias_id, alias| alias_id != task_id && alias.task_id != task_id);
     }
     prune_completed_heal_statuses(&mut retained);
+    drop(retained);
+    drop(aliases);
+    if terminal && rustfs_heal_contracts::completion::has_heal_completion_observers() {
+        // Publish the canonical terminal only after ownership settles. Retrying
+        // attempts and command success are not object completion observations.
+        let outcome = completed.outcome.as_deref();
+        let object = outcome
+            .filter(|outcome| completed.heal_type.is_per_object() && !outcome.objects_truncated && outcome.objects.len() == 1)
+            .and_then(|outcome| outcome.objects.front())
+            .map(|object| crate::heal::outcome::HealObjectReceipt {
+                identity: object.identity.clone(),
+                disposition: object.disposition.clone(),
+            });
+        rustfs_heal_contracts::completion::publish_heal_completion(rustfs_heal_contracts::completion::HealCompletion {
+            task_id: task_id.to_owned(),
+            scan_mode: completed.options.scan_mode,
+            dry_run: completed.options.dry_run,
+            execution: outcome.map(|outcome| outcome.execution),
+            object,
+        });
+    }
 }
 
 #[derive(Debug, Clone)]
