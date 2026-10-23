@@ -36,10 +36,10 @@ use s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE;
 use crate::auth::UNSIGNED_PAYLOAD;
 use crate::auth::UNSIGNED_PAYLOAD_TRAILER;
 use rustfs_policy::service_type::ServiceType;
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use rustfs_utils::http::AMZ_CONTENT_SHA256;
 use rustfs_utils::path::is_dir_object;
-use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use tracing::error;
@@ -1197,13 +1197,13 @@ mod tests {
         put_opts_with_replication_authorization, should_skip_object_metadata_key, validate_archive_content_encoding,
     };
     use http::{HeaderMap, HeaderValue};
+    use rustfs_s3_types::S3ErrorCode;
     use rustfs_utils::http::{
         AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER,
         AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG,
         SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
         SUFFIX_SOURCE_VERSION_ID, header_compat::RUSTFS_ENCRYPTION_PREFIX, insert_header,
     };
-    use s3s::S3ErrorCode;
     use std::collections::HashMap;
     use uuid::Uuid;
 
