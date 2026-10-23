@@ -503,6 +503,416 @@ async fn full_rebuild_reset_starts_from_empty_baseline_without_trusted_floor_or_
     assert_eq!(scanner_cycle_recovery_status().state, "healthy");
 }
 
+#[tokio::test]
+#[serial]
+async fn dual_corrupt_usage_and_cycle_recover_through_the_production_supervisor() {
+    temp_env::async_with_vars(SUPERVISOR_ENV, async {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+        reset_recovery_status();
+        let (_dir, store) = setup_scanner_cycle_store_with_usage_baseline(false).await;
+        for path in [
+            DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
+            format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()),
+            LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
+            format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        ] {
+            save_config(store.clone(), &path, b"{broken-usage".to_vec())
+                .await
+                .expect("corrupt usage slot should persist");
+        }
+        let mut corrupt_cycle = 31_u64.to_le_bytes().to_vec();
+        corrupt_cycle.extend_from_slice(SCANNER_CYCLE_STATE_MAGIC);
+        corrupt_cycle.extend_from_slice(&7_u64.to_le_bytes());
+        corrupt_cycle.push(0xc1); // Reserved MessagePack byte: the header survives, the body does not.
+        save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), corrupt_cycle)
+            .await
+            .expect("corrupt cycle should persist with a usable epoch lower bound");
+        assert!(matches!(
+            load_scanner_cycle_state_for_startup(store.clone()).await,
+            ScannerCycleStateStartup::Blocked
+        ));
+        assert!(
+            reset_scanner_usage_state_for_full_rebuild(CancellationToken::new(), store.clone())
+                .await
+                .is_err(),
+            "usage reset alone requires a valid cycle"
+        );
+        assert!(
+            reset_scanner_cycle_recovery(CancellationToken::new(), store.clone())
+                .await
+                .is_err(),
+            "cycle reset alone requires a trusted usage floor"
+        );
+
+        let ctx = CancellationToken::new();
+        let _cancel_on_drop = ctx.clone().drop_guard();
+        init_data_scanner_with_storage(ctx.clone(), store.clone()).await;
+        notify_scanner_cycle_recovery_wake();
+        let (cycle, epoch) = wait_for_persisted_cycle(&store, |cycle, epoch| cycle.next >= 31 && epoch > 7).await;
+        assert!(cycle.next >= 31, "recovery must preserve the surviving cycle lower bound");
+        assert!(epoch > 7, "recovery must fence workers from the surviving epoch");
+        tokio::time::timeout(WAIT_BUDGET, async {
+            loop {
+                if persisted_usage_floor(store.clone()).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the production supervisor must finish its controlled full rebuild");
+        assert!(
+            read_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str())
+                .await
+                .is_ok(),
+            "automatic recovery must retain the original quarantine marker"
+        );
+        stop_supervisor(ctx).await;
+        global_metrics().set_cycle(None).await;
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    })
+    .await;
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+}
+
+async fn seed_dual_corruption(
+    store: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+    next: u64,
+    epoch: u64,
+) -> (DataUsageCacheRevision, Vec<u8>) {
+    for path in [
+        DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
+        format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
+        format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
+    ] {
+        save_config(store.clone(), &path, b"{broken-usage".to_vec())
+            .await
+            .expect("corrupt usage slot should persist");
+    }
+    let mut cycle = next.to_le_bytes().to_vec();
+    cycle.extend_from_slice(SCANNER_CYCLE_STATE_MAGIC);
+    cycle.extend_from_slice(&epoch.to_le_bytes());
+    cycle.push(0xc1);
+    save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), cycle.clone())
+        .await
+        .expect("corrupt cycle should persist");
+    assert!(matches!(
+        load_scanner_cycle_state_for_startup(store.clone()).await,
+        ScannerCycleStateStartup::Blocked
+    ));
+    let (_, revision) = read_config_with_revision(store, DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("corrupt cycle revision should remain readable");
+    (revision, cycle)
+}
+
+#[tokio::test]
+#[serial]
+async fn dual_recovery_preserves_raw_bytes_and_publishes_only_a_pending_baseline() {
+    reset_recovery_status();
+    let store = Arc::new(MemoryConfigStore::default());
+    let (revision, original_cycle) = seed_dual_corruption(store.clone(), 31, 7).await;
+    let mut observed: DataUsageInfo = serde_json::from_slice(&valid_usage_floor(12, 55)).expect("observed ordering fixture");
+    observed.usage_snapshot_observational = true;
+    save_config(
+        store.clone(),
+        DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
+        serde_json::to_vec(&observed).expect("observed usage should encode"),
+    )
+    .await
+    .expect("observed values may raise ordering bounds, never supply authority");
+    let original = store.objects.lock().await.clone();
+    let (cycle, epoch, _) = recover_dual_corrupt_scanner_state(store.clone(), &revision, || true)
+        .await
+        .expect("known corrupt head should recover")
+        .expect("dual corruption should be eligible");
+    assert_eq!((cycle.next, epoch), (56, 13));
+    let (floor, startup) = persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect("the pending baseline should permit controlled rebuild");
+    assert_eq!(startup, PersistedUsageFloorStartup::BootstrapPending);
+    assert_eq!(floor.leader_epoch, 13);
+    let pending: DataUsageInfo = serde_json::from_slice(
+        &read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+            .await
+            .expect("pending primary"),
+    )
+    .expect("pending primary should decode");
+    assert!(!data_usage_info_has_persisted_baseline_identity(&pending));
+    assert!(!pending.usage_snapshot_complete);
+    assert!(pending.buckets_usage.is_empty() && pending.bucket_sizes.is_empty());
+    let objects = store.objects.lock().await;
+    let evidence: Vec<_> = objects.iter().filter(|(path, _)| path.contains(".dual-recovery/")).collect();
+    assert!(evidence.iter().any(|(_, bytes)| **bytes == original_cycle));
+    for (path, bytes) in original {
+        if path.ends_with(DATA_USAGE_BLOOM_RECOVERY_PATH.as_str()) {
+            assert_eq!(objects.get(&path), Some(&bytes), "the original marker must be retained");
+        } else {
+            assert!(
+                evidence.iter().any(|(_, retained)| **retained == bytes),
+                "raw source bytes must survive: {path}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn dual_recovery_production_supervisor_resumes_both_committed_interruption_points() {
+    temp_env::async_with_vars(SUPERVISOR_ENV, async {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        for stage in [
+            dual_recovery_fault::Stage::CounterCommitted,
+            dual_recovery_fault::Stage::BootstrapCommitted,
+        ] {
+            crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+            reset_recovery_status();
+            let (_dir, store) = setup_scanner_cycle_store_with_usage_baseline(false).await;
+            let (revision, _) = seed_dual_corruption(store.clone(), 31, 7).await;
+            let marker: ScannerCycleRecoveryMarker = serde_json::from_slice(
+                &read_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str())
+                    .await
+                    .expect("durable quarantine marker"),
+            )
+            .expect("strict marker should decode");
+            let fault = dual_recovery_fault::install(marker.primary_revision, stage);
+            let lock = store
+                .new_ns_lock(RUSTFS_META_BUCKET, "leader.lock")
+                .await
+                .expect("leader lock");
+            let guard = lock
+                .get_write_lock_quiet(Duration::from_secs(5))
+                .await
+                .expect("leader ownership");
+            assert!(
+                recover_dual_corrupt_scanner_state(store.clone(), &revision, || !guard.is_lock_lost())
+                    .await
+                    .is_err(),
+                "the committed interruption must be surfaced"
+            );
+            assert!(fault.fired(), "the real persistence boundary must have been reached");
+            drop(fault);
+            drop(guard);
+            assert!(matches!(
+                load_scanner_cycle_state_for_startup(store.clone()).await,
+                ScannerCycleStateStartup::Ready { cycle, leader_epoch: 8, .. } if cycle.next == 31
+            ));
+            let floor = persisted_usage_floor_for_startup(store.clone(), true).await;
+            if stage == dual_recovery_fault::Stage::CounterCommitted {
+                assert!(floor.is_err(), "the first interruption is before bootstrap publication");
+            } else {
+                assert_eq!(
+                    floor.expect("bootstrap CAS already committed").1,
+                    PersistedUsageFloorStartup::BootstrapPending
+                );
+                let checker = crate::storage_api::EcstoreQuotaChecker::new(Arc::new(tokio::sync::RwLock::new(
+                    crate::storage_api::EcstoreQuotaMetadataSys::new(store.clone()),
+                )));
+                let bucket = format!("dual-recovery-quota-{}", Uuid::new_v4().simple());
+                assert!(
+                    matches!(
+                        checker.get_real_time_usage(&bucket).await,
+                        Err(crate::storage_api::EcstoreQuotaError::UsageUnavailable { bucket: failed }) if failed == bucket
+                    ),
+                    "pending recovery must not fabricate a legacy quota usage floor"
+                );
+            }
+
+            let ctx = CancellationToken::new();
+            let _cancel_on_drop = ctx.clone().drop_guard();
+            init_data_scanner_with_storage(ctx.clone(), store.clone()).await;
+            notify_scanner_cycle_recovery_wake();
+            wait_for_persisted_cycle(&store, |cycle, epoch| cycle.next >= 31 && epoch > 8).await;
+            tokio::time::timeout(WAIT_BUDGET, async {
+                while persisted_usage_floor(store.clone()).await.is_err() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("a fresh supervisor must finish recovery from durable evidence");
+            stop_supervisor(ctx).await;
+            global_metrics().set_cycle(None).await;
+        }
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    })
+    .await;
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+}
+
+#[tokio::test]
+#[serial]
+async fn dual_recovery_refuses_unknown_fences_future_shapes_and_valid_backups() {
+    for case in [
+        "garbled",
+        "zero_epoch",
+        "future_cycle",
+        "future_usage",
+        "backup",
+        "cleanup",
+        "future_marker",
+    ] {
+        reset_recovery_status();
+        let store = Arc::new(MemoryConfigStore::default());
+        let (mut revision, mut cycle) = seed_dual_corruption(store.clone(), 31, 7).await;
+        match case {
+            "garbled" | "zero_epoch" | "future_cycle" => {
+                match case {
+                    "garbled" => cycle = b"unrecognizable".to_vec(),
+                    "zero_epoch" => cycle[16..24].copy_from_slice(&0_u64.to_le_bytes()),
+                    _ => cycle[15] ^= 1,
+                }
+                save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), cycle)
+                    .await
+                    .expect("negative cycle fixture");
+                let _ = load_scanner_cycle_state_for_startup(store.clone()).await;
+                revision = read_config_with_revision(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+                    .await
+                    .expect("negative cycle revision")
+                    .1;
+            }
+            "future_usage" => {
+                save_config(
+                    store.clone(),
+                    DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                    br#"{"schema_version":999,"future_data":true}"#.to_vec(),
+                )
+                .await
+                .expect("unrecognized structured usage");
+            }
+            "backup" => {
+                save_config(
+                    store.clone(),
+                    &format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()),
+                    valid_usage_floor(12, 55),
+                )
+                .await
+                .expect("trusted backup must take precedence over empty recovery");
+            }
+            "cleanup" | "future_marker" => {
+                let mut marker: serde_json::Value = serde_json::from_slice(
+                    &read_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str())
+                        .await
+                        .expect("marker"),
+                )
+                .expect("marker JSON");
+                if case == "cleanup" {
+                    marker["state"] = "cleanup-pending".into();
+                } else {
+                    marker["future_field"] = true.into();
+                }
+                save_config(
+                    store.clone(),
+                    DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(),
+                    serde_json::to_vec(&marker).expect("marker"),
+                )
+                .await
+                .expect("negative marker fixture");
+            }
+            _ => unreachable!(),
+        }
+        let before = store.objects.lock().await.clone();
+        let result = recover_dual_corrupt_scanner_state(store.clone(), &revision, || true).await;
+        assert!(!matches!(result, Ok(Some(_))), "{case} must never authorize automatic recovery");
+        assert_eq!(*store.objects.lock().await, before, "{case} must leave every object untouched");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn dual_recovery_refuses_io_movement_ownership_and_exhausted_counters() {
+    for case in [
+        "read_error",
+        "movement",
+        "ownership",
+        "epoch_exhausted",
+        "cycle_exhausted",
+        "evidence_write",
+    ] {
+        reset_recovery_status();
+        let store = Arc::new(MemoryConfigStore::default());
+        let (revision, _) = seed_dual_corruption(
+            store.clone(),
+            if case == "cycle_exhausted" { u64::MAX } else { 31 },
+            if case == "epoch_exhausted" { u64::MAX } else { 7 },
+        )
+        .await;
+        match case {
+            "read_error" => {
+                store.read_errors.lock().await.insert(
+                    memory_config_key(RUSTFS_META_BUCKET, &format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str())),
+                    EcstoreError::InsufficientReadQuorum("meta".to_string(), "usage".to_string()),
+                );
+            }
+            "movement" => store.publication_admission_blocked.store(true, Ordering::Relaxed),
+            "evidence_write" => {
+                let marker = read_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str())
+                    .await
+                    .expect("marker");
+                let prefix = format!("{}.dual-recovery/{}", DATA_USAGE_BLOOM_NAME_PATH.as_str(), sha256_hex(&[&marker]));
+                store
+                    .fail_puts_from
+                    .lock()
+                    .await
+                    .insert(memory_config_key(RUSTFS_META_BUCKET, &format!("{prefix}/cycle.bin")), 1);
+            }
+            _ => {}
+        }
+        let before = store.objects.lock().await.clone();
+        assert!(
+            recover_dual_corrupt_scanner_state(store.clone(), &revision, || case != "ownership")
+                .await
+                .is_err(),
+            "{case}"
+        );
+        assert_eq!(*store.objects.lock().await, before, "{case} must preserve the original sources");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn dual_recovery_rejects_foreign_counter_and_usage_cas_winners() {
+    for foreign_counter in [false, true] {
+        reset_recovery_status();
+        let store = Arc::new(MemoryConfigStore::default());
+        let (revision, _) = seed_dual_corruption(store.clone(), 31, 7).await;
+        let replacement = if foreign_counter {
+            encode_scanner_cycle_state(
+                &CurrentCycle {
+                    next: 100,
+                    ..Default::default()
+                },
+                50,
+            )
+            .expect("foreign counter")
+        } else {
+            valid_usage_floor(50, 100)
+        };
+        let path = if foreign_counter {
+            DATA_USAGE_BLOOM_NAME_PATH.as_str()
+        } else {
+            DATA_USAGE_OBJ_NAME_PATH.as_str()
+        };
+        store
+            .interleaving_puts
+            .lock()
+            .await
+            .insert(memory_config_key(RUSTFS_META_BUCKET, path), (2, replacement.clone()));
+        assert!(
+            recover_dual_corrupt_scanner_state(store.clone(), &revision, || true)
+                .await
+                .is_err()
+        );
+        assert_eq!(read_config(store.clone(), path).await.expect("CAS winner"), replacement);
+        assert!(
+            read_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str())
+                .await
+                .is_ok()
+        );
+    }
+}
+
 async fn seeded_memory_cycle(epoch: u64) -> (Arc<MemoryConfigStore>, CurrentCycle, DataUsageCacheRevision) {
     let store = Arc::new(MemoryConfigStore::default());
     let ctx = CancellationToken::new();

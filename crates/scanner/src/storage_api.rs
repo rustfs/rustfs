@@ -61,6 +61,11 @@ pub(crate) use rustfs_ecstore::api::bucket::replication::{ReplicationStatusType,
 pub(crate) use rustfs_ecstore::api::bucket::target::BucketTargets as EcstoreBucketTargets;
 pub(crate) use rustfs_ecstore::api::bucket::versioning::VersioningApi as EcstoreVersioningApi;
 pub(crate) use rustfs_ecstore::api::bucket::versioning_sys::BucketVersioningSys as EcstoreBucketVersioningSys;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::bucket::{
+    metadata_sys::BucketMetadataSys as EcstoreQuotaMetadataSys,
+    quota::{QuotaError as EcstoreQuotaError, checker::QuotaChecker as EcstoreQuotaChecker},
+};
 pub(crate) use rustfs_ecstore::api::cache::{
     ListPathRawOptions as EcstoreListPathRawOptions, list_path_raw as ecstore_list_path_raw,
 };

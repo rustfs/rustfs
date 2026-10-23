@@ -2923,7 +2923,25 @@ where
                 return Err(err);
             }
         };
-    let (usage_floor, usage_floor_startup) = match persisted_usage_floor_for_startup(storeapi.clone(), true).await {
+    let mut usage_floor_result = persisted_usage_floor_for_startup(storeapi.clone(), true).await;
+    if usage_floor_result.is_err() {
+        match recover_dual_corrupt_scanner_state(storeapi.clone(), &cycle_revision, || {
+            !ctx.is_cancelled() && !guard.is_lock_lost()
+        })
+        .await
+        {
+            Ok(Some((cycle, epoch, revision))) => {
+                cycle_info = cycle;
+                leader_epoch = epoch;
+                cycle_revision = revision;
+                rebuild_from_quarantine = true;
+                usage_floor_result = persisted_usage_floor_for_startup(storeapi.clone(), true).await;
+            }
+            Ok(None) => {}
+            Err(err) => usage_floor_result = Err(err),
+        }
+    }
+    let (usage_floor, usage_floor_startup) = match usage_floor_result {
         Ok(result) => result,
         Err(err) => {
             let error = err.to_string();
