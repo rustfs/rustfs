@@ -987,6 +987,10 @@ pub struct ObjectOptions {
 
     pub data_movement: bool,
     pub raw_data_movement_read: bool,
+    /// Marks the physical copy-back write of a RestoreObject operation. This
+    /// is in-memory request context and must not be copied into object metadata.
+    #[doc(hidden)]
+    pub restore_copyback: bool,
     /// Internal, in-memory protection context. Never populated from S3 metadata.
     /// None selects the rollout default only for a new write, not for a rewrite.
     #[doc(hidden)]

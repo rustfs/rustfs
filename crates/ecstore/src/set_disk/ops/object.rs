@@ -4587,18 +4587,21 @@ impl SetDisks {
                 );
             }
             fi.metadata = user_defined;
-            let put_tier_free_version_id =
-                if fi.version_id.is_none_or(|id| id.is_nil()) && !opts.data_movement && expected_restore_operation_id.is_none() {
-                    // Current disks publish the same cleanup owner alongside a
-                    // replaced null version. Keep the intent outside metadata:
-                    // older disks persist unknown metadata keys, which splits
-                    // the replacement's read-quorum identity during an upgrade.
-                    let free_version_id = Uuid::new_v4();
-                    fi.overwrite_tier_free_version_id = Some(free_version_id);
-                    Some(free_version_id)
-                } else {
-                    None
-                };
+            let put_tier_free_version_id = if fi.version_id.is_none_or(|id| id.is_nil())
+                && !opts.data_movement
+                && expected_restore_operation_id.is_none()
+                && !opts.restore_copyback
+            {
+                // Current disks publish the same cleanup owner alongside a
+                // replaced null version. Keep the intent outside metadata:
+                // older disks persist unknown metadata keys, which splits
+                // the replacement's read-quorum identity during an upgrade.
+                let free_version_id = Uuid::new_v4();
+                fi.overwrite_tier_free_version_id = Some(free_version_id);
+                Some(free_version_id)
+            } else {
+                None
+            };
             fi.mod_time = mod_time;
             fi.size = w_size as i64;
             fi.versioned = opts.versioned || opts.version_suspended;
@@ -11092,7 +11095,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         if fi.transition_status == TRANSITION_COMPLETE {
             return Ok(());
         }
-
+        if fi
+            .metadata
+            .get(metadata_keys::RESTORE)
+            .and_then(|value| rustfs_filemeta::parse_restore_obj_status(value).ok())
+            .is_some_and(|status| status.is_restore_in_progress == Some(true))
+        {
+            return Ok(());
+        }
         /*if fi.xlv1 {
             if let Err(err) = self.heal_object(bucket, object, "", &HealOpts {no_lock: true, ..Default::default()}) {
                 return err.expect("err");
@@ -11598,6 +11608,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         let oi = ObjectInfo::from_file_info(actual_fi, bucket, object, opts.versioned || opts.version_suspended);
         let restore_result: Result<()> = async {
+            crate::services::notification_sys::require_restore_copyback_fleet_capability().await?;
             // The tier reader releases its own lease at EOF, before PUT or
             // CompleteMultipartUpload necessarily reaches metadata quorum. Keep a
             // second exact-generation lease for the whole restore so the final

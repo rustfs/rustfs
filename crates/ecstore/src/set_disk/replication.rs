@@ -231,6 +231,7 @@ impl SetDisks {
             }
             .to_string(),
         );
+        fi.transition_status = lifecycle::TRANSITION_COMPLETE.to_string();
         rustfs_utils::http::metadata_compat::insert_str(
             &mut fi.metadata,
             rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_STATUS,

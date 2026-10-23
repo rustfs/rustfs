@@ -345,7 +345,7 @@ async fn restore_copyback_stays_pending_before_finalization(multipart: bool) {
             &ObjectOptions {
                 transition: TransitionOptions {
                     status: TRANSITION_PENDING.to_string(),
-                    tier: tier_name,
+                    tier: tier_name.clone(),
                     etag: original.etag.clone().expect("source ETag should be present"),
                     ..Default::default()
                 },
@@ -411,6 +411,32 @@ async fn restore_copyback_stays_pending_before_finalization(multipart: bool) {
     assert_eq!(
         pending.transitioned_object.status, TRANSITION_PENDING,
         "copy-back must advertise local data to older peers until restore finalization"
+    );
+    set_disks
+        .transition_object(
+            bucket,
+            object,
+            &ObjectOptions {
+                transition: TransitionOptions {
+                    status: TRANSITION_PENDING.to_string(),
+                    tier: pending.transitioned_object.tier.clone(),
+                    etag: pending.etag.clone().expect("pending ETag should be present"),
+                    ..Default::default()
+                },
+                version_id: pending.version_id.map(|version| version.to_string()),
+                mod_time: pending.mod_time,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("a queued transition must skip the pending restore copy-back");
+    let after_queued_transition = set_disks
+        .get_object_info(bucket, object, &ObjectOptions::default())
+        .await
+        .expect("restore metadata should remain readable after a queued transition");
+    assert_eq!(
+        after_queued_transition.transitioned_object.status, TRANSITION_PENDING,
+        "queued transition must not remove local copy-back data before finalization"
     );
     // Evaluate beyond any pre-copy deadline without sleeping or advancing the
     // process clock. Pending copy-back must never become a restore-expiry candidate.

@@ -31,7 +31,7 @@ rustfs-io-metrics	131	0
 rustfs-keystone	29	0
 rustfs-kms	715	25
 rustfs-license	2	0
-rustfs-lifecycle	152	0
+rustfs-lifecycle	154	0
 rustfs-lock	135	0
 rustfs-log-analyzer	89	0
 rustfs-madmin	209	0
@@ -41,7 +41,7 @@ rustfs-object-data-cache	140	0
 rustfs-obs	367	0
 rustfs-policy	704	0
 rustfs-protocols	738	1
-rustfs-protos	64	0
+rustfs-protos	65	0
 rustfs-replication	207	0
 rustfs-rio	200	0
 rustfs-rio-v2	34	6

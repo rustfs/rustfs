@@ -3405,6 +3405,10 @@ impl ECStore {
         Ok(RestoreAcceptGuard(guard))
     }
 
+    pub async fn check_restore_copyback_compatibility(&self) -> Result<()> {
+        crate::services::notification_sys::require_restore_copyback_fleet_capability().await
+    }
+
     /// Acquire the liveness lock for a newly generated restore UUID using the
     /// normal namespace-lock timeout. New generations cannot legitimately
     /// contend, but a distributed quorum can take longer than the short orphan
