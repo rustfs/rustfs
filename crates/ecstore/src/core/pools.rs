@@ -17192,6 +17192,8 @@ impl ECStore {
         };
 
         let mut fivs = load_decommission_entry_exact_versions(&set, &entry, &bucket, "file_info_versions").await?;
+        #[cfg(test)]
+        decommission_test_wrap_result("exact_versions_read", &bucket, &entry.name, entry_attempt, Ok(()))?;
 
         if data_movement::scanner_backlog::is_scanner_pause_backlog(&bucket, &entry.name) {
             let outcome = self

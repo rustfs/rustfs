@@ -808,8 +808,8 @@ mod decommission_lock_order_tests {
             .expect("write the source object");
     }
 
-    /// A key that sorts after `anchor` in the same source set, so that with
-    /// one entry at a time the routine migrates `anchor` first.
+    /// A key that sorts after `anchor` in the same source set. Listing order
+    /// does not guarantee execution order between the set's entry workers.
     fn source_key_after(store: &Arc<crate::store::ECStore>, anchor: &str, label: &str) -> String {
         let anchor_set = store.pools[0].get_disks_by_key(anchor).set_index;
         (0..1024)
@@ -1212,32 +1212,58 @@ mod decommission_lock_order_tests {
         });
     }
 
-    /// Run a case whose subject key has no data version to read: an anchor
-    /// object in the same set goes first, and the pause holds the subject's
-    /// gate acquisition right after the anchor's.
-    async fn run_stale_subject_case(store: &Arc<crate::store::ECStore>, bucket: &str, anchor: &str, subject: &str) {
+    /// Pause the subject's first target mutation after its exact versions are
+    /// loaded, without relying on another entry's execution order.
+    async fn run_stale_subject_case(store: &Arc<crate::store::ECStore>, bucket: &str, subject: &str, expected_versions: usize) {
         start_over_budget_routine_decommission(store, bucket, 45 << 20).await;
         let barrier = stale_target_barrier(store);
-        let _fault = pause_object_target_gate_acquire(Arc::clone(&barrier), bucket.to_string(), anchor.to_string(), 1);
-        run_routine_while_target_1_changes(
-            store,
-            &barrier,
-            1,
-            6 << 20,
-            true,
-            assert_held_at_subject(store, bucket, anchor, subject),
-        )
+        let _fault = {
+            let barrier = Arc::clone(&barrier);
+            let bucket = bucket.to_string();
+            let subject = subject.to_string();
+            let armed = AtomicBool::new(false);
+            DecommissionTestFaultGuard::install(Arc::new(move |stage, entry_bucket, entry_object, _, _| {
+                if stage == "exact_versions_read"
+                    && entry_bucket == bucket
+                    && entry_object == subject
+                    && !armed.swap(true, Ordering::AcqRel)
+                {
+                    barrier.pause_one_target_gate_acquire_after(1, 0);
+                }
+                false
+            }))
+        };
+        let mut items_before_subject = 0;
+        run_routine_while_target_1_changes(store, &barrier, 1, 6 << 20, true, async {
+            assert_held_at_subject(store, bucket, subject, expected_versions).await;
+            items_before_subject = store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present")
+                .items_decommissioned;
+        })
         .await;
         assert_source_key_migrated_to_target_2(store, bucket, subject).await;
+        assert_eq!(
+            store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present")
+                .items_decommissioned,
+            items_before_subject + expected_versions,
+            "each subject version must be counted once after target reselection"
+        );
     }
 
-    /// The pause holds the subject, not the anchor: the anchor is already on
-    /// target 1 and the subject on neither target.
-    async fn assert_held_at_subject(store: &Arc<crate::store::ECStore>, bucket: &str, anchor: &str, subject: &str) {
-        store.pools[1]
-            .get_object_info(bucket, anchor, &ObjectOptions::default())
+    /// The subject's exact source versions remain, and neither target has it.
+    async fn assert_held_at_subject(store: &Arc<crate::store::ECStore>, bucket: &str, subject: &str, expected_versions: usize) {
+        let versions = store.pools[0]
+            .get_disks_by_key(subject)
+            .load_file_info_versions_exact(bucket, subject)
             .await
-            .expect("the anchor must be on target 1 before the subject is held");
+            .expect("the source versions should decode while the subject is held")
+            .expect("the source must remain while the subject is held");
+        assert_eq!(versions.versions.len(), expected_versions, "the source versions must remain intact");
         assert_key_not_yet_migrated(store, bucket, subject).await;
     }
 
@@ -1246,13 +1272,11 @@ mod decommission_lock_order_tests {
     fn decommission_reselects_a_delete_marker_target_that_went_over_budget() {
         run_large_stack_async_test("decommission-stale-delete-marker", || async {
             let (_temp_dirs, store, bucket) = new_stale_target_store("stale-delete-marker").await;
-            let anchor = "a-anchor.bin";
-            put_source_object(&store, &bucket, anchor, b"anchor".to_vec()).await;
-            let subject = source_key_after(&store, anchor, "marker");
+            let subject = "marker.bin";
             store.pools[0]
                 .put_object(
                     &bucket,
-                    &subject,
+                    subject,
                     &mut PutObjReader::from_vec(b"marked version".to_vec()),
                     &ObjectOptions {
                         versioned: true,
@@ -1264,7 +1288,7 @@ mod decommission_lock_order_tests {
             let marker = store.pools[0]
                 .delete_object(
                     &bucket,
-                    &subject,
+                    subject,
                     ObjectOptions {
                         versioned: true,
                         ..Default::default()
@@ -1273,10 +1297,10 @@ mod decommission_lock_order_tests {
                 .await
                 .expect("write the delete marker");
             assert!(marker.delete_marker);
-            run_stale_subject_case(&store, &bucket, anchor, &subject).await;
+            run_stale_subject_case(&store, &bucket, subject, 2).await;
             let versions = store.pools[2]
-                .get_disks_by_key(&subject)
-                .load_file_info_versions_exact(&bucket, &subject)
+                .get_disks_by_key(subject)
+                .load_file_info_versions_exact(&bucket, subject)
                 .await
                 .expect("the target 2 versions should decode")
                 .expect("the subject should be on target 2");
@@ -1289,11 +1313,9 @@ mod decommission_lock_order_tests {
     fn decommission_reselects_a_tiered_object_target_that_went_over_budget() {
         run_large_stack_async_test("decommission-stale-tiered", || async {
             let (_temp_dirs, store, bucket) = new_stale_target_store("stale-tiered").await;
-            let anchor = "a-anchor.bin";
-            put_source_object(&store, &bucket, anchor, b"anchor".to_vec()).await;
-            let subject = source_key_after(&store, anchor, "tiered");
-            let _tier = seed_source_transitioned_object(&store, &bucket, &subject, false).await;
-            run_stale_subject_case(&store, &bucket, anchor, &subject).await;
+            let subject = "tiered.bin";
+            let _tier = seed_source_transitioned_object(&store, &bucket, subject, false).await;
+            run_stale_subject_case(&store, &bucket, subject, 1).await;
         });
     }
 
@@ -1302,14 +1324,12 @@ mod decommission_lock_order_tests {
     fn decommission_counts_a_free_version_once_after_its_target_went_over_budget() {
         run_large_stack_async_test("decommission-stale-free-version", || async {
             let (_temp_dirs, store, bucket) = new_stale_target_store("stale-free-version").await;
-            let anchor = "a-anchor.bin";
-            put_source_object(&store, &bucket, anchor, b"anchor".to_vec()).await;
-            let subject = source_key_after(&store, anchor, "free");
-            let _tier = seed_source_transitioned_object(&store, &bucket, &subject, true).await;
-            run_stale_subject_case(&store, &bucket, anchor, &subject).await;
+            let subject = "free.bin";
+            let _tier = seed_source_transitioned_object(&store, &bucket, subject, true).await;
+            run_stale_subject_case(&store, &bucket, subject, 1).await;
             let versions = store.pools[2]
-                .get_disks_by_key(&subject)
-                .load_file_info_versions_exact(&bucket, &subject)
+                .get_disks_by_key(subject)
+                .load_file_info_versions_exact(&bucket, subject)
                 .await
                 .expect("the target 2 versions should decode")
                 .expect("the free version should be on target 2");
@@ -1342,20 +1362,32 @@ mod decommission_lock_order_tests {
     fn decommission_counts_a_free_version_once_after_an_intent_conflict() {
         run_large_stack_async_test("decommission-free-version-intent-conflict", || async {
             let (_temp_dirs, store, bucket) = new_stale_target_store("free-version-conflict").await;
-            let anchor = "a-anchor.bin";
-            put_source_object(&store, &bucket, anchor, b"anchor".to_vec()).await;
-            let subject = source_key_after(&store, anchor, "free-conflict");
-            let _tier = seed_source_transitioned_object(&store, &bucket, &subject, true).await;
+            let subject = "free-conflict.bin";
+            let _tier = seed_source_transitioned_object(&store, &bucket, subject, true).await;
             start_over_budget_routine_decommission(&store, &bucket, 0).await;
             let barrier = stale_target_barrier(&store);
-            let _fault = pause_object_target_gate_acquire(Arc::clone(&barrier), bucket.clone(), anchor.to_string(), 1);
+            let _fault = {
+                let barrier = Arc::clone(&barrier);
+                let bucket = bucket.clone();
+                DecommissionTestFaultGuard::install(Arc::new(move |stage, entry_bucket, entry_object, _, _| {
+                    if stage == "exact_versions_read" && entry_bucket == bucket && entry_object == subject {
+                        barrier.pause_one_target_gate_acquire_after(1, 0);
+                    }
+                    false
+                }))
+            };
             let routine = spawn_decommission_routine(&store, 1);
 
             // The free version selected target 1. Another mutation fails after
             // persisting its intent there, so the free version's admission
             // meets an intent conflict; hold its retry as well.
             barrier.wait_until_target_gate_acquire_paused().await;
-            assert_held_at_subject(&store, &bucket, anchor, &subject).await;
+            assert_held_at_subject(&store, &bucket, subject, 1).await;
+            let items_before_subject = store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present")
+                .items_decommissioned;
             let owner = decommission_capacity_owner(&*store.pool_meta.read().await).with_mutation_id(uuid::Uuid::new_v4());
             store
                 .run_decommission_capacity_admitted_mutation(1, Some(owner), Some(1 << 20), || async {
@@ -1364,13 +1396,12 @@ mod decommission_lock_order_tests {
                 .await
                 .expect_err("the other mutation must fail");
             assert!(killed_leader_target(&store, 1).await.pending_mutation_id.is_some());
-            // Releasing clears the pause target, so arm the next pause after it.
+            // The conflicting attempt reloads the subject and arms its own retry.
             barrier.release_target_gate_acquire();
-            barrier.pause_one_target_gate_acquire_after(1, 0);
 
-            // The retry finds the intent resolved.
+            // Resolve the intent while that retry is held before its gate.
             barrier.wait_until_target_gate_acquire_paused().await;
-            assert_held_at_subject(&store, &bucket, anchor, &subject).await;
+            assert_held_at_subject(&store, &bucket, subject, 1).await;
             edit_target_1_ledger(&store, |reservation| {
                 let target = reservation
                     .targets
@@ -1393,13 +1424,42 @@ mod decommission_lock_order_tests {
                 .as_ref()
                 .expect("the decommission state should remain present");
             assert!(
-                info.complete && !info.failed && info.items_decommission_failed == 0,
+                info.complete
+                    && !info.failed
+                    && !info.canceled
+                    && info.capacity_blocked_reason.is_none()
+                    && info.items_decommission_failed == 0,
                 "a free version retried after an intent conflict must count once, as decommissioned: complete={}, failed={}, items_decommission_failed={}, blocked_reason={:?}",
                 info.complete,
                 info.failed,
                 info.items_decommission_failed,
                 info.capacity_blocked_reason
             );
+            assert_eq!(
+                info.items_decommissioned,
+                items_before_subject + 1,
+                "the free version must be counted once"
+            );
+            drop(local);
+            let versions = store.pools[1]
+                .get_disks_by_key(subject)
+                .load_file_info_versions_exact(&bucket, subject)
+                .await
+                .expect("the target 1 versions should decode")
+                .expect("the free version should be on target 1");
+            assert_eq!(versions.versions.len(), 1);
+            assert!(versions.versions[0].tier_free_version());
+            for pool_index in [0, 2] {
+                let versions = store.pools[pool_index]
+                    .get_disks_by_key(subject)
+                    .load_file_info_versions_exact(&bucket, subject)
+                    .await
+                    .expect("the remaining pool versions should decode");
+                assert!(
+                    versions.is_none_or(|versions| versions.versions.is_empty()),
+                    "the free version must only remain on target 1"
+                );
+            }
         });
     }
 
