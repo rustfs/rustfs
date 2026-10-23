@@ -660,6 +660,167 @@ async fn dual_recovery_preserves_raw_bytes_and_publishes_only_a_pending_baseline
 
 #[tokio::test]
 #[serial]
+async fn dual_recovery_preserves_the_independent_usage_marker_fence() {
+    reset_recovery_status();
+    let store = Arc::new(MemoryConfigStore::default());
+    let (revision, _) = seed_dual_corruption(store.clone(), 31, 7).await;
+    let marker = br#"{"schema_version":1,"primary_revision":"earlier-usage-revision","leader_epoch":100}"#.to_vec();
+    save_config(store.clone(), DATA_USAGE_RECOVERY_PATH.as_str(), marker.clone())
+        .await
+        .expect("retain prior recovery fence");
+    let (_, epoch, _) = recover_dual_corrupt_scanner_state(store.clone(), &revision, || true)
+        .await
+        .expect("compatible marker may raise the recovery epoch")
+        .expect("known dual corruption");
+    assert_eq!(epoch, 101);
+    let (floor, startup) = persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect("bootstrap must not be older than the independent marker");
+    assert_eq!(floor.leader_epoch, 101);
+    assert_eq!(startup, PersistedUsageFloorStartup::BootstrapPending);
+    assert_eq!(
+        read_config(store, DATA_USAGE_RECOVERY_PATH.as_str())
+            .await
+            .expect("retained usage marker"),
+        marker
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn dual_recovery_rejects_unknown_usage_markers_and_retains_legacy_quota_baselines() {
+    for case in ["future_marker", "corrupt_marker", "bucket_sizes", "bucket_usage", "zero_size"] {
+        reset_recovery_status();
+        let store = Arc::new(MemoryConfigStore::default());
+        let (revision, _) = seed_dual_corruption(store.clone(), 31, 7).await;
+        if case.ends_with("marker") {
+            let marker = if case == "future_marker" {
+                br#"{"schema_version":2,"primary_revision":"old","leader_epoch":100}"#.to_vec()
+            } else {
+                b"{broken-marker".to_vec()
+            };
+            save_config(store.clone(), DATA_USAGE_RECOVERY_PATH.as_str(), marker)
+                .await
+                .expect("unknown usage recovery marker");
+        } else {
+            let mut usage = DataUsageInfo {
+                scanner_epoch: Some(7),
+                ..Default::default()
+            };
+            if case == "bucket_usage" {
+                usage.buckets_usage.insert("legacy".to_string(), Default::default());
+            } else {
+                usage
+                    .bucket_sizes
+                    .insert("legacy".to_string(), if case == "zero_size" { 0 } else { 100 });
+            }
+            save_config(
+                store.clone(),
+                DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                serde_json::to_vec(&usage).expect("incomplete current-format usage"),
+            )
+            .await
+            .expect("per-bucket degraded baseline");
+        }
+        let before = store.objects.lock().await.clone();
+        assert!(
+            !matches!(recover_dual_corrupt_scanner_state(store.clone(), &revision, || true).await, Ok(Some(_))),
+            "{case} cannot authorize empty bootstrap"
+        );
+        assert_eq!(*store.objects.lock().await, before, "{case} must not mutate any source or evidence");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn dual_recovery_revalidates_non_cas_sources_before_replacing_the_counter() {
+    for path in [
+        format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        DATA_USAGE_OBSERVED_OBJ_NAME_PATH.to_string(),
+        DATA_USAGE_RECOVERY_PATH.to_string(),
+    ] {
+        reset_recovery_status();
+        let store = Arc::new(MemoryConfigStore::default());
+        let (revision, original_cycle) = seed_dual_corruption(store.clone(), 31, 7).await;
+        let replacement = if path == DATA_USAGE_RECOVERY_PATH.as_str() {
+            br#"{"schema_version":1,"primary_revision":"new","leader_epoch":100}"#.to_vec()
+        } else {
+            valid_usage_floor(100, 100)
+        };
+        store
+            .insert_after_gets
+            .lock()
+            .await
+            .insert(memory_config_key(RUSTFS_META_BUCKET, &path), replacement.clone());
+        assert!(
+            recover_dual_corrupt_scanner_state(store.clone(), &revision, || true)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+                .await
+                .expect("unchanged corrupt counter"),
+            original_cycle,
+            "a non-CAS source change must prevent counter publication"
+        );
+        assert_eq!(read_config(store.clone(), &path).await.expect("source winner retained"), replacement);
+        assert_eq!(
+            read_config(store, DATA_USAGE_OBJ_NAME_PATH.as_str())
+                .await
+                .expect("unmodified usage primary"),
+            b"{broken-usage"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn dual_recovery_cannot_resume_after_its_usage_revision_set_changes() {
+    reset_recovery_status();
+    let store = Arc::new(MemoryConfigStore::default());
+    let (revision, _) = seed_dual_corruption(store.clone(), 31, 7).await;
+    let marker: ScannerCycleRecoveryMarker = serde_json::from_slice(
+        &read_config(store.clone(), DATA_USAGE_BLOOM_RECOVERY_PATH.as_str())
+            .await
+            .expect("marker"),
+    )
+    .expect("strict marker");
+    let fault = dual_recovery_fault::install(marker.primary_revision, dual_recovery_fault::Stage::CounterCommitted);
+    assert!(
+        recover_dual_corrupt_scanner_state(store.clone(), &revision, || true)
+            .await
+            .is_err()
+    );
+    assert!(fault.fired());
+    drop(fault);
+    let (counter, revision) = read_config_with_revision(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("committed recovery counter");
+    save_config(
+        store.clone(),
+        &format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        b"{different-corruption".to_vec(),
+    )
+    .await
+    .expect("another revision won after interruption");
+    let before = store.objects.lock().await.clone();
+    assert!(
+        recover_dual_corrupt_scanner_state(store.clone(), &revision, || true)
+            .await
+            .is_err()
+    );
+    assert_eq!(*store.objects.lock().await, before, "a new revision-set cannot inherit the old intent");
+    assert_eq!(
+        read_config(store, DATA_USAGE_BLOOM_NAME_PATH.as_str())
+            .await
+            .expect("counter unchanged"),
+        counter.expect("committed counter body")
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn dual_recovery_production_supervisor_resumes_both_committed_interruption_points() {
     temp_env::async_with_vars(SUPERVISOR_ENV, async {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
@@ -827,6 +988,7 @@ async fn dual_recovery_refuses_io_movement_ownership_and_exhausted_counters() {
         "movement",
         "ownership",
         "epoch_exhausted",
+        "claim_epoch_exhausted",
         "cycle_exhausted",
         "evidence_write",
     ] {
@@ -835,7 +997,11 @@ async fn dual_recovery_refuses_io_movement_ownership_and_exhausted_counters() {
         let (revision, _) = seed_dual_corruption(
             store.clone(),
             if case == "cycle_exhausted" { u64::MAX } else { 31 },
-            if case == "epoch_exhausted" { u64::MAX } else { 7 },
+            match case {
+                "epoch_exhausted" => u64::MAX,
+                "claim_epoch_exhausted" => u64::MAX - 2,
+                _ => 7,
+            },
         )
         .await;
         match case {

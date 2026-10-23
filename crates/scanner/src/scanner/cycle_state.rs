@@ -2907,6 +2907,21 @@ async fn preserve_dual_recovery_bytes(
     Ok(())
 }
 
+async fn read_dual_recovery_slots(
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+) -> Result<Vec<ScannerUsageStateResetSlot>, ScannerError> {
+    let mut slots = read_usage_state_reset_slots(storeapi.clone()).await?;
+    let (data, revision) = read_config_with_revision(storeapi, DATA_USAGE_RECOVERY_PATH.as_str())
+        .await
+        .map_err(|err| ScannerError::Other(format!("failed to inspect scanner usage recovery marker: {err}")))?;
+    slots.push(ScannerUsageStateResetSlot {
+        path: DATA_USAGE_RECOVERY_PATH.clone(),
+        data,
+        revision,
+    });
+    Ok(slots)
+}
+
 async fn confirm_dual_recovery_sources(
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
     marker: (&[u8], &DataUsageCacheRevision),
@@ -2924,10 +2939,12 @@ async fn confirm_dual_recovery_sources(
             return Err(ScannerError::Other("scanner recovery cycle or marker changed".to_string()));
         }
     }
-    let current = read_usage_state_reset_slots(storeapi).await?;
-    if !current.iter().zip(slots).all(|(current, source)| {
-        current.path == source.path && current.revision == source.revision && current.data == source.data
-    }) {
+    let current = read_dual_recovery_slots(storeapi).await?;
+    if current.len() != slots.len()
+        || !current.iter().zip(slots).all(|(current, source)| {
+            current.path == source.path && current.revision == source.revision && current.data == source.data
+        })
+    {
         return Err(ScannerError::Other("scanner recovery usage slots changed".to_string()));
     }
     Ok(())
@@ -2994,7 +3011,7 @@ pub(super) async fn recover_dual_corrupt_scanner_state(
     if head_epoch == 0 || marker.generation != next_cycle || marker.leader_epoch != head_epoch {
         return Ok(None);
     }
-    let slots = read_usage_state_reset_slots(storeapi.clone()).await?;
+    let slots = read_dual_recovery_slots(storeapi.clone()).await?;
     let mut floor = PersistedUsageFloor {
         next_cycle,
         leader_epoch: head_epoch,
@@ -3004,10 +3021,21 @@ pub(super) async fn recover_dual_corrupt_scanner_state(
         let Some(data) = slot.data.as_deref() else {
             continue;
         };
+        if slot.path == DATA_USAGE_RECOVERY_PATH.as_str() {
+            let marker = decode_legacy_incomplete_usage_floor_recovery_marker(data)?;
+            if !matches!(slot.revision, DataUsageCacheRevision::Etag(_)) {
+                return Err(ScannerError::Other("scanner usage recovery marker has no revision".to_string()));
+            }
+            floor.leader_epoch = floor.leader_epoch.max(marker.leader_epoch);
+            continue;
+        }
         match serde_json::from_slice::<DataUsageInfo>(data) {
             Ok(usage) => {
                 if slot.path != DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()
-                    && (data_usage_info_has_persisted_baseline_identity(&usage) || data_usage_info_is_bootstrap_pending(&usage))
+                    && (data_usage_info_has_persisted_baseline_identity(&usage)
+                        || data_usage_info_is_bootstrap_pending(&usage)
+                        || !usage.bucket_sizes.is_empty()
+                        || !usage.buckets_usage.is_empty())
                 {
                     return Ok(None);
                 }
@@ -3036,7 +3064,8 @@ pub(super) async fn recover_dual_corrupt_scanner_state(
     let leader_epoch = floor
         .leader_epoch
         .checked_add(1)
-        .filter(|epoch| *epoch < u64::MAX)
+        // Ordinary leadership claim must still advance once more before work.
+        .filter(|epoch| epoch.checked_add(1).is_some_and(|claimed| claimed < u64::MAX))
         .ok_or_else(|| ScannerError::Other("scanner dual recovery leader epoch is exhausted".to_string()))?;
     let rebuilt_cycle = CurrentCycle {
         next: floor.next_cycle,
@@ -3316,6 +3345,17 @@ impl LegacyIncompleteUsageFence {
     }
 }
 
+fn decode_legacy_incomplete_usage_floor_recovery_marker(
+    data: &[u8],
+) -> Result<LegacyIncompleteUsageFloorRecoveryMarker, ScannerError> {
+    let marker = serde_json::from_slice::<LegacyIncompleteUsageFloorRecoveryMarker>(data)
+        .map_err(|err| ScannerError::Other(format!("failed to decode scanner usage recovery marker: {err}")))?;
+    if marker.schema_version != 1 || marker.primary_revision.is_empty() || marker.leader_epoch == 0 {
+        return Err(ScannerError::Other("scanner usage recovery marker is invalid".to_string()));
+    }
+    Ok(marker)
+}
+
 async fn read_legacy_incomplete_usage_floor_recovery_marker(
     storeapi: Arc<impl ScannerObjectIO>,
 ) -> Result<Option<(LegacyIncompleteUsageFloorRecoveryMarker, DataUsageCacheRevision)>, ScannerError> {
@@ -3325,11 +3365,7 @@ async fn read_legacy_incomplete_usage_floor_recovery_marker(
     let Some(data) = data else {
         return Ok(None);
     };
-    let marker = serde_json::from_slice::<LegacyIncompleteUsageFloorRecoveryMarker>(&data)
-        .map_err(|err| ScannerError::Other(format!("failed to decode scanner usage recovery marker: {err}")))?;
-    if marker.schema_version != 1 || marker.primary_revision.is_empty() || marker.leader_epoch == 0 {
-        return Err(ScannerError::Other("scanner usage recovery marker is invalid".to_string()));
-    }
+    let marker = decode_legacy_incomplete_usage_floor_recovery_marker(&data)?;
     if !matches!(revision, DataUsageCacheRevision::Etag(_)) {
         return Err(ScannerError::Other("scanner usage recovery marker has no revision".to_string()));
     }
