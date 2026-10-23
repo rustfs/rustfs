@@ -14,7 +14,6 @@
 
 use crate::{
     Error, FileInfo, FileInfoOpts, FileInfoVersions, FileMeta, FileMetaShallowVersion, Result, VersionType, get_file_info,
-    merge_file_meta_versions, merge_file_meta_versions_with_write_quorum,
 };
 use arc_swap::ArcSwapOption;
 use rmp::Marker;
@@ -243,9 +242,13 @@ impl MetaCacheEntry {
             });
         }
 
-        let mut fm = FileMeta::new();
-        fm.unmarshal_msg(&self.metadata)?;
-        let mut versions = fm.get_file_info_versions(bucket, self.name.as_str(), false)?;
+        if let Some(fm) = &self.cached {
+            let mut versions = fm.get_file_info_versions(bucket, self.name.as_str(), false)?;
+            versions.free_versions.clear();
+            return Ok(versions);
+        }
+
+        let mut versions = FileMeta::decode_file_info_versions_from_buf(&self.metadata, bucket, self.name.as_str(), false)?;
         versions.free_versions.clear();
         Ok(versions)
     }
@@ -264,11 +267,14 @@ impl MetaCacheEntry {
             });
         }
 
-        let mut fm = FileMeta::new();
-        fm.unmarshal_msg(&self.metadata)?;
-        // `get_file_info_versions(..., false)` is the existing path that
-        // separates persisted tier free-version records into `free_versions`.
-        fm.get_file_info_versions(bucket, self.name.as_str(), false)
+        if let Some(fm) = &self.cached {
+            return fm.get_file_info_versions(bucket, self.name.as_str(), false);
+        }
+
+        // `decode_file_info_versions_from_buf(..., false)` separates persisted
+        // tier free-version records into `free_versions` without allocating an
+        // intermediate `FileMeta`.
+        FileMeta::decode_file_info_versions_from_buf(&self.metadata, bucket, self.name.as_str(), false)
     }
 
     pub fn matches(&self, other: Option<&MetaCacheEntry>, strict: bool) -> (Option<MetaCacheEntry>, bool) {
@@ -637,16 +643,16 @@ impl MetaCacheEntries {
         }
 
         let mut dir_exists = 0;
-        let mut directory = None;
+        let mut directory: Option<&MetaCacheEntry> = None;
         let mut selected = None;
+        let mut invalid_entries: Vec<usize> = Vec::new();
+        let mut fallback_borrowed = Vec::new();
 
         params.candidates.clear();
         let mut objs_agree = 0;
         let mut objs_valid = 0;
 
-        for entry in self.0.iter().flatten() {
-            let mut entry = entry.clone();
-
+        for (entry_idx, entry) in self.0.iter().flatten().enumerate() {
             debug!(entry = %entry.name, "metacache resolve examining candidate entry");
             if entry.name.is_empty() {
                 continue;
@@ -654,33 +660,72 @@ impl MetaCacheEntries {
             if entry.is_dir() {
                 dir_exists += 1;
                 directory = Some(entry);
-                debug!(entry = %directory.as_ref().expect("directory entry").name, "metacache resolve observed directory candidate");
+                debug!(entry = %entry.name, "metacache resolve observed directory candidate");
                 continue;
             }
 
-            let versions = match entry.xl_meta_ref() {
-                Ok(xl) => xl.versions.clone(),
-                Err(e) => {
-                    debug!(entry = %entry.name, error = ?e, "metacache resolve skipped candidate with unreadable xl.meta");
+            let Some((current_selected_idx, current_selected, selected_borrowed)) = &mut selected else {
+                let initial_borrowed = if let Some(fm) = &entry.cached {
+                    fm.borrow_cached()
+                } else if entry.metadata.is_empty() {
+                    debug!(entry = %entry.name, "metacache resolve skipped candidate with empty xl.meta");
                     continue;
+                } else {
+                    match FileMeta::decode_borrowed(&entry.metadata) {
+                        Ok(borrowed) => borrowed,
+                        Err(e) => {
+                            invalid_entries.push(entry_idx);
+                            debug!(entry = %entry.name, error = ?e, "metacache resolve skipped candidate with unreadable xl.meta");
+                            continue;
+                        }
+                    }
+                };
+                selected = Some((entry_idx, entry, initial_borrowed));
+                objs_valid = 1;
+                objs_agree = 1;
+                debug!(entry = %entry.name, "metacache resolve selected initial candidate");
+                continue;
+            };
+
+            let same_name = entry.name == current_selected.name;
+            let outcome = if let Some(fm) = &entry.cached {
+                let (res, maybe_prev) = selected_borrowed.compare_cached(fm, same_name, params.strict);
+                if let Some(prev) = maybe_prev {
+                    fallback_borrowed.push((*current_selected_idx, prev));
+                }
+                res
+            } else if entry.metadata.is_empty() {
+                debug!(entry = %entry.name, "metacache resolve skipped candidate with empty xl.meta");
+                continue;
+            } else if current_selected.cached.is_none() && entry.metadata == current_selected.metadata {
+                same_name.then_some(true)
+            } else {
+                let hint = fallback_borrowed.last().map(|(_, b)| b);
+                match FileMeta::validate_and_compare_borrowed(&entry.metadata, selected_borrowed, hint, same_name, params.strict)
+                {
+                    Ok((res, maybe_borrowed)) => {
+                        if let Some(borrowed) = maybe_borrowed {
+                            let saved_idx = if res == Some(true) { *current_selected_idx } else { entry_idx };
+                            fallback_borrowed.push((saved_idx, borrowed));
+                        }
+                        res
+                    }
+                    Err(e) => {
+                        invalid_entries.push(entry_idx);
+                        debug!(entry = %entry.name, error = ?e, "metacache resolve skipped candidate with unreadable xl.meta");
+                        continue;
+                    }
                 }
             };
 
             objs_valid += 1;
-            params.candidates.push(versions);
-
-            if selected.is_none() {
-                debug!(entry = %entry.name, "metacache resolve selected initial candidate");
-                selected = Some(entry);
-                objs_agree = 1;
-                continue;
-            }
-
-            if let (prefer, true) = entry.matches(selected.as_ref(), params.strict) {
-                selected = prefer;
+            if let Some(prefer_self) = outcome {
+                if prefer_self {
+                    *current_selected_idx = entry_idx;
+                    *current_selected = entry;
+                }
                 objs_agree += 1;
                 debug!(entry = %entry.name, "metacache resolve preferred candidate during reconciliation");
-                continue;
             }
         }
 
@@ -688,14 +733,14 @@ impl MetaCacheEntries {
         // Keep directory evidence separate so its arrival cannot displace an
         // object that meets the metadata quorum.
         let directory = directory.filter(|_| dir_exists >= params.dir_quorum);
-        let Some(selected) = selected else {
+        let Some((_selected_idx, selected_ref, selected_borrowed)) = selected else {
             debug!(
                 bucket = %params.bucket,
                 dir_quorum = params.dir_quorum,
                 obj_quorum = params.obj_quorum,
                 "metacache resolve could not select any candidate entry"
             );
-            return directory;
+            return directory.cloned();
         };
 
         // If we would never be able to reach the required object quorum.
@@ -705,18 +750,17 @@ impl MetaCacheEntries {
                 obj_quorum = params.obj_quorum,
                 "metacache resolve did not have enough valid object candidates to satisfy quorum"
             );
-            return directory;
+            return directory.cloned();
         }
 
         if objs_agree == objs_valid {
             let required_quorum = if enforce_write_quorum {
-                selected
-                    .cached
-                    .as_ref()
-                    .and_then(|cached| cached.versions.first())
-                    .map(|version| {
-                        version
-                            .write_quorum(params.obj_quorum)
+                selected_borrowed
+                    .versions
+                    .as_slice()
+                    .first()
+                    .map(|(hdr, _, meta)| {
+                        crate::filemeta::write_quorum_from_header_and_meta(hdr, meta, params.obj_quorum)
                             .saturating_sub(params.write_quorum_slack)
                             .max(params.obj_quorum)
                     })
@@ -727,42 +771,70 @@ impl MetaCacheEntries {
 
             if objs_agree >= required_quorum {
                 debug!(
-                    selected = %selected.name,
+                    selected = %selected_ref.name,
                     objs_agree,
                     objs_valid,
                     "metacache resolve reused selected candidate because all valid object entries agreed"
                 );
-                return Some(selected);
+                let selected_fm = selected_ref
+                    .cached
+                    .clone()
+                    .unwrap_or_else(|| selected_borrowed.into_file_meta());
+                return Some(MetaCacheEntry {
+                    name: selected_ref.name.clone(),
+                    metadata: selected_ref.metadata.clone(),
+                    cached: Some(selected_fm),
+                    reusable: selected_ref.reusable,
+                });
             }
         }
 
-        let Some(cached) = selected.cached else {
-            debug!(selected = %selected.name, "metacache resolve could not merge because selected candidate had no cached metadata");
-            return directory;
-        };
+        let selected_meta_ver = selected_borrowed.meta_ver;
+        let mut streams: Vec<Vec<(&crate::FileMetaVersionHeader, &[u8])>> = Vec::with_capacity(objs_valid);
+        for (entry_idx, entry) in self.0.iter().flatten().enumerate() {
+            if entry.name.is_empty() || entry.is_dir() || invalid_entries.contains(&entry_idx) {
+                continue;
+            }
+            if let Some(fm) = &entry.cached {
+                streams.push(fm.versions.iter().map(|v| (&v.header, v.meta.as_slice())).collect());
+            } else if std::ptr::eq(entry, selected_ref)
+                || (selected_ref.cached.is_none() && entry.metadata == selected_ref.metadata)
+            {
+                streams.push(selected_borrowed.as_borrowed_stream());
+            } else if let Some((_, borrowed)) = fallback_borrowed.iter().find(|(idx, _)| *idx == entry_idx) {
+                streams.push(borrowed.as_borrowed_stream());
+            } else if let Some(stream) = selected_borrowed
+                .stream_from_prevalidated_matching_buf(&entry.metadata)
+                .or_else(|| {
+                    fallback_borrowed
+                        .iter()
+                        .find_map(|(_, b)| b.stream_from_prevalidated_matching_buf(&entry.metadata))
+                })
+            {
+                streams.push(stream);
+            }
+        }
+        debug_assert_eq!(streams.len(), objs_valid);
 
-        let versions = if enforce_write_quorum {
-            merge_file_meta_versions_with_write_quorum(
-                params.obj_quorum,
-                params.strict,
-                params.requested_versions,
-                params.write_quorum_slack,
-                &params.candidates,
-            )
-        } else {
-            merge_file_meta_versions(params.obj_quorum, params.strict, params.requested_versions, &params.candidates)
-        };
+        let versions = crate::filemeta::merge_file_meta_borrowed_streams(
+            params.obj_quorum,
+            params.strict,
+            params.requested_versions,
+            enforce_write_quorum,
+            params.write_quorum_slack,
+            streams,
+        );
         if versions.is_empty() {
             debug!(
-                selected = %selected.name,
+                selected = %selected_ref.name,
                 requested_versions = params.requested_versions,
                 "metacache resolve produced no merged versions after reconciliation"
             );
-            return directory;
+            return directory.cloned();
         }
 
         let merged_cached = FileMeta {
-            meta_ver: cached.meta_ver,
+            meta_ver: selected_meta_ver,
             versions,
             ..Default::default()
         };
@@ -771,18 +843,18 @@ impl MetaCacheEntries {
             Ok(meta) => meta,
             Err(e) => {
                 warn!(
-                    selected = %selected.name,
+                    selected = %selected_ref.name,
                     error = ?e,
                     "metacache resolve failed to marshal merged metadata entry"
                 );
-                return directory;
+                return directory.cloned();
             }
         };
 
         // Merge if we have disagreement.
         // Create a new merged result.
         let new_selected = MetaCacheEntry {
-            name: selected.name.clone(),
+            name: selected_ref.name.clone(),
             cached: Some(merged_cached),
             reusable: true,
             metadata,
@@ -904,18 +976,30 @@ impl<W: AsyncWrite + Unpin> MetacacheWriter<W> {
                 return Err(Error::other("metacacheWriter: no name"));
             }
 
-            self.write_obj(obj).await?;
+            Self::encode_obj(&mut self.buf, obj)?;
+            if self.buf.len() >= METACACHE_READ_CHUNK_SIZE {
+                self.flush().await?;
+            }
         }
 
+        if !self.buf.is_empty() {
+            self.flush().await?;
+        }
+
+        Ok(())
+    }
+
+    fn encode_obj(buf: &mut Vec<u8>, obj: &MetaCacheEntry) -> Result<()> {
+        rmp::encode::write_bool(buf, true).map_err(|e| Error::other(format!("{e:?}")))?;
+        rmp::encode::write_str(buf, &obj.name).map_err(|e| Error::other(format!("{e:?}")))?;
+        rmp::encode::write_bin(buf, &obj.metadata).map_err(|e| Error::other(format!("{e:?}")))?;
         Ok(())
     }
 
     pub async fn write_obj(&mut self, obj: &MetaCacheEntry) -> Result<()> {
         self.init().await?;
 
-        rmp::encode::write_bool(&mut self.buf, true).map_err(|e| Error::other(format!("{e:?}")))?;
-        rmp::encode::write_str(&mut self.buf, &obj.name).map_err(|e| Error::other(format!("{e:?}")))?;
-        rmp::encode::write_bin(&mut self.buf, &obj.metadata).map_err(|e| Error::other(format!("{e:?}")))?;
+        Self::encode_obj(&mut self.buf, obj)?;
         self.flush().await?;
 
         Ok(())
@@ -935,6 +1019,7 @@ pub struct MetacacheReader<R> {
     in_entry: bool,
     err: Option<Error>,
     buf: Vec<u8>,
+    pos: usize,
     has_current: bool,
 }
 
@@ -946,63 +1031,111 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
             in_entry: false,
             err: None,
             buf: Vec::new(),
+            pos: 0,
             has_current: false,
         }
     }
 
     pub async fn read_more(&mut self, read_size: usize) -> Result<&[u8]> {
+        self.read_more_inner(read_size, true).await
+    }
+
+    async fn read_more_inner(&mut self, read_size: usize, lookahead: bool) -> Result<&[u8]> {
         if let Some(err) = &self.err {
             return Err(err.clone());
         }
 
-        let pref = self.buf.len();
-        let Some(ext_size) = pref.checked_add(read_size) else {
-            let err = Error::other("metacache stream: element length overflow");
-            self.err = Some(err.clone());
-            return Err(err);
-        };
+        if self.buf.len() - self.pos >= read_size {
+            let start = self.pos;
+            self.pos += read_size;
+            return Ok(&self.buf[start..self.pos]);
+        }
+
+        if self.pos > 0 {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
 
         // A whole xl.meta can legitimately exceed the limit on its individual
         // msgpack values. Grow only as payload arrives, so a corrupt length
         // prefix cannot cause a speculative allocation of the advertised size.
-        while self.buf.len() < ext_size {
+        while self.buf.len() < read_size {
             let start = self.buf.len();
-            let extra = (ext_size - start).min(METACACHE_READ_CHUNK_SIZE);
+            let extra = if lookahead {
+                let min_chunk = METACACHE_READ_CHUNK_SIZE.saturating_sub(start);
+                (read_size - start).clamp(min_chunk, METACACHE_READ_CHUNK_SIZE)
+            } else {
+                (read_size - start).min(METACACHE_READ_CHUNK_SIZE)
+            };
             if let Err(e) = self.buf.try_reserve(extra) {
                 let err = Error::other(format!("metacache stream: buffer allocation of {extra} bytes failed: {e}"));
                 self.err = Some(err.clone());
                 return Err(err);
             }
-            self.buf.resize(start + extra, 0);
-            if let Err(e) = self.rd.read_exact(&mut self.buf[start..]).await {
-                // Listings treat Unexpected/UnexpectedEof as clean exhaustion.
-                // An incomplete entry must not hide remaining keys. Preserve
-                // the existing empty/between-entry EOF handling.
-                let err = match e.kind() {
-                    std::io::ErrorKind::UnexpectedEof if self.in_entry => Error::FileCorrupt,
-                    _ => Error::from(e),
-                };
-                self.err = Some(err.clone());
-                return Err(err);
+            let mut dst = bytes::BufMut::limit(&mut self.buf, extra);
+            match self.rd.read_buf(&mut dst).await {
+                Ok(0) => {
+                    // Listings treat Unexpected/UnexpectedEof as clean exhaustion.
+                    // An incomplete entry must not hide remaining keys. Preserve
+                    // the existing empty/between-entry EOF handling.
+                    let err = if self.in_entry {
+                        Error::FileCorrupt
+                    } else {
+                        Error::Unexpected
+                    };
+                    self.err = Some(err.clone());
+                    return Err(err);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let err = match e.kind() {
+                        std::io::ErrorKind::UnexpectedEof if self.in_entry => Error::FileCorrupt,
+                        _ => Error::from(e),
+                    };
+                    self.err = Some(err.clone());
+                    return Err(err);
+                }
             }
         }
 
-        Ok(&self.buf[pref..ext_size])
+        self.pos = read_size;
+        Ok(&self.buf[..read_size])
     }
 
     async fn discard(&mut self, mut size: usize) -> Result<()> {
-        self.reset();
+        let avail = self.buf.len() - self.pos;
+        if size <= avail {
+            self.pos += size;
+            self.reset();
+            return Ok(());
+        }
+        size -= avail;
+        self.buf.clear();
+        self.pos = 0;
         while size > 0 {
             let chunk = size.min(METACACHE_READ_CHUNK_SIZE);
-            self.read_more(chunk).await?;
+            self.read_more_inner(chunk, false).await?;
             size -= chunk;
-            self.reset();
+            self.buf.clear();
+            self.pos = 0;
         }
         Ok(())
     }
 
     fn reset(&mut self) {
-        self.buf.clear();
+        if self.pos >= self.buf.len() {
+            self.buf.clear();
+            self.pos = 0;
+            if self.buf.capacity() > METACACHE_READ_CHUNK_SIZE {
+                self.buf.shrink_to(METACACHE_READ_CHUNK_SIZE);
+            }
+        } else if self.pos >= METACACHE_READ_CHUNK_SIZE {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+            if self.buf.capacity() > METACACHE_READ_CHUNK_SIZE {
+                self.buf.shrink_to(METACACHE_READ_CHUNK_SIZE);
+            }
+        }
     }
 
     async fn check_init(&mut self) -> Result<()> {
@@ -1157,9 +1290,11 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
 
         let l = self.read_bin_len().await?;
 
-        let buf = self.read_more(l as usize).await?;
-
-        let metadata = buf.to_vec();
+        let metadata = if l == 0 {
+            Vec::new()
+        } else {
+            self.read_more(l as usize).await?.to_vec()
+        };
 
         self.in_entry = false;
         self.reset();
@@ -1360,6 +1495,74 @@ mod tests {
             .await
             .expect("skip must consume the current and following entry");
         assert_eq!(reader.read_all().await.expect("remaining entries must decode"), entries[3..]);
+    }
+
+    struct FragmentedReader<'a> {
+        data: &'a [u8],
+        chunk: usize,
+        reads: usize,
+    }
+
+    impl AsyncRead for FragmentedReader<'_> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let count = this.data.len().min(this.chunk).min(buf.remaining());
+            buf.put_slice(&this.data[..count]);
+            this.data = &this.data[count..];
+            this.reads += 1;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reader_buffered_wire_frames_survive_fragmented_reads_and_skips() {
+        for version in [1, 2] {
+            let mut bytes = vec![0xcc, version];
+            let payloads = [
+                vec![1; METACACHE_READ_CHUNK_SIZE - 1],
+                vec![],
+                vec![3; METACACHE_READ_CHUNK_SIZE + 1],
+            ];
+            for (i, payload) in payloads.iter().enumerate() {
+                rmp::encode::write_bool(&mut bytes, true).expect("entry marker");
+                rmp::encode::write_str(&mut bytes, &format!("key-{i}")).expect("entry name");
+                rmp::encode::write_bin(&mut bytes, payload).expect("entry metadata");
+            }
+            rmp::encode::write_bool(&mut bytes, false).expect("stream end");
+            for chunk in [1, 2, 7, 4096, METACACHE_READ_CHUNK_SIZE] {
+                let mut reader = MetacacheReader::new(FragmentedReader {
+                    data: &bytes,
+                    chunk,
+                    reads: 0,
+                });
+                assert_eq!(reader.peek().await.expect("first entry").expect("present").metadata, payloads[0]);
+                reader.skip(2).await.expect("consume first and empty second entries");
+                let last = reader.peek().await.expect("last entry").expect("present");
+                assert_eq!(last.name, "key-2");
+                assert_eq!(last.metadata, payloads[2]);
+                assert!(reader.peek().await.expect("valid terminator").is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reader_coalesces_small_entries_without_per_field_reads() {
+        let mut bytes = vec![0xcc, 2];
+        for _ in 0..1000 {
+            bytes.extend_from_slice(&[0xc3, 0xa1, b'x', 0xc4, 1, 0x42]);
+        }
+        bytes.push(0xc2);
+        let mut reader = MetacacheReader::new(FragmentedReader {
+            data: &bytes,
+            chunk: METACACHE_READ_CHUNK_SIZE,
+            reads: 0,
+        });
+        assert_eq!(reader.read_all().await.expect("decode page").len(), 1000);
+        assert_eq!(reader.rd.reads, 1, "a ready page smaller than 64 KiB needs one stream read");
     }
 
     #[tokio::test]
@@ -3417,5 +3620,603 @@ mod tests {
             reusable: false,
         };
         assert!(corrupt_crc_entry.is_latest_delete_marker());
+    }
+
+    #[test]
+    fn file_info_versions_and_borrowed_slice_decode_match_cached_and_full_decoders() {
+        let mut fm = FileMeta::load(&crate::test_data::create_realistic_object_xlmeta().expect("realistic xl.meta"))
+            .expect("load realistic xl.meta");
+        let mut obj = FileMetaVersion::try_from(fm.versions[0].meta.as_slice())
+            .expect("decode version")
+            .object
+            .expect("v2 object");
+        obj.meta_user.insert(
+            rustfs_utils::http::headers::AMZ_META_UNENCRYPTED_CONTENT_LENGTH.to_string(),
+            "128".to_string(),
+        );
+        obj.meta_user.insert(
+            rustfs_utils::http::headers::AMZ_META_UNENCRYPTED_CONTENT_MD5.to_string(),
+            "deadbeef".to_string(),
+        );
+        obj.meta_user
+            .insert(crate::metadata_keys::STORAGE_CLASS.to_string(), "STANDARD".to_string());
+        rustfs_utils::http::insert_bytes(&mut obj.meta_sys, rustfs_utils::http::SUFFIX_TIER_FV_MARKER, b"true".to_vec());
+        fm.versions[0] = FileMetaShallowVersion::try_from(FileMetaVersion {
+            version_type: VersionType::Object,
+            object: Some(obj),
+            write_version: 1,
+            ..Default::default()
+        })
+        .expect("re-encode object version");
+
+        let t1 = OffsetDateTime::from_unix_timestamp(1_705_312_100).expect("t1");
+        let mut free_meta_sys = HashMap::new();
+        rustfs_utils::http::insert_bytes(&mut free_meta_sys, rustfs_utils::http::SUFFIX_FREE_VERSION, Vec::new());
+        rustfs_utils::http::insert_bytes(&mut free_meta_sys, rustfs_utils::http::SUFFIX_TRANSITION_TIER, b"WARM".to_vec());
+        fm.versions.push(
+            FileMetaShallowVersion::try_from(FileMetaVersion {
+                version_type: VersionType::Delete,
+                delete_marker: Some(MetaDeleteMarker {
+                    version_id: Some(Uuid::from_u128(1)),
+                    mod_time: Some(t1),
+                    meta_sys: free_meta_sys,
+                }),
+                write_version: 1,
+                ..Default::default()
+            })
+            .expect("free version shallow"),
+        );
+
+        for sv in &fm.versions {
+            for all_parts in [true, false] {
+                let fast = sv.into_fileinfo("bucket", "object", all_parts).expect("borrowed decode");
+                let full = FileMetaVersion::try_from(sv.meta.as_slice())
+                    .expect("full try_from")
+                    .into_fileinfo("bucket", "object", all_parts)
+                    .expect("full into_fileinfo");
+                assert_eq!(fast, full);
+            }
+        }
+
+        let raw = fm.marshal_msg().expect("marshal multi-version xl.meta");
+        let cached_entry = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: Vec::new(),
+            cached: Some(fm),
+            reusable: false,
+        };
+        let uncached_entry = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: raw,
+            cached: None,
+            reusable: false,
+        };
+
+        let cached_fi = cached_entry.to_fileinfo("bucket").expect("cached to_fileinfo");
+        let uncached_fi = uncached_entry.to_fileinfo("bucket").expect("uncached to_fileinfo");
+        assert_eq!(cached_fi, uncached_fi);
+        assert_eq!(cached_fi.num_versions, 1);
+        assert!(!cached_fi.metadata.contains_key(crate::metadata_keys::STORAGE_CLASS));
+        assert!(!rustfs_utils::http::contains_key_str(
+            &cached_fi.metadata,
+            rustfs_utils::http::SUFFIX_TIER_FV_MARKER
+        ));
+
+        let cached_versions = cached_entry.file_info_versions("bucket").expect("cached versions");
+        let uncached_versions = uncached_entry.file_info_versions("bucket").expect("uncached versions");
+        assert_eq!(cached_versions.versions, uncached_versions.versions);
+        assert!(cached_versions.free_versions.is_empty());
+        assert_eq!(cached_versions.versions[0].num_versions, 1);
+
+        let cached_with_free = cached_entry
+            .file_info_versions_with_free_versions("bucket")
+            .expect("cached versions with free");
+        let uncached_with_free = uncached_entry
+            .file_info_versions_with_free_versions("bucket")
+            .expect("uncached versions with free");
+        assert_eq!(cached_with_free.versions, uncached_with_free.versions);
+        assert_eq!(cached_with_free.free_versions, uncached_with_free.free_versions);
+        assert_eq!(cached_with_free.free_versions.len(), 1);
+        assert_eq!(cached_with_free.free_versions[0].num_versions, 1);
+
+        let empty_fm = FileMeta::new();
+        let empty_raw = empty_fm.marshal_msg().expect("marshal empty xl.meta");
+        let empty_cached = MetaCacheEntry {
+            name: "empty".to_string(),
+            metadata: Vec::new(),
+            cached: Some(empty_fm),
+            reusable: false,
+        }
+        .file_info_versions("bucket")
+        .expect("empty cached versions");
+        let empty_uncached = MetaCacheEntry {
+            name: "empty".to_string(),
+            metadata: empty_raw,
+            cached: None,
+            reusable: false,
+        }
+        .file_info_versions("bucket")
+        .expect("empty uncached versions");
+        assert_eq!(empty_cached.versions, empty_uncached.versions);
+        assert_eq!(empty_cached.versions[0].num_versions, 1);
+
+        // Verify fallback cases (legacy V1Obj, >64 MetaSys keys, rmp_serde legacy format)
+        // and the 't'-prefixed internal key branches (`tier-free-marker` dropped,
+        // `tier-free-versionID` preserved, `transitioned-versionID` normalized).
+        let v1_fm = FileMeta::load(&crate::test_data::create_legacy_v1_object_xlmeta().expect("v1 xl.meta")).expect("load v1");
+        assert_eq!(
+            v1_fm.versions[0].into_fileinfo("bucket", "object", true).expect("v1 fast"),
+            FileMetaVersion::try_from(v1_fm.versions[0].meta.as_slice())
+                .expect("v1 try_from")
+                .into_fileinfo("bucket", "object", true)
+                .expect("v1 full"),
+        );
+
+        let mut large_obj = FileMetaVersion::try_from(cached_entry.cached.as_ref().expect("cached").versions[0].meta.as_slice())
+            .expect("decode obj")
+            .object
+            .expect("v2 obj");
+        for i in 0..65 {
+            large_obj.meta_sys.insert(format!("x-rustfs-internal-custom-{i}"), vec![b'v']);
+        }
+        large_obj
+            .meta_sys
+            .insert("X-Rustfs-Internal-Tier-Free-Marker".to_string(), b"1".to_vec());
+        rustfs_utils::http::insert_bytes(&mut large_obj.meta_sys, rustfs_utils::http::SUFFIX_TIER_FV_ID, b"keep-id".to_vec());
+        rustfs_utils::http::insert_bytes(
+            &mut large_obj.meta_sys,
+            rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_ID,
+            b"null".to_vec(),
+        );
+        rustfs_utils::http::insert_bytes(
+            &mut large_obj.meta_sys,
+            rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_STATE,
+            b"suspended-null".to_vec(),
+        );
+        let large_ver = FileMetaVersion {
+            version_type: VersionType::Object,
+            object: Some(large_obj),
+            write_version: 1,
+            ..Default::default()
+        };
+        let native_large_sv = FileMetaShallowVersion::try_from(large_ver.clone()).expect("native >64 MetaSys shallow");
+        assert_eq!(
+            native_large_sv
+                .into_fileinfo("bucket", "object", true)
+                .expect("native >64 fallback"),
+            FileMetaVersion::try_from(native_large_sv.meta.as_slice())
+                .expect("native >64 try_from")
+                .into_fileinfo("bucket", "object", true)
+                .expect("native >64 full"),
+        );
+        let rmp_legacy_bytes = rmp_serde::to_vec_named(&large_ver).expect("rmp_serde named");
+        let rmp_legacy_fi = FileMetaShallowVersion {
+            header: large_ver.header(),
+            meta: rmp_legacy_bytes,
+        }
+        .into_fileinfo("bucket", "object", true)
+        .expect("rmp_serde fallback");
+        assert!(rmp_legacy_fi.uses_legacy_checksum);
+        assert!(!rmp_legacy_fi.metadata.contains_key("X-Rustfs-Internal-Tier-Free-Marker"));
+        assert!(rustfs_utils::http::contains_key_str(
+            &rmp_legacy_fi.metadata,
+            rustfs_utils::http::SUFFIX_TIER_FV_ID
+        ));
+        assert_eq!(rmp_legacy_fi.transition_version.as_deref(), Some("null"));
+    }
+
+    #[test]
+    fn resolve_inner_borrowed_matches_distinct_ec_non_strict_and_multi_version_cases() {
+        let now = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("timestamp");
+        let base = metacache_entry_single_version(1, now, "etag-1");
+        let base_fm = FileMeta::load(&base.metadata).expect("load base");
+
+        // 1. Distinct erasure_index per disk (different raw metadata bytes, identical version headers).
+        let mut distinct_ec_entries = Vec::with_capacity(4);
+        for disk_idx in 1..=4usize {
+            let mut fm = base_fm.clone();
+            let mut ver = FileMetaVersion::try_from(fm.versions[0].meta.as_slice()).expect("decode version");
+            ver.object.as_mut().expect("object").erasure_index = disk_idx;
+            fm.versions[0].meta = ver.marshal_msg().expect("marshal version");
+            distinct_ec_entries.push(Some(MetaCacheEntry {
+                name: base.name.clone(),
+                metadata: fm.marshal_msg().expect("marshal fm"),
+                cached: if disk_idx == 2 { Some(fm) } else { None },
+                reusable: false,
+            }));
+        }
+        let resolved_ec = MetaCacheEntries(distinct_ec_entries)
+            .resolve_with_write_quorum(MetadataResolutionParams {
+                dir_quorum: 2,
+                obj_quorum: 2,
+                requested_versions: 1,
+                bucket: "bucket".to_string(),
+                strict: true,
+                write_quorum_slack: 0,
+                candidates: Vec::new(),
+            })
+            .expect("resolve distinct ec");
+        assert!(resolved_ec.cached.is_some());
+        let resolved_ver =
+            FileMetaVersion::try_from(resolved_ec.cached.as_ref().expect("cached").versions[0].meta.as_slice()).expect("ver");
+        assert_eq!(resolved_ver.object.expect("obj").erasure_index, 4);
+
+        // 2. Multi-version (> 2 versions, exercising BorrowedVersions::Multi) with non-strict signature preference.
+        let mut multi_a = FileMeta::new();
+        for v_idx in 1..=4u128 {
+            let entry = metacache_entry_single_version(
+                v_idx,
+                now + time::Duration::seconds(i64::try_from(v_idx).expect("i64")),
+                &format!("etag-{v_idx}"),
+            );
+            multi_a
+                .versions
+                .extend(FileMeta::load(&entry.metadata).expect("load v").versions);
+        }
+        let mut multi_b = multi_a.clone();
+        multi_a.versions[0].header.signature = [1, 1, 1, 1];
+        multi_b.versions[0].header.signature = [9, 9, 9, 9];
+        let raw_a = multi_a.marshal_msg().expect("marshal multi_a");
+        let raw_b = multi_b.marshal_msg().expect("marshal multi_b");
+
+        // When higher-signature `multi_b` is first and `multi_a` is second, `!strict` keeps `multi_b`.
+        let keep_first = MetaCacheEntries(vec![
+            Some(MetaCacheEntry {
+                name: "multi".to_string(),
+                metadata: raw_b.clone(),
+                cached: None,
+                reusable: false,
+            }),
+            Some(MetaCacheEntry {
+                name: "multi".to_string(),
+                metadata: raw_a.clone(),
+                cached: None,
+                reusable: false,
+            }),
+        ])
+        .resolve(MetadataResolutionParams {
+            dir_quorum: 1,
+            obj_quorum: 2,
+            requested_versions: 0,
+            bucket: "bucket".to_string(),
+            strict: false,
+            write_quorum_slack: 0,
+            candidates: Vec::new(),
+        })
+        .expect("resolve keep_first");
+        assert_eq!(keep_first.cached.as_ref().expect("cached").versions[0].header.signature, [9, 9, 9, 9]);
+
+        // When lower-signature `multi_a` is first and `multi_b` is second, `!strict` prefers `multi_b`.
+        let prefer_second = MetaCacheEntries(vec![
+            Some(MetaCacheEntry {
+                name: "multi".to_string(),
+                metadata: raw_a,
+                cached: None,
+                reusable: false,
+            }),
+            Some(MetaCacheEntry {
+                name: "multi".to_string(),
+                metadata: raw_b,
+                cached: None,
+                reusable: false,
+            }),
+        ])
+        .resolve(MetadataResolutionParams {
+            dir_quorum: 1,
+            obj_quorum: 2,
+            requested_versions: 0,
+            bucket: "bucket".to_string(),
+            strict: false,
+            write_quorum_slack: 0,
+            candidates: Vec::new(),
+        })
+        .expect("resolve prefer_second");
+        assert_eq!(prefer_second.cached.as_ref().expect("cached").versions[0].header.signature, [9, 9, 9, 9]);
+
+        // 3. Exhaustive truth table for headers_match_strict over (ec_n, ec_m) pairs, including zero-parity headers.
+        let base_hdr = base_fm.versions[0].header.clone();
+        for s_m in [0u8, 1, 4, 7] {
+            for s_n in [0u8, 1, 2] {
+                for o_m in [0u8, 1, 4, 8] {
+                    for o_n in [0u8, 1, 2] {
+                        let mut s_hdr = base_hdr.clone();
+                        s_hdr.ec_m = s_m;
+                        s_hdr.ec_n = s_n;
+                        let mut o_hdr = base_hdr.clone();
+                        o_hdr.ec_m = o_m;
+                        o_hdr.ec_n = o_n;
+
+                        let expected = {
+                            let mut s_cmp = s_hdr.clone();
+                            let mut o_cmp = o_hdr.clone();
+                            if s_cmp.has_ec() != o_cmp.has_ec() {
+                                s_cmp.ec_m = 0;
+                                s_cmp.ec_n = 0;
+                                o_cmp.ec_m = 0;
+                                o_cmp.ec_n = 0;
+                            }
+                            s_cmp == o_cmp
+                        };
+                        assert_eq!(
+                            FileMeta::headers_match_strict(&s_hdr, &o_hdr),
+                            expected,
+                            "mismatch for s=({s_m},{s_n}) vs o=({o_m},{o_n})"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Zero-parity unequal EC fields ((7, 0) vs (0, 0)) must disagree in strict mode (both cached and uncached).
+        let mut fm_ec_7_0 = base_fm.clone();
+        fm_ec_7_0.versions[0].header.ec_m = 7;
+        fm_ec_7_0.versions[0].header.ec_n = 0;
+        let mut fm_ec_0_0 = base_fm.clone();
+        fm_ec_0_0.versions[0].header.ec_m = 0;
+        fm_ec_0_0.versions[0].header.ec_n = 0;
+        let mut e_7_0 = MetaCacheEntry {
+            name: base.name.clone(),
+            metadata: fm_ec_7_0.marshal_msg().expect("marshal 7_0"),
+            cached: None,
+            reusable: false,
+        };
+        let e_0_0_uncached = MetaCacheEntry {
+            name: base.name.clone(),
+            metadata: fm_ec_0_0.marshal_msg().expect("marshal 0_0"),
+            cached: None,
+            reusable: false,
+        };
+        let e_0_0_cached = MetaCacheEntry {
+            name: base.name.clone(),
+            metadata: e_0_0_uncached.metadata.clone(),
+            cached: Some(fm_ec_0_0),
+            reusable: false,
+        };
+        assert!(!e_7_0.matches_strict(&e_0_0_uncached));
+        assert!(!e_7_0.matches_strict(&e_0_0_cached));
+
+        // 4. Differential test: uncached vs cached disagreement merge (with distinct per-disk EC index and corrupt entry).
+        let newer = metacache_entry_single_version(2, now + time::Duration::seconds(10), "etag-2");
+        let newer_fm = FileMeta::load(&newer.metadata).expect("load newer");
+        let mut uncached_disagree = Vec::with_capacity(6);
+        let mut cached_disagree = Vec::with_capacity(6);
+        for disk_idx in 0..5usize {
+            let mut fm = if disk_idx == 0 { base_fm.clone() } else { newer_fm.clone() };
+            let mut ver = FileMetaVersion::try_from(fm.versions[0].meta.as_slice()).expect("decode ver");
+            ver.object.as_mut().expect("obj").erasure_index = disk_idx + 1;
+            fm.versions[0].meta = ver.marshal_msg().expect("marshal ver");
+            let raw = fm.marshal_msg().expect("marshal fm");
+            uncached_disagree.push(Some(MetaCacheEntry {
+                name: base.name.clone(),
+                metadata: raw.clone(),
+                cached: None,
+                reusable: false,
+            }));
+            cached_disagree.push(Some(MetaCacheEntry {
+                name: base.name.clone(),
+                metadata: raw,
+                cached: Some(fm),
+                reusable: false,
+            }));
+        }
+        // Append one corrupt uncached entry to both sets.
+        let mut corrupt_raw = base.metadata.clone();
+        if let Some(last) = corrupt_raw.last_mut() {
+            *last ^= 0xff;
+        }
+        uncached_disagree.push(Some(MetaCacheEntry {
+            name: base.name.clone(),
+            metadata: corrupt_raw.clone(),
+            cached: None,
+            reusable: false,
+        }));
+        cached_disagree.push(Some(MetaCacheEntry {
+            name: base.name.clone(),
+            metadata: corrupt_raw.clone(),
+            cached: None,
+            reusable: false,
+        }));
+
+        let res_uncached = MetaCacheEntries(uncached_disagree)
+            .resolve_with_write_quorum(MetadataResolutionParams {
+                dir_quorum: 2,
+                obj_quorum: 3,
+                requested_versions: 1,
+                bucket: "bucket".to_string(),
+                strict: true,
+                write_quorum_slack: 0,
+                candidates: Vec::new(),
+            })
+            .expect("resolve uncached disagree");
+        let res_cached = MetaCacheEntries(cached_disagree)
+            .resolve_with_write_quorum(MetadataResolutionParams {
+                dir_quorum: 2,
+                obj_quorum: 3,
+                requested_versions: 1,
+                bucket: "bucket".to_string(),
+                strict: true,
+                write_quorum_slack: 0,
+                candidates: Vec::new(),
+            })
+            .expect("resolve cached disagree");
+        let fm_uncached = res_uncached.cached.expect("uncached fm");
+        let fm_cached = res_cached.cached.expect("cached fm");
+        assert_eq!(fm_uncached.versions[0].header.version_id, Some(Uuid::from_u128(2)));
+        assert_eq!(fm_uncached.meta_ver, fm_cached.meta_ver);
+        assert_eq!(fm_uncached.versions, fm_cached.versions);
+        assert_eq!(res_uncached.metadata, res_cached.metadata);
+
+        // An all-agree set with one corrupt entry must still take the fast agree path (`reusable == false`).
+        let mut agree_with_corrupt: Vec<Option<MetaCacheEntry>> = (0..4)
+            .map(|_| {
+                Some(MetaCacheEntry {
+                    name: base.name.clone(),
+                    metadata: newer.metadata.clone(),
+                    cached: None,
+                    reusable: false,
+                })
+            })
+            .collect();
+        agree_with_corrupt.push(Some(MetaCacheEntry {
+            name: base.name.clone(),
+            metadata: corrupt_raw,
+            cached: None,
+            reusable: false,
+        }));
+        let res_agree_corrupt = MetaCacheEntries(agree_with_corrupt)
+            .resolve_with_write_quorum(MetadataResolutionParams {
+                dir_quorum: 2,
+                obj_quorum: 3,
+                requested_versions: 1,
+                bucket: "bucket".to_string(),
+                strict: true,
+                write_quorum_slack: 0,
+                candidates: Vec::new(),
+            })
+            .expect("resolve agree with corrupt");
+        assert!(!res_agree_corrupt.reusable);
+        assert_eq!(res_agree_corrupt.metadata, newer.metadata);
+
+        // Identical-byte supplement replicas + one divergent entry (exercising `entry.metadata == selected_ref.metadata` and `last_loaded`).
+        let mut supplement_entries: Vec<Option<MetaCacheEntry>> = (0..4)
+            .map(|_| {
+                Some(MetaCacheEntry {
+                    name: base.name.clone(),
+                    metadata: newer.metadata.clone(),
+                    cached: None,
+                    reusable: false,
+                })
+            })
+            .collect();
+        for _ in 0..2 {
+            supplement_entries.push(Some(MetaCacheEntry {
+                name: base.name.clone(),
+                metadata: base.metadata.clone(),
+                cached: None,
+                reusable: false,
+            }));
+        }
+        let res_supplement = MetaCacheEntries(supplement_entries)
+            .resolve_with_write_quorum(MetadataResolutionParams {
+                dir_quorum: 2,
+                obj_quorum: 3,
+                requested_versions: 1,
+                bucket: "bucket".to_string(),
+                strict: true,
+                write_quorum_slack: 0,
+                candidates: Vec::new(),
+            })
+            .expect("resolve supplement");
+        assert!(res_supplement.reusable);
+        assert_eq!(
+            res_supplement.cached.expect("cached").versions[0].header.version_id,
+            Some(Uuid::from_u128(2))
+        );
+
+        // 5. Duplicate-header stream removal preserves remaining duplicates per stream.
+        let dup_ver = base_fm.versions[0].clone();
+        let dup_candidates = vec![vec![dup_ver.clone(), dup_ver.clone()]; 3];
+        let merged_dups = crate::merge_file_meta_versions(2, true, 0, &dup_candidates);
+        assert_eq!(merged_dups.len(), 2);
+        assert_eq!(merged_dups[0].header, dup_ver.header);
+        assert_eq!(merged_dups[1].header, dup_ver.header);
+
+        // 6. Outlier last (drives 0..4 agree with distinct EC index, drive 1 cached, drive 4 disagrees),
+        // exercising `stream_from_prevalidated_matching_buf` and `compare_cached` displaced-entry retention.
+        let mut outlier_last = Vec::with_capacity(5);
+        for disk_idx in 0..5usize {
+            let mut fm = if disk_idx == 4 { base_fm.clone() } else { newer_fm.clone() };
+            let mut ver = FileMetaVersion::try_from(fm.versions[0].meta.as_slice()).expect("decode ver");
+            ver.object.as_mut().expect("obj").erasure_index = disk_idx + 1;
+            fm.versions[0].meta = ver.marshal_msg().expect("marshal ver");
+            let raw = fm.marshal_msg().expect("marshal fm");
+            outlier_last.push(Some(MetaCacheEntry {
+                name: base.name.clone(),
+                metadata: raw,
+                cached: if disk_idx == 1 { Some(fm) } else { None },
+                reusable: false,
+            }));
+        }
+        let res_outlier_last = MetaCacheEntries(outlier_last)
+            .resolve_with_write_quorum(MetadataResolutionParams {
+                dir_quorum: 2,
+                obj_quorum: 3,
+                requested_versions: 1,
+                bucket: "bucket".to_string(),
+                strict: true,
+                write_quorum_slack: 0,
+                candidates: Vec::new(),
+            })
+            .expect("resolve outlier_last");
+        assert_eq!(
+            res_outlier_last.cached.expect("cached").versions[0].header.version_id,
+            Some(Uuid::from_u128(2))
+        );
+
+        // 7. Canonical 38-byte header unmarshal_msg and matches_buf_strict across negative, zero, and subsecond timestamps.
+        for nanos in [-1_705_312_300_123_456_789i128, -1, 0, 1, 1_705_312_300_987_654_321] {
+            let mut fm = base_fm.clone();
+            let ts = OffsetDateTime::from_unix_timestamp_nanos(nanos).expect("valid ts");
+            fm.versions[0].header.mod_time = (ts != OffsetDateTime::UNIX_EPOCH).then_some(ts);
+            let encoded = fm.versions[0].header.marshal_msg().expect("marshal hdr");
+            assert_eq!(encoded.len(), 38);
+            assert!(crate::filemeta::parse_canonical_v3_header_fields(&encoded).is_some());
+            let mut decoded = crate::FileMetaVersionHeader::default();
+            assert_eq!(decoded.unmarshal_msg(&encoded).expect("unmarshal 38B"), 38);
+            assert_eq!(decoded, fm.versions[0].header);
+            let fm_raw = fm.marshal_msg().expect("marshal fm");
+            assert!(fm.matches_buf_strict(&fm_raw));
+            assert_eq!(
+                fm.matches_buf_strict(&base.metadata),
+                fm.versions[0].header.mod_time == base_fm.versions[0].header.mod_time
+            );
+        }
+
+        // 8. Mixed empty V3 (`versions_len == 0`) and zero-meta-payload envelope preserve stream 0 during fallback merge.
+        let empty_v3_raw = FileMeta::new().marshal_msg().expect("marshal empty v3");
+        let mut zero_meta_envelope = Vec::from(&b"XL2 "[..]);
+        zero_meta_envelope.extend_from_slice(&1u16.to_le_bytes());
+        zero_meta_envelope.extend_from_slice(&3u16.to_le_bytes());
+        zero_meta_envelope.extend_from_slice(&[0xc6, 0, 0, 0, 0]);
+        let zero_crc = xxhash_rust::xxh64::xxh64(&[], 0) as u32;
+        zero_meta_envelope.push(0xce);
+        zero_meta_envelope.extend_from_slice(&zero_crc.to_be_bytes());
+
+        let mut two_ver_fm = newer_fm;
+        two_ver_fm.versions.push(base_fm.versions[0].clone());
+        let two_ver_raw = two_ver_fm.marshal_msg().expect("marshal two_ver_fm");
+
+        let mut mixed_empty_entries = vec![Some(MetaCacheEntry {
+            name: base.name.clone(),
+            metadata: empty_v3_raw,
+            cached: None,
+            reusable: false,
+        })];
+        for _ in 0..4 {
+            mixed_empty_entries.push(Some(MetaCacheEntry {
+                name: base.name.clone(),
+                metadata: two_ver_raw.clone(),
+                cached: None,
+                reusable: false,
+            }));
+        }
+        mixed_empty_entries.push(Some(MetaCacheEntry {
+            name: base.name,
+            metadata: zero_meta_envelope,
+            cached: None,
+            reusable: false,
+        }));
+        let res_mixed_empty = MetaCacheEntries(mixed_empty_entries)
+            .resolve_with_write_quorum(MetadataResolutionParams {
+                dir_quorum: 2,
+                obj_quorum: 4,
+                requested_versions: 1,
+                bucket: "bucket".to_string(),
+                strict: true,
+                write_quorum_slack: 0,
+                candidates: Vec::new(),
+            })
+            .expect("resolve mixed empty");
+        assert_eq!(res_mixed_empty.cached.expect("cached").versions.len(), 1);
     }
 }

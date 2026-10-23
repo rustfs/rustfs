@@ -235,9 +235,19 @@ enum ReadAllError {
 
 struct ListingMetadataRead {
     bytes: Vec<u8>,
+    #[cfg(test)]
     file_meta: Option<FileMeta>,
-    data_dirs: HashSet<String>,
+    data_dirs: Vec<Uuid>,
     has_namespace_child_candidate: bool,
+    counts_toward_limit: bool,
+}
+
+type ListingMetadataItem = core::result::Result<ListingMetadataRead, ReadAllError>;
+
+struct ListingMetadataBatch {
+    volume_dir: PathBuf,
+    rx: tokio::sync::mpsc::UnboundedReceiver<ListingMetadataItem>,
+    remaining: usize,
 }
 
 const LISTING_META_INITIAL_READ_BYTES: usize = 4 << 10;
@@ -272,31 +282,56 @@ fn read_listing_metadata_bytes_std(
     opened: std::io::Result<std::fs::File>,
 ) -> core::result::Result<(Vec<u8>, Option<OffsetDateTime>), ReadAllError> {
     let mut file = opened.map_err(ReadAllError::Open)?;
-    let metadata = file.metadata().map_err(|err| ReadAllError::Disk(to_file_error(err).into()))?;
+    let mut initial_buf = [0u8; LISTING_META_INITIAL_READ_BYTES];
+    let mut n = 0;
+    let mut reached_eof = false;
 
-    if metadata.is_dir() {
-        return Err(ReadAllError::Disk(DiskError::FileNotFound));
+    while n < LISTING_META_INITIAL_READ_BYTES {
+        match std::io::Read::read(&mut file, &mut initial_buf[n..]) {
+            Ok(0) => {
+                reached_eof = true;
+                break;
+            }
+            Ok(read_bytes) => {
+                n += read_bytes;
+                if let Ok((tmp_buf, 1, minor @ 1..=3)) = FileMeta::check_xl2_v1(&initial_buf[..n])
+                    && let Ok((sz, rest)) = FileMeta::read_bytes_header(tmp_buf)
+                {
+                    let header_len = n - rest.len();
+                    let crc_len = if minor >= 2 { 5 } else { 0 };
+                    if let Some(want) = (sz as usize).checked_add(header_len).and_then(|v| v.checked_add(crc_len))
+                        && want <= n
+                    {
+                        return Ok((initial_buf[..want].to_vec(), None));
+                    }
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            #[cfg(unix)]
+            Err(err) if err.raw_os_error() == Some(libc::EISDIR) => {
+                return Err(ReadAllError::Disk(DiskError::FileNotFound));
+            }
+            Err(err) => {
+                #[cfg(not(unix))]
+                if file.metadata().is_ok_and(|m| m.is_dir()) {
+                    return Err(ReadAllError::Disk(DiskError::FileNotFound));
+                }
+                return Err(ReadAllError::Disk(to_file_error(err).into()));
+            }
+        }
     }
 
-    let size = usize::try_from(metadata.len()).map_err(|err| ReadAllError::Disk(DiskError::other(err)))?;
-    let modtime = metadata.modified().ok().map(OffsetDateTime::from);
-    if size == 0 {
-        return Ok((Vec::new(), modtime));
+    if n == 0 {
+        return Ok((Vec::new(), None));
     }
 
-    let initial = size.min(LISTING_META_INITIAL_READ_BYTES);
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(initial)
-        .map_err(|err| ReadAllError::Disk(Error::other(err)))?;
-    std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, initial as u64), &mut bytes)
-        .map_err(|err| ReadAllError::Disk(to_file_error(err).into()))?;
-
-    if let Ok((tmp_buf, major, minor)) = FileMeta::check_xl2_v1(&bytes) {
+    if !reached_eof && let Ok((tmp_buf, major, minor)) = FileMeta::check_xl2_v1(&initial_buf) {
+        let metadata = file.metadata().map_err(|err| ReadAllError::Disk(to_file_error(err).into()))?;
+        let size = usize::try_from(metadata.len()).map_err(|err| ReadAllError::Disk(DiskError::other(err)))?;
         let want = match (major, minor) {
             (1, 0) => Some(size),
             (1, 1..=3) => FileMeta::read_bytes_header(tmp_buf).ok().and_then(|(sz, rest)| {
-                let header_len = bytes.len() - rest.len();
+                let header_len = initial_buf.len() - rest.len();
                 let crc_len = if minor >= 2 { 5 } else { 0 };
                 (sz as usize).checked_add(header_len)?.checked_add(crc_len)
             }),
@@ -304,21 +339,83 @@ fn read_listing_metadata_bytes_std(
         };
         if let Some(want) = want
             && want <= size
+            && want > initial_buf.len()
         {
-            if want > bytes.len() && bytes.len() == initial {
-                let extra = want - bytes.len();
-                bytes
-                    .try_reserve_exact(extra)
-                    .map_err(|err| ReadAllError::Disk(Error::other(err)))?;
-                std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, extra as u64), &mut bytes)
-                    .map_err(|err| ReadAllError::Disk(to_file_error(err).into()))?;
-            } else if want < bytes.len() {
-                bytes.truncate(want);
-            }
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(want.saturating_add(1))
+                .map_err(|err| ReadAllError::Disk(Error::other(err)))?;
+            bytes.extend_from_slice(&initial_buf);
+            let extra = want - initial_buf.len();
+            std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, extra as u64), &mut bytes)
+                .map_err(|err| ReadAllError::Disk(to_file_error(err).into()))?;
+            return Ok((bytes, None));
         }
     }
 
-    Ok((bytes, modtime))
+    Ok((initial_buf[..n].to_vec(), None))
+}
+
+const LISTING_META_BATCH_MAX_BYTES: usize = 1 << 20;
+
+// Deliver progress before starting another blocking read. A timer checked after a
+// read cannot publish completed entries while the next filesystem call is stalled.
+fn stream_listing_metadata_batch(
+    object_names: &[String],
+    tx: tokio::sync::mpsc::UnboundedSender<ListingMetadataItem>,
+    mut read: impl FnMut(&str) -> ListingMetadataItem,
+) {
+    let mut buffered_bytes = 0usize;
+    for object_name in object_names {
+        if tx.is_closed() {
+            break;
+        }
+        let res = read(object_name);
+        if let Ok(read) = &res {
+            buffered_bytes = buffered_bytes.saturating_add(read.bytes.len());
+        }
+        let stop = res.as_ref().map_or(true, |read| read.has_namespace_child_candidate)
+            || buffered_bytes >= LISTING_META_BATCH_MAX_BYTES;
+        if tx.send(res).is_err() || stop {
+            break;
+        }
+    }
+}
+
+fn parse_listing_metadata_bytes(bytes: &[u8]) -> (Option<FileMeta>, Vec<Uuid>, bool) {
+    let file_meta = FileMeta::load(bytes).ok();
+    let mut data_dirs = Vec::new();
+    if let Some(meta) = file_meta.as_ref()
+        && let Ok(dirs) = meta.get_data_dirs()
+    {
+        data_dirs.extend(dirs.into_iter().flatten());
+        data_dirs.sort_unstable();
+        data_dirs.dedup();
+    }
+    let counts_toward_limit = file_meta.as_ref().is_none_or(file_meta_counts_toward_limit);
+    (file_meta, data_dirs, counts_toward_limit)
+}
+
+fn read_listing_metadata_entry_std(
+    root: &os::PublicationRoot,
+    object_dir: &Path,
+) -> core::result::Result<ListingMetadataRead, ReadAllError> {
+    let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
+    let (bytes, _) = read_listing_metadata_bytes_std(root.open_readonly(&metadata_path))?;
+    let (file_meta, data_dirs, counts_toward_limit) = parse_listing_metadata_bytes(&bytes);
+    #[cfg(not(test))]
+    let _ = file_meta;
+    let has_namespace_child_candidate =
+        os::has_non_data_dir_entry(object_dir, &data_dirs).map_err(|err| ReadAllError::Disk(to_file_error(err).into()))?;
+
+    Ok(ListingMetadataRead {
+        bytes,
+        #[cfg(test)]
+        file_meta,
+        data_dirs,
+        has_namespace_child_candidate,
+        counts_toward_limit,
+    })
 }
 
 pub(crate) fn inline_metadata_rollback_dir(version_id: Uuid, meta: &FileMeta) -> Uuid {
@@ -629,7 +726,18 @@ async fn restore_delete_rollback_with_namespace_owner(
     }
 
     let backup_path = rollback_path.join(STORAGE_FORMAT_FILE_BACKUP);
-    match os::rename_all_with_owner(&backup_path, xl_path, object_dir, publication_root, namespace_owner.clone()).await {
+    // A journal that recorded no original metadata never wrote a backup (a
+    // delete marker created on a missing key). Renaming it would only log a
+    // NotFound that reads like the cause of the failed write it undoes.
+    let restored = if recovery_journal
+        .as_ref()
+        .is_some_and(|journal| journal.original_digest.is_none())
+    {
+        Err(DiskError::FileNotFound)
+    } else {
+        os::rename_all_with_owner(&backup_path, xl_path, object_dir, publication_root, namespace_owner.clone()).await
+    };
+    match restored {
         Ok(()) => {}
         Err(DiskError::FileNotFound) if remove_new_metadata => {
             match os::remove_file_with_owner(xl_path, namespace_owner.clone()).await {
@@ -6283,12 +6391,34 @@ impl LocalDisk {
             return Ok(());
         }
         let path = trash.join(name);
-        let result = if entry.file_type().await?.is_dir() {
-            fs::remove_dir_all(path).await
-        } else {
-            fs::remove_file(path).await
-        };
+        let result = async {
+            if entry.file_type().await?.is_dir() {
+                fs::remove_dir_all(&path).await
+            } else {
+                fs::remove_file(&path).await
+            }
+        }
+        .await;
         match result {
+            // Windows can report ERROR_ACCESS_DENIED while another remover
+            // still holds the deleted entry open. Allow up to 150 ms for that
+            // deletion to settle, but only explicit absence proves completion.
+            #[cfg(windows)]
+            Err(err) if err.raw_os_error() == Some(5) => {
+                for delay_ms in [0, 10, 20, 40, 80] {
+                    if delay_ms != 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                    // Do not follow links or treat a failed probe as absence.
+                    if fs::symlink_metadata(&path)
+                        .await
+                        .is_err_and(|probe| probe.kind() == ErrorKind::NotFound)
+                    {
+                        return Ok(());
+                    }
+                }
+                Err(err.into())
+            }
             Err(err) if err.kind() != ErrorKind::NotFound => Err(err.into()),
             _ => Ok(()),
         }
@@ -7940,49 +8070,54 @@ impl LocalDisk {
         }))
     }
 
+    #[cfg(test)]
     async fn read_listing_metadata(&self, volume: &str, object_name: &str) -> Result<ListingMetadataRead> {
-        let io_permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
-        let object_dir = self.io_get_object_path(volume, object_name)?;
-        let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
+        let mut batch = self
+            .spawn_listing_metadata_batch(volume, vec![object_name.to_owned()], None)
+            .await?;
+        let raw = batch
+            .rx
+            .recv()
+            .await
+            .ok_or_else(|| DiskError::other("listing metadata batch closed unexpectedly"))?;
+        self.resolve_read_all_result(volume, &batch.volume_dir, raw).await
+    }
+
+    async fn spawn_listing_metadata_batch(
+        &self,
+        volume: &str,
+        object_names: Vec<String>,
+        stall: Option<Duration>,
+    ) -> Result<ListingMetadataBatch> {
+        let io_permit = with_walk_stall_deadline(stall, acquire_context_disk_io_permit())
+            .await?
+            .map_err(DiskError::Io)?;
         let volume_dir = self.io_get_bucket_path(volume)?;
+        let io_root = self.io_root().to_path_buf();
+        #[cfg(target_os = "linux")]
+        let mount_lease = self.mount_lease.clone();
+        let volume_str = volume.to_owned();
         let root = self.publication_root.clone();
-        let result = spawn_blocking_with_disk_io_permit(io_permit, move || {
-            let (bytes, _) = read_listing_metadata_bytes_std(root.open_readonly(&metadata_path))?;
-            let file_meta = FileMeta::load(&bytes).ok();
-            let data_dirs: HashSet<String> = file_meta
-                .as_ref()
-                .and_then(|meta| meta.get_data_dirs().ok())
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|data_dir| data_dir.to_string())
-                .collect();
-            let probe = match os::read_dir_probe(&object_dir, data_dirs.len().saturating_add(2)) {
-                Ok(probe) => probe,
-                Err(err) if err.kind() == ErrorKind::NotFound => os::ReadDirProbe {
-                    entries: Vec::new(),
-                    complete: true,
-                },
-                Err(err) => return Err(ReadAllError::Disk(to_file_error(err).into())),
-            };
-            let found_child = probe.entries.into_iter().any(|entry| {
-                entry
-                    .strip_suffix(SLASH_SEPARATOR)
-                    .is_some_and(|child| !child.is_empty() && !data_dirs.contains(child))
+        let remaining = object_names.len();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(spawn_blocking_with_disk_io_permit(io_permit, move || {
+            stream_listing_metadata_batch(&object_names, tx, |object_name| {
+                let (bucket_path, object_dir) = build_local_disk_object_path(&io_root, &volume_str, object_name);
+                #[cfg(target_os = "linux")]
+                let path_check = check_local_disk_valid_object_path_at(&io_root, &mount_lease, &bucket_path, &object_dir);
+                #[cfg(not(target_os = "linux"))]
+                let path_check = check_local_disk_valid_object_path(&io_root, &bucket_path, &object_dir);
+                match path_check {
+                    Ok(()) => read_listing_metadata_entry_std(&root, &object_dir),
+                    Err(err) => Err(ReadAllError::Disk(err)),
+                }
             });
-            let has_namespace_child_candidate = found_child || !probe.complete;
-
-            Ok(ListingMetadataRead {
-                bytes,
-                file_meta,
-                data_dirs,
-                has_namespace_child_candidate,
-            })
+        }));
+        Ok(ListingMetadataBatch {
+            volume_dir,
+            rx,
+            remaining,
         })
-        .await
-        .map_err(DiskError::from)?;
-
-        self.resolve_read_all_result(volume, &volume_dir, result).await
     }
 
     async fn resolve_read_all_result<T>(
@@ -9191,8 +9326,10 @@ impl LocalDisk {
                 }
             };
             prefix = "".to_owned();
+            let mut prefetched_batch: Option<ListingMetadataBatch> = None;
+            let mut adaptive_batch_cap = WALK_DIR_BATCH_SIZE;
 
-            for entry in entries.iter() {
+            for (entry_idx, entry) in entries.iter().enumerate() {
                 if entry.is_empty() {
                     continue;
                 }
@@ -9277,50 +9414,93 @@ impl LocalDisk {
                     meta.name.push_str(GLOBAL_DIR_SUFFIX_WITH_SLASH);
                 }
 
-                let fname = format!("{}/{}", meta.name, STORAGE_FORMAT_FILE);
                 let metadata_read = if !is_dir_obj {
-                    with_walk_stall_timeout(stall, self.read_listing_metadata(&opts.bucket, &meta.name))
-                        .await
-                        .map(|read| (read.bytes, read.file_meta, Some(read.data_dirs), read.has_namespace_child_candidate))
+                    async {
+                        let mut spawned = false;
+                        let (volume_dir, raw_res) = loop {
+                            if let Some(batch) = prefetched_batch.as_mut() {
+                                if let Some(raw_res) = with_walk_stall_deadline(stall, batch.rx.recv()).await? {
+                                    batch.remaining -= 1;
+                                    let stop = batch.remaining == 0
+                                        || raw_res.as_ref().map_or(true, |r| r.has_namespace_child_candidate);
+                                    let volume_dir = batch.volume_dir.clone();
+                                    if stop {
+                                        prefetched_batch = None;
+                                    }
+                                    break (volume_dir, raw_res);
+                                }
+                                prefetched_batch = None;
+                                if spawned {
+                                    return Err(DiskError::other("listing metadata batch closed unexpectedly"));
+                                }
+                            }
+                            spawned = true;
+                            let batch_limit = if opts.limit > 0 {
+                                usize::try_from(opts.limit - *objs_returned)
+                                    .unwrap_or(1)
+                                    .min(adaptive_batch_cap)
+                            } else {
+                                adaptive_batch_cap
+                            };
+                            let batch_names = if batch_limit > 1
+                                && dir_objes.is_empty()
+                                && dir_stack.iter().all(|(_, _, _, scan_required)| !*scan_required)
+                            {
+                                entries[entry_idx..]
+                                    .iter()
+                                    .take_while(|c| !c.is_empty())
+                                    .take(batch_limit)
+                                    .map(|c| path_join_buf(&[current.as_str(), c.as_str()]))
+                                    .collect()
+                            } else {
+                                vec![meta.name.clone()]
+                            };
+                            prefetched_batch = Some(self.spawn_listing_metadata_batch(&opts.bucket, batch_names, stall).await?);
+                        };
+                        with_walk_stall_timeout(stall, self.resolve_read_all_result(&opts.bucket, &volume_dir, raw_res)).await
+                    }
+                    .await
                 } else {
+                    let fname = format!("{}/{}", meta.name, STORAGE_FORMAT_FILE);
                     with_walk_stall_timeout(stall, self.read_metadata(&opts.bucket, fname.as_str()))
                         .await
-                        .map(|metadata| (Vec::from(metadata), None, None, true))
+                        .map(|metadata| {
+                            let bytes = Vec::from(metadata);
+                            let (file_meta, data_dirs, counts_toward_limit) = parse_listing_metadata_bytes(&bytes);
+                            #[cfg(not(test))]
+                            let _ = file_meta;
+                            ListingMetadataRead {
+                                bytes,
+                                #[cfg(test)]
+                                file_meta,
+                                data_dirs,
+                                has_namespace_child_candidate: true,
+                                counts_toward_limit,
+                            }
+                        })
                 };
 
                 match metadata_read {
-                    Ok((res, prefetched_file_meta, prefetched_data_dirs, has_namespace_child_candidate)) => {
+                    Ok(read) => {
+                        adaptive_batch_cap = WALK_DIR_BATCH_SIZE;
                         if is_dir_obj {
                             meta.name = meta.name.trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH).to_owned();
                             meta.name.push_str(SLASH_SEPARATOR);
                         }
 
-                        let file_meta = match prefetched_file_meta {
-                            Some(file_meta) => Some(file_meta),
-                            None if opts.limit > 0 || opts.recursive || !is_dir_obj => FileMeta::load(&res).ok(),
-                            None => None,
-                        };
-
-                        meta.metadata = res;
+                        meta.metadata = read.bytes;
 
                         write_metacache_obj(out, &meta).await?;
 
-                        if opts.limit <= 0 || file_meta.as_ref().is_none_or(file_meta_counts_toward_limit) {
+                        if opts.limit <= 0 || read.counts_toward_limit {
                             *objs_returned += 1;
                         }
 
-                        let dir_to_skip = if let Some(data_dirs) = prefetched_data_dirs {
-                            data_dirs
+                        let has_namespace_child_candidate = read.has_namespace_child_candidate;
+                        let dir_to_skip: HashSet<String> = if has_namespace_child_candidate || !dir_objes.is_empty() {
+                            read.data_dirs.into_iter().map(|dir| dir.to_string()).collect()
                         } else {
-                            let mut data_dirs_to_skip = HashSet::new();
-                            if let Some(file_meta) = file_meta.as_ref()
-                                && let Ok(data_dirs) = file_meta.get_data_dirs()
-                            {
-                                for data_dir in data_dirs.iter().flatten() {
-                                    data_dirs_to_skip.insert(data_dir.to_string());
-                                }
-                            }
-                            data_dirs_to_skip
+                            HashSet::new()
                         };
 
                         if opts.recursive {
@@ -9354,6 +9534,7 @@ impl LocalDisk {
                     }
                     Err(err) => {
                         if err == Error::FileNotFound || err == Error::IsNotRegular {
+                            adaptive_batch_cap = 1;
                             // NOT an object, append to stack (with slash)
                             // If dirObject, but no metadata (which is unexpected) we skip it.
                             if !is_dir_obj && {
@@ -9382,6 +9563,7 @@ impl LocalDisk {
                             continue;
                         }
 
+                        let fname = format!("{}/{}", meta.name, STORAGE_FORMAT_FILE);
                         error!(
                             event = EVENT_DISK_LOCAL_SCAN_FAILED,
                             component = LOG_COMPONENT_ECSTORE,
@@ -9755,18 +9937,39 @@ fn rename_data_versions_signature(meta: &FileMeta) -> Option<Vec<u8>> {
 /// size field decodes independently of the inline data, so the vote carries
 /// the same value healthy disks report, and skipping the lookup's inline
 /// bytes clone keeps the observation allocation-light.
-fn observe_old_current_size(dst_meta_existed: bool, xlmeta: &FileMeta) -> Option<OldCurrentSize> {
+fn observe_old_current(
+    dst_meta_existed: bool,
+    dst_meta_unparsable: bool,
+    xlmeta: &FileMeta,
+    volume: &str,
+    path: &str,
+    version_id: Uuid,
+) -> (Option<OldCurrentSize>, bool, Option<FileInfo>) {
+    if dst_meta_existed && dst_meta_unparsable {
+        return (None, false, None);
+    }
     if !dst_meta_existed {
-        return Some(OldCurrentSize::Absent);
+        return (Some(OldCurrentSize::Absent), true, None);
     }
     if xlmeta.versions.is_empty() {
-        return Some(OldCurrentSize::Present(0));
+        return (Some(OldCurrentSize::Present(0)), false, None);
     }
-    match xlmeta.into_fileinfo("", "", "", false, false, true) {
-        Ok(fi) => Some(OldCurrentSize::Present(fi.size)),
-        Err(rustfs_filemeta::Error::FileNotFound) => Some(OldCurrentSize::Absent),
-        Err(_) => None,
+    match xlmeta.into_fileinfo(volume, path, "", false, false, true) {
+        Ok(old_current) => {
+            let size = Some(OldCurrentSize::Present(old_current.size));
+            let source = (old_current.version_id.unwrap_or_default() == version_id
+                && old_current.transition_status == rustfs_filemeta::TRANSITION_COMPLETE)
+                .then_some(old_current);
+            (size, true, source)
+        }
+        Err(rustfs_filemeta::Error::FileNotFound) => (Some(OldCurrentSize::Absent), false, None),
+        Err(_) => (None, false, None),
     }
+}
+
+#[cfg(test)]
+fn observe_old_current_size(dst_meta_existed: bool, xlmeta: &FileMeta) -> Option<OldCurrentSize> {
+    observe_old_current(dst_meta_existed, false, xlmeta, "", "", Uuid::nil()).0
 }
 
 fn is_root_path(path: impl AsRef<Path>) -> bool {
@@ -12692,16 +12895,16 @@ mod test {
     }
 
     #[derive(Clone, Default)]
-    struct CapturedLogs {
+    pub(super) struct CapturedLogs {
         buffer: Arc<Mutex<Vec<u8>>>,
     }
 
-    struct CapturedLogWriter {
+    pub(super) struct CapturedLogWriter {
         buffer: Arc<Mutex<Vec<u8>>>,
     }
 
     impl CapturedLogs {
-        fn contents(&self) -> String {
+        pub(super) fn contents(&self) -> String {
             let buffer = self
                 .buffer
                 .lock()
@@ -14333,6 +14536,109 @@ mod test {
             std::fs::read(moved.join("payload")).expect("read preserved payload"),
             b"unchanged payload"
         );
+    }
+
+    #[cfg(windows)]
+    mod windows_trash_cleanup {
+        use super::*;
+
+        async fn read_trash_entry(trash: &Path) -> fs::DirEntry {
+            fs::read_dir(trash)
+                .await
+                .expect("open the fixture trash directory")
+                .next_entry()
+                .await
+                .expect("read the fixture trash entry")
+                .expect("the fixture has one trash entry")
+        }
+
+        #[tokio::test]
+        async fn issue_8734_concurrent_deletes_are_idempotent() {
+            let root = tempfile::tempdir().expect("create isolated trash fixture");
+            let trash = LocalDisk::meta_path(root.path(), RUSTFS_META_TMP_DELETED_BUCKET);
+            fs::create_dir_all(&trash).await.expect("create trash directory");
+
+            // Both cleaners enumerate the same entry before either starts deleting.
+            // Exercise real Windows deletion races, without synthesizing OS errors.
+            for round in 0..32 {
+                let target = trash.join(Uuid::new_v4().to_string());
+                for part in 0..16 {
+                    let child = target.join(part.to_string());
+                    fs::create_dir_all(&child).await.expect("create object data directory");
+                    fs::write(child.join("part.1"), b"trash payload")
+                        .await
+                        .expect("write object data");
+                }
+                let first = read_trash_entry(&trash).await;
+                let second = read_trash_entry(&trash).await;
+                let (first_result, second_result) = tokio::join!(
+                    LocalDisk::cleanup_trash_entry(first, &trash),
+                    LocalDisk::cleanup_trash_entry(second, &trash),
+                );
+
+                let missing = fs::symlink_metadata(&target)
+                    .await
+                    .expect_err("the concurrent cleaners must have removed the target");
+                assert_eq!(missing.kind(), ErrorKind::NotFound, "absence must not be a failed permission probe");
+                assert!(
+                    first_result.is_ok() && second_result.is_ok(),
+                    "issue #8734: target is gone but cleanup failed in round {round}: \
+                     first={first_result:?}, second={second_result:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn already_missing_entry_is_successful() {
+            let root = tempfile::tempdir().expect("create isolated trash fixture");
+            let trash = LocalDisk::meta_path(root.path(), RUSTFS_META_TMP_DELETED_BUCKET);
+            let target = trash.join(Uuid::new_v4().to_string());
+            fs::create_dir_all(&target).await.expect("create trash entry");
+            let entry = read_trash_entry(&trash).await;
+            fs::remove_dir(&target).await.expect("delete the entry after enumeration");
+
+            LocalDisk::cleanup_trash_entry(entry, &trash)
+                .await
+                .expect("an entry deleted before cleanup must be a successful no-op");
+            assert_eq!(
+                fs::symlink_metadata(&target)
+                    .await
+                    .expect_err("cleanup must not recreate the deleted entry")
+                    .kind(),
+                ErrorKind::NotFound
+            );
+        }
+
+        #[tokio::test]
+        async fn locked_file_deletion_error_is_preserved() {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::{Foundation::ERROR_SHARING_VIOLATION, Storage::FileSystem::FILE_SHARE_READ};
+
+            let root = tempfile::tempdir().expect("create isolated trash fixture");
+            let trash = LocalDisk::meta_path(root.path(), RUSTFS_META_TMP_DELETED_BUCKET);
+            fs::create_dir_all(&trash).await.expect("create trash directory");
+            let target = trash.join(Uuid::new_v4().to_string());
+            fs::write(&target, b"retained payload").await.expect("write trash file");
+            let guard = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&target)
+                .expect("hold the trash file without delete sharing");
+
+            let result =
+                LocalDisk::cleanup_deleted_objects(root.path().to_path_buf(), &crate::disk::cleanup_runtime::GcBudget::default())
+                    .await;
+            // Release the handle before assertions so TempDir can clean up even
+            // if a future implementation incorrectly swallows the deletion error.
+            drop(guard);
+            let error = result.expect_err("a surviving locked file must still report a deletion failure");
+            let sharing_violation = i32::try_from(ERROR_SHARING_VIOLATION).expect("Windows error code fits i32");
+            assert!(
+                matches!(&error, DiskError::Io(source) if source.raw_os_error() == Some(sharing_violation)),
+                "preserve the real Windows sharing-violation error: {error:?}"
+            );
+            assert_eq!(fs::read(&target).await.expect("read surviving trash file"), b"retained payload");
+        }
     }
 
     #[tokio::test]
@@ -18213,6 +18519,69 @@ mod test {
                 mod_time: Some(mod_time),
                 ..Default::default()
             }
+        }
+
+        #[test]
+        fn observe_preserves_source_check_decisions_for_missing_empty_and_corrupt_metadata() {
+            for (exists, unparsable, expected_size, expected_checked) in [
+                (false, false, Some(OldCurrentSize::Absent), true),
+                (true, false, Some(OldCurrentSize::Present(0)), false),
+                (true, true, None, false),
+            ] {
+                let (size, checked, source) =
+                    observe_old_current(exists, unparsable, &FileMeta::new(), "bucket", "object", Uuid::nil());
+                assert_eq!(size, expected_size);
+                assert_eq!(checked, expected_checked);
+                assert!(source.is_none());
+            }
+
+            let mut metadata = FileMeta::new();
+            metadata
+                .add_version(live_file_info("object", Uuid::new_v4(), 42, OffsetDateTime::now_utc()))
+                .expect("seed a live version");
+            metadata.versions[0].meta = vec![0xc1];
+            let (size, checked, source) = observe_old_current(true, false, &metadata, "bucket", "object", Uuid::nil());
+            assert_eq!(size, None);
+            assert!(!checked);
+            assert!(source.is_none());
+        }
+
+        #[test]
+        fn observe_returns_only_the_matching_transitioned_old_current_source() {
+            let version_id = Uuid::new_v4();
+            let mut info = live_file_info("object", version_id, 42, OffsetDateTime::now_utc());
+            info.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_string();
+            info.transition_tier = "WARM".to_string();
+            info.transitioned_objname = "remote-object".to_string();
+            let mut metadata = FileMeta::new();
+            metadata.add_version(info).expect("seed transitioned current version");
+
+            for (requested, expected_source) in [(version_id, true), (Uuid::new_v4(), false)] {
+                let (size, checked, source) = observe_old_current(true, false, &metadata, "bucket", "object", requested);
+                assert_eq!(size, Some(OldCurrentSize::Present(42)));
+                assert!(checked);
+                assert_eq!(source.is_some(), expected_source);
+                if let Some(source) = source {
+                    assert_eq!(source.version_id, Some(version_id));
+                    assert_eq!(source.name, "object");
+                    assert_eq!(source.volume, "bucket");
+                    assert_eq!(source.transition_status, rustfs_filemeta::TRANSITION_COMPLETE);
+                    assert_eq!(source.transition_tier, "WARM");
+                    assert_eq!(source.transitioned_objname, "remote-object");
+                }
+            }
+
+            metadata
+                .add_version(delete_marker_file_info(
+                    "object",
+                    Uuid::new_v4(),
+                    OffsetDateTime::now_utc() + time::Duration::seconds(1),
+                ))
+                .expect("seed newer delete marker");
+            let (size, checked, source) = observe_old_current(true, false, &metadata, "bucket", "object", version_id);
+            assert_eq!(size, Some(OldCurrentSize::Present(0)));
+            assert!(checked);
+            assert!(source.is_none(), "a historical transitioned version is not the old current");
         }
 
         #[test]
@@ -22325,7 +22694,7 @@ mod test {
             .await
             .expect("read leaf metadata");
         assert!(!leaf.has_namespace_child_candidate);
-        assert!(leaf.data_dirs.contains(&data_dir.to_string()));
+        assert!(leaf.data_dirs.contains(&data_dir));
 
         fs::create_dir(object_dir.join("child"))
             .await
@@ -22335,6 +22704,94 @@ mod test {
             .await
             .expect("read parent metadata");
         assert!(parent.has_namespace_child_candidate);
+    }
+
+    fn listing_batch_fixture(bytes: Vec<u8>, has_namespace_child_candidate: bool) -> ListingMetadataRead {
+        ListingMetadataRead {
+            bytes,
+            file_meta: None,
+            data_dirs: Vec::new(),
+            has_namespace_child_candidate,
+            counts_toward_limit: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_metadata_batch_publishes_before_the_next_read_completes() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let mut started_tx = Some(started_tx);
+            stream_listing_metadata_batch(&["first".to_string(), "second".to_string()], tx, |name| {
+                if name == "second" {
+                    started_tx
+                        .take()
+                        .expect("second read starts once")
+                        .send(())
+                        .expect("notify reader");
+                    resume_rx.recv().expect("resume second read");
+                }
+                Ok(listing_batch_fixture(name.as_bytes().to_vec(), false))
+            });
+        });
+        started_rx.await.expect("worker must reach the blocked second read");
+        let first = rx.try_recv();
+        // Release the blocking task before asserting, including on regression.
+        resume_tx.send(()).expect("release blocked worker");
+        worker.await.expect("worker must finish");
+        assert_eq!(
+            first
+                .expect("first result must already be published")
+                .ok()
+                .expect("first read succeeds")
+                .bytes,
+            b"first"
+        );
+        assert_eq!(
+            rx.recv()
+                .await
+                .expect("second result")
+                .ok()
+                .expect("second read succeeds")
+                .bytes,
+            b"second"
+        );
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn listing_metadata_batch_stops_on_boundaries_and_cancellation() {
+        for boundary in ["bytes", "child", "error", "cancel"] {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            if boundary == "cancel" {
+                rx.close();
+            }
+            let mut reads = 0;
+            stream_listing_metadata_batch(&["first".to_string(), "second".to_string()], tx, |_| {
+                reads += 1;
+                if boundary == "error" {
+                    Err(ReadAllError::Disk(DiskError::FileNotFound))
+                } else {
+                    Ok(listing_batch_fixture(
+                        vec![
+                            0;
+                            if boundary == "bytes" {
+                                LISTING_META_BATCH_MAX_BYTES
+                            } else {
+                                1
+                            }
+                        ],
+                        boundary == "child",
+                    ))
+                }
+            });
+            assert_eq!(reads, usize::from(boundary != "cancel"), "boundary: {boundary}");
+            if boundary != "cancel" {
+                assert!(rx.try_recv().is_ok(), "the boundary result must be delivered: {boundary}");
+            }
+            assert!(rx.try_recv().is_err(), "no result may follow the boundary: {boundary}");
+        }
     }
 
     #[tokio::test]
@@ -22544,6 +23001,12 @@ mod test {
             fi.data_dir = Some(data_dir);
             fi.size = 16;
             fi.mod_time = Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("ts"));
+            if name == "obj-20" {
+                // A single envelope can exhaust the byte budget before the name
+                // batch ends; subsequent keys must resume in a fresh worker.
+                fi.metadata
+                    .insert("x-amz-meta-padding".to_string(), "p".repeat(LISTING_META_BATCH_MAX_BYTES));
+            }
             fi.data = Some(Bytes::from(vec![b'a'; 16 * 1024]));
             fi.set_inline_data();
             fm.add_version(fi).expect("add version");
@@ -22603,6 +23066,57 @@ mod test {
 
         assert_eq!(entries[2].name, "parent/");
         assert!(entries[2].is_dir());
+
+        // Cross multiple batches, including an early stop for a nested child, and
+        // pin both sides of the 32-object batch boundary and an unlimited walk.
+        let batch_bucket = "walk-batch-bucket";
+        let batch_bucket_dir = dir.path().join(batch_bucket);
+        for idx in 0..80 {
+            let name = format!("obj-{idx:02}");
+            let obj_dir = batch_bucket_dir.join(&name);
+            fs::create_dir_all(obj_dir.join(data_dir.to_string()))
+                .await
+                .expect("create batch obj data_dir");
+            fs::write(obj_dir.join(STORAGE_FORMAT_FILE), make_obj_meta(&name))
+                .await
+                .expect("write batch obj xl.meta");
+            if idx == 10 {
+                let nested_dir = obj_dir.join("nested");
+                fs::create_dir_all(&nested_dir).await.expect("create nested child dir");
+                fs::write(nested_dir.join(STORAGE_FORMAT_FILE), make_obj_meta("obj-10/nested"))
+                    .await
+                    .expect("write nested child xl.meta");
+            }
+        }
+
+        let mut expected: Vec<String> = (0..80).map(|i| format!("obj-{i:02}")).collect();
+        expected.insert(11, "obj-10/nested".to_string());
+        for limit in [15, 32, 33, 0] {
+            let (reader, mut writer) = tokio::io::duplex(64 * 1024);
+            let batch_opts = WalkDirOptions {
+                bucket: batch_bucket.to_string(),
+                base_dir: String::new(),
+                recursive: true,
+                limit,
+                ..Default::default()
+            };
+            let disk_ref = &disk;
+            let produce = async move { disk_ref.walk_dir(batch_opts, &mut writer).await };
+            let consume = async { MetacacheReader::new(reader).read_all().await.expect("read batched stream") };
+            let (result, batch_entries) = tokio::join!(produce, consume);
+            result.expect("batched recursive walk_dir must succeed");
+            let visible_names: Vec<_> = batch_entries
+                .iter()
+                .filter(|e| !e.metadata.is_empty())
+                .map(|e| e.name.as_str())
+                .collect();
+            let count = if limit == 0 {
+                expected.len()
+            } else {
+                usize::try_from(limit).expect("positive limit")
+            };
+            assert_eq!(visible_names, expected[..count], "page limit {limit}");
+        }
     }
 
     #[tokio::test]

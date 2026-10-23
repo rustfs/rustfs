@@ -173,3 +173,6 @@ rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", 
 rustls-pki-types.workspace = true
 tokio = { workspace = true, features = ["io-util", "net"] }
 tokio-rustls = { workspace = true, default-features = false, features = ["aws-lc-rs"] }
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dev-dependencies]
+rustfs-common = { workspace = true, features = ["test-util"] }

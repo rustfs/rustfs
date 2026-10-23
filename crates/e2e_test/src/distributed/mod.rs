@@ -32,6 +32,8 @@ mod replication_delete_marker_test;
 mod replication_quota_test;
 mod s3_basic_test;
 mod s3_during_data_movement_test;
+mod scanner_heal_topology_fixture;
+mod scanner_heal_topology_test;
 mod site_replication_test;
 mod upgrade_test;
 mod versioning_test;

@@ -182,6 +182,13 @@ const DECOMMISSION_CAPACITY_INTENT_CONFLICT_MAX_ATTEMPTS: usize = 12;
 // divergent authority still reaches a terminal, attributable failure.
 const DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS: usize = 12;
 const DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+/// In-place attempts for a source cleanup quorum failure before the entry is
+/// deferred to the end of the round.
+pub(crate) const DECOMMISSION_SOURCE_CLEANUP_QUORUM_MAX_ATTEMPTS: usize = 3;
+/// Fixed part of the wait before in-place cleanup retry `n`: `n` times this.
+/// Drive reconnects and health-check blips last seconds, so jitter alone
+/// (which may be near zero) would rarely ride one out.
+const DECOMMISSION_SOURCE_CLEANUP_QUORUM_RETRY_FLOOR: std::time::Duration = std::time::Duration::from_secs(1);
 pub(crate) const DECOMMISSION_VERSION_COPY_ATTEMPTS: usize = 3;
 const DECOMMISSION_COPY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 const DECOMMISSION_CAPACITY_GATE_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(100);
@@ -3479,7 +3486,13 @@ fn resolve_decommission_progress_save_result(result: Result<()>) -> Option<Error
 }
 
 fn resolve_decommission_preflight_heal_result<T>(bucket: &str, result: Result<T>) -> Result<T> {
-    result.map_err(|err| Error::other(format!("decommission preflight heal failed for bucket {bucket}: {err}")))
+    result.map_err(|err| match err {
+        // A peer whose movement gate has a queued writer refuses the bucket
+        // heal instead of waiting; the refusal crosses the disk layer as
+        // `TooManyOpenFiles`. Keep it retryable so the start answers 503.
+        Error::SlowDown | Error::TooManyOpenFiles => Error::SlowDown,
+        err => Error::other(format!("decommission preflight heal failed for bucket {bucket}: {err}")),
+    })
 }
 
 fn resolve_decommission_optional_bucket_config_result<T>(bucket: &str, stage: &str, result: Result<T>) -> Result<Option<T>> {
@@ -3496,10 +3509,77 @@ fn resolve_decommission_entry_cleanup_delete_result<T>(result: Result<T>, bucket
     match result {
         Ok(_) => Ok(()),
         Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => Ok(()),
-        Err(err) => Err(Error::other(format!(
-            "decommission cleanup_delete_object failed for {bucket}/{object_name}: {err}"
-        ))),
+        Err(err) => Err(data_movement::data_movement_context_error(
+            format!("decommission cleanup_delete_object failed for {bucket}/{object_name}: {err}"),
+            DecommissionSourceCleanupFailure(err),
+        )),
     }
+}
+
+/// The storage error of a failed source cleanup, kept typed so the entry
+/// failure policy can tell a retryable cleanup failure from a terminal one.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct DecommissionSourceCleanupFailure(Error);
+
+/// A drive quorum failure while deleting the source of an already copied
+/// entry leaves the source in place: an uncommitted delete transaction is
+/// settled by delete recovery, and the entry's next attempt re-verifies the
+/// source before it cleans up again. Retrying is safe, so it must not fail the
+/// pool. A lost namespace lock or mutation fence
+/// (`NamespaceLockQuorumUnavailable`) is not a drive quorum failure: this
+/// worker no longer owns the key, so it stops without retrying.
+fn is_decommission_source_cleanup_retryable_error(err: &Error) -> bool {
+    data_movement::data_movement_stage_source_as::<DecommissionSourceCleanupFailure>(err).is_some_and(|failure| {
+        matches!(
+            failure.0,
+            Error::ErasureReadQuorum
+                | Error::ErasureWriteQuorum
+                | Error::InsufficientReadQuorum(_, _)
+                | Error::InsufficientWriteQuorum(_, _)
+        )
+    })
+}
+
+/// The storage error of a version copy that kept losing drive quorum through
+/// its in-place retries, kept typed so the entry failure policy defers it.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct DecommissionCopyQuorumFailure(#[source] Error);
+
+fn is_decommission_copy_quorum_error(err: &Error) -> bool {
+    if data_movement::is_data_movement_source_read_error(err) {
+        return false;
+    }
+    let err = data_movement::data_movement_stage_source(err).unwrap_or(err);
+    matches!(
+        err,
+        Error::ErasureReadQuorum
+            | Error::ErasureWriteQuorum
+            | Error::InsufficientReadQuorum(_, _)
+            | Error::InsufficientWriteQuorum(_, _)
+    )
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) fn is_decommission_copy_quorum_error_for_test(err: &Error) -> bool {
+    is_decommission_copy_quorum_error(err)
+}
+
+/// A drive quorum failure while copying a version leaves the source intact:
+/// the target write either never committed or is settled by delete and write
+/// recovery, so the entry can be copied again later. It is a property of the
+/// pools' drives at that moment, not of the object, and must not be counted as
+/// a permanent per-object failure.
+fn decommission_copy_quorum_deferral(stage: &str, bucket: &str, object: &str, err: Error) -> Error {
+    data_movement::data_movement_context_error(
+        format!("decommission {stage} lost drive quorum for {bucket}/{object}: {err}"),
+        DecommissionCopyQuorumFailure(err),
+    )
+}
+
+fn is_decommission_copy_quorum_deferral(err: &Error) -> bool {
+    data_movement::data_movement_stage_source_as::<DecommissionCopyQuorumFailure>(err).is_some()
 }
 
 fn resolve_decommission_entry_reload_result(result: Result<()>, bucket: &str, object_name: &str) -> Result<()> {
@@ -5188,17 +5268,32 @@ fn resolve_decommission_listing_worker_result(
     worker_result.map_err(|err| Error::other(format!("decommission listing worker {set_idx} task join error: {err}")))?
 }
 
+/// Prefix of a pause reason caused by source cleanup rather than target
+/// capacity; see [`PoolDecommissionInfo::is_source_cleanup_blocked`].
+pub(crate) const DECOMMISSION_SOURCE_CLEANUP_BLOCKED: &str = "source cleanup blocked";
+
 /// Keep the deferral cause the pause reason should name. A stale target
-/// selection outranks transient contention such as a busy gate: it does not
-/// clear by waiting, so it is what an operator has to act on, whichever entry
-/// of the set finished last.
+/// selection or a source cleanup that kept failing outranks transient
+/// contention such as a busy gate: neither clears by waiting, so it is what an
+/// operator has to act on, whichever entry of the set finished last.
 fn record_decommission_deferral_cause(recorded: &mut Option<(bool, String)>, err: &Error) {
-    let stale = matches!(
-        classify_decommission_capacity_failure(err),
-        DecommissionCapacityFailure::StaleTargetSelection { .. }
-    );
-    if recorded.as_ref().is_none_or(|(recorded_stale, _)| stale || !recorded_stale) {
-        *recorded = Some((stale, err.to_string()));
+    let source_cleanup = is_decommission_source_cleanup_retryable_error(err);
+    let durable = source_cleanup
+        || is_decommission_copy_quorum_deferral(err)
+        || matches!(
+            classify_decommission_capacity_failure(err),
+            DecommissionCapacityFailure::StaleTargetSelection { .. }
+        );
+    if recorded
+        .as_ref()
+        .is_none_or(|(recorded_durable, _)| durable || !recorded_durable)
+    {
+        let cause = if source_cleanup {
+            format!("{DECOMMISSION_SOURCE_CLEANUP_BLOCKED}: {err}")
+        } else {
+            err.to_string()
+        };
+        *recorded = Some((durable, cause));
     }
 }
 
@@ -5219,12 +5314,37 @@ fn ensure_decommission_deferred_drained(
     if deferred_remaining == 0 {
         return Ok(());
     }
+    let remaining =
+        format!("decommission bucket {bucket} set {set_idx} finished with {deferred_remaining} deferred entries remaining");
+    // A source cleanup pause leads with its own label so the persisted reason
+    // does not read as a target capacity problem.
+    if let Some(cause) = deferral_cause.and_then(|cause| cause.strip_prefix(DECOMMISSION_SOURCE_CLEANUP_BLOCKED)) {
+        return Err(decommission_capacity_blocked_error(format!(
+            "{DECOMMISSION_SOURCE_CLEANUP_BLOCKED}: {remaining}; deferral cause{cause}"
+        )));
+    }
     let cause = deferral_cause
         .map(|cause| format!("; deferral cause: {cause}"))
         .unwrap_or_default();
-    Err(decommission_capacity_blocked_error(format!(
-        "decommission bucket {bucket} set {set_idx} finished with {deferred_remaining} deferred entries remaining{cause}"
-    )))
+    Err(decommission_capacity_blocked_error(format!("{remaining}{cause}")))
+}
+
+/// The reason persisted for a durable decommission pause. A source cleanup
+/// pause keeps only its own message; the capacity wording of the carrier error
+/// would misreport it.
+fn decommission_pause_reason(err: &Error) -> String {
+    source_cleanup_blocked_message(err).map_or_else(|| err.to_string(), str::to_owned)
+}
+
+/// The source cleanup pause message of `err`, seen through stage wrappers the
+/// same way `is_decommission_capacity_blocked_error` sees through them.
+fn source_cleanup_blocked_message(err: &Error) -> Option<&str> {
+    match err {
+        Error::DecommissionCapacityBlocked { message } if message.starts_with(DECOMMISSION_SOURCE_CLEANUP_BLOCKED) => {
+            Some(message.as_str())
+        }
+        _ => data_movement::data_movement_stage_source(err).and_then(source_cleanup_blocked_message),
+    }
 }
 
 fn decommission_entry_budget_acquire_error(err: impl Display) -> Error {
@@ -5273,6 +5393,13 @@ fn decommission_retry_backoff_delay(base: std::time::Duration, attempt: usize) -
     }
     let ceiling_millis = u64::try_from(ceiling.as_millis()).unwrap_or(u64::MAX);
     std::time::Duration::from_millis(rand::rng().random_range(0..=ceiling_millis))
+}
+
+/// Wait before the 1-based in-place source cleanup retry `attempt`: a fixed
+/// floor of `attempt` seconds plus the usual source-cleanup jitter on top.
+fn decommission_source_cleanup_quorum_retry_delay(attempt: usize) -> std::time::Duration {
+    let floor = DECOMMISSION_SOURCE_CLEANUP_QUORUM_RETRY_FLOOR.saturating_mul(u32::try_from(attempt).unwrap_or(u32::MAX));
+    floor.saturating_add(decommission_retry_backoff_delay(DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY, attempt))
 }
 
 /// Backoff for retries that wait on another mutation's target capacity gate.
@@ -5490,6 +5617,10 @@ enum DecommissionEntryAttemptOutcome {
 struct DeferredDecommissionEntry {
     name: String,
     attempts: usize,
+    /// Versions whose progress was already counted. A deferral after the
+    /// copy (source cleanup) has counted every version; the replay must not
+    /// count them again.
+    counted_versions: HashSet<(Option<uuid::Uuid>, bool)>,
 }
 
 /// Terminal result of a decommission entry pass.
@@ -5510,9 +5641,16 @@ enum DecommissionEntryOutcome {
 /// so the entry is deferred to the end of the round instead of failing the
 /// bucket. Benign contention means the mutation is no longer needed (the object
 /// or version disappeared, or a competing mutation already superseded it): the
-/// entry is done and must not be counted as a failure or escalated. Every other
-/// failure stays terminal.
+/// entry is done and must not be counted as a failure or escalated. A quorum
+/// failure of the source cleanup is deferred too: the copied source is still
+/// in place and the next attempt cleans it up again. So is a version copy that
+/// lost drive quorum through its in-place retries: the source still holds the
+/// version and the next attempt copies it again. Every other failure stays
+/// terminal.
 fn resolve_decommission_entry_failure(err: Error) -> Result<DecommissionEntryOutcome> {
+    if is_decommission_source_cleanup_retryable_error(&err) || is_decommission_copy_quorum_deferral(&err) {
+        return Ok(DecommissionEntryOutcome::Deferred(err));
+    }
     match classify_decommission_capacity_failure(&err) {
         DecommissionCapacityFailure::TargetGateBusy { .. }
         | DecommissionCapacityFailure::IntentConflict
@@ -5571,7 +5709,7 @@ impl Drop for DecommissionTestFaultGuard {
 }
 
 #[cfg(test)]
-fn decommission_test_wrap_result<T>(
+pub(crate) fn decommission_test_wrap_result<T>(
     stage: &'static str,
     bucket: &str,
     object: &str,
@@ -11196,6 +11334,14 @@ struct DecommissionProgressCheckpoint {
 }
 
 impl PoolDecommissionInfo {
+    /// Whether the durable pause was caused by a source cleanup that kept
+    /// failing rather than by target capacity.
+    pub fn is_source_cleanup_blocked(&self) -> bool {
+        self.capacity_blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with(DECOMMISSION_SOURCE_CLEANUP_BLOCKED))
+    }
+
     pub fn has_decommission_state(&self) -> bool {
         self.complete
             || self.failed
@@ -11419,7 +11565,7 @@ type DecommissionCapacityInfoOverrides =
 #[cfg(any(test, feature = "test-util"))]
 static DECOMMISSION_CAPACITY_INFO_OVERRIDES: std::sync::OnceLock<DecommissionCapacityInfoOverrides> = std::sync::OnceLock::new();
 
-/// Queues capacity snapshots consumed in order by `get_decommission_all_pool_capacity_infos`;
+/// Queues capacity snapshots consumed in order by decommission capacity sampling;
 /// the final snapshot is retained and replayed for every subsequent sample, so tests never
 /// fall back to the host's real disk statistics once an override is installed.
 #[cfg(any(test, feature = "test-util"))]
@@ -12192,10 +12338,7 @@ impl Drop for LifecycleDataMovementMutationBarrier {
 }
 
 #[cfg(test)]
-async fn pause_lifecycle_data_movement_mutation(bucket: &str, object: &str, has_run_fence_signal: bool) {
-    if !has_run_fence_signal {
-        return;
-    }
+async fn pause_lifecycle_data_movement_mutation(bucket: &str, object: &str) {
     let barrier = LIFECYCLE_DATA_MOVEMENT_MUTATION_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
@@ -12272,7 +12415,7 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
         }
         action if lifecycle_action_removes_data_movement_version(action) => {
             #[cfg(test)]
-            pause_lifecycle_data_movement_mutation(bucket, &version.name, lock_lost_signal.is_some()).await;
+            pause_lifecycle_data_movement_mutation(bucket, &version.name).await;
             if lifecycle_delete_all_versions_blocked_by_replication(store.clone(), bucket, &object_info.name, action).await? {
                 return Ok(false);
             }
@@ -12280,6 +12423,43 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
                 || match lock_lost_signal {
                     Some(signal) => {
                         apply_expiry_rule_for_data_movement(store, &event, event_source, &object_info, Some(signal)).await
+                    }
+                    // The source cleanup removes an expired version whether or
+                    // not its expiry ran. For a transitioned version, only an
+                    // applied expiry leaves the tier free version on the source
+                    // before that cleanup, so the entry moves it to a target
+                    // instead of leaving it behind for the post-check.
+                    None if !object_info.transitioned_object.status.is_empty() => {
+                        // A delete-all is a prefix delete that takes the bucket
+                        // lifecycle write lock, which the lifecycle read lock
+                        // held here and by the entry would block until timeout.
+                        let delete_all = action.delete_all();
+                        #[cfg(test)]
+                        let injected =
+                            decommission_test_wrap_result("lifecycle_expiry_apply", bucket, &version.name, 1, Ok(())).is_err();
+                        #[cfg(not(test))]
+                        let injected = false;
+                        if delete_all
+                            || injected
+                            || !apply_expiry_rule_for_data_movement(store, &event, event_source, &object_info, None).await
+                        {
+                            // The version is still live, so it moves like any
+                            // other version and lifecycle expires it on the
+                            // target.
+                            warn!(
+                                event = EVENT_DECOMMISSION_ENTRY,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_POOLS,
+                                state = "lifecycle_expiry_deferred",
+                                bucket = %bucket,
+                                object = %version.name,
+                                action = ?action,
+                                reason = if delete_all { "delete_all_needs_bucket_write_lock" } else { "not_applied" },
+                                "Data movement deferred a transitioned version's lifecycle expiry; moving the version"
+                            );
+                            return Ok(false);
+                        }
+                        true
                     }
                     None => apply_expiry_rule_in(store, &event, event_source, &object_info).await,
                 };
@@ -12651,6 +12831,19 @@ impl ECStore {
         let (pool_meta_guard, snapshot) = self
             .acquire_pool_meta_read_guard(&save_guard, "target capacity admission failed")
             .await?;
+        // A scanner publication must cover the complete durable membership.
+        // A smaller startup view could otherwise overwrite an expanded commit
+        // proof with its older stable rollback, even though every target is writable.
+        if matches!(admission, DecommissionCapacityAdmission::ScannerBacklog)
+            && !snapshot
+                .pools
+                .iter()
+                .enumerate()
+                .filter_map(|(index, _)| snapshot.scanner_pause_backlog_pool_writable(index).then_some(index))
+                .eq(target_pool_indices.iter().copied())
+        {
+            return Err(Error::SlowDown);
+        }
         for target_pool_index in target_pool_indices.iter().copied() {
             ensure_external_decommission_target_admission(&snapshot, target_pool_index, admission)?;
         }
@@ -13560,16 +13753,17 @@ impl ECStore {
                 .lock_lost_signal()
         };
 
-        let capacity_infos = if pending_added > 0 {
-            self.get_decommission_all_pool_capacity_infos().await?
+        // Intent persistence changes disk usage. Refresh the target baseline,
+        // while admission and finalization retain their global reservation checks.
+        let before_free = if pending_added > 0 {
+            self.get_decommission_prewrite_free_capacity(target_pool_index).await?
         } else {
             capacity_infos
+                .iter()
+                .find(|capacity| capacity.pool_index == target_pool_index)
+                .map(|capacity| capacity.physical_free)
+                .ok_or_else(|| decommission_capacity_blocked_error("target capacity snapshot is missing before mutation"))?
         };
-        let before_free = capacity_infos
-            .iter()
-            .find(|capacity| capacity.pool_index == target_pool_index)
-            .map(|capacity| capacity.physical_free)
-            .ok_or_else(|| decommission_capacity_blocked_error("target capacity snapshot is missing before mutation"))?;
 
         let result = operation.take().expect("capacity-admitted operation should run once")(capacity_lease).await;
         let clear_pending_on_temporary_release = result.as_ref().ok().is_some_and(&clear_pending_on_temporary_release);
@@ -14635,6 +14829,21 @@ impl ECStore {
         }
     }
 
+    async fn get_decommission_prewrite_free_capacity(&self, target_pool_index: usize) -> Result<usize> {
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(capacity_infos) = take_decommission_capacity_info_override_for_test(self.id) {
+            return capacity_infos
+                .iter()
+                .find(|capacity| capacity.pool_index == target_pool_index)
+                .map(|capacity| capacity.physical_free)
+                .ok_or_else(|| decommission_capacity_blocked_error("target capacity snapshot is missing before mutation"));
+        }
+
+        self.get_decommission_pool_capacity_info(target_pool_index, false)
+            .await
+            .map(|capacity| capacity.physical_free)
+    }
+
     async fn get_decommission_all_pool_capacity_infos(&self) -> Result<Vec<DecommissionPoolCapacityInfo>> {
         #[cfg(any(test, feature = "test-util"))]
         if let Some(capacity_infos) = take_decommission_capacity_info_override_for_test(self.id) {
@@ -15531,7 +15740,7 @@ impl ECStore {
         let (pool_meta_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "decommission capacity pause failed")
             .await?;
-        snapshot.mark_decommission_capacity_blocked(idx, err.to_string(), OffsetDateTime::now_utc())?;
+        snapshot.mark_decommission_capacity_blocked(idx, decommission_pause_reason(err), OffsetDateTime::now_utc())?;
         let outcome = snapshot
             .save_no_lock_armed(
                 self.pools.clone(),
@@ -15824,6 +16033,7 @@ impl ECStore {
             }
             let object_name = entry.name.clone();
             let mut attempts = 0;
+            let mut counted_versions = HashSet::new();
 
             if entry_error.lock().await.is_some() {
                 drop(queue_permit);
@@ -15899,6 +16109,7 @@ impl ECStore {
                     expected_bucket_incarnation_id,
                     Arc::clone(&source_changed_exhaustions),
                     &mut attempts,
+                    &mut counted_versions,
                 )
                 .await;
             drop(entry_budget_permit);
@@ -15910,12 +16121,14 @@ impl ECStore {
                     // listing drain waits for the full budget to return, and the
                     // listing has already finished for this round.
                     drop(queue_permit);
-                    // Only the name and attempt count are retained. A contention streak
-                    // would otherwise pin one metadata buffer per object, and the
-                    // replay reloads the versions it needs from disk anyway.
+                    // Only the name, attempt count and counted version ids are
+                    // retained. A contention streak would otherwise pin one
+                    // metadata buffer per object, and the replay reloads the
+                    // versions it needs from disk anyway.
                     deferred.lock().await.push(DeferredDecommissionEntry {
                         name: object_name,
                         attempts,
+                        counted_versions,
                     });
                     info!(
                         event = EVENT_DECOMMISSION_ENTRY,
@@ -16039,6 +16252,7 @@ impl ECStore {
                 expected_bucket_incarnation_id,
                 source_changed_exhaustions,
                 &mut deferred_entry.attempts,
+                &mut deferred_entry.counted_versions,
             )
             .await;
         drop(entry_budget_permit);
@@ -16411,6 +16625,16 @@ impl ECStore {
         source_pool_index: usize,
         source_bytes: usize,
     ) -> Result<()> {
+        self.prepare_scanner_pause_backlog_retirement_targets_for_test(&[source_pool_index], source_bytes)
+            .await
+    }
+
+    #[cfg(feature = "test-util")]
+    pub async fn prepare_scanner_pause_backlog_retirement_targets_for_test(
+        &self,
+        source_pool_indices: &[usize],
+        source_bytes: usize,
+    ) -> Result<()> {
         let source_bytes = source_bytes.max(1);
         let total = source_bytes.saturating_mul(8).saturating_add(64 * 1024);
         let capacities = (0..self.pools.len())
@@ -16418,14 +16642,18 @@ impl ECStore {
                 DecommissionPoolCapacityInfo::for_test(
                     pool_index,
                     DecommissionErasureLayout { data: 1, parity: 0 },
-                    if pool_index == source_pool_index { 0 } else { total },
+                    if source_pool_indices.contains(&pool_index) { 0 } else { total },
                     total,
-                    if pool_index == source_pool_index { source_bytes } else { 0 },
+                    if source_pool_indices.contains(&pool_index) {
+                        source_bytes
+                    } else {
+                        0
+                    },
                 )
             })
             .collect();
         set_decommission_capacity_info_overrides_for_test(self.id, vec![capacities]);
-        self.save_current_pool_meta_for_decommission_start(&[source_pool_index], Vec::new())
+        self.save_current_pool_meta_for_decommission_start(source_pool_indices, Vec::new())
             .await
             .map(|_| ())
     }
@@ -16527,8 +16755,8 @@ impl ECStore {
         capacity_owner: Option<DecommissionCapacityOwner>,
     ) -> Result<DecommissionEntryAttemptOutcome> {
         use data_movement::scanner_backlog::{
-            SCANNER_PAUSE_BACKLOG_PATH, persist_native_scanner_pause_backlog_replica, plan_scanner_pause_backlog_retirement,
-            read_scanner_pause_backlog_retirement_replicas,
+            SCANNER_PAUSE_BACKLOG_PATH, ScannerPauseBacklogRetirementPhase, persist_native_scanner_pause_backlog_replica,
+            plan_scanner_pause_backlog_retirement, read_scanner_pause_backlog_retirement_replicas,
         };
 
         if expected.versions.is_empty() && expected.free_versions.is_empty() {
@@ -16583,19 +16811,32 @@ impl ECStore {
             .pools
             .iter()
             .enumerate()
-            .filter(|(pool_index, _)| *pool_index == idx || snapshot.scanner_pause_backlog_pool_writable(*pool_index))
-            .flat_map(|(_, pool)| pool.disk_set.iter().cloned())
+            // Queued pools can still carry members of the last native commit.
+            // Read their proof without admitting them as handoff destinations.
+            .filter(|(pool_index, _)| {
+                *pool_index == idx
+                    || snapshot
+                        .pools
+                        .get(*pool_index)
+                        .is_some_and(|pool| !pool.decommission.as_ref().is_some_and(|info| info.complete))
+            })
+            .flat_map(|(pool_index, pool)| {
+                let writable = snapshot.scanner_pause_backlog_pool_writable(pool_index);
+                pool.disk_set.iter().map(move |set| (Arc::clone(set), writable))
+            })
             .collect();
         let mut replicas = read_scanner_pause_backlog_retirement_replicas(idx, set.set_index, sets.clone()).await?;
-        if let Some(plan) = plan_scanner_pause_backlog_retirement(idx, &replicas)? {
+        if let Some(plan) =
+            plan_scanner_pause_backlog_retirement(idx, &replicas, ScannerPauseBacklogRetirementPhase::InitialRead)?
+        {
             let expected_stable_record = plan.stable_record.clone();
             let mut phases = Vec::with_capacity(3);
             if let Some(record) = plan.seed_record {
-                phases.push(("seed", record));
+                phases.push(("seed", ScannerPauseBacklogRetirementPhase::SeedReadback, record));
             }
-            phases.push(("commit", plan.commit_record));
-            phases.push(("stabilize", plan.stable_record));
-            for (phase, record) in phases {
+            phases.push(("commit", ScannerPauseBacklogRetirementPhase::CommitReadback, plan.commit_record));
+            phases.push(("stabilize", ScannerPauseBacklogRetirementPhase::StabilizeReadback, plan.stable_record));
+            for (phase, readback_phase, record) in phases {
                 if object_fence.is_lock_lost()
                     || pool_meta_guard.is_lock_lost()
                     || !reservation.admits_owner(owner, OffsetDateTime::now_utc())
@@ -16604,28 +16845,37 @@ impl ECStore {
                         "scanner pause backlog retirement fence expired during native repair",
                     ));
                 }
-                for read in replicas.iter().filter(|read| read.replica.pool_index != idx) {
+                for read in replicas
+                    .iter()
+                    .filter(|read| read.replica.pool_index != idx && read.replica.writable)
+                {
                     ensure_external_decommission_target_admission(
                         &snapshot,
                         read.replica.pool_index,
                         DecommissionCapacityAdmission::ScannerBacklog,
                     )?;
                 }
-                let results = join_all(replicas.iter().filter(|read| read.replica.pool_index != idx).map(|read| {
-                    let target = Arc::clone(&self.pools[read.replica.pool_index].disk_set[read.replica.set_index]);
-                    let record = record.clone();
-                    let object_fence = &object_fence;
-                    let pool_meta_guard = &pool_meta_guard;
-                    async move {
-                        let mut opts = ObjectOptions {
-                            no_lock: self.pools[0].disk_set[0].shares_namespace_lock_domain(&target).await,
-                            ..Default::default()
-                        };
-                        object_fence.add_namespace_lock_fence(&mut opts);
-                        opts.add_namespace_lock_guard(pool_meta_guard);
-                        persist_native_scanner_pause_backlog_replica(target, record, read.preconditions(), opts, phase).await
-                    }
-                }))
+                let results = join_all(
+                    replicas
+                        .iter()
+                        .filter(|read| read.replica.pool_index != idx && read.replica.writable)
+                        .map(|read| {
+                            let target = Arc::clone(&self.pools[read.replica.pool_index].disk_set[read.replica.set_index]);
+                            let record = record.clone();
+                            let object_fence = &object_fence;
+                            let pool_meta_guard = &pool_meta_guard;
+                            async move {
+                                let mut opts = ObjectOptions {
+                                    no_lock: self.pools[0].disk_set[0].shares_namespace_lock_domain(&target).await,
+                                    ..Default::default()
+                                };
+                                object_fence.add_namespace_lock_fence(&mut opts);
+                                opts.add_namespace_lock_guard(pool_meta_guard);
+                                persist_native_scanner_pause_backlog_replica(target, record, read.preconditions(), opts, phase)
+                                    .await
+                            }
+                        }),
+                )
                 .await;
                 // Every dispatched native CAS has finished before an error can
                 // release the owned task's object and durable membership fences.
@@ -16635,20 +16885,20 @@ impl ECStore {
                 replicas = read_scanner_pause_backlog_retirement_replicas(idx, set.set_index, sets.clone()).await?;
                 if replicas
                     .iter()
-                    .filter(|read| read.replica.pool_index != idx)
+                    .filter(|read| read.replica.pool_index != idx && read.replica.writable)
                     .any(|read| read.replica.data.as_deref() != Some(record.as_slice()))
                 {
                     return Err(Error::other(
                         "scanner pause backlog native repair did not persist every surviving replica",
                     ));
                 }
-                if let Some(next) = plan_scanner_pause_backlog_retirement(idx, &replicas)?
+                if let Some(next) = plan_scanner_pause_backlog_retirement(idx, &replicas, readback_phase)?
                     && next.stable_record != expected_stable_record
                 {
                     return Err(Error::other("scanner pause backlog native authority changed during repair"));
                 }
             }
-            if plan_scanner_pause_backlog_retirement(idx, &replicas)?.is_some() {
+            if plan_scanner_pause_backlog_retirement(idx, &replicas, ScannerPauseBacklogRetirementPhase::FinalCheck)?.is_some() {
                 return Err(Error::other("scanner pause backlog native repair is not fully committed and stable"));
             }
         }
@@ -16712,13 +16962,13 @@ impl ECStore {
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         source_changed_exhaustions: Arc<AtomicUsize>,
         attempts: &mut usize,
+        counted_versions: &mut HashSet<(Option<uuid::Uuid>, bool)>,
     ) -> Result<DecommissionEntryOutcome> {
-        let mut counted_versions = HashSet::new();
-
         for entry_attempt in 1..=DECOMMISSION_ENTRY_MAX_ATTEMPTS {
             let attempt_result = {
                 let mut conflict_attempt = 0;
                 let mut scanner_backlog_handoff_attempt = 0;
+                let mut source_cleanup_quorum_attempt = 0;
                 loop {
                     let result = self
                         .decommission_entry_attempt(
@@ -16735,7 +16985,7 @@ impl ECStore {
                             entry_attempt,
                             scanner_backlog_handoff_attempt,
                             source_changed_exhaustions.as_ref(),
-                            &mut counted_versions,
+                            counted_versions,
                             attempts,
                         )
                         .await;
@@ -16778,6 +17028,35 @@ impl ECStore {
                             max_attempts = DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS,
                             retry_delay_ms = retry_delay.as_millis(),
                             "Decommission scanner pause backlog handoff conflict; retrying entry"
+                        );
+                        if wait_decommission_retry_backoff(&rx, retry_delay).await {
+                            decommission_cancel_signal_result(rx.is_cancelled())?;
+                        }
+                        continue;
+                    }
+                    // A quorum blip while deleting the copied source is retried
+                    // in place first; only a failure that outlasts this budget
+                    // is deferred to the end of the round.
+                    if source_cleanup_quorum_attempt + 1 < DECOMMISSION_SOURCE_CLEANUP_QUORUM_MAX_ATTEMPTS
+                        && result
+                            .as_ref()
+                            .err()
+                            .is_some_and(is_decommission_source_cleanup_retryable_error)
+                    {
+                        source_cleanup_quorum_attempt += 1;
+                        let retry_delay = decommission_source_cleanup_quorum_retry_delay(source_cleanup_quorum_attempt);
+                        warn!(
+                            event = EVENT_DECOMMISSION_ENTRY,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_POOLS,
+                            state = "source_cleanup_quorum_retry",
+                            pool_index = idx,
+                            bucket = %bucket,
+                            object = %entry.name,
+                            attempt = source_cleanup_quorum_attempt,
+                            max_attempts = DECOMMISSION_SOURCE_CLEANUP_QUORUM_MAX_ATTEMPTS,
+                            retry_delay_ms = retry_delay.as_millis(),
+                            "Decommission source cleanup lost quorum; retrying entry"
                         );
                         if wait_decommission_retry_backoff(&rx, retry_delay).await {
                             decommission_cancel_signal_result(rx.is_cancelled())?;
@@ -16913,6 +17192,8 @@ impl ECStore {
         };
 
         let mut fivs = load_decommission_entry_exact_versions(&set, &entry, &bucket, "file_info_versions").await?;
+        #[cfg(test)]
+        decommission_test_wrap_result("exact_versions_read", &bucket, &entry.name, entry_attempt, Ok(()))?;
 
         if data_movement::scanner_backlog::is_scanner_pause_backlog(&bucket, &entry.name) {
             let outcome = self
@@ -17207,6 +17488,9 @@ impl ECStore {
             let mut failure = false;
             let mut error = None;
             let mut copy = None;
+            // A source read that keeps losing quorum stays a per-object
+            // failure: only the target write is retried later.
+            let mut source_read_failed = false;
             if version.deleted {
                 let mut version_attempt = 1;
                 let mut target_busy_attempt: usize = 0;
@@ -17340,6 +17624,15 @@ impl ECStore {
                             version_attempt += 1;
                         }
                     }
+                }
+
+                if failure && let Some(err) = error.take_if(|err| is_decommission_copy_quorum_error(err)) {
+                    return Err(decommission_copy_quorum_deferral(
+                        "delete_marker_copy",
+                        bucket.as_str(),
+                        version.name.as_str(),
+                        err,
+                    ));
                 }
 
                 if ignore {
@@ -17477,6 +17770,7 @@ impl ECStore {
                         }
                         Err(err) => {
                             failure = true;
+                            source_read_failed = false;
                             if version_attempt == DECOMMISSION_VERSION_COPY_ATTEMPTS {
                                 error!(
                                     event = EVENT_DECOMMISSION_ENTRY,
@@ -17546,6 +17840,7 @@ impl ECStore {
                         }
 
                         failure = true;
+                        source_read_failed = true;
                         if version_attempt == DECOMMISSION_VERSION_COPY_ATTEMPTS {
                             error!(
                                 event = EVENT_DECOMMISSION_ENTRY,
@@ -17603,6 +17898,16 @@ impl ECStore {
 
                 let migrate_result = self
                     .run_guarded_decommission_side_effect(&rx, &operation_gate, || async {
+                        // Injected before the copy, so a test fault leaves the
+                        // target exactly as a write that never committed would.
+                        #[cfg(test)]
+                        decommission_test_wrap_result(
+                            "before_target_commit",
+                            bucket_name.as_str(),
+                            object_name.as_str(),
+                            version_attempt,
+                            Ok(()),
+                        )?;
                         self.clone()
                             .decommission_object(idx, bucket, rd, expected_bucket_incarnation_id, capacity_owner)
                             .await
@@ -17662,6 +17967,7 @@ impl ECStore {
                     }
 
                     failure = true;
+                    source_read_failed = false;
                     if version_attempt == DECOMMISSION_VERSION_COPY_ATTEMPTS {
                         error!(
                             event = EVENT_DECOMMISSION_ENTRY,
@@ -17719,6 +18025,18 @@ impl ECStore {
 
                 failure = false;
                 break;
+            }
+
+            if failure
+                && !source_read_failed
+                && let Some(err) = error.take_if(|err| is_decommission_copy_quorum_error(err))
+            {
+                return Err(decommission_copy_quorum_deferral(
+                    DECOMMISSION_STAGE_MIGRATE_OBJECT,
+                    bucket.as_str(),
+                    version.name.as_str(),
+                    err,
+                ));
             }
 
             if ignore {
@@ -17821,6 +18139,11 @@ impl ECStore {
             let cleanup_expected = data_movement::source_cleanup_expected_without_vanished(&fivs, &cleanup_preflight_vanished);
             let cleanup_result = self
                 .run_guarded_decommission_side_effect(&rx, &operation_gate, || async {
+                    // Injected before the delete, so a test fault leaves the
+                    // source exactly as a failed cleanup would.
+                    #[cfg(test)]
+                    decommission_test_wrap_result("source_cleanup", bucket.as_str(), entry.name.as_str(), entry_attempt, Ok(()))
+                        .map_err(data_movement::SourceCleanupError::Storage)?;
                     data_movement::cleanup_source_entry_if_unchanged(
                         set.clone(),
                         bucket.as_str(),
@@ -18072,6 +18395,7 @@ impl ECStore {
                 expected_bucket_incarnation_id,
                 source_changed_exhaustions,
                 &mut 0,
+                &mut HashSet::new(),
             )
             .await,
         )
@@ -18118,6 +18442,7 @@ impl ECStore {
                 expected_bucket_incarnation_id,
                 Arc::new(AtomicUsize::new(0)),
                 &mut 0,
+                &mut HashSet::new(),
             )
             .await,
         )
@@ -18977,6 +19302,15 @@ impl ECStore {
         // The local durable transition is now fenced. Release the writer
         // before any peer RPC; remote reload must not block scanner admission.
         drop(_movement_guard);
+        #[cfg(feature = "e2e-test-hooks")]
+        data_movement::e2e_barrier::wait(
+            "decommission_start",
+            RUSTFS_META_BUCKET,
+            POOL_META_NAME,
+            data_movement::e2e_barrier::STAGE_AFTER_RESPONSIBILITY_PERSISTED,
+        )
+        .await
+        .map_err(Error::from)?;
 
         #[cfg(test)]
         pause_decommission_start_for_test(self.id, DecommissionStartPausePoint::PeerReload).await;
@@ -24580,6 +24914,104 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_capacity_mutation_limits_prewrite_sampling_to_target() {
+        let (_temp_dirs, store, _other_store) =
+            crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
+        start_leftover_intent_test_decommission(&store, Vec::new(), DECOMMISSION_CAPACITY_TARGET_FENCE_MODEL_VERSION).await;
+        DECOMMISSION_CAPACITY_INFO_OVERRIDES
+            .get()
+            .expect("activation should install capacity snapshots")
+            .lock()
+            .expect("capacity overrides should not be poisoned")
+            .remove(&store.id)
+            .expect("use real disk probes for the mutation");
+        let owner = leftover_intent_test_owner(&store, uuid::Uuid::new_v4()).await;
+        let disk_info_calls = async || {
+            let mut pools = Vec::new();
+            for pool in &store.pools {
+                let mut counts = Vec::new();
+                for set in &pool.disk_set {
+                    for disk in set.disk_inventory().await.into_iter().flatten() {
+                        counts.push(
+                            disk.metrics_snapshot()
+                                .expect("fixture disks must expose local metrics")
+                                .api_calls
+                                .get("disk_info")
+                                .copied()
+                                .unwrap_or_default(),
+                        );
+                    }
+                }
+                pools.push(counts);
+            }
+            pools
+        };
+        let before = disk_info_calls().await;
+        store
+            .run_decommission_capacity_admitted_mutation(1, Some(owner), Some(16), || async { Ok(()) })
+            .await
+            .expect("the capacity-accounted mutation should commit");
+        let after = disk_info_calls().await;
+        for (pool_index, (before, after)) in before.iter().zip(&after).enumerate() {
+            assert!(!before.is_empty(), "pool {pool_index} must have real disks");
+            assert_eq!(before.len(), after.len());
+            let expected = if pool_index == 1 { 3 } else { 2 };
+            for (disk_index, (before, after)) in before.iter().zip(after).enumerate() {
+                assert_eq!(
+                    after - before,
+                    expected,
+                    "pool {pool_index} disk {disk_index}: admission/finalization check every pool; prewrite checks only the target"
+                );
+            }
+        }
+        let target = leftover_intent_test_target(&store, 1).await;
+        assert_eq!(target.pending_mutation_id, None, "the durable intent must be settled");
+        assert_eq!(target.consumed_physical_bytes, 16);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_prewrite_sampling_preserves_override_order_and_missing_target_error() {
+        let (_temp_dirs, store, _other_store) =
+            crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![
+                vec![DecommissionPoolCapacityInfo::for_test(1, layout, 70, 100, 30)],
+                vec![DecommissionPoolCapacityInfo::for_test(1, layout, 40, 100, 60)],
+                vec![DecommissionPoolCapacityInfo::for_test(0, layout, 90, 100, 10)],
+            ],
+        );
+        assert_eq!(
+            store
+                .get_decommission_prewrite_free_capacity(1)
+                .await
+                .expect("first injected sample"),
+            70
+        );
+        assert_eq!(
+            store
+                .get_decommission_prewrite_free_capacity(1)
+                .await
+                .expect("second injected sample"),
+            40
+        );
+        for _ in 0..2 {
+            let error = store
+                .get_decommission_prewrite_free_capacity(1)
+                .await
+                .expect_err("missing injected target must not fall back to host capacity");
+            assert!(matches!(
+                error,
+                Error::DecommissionCapacityBlocked { message }
+                    if message == "target capacity snapshot is missing before mutation"
+            ));
+        }
+    }
+
     async fn start_leftover_intent_test_decommission(
         store: &Arc<ECStore>,
         decom_buckets: Vec<DecomBucketInfo>,
@@ -26366,6 +26798,7 @@ mod tests {
             DeferredDecommissionEntry {
                 name: object.into(),
                 attempts: 2,
+                counted_versions: HashSet::new(),
             },
             bucket.into(),
             source_set.clone(),
@@ -26423,6 +26856,7 @@ mod tests {
             Some(incarnation),
             Arc::new(AtomicUsize::new(0)),
             &mut attempts,
+            &mut HashSet::new(),
         ))
         .await
         .expect("retry migration");
@@ -26554,6 +26988,7 @@ mod tests {
                 Some(self.incarnation),
                 Arc::clone(&exhaustions),
                 &mut 0,
+                &mut HashSet::new(),
             ))
             .await
             .expect("decommission entry");
@@ -26800,6 +27235,7 @@ mod tests {
         let mut deferred = DeferredDecommissionEntry {
             name: "object".into(),
             attempts,
+            counted_versions: HashSet::new(),
         };
         record_decommission_object_attempt(&mut deferred.attempts);
         assert_eq!(deferred.attempts, 3);
@@ -27011,12 +27447,66 @@ mod tests {
             Error::VersionNotFound("bucket-a".to_string(), "object-a".to_string(), "version-a".to_string()),
         ] {
             assert!(is_decommission_copy_cleanup_safe_error(&missing_target));
+            let wrapped = wrap(missing_target);
             assert!(
-                !is_decommission_copy_cleanup_safe_error(&wrap(missing_target)),
+                !is_decommission_copy_cleanup_safe_error(&wrapped),
                 "a missing target part must never authorize source cleanup"
             );
+            assert!(!is_decommission_copy_quorum_error(&wrapped));
         }
         assert!(is_decommission_target_capacity_error(&wrap(Error::DiskFull)));
+    }
+
+    #[test]
+    fn decommission_copy_quorum_classifier_distinguishes_source_and_target_errors() {
+        for quorum in [
+            Error::ErasureReadQuorum,
+            Error::ErasureWriteQuorum,
+            Error::InsufficientReadQuorum("bucket-a".to_owned(), "object-a".to_owned()),
+            Error::InsufficientWriteQuorum("bucket-a".to_owned(), "object-a".to_owned()),
+        ] {
+            assert!(is_decommission_copy_quorum_error(&quorum));
+            let target = data_movement::data_movement_stage_error_for_test(
+                "decommission_object",
+                "put_object",
+                "bucket-a",
+                "object-a",
+                quorum.clone(),
+            );
+            assert!(is_decommission_copy_quorum_error(&target));
+
+            let source = data_movement::data_movement_source_read_error("bucket-a", "object-a", quorum.clone());
+            assert!(!is_decommission_copy_quorum_error(&source));
+            assert!(!is_decommission_copy_cleanup_safe_error(&source));
+
+            for stage in ["put_object_part", "read_part", "prepare_part"] {
+                let part = data_movement::data_movement_part_stage_error_for_test(
+                    "decommission_object",
+                    stage,
+                    "bucket-a",
+                    "object-a",
+                    1,
+                    quorum.clone(),
+                );
+                assert_eq!(is_decommission_copy_quorum_error(&part), stage == "put_object_part", "{part}");
+                assert!(!is_decommission_copy_cleanup_safe_error(&part));
+                if stage != "put_object_part" {
+                    assert!(data_movement::data_movement_stage_source(&part).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decommission_copy_quorum_deferral_keeps_the_original_error_chain() {
+        let deferred = decommission_copy_quorum_deferral("put_object", "bucket-a", "object-a", Error::ErasureWriteQuorum);
+        assert!(is_decommission_copy_quorum_deferral(&deferred));
+        let failure = data_movement::data_movement_stage_source_as::<DecommissionCopyQuorumFailure>(&deferred)
+            .expect("the deferred error must keep its copy-quorum origin");
+        assert!(matches!(
+            std::error::Error::source(failure).and_then(|source| source.downcast_ref::<Error>()),
+            Some(Error::ErasureWriteQuorum)
+        ));
     }
 
     #[test]
@@ -27087,40 +27577,45 @@ mod tests {
 
     #[test]
     fn decommission_scanner_backlog_handoff_retry_is_typed_and_bounded() {
-        use data_movement::scanner_backlog::ScannerPauseBacklogRetirementError;
+        use data_movement::scanner_backlog::{ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPhase};
 
-        let handoff = data_movement::data_movement_context_error(
-            "scanner pause backlog retirement planner failed: competing proofs".to_string(),
-            ScannerPauseBacklogRetirementError::HandoffConflict {
-                reason: "competing maximum-membership commit proofs".to_string(),
-            },
-        );
-        assert!(is_decommission_scanner_backlog_handoff_conflict(&handoff));
-        assert_eq!(
-            decommission_scanner_backlog_retry_kind(&handoff, DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS - 1),
-            Some(DecommissionScannerBacklogRetryKind::HandoffConflict)
-        );
-        assert_eq!(
-            decommission_scanner_backlog_retry_kind(&handoff, DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS),
-            None,
-            "a divergent handoff must not retry forever"
-        );
-
-        for non_retryable in [
-            ScannerPauseBacklogRetirementError::AuthorityConflict {
-                reason: "larger source authority".to_string(),
-            },
-            ScannerPauseBacklogRetirementError::InvalidRecord {
-                reason: "unread member".to_string(),
-            },
+        for phase in [
+            ScannerPauseBacklogRetirementPhase::InitialRead,
+            ScannerPauseBacklogRetirementPhase::SeedReadback,
+            ScannerPauseBacklogRetirementPhase::CommitReadback,
+            ScannerPauseBacklogRetirementPhase::StabilizeReadback,
+            ScannerPauseBacklogRetirementPhase::FinalCheck,
         ] {
-            let err = data_movement::data_movement_context_error("planner failed".to_string(), non_retryable);
-            assert!(!is_decommission_scanner_backlog_handoff_conflict(&err));
+            let handoff = phase.planner_error(ScannerPauseBacklogRetirementError::HandoffConflict {
+                reason: "competing maximum-membership commit proofs".to_string(),
+            });
+            assert!(is_decommission_scanner_backlog_handoff_conflict(&handoff));
             assert_eq!(
-                decommission_scanner_backlog_retry_kind(&err, 0),
-                None,
-                "only a handoff conflict may be retried"
+                decommission_scanner_backlog_retry_kind(&handoff, DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS - 1),
+                Some(DecommissionScannerBacklogRetryKind::HandoffConflict)
             );
+            assert_eq!(
+                decommission_scanner_backlog_retry_kind(&handoff, DECOMMISSION_SCANNER_BACKLOG_HANDOFF_MAX_ATTEMPTS),
+                None,
+                "a divergent handoff must not retry forever"
+            );
+
+            for non_retryable in [
+                ScannerPauseBacklogRetirementError::AuthorityConflict {
+                    reason: "larger source authority".to_string(),
+                },
+                ScannerPauseBacklogRetirementError::InvalidRecord {
+                    reason: "unread member".to_string(),
+                },
+            ] {
+                let err = phase.planner_error(non_retryable);
+                assert!(!is_decommission_scanner_backlog_handoff_conflict(&err));
+                assert_eq!(
+                    decommission_scanner_backlog_retry_kind(&err, 0),
+                    None,
+                    "only a handoff conflict may be retried"
+                );
+            }
         }
     }
 
@@ -33196,12 +33691,24 @@ mod pools_tests {
 
     #[test]
     fn test_resolve_decommission_preflight_heal_result_wraps_error_context() {
-        let err = resolve_decommission_preflight_heal_result::<()>("bucket-a", Err(Error::SlowDown))
-            .expect_err("heal failure should carry preflight context");
-        assert!(
-            err.to_string()
-                .contains("decommission preflight heal failed for bucket bucket-a")
-        );
+        for failure in [Error::FaultyDisk, Error::ErasureWriteQuorum] {
+            let err = resolve_decommission_preflight_heal_result::<()>("bucket-a", Err(failure))
+                .expect_err("heal failure should carry preflight context");
+            assert!(
+                err.to_string()
+                    .contains("decommission preflight heal failed for bucket bucket-a")
+            );
+            assert_ne!(err, Error::SlowDown, "non-busy failures must not become a retryable start");
+        }
+    }
+
+    #[test]
+    fn test_resolve_decommission_preflight_heal_result_keeps_busy_gate_retryable() {
+        for busy in [Error::SlowDown, Error::TooManyOpenFiles] {
+            let err = resolve_decommission_preflight_heal_result::<()>("bucket-a", Err(busy))
+                .expect_err("a refused heal must fail the start");
+            assert_eq!(err, Error::SlowDown);
+        }
     }
 
     #[test]
@@ -33246,6 +33753,128 @@ mod pools_tests {
         assert!(
             err.to_string()
                 .contains("decommission cleanup_delete_object failed for bucket-a/obj.txt")
+        );
+    }
+
+    #[test]
+    fn decommission_source_cleanup_quorum_retry_waits_at_least_its_floor() {
+        for _ in 0..64 {
+            let first = super::decommission_source_cleanup_quorum_retry_delay(1);
+            assert!(
+                first >= std::time::Duration::from_secs(1) && first <= std::time::Duration::from_millis(1_100),
+                "{first:?}"
+            );
+            let second = super::decommission_source_cleanup_quorum_retry_delay(2);
+            assert!(
+                second >= std::time::Duration::from_secs(2) && second <= std::time::Duration::from_millis(2_200),
+                "{second:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decommission_source_cleanup_pause_reason_sees_through_stage_wrappers() {
+        let blocked = super::ensure_decommission_deferred_drained(
+            "bucket-a",
+            0,
+            1,
+            Some("source cleanup blocked: decommission cleanup_delete_object failed for bucket-a/obj.txt: erasure write quorum"),
+        )
+        .expect_err("an undrained cleanup deferral pauses");
+        let wrapped = data_movement::data_movement_stage_error_for_test("decommission", "bucket", "bucket-a", "", blocked);
+        assert!(is_decommission_capacity_blocked_error(&wrapped));
+        let reason = super::decommission_pause_reason(&wrapped);
+        assert!(reason.starts_with(super::DECOMMISSION_SOURCE_CLEANUP_BLOCKED), "{reason}");
+        assert!(!reason.contains("free drive threshold"), "{reason}");
+    }
+
+    #[test]
+    fn decommission_source_cleanup_quorum_failure_defers_the_entry() {
+        for quorum in [
+            Error::ErasureWriteQuorum,
+            Error::ErasureReadQuorum,
+            Error::InsufficientWriteQuorum("bucket-a".to_string(), "obj.txt".to_string()),
+        ] {
+            let err = resolve_decommission_entry_cleanup_delete_result::<()>(Err(quorum), "bucket-a", "obj.txt")
+                .expect_err("cleanup quorum failure should surface");
+            assert!(
+                err.to_string()
+                    .contains("decommission cleanup_delete_object failed for bucket-a/obj.txt")
+            );
+            assert!(
+                matches!(
+                    super::resolve_decommission_entry_failure(err),
+                    Ok(super::DecommissionEntryOutcome::Deferred(_))
+                ),
+                "a retryable source cleanup failure must not fail the pool"
+            );
+        }
+
+        let lock_lost = resolve_decommission_entry_cleanup_delete_result::<()>(
+            Err(Error::NamespaceLockQuorumUnavailable {
+                mode: "delete_object_commit",
+                bucket: "bucket-a".to_string(),
+                object: "obj.txt".to_string(),
+                required: 1,
+                achieved: 0,
+            }),
+            "bucket-a",
+            "obj.txt",
+        )
+        .expect_err("cleanup fence loss should surface");
+        assert!(
+            !super::is_decommission_source_cleanup_retryable_error(&lock_lost),
+            "a lost cleanup fence must not be retried"
+        );
+        assert!(
+            super::resolve_decommission_entry_failure(lock_lost).is_err(),
+            "a lost cleanup fence stays terminal"
+        );
+
+        let terminal = resolve_decommission_entry_cleanup_delete_result::<()>(Err(Error::SlowDown), "bucket-a", "obj.txt")
+            .expect_err("cleanup failure should surface");
+        assert!(
+            super::resolve_decommission_entry_failure(terminal).is_err(),
+            "a non-quorum cleanup failure stays terminal"
+        );
+        assert!(
+            super::resolve_decommission_entry_failure(Error::ErasureWriteQuorum).is_err(),
+            "a quorum failure outside source cleanup stays terminal"
+        );
+        for stage in ["put_object", "put_object_part", "complete_multipart_upload"] {
+            let copy = data_movement::data_movement_stage_error_for_test(
+                "decommission_object",
+                stage,
+                "bucket-a",
+                "obj.txt",
+                Error::ErasureWriteQuorum,
+            );
+            assert!(
+                super::resolve_decommission_entry_failure(copy).is_err(),
+                "a quorum failure while copying or committing the target ({stage}) stays terminal"
+            );
+        }
+
+        // A deferral that persists through the round pauses the pool with the
+        // cleanup cause; the bucket is never reported complete.
+        let deferred =
+            resolve_decommission_entry_cleanup_delete_result::<()>(Err(Error::ErasureWriteQuorum), "bucket-a", "obj.txt")
+                .expect_err("cleanup quorum failure should surface");
+        let mut cause = None;
+        super::record_decommission_deferral_cause(&mut cause, &deferred);
+        let (_, cause) = cause.expect("a cleanup deferral records its cause");
+        let undrained = super::ensure_decommission_deferred_drained("bucket-a", 0, 1, Some(&cause))
+            .expect_err("an undrained cleanup deferral must not complete the bucket");
+        assert!(is_decommission_capacity_blocked_error(&undrained));
+        let reason = super::decommission_pause_reason(&undrained);
+        assert!(reason.starts_with(super::DECOMMISSION_SOURCE_CLEANUP_BLOCKED), "{reason}");
+        assert!(
+            reason.contains("decommission cleanup_delete_object failed for bucket-a/obj.txt"),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains("free drive threshold"),
+            "a cleanup pause is not a capacity problem: {reason}"
         );
     }
 

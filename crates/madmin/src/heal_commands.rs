@@ -68,6 +68,10 @@ pub struct HealResultItem {
     /// this heal. This is intentionally in-process only.
     #[serde(skip)]
     pub metadata_repair_verified: bool,
+    /// Storage-owner observation that canonical metadata has no independent
+    /// payload identity commitment. This alone does not authorize MRF pause.
+    #[serde(skip)]
+    pub legacy_identity_unverified: bool,
     #[serde(rename = "resultId")]
     pub result_index: usize,
     #[serde(rename = "type")]
@@ -170,6 +174,7 @@ mod tests {
     fn resolved_heal_version_is_not_wire_proof() {
         let item = HealResultItem {
             resolved_version_id: Some([0; 16]),
+            legacy_identity_unverified: true,
             ..Default::default()
         };
         let mut wire = serde_json::to_value(&item).expect("heal result should serialize");
@@ -181,9 +186,14 @@ mod tests {
         assert!(wire.get("metadataVerified").is_none());
         assert!(wire.get("metadata_repair_verified").is_none());
         assert!(wire.get("metadataRepairVerified").is_none());
+        assert!(wire.get("legacy_identity_unverified").is_none());
+        assert!(wire.get("legacyIdentityUnverified").is_none());
+        wire["legacy_identity_unverified"] = serde_json::json!(true);
+        wire["legacyIdentityUnverified"] = serde_json::json!(true);
         wire["resolved_version_id"] = serde_json::json!(vec![0; 16]);
         let decoded: HealResultItem = serde_json::from_value(wire).expect("legacy wire shape should remain readable");
         assert_eq!(decoded.resolved_version_id, None, "wire input cannot supply owner proof");
+        assert!(!decoded.legacy_identity_unverified, "wire input cannot supply owner classification");
     }
 
     fn drive(state: &str) -> HealDriveInfo {

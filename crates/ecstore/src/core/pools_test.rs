@@ -764,7 +764,11 @@ mod decommission_lock_order_tests {
     }
 
     /// A two-part source object: a 5 MiB part and a 1-byte part.
-    async fn put_source_multipart_object(store: &Arc<crate::store::ECStore>, bucket: &str, object: &str) {
+    async fn put_source_multipart_object(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+    ) -> crate::object_api::ObjectInfo {
         let source_upload = new_multipart_upload(store, 0, bucket, object, ObjectOptions::default())
             .await
             .expect("create the source multipart upload");
@@ -794,6 +798,7 @@ mod decommission_lock_order_tests {
             .await
             .expect("complete the source multipart object");
         assert!(source_info.is_multipart());
+        source_info
     }
 
     async fn put_source_object(store: &Arc<crate::store::ECStore>, bucket: &str, object: &str, body: Vec<u8>) {
@@ -803,8 +808,8 @@ mod decommission_lock_order_tests {
             .expect("write the source object");
     }
 
-    /// A key that sorts after `anchor` in the same source set, so that with
-    /// one entry at a time the routine migrates `anchor` first.
+    /// A key that sorts after `anchor` in the same source set. Listing order
+    /// does not guarantee execution order between the set's entry workers.
     fn source_key_after(store: &Arc<crate::store::ECStore>, anchor: &str, label: &str) -> String {
         let anchor_set = store.pools[0].get_disks_by_key(anchor).set_index;
         (0..1024)
@@ -947,6 +952,186 @@ mod decommission_lock_order_tests {
         );
     }
 
+    /// A source cleanup that keeps losing quorum through its in-place retries
+    /// is deferred, replayed at the end of the round and completed. The source
+    /// is removed, the bucket finishes, and the entry's version is counted once
+    /// even though the replay walks it again.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_defers_cleanup_quorum_failure_and_completes_on_replay() {
+        run_large_stack_async_test("decommission-cleanup-quorum-replay", || async {
+            let (_temp_dirs, store, bucket) = new_stale_target_store("cleanup-quorum-replay").await;
+            let object = "cleanup-quorum.bin";
+            // Large enough that the small `.rustfs.sys` objects the routine also
+            // moves cannot account for a second count of it.
+            let object_size = 1 << 20;
+            put_source_object(&store, &bucket, object, vec![0x5c; object_size]).await;
+
+            // Every in-place attempt of the first pass fails; the replay succeeds.
+            let failing_calls = crate::core::pools::DECOMMISSION_SOURCE_CLEANUP_QUORUM_MAX_ATTEMPTS;
+            let cleanup_calls = Arc::new(AtomicUsize::new(0));
+            let _fault = DecommissionTestFaultGuard::install_with_error(
+                Arc::new({
+                    let cleanup_calls = Arc::clone(&cleanup_calls);
+                    let bucket = bucket.clone();
+                    move |stage, entry_bucket, entry_object, _, _| {
+                        stage == "source_cleanup"
+                            && entry_bucket == bucket
+                            && entry_object == object
+                            && cleanup_calls.fetch_add(1, Ordering::AcqRel) < failing_calls
+                    }
+                }),
+                Some(Arc::new(|_, _, _| crate::error::Error::ErasureWriteQuorum)),
+            );
+
+            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+            start_routine_decommission_with_capacity(
+                &store,
+                &bucket,
+                vec![
+                    DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64 << 20, 64 << 20),
+                    DecommissionPoolCapacityInfo::for_test(1, layout, 1 << 30, 1 << 30, 0),
+                    DecommissionPoolCapacityInfo::for_test(2, layout, 1 << 30, 1 << 30, 0),
+                ],
+                0,
+            )
+            .await;
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the decommission routine task should join")
+                .expect("the decommission routine should return");
+
+            assert_eq!(
+                cleanup_calls.load(Ordering::Acquire),
+                failing_calls + 1,
+                "the first pass exhausts its in-place retries and the replay cleans up once"
+            );
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert!(
+                info.complete && !info.failed && !info.canceled && info.capacity_blocked_reason.is_none(),
+                "a deferred cleanup that succeeds on replay must complete the decommission: complete={}, failed={}, canceled={}, blocked_reason={:?}",
+                info.complete,
+                info.failed,
+                info.canceled,
+                info.capacity_blocked_reason
+            );
+            assert!(!info.queued_buckets.contains(&bucket), "the bucket must be popped: {info:?}");
+            assert!(
+                info.bytes_done >= object_size && info.bytes_done < 2 * object_size,
+                "the replay must not count the version again: bytes_done={}",
+                info.bytes_done
+            );
+            assert_eq!(info.items_decommission_failed, 0);
+            drop(local);
+
+            let source = store.pools[0]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(&bucket, object)
+                .await
+                .expect("the source versions should decode");
+            assert!(
+                source.is_none_or(|versions| versions.versions.is_empty()),
+                "the replayed cleanup must remove the source"
+            );
+            let mut on_targets = 0;
+            for target_pool_index in [1, 2] {
+                let target = store.pools[target_pool_index]
+                    .get_disks_by_key(object)
+                    .load_file_info_versions_exact(&bucket, object)
+                    .await
+                    .expect("the target versions should decode");
+                if target.is_some_and(|versions| !versions.versions.is_empty()) {
+                    on_targets += 1;
+                }
+            }
+            assert_eq!(on_targets, 1, "the object must live on exactly one target pool");
+        });
+    }
+
+    /// A source cleanup that keeps losing quorum through the replay pauses the
+    /// decommission instead of failing it, with a reason that names source
+    /// cleanup rather than target capacity, and leaves the source in place.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_pauses_on_persistent_cleanup_quorum_failure_as_source_cleanup() {
+        run_large_stack_async_test("decommission-cleanup-quorum-pause", || async {
+            let (_temp_dirs, store, bucket) = new_stale_target_store("cleanup-quorum-pause").await;
+            let object = "cleanup-quorum-pause.bin";
+            put_source_object(&store, &bucket, object, b"source cleanup never regains quorum".to_vec()).await;
+
+            let cleanup_calls = Arc::new(AtomicUsize::new(0));
+            let _fault = DecommissionTestFaultGuard::install_with_error(
+                Arc::new({
+                    let cleanup_calls = Arc::clone(&cleanup_calls);
+                    let bucket = bucket.clone();
+                    move |stage, entry_bucket, entry_object, _, _| {
+                        let hit = stage == "source_cleanup" && entry_bucket == bucket && entry_object == object;
+                        if hit {
+                            cleanup_calls.fetch_add(1, Ordering::AcqRel);
+                        }
+                        hit
+                    }
+                }),
+                Some(Arc::new(|_, _, _| crate::error::Error::ErasureWriteQuorum)),
+            );
+
+            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+            start_routine_decommission_with_capacity(
+                &store,
+                &bucket,
+                vec![
+                    DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64 << 20, 64 << 20),
+                    DecommissionPoolCapacityInfo::for_test(1, layout, 1 << 30, 1 << 30, 0),
+                    DecommissionPoolCapacityInfo::for_test(2, layout, 1 << 30, 1 << 30, 0),
+                ],
+                0,
+            )
+            .await;
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the decommission routine task should join")
+                .expect("a paused decommission routine returns without an error");
+
+            assert_eq!(
+                cleanup_calls.load(Ordering::Acquire),
+                2 * crate::core::pools::DECOMMISSION_SOURCE_CLEANUP_QUORUM_MAX_ATTEMPTS,
+                "the first pass and the replay each exhaust their in-place retries"
+            );
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert!(
+                !info.complete && !info.failed && !info.canceled,
+                "a persistent cleanup failure must pause, not finish or fail: complete={}, failed={}, canceled={}",
+                info.complete,
+                info.failed,
+                info.canceled
+            );
+            assert!(info.is_source_cleanup_blocked(), "{:?}", info.capacity_blocked_reason);
+            let reason = info.capacity_blocked_reason.as_deref().unwrap_or_default();
+            assert!(reason.contains("decommission cleanup_delete_object failed for"), "{reason}");
+            assert!(!reason.contains("free drive threshold"), "{reason}");
+            assert!(info.queued_buckets.contains(&bucket), "the bucket must not be marked done: {info:?}");
+            drop(local);
+
+            let source = store.pools[0]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(&bucket, object)
+                .await
+                .expect("the source versions should decode");
+            assert!(
+                source.is_some_and(|versions| !versions.versions.is_empty()),
+                "the source must stay in place while cleanup cannot commit"
+            );
+        });
+    }
+
     #[test]
     #[serial_test::serial]
     fn decommission_reselects_a_target_that_no_longer_fits_after_selection() {
@@ -1027,32 +1212,58 @@ mod decommission_lock_order_tests {
         });
     }
 
-    /// Run a case whose subject key has no data version to read: an anchor
-    /// object in the same set goes first, and the pause holds the subject's
-    /// gate acquisition right after the anchor's.
-    async fn run_stale_subject_case(store: &Arc<crate::store::ECStore>, bucket: &str, anchor: &str, subject: &str) {
+    /// Pause the subject's first target mutation after its exact versions are
+    /// loaded, without relying on another entry's execution order.
+    async fn run_stale_subject_case(store: &Arc<crate::store::ECStore>, bucket: &str, subject: &str, expected_versions: usize) {
         start_over_budget_routine_decommission(store, bucket, 45 << 20).await;
         let barrier = stale_target_barrier(store);
-        let _fault = pause_object_target_gate_acquire(Arc::clone(&barrier), bucket.to_string(), anchor.to_string(), 1);
-        run_routine_while_target_1_changes(
-            store,
-            &barrier,
-            1,
-            6 << 20,
-            true,
-            assert_held_at_subject(store, bucket, anchor, subject),
-        )
+        let _fault = {
+            let barrier = Arc::clone(&barrier);
+            let bucket = bucket.to_string();
+            let subject = subject.to_string();
+            let armed = AtomicBool::new(false);
+            DecommissionTestFaultGuard::install(Arc::new(move |stage, entry_bucket, entry_object, _, _| {
+                if stage == "exact_versions_read"
+                    && entry_bucket == bucket
+                    && entry_object == subject
+                    && !armed.swap(true, Ordering::AcqRel)
+                {
+                    barrier.pause_one_target_gate_acquire_after(1, 0);
+                }
+                false
+            }))
+        };
+        let mut items_before_subject = 0;
+        run_routine_while_target_1_changes(store, &barrier, 1, 6 << 20, true, async {
+            assert_held_at_subject(store, bucket, subject, expected_versions).await;
+            items_before_subject = store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present")
+                .items_decommissioned;
+        })
         .await;
         assert_source_key_migrated_to_target_2(store, bucket, subject).await;
+        assert_eq!(
+            store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present")
+                .items_decommissioned,
+            items_before_subject + expected_versions,
+            "each subject version must be counted once after target reselection"
+        );
     }
 
-    /// The pause holds the subject, not the anchor: the anchor is already on
-    /// target 1 and the subject on neither target.
-    async fn assert_held_at_subject(store: &Arc<crate::store::ECStore>, bucket: &str, anchor: &str, subject: &str) {
-        store.pools[1]
-            .get_object_info(bucket, anchor, &ObjectOptions::default())
+    /// The subject's exact source versions remain, and neither target has it.
+    async fn assert_held_at_subject(store: &Arc<crate::store::ECStore>, bucket: &str, subject: &str, expected_versions: usize) {
+        let versions = store.pools[0]
+            .get_disks_by_key(subject)
+            .load_file_info_versions_exact(bucket, subject)
             .await
-            .expect("the anchor must be on target 1 before the subject is held");
+            .expect("the source versions should decode while the subject is held")
+            .expect("the source must remain while the subject is held");
+        assert_eq!(versions.versions.len(), expected_versions, "the source versions must remain intact");
         assert_key_not_yet_migrated(store, bucket, subject).await;
     }
 
@@ -1061,13 +1272,11 @@ mod decommission_lock_order_tests {
     fn decommission_reselects_a_delete_marker_target_that_went_over_budget() {
         run_large_stack_async_test("decommission-stale-delete-marker", || async {
             let (_temp_dirs, store, bucket) = new_stale_target_store("stale-delete-marker").await;
-            let anchor = "a-anchor.bin";
-            put_source_object(&store, &bucket, anchor, b"anchor".to_vec()).await;
-            let subject = source_key_after(&store, anchor, "marker");
+            let subject = "marker.bin";
             store.pools[0]
                 .put_object(
                     &bucket,
-                    &subject,
+                    subject,
                     &mut PutObjReader::from_vec(b"marked version".to_vec()),
                     &ObjectOptions {
                         versioned: true,
@@ -1079,7 +1288,7 @@ mod decommission_lock_order_tests {
             let marker = store.pools[0]
                 .delete_object(
                     &bucket,
-                    &subject,
+                    subject,
                     ObjectOptions {
                         versioned: true,
                         ..Default::default()
@@ -1088,10 +1297,10 @@ mod decommission_lock_order_tests {
                 .await
                 .expect("write the delete marker");
             assert!(marker.delete_marker);
-            run_stale_subject_case(&store, &bucket, anchor, &subject).await;
+            run_stale_subject_case(&store, &bucket, subject, 2).await;
             let versions = store.pools[2]
-                .get_disks_by_key(&subject)
-                .load_file_info_versions_exact(&bucket, &subject)
+                .get_disks_by_key(subject)
+                .load_file_info_versions_exact(&bucket, subject)
                 .await
                 .expect("the target 2 versions should decode")
                 .expect("the subject should be on target 2");
@@ -1104,11 +1313,9 @@ mod decommission_lock_order_tests {
     fn decommission_reselects_a_tiered_object_target_that_went_over_budget() {
         run_large_stack_async_test("decommission-stale-tiered", || async {
             let (_temp_dirs, store, bucket) = new_stale_target_store("stale-tiered").await;
-            let anchor = "a-anchor.bin";
-            put_source_object(&store, &bucket, anchor, b"anchor".to_vec()).await;
-            let subject = source_key_after(&store, anchor, "tiered");
-            let _tier = seed_source_transitioned_object(&store, &bucket, &subject, false).await;
-            run_stale_subject_case(&store, &bucket, anchor, &subject).await;
+            let subject = "tiered.bin";
+            let _tier = seed_source_transitioned_object(&store, &bucket, subject, false).await;
+            run_stale_subject_case(&store, &bucket, subject, 1).await;
         });
     }
 
@@ -1117,14 +1324,12 @@ mod decommission_lock_order_tests {
     fn decommission_counts_a_free_version_once_after_its_target_went_over_budget() {
         run_large_stack_async_test("decommission-stale-free-version", || async {
             let (_temp_dirs, store, bucket) = new_stale_target_store("stale-free-version").await;
-            let anchor = "a-anchor.bin";
-            put_source_object(&store, &bucket, anchor, b"anchor".to_vec()).await;
-            let subject = source_key_after(&store, anchor, "free");
-            let _tier = seed_source_transitioned_object(&store, &bucket, &subject, true).await;
-            run_stale_subject_case(&store, &bucket, anchor, &subject).await;
+            let subject = "free.bin";
+            let _tier = seed_source_transitioned_object(&store, &bucket, subject, true).await;
+            run_stale_subject_case(&store, &bucket, subject, 1).await;
             let versions = store.pools[2]
-                .get_disks_by_key(&subject)
-                .load_file_info_versions_exact(&bucket, &subject)
+                .get_disks_by_key(subject)
+                .load_file_info_versions_exact(&bucket, subject)
                 .await
                 .expect("the target 2 versions should decode")
                 .expect("the free version should be on target 2");
@@ -1157,20 +1362,32 @@ mod decommission_lock_order_tests {
     fn decommission_counts_a_free_version_once_after_an_intent_conflict() {
         run_large_stack_async_test("decommission-free-version-intent-conflict", || async {
             let (_temp_dirs, store, bucket) = new_stale_target_store("free-version-conflict").await;
-            let anchor = "a-anchor.bin";
-            put_source_object(&store, &bucket, anchor, b"anchor".to_vec()).await;
-            let subject = source_key_after(&store, anchor, "free-conflict");
-            let _tier = seed_source_transitioned_object(&store, &bucket, &subject, true).await;
+            let subject = "free-conflict.bin";
+            let _tier = seed_source_transitioned_object(&store, &bucket, subject, true).await;
             start_over_budget_routine_decommission(&store, &bucket, 0).await;
             let barrier = stale_target_barrier(&store);
-            let _fault = pause_object_target_gate_acquire(Arc::clone(&barrier), bucket.clone(), anchor.to_string(), 1);
+            let _fault = {
+                let barrier = Arc::clone(&barrier);
+                let bucket = bucket.clone();
+                DecommissionTestFaultGuard::install(Arc::new(move |stage, entry_bucket, entry_object, _, _| {
+                    if stage == "exact_versions_read" && entry_bucket == bucket && entry_object == subject {
+                        barrier.pause_one_target_gate_acquire_after(1, 0);
+                    }
+                    false
+                }))
+            };
             let routine = spawn_decommission_routine(&store, 1);
 
             // The free version selected target 1. Another mutation fails after
             // persisting its intent there, so the free version's admission
             // meets an intent conflict; hold its retry as well.
             barrier.wait_until_target_gate_acquire_paused().await;
-            assert_held_at_subject(&store, &bucket, anchor, &subject).await;
+            assert_held_at_subject(&store, &bucket, subject, 1).await;
+            let items_before_subject = store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present")
+                .items_decommissioned;
             let owner = decommission_capacity_owner(&*store.pool_meta.read().await).with_mutation_id(uuid::Uuid::new_v4());
             store
                 .run_decommission_capacity_admitted_mutation(1, Some(owner), Some(1 << 20), || async {
@@ -1179,13 +1396,12 @@ mod decommission_lock_order_tests {
                 .await
                 .expect_err("the other mutation must fail");
             assert!(killed_leader_target(&store, 1).await.pending_mutation_id.is_some());
-            // Releasing clears the pause target, so arm the next pause after it.
+            // The conflicting attempt reloads the subject and arms its own retry.
             barrier.release_target_gate_acquire();
-            barrier.pause_one_target_gate_acquire_after(1, 0);
 
-            // The retry finds the intent resolved.
+            // Resolve the intent while that retry is held before its gate.
             barrier.wait_until_target_gate_acquire_paused().await;
-            assert_held_at_subject(&store, &bucket, anchor, &subject).await;
+            assert_held_at_subject(&store, &bucket, subject, 1).await;
             edit_target_1_ledger(&store, |reservation| {
                 let target = reservation
                     .targets
@@ -1208,13 +1424,42 @@ mod decommission_lock_order_tests {
                 .as_ref()
                 .expect("the decommission state should remain present");
             assert!(
-                info.complete && !info.failed && info.items_decommission_failed == 0,
+                info.complete
+                    && !info.failed
+                    && !info.canceled
+                    && info.capacity_blocked_reason.is_none()
+                    && info.items_decommission_failed == 0,
                 "a free version retried after an intent conflict must count once, as decommissioned: complete={}, failed={}, items_decommission_failed={}, blocked_reason={:?}",
                 info.complete,
                 info.failed,
                 info.items_decommission_failed,
                 info.capacity_blocked_reason
             );
+            assert_eq!(
+                info.items_decommissioned,
+                items_before_subject + 1,
+                "the free version must be counted once"
+            );
+            drop(local);
+            let versions = store.pools[1]
+                .get_disks_by_key(subject)
+                .load_file_info_versions_exact(&bucket, subject)
+                .await
+                .expect("the target 1 versions should decode")
+                .expect("the free version should be on target 1");
+            assert_eq!(versions.versions.len(), 1);
+            assert!(versions.versions[0].tier_free_version());
+            for pool_index in [0, 2] {
+                let versions = store.pools[pool_index]
+                    .get_disks_by_key(subject)
+                    .load_file_info_versions_exact(&bucket, subject)
+                    .await
+                    .expect("the remaining pool versions should decode");
+                assert!(
+                    versions.is_none_or(|versions| versions.versions.is_empty()),
+                    "the free version must only remain on target 1"
+                );
+            }
         });
     }
 
@@ -1716,6 +1961,656 @@ mod decommission_lock_order_tests {
         );
     }
 
+    /// A delete marker copy that keeps losing target drive quorum through its
+    /// in-place retries is deferred and copied again at the end of the round
+    /// (rustfs/backlog#2873, defect F). It is not a permanent per-object
+    /// failure, and the source is removed only after every version committed.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_defers_a_delete_marker_copy_that_lost_target_quorum() {
+        run_large_stack_async_test("decommission-marker-quorum-deferral", || async {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("marker-quorum");
+            let object = "versioned/03.bin";
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        versioning_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create the versioned bucket");
+            let mut written = Vec::new();
+            for index in 0..2u8 {
+                written.push(
+                    store.pools[0]
+                        .put_object(
+                            &bucket,
+                            object,
+                            &mut PutObjReader::from_vec(vec![index; 2048]),
+                            &ObjectOptions {
+                                versioned: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("write a source version"),
+                );
+            }
+            let marker = store.pools[0]
+                .delete_object(
+                    &bucket,
+                    object,
+                    ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write the source delete marker");
+            assert!(marker.delete_marker);
+
+            // Every in-place attempt of the first pass loses quorum; the
+            // deferred replay commits.
+            let failing_calls = crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS;
+            let marker_calls = Arc::new(AtomicUsize::new(0));
+            let source_present_at_marker_commit = Arc::new(StdMutex::new(Vec::new()));
+            let _fault = DecommissionTestFaultGuard::install_with_error(
+                Arc::new({
+                    let marker_calls = Arc::clone(&marker_calls);
+                    let bucket = bucket.clone();
+                    move |stage, entry_bucket, entry_object, _, _| {
+                        stage == "delete_marker_copy"
+                            && entry_bucket == bucket
+                            && entry_object == object
+                            && marker_calls.fetch_add(1, Ordering::AcqRel) < failing_calls
+                    }
+                }),
+                Some(Arc::new(|_, bucket, object| {
+                    crate::error::Error::InsufficientWriteQuorum(bucket.to_owned(), object.to_owned())
+                })),
+            );
+            let cleanup_observer = {
+                let store = Arc::clone(&store);
+                let bucket = bucket.clone();
+                let seen = Arc::clone(&source_present_at_marker_commit);
+                crate::core::pools::DecommissionCleanupMutationGuard::install(Arc::new(move |hook_bucket, hook_object, _| {
+                    let store = Arc::clone(&store);
+                    let bucket = bucket.clone();
+                    let seen = Arc::clone(&seen);
+                    let matches = hook_bucket == bucket && hook_object == object;
+                    Box::pin(async move {
+                        if matches {
+                            // Cleanup only starts once the target holds every version.
+                            let on_targets = exact_versions(&store, 1, &bucket, object).await.len()
+                                + exact_versions(&store, 2, &bucket, object).await.len();
+                            seen.lock().unwrap().push(on_targets);
+                        }
+                    })
+                }))
+            };
+
+            start_transitioned_entry_decommission(&store, &bucket).await;
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the decommission routine task should join")
+                .expect("the decommission routine should return");
+            drop(cleanup_observer);
+
+            assert_eq!(
+                marker_calls.load(Ordering::Acquire),
+                failing_calls + 1,
+                "the first pass exhausts its in-place retries and the replay copies the marker once"
+            );
+            assert_eq!(
+                *source_present_at_marker_commit.lock().unwrap(),
+                vec![3],
+                "the source is cleaned up once, after the target committed all three versions"
+            );
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert_eq!(info.items_decommission_failed, 0, "a lost quorum is not a permanent failure: {info:?}");
+            assert!(
+                info.complete && !info.failed && !info.canceled && info.capacity_blocked_reason.is_none(),
+                "the replayed entry must complete the decommission: {info:?}"
+            );
+            drop(local);
+            assert!(exact_versions(&store, 0, &bucket, object).await.is_empty(), "the source is cleaned up");
+            for version in written.iter().chain(std::iter::once(&marker)) {
+                let found = store
+                    .get_object_info(
+                        &bucket,
+                        object,
+                        &ObjectOptions {
+                            versioned: true,
+                            version_id: version.version_id.map(|id| id.to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                if version.delete_marker {
+                    assert!(found.is_err(), "the marker version stays a delete marker");
+                } else {
+                    assert_eq!(found.expect("every data version stays readable").version_id, version.version_id);
+                }
+            }
+        });
+    }
+
+    /// A partially migrated entry leaves some versions on the target while the
+    /// retained source still holds all of them, so the two pools disagree on
+    /// the version count. A copied version must stay readable from either
+    /// pool instead of failing closed as an identity conflict, and a target
+    /// write that keeps losing quorum pauses the decommission instead of
+    /// counting a permanent failure (rustfs/backlog#2873, defect F).
+    #[test]
+    #[serial_test::serial]
+    fn decommission_partial_entry_keeps_every_version_readable() {
+        run_large_stack_async_test("decommission-partial-entry-readable", || async {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("partial-entry");
+            let object = "versioned/03.bin";
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        versioning_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create the versioned bucket");
+            let mut written = Vec::new();
+            for index in 0..3u8 {
+                written.push(
+                    store.pools[0]
+                        .put_object(
+                            &bucket,
+                            object,
+                            &mut PutObjReader::from_vec(vec![index; 2048]),
+                            &ObjectOptions {
+                                versioned: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("write a source version"),
+                );
+            }
+            store.pools[0]
+                .delete_object(
+                    &bucket,
+                    object,
+                    ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write the source delete marker");
+
+            // The newest data version migrates; every later target write of
+            // this entry loses quorum before it commits, in place and in the
+            // deferred replay.
+            let writes = Arc::new(AtomicUsize::new(0));
+            let _fault = DecommissionTestFaultGuard::install_with_error(
+                Arc::new({
+                    let writes = Arc::clone(&writes);
+                    let bucket = bucket.clone();
+                    move |stage, entry_bucket, entry_object, _, _| {
+                        stage == "before_target_commit"
+                            && entry_bucket == bucket
+                            && entry_object == object
+                            && writes.fetch_add(1, Ordering::AcqRel) >= 1
+                    }
+                }),
+                Some(Arc::new(|_, bucket, object| {
+                    crate::error::Error::InsufficientWriteQuorum(bucket.to_owned(), object.to_owned())
+                })),
+            );
+
+            start_transitioned_entry_decommission(&store, &bucket).await;
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the decommission routine task should join")
+                .expect("a paused decommission routine returns without an error");
+
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert_eq!(info.items_decommission_failed, 0, "a lost quorum is not a permanent failure: {info:?}");
+            assert!(
+                !info.complete && !info.failed && !info.canceled,
+                "the entry must pause the decommission: {info:?}"
+            );
+            let reason = info.capacity_blocked_reason.as_deref().unwrap_or_default();
+            assert!(reason.contains("lost drive quorum"), "{reason}");
+            drop(local);
+
+            assert_eq!(exact_versions(&store, 0, &bucket, object).await.len(), 4, "the source is retained");
+            let on_target =
+                exact_versions(&store, 1, &bucket, object).await.len() + exact_versions(&store, 2, &bucket, object).await.len();
+            assert_eq!(on_target, 2, "the marker and the newest version reached the target");
+
+            for version in &written {
+                let opts = ObjectOptions {
+                    versioned: true,
+                    version_id: version.version_id.map(|id| id.to_string()),
+                    ..Default::default()
+                };
+                let mut reader = store
+                    .get_object_reader(&bucket, object, None, HeaderMap::new(), &opts)
+                    .await
+                    .unwrap_or_else(|err| panic!("version {:?} must stay readable: {err:?}", version.version_id));
+                let mut body = Vec::new();
+                reader.stream.read_to_end(&mut body).await.expect("read the version body");
+                assert_eq!(body.len(), 2048);
+                assert_eq!(reader.object_info.version_id, version.version_id);
+            }
+            // The latest version is the copied delete marker: reads answer
+            // not found, not a cross-pool identity conflict.
+            let latest = store
+                .get_object_reader(
+                    &bucket,
+                    object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .err()
+                .expect("the latest version is a delete marker");
+            assert!(
+                crate::error::is_err_object_not_found(&latest) || crate::error::is_err_version_not_found(&latest),
+                "{latest:?}"
+            );
+        });
+    }
+
+    struct FirstPayloadReadQuorum {
+        reads: Arc<AtomicUsize>,
+        disk_error: bool,
+    }
+
+    impl tokio::io::AsyncRead for FirstPayloadReadQuorum {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if buf.remaining() == 0 {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            self.reads.fetch_add(1, Ordering::AcqRel);
+            // Both producer paths fail before filling any bytes of the first stripe.
+            let err = if self.disk_error {
+                std::io::Error::other(crate::disk::error::DiskError::ErasureReadQuorum)
+            } else {
+                std::io::Error::other(crate::error::Error::ErasureReadQuorum)
+            };
+            std::task::Poll::Ready(Err(err))
+        }
+    }
+
+    async fn assert_source_stream_quorum_is_not_a_target_failure(multipart: bool) {
+        let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+        let bucket = test_bucket("source-stream-quorum");
+        let object = "source.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create the bucket");
+        if multipart {
+            put_source_multipart_object(&store, &bucket, object).await;
+        } else {
+            put_source_object(&store, &bucket, object, vec![0x5a; 2048]).await;
+        }
+        start_transitioned_entry_decommission(&store, &bucket).await;
+        let owner = decommission_capacity_owner(&*store.pool_meta.read().await);
+        let incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("load the source bucket incarnation");
+        let mut source_reader = store.pools[0]
+            .get_object_reader(
+                &bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    no_lock: true,
+                    data_movement: true,
+                    raw_data_movement_read: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the real source must open successfully before its payload fails");
+        assert_eq!(source_reader.object_info.is_multipart(), multipart);
+        let reads = Arc::new(AtomicUsize::new(0));
+        source_reader.stream = Box::new(FirstPayloadReadQuorum {
+            reads: Arc::clone(&reads),
+            disk_error: multipart,
+        });
+        let source_rechecks = Arc::new(AtomicUsize::new(0));
+        let _observer = DecommissionTestFaultGuard::install(Arc::new({
+            let bucket = bucket.clone();
+            let source_rechecks = Arc::clone(&source_rechecks);
+            move |stage, entry_bucket, entry_object, _, succeeded| {
+                if stage == "source_recheck" && entry_bucket == bucket && entry_object == object && succeeded {
+                    source_rechecks.fetch_add(1, Ordering::AcqRel);
+                }
+                false
+            }
+        }));
+        let err = data_movement::migrate_decommission_object(
+            Arc::clone(&store),
+            0,
+            bucket.clone(),
+            source_reader,
+            Some(incarnation),
+            "decommission_source_payload_test",
+            Some(owner),
+        )
+        .await
+        .expect_err("the actual upload must return the source payload failure");
+
+        assert!(
+            source_rechecks.load(Ordering::Acquire) > 0,
+            "source metadata must pass the copy-time recheck"
+        );
+        assert!(
+            reads.load(Ordering::Acquire) > 0,
+            "the actual upload must poll the failing source payload"
+        );
+        assert_eq!(
+            exact_versions(&store, 0, &bucket, object).await.len(),
+            1,
+            "the source must remain present"
+        );
+        assert!(exact_versions(&store, 1, &bucket, object).await.is_empty());
+        assert!(exact_versions(&store, 2, &bucket, object).await.is_empty());
+        assert!(
+            !crate::core::pools::is_decommission_copy_quorum_error_for_test(&err),
+            "a source payload failure must not defer the entry as a target failure: {err:?}"
+        );
+        if multipart {
+            assert!(
+                err.to_string().contains("read_part failed"),
+                "the actual upload must classify the source read: {err}"
+            );
+        } else {
+            assert!(
+                data_movement::is_data_movement_source_read_error(&err),
+                "the put stage must preserve source origin: {err}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_does_not_defer_a_singlepart_source_stream_quorum_failure() {
+        run_large_stack_async_test("decommission-singlepart-source-stream-quorum", || async {
+            assert_source_stream_quorum_is_not_a_target_failure(false).await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_does_not_defer_a_multipart_source_stream_quorum_failure() {
+        run_large_stack_async_test("decommission-multipart-source-stream-quorum", || async {
+            assert_source_stream_quorum_is_not_a_target_failure(true).await;
+        });
+    }
+
+    /// Multipart upload errors carry a part-stage context. That real wrapper
+    /// must keep a target quorum failure retryable by the full routine.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_defers_a_multipart_part_copy_that_lost_target_quorum() {
+        run_large_stack_async_test("decommission-multipart-part-quorum", || async {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("multipart-part-quorum");
+            let object = "multipart.bin";
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create the bucket");
+            put_source_object(&store, &bucket, object, vec![0x5a; 2048]).await;
+            let writes = Arc::new(AtomicUsize::new(0));
+            let _fault = DecommissionTestFaultGuard::install_with_error(
+                Arc::new({
+                    let bucket = bucket.clone();
+                    move |stage, entry_bucket, entry_object, _, _| {
+                        stage == "before_target_commit" && entry_bucket == bucket && entry_object == object
+                    }
+                }),
+                Some(Arc::new({
+                    let writes = Arc::clone(&writes);
+                    move |_, bucket, object| {
+                        writes.fetch_add(1, Ordering::AcqRel);
+                        let err = data_movement::data_movement_part_stage_error_for_test(
+                            "decommission_object",
+                            "put_object_part",
+                            bucket,
+                            object,
+                            1,
+                            crate::error::Error::InsufficientWriteQuorum(bucket.to_owned(), object.to_owned()),
+                        );
+                        assert!(
+                            err.to_string()
+                                .contains(&format!("put_object_part failed for {bucket}/{object} part 1")),
+                            "inject the multipart part wrapper used by the copy path: {err}"
+                        );
+                        err
+                    }
+                })),
+            );
+
+            start_transitioned_entry_decommission(&store, &bucket).await;
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the decommission routine task should join")
+                .expect("a paused decommission routine returns without an error");
+
+            assert!(writes.load(Ordering::Acquire) > 1, "the copy must exhaust its in-place retries");
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert_eq!(
+                info.items_decommission_failed, 0,
+                "a lost target quorum is not a permanent failure: {info:?}"
+            );
+            assert!(
+                !info.complete && !info.failed && !info.canceled,
+                "the entry must pause the decommission: {info:?}"
+            );
+            let reason = info.capacity_blocked_reason.as_deref().unwrap_or_default();
+            assert!(reason.contains("lost drive quorum"), "{reason}");
+            drop(local);
+
+            assert_eq!(exact_versions(&store, 0, &bucket, object).await.len(), 1, "the source is retained");
+            assert!(exact_versions(&store, 1, &bucket, object).await.is_empty());
+            assert!(exact_versions(&store, 2, &bucket, object).await.is_empty());
+        });
+    }
+
+    /// Only a target write is deferred. A source version that cannot be read
+    /// keeps its per-object failure, so an unreadable source ends the
+    /// decommission as failed instead of pausing and resuming forever.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_counts_a_source_read_that_lost_quorum_as_failed() {
+        run_large_stack_async_test("decommission-source-read-quorum", || async {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("source-read-quorum");
+            let object = "unreadable.bin";
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create the bucket");
+            put_source_object(&store, &bucket, object, vec![0x5a; 2048]).await;
+            let _fault = DecommissionTestFaultGuard::install_with_error(
+                Arc::new({
+                    let bucket = bucket.clone();
+                    move |stage, entry_bucket, entry_object, _, _| {
+                        stage == "object_read" && entry_bucket == bucket && entry_object == object
+                    }
+                }),
+                Some(Arc::new(|_, bucket, object| {
+                    crate::error::Error::InsufficientReadQuorum(bucket.to_owned(), object.to_owned())
+                })),
+            );
+
+            start_transitioned_entry_decommission(&store, &bucket).await;
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the decommission routine task should join")
+                .expect("the decommission routine should return");
+
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert_eq!(info.items_decommission_failed, 1, "{info:?}");
+            assert!(info.failed && info.capacity_blocked_reason.is_none(), "{info:?}");
+            drop(local);
+            assert_eq!(exact_versions(&store, 0, &bucket, object).await.len(), 1, "the source is retained");
+        });
+    }
+
+    async fn assert_decommission_source_recheck_quorum_failure_is_permanent(delete_marker: bool) {
+        let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+        let bucket = test_bucket("source-recheck-quorum");
+        let object = "source.bin";
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: delete_marker,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create the bucket");
+        store.pools[0]
+            .put_object(
+                &bucket,
+                object,
+                &mut PutObjReader::from_vec(vec![0x5a; 2048]),
+                &ObjectOptions {
+                    versioned: delete_marker,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write the source version");
+        if delete_marker {
+            let marker = store.pools[0]
+                .delete_object(
+                    &bucket,
+                    object,
+                    ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write the source delete marker");
+            assert!(marker.delete_marker);
+        }
+        let source_versions = exact_versions(&store, 0, &bucket, object).await.len();
+        assert_eq!(source_versions, if delete_marker { 2 } else { 1 });
+        let source_reads = Arc::new(AtomicUsize::new(0));
+        let source_rechecks = Arc::new(AtomicUsize::new(0));
+        let recheck_stage = if delete_marker {
+            "delete_marker_source_recheck"
+        } else {
+            "source_recheck"
+        };
+        let _fault = DecommissionTestFaultGuard::install_with_error(
+            Arc::new({
+                let source_reads = Arc::clone(&source_reads);
+                let bucket = bucket.clone();
+                move |stage, entry_bucket, entry_object, _, succeeded| {
+                    if entry_bucket != bucket || entry_object != object {
+                        return false;
+                    }
+                    if stage == "object_read" && succeeded {
+                        source_reads.fetch_add(1, Ordering::AcqRel);
+                    }
+                    stage == recheck_stage
+                }
+            }),
+            Some(Arc::new({
+                let source_rechecks = Arc::clone(&source_rechecks);
+                move |_, bucket, object| {
+                    source_rechecks.fetch_add(1, Ordering::AcqRel);
+                    crate::error::Error::InsufficientReadQuorum(bucket.to_owned(), object.to_owned())
+                }
+            })),
+        );
+
+        start_transitioned_entry_decommission(&store, &bucket).await;
+        spawn_decommission_routine(&store, 1)
+            .await
+            .expect("the decommission routine task should join")
+            .expect("the decommission routine should return");
+
+        assert!(
+            source_rechecks.load(Ordering::Acquire) >= crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS,
+            "the source metadata recheck inside the copy must exhaust its retries"
+        );
+        if !delete_marker {
+            assert!(source_reads.load(Ordering::Acquire) > 0, "the initial source open must succeed");
+        }
+        let local = store.pool_meta.read().await;
+        let info = local.pools[0]
+            .decommission
+            .as_ref()
+            .expect("the decommission state should remain present");
+        assert_eq!(info.items_decommission_failed, 1, "a source failure is permanent: {info:?}");
+        assert!(
+            info.failed && !info.complete && !info.canceled && info.capacity_blocked_reason.is_none(),
+            "a source recheck must fail the decommission instead of pausing it: {info:?}"
+        );
+        drop(local);
+        assert_eq!(
+            exact_versions(&store, 0, &bucket, object).await.len(),
+            source_versions,
+            "all source versions are retained"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_counts_a_source_recheck_that_lost_quorum_as_failed() {
+        run_large_stack_async_test("decommission-source-recheck-quorum", || async {
+            assert_decommission_source_recheck_quorum_failure_is_permanent(false).await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_counts_a_delete_marker_source_recheck_that_lost_quorum_as_failed() {
+        run_large_stack_async_test("decommission-marker-source-recheck-quorum", || async {
+            assert_decommission_source_recheck_quorum_failure_is_permanent(true).await;
+        });
+    }
+
     /// A restored source moves as data; the copy keeps its transition tuple,
     /// so the target owns the remote object and the source cleanup must not
     /// leave a tier free version (rustfs/backlog#2873, defect D).
@@ -1853,49 +2748,283 @@ mod decommission_lock_order_tests {
         run_large_stack_async_test("decommission-superseded-restored-null-version", run_superseded_restored_null_version_case);
     }
 
-    /// Of two transitioned versions in one entry, lifecycle expires the
-    /// noncurrent one while its queued expiry has not run yet, and the current
-    /// one moves. The source cleanup removes both, but only the expired
-    /// version keeps a tier free version: it is the only owner of that remote
-    /// object, while the target copy owns the other (rustfs/backlog#2873).
-    #[test]
-    #[serial_test::serial]
-    fn decommission_keeps_a_free_version_only_for_the_expired_version_of_an_entry() {
-        run_large_stack_async_test("decommission-expired-and-moved-versions", || async {
-            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
-            let bucket = test_bucket("expired-and-moved");
-            let object = "versions.bin";
-            store
-                .make_bucket(
+    /// Every capacity marker of the decommission's target reservations is
+    /// settled: no pending intent and no temporary mutation remain.
+    async fn assert_decommission_capacity_settled(store: &Arc<crate::store::ECStore>) {
+        let pool_meta = store.pool_meta.read().await;
+        let info = pool_meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("the decommission state should remain present");
+        assert!(
+            info.capacity_blocked_reason.is_none(),
+            "the decommission must not pause: {:?}",
+            info.capacity_blocked_reason
+        );
+        let reservation = info
+            .capacity_reservation
+            .as_ref()
+            .expect("the capacity reservation should remain present");
+        assert_eq!(reservation.pending_target_physical_bytes, 0);
+        assert_eq!(reservation.inflight_target_physical_bytes, 0);
+        for target in &reservation.targets {
+            assert!(
+                target.pending_mutation_id.is_none(),
+                "target {} keeps a pending intent",
+                target.pool_index
+            );
+            assert_eq!(target.pending_physical_bytes, 0);
+            assert_eq!(target.inflight_physical_bytes, 0);
+            assert!(
+                target.temporary_mutations.is_empty(),
+                "target {} keeps temporary mutations: {:?}",
+                target.pool_index,
+                target.temporary_mutations
+            );
+        }
+    }
+
+    /// A newer unversioned object written to the target replaces a multipart
+    /// null source. The multipart copy settles as superseded and aborts its
+    /// staged upload; that cleanup must accept the newer target as proof the
+    /// staged copy holds nothing there, instead of failing closed as a
+    /// capacity block that never lets the entry finish (rustfs/backlog#2873).
+    async fn run_superseded_multipart_null_version_case(tiered: bool) {
+        let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+        let bucket = test_bucket("superseded-multipart");
+        let object = "multipart.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create the unversioned bucket");
+        let written = put_source_multipart_object(&store, &bucket, object).await;
+        let backend = if tiered {
+            let tier_name = format!("DECOMTIER{}", &uuid::Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+            let backend = register_mock_tier(&store.pools[0].instance_ctx().tier_config_mgr(), &tier_name).await;
+            store.pools[0]
+                .transition_object(
                     &bucket,
-                    &MakeBucketOptions {
-                        versioning_enabled: true,
+                    object,
+                    &ObjectOptions {
+                        transition: crate::bucket::lifecycle::lifecycle::TransitionOptions {
+                            status: TRANSITION_PENDING.to_string(),
+                            tier: tier_name,
+                            etag: written.etag.clone().expect("the multipart source should have an ETag"),
+                            ..Default::default()
+                        },
+                        mod_time: written.mod_time,
                         ..Default::default()
                     },
                 )
                 .await
-                .expect("create the versioned bucket");
-            let tier_name = format!("DECOMTIER{}", &uuid::Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
-            let backend = register_mock_tier(&store.pools[0].instance_ctx().tier_config_mgr(), &tier_name).await;
-            let now = time::OffsetDateTime::now_utc();
-            let expired =
-                put_transitioned_source_version(&store, &bucket, object, &tier_name, true, Some(now - time::Duration::days(10)))
-                    .await;
-            let moved =
-                put_transitioned_source_version(&store, &bucket, object, &tier_name, true, Some(now - time::Duration::days(5)))
-                    .await;
-            let source_versions = exact_versions(&store, 0, &bucket, object).await;
-            assert_eq!(source_versions.len(), 2);
-            let source = |version_id| {
-                source_versions
-                    .iter()
-                    .find(|version| version.version_id == version_id)
-                    .cloned()
-                    .expect("each written version should be loaded")
-            };
-            let (expired, moved) = (source(expired.version_id), source(moved.version_id));
-            assert_ne!(expired.transitioned_objname, moved.transitioned_objname);
-            let lifecycle_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+                .expect("transition the multipart source before the decommission");
+            restore_source_version(&store, &bucket, object, false, &written).await;
+            Some(backend)
+        } else {
+            None
+        };
+        let source_versions = exact_versions(&store, 0, &bucket, object).await;
+        assert_eq!(source_versions.len(), 1);
+        let source = source_versions[0].clone();
+        assert!(source.version_id.is_none(), "the source must be a null version");
+        assert_eq!(source.parts.len(), 2, "the source must move through the multipart copy");
+        assert!(!source.is_remote(), "the source keeps its local copy");
+        let newer = b"written to the target after the source".to_vec();
+        store.pools[1]
+            .put_object(&bucket, object, &mut PutObjReader::from_vec(newer.clone()), &ObjectOptions::default())
+            .await
+            .expect("write a newer null version on the target");
+
+        start_transitioned_entry_decommission(&store, &bucket).await;
+        store
+            .decommission_entry_for_test_with_bucket_incarnation(
+                0,
+                MetaCacheEntry {
+                    name: object.to_string(),
+                    ..Default::default()
+                },
+                bucket.clone(),
+                store.pools[0].get_disks_by_key(object),
+            )
+            .await
+            .expect("the superseded multipart entry should finish");
+
+        let left = exact_versions(&store, 0, &bucket, object).await;
+        if let Some(backend) = backend.as_ref() {
+            // The newer target references no remote object, so the source
+            // cleanup keeps the tier free version that owns the remote delete.
+            assert_eq!(left.len(), 1, "the source must keep one tier free version: {left:?}");
+            assert!(left[0].tier_free_version());
+            assert_same_remote_tuple(&left[0], &source);
+            assert!(backend.contains(&source.transitioned_objname).await);
+            assert_eq!(backend.remove_count().await, 0);
+        } else {
+            assert!(left.is_empty(), "the superseded source must be cleaned up: {left:?}");
+        }
+        let target = exact_versions(&store, 1, &bucket, object).await;
+        assert_eq!(target.len(), 1, "the target keeps only its newer version: {target:?}");
+        assert!(!target[0].tier_free_version());
+        assert!(target[0].transition_status.is_empty(), "the newer version references no remote object");
+        assert!(exact_versions(&store, 2, &bucket, object).await.is_empty());
+        let target_set = store.pools[1].get_disks_by_key(object);
+        let incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("load the bucket incarnation");
+        let staged_identity = format!(
+            "v1:none:{}",
+            source
+                .mod_time
+                .expect("the source has a modification time")
+                .unix_timestamp_nanos()
+        );
+        assert!(
+            target_set
+                .data_movement_multipart_upload_ids(&bucket, object, Some(incarnation), &staged_identity)
+                .await
+                .expect("scan the target for the staged upload")
+                .is_empty(),
+            "the staged upload must be aborted"
+        );
+        let mut reader = store.pools[1]
+            .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("the newer target version should be readable");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("drain the newer version");
+        assert_eq!(body, newer);
+        assert_decommission_capacity_settled(&store).await;
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_finishes_a_restored_multipart_null_version_superseded_on_target() {
+        run_large_stack_async_test("decommission-superseded-restored-multipart", || {
+            run_superseded_multipart_null_version_case(true)
+        });
+    }
+
+    /// The target already holds a null object with the multipart source's
+    /// exact identity but without the data-movement ownership proof. The copy
+    /// cannot publish over it, and its cleanup cannot tell whether that object
+    /// is the staged copy. That identity-proof failure must fail the
+    /// decommission with an accurate error, not pause it as a capacity block
+    /// that only a restart could leave (rustfs/backlog#2873).
+    #[test]
+    #[serial_test::serial]
+    fn decommission_fails_instead_of_pausing_on_an_unowned_exact_multipart_target() {
+        run_large_stack_async_test("decommission-unowned-exact-multipart-target", || async {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("unowned-exact-multipart");
+            let object = "multipart.bin";
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create the unversioned bucket");
+            let written = put_source_multipart_object(&store, &bucket, object).await;
+            let unowned = b"same identity, written without a data movement".to_vec();
+            store.pools[1]
+                .put_object(
+                    &bucket,
+                    object,
+                    &mut PutObjReader::from_vec(unowned.clone()),
+                    &ObjectOptions {
+                        mod_time: written.mod_time,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write the unowned exact-identity object on the target");
+            let target = exact_versions(&store, 1, &bucket, object).await;
+            assert_eq!(target.len(), 1);
+            assert!(target[0].version_id.is_none());
+            assert_eq!(target[0].mod_time, written.mod_time, "the target must carry the staged identity");
+
+            start_transitioned_entry_decommission(&store, &bucket).await;
+            let _ = spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the decommission routine task should join");
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert!(
+                info.failed && !info.complete && info.capacity_blocked_reason.is_none(),
+                "an identity-proof failure must fail the decommission, not pause it as a capacity block: complete={}, failed={}, blocked_reason={:?}",
+                info.complete,
+                info.failed,
+                info.capacity_blocked_reason
+            );
+            drop(local);
+
+            assert_eq!(exact_versions(&store, 0, &bucket, object).await.len(), 1, "the source must stay in place");
+            let mut reader = store.pools[1]
+                .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("the unowned target object should stay readable");
+            let mut body = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("drain the unowned target object");
+            assert_eq!(body, unowned);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_finishes_a_multipart_null_version_superseded_on_target() {
+        run_large_stack_async_test("decommission-superseded-multipart", || run_superseded_multipart_null_version_case(false));
+    }
+
+    struct ExpiredAndMovedVersions {
+        _temp_dirs: Vec<tempfile::TempDir>,
+        store: Arc<crate::store::ECStore>,
+        bucket: String,
+        object: &'static str,
+        backend: crate::services::tier::test_util::MockWarmBackend,
+        expired: rustfs_filemeta::FileInfo,
+        moved: rustfs_filemeta::FileInfo,
+    }
+
+    /// Write two transitioned versions of one object to pool 0 of a versioned
+    /// bucket whose lifecycle expires the older, noncurrent one.
+    async fn put_expired_and_moved_transitioned_versions(name: &str) -> ExpiredAndMovedVersions {
+        let (temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+        let bucket = test_bucket(name);
+        let object = "versions.bin";
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create the versioned bucket");
+        let tier_name = format!("DECOMTIER{}", &uuid::Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&store.pools[0].instance_ctx().tier_config_mgr(), &tier_name).await;
+        let now = time::OffsetDateTime::now_utc();
+        let expired =
+            put_transitioned_source_version(&store, &bucket, object, &tier_name, true, Some(now - time::Duration::days(10)))
+                .await;
+        let moved =
+            put_transitioned_source_version(&store, &bucket, object, &tier_name, true, Some(now - time::Duration::days(5))).await;
+        let source_versions = exact_versions(&store, 0, &bucket, object).await;
+        assert_eq!(source_versions.len(), 2);
+        let source = |version_id| {
+            source_versions
+                .iter()
+                .find(|version| version.version_id == version_id)
+                .cloned()
+                .expect("each written version should be loaded")
+        };
+        let (expired, moved) = (source(expired.version_id), source(moved.version_id));
+        assert_ne!(expired.transitioned_objname, moved.transitioned_objname);
+        let lifecycle_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <LifecycleConfiguration>
   <Rule>
     <ID>expire-noncurrent</ID>
@@ -1908,23 +3037,85 @@ mod decommission_lock_order_tests {
     </NoncurrentVersionExpiration>
   </Rule>
 </LifecycleConfiguration>"#;
-            crate::bucket::metadata_sys::update_in(
-                &store.ctx,
-                &bucket,
-                crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG,
-                lifecycle_xml.as_bytes().to_vec(),
-            )
-            .await
-            .expect("store the noncurrent expiration rule");
+        crate::bucket::metadata_sys::update_in(
+            &store.ctx,
+            &bucket,
+            crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG,
+            lifecycle_xml.as_bytes().to_vec(),
+        )
+        .await
+        .expect("store the noncurrent expiration rule");
+        ExpiredAndMovedVersions {
+            _temp_dirs: temp_dirs,
+            store,
+            bucket,
+            object,
+            backend,
+            expired,
+            moved,
+        }
+    }
+
+    /// The source keeps nothing, and the target pools hold the moved version
+    /// and the expired version's tier free version, its only remote owner.
+    /// Nothing deleted a remote object yet.
+    async fn assert_expired_version_owner_moved(case: &ExpiredAndMovedVersions) -> rustfs_filemeta::FileInfo {
+        let ExpiredAndMovedVersions {
+            store,
+            bucket,
+            object,
+            backend,
+            expired,
+            moved,
+            ..
+        } = case;
+        let left = exact_versions(store, 0, bucket, object).await;
+        assert!(
+            left.is_empty(),
+            "the source must keep neither a version nor a tier free version: {left:?}"
+        );
+        let mut owners = Vec::new();
+        for target_pool_index in [1, 2] {
+            owners.extend(exact_versions(store, target_pool_index, bucket, object).await);
+        }
+        assert_eq!(owners.len(), 2, "the moved version and one tier free version: {owners:?}");
+        let (free_versions, live): (Vec<_>, Vec<_>) = owners.into_iter().partition(|version| version.tier_free_version());
+        assert_eq!(live.len(), 1, "only the current version moves as a version: {live:?}");
+        assert_eq!(live[0].version_id, moved.version_id);
+        assert_same_remote_tuple(&live[0], moved);
+        assert_eq!(
+            free_versions.len(),
+            1,
+            "exactly one owner of the expired remote object: {free_versions:?}"
+        );
+        assert_same_remote_tuple(&free_versions[0], expired);
+        for remote in [&expired.transitioned_objname, &moved.transitioned_objname] {
+            assert!(backend.contains(remote).await, "no remote object may be deleted by the move");
+        }
+        assert_eq!(backend.remove_count().await, 0);
+        free_versions[0].clone()
+    }
+
+    /// Of two transitioned versions in one entry, lifecycle expires the
+    /// noncurrent one and the current one moves. The expiry is applied before
+    /// the source cleanup, so the tier free version it leaves on the source
+    /// moves with the entry instead of staying behind (rustfs/backlog#2873).
+    #[test]
+    #[serial_test::serial]
+    fn decommission_moves_the_free_version_of_an_expired_version_with_its_entry() {
+        run_large_stack_async_test("decommission-expired-and-moved-versions", || async {
+            let case = put_expired_and_moved_transitioned_versions("expired-and-moved").await;
+            let (store, bucket, object) = (&case.store, &case.bucket, case.object);
             // Load it the way the decommission routine does for each bucket.
-            let lifecycle = crate::bucket::lifecycle::get_expiry_configs(&store, &bucket)
+            let lifecycle = crate::bucket::lifecycle::get_expiry_configs(store, bucket)
                 .await
                 .expect("the bucket lifecycle configuration should load")
                 .lifecycle
                 .map(|config| (*config).clone())
                 .expect("the bucket should have a lifecycle configuration");
 
-            start_transitioned_entry_decommission(&store, &bucket).await;
+            start_transitioned_entry_decommission(store, bucket).await;
+            // Busy expiry workers must not decide the outcome.
             let expiry_queue = crate::bucket::lifecycle::bucket_lifecycle_ops::HeldExpiryQueue::hold().await;
             let result = store
                 .decommission_entry_for_test_with_lifecycle(
@@ -1938,27 +3129,363 @@ mod decommission_lock_order_tests {
                     Some(lifecycle),
                 )
                 .await;
-            let pending_expiries = expiry_queue.pending_tasks().await;
             expiry_queue.release().await;
             result.expect("the entry should finish");
-            assert_eq!(pending_expiries, 1, "the noncurrent version's expiry must stay queued");
 
-            let left = exact_versions(&store, 0, &bucket, object).await;
-            assert_eq!(left.len(), 1, "only the expired version keeps a tier free version: {left:?}");
-            assert!(left[0].tier_free_version());
-            assert_same_remote_tuple(&left[0], &expired);
+            assert_expired_version_owner_moved(&case).await;
+        });
+    }
+
+    /// The full routine over the same entry: while the expiry workers are
+    /// busy, the source cleanup used to delete the expired version first and
+    /// leave its tier free version on the source, and the post-check then
+    /// failed the decommission. It now completes in one pass, and the moved
+    /// free version is consumed exactly once, after the cross-pool scan.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_of_an_expired_transitioned_version_completes_in_one_pass() {
+        run_large_stack_async_test("decommission-expired-transitioned-routine", || async {
+            let case = put_expired_and_moved_transitioned_versions("expired-routine").await;
+            let (store, bucket) = (&case.store, &case.bucket);
+
+            start_transitioned_entry_decommission(store, bucket).await;
+            let expiry_queue = crate::bucket::lifecycle::bucket_lifecycle_ops::HeldExpiryQueue::hold().await;
+            let routine = spawn_decommission_routine(store, 1)
+                .await
+                .expect("the decommission routine task should join");
+            expiry_queue.release().await;
+            routine.expect("the decommission should pass its post-check");
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert!(
+                info.complete && !info.failed && !info.canceled,
+                "complete={}, failed={}, canceled={}",
+                info.complete,
+                info.failed,
+                info.canceled
+            );
+            assert_eq!(info.items_decommission_failed, 0);
+            drop(local);
+
+            let free_version = assert_expired_version_owner_moved(&case).await;
+            let owner = crate::object_api::ObjectInfo::from_file_info(&free_version, bucket, &free_version.name, true);
+            assert!(
+                crate::bucket::lifecycle::bucket_lifecycle_ops::cleanup_free_version_exact(
+                    Arc::clone(store),
+                    &owner,
+                    &CancellationToken::new(),
+                )
+                .await
+                .expect("the moved free version should be consumed"),
+                "the moved free version must own the expired remote object"
+            );
+            assert!(!case.backend.contains(&case.expired.transitioned_objname).await);
+            assert!(
+                case.backend.contains(&case.moved.transitioned_objname).await,
+                "the moved version keeps its remote object"
+            );
+            assert_eq!(case.backend.remove_count().await, 1, "the expired remote object is deleted exactly once");
+            let mut left = Vec::new();
+            for pool_index in [0, 1, 2] {
+                left.extend(exact_versions(store, pool_index, bucket, case.object).await);
+            }
+            assert_eq!(left.len(), 1, "only the moved version remains: {left:?}");
+            assert_eq!(left[0].version_id, case.moved.version_id);
+        });
+    }
+
+    /// A transitioned version's expiry that cannot be applied leaves the
+    /// version live: it moves to a target like any other version, so the
+    /// entry neither fails nor leaves an owner of its remote object behind.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_moves_a_transitioned_version_whose_expiry_cannot_be_applied() {
+        run_large_stack_async_test("decommission-expiry-not-applied", || async {
+            let case = put_expired_and_moved_transitioned_versions("expiry-not-applied").await;
+            let (store, bucket) = (&case.store, &case.bucket);
+
+            start_transitioned_entry_decommission(store, bucket).await;
+            let _fault = DecommissionTestFaultGuard::install(Arc::new(|stage, _, _, _, _| stage == "lifecycle_expiry_apply"));
+            spawn_decommission_routine(store, 1)
+                .await
+                .expect("the decommission routine task should join")
+                .expect("the decommission should pass its post-check");
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert!(
+                info.complete && !info.failed && !info.canceled,
+                "complete={}, failed={}, canceled={}",
+                info.complete,
+                info.failed,
+                info.canceled
+            );
+            assert_eq!(info.items_decommission_failed, 0);
+            drop(local);
+
+            assert_versions_moved_live(store, bucket, case.object, &case.backend, &[&case.expired, &case.moved]).await;
+        });
+    }
+
+    /// The source holds nothing, and the target pools hold every source
+    /// version as a live version with its own remote tuple. No tier free
+    /// version was created and no remote object was deleted.
+    async fn assert_versions_moved_live(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        backend: &crate::services::tier::test_util::MockWarmBackend,
+        sources: &[&rustfs_filemeta::FileInfo],
+    ) {
+        let left = exact_versions(store, 0, bucket, object).await;
+        assert!(left.is_empty(), "the source must keep nothing: {left:?}");
+        let mut moved = Vec::new();
+        for target_pool_index in [1, 2] {
+            moved.extend(exact_versions(store, target_pool_index, bucket, object).await);
+        }
+        assert!(moved.iter().all(|version| !version.tier_free_version()), "{moved:?}");
+        assert_eq!(moved.len(), sources.len(), "every version moves as a version: {moved:?}");
+        for source in sources {
+            let copy = moved
+                .iter()
+                .find(|version| version.version_id == source.version_id)
+                .expect("each source version should move");
+            assert_same_remote_tuple(copy, source);
+            assert!(backend.contains(&source.transitioned_objname).await);
+        }
+        assert_eq!(backend.remove_count().await, 0);
+    }
+
+    /// An ExpiredObjectAllVersions rule expires a transitioned version with a
+    /// prefix delete that needs the bucket lifecycle write lock. Applying it
+    /// inline would wait on the entry's own lifecycle read lock until the
+    /// lock timeout, and block every write in the bucket meanwhile. The
+    /// version moves live instead, without waiting for that lock.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_moves_a_transitioned_version_expired_by_a_delete_all_rule_without_stalling() {
+        run_large_stack_async_test("decommission-delete-all-transitioned", || async {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("delete-all-transitioned");
+            let object = "all-versions.bin";
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        versioning_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create the versioned bucket");
+            let tier_name = format!("DECOMTIER{}", &uuid::Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+            let backend = register_mock_tier(&store.pools[0].instance_ctx().tier_config_mgr(), &tier_name).await;
+            let now = time::OffsetDateTime::now_utc();
+            put_transitioned_source_version(&store, &bucket, object, &tier_name, true, Some(now - time::Duration::days(10)))
+                .await;
+            let source = exact_versions(&store, 0, &bucket, object).await;
+            assert_eq!(source.len(), 1);
+            let lifecycle_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+  <Rule>
+    <ID>expire-all-versions</ID>
+    <Status>Enabled</Status>
+    <Filter>
+      <Prefix></Prefix>
+    </Filter>
+    <Expiration>
+      <Days>1</Days>
+      <ExpiredObjectAllVersions>true</ExpiredObjectAllVersions>
+    </Expiration>
+  </Rule>
+</LifecycleConfiguration>"#;
+            crate::bucket::metadata_sys::update_in(
+                &store.ctx,
+                &bucket,
+                crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG,
+                lifecycle_xml.as_bytes().to_vec(),
+            )
+            .await
+            .expect("store the delete-all expiration rule");
+            let lifecycle = crate::bucket::lifecycle::get_expiry_configs(&store, &bucket)
+                .await
+                .expect("the bucket lifecycle configuration should load")
+                .lifecycle
+                .map(|config| (*config).clone())
+                .expect("the bucket should have a lifecycle configuration");
+
+            start_transitioned_entry_decommission(&store, &bucket).await;
+            let started = std::time::Instant::now();
+            store
+                .decommission_entry_for_test_with_lifecycle(
+                    0,
+                    MetaCacheEntry {
+                        name: object.to_string(),
+                        ..Default::default()
+                    },
+                    bucket.clone(),
+                    store.pools[0].get_disks_by_key(object),
+                    Some(lifecycle),
+                )
+                .await
+                .expect("the entry should finish");
+            let elapsed = started.elapsed();
+            // The lock timeout is 5 seconds by default.
+            assert!(
+                elapsed < Duration::from_secs(4),
+                "the entry must not wait for the bucket lifecycle write lock: {elapsed:?}"
+            );
+
+            assert_versions_moved_live(&store, &bucket, object, &backend, &[&source[0]]).await;
+        });
+    }
+
+    /// The version is deleted between the entry's inventory and its lifecycle
+    /// expiry, so the expiry is genuinely not applied. The entry does not
+    /// fail: its retry moves the tier free version that the delete left.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_moves_the_free_version_left_when_the_expired_version_was_deleted_first() {
+        run_large_stack_async_test("decommission-expired-version-deleted-first", || async {
+            let case = put_expired_and_moved_transitioned_versions("expired-deleted-first").await;
+            let (store, bucket, object) = (&case.store, &case.bucket, case.object);
+            let lifecycle = crate::bucket::lifecycle::get_expiry_configs(store, bucket)
+                .await
+                .expect("the bucket lifecycle configuration should load")
+                .lifecycle
+                .map(|config| (*config).clone())
+                .expect("the bucket should have a lifecycle configuration");
+
+            start_transitioned_entry_decommission(store, bucket).await;
+            let expiry_queue = crate::bucket::lifecycle::bucket_lifecycle_ops::HeldExpiryQueue::hold().await;
+            let barrier = crate::core::pools::LifecycleDataMovementMutationBarrier::install(bucket, object);
+            let entry = tokio::spawn({
+                let (store, bucket) = (Arc::clone(store), bucket.clone());
+                async move {
+                    store
+                        .decommission_entry_for_test_with_lifecycle(
+                            0,
+                            MetaCacheEntry {
+                                name: object.to_string(),
+                                ..Default::default()
+                            },
+                            bucket,
+                            store.pools[0].get_disks_by_key(object),
+                            Some(lifecycle),
+                        )
+                        .await
+                }
+            });
+            barrier.wait_until_paused().await;
+            // A client deletes the expired version first, so the expiry no
+            // longer finds it. That delete leaves the version's tier free
+            // version on the source.
+            store.pools[0]
+                .delete_object(
+                    bucket,
+                    object,
+                    ObjectOptions {
+                        versioned: true,
+                        version_id: case.expired.version_id.map(|version_id| version_id.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("delete the expired version");
+            barrier.release();
+            drop(barrier);
+            let result = entry.await.expect("the entry task should join");
+            expiry_queue.release().await;
+            result.expect("an expiry that was not applied must not fail the entry");
+
+            assert_expired_version_owner_moved(&case).await;
+        });
+    }
+
+    /// The free-version worker consumes the expired version's free version
+    /// as soon as the inline expiry creates it, before the entry moves it.
+    /// The entry then finishes without it, and the remote object is deleted
+    /// once.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_finishes_when_the_free_version_worker_consumes_the_expired_version_first() {
+        run_large_stack_async_test("decommission-expired-free-version-consumed", || async {
+            let case = put_expired_and_moved_transitioned_versions("expired-consumed").await;
+            let (store, bucket, object) = (&case.store, &case.bucket, case.object);
+            let lifecycle = crate::bucket::lifecycle::get_expiry_configs(store, bucket)
+                .await
+                .expect("the bucket lifecycle configuration should load")
+                .lifecycle
+                .map(|config| (*config).clone())
+                .expect("the bucket should have a lifecycle configuration");
+
+            start_transitioned_entry_decommission(store, bucket).await;
+            let expiry_queue = crate::bucket::lifecycle::bucket_lifecycle_ops::HeldExpiryQueue::hold().await;
+            let consumed = Arc::new(AtomicUsize::new(0));
+            let _hook = crate::core::pools::DecommissionCleanupMutationGuard::install(Arc::new({
+                let (store, consumed) = (Arc::clone(store), Arc::clone(&consumed));
+                move |bucket: &str, object: &str, _attempt: usize| {
+                    let (store, consumed, bucket, object) =
+                        (Arc::clone(&store), Arc::clone(&consumed), bucket.to_string(), object.to_string());
+                    Box::pin(async move {
+                        for free_version in exact_versions(&store, 0, &bucket, &object)
+                            .await
+                            .into_iter()
+                            .filter(|version| version.tier_free_version())
+                        {
+                            let owner =
+                                crate::object_api::ObjectInfo::from_file_info(&free_version, &bucket, &free_version.name, true);
+                            if crate::bucket::lifecycle::bucket_lifecycle_ops::cleanup_free_version_exact(
+                                Arc::clone(&store),
+                                &owner,
+                                &CancellationToken::new(),
+                            )
+                            .await
+                            .expect("the worker should consume the source free version")
+                            {
+                                consumed.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                    })
+                }
+            }));
+            let result = store
+                .decommission_entry_for_test_with_lifecycle(
+                    0,
+                    MetaCacheEntry {
+                        name: object.to_string(),
+                        ..Default::default()
+                    },
+                    bucket.clone(),
+                    store.pools[0].get_disks_by_key(object),
+                    Some(lifecycle),
+                )
+                .await;
+            expiry_queue.release().await;
+            result.expect("the entry should finish");
+            assert_eq!(
+                consumed.load(Ordering::SeqCst),
+                1,
+                "the worker consumes the expired version's free version"
+            );
+
+            let left = exact_versions(store, 0, bucket, object).await;
+            assert!(left.is_empty(), "the source must keep nothing: {left:?}");
             let mut owners = Vec::new();
             for target_pool_index in [1, 2] {
-                owners.extend(exact_versions(&store, target_pool_index, &bucket, object).await);
+                owners.extend(exact_versions(store, target_pool_index, bucket, object).await);
             }
-            assert_eq!(owners.len(), 1, "only the current version moves: {owners:?}");
-            assert!(!owners[0].tier_free_version());
-            assert_eq!(owners[0].version_id, moved.version_id);
-            assert_same_remote_tuple(&owners[0], &moved);
-            for remote in [&expired.transitioned_objname, &moved.transitioned_objname] {
-                assert!(backend.contains(remote).await, "no remote object may be deleted by the move");
-            }
-            assert_eq!(backend.remove_count().await, 0);
+            assert_eq!(owners.len(), 1, "only the moved version remains: {owners:?}");
+            assert_eq!(owners[0].version_id, case.moved.version_id);
+            assert_same_remote_tuple(&owners[0], &case.moved);
+            assert!(!case.backend.contains(&case.expired.transitioned_objname).await);
+            assert!(case.backend.contains(&case.moved.transitioned_objname).await);
+            assert_eq!(case.backend.remove_count().await, 1, "the expired remote object is deleted once");
         });
     }
 
@@ -7074,10 +8601,27 @@ mod decommission_lock_order_tests {
                 .expect("read the entire retained source");
             assert_eq!(actual, body);
 
+            // A new publication captures the surviving membership even while
+            // the storage handle retains its old node-local metadata.
+            let surviving_pools: Arc<[usize]> = Arc::from([1, 2]);
             for set in &writer.pools[2].disk_set {
+                let stale = writer
+                    .save_scanner_pause_backlog_replica(
+                        2,
+                        set.set_index,
+                        b"late stale-cohort target update".to_vec(),
+                        crate::storage_api_contracts::object::HTTPPreconditions {
+                            if_none_match: Some("*".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect_err("the stale cohort must also fence publication on a healthy target");
+                assert!(matches!(stale, crate::error::Error::SlowDown));
+
                 let target_body = format!("surviving native scanner set {}", set.set_index).into_bytes();
                 let committed = writer
-                    .save_scanner_pause_backlog_replica(
+                    .save_scanner_pause_backlog_replica_for_membership(
                         2,
                         set.set_index,
                         target_body.clone(),
@@ -7085,11 +8629,12 @@ mod decommission_lock_order_tests {
                             if_none_match: Some("*".to_string()),
                             ..Default::default()
                         },
+                        Arc::clone(&surviving_pools),
                     )
                     .await
-                    .expect("every reserved healthy target set must still accept scanner replicas");
+                    .expect("the current surviving cohort must admit every reserved healthy target set");
                 let conflict = writer
-                    .save_scanner_pause_backlog_replica(
+                    .save_scanner_pause_backlog_replica_for_membership(
                         2,
                         set.set_index,
                         b"must not bypass CAS".to_vec(),
@@ -7097,6 +8642,7 @@ mod decommission_lock_order_tests {
                             if_match: Some("stale-native-revision".to_string()),
                             ..Default::default()
                         },
+                        Arc::clone(&surviving_pools),
                     )
                     .await
                     .expect_err("capacity admission must retain the native writer's CAS");
@@ -7113,6 +8659,10 @@ mod decommission_lock_order_tests {
                     .expect("read the complete native target");
                 assert_eq!(actual, target_body);
             }
+            assert!(
+                writer.pool_meta.read().await.pools[0].decommission.is_none(),
+                "valid captured membership must work without refreshing the writer's stale snapshot"
+            );
             for (pool_index, set_index) in [(writer.pools.len(), 0), (0, writer.pools[0].disk_set.len())] {
                 assert!(matches!(
                     writer

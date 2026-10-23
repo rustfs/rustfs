@@ -58,11 +58,12 @@ use super::super::{
     record_get_codec_streaming_gate_decision, record_get_direct_memory_decision, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_object_reader_path_observation, record_get_stage_duration_if_enabled,
     record_lock_acquire, reduce_write_quorum_errs, release_materialized_read_lock, replication_write_may_pass_worm_gate,
-    require_restore_operation_id, resolve_delete_version_state, resolve_tiered_decommission_write_quorum_result,
-    resolve_write_layout, restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata, send_event,
-    set_disk_delete_creates_delete_marker, should_force_delete_marker_for_missing_version,
-    should_persist_encryption_original_size, should_preserve_delete_replication_state, should_use_inline_fast_path_with_plan,
-    take_prepared_get_object_metadata, to_object_err, try_read_inline_data_shards_direct, warn,
+    republishes_data_movement_delete_marker, require_restore_operation_id, resolve_delete_version_state,
+    resolve_tiered_decommission_write_quorum_result, resolve_write_layout, restore_commit_operation_id_from_metadata,
+    restore_operation_id_from_metadata, send_event, set_disk_delete_creates_delete_marker,
+    should_force_delete_marker_for_missing_version, should_persist_encryption_original_size,
+    should_preserve_delete_replication_state, should_use_inline_fast_path_with_plan, take_prepared_get_object_metadata,
+    to_object_err, try_read_inline_data_shards_direct, warn,
 };
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
 use super::delete_recovery::DeleteRecoveryContext;
@@ -10826,7 +10827,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
             fi.set_tier_free_version_id(&find_vid.to_string());
 
-            if let Some(incarnation) = opts.expected_bucket_incarnation_id {
+            let marker_incarnation = if republishes_data_movement_delete_marker(&opts, &goi, version_found) {
+                // Keep the existing marker's birth identity, including an
+                // unknown legacy identity, identical on newly repaired disks.
+                authoritative_file_info.delete_marker_incarnation()
+            } else {
+                opts.expected_bucket_incarnation_id
+            };
+            if let Some(incarnation) = marker_incarnation {
                 fi.set_delete_marker_incarnation(incarnation);
             }
 
@@ -10857,6 +10865,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             )
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
+            if republishes_data_movement_delete_marker(&opts, &goi, version_found)
+                && let Some(version_id) = opts.version_id.as_deref()
+            {
+                self.verify_data_movement_delete_marker_write_quorum(bucket, object, version_id)
+                    .await?;
+            }
             #[cfg(test)]
             pause_delete_object_commit_after_publish(bucket, object).await;
 
@@ -27057,3 +27071,6 @@ mod delete_recovery_inventory_tests {
         assert!(errors.iter().all(Option::is_none), "DELETE result must remain successful: {errors:?}");
     }
 }
+
+#[cfg(all(test, feature = "test-util"))]
+mod data_movement_prefix_cleanup_tests;

@@ -15,9 +15,12 @@
 // #730: data-movement migration keeps staged cleanup helpers until copy paths converge.
 
 pub(crate) mod backpressure;
+#[cfg(feature = "e2e-test-hooks")]
+pub(crate) mod e2e_barrier;
 pub(crate) mod scanner_backlog;
 
 use crate::core::pools::{DecommissionCapacityOwner, decommission_capacity_mutation_id};
+use crate::disk::error::DiskError;
 use crate::error::{
     Error, Result, is_err_data_movement_overwrite, is_err_invalid_upload_id, is_err_object_not_found, is_err_version_not_found,
 };
@@ -71,7 +74,9 @@ impl<R> IndexedDataMovementReader<R> {
 
 impl<R: AsyncRead + Unpin + Send + Sync> AsyncRead for IndexedDataMovementReader<R> {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        Pin::new(&mut self.inner)
+            .poll_read(cx, buf)
+            .map(|result| result.map_err(data_movement_source_stream_error))
     }
 }
 
@@ -645,11 +650,16 @@ pub(crate) fn data_movement_stage_source(err: &Error) -> Option<&Error> {
     let Error::Io(io_err) = err else {
         return None;
     };
-    io_err
-        .get_ref()?
-        .downcast_ref::<DataMovementStageError>()?
-        .source
-        .downcast_ref::<Error>()
+    let source = io_err.get_ref()?;
+    if let Some(failure) = source.downcast_ref::<DataMovementSourceReadFailure>() {
+        return Some(&failure.0);
+    }
+    let source = &source.downcast_ref::<DataMovementStageError>()?.source;
+    source.downcast_ref::<Error>().or_else(|| {
+        source
+            .downcast_ref::<DataMovementSourceReadFailure>()
+            .map(|failure| &failure.0)
+    })
 }
 
 /// Recover a concrete typed error wrapped by [`data_movement_stage_error`].
@@ -665,6 +675,59 @@ where
         .downcast_ref::<DataMovementStageError>()?
         .source
         .downcast_ref::<T>()
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct DataMovementSourceReadFailure(#[source] Error);
+
+pub(crate) fn is_data_movement_source_read_error(err: &Error) -> bool {
+    if data_movement_stage_source_as::<DataMovementSourceReadFailure>(err).is_some()
+        || matches!(err, Error::Io(io_err) if io_err.get_ref().is_some_and(|source| source.is::<DataMovementSourceReadFailure>()))
+    {
+        return true;
+    }
+    data_movement_stage_source(err).is_some_and(is_data_movement_source_read_error)
+}
+
+fn data_movement_source_stream_error(err: std::io::Error) -> std::io::Error {
+    let Some(source) = err.get_ref() else {
+        return err;
+    };
+    let is_quorum = matches!(
+        source.downcast_ref::<Error>(),
+        Some(
+            Error::ErasureReadQuorum
+                | Error::ErasureWriteQuorum
+                | Error::InsufficientReadQuorum(_, _)
+                | Error::InsufficientWriteQuorum(_, _)
+        )
+    ) || matches!(
+        source.downcast_ref::<DiskError>(),
+        Some(DiskError::ErasureReadQuorum | DiskError::ErasureWriteQuorum)
+    );
+    if !is_quorum {
+        return err;
+    }
+    std::io::Error::new(err.kind(), DataMovementSourceReadFailure(Error::from(err)))
+}
+
+/// Keep source metadata quorum failures distinct from target writes so
+/// decommission retains its per-object failure policy.
+pub(crate) fn data_movement_source_read_error(bucket: &str, object: &str, err: Error) -> Error {
+    if matches!(
+        err,
+        Error::ErasureReadQuorum
+            | Error::ErasureWriteQuorum
+            | Error::InsufficientReadQuorum(_, _)
+            | Error::InsufficientWriteQuorum(_, _)
+    ) {
+        return data_movement_context_error(
+            format!("data movement source read failed for {bucket}/{object}: {err}"),
+            DataMovementSourceReadFailure(err),
+        );
+    }
+    err
 }
 
 fn schedule_data_movement_multipart_abort_cleanup(
@@ -1444,6 +1507,10 @@ pub(crate) async fn cleanup_source_entry_if_unchanged(
 
     #[cfg(any(test, feature = "test-util"))]
     pause_source_cleanup_before_delete(bucket, object).await;
+    #[cfg(feature = "e2e-test-hooks")]
+    e2e_barrier::wait(op_label, bucket, object, e2e_barrier::STAGE_BEFORE_SOURCE_CLEANUP)
+        .await
+        .map_err(|err| SourceCleanupError::Storage(Error::from(err)))?;
 
     let mut opts = ObjectOptions {
         delete_prefix: true,
@@ -1639,7 +1706,16 @@ fn data_movement_part_stage_error(
     err: Error,
 ) -> Error {
     let rendered = format!("{op_label}: {stage} failed for {bucket}/{object} part {part_number}: {err}");
-    if matches!(&err, Error::DecommissionCapacityBlocked { .. }) {
+    if matches!(&err, Error::DecommissionCapacityBlocked { .. })
+        || (stage == "put_object_part"
+            && matches!(
+                &err,
+                Error::ErasureReadQuorum
+                    | Error::ErasureWriteQuorum
+                    | Error::InsufficientReadQuorum(_, _)
+                    | Error::InsufficientWriteQuorum(_, _)
+            ))
+    {
         return data_movement_context_error(rendered, err);
     }
     // A missing target part is not evidence that the source can be deleted.
@@ -1668,7 +1744,7 @@ fn is_data_movement_part_read_error(err: &Error) -> bool {
                 .is_some_and(is_unexpected_eof)
     }
 
-    matches!(err, Error::Io(io_err) if is_unexpected_eof(io_err))
+    is_data_movement_source_read_error(err) || matches!(err, Error::Io(io_err) if is_unexpected_eof(io_err))
 }
 
 fn data_movement_part_upload_failure_stage(err: &Error) -> &'static str {
@@ -1692,8 +1768,11 @@ pub(crate) async fn migrate_decommission_object(
     let mutation_fence = store
         .acquire_decommission_object_mutation_fence(&bucket, &source.name)
         .await?;
-    let current = find_data_movement_target_info(store.as_ref(), pool_idx, &bucket, &source)
-        .await?
+    let current = find_data_movement_target_info(store.as_ref(), pool_idx, &bucket, &source).await;
+    #[cfg(test)]
+    let current = crate::core::pools::decommission_test_wrap_result("source_recheck", &bucket, &source.name, 0, current);
+    let current = current
+        .map_err(|err| data_movement_source_read_error(&bucket, &source.name, err))?
         .ok_or(Error::FileNotFound)?;
     if !is_equivalent_data_movement_object_identity(&source, &current, true, false) {
         return Err(Error::FileNotFound);
@@ -1969,6 +2048,23 @@ async fn migrate_object_inner(
                 };
             }
 
+            #[cfg(feature = "e2e-test-hooks")]
+            e2e_barrier::wait(
+                op_label,
+                bucket.as_str(),
+                object_info.name.as_str(),
+                e2e_barrier::STAGE_BEFORE_TARGET_COMMIT,
+            )
+            .await
+            .map_err(|err| {
+                data_movement_stage_error(
+                    op_label,
+                    "complete_multipart_upload",
+                    bucket.as_str(),
+                    object_info.name.as_str(),
+                    Error::from(err),
+                )
+            })?;
             let mut complete_multipart_opts =
                 data_movement_complete_multipart_opts(&object_info, pool_idx, preserve_part_checksums).map_err(|err| {
                     data_movement_stage_error(
@@ -2611,6 +2707,54 @@ mod tests {
     }
 
     #[test]
+    fn source_read_quorum_error_keeps_its_source_and_origin() {
+        let original = Error::InsufficientReadQuorum("bucket-a".to_owned(), "object-a".to_owned());
+        let wrapped = data_movement_source_read_error("bucket-a", "object-a", original.clone());
+        let failure = data_movement_stage_source_as::<DataMovementSourceReadFailure>(&wrapped)
+            .expect("the error must retain its source-read origin");
+        let source = std::error::Error::source(failure)
+            .and_then(|source| source.downcast_ref::<Error>())
+            .expect("the original storage error must remain in the error chain");
+        assert_eq!(source.to_string(), original.to_string());
+        assert!(is_data_movement_source_read_error(&wrapped));
+        assert!(matches!(data_movement_stage_source(&wrapped), Some(Error::InsufficientReadQuorum(_, _))));
+
+        assert!(matches!(
+            data_movement_source_read_error("bucket-a", "object-a", Error::FileNotFound),
+            Error::FileNotFound
+        ));
+        assert!(matches!(
+            data_movement_source_read_error("bucket-a", "object-a", Error::DiskFull),
+            Error::DiskFull
+        ));
+    }
+
+    #[test]
+    fn source_stream_quorum_keeps_its_kind_origin_and_original_error_through_put_stage() {
+        for source_error in [
+            std::io::Error::new(std::io::ErrorKind::InvalidData, Error::ErasureReadQuorum),
+            std::io::Error::new(std::io::ErrorKind::InvalidData, DiskError::ErasureReadQuorum),
+        ] {
+            let marked = data_movement_source_stream_error(source_error);
+            assert_eq!(marked.kind(), std::io::ErrorKind::InvalidData);
+            let source = Error::from(marked);
+            assert!(is_data_movement_source_read_error(&source));
+            assert_eq!(data_movement_part_upload_failure_stage(&source), "read_part");
+            let wrapped = data_movement_stage_error("decommission_object", "put_object", "bucket-a", "object-a", source);
+            assert!(is_data_movement_source_read_error(&wrapped));
+            // Rebalance unwraps each stage before checking whether quorum is transient.
+            let mut original = &wrapped;
+            while let Some(source) = data_movement_stage_source(original) {
+                original = source;
+            }
+            assert!(matches!(original, Error::ErasureReadQuorum));
+        }
+        let unrelated = data_movement_source_stream_error(std::io::Error::new(std::io::ErrorKind::TimedOut, "source timeout"));
+        assert_eq!(unrelated.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(unrelated.to_string(), "source timeout");
+    }
+
+    #[test]
     fn test_data_movement_part_stage_error_includes_stage_object_and_part() {
         let err =
             data_movement_part_stage_error("rebalance_object", "put_object_part", "bucket-a", "object-a", 7, Error::SlowDown);
@@ -2635,7 +2779,15 @@ mod tests {
 
     #[test]
     fn test_data_movement_part_upload_failure_stage_keeps_write_errors() {
-        assert_eq!(data_movement_part_upload_failure_stage(&Error::SlowDown), "put_object_part");
+        for target_error in [
+            Error::SlowDown,
+            Error::ErasureReadQuorum,
+            Error::ErasureWriteQuorum,
+            Error::InsufficientReadQuorum("bucket-a".to_owned(), "object-a".to_owned()),
+            Error::InsufficientWriteQuorum("bucket-a".to_owned(), "object-a".to_owned()),
+        ] {
+            assert_eq!(data_movement_part_upload_failure_stage(&target_error), "put_object_part");
+        }
     }
 
     #[test]

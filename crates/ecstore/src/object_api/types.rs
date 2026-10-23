@@ -1026,8 +1026,9 @@ pub struct ObjectOptions {
     /// fence avoids recursively acquiring the read lock behind a queued writer.
     pub bucket_lifecycle_lock_fence: Option<NamespaceLockFence>,
     /// Retains the actual lifecycle guard for an owned multipart commit. A
-    /// lock-loss fence alone does not keep a cancelled caller's lock alive.
-    pub bucket_lifecycle_lock_owner: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
+    /// lock-loss fence alone does not keep a cancelled caller's lock alive. The
+    /// owner also retains the continuous incarnation-validation coverage.
+    pub bucket_lifecycle_lock_owner: Option<Arc<crate::store::BucketIncarnationFenceGuard>>,
     pub replication_request: bool,
     /// True when the inbound request carried the
     /// `{x-rustfs-,x-minio-}source-proxy-request` header family with the
@@ -1436,7 +1437,27 @@ fn update_replication_fingerprint_optional_str(hasher: &mut Sha256, value: Optio
     }
 }
 
-#[derive(Debug, Default)]
+static EMPTY_USER_DEFINED: std::sync::LazyLock<Arc<HashMap<String, String>>> =
+    std::sync::LazyLock::new(|| Arc::new(HashMap::new()));
+static EMPTY_USER_TAGS: std::sync::LazyLock<Arc<String>> = std::sync::LazyLock::new(|| Arc::new(String::new()));
+static EMPTY_PARTS: std::sync::LazyLock<Arc<Vec<ObjectPartInfo>>> = std::sync::LazyLock::new(|| Arc::new(Vec::new()));
+
+#[inline]
+fn empty_user_defined() -> Arc<HashMap<String, String>> {
+    Arc::clone(&EMPTY_USER_DEFINED)
+}
+
+#[inline]
+fn empty_user_tags() -> Arc<String> {
+    Arc::clone(&EMPTY_USER_TAGS)
+}
+
+#[inline]
+fn empty_parts() -> Arc<Vec<ObjectPartInfo>> {
+    Arc::clone(&EMPTY_PARTS)
+}
+
+#[derive(Debug)]
 pub struct ObjectInfo {
     pub bucket: String,
     pub name: String,
@@ -1482,6 +1503,50 @@ pub struct ObjectInfo {
     /// published by the same upload. Callers must not repeat quota, replication,
     /// lifecycle, or object-created side effects for that response.
     pub multipart_completion_replayed: bool,
+}
+
+impl Default for ObjectInfo {
+    fn default() -> Self {
+        Self {
+            bucket: String::new(),
+            name: String::new(),
+            storage_class: None,
+            mod_time: None,
+            size: 0,
+            actual_size: 0,
+            is_dir: false,
+            user_defined: empty_user_defined(),
+            parity_blocks: 0,
+            data_blocks: 0,
+            version_id: None,
+            data_dir: None,
+            delete_marker: false,
+            transitioned_object: TransitionedObject::default(),
+            transition_version_state: rustfs_filemeta::TransitionVersionState::default(),
+            restore_ongoing: false,
+            restore_expires: None,
+            user_tags: empty_user_tags(),
+            parts: empty_parts(),
+            is_latest: false,
+            content_type: None,
+            content_encoding: None,
+            expires: None,
+            num_versions: 0,
+            successor_mod_time: None,
+            put_object_reader: None,
+            etag: None,
+            inlined: false,
+            metadata_only: false,
+            version_only: false,
+            replication_status_internal: None,
+            replication_status: ReplicationStatusType::default(),
+            version_purge_status_internal: None,
+            version_purge_status: VersionPurgeStatusType::default(),
+            replication_decision: String::new(),
+            checksum: None,
+            multipart_completion_replayed: false,
+        }
+    }
 }
 
 impl Clone for ObjectInfo {
@@ -1833,8 +1898,45 @@ impl ObjectInfo {
         Self::from_file_info_with_version_id(fi, bucket, object, version_id)
     }
 
+    pub fn from_owned_file_info(mut fi: FileInfo, bucket: &str, object: &str, versioned: bool) -> ObjectInfo {
+        let mut version_id = fi.version_id;
+
+        if versioned && version_id.is_none() {
+            version_id = Some(Uuid::nil())
+        }
+
+        let inlined = fi.inline_data();
+        let free_version = fi.tier_free_version();
+        let metadata = std::mem::take(&mut fi.metadata);
+        let parts = std::mem::take(&mut fi.parts);
+        Self::from_file_info_parts(&fi, inlined, free_version, metadata, parts, bucket, object, version_id)
+    }
+
     pub(crate) fn from_file_info_with_version_id(
         fi: &FileInfo,
+        bucket: &str,
+        object: &str,
+        version_id: Option<Uuid>,
+    ) -> ObjectInfo {
+        Self::from_file_info_parts(
+            fi,
+            fi.inline_data(),
+            fi.tier_free_version(),
+            fi.metadata.clone(),
+            fi.parts.clone(),
+            bucket,
+            object,
+            version_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_file_info_parts(
+        fi: &FileInfo,
+        inlined: bool,
+        free_version: bool,
+        mut metadata: HashMap<String, String>,
+        parts: Vec<ObjectPartInfo>,
         bucket: &str,
         object: &str,
         version_id: Option<Uuid>,
@@ -1843,33 +1945,30 @@ impl ObjectInfo {
 
         // etag
         let (content_type, content_encoding, etag) = {
-            let content_type = fi.metadata.get("content-type").cloned();
-            let content_encoding = fi.metadata.get("content-encoding").cloned();
-            let etag = fi.metadata.get("etag").cloned();
+            let content_type = metadata.get("content-type").cloned();
+            let content_encoding = metadata.get("content-encoding").cloned();
+            let etag = metadata.remove("etag");
 
             (content_type, content_encoding, etag)
         };
 
         // tags
-        let user_tags: Arc<String> = fi
-            .metadata
-            .get(AMZ_OBJECT_TAGGING)
-            .map(|s| Arc::new(s.clone()))
-            .unwrap_or_default();
-
-        let inlined = fi.inline_data();
+        let user_tags: Arc<String> = metadata
+            .remove(AMZ_OBJECT_TAGGING)
+            .map(Arc::new)
+            .unwrap_or_else(empty_user_tags);
 
         // Parse expires from metadata (HTTP date format RFC 7231 or ISO 8601)
-        let expires = fi.metadata.get("expires").and_then(|s| {
+        let expires = metadata.remove("expires").and_then(|s| {
             // Try parsing as ISO 8601 first
-            OffsetDateTime::parse(s, &time::format_description::well_known::Iso8601::DEFAULT)
+            OffsetDateTime::parse(&s, &time::format_description::well_known::Iso8601::DEFAULT)
                 .or_else(|_| {
                     // Try RFC 2822 format
-                    OffsetDateTime::parse(s, &time::format_description::well_known::Rfc2822)
+                    OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc2822)
                 })
                 .or_else(|_| {
                     // Try RFC 3339 format
-                    OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+                    OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc3339)
                 })
                 .ok()
         });
@@ -1890,7 +1989,7 @@ impl ObjectInfo {
 
         let mut replication_status = replication_status_from_filemeta(fi.replication_status());
         if replication_status.is_empty()
-            && let Some(status) = fi.metadata.get(metadata_keys::REPLICATION_STATUS).cloned()
+            && let Some(status) = metadata.get(metadata_keys::REPLICATION_STATUS)
             && status == ReplicationStatusType::Replica.as_str()
         {
             replication_status = ReplicationStatusType::Replica;
@@ -1906,19 +2005,15 @@ impl ObjectInfo {
                 .or_else(|| fi.transition_version_id.map(|version_id| version_id.to_string()))
                 .unwrap_or_default(),
             status: fi.transition_status.clone(),
-            free_version: fi.tier_free_version(),
+            free_version,
             tier: fi.transition_tier.clone(),
         };
 
-        let metadata = {
-            let mut v = fi.metadata.clone();
-            clean_metadata(&mut v);
-            v
-        };
+        clean_metadata(&mut metadata);
 
         let storage_class = Some(
             storageclass::effective_class(
-                fi.metadata.get(metadata_keys::STORAGE_CLASS).map(String::as_str),
+                metadata.get(metadata_keys::STORAGE_CLASS).map(String::as_str),
                 (fi.transition_status == rustfs_filemeta::TRANSITION_COMPLETE && !fi.transition_tier.is_empty())
                     .then_some(fi.transition_tier.as_str()),
             )
@@ -1927,29 +2022,19 @@ impl ObjectInfo {
 
         let mut restore_ongoing = false;
         let mut restore_expires = None;
-        if let Some(restore_status) = fi.metadata.get(metadata_keys::RESTORE).cloned()
-            && let Ok(restore_status) = parse_restore_obj_status(&restore_status)
+        if let Some(restore_status) = metadata.get(metadata_keys::RESTORE)
+            && let Ok(restore_status) = parse_restore_obj_status(restore_status)
         {
             restore_ongoing = restore_status.on_going();
             restore_expires = restore_status.expiry();
         }
 
-        // Convert parts from rustfs_filemeta::ObjectPartInfo to object_api::ObjectPartInfo
-        let parts = fi
-            .parts
-            .iter()
-            .map(|part| ObjectPartInfo {
-                etag: part.etag.clone(),
-                index: part.index.clone(),
-                size: part.size,
-                actual_size: part.actual_size,
-                mod_time: part.mod_time,
-                checksums: part.checksums.clone(),
-                number: part.number,
-                error: part.error.clone(),
-                integrity: part.integrity.clone(),
-            })
-            .collect::<Vec<_>>();
+        let user_defined = if metadata.is_empty() {
+            empty_user_defined()
+        } else {
+            Arc::new(metadata)
+        };
+        let parts = if parts.is_empty() { empty_parts() } else { Arc::new(parts) };
 
         ObjectInfo {
             bucket: bucket.to_string(),
@@ -1962,7 +2047,7 @@ impl ObjectInfo {
             delete_marker: fi.deleted,
             mod_time: fi.mod_time,
             size: fi.size,
-            parts: Arc::new(parts),
+            parts,
             is_latest: fi.is_latest,
             user_tags,
             content_type,
@@ -1972,7 +2057,7 @@ impl ObjectInfo {
             successor_mod_time: fi.successor_mod_time,
             etag,
             inlined,
-            user_defined: Arc::new(metadata),
+            user_defined,
             transitioned_object,
             transition_version_state: fi.transition_version_state,
             checksum: fi.checksum.clone(),
@@ -2092,7 +2177,7 @@ impl ObjectInfo {
                     }
                 }
 
-                let file_infos = match entry.file_info_versions(bucket) {
+                let mut file_infos = match entry.file_info_versions(bucket) {
                     Ok(res) => res,
                     Err(err) => {
                         if fail_on_decode_error {
@@ -2103,19 +2188,18 @@ impl ObjectInfo {
                     }
                 };
 
-                let versions = if let Some(marker) = after_version_marker.take() {
-                    versions_after_marker(&file_infos, marker)
-                } else {
-                    &file_infos.versions
-                };
+                let start_idx = after_version_marker
+                    .take()
+                    .and_then(|marker| version_marker_index(&file_infos, marker))
+                    .map_or(0, |idx| idx + 1);
+                let versioned = vcfg.as_ref().is_some_and(|(v, _)| v.versioned(&entry.name));
 
-                for fi in versions.iter() {
+                for fi in file_infos.versions.drain(start_idx..) {
                     if !include_version_purge && !fi.version_purge_status().is_empty() {
                         continue;
                     }
 
-                    let versioned = vcfg.clone().map(|v| v.0.versioned(&entry.name)).unwrap_or_default();
-                    objects.push(ObjectInfo::from_file_info(fi, bucket, &entry.name, versioned));
+                    objects.push(ObjectInfo::from_owned_file_info(fi, bucket, &entry.name, versioned));
                 }
                 continue;
             }
@@ -2163,6 +2247,23 @@ impl ObjectInfo {
         let mut prev_prefix = "";
         for entry in entries.entries() {
             if entry.is_object() {
+                let matched_delimiter = delimiter.as_ref().and_then(|delimiter| {
+                    let remaining = if entry.name.starts_with(prefix) {
+                        &entry.name[prefix.len()..]
+                    } else {
+                        entry.name.as_str()
+                    };
+                    remaining.find(delimiter.as_str()).map(|idx| {
+                        let idx = prefix.len() + idx + delimiter.len();
+                        entry.name.get(0..idx)
+                    })
+                });
+                if let Some(Some(curr_prefix)) = matched_delimiter
+                    && curr_prefix == prev_prefix
+                {
+                    continue;
+                }
+
                 let fi = match entry.to_fileinfo(bucket) {
                     Ok(res) => Some(res),
                     Err(err) => {
@@ -2175,38 +2276,26 @@ impl ObjectInfo {
                     continue;
                 }
 
-                if let Some(delimiter) = &delimiter {
-                    let remaining = if entry.name.starts_with(prefix) {
-                        &entry.name[prefix.len()..]
-                    } else {
-                        entry.name.as_str()
-                    };
-                    if let Some(idx) = remaining.find(delimiter.as_str()) {
-                        let idx = prefix.len() + idx + delimiter.len();
-                        if let Some(curr_prefix) = entry.name.get(0..idx) {
-                            if curr_prefix == prev_prefix {
-                                continue;
-                            }
+                if let Some(maybe_prefix) = matched_delimiter {
+                    if let Some(curr_prefix) = maybe_prefix {
+                        prev_prefix = curr_prefix;
 
-                            prev_prefix = curr_prefix;
-
-                            objects.push(ObjectInfo {
-                                is_dir: true,
-                                bucket: bucket.to_owned(),
-                                name: curr_prefix.to_owned(),
-                                ..Default::default()
-                            });
-                        }
-                        continue;
+                        objects.push(ObjectInfo {
+                            is_dir: true,
+                            bucket: bucket.to_owned(),
+                            name: curr_prefix.to_owned(),
+                            ..Default::default()
+                        });
                     }
+                    continue;
                 }
 
                 let Some(fi) = fi else {
                     continue;
                 };
 
-                let versioned = vcfg.clone().map(|v| v.0.versioned(&entry.name)).unwrap_or_default();
-                objects.push(ObjectInfo::from_file_info(&fi, bucket, &entry.name, versioned));
+                let versioned = vcfg.as_ref().is_some_and(|(v, _)| v.versioned(&entry.name));
+                objects.push(ObjectInfo::from_owned_file_info(fi, bucket, &entry.name, versioned));
 
                 continue;
             }
@@ -2309,13 +2398,16 @@ impl ObjectInfo {
     }
 }
 
-fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker: VersionMarker) -> &[FileInfo] {
-    let marker_idx = match marker {
+fn version_marker_index(file_infos: &rustfs_filemeta::FileInfoVersions, marker: VersionMarker) -> Option<usize> {
+    match marker {
         VersionMarker::Null => file_infos.versions.iter().position(|version| version.version_id.is_none()),
         VersionMarker::Version(vid) => file_infos.find_version_index(vid),
-    };
+    }
+}
 
-    marker_idx
+#[cfg(test)]
+fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker: VersionMarker) -> &[FileInfo] {
+    version_marker_index(file_infos, marker)
         .map(|idx| &file_infos.versions[idx + 1..])
         .unwrap_or(&file_infos.versions)
 }
@@ -3615,5 +3707,79 @@ mod tests {
         assert!(opts.tier_free_version_receipt_sink.is_none());
         opts.ensure_lifecycle_delete_all_journal();
         assert!(opts.lifecycle_delete_all_journal().is_some());
+    }
+
+    #[tokio::test]
+    async fn from_owned_file_info_matches_borrowed_and_delimiter_skips_duplicate_prefix_decode() {
+        let valid_bytes = rustfs_filemeta::test_data::create_realistic_object_xlmeta().expect("realistic xl.meta");
+        let mut fi = rustfs_filemeta::FileMeta::load(&valid_bytes)
+            .expect("load realistic xl.meta")
+            .into_fileinfo("bucket", "photos/a.jpg", "", false, false, true)
+            .expect("decode fileinfo");
+        fi.metadata.insert("etag".to_string(), "etag-123".to_string());
+        fi.metadata.insert("md5Sum".to_string(), "md5-123".to_string());
+        fi.metadata.insert("expires".to_string(), "2024-01-16T10:30:00Z".to_string());
+        fi.metadata
+            .insert(AMZ_OBJECT_TAGGING.to_string(), "env=prod&team=storage".to_string());
+        fi.metadata
+            .insert(metadata_keys::STORAGE_CLASS.to_string(), "STANDARD".to_string());
+
+        fi.set_tier_free_version();
+        let borrowed = ObjectInfo::from_file_info(&fi, "bucket", "photos/a.jpg", true);
+        let owned = ObjectInfo::from_owned_file_info(fi, "bucket", "photos/a.jpg", true);
+        assert!(owned.inlined);
+        assert!(owned.transitioned_object.free_version);
+        assert_eq!(
+            (
+                &owned.bucket,
+                &owned.name,
+                owned.version_id,
+                owned.size,
+                owned.inlined,
+                owned.transitioned_object.free_version,
+                &owned.etag,
+                owned.expires,
+                &owned.user_tags,
+                &owned.user_defined,
+                &owned.parts,
+                &owned.storage_class
+            ),
+            (
+                &borrowed.bucket,
+                &borrowed.name,
+                borrowed.version_id,
+                borrowed.size,
+                borrowed.inlined,
+                borrowed.transitioned_object.free_version,
+                &borrowed.etag,
+                borrowed.expires,
+                &borrowed.user_tags,
+                &borrowed.user_defined,
+                &borrowed.parts,
+                &borrowed.storage_class
+            ),
+        );
+
+        let entries = MetaCacheEntriesSorted {
+            o: rustfs_filemeta::MetaCacheEntries(vec![
+                Some(rustfs_filemeta::MetaCacheEntry {
+                    name: "photos/a.jpg".to_string(),
+                    metadata: valid_bytes,
+                    cached: None,
+                    reusable: false,
+                }),
+                Some(rustfs_filemeta::MetaCacheEntry {
+                    name: "photos/b.jpg".to_string(),
+                    metadata: b"corrupt-duplicate-prefix-entry".to_vec(),
+                    cached: None,
+                    reusable: false,
+                }),
+            ]),
+            ..Default::default()
+        };
+        let grouped = ObjectInfo::from_meta_cache_entries_sorted_infos(&entries, "bucket", "", Some("/".to_string())).await;
+        assert_eq!(grouped.len(), 1);
+        assert!(grouped[0].is_dir);
+        assert_eq!(grouped[0].name, "photos/");
     }
 }

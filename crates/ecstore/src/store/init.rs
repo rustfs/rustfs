@@ -7241,6 +7241,280 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn data_movement_delete_marker_resume_repairs_read_quorum_only_target() {
+        use crate::disk::DiskAPI;
+        use tokio::io::AsyncReadExt;
+
+        let temp_dir = tempfile::tempdir().expect("create partial delete-marker target store");
+        let (_ctx, store, _shutdown) = Box::pin(without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "partial-marker-target",
+            &[4, 4],
+        )))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("dm-partial-marker-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create partial marker bucket");
+        let incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("fixture bucket incarnation");
+        for (object, marker_id, marker_incarnation) in [
+            ("legacy-marker", uuid::Uuid::new_v4(), None),
+            ("versioned-object", uuid::Uuid::new_v4(), Some(incarnation)),
+            ("legacy-null-marker", uuid::Uuid::nil(), None),
+            ("null-marker", uuid::Uuid::nil(), Some(incarnation)),
+        ] {
+            let marker_time = OffsetDateTime::now_utc();
+            let marker_opts = ObjectOptions {
+                versioned: !marker_id.is_nil(),
+                version_suspended: marker_id.is_nil(),
+                data_movement: true,
+                version_id: Some(marker_id.to_string()),
+                delete_marker: true,
+                mod_time: Some(marker_time),
+                expected_bucket_incarnation_id: marker_incarnation,
+                ..Default::default()
+            };
+            store.pools[0]
+                .delete_object(&bucket, object, marker_opts.clone())
+                .await
+                .expect("seed the source delete marker");
+            let old_version = uuid::Uuid::new_v4();
+            store.pools[1]
+                .put_object(
+                    &bucket,
+                    object,
+                    &mut PutObjReader::from_vec(b"historical target body".to_vec()),
+                    &ObjectOptions {
+                        versioned: true,
+                        version_id: Some(old_version.to_string()),
+                        mod_time: Some(marker_time - time::Duration::SECOND),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed older target metadata on all disks");
+            let source = store.pools[0]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(&bucket, object)
+                .await
+                .expect("read source marker metadata")
+                .expect("source marker must exist")
+                .versions
+                .into_iter()
+                .find(|version| version.version_id.unwrap_or_default() == marker_id)
+                .expect("find source delete marker");
+            let target_set = store.pools[1].get_disks_by_key(object);
+            for disk in target_set.disk_inventory().await.into_iter().flatten().take(2) {
+                disk.write_metadata("", &bucket, object, source.clone())
+                    .await
+                    .expect("seed a read-quorum-only target marker");
+            }
+            target_set
+                .get_object_info(&bucket, object, &marker_opts)
+                .await
+                .expect("the exact marker is visible at read quorum");
+            store
+                .delete_object(
+                    &bucket,
+                    object,
+                    ObjectOptions {
+                        data_movement: true,
+                        src_pool_idx: 0,
+                        ..marker_opts.clone()
+                    },
+                )
+                .await
+                .expect("resume the exact delete-marker copy");
+            for disk in target_set.disk_inventory().await.into_iter().flatten() {
+                let marker = disk
+                    .read_version("", &bucket, object, &marker_id.to_string(), &crate::disk::ReadOptions::default())
+                    .await
+                    .expect("resumed marker must be published on every healthy target disk");
+                assert!(marker.deleted);
+                assert_eq!(marker.delete_marker_incarnation(), marker_incarnation);
+            }
+            let latest = target_set
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect("latest lookup must resolve the resumed marker");
+            assert!(latest.delete_marker);
+            assert_eq!(latest.mod_time, Some(marker_time));
+            let mut historical = target_set
+                .get_object_reader(
+                    &bucket,
+                    object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        version_id: Some(old_version.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("marker repair must retain the target's older version");
+            let mut body = Vec::new();
+            historical
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("read older target body");
+            assert_eq!(body, b"historical target body");
+            let retained = store.pools[0]
+                .get_object_info(&bucket, object, &marker_opts)
+                .await
+                .expect("marker retry must retain the source");
+            assert!(retained.delete_marker);
+            assert_eq!(retained.version_id.unwrap_or_default(), marker_id);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn data_movement_delete_marker_resume_uses_configured_marker_majority() {
+        use crate::disk::DiskAPI;
+
+        let temp_dir = tempfile::tempdir().expect("create degraded marker target store");
+        let (_ctx, store, _shutdown) = Box::pin(without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "marker-majority-target",
+            &[12, 12],
+        )))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("dm-marker-majority-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create marker majority bucket");
+        let incarnation = store.bucket_incarnation_id(&bucket).await.expect("fixture incarnation");
+        for (object, marker_id) in [("named-marker", uuid::Uuid::new_v4()), ("null-marker", uuid::Uuid::nil())] {
+            let marker_time = OffsetDateTime::now_utc();
+            let old_version = uuid::Uuid::new_v4();
+            store.pools[0]
+                .put_object(
+                    &bucket,
+                    object,
+                    &mut PutObjReader::from_vec(b"historical source body".to_vec()),
+                    &ObjectOptions {
+                        versioned: true,
+                        version_id: Some(old_version.to_string()),
+                        mod_time: Some(marker_time - time::Duration::SECOND),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed an older source version");
+            let marker_opts = ObjectOptions {
+                versioned: !marker_id.is_nil(),
+                version_suspended: marker_id.is_nil(),
+                data_movement: true,
+                version_id: Some(marker_id.to_string()),
+                delete_marker: true,
+                mod_time: Some(marker_time),
+                expected_bucket_incarnation_id: Some(incarnation),
+                ..Default::default()
+            };
+            store.pools[0]
+                .delete_object(&bucket, object, marker_opts.clone())
+                .await
+                .expect("seed the source marker");
+            let source = store.pools[0]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(&bucket, object)
+                .await
+                .expect("read source versions")
+                .expect("source versions must exist")
+                .versions
+                .into_iter()
+                .find(|version| version.version_id.unwrap_or_default() == marker_id)
+                .expect("find the source marker");
+            let target_set = store.pools[1].get_disks_by_key(object);
+            assert_eq!(target_set.default_write_quorum(), 8, "the fixture must distinguish EC4 data quorum");
+            let original_disks = target_set.disk_inventory().await;
+            for disk in original_disks.iter().take(7).flatten() {
+                disk.write_metadata("", &bucket, object, source.clone())
+                    .await
+                    .expect("seed a marker majority");
+            }
+            let mut degraded_disks = original_disks.clone();
+            degraded_disks[7..].fill(None);
+            *target_set.disks.write().await = degraded_disks;
+            let latest = target_set
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect("seven target markers must resolve the latest version");
+            assert!(latest.delete_marker);
+            assert_eq!(latest.version_id.unwrap_or_default(), marker_id);
+            *store.rebalance_meta.write().await = Some(active_rebalance_meta_for_pool(2, 0));
+            let resumed = store
+                .delete_object(
+                    &bucket,
+                    object,
+                    ObjectOptions {
+                        src_pool_idx: 0,
+                        ..marker_opts.clone()
+                    },
+                )
+                .await
+                .expect("rebalance retry must accept seven matching markers in a twelve-drive set");
+            assert!(resumed.delete_marker);
+            assert_eq!(resumed.version_id.unwrap_or_default(), marker_id);
+            assert_eq!(resumed.mod_time, Some(marker_time));
+            for shortened_snapshot in [false, true] {
+                {
+                    let mut disks = target_set.disks.write().await;
+                    disks[6] = None;
+                    if shortened_snapshot {
+                        disks.truncate(6);
+                    }
+                }
+                let error = target_set
+                    .verify_data_movement_delete_marker_write_quorum(&bucket, object, &marker_id.to_string())
+                    .await
+                    .expect_err("six markers must remain below the configured majority");
+                assert!(
+                    matches!(error, StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _)),
+                    "unexpected subquorum marker error: {error:?}"
+                );
+            }
+            *target_set.disks.write().await = original_disks;
+            *store.rebalance_meta.write().await = None;
+            let retained = store.pools[0]
+                .get_object_info(&bucket, object, &marker_opts)
+                .await
+                .expect("resumed copy must retain the source marker");
+            assert!(retained.delete_marker);
+            assert_eq!(retained.version_id.unwrap_or_default(), marker_id);
+            let mut historical = store.pools[0]
+                .get_object_reader(
+                    &bucket,
+                    object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        version_id: Some(old_version.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("resumed copy must retain the older source version");
+            let mut body = Vec::new();
+            historical
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("read older source body");
+            assert_eq!(body, b"historical source body");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn data_movement_delete_marker_retries_converge_safely() {
         let temp_dir = tempfile::tempdir().expect("create delete-marker data movement store dir");
         let (_ctx, store, _shutdown) =
@@ -10227,6 +10501,20 @@ mod tests {
             )
             .await
             .expect("seed data movement source");
+        store.pools[0]
+            .put_object(
+                &bucket,
+                object,
+                &mut PutObjReader::from_vec(b"newer source body".to_vec()),
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(uuid::Uuid::new_v4().to_string()),
+                    mod_time: Some(mod_time + time::Duration::SECOND),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("retain an unmoved newer source version");
         *store.rebalance_meta.write().await = Some(active_rebalance_meta_for_pool(store.pools.len(), 0));
 
         let source_reader = store.pools[0]
@@ -10245,6 +10533,8 @@ mod tests {
             .await
             .expect("read data movement source");
         let source_data_dir = source_reader.object_info.data_dir;
+        assert!(!source_reader.object_info.is_latest, "the copied version is historical on the source");
+        assert_eq!(source_reader.object_info.num_versions, 2);
         crate::data_movement::migrate_object(store.clone(), 0, bucket.clone(), source_reader, None, "test_read_window")
             .await
             .expect("commit data movement target");
@@ -10261,6 +10551,8 @@ mod tests {
             )
             .await
             .expect("read committed data movement target");
+        assert!(target.is_latest, "the target has only the copied historical version");
+        assert_eq!(target.num_versions, 1);
         assert_ne!(source_data_dir, target.data_dir, "the target must use its own data directory");
         assert_eq!(
             rustfs_utils::http::get_consistent_str(&target.user_defined, rustfs_utils::http::SUFFIX_DATA_MOVED),
@@ -10280,6 +10572,27 @@ mod tests {
             .await
             .expect("the equal-time migration window must remain readable");
         assert_eq!(resolved.data_dir, target.data_dir);
+
+        let mut migrated = store
+            .get_object_reader(
+                &bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: Some(version.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a partial target history must not hide the readable historical version");
+        let mut body = Vec::new();
+        migrated
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("read migrated historical body");
+        assert_eq!(body, b"source body");
 
         shutdown.cancel();
     }
@@ -19987,6 +20300,220 @@ mod tests {
             assert_eq!(parts.parts[0].size, 4096);
             shutdown.cancel();
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn bucket_incarnation_fence_cancellation_revalidates_after_coverage_gap() {
+        let temp = tempfile::tempdir().expect("create incarnation cancellation store");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "incarnation-cancel", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("incarnation-cancel-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let expected = store.bucket_incarnation_id(&bucket).await.expect("read incarnation");
+        let metadata_writer = crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_lock_in(&store.ctx, &bucket)
+            .await
+            .expect("hold metadata validation behind writer");
+        let mut cancelled = Box::pin(store.acquire_bucket_incarnation_fence(&bucket, expected));
+        assert!(futures::poll!(&mut cancelled).is_pending(), "validation must wait for metadata writer");
+        let mut lifecycle_writer = Box::pin(store.acquire_bucket_lifecycle_write_lock(&bucket));
+        assert!(
+            futures::poll!(&mut lifecycle_writer).is_pending(),
+            "validation must already own lifecycle coverage"
+        );
+        drop(lifecycle_writer);
+        drop(cancelled);
+        drop(metadata_writer);
+
+        let validated = store
+            .acquire_bucket_incarnation_fence(&bucket, expected)
+            .await
+            .expect("validate after cancellation");
+        drop(validated);
+        let metadata_writer = crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_lock_in(&store.ctx, &bucket)
+            .await
+            .expect("hold validation after real coverage ended");
+        let mut revalidate = Box::pin(store.acquire_bucket_incarnation_fence(&bucket, expected));
+        assert!(
+            futures::poll!(&mut revalidate).is_pending(),
+            "a cancelled registration must not preserve a memo across a coverage gap"
+        );
+        drop(revalidate);
+        drop(metadata_writer);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn multipart_generation_fence_reuses_overlapping_validation() {
+        let temp = tempfile::tempdir().expect("create multipart fence store");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "multipart-fence-reuse", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("multipart-fence-reuse-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let expected = store.bucket_incarnation_id(&bucket).await.expect("read incarnation");
+        let coverage = store
+            .acquire_bucket_incarnation_fence(&bucket, expected)
+            .await
+            .expect("validate continuous coverage");
+        let metadata_writer = crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_lock_in(&store.ctx, &bucket)
+            .await
+            .expect("hold metadata writer during covered session operation");
+        let upload = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.new_multipart_upload(&bucket, "covered.bin", &ObjectOptions::default()),
+        )
+        .await
+        .expect("covered multipart creation must not reacquire the metadata transaction lock")
+        .expect("create upload using authoritative memo");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            store.abort_multipart_upload(&bucket, "covered.bin", &upload.upload_id, &ObjectOptions::default()),
+        )
+        .await
+        .expect("covered abort must not reacquire the metadata transaction lock")
+        .expect("abort the created session");
+        let stale_opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                store.new_multipart_upload(&bucket, "stale.bin", &stale_opts).await,
+                Err(StorageError::BucketNotFound(_))
+            ),
+            "memoized authority must still be compared with each caller's expected incarnation"
+        );
+        let invalid_snapshot = ObjectOptions {
+            object_lock_config_snapshot: Some(Arc::new(crate::object_api::ObjectLockConfigSnapshot::new(
+                crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+            ))),
+            expected_bucket_incarnation_id: Some(expected),
+            ..Default::default()
+        };
+        assert!(
+            store
+                .new_multipart_upload(&bucket, "invalid-snapshot.bin", &invalid_snapshot)
+                .await
+                .is_err(),
+            "a warm memo must not bypass validation of an Object Lock transaction guard"
+        );
+        drop(metadata_writer);
+        drop(coverage);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn multipart_snapshot_bypasses_initializer_queued_behind_metadata_writer() {
+        let temp = tempfile::tempdir().expect("create snapshot validation store");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "multipart-snapshot-fence", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("multipart-snapshot-fence-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let expected = store.bucket_incarnation_id(&bucket).await.expect("read incarnation");
+        let snapshot = store
+            .object_lock_config_snapshot(&bucket)
+            .await
+            .expect("retain metadata snapshot read guard");
+        let mut writer = Box::pin(crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_lock_in(
+            &store.ctx, &bucket,
+        ));
+        assert!(futures::poll!(&mut writer).is_pending(), "writer must queue behind the retained snapshot");
+        let mut ordinary = Box::pin(store.acquire_bucket_incarnation_fence(&bucket, expected));
+        assert!(
+            futures::poll!(&mut ordinary).is_pending(),
+            "ordinary validation must queue behind the metadata writer"
+        );
+        let mut opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(expected),
+            object_lock_config_snapshot: Some(snapshot.clone()),
+            ..Default::default()
+        };
+        let mut uploads = Vec::new();
+        for object in ["owned-snapshot.bin", "borrowed-snapshot.bin"] {
+            if object == "borrowed-snapshot.bin" {
+                snapshot.add_lock_fences(&mut opts);
+            }
+            let upload = tokio::time::timeout(Duration::from_secs(10), store.new_multipart_upload(&bucket, object, &opts))
+                .await
+                .expect("snapshot validation must not join an initializer blocked by its own transaction guard")
+                .expect("create multipart session using held snapshot");
+            uploads.push((object, upload.upload_id));
+        }
+        drop(ordinary);
+        drop(opts);
+        drop(snapshot);
+        let writer_guard = tokio::time::timeout(Duration::from_secs(10), writer)
+            .await
+            .expect("writer resumes after snapshot owners drop")
+            .expect("metadata write guard");
+        drop(writer_guard);
+        for (object, upload_id) in uploads {
+            store
+                .abort_multipart_upload(&bucket, object, &upload_id, &ObjectOptions::default())
+                .await
+                .expect("abort session");
+        }
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn bucket_incarnation_fence_does_not_cache_when_locking_is_disabled() {
+        let temp = tempfile::tempdir().expect("create disabled-lock validation store");
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::with_lock_manager_for_test(Arc::new(
+            rustfs_lock::GlobalLockManager::Disabled(rustfs_lock::DisabledLockManager::new()),
+        )));
+        let (_ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp.path(),
+            "incarnation-disabled-locks",
+            &[(1, 4)],
+            CancellationToken::new(),
+            Some(ctx),
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("incarnation-disabled-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let old = store.bucket_incarnation_id(&bucket).await.expect("read incarnation");
+        let held = store
+            .acquire_bucket_incarnation_fence(&bucket, old)
+            .await
+            .expect("validate with no-op lock");
+        let current = Uuid::new_v4();
+        crate::bucket::metadata::save_bucket_incarnation(store.clone(), &bucket, current)
+            .await
+            .expect("replace authority while no-op guard provides no exclusion");
+        assert!(
+            matches!(
+                store.acquire_bucket_incarnation_fence(&bucket, old).await,
+                Err(StorageError::BucketNotFound(_))
+            ),
+            "a no-op lifecycle guard must not authorize reuse of an obsolete incarnation"
+        );
+        let fresh = store
+            .acquire_bucket_incarnation_fence(&bucket, current)
+            .await
+            .expect("validate replacement from disk");
+        drop(fresh);
+        drop(held);
+        shutdown.cancel();
     }
 
     #[tokio::test]

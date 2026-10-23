@@ -288,18 +288,17 @@ impl HealManager {
                                     "Heal scheduler task retrying"
                                 });
                             } else {
-                                error!(
-                                    target: "rustfs::heal::manager",
+                                demote_to_debug_when!(!task.should_log_failure(e), error, target: "rustfs::heal::manager", {
                                     event = EVENT_HEAL_SCHEDULER_STATE,
                                     component = LOG_COMPONENT_HEAL,
                                     subsystem = LOG_SUBSYSTEM_MANAGER,
+                                    state = "task_failed",
                                     task_id,
                                     heal_type = %task_type_label_for_spawn,
                                     set = %task_set_label_for_spawn,
-                                    state = "task_failed",
                                     error = %e,
                                     "Heal scheduler task failed"
-                                );
+                                });
                             }
                         }
                     }
@@ -460,7 +459,7 @@ impl HealManager {
                             release_mrf_repair_notice_targets(&notice_targets);
                         }
                         publish_verified_mrf_repair_events(&notice_targets, &completed_status_for_verified_events);
-                        publish_unverified_legacy_mrf_events(&notice_targets, &completed_status_for_verified_events);
+                        publish_unverified_legacy_mrf_events(&notice_targets, &completed_status_for_verified_events, &result);
                         // update statistics
                         let mut stats = statistics_clone.write().await;
                         match completed_status {
@@ -939,10 +938,7 @@ pub(super) fn unverified_legacy_mrf_event_for_target(
     use rustfs_common::mrf_channel::MrfKind;
 
     let anchor = target.durable_anchor.as_ref()?;
-    if target.kind != MrfKind::PartialWrite
-        || outcome.disposition != HealObjectDisposition::Unknown
-        || outcome.detail.as_deref() != Some(rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL)
-    {
+    if target.kind != MrfKind::PartialWrite || outcome.disposition != HealObjectDisposition::Unknown {
         return None;
     }
     let version_id = target.version_id.filter(|bytes| *bytes != [0; 16]);
@@ -968,10 +964,16 @@ pub(super) fn unverified_legacy_mrf_event_for_target(
     Some(rustfs_common::mrf_channel::MrfUnverifiedLegacyEvent { anchor: anchor.clone() })
 }
 
-pub(super) fn publish_unverified_legacy_mrf_events(targets: &[MrfRepairNoticeTarget], completed: &CompletedHealStatus) {
+pub(super) fn publish_unverified_legacy_mrf_events(
+    targets: &[MrfRepairNoticeTarget],
+    completed: &CompletedHealStatus,
+    result: &Result<()>,
+) {
     use crate::heal::outcome::HealExecutionOutcome;
 
-    if !matches!(completed.status, HealTaskStatus::Completed | HealTaskStatus::Failed { .. }) {
+    if !matches!(result, Err(Error::LegacyMrfUnverified { .. }))
+        || !matches!(completed.status, HealTaskStatus::Completed | HealTaskStatus::Failed { .. })
+    {
         return;
     }
     let Some(outcome) = completed.outcome.as_ref() else {

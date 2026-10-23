@@ -272,6 +272,14 @@ fn mimalloc_stat_current(value: &Value, metric: &str) -> Option<u64> {
 }
 
 #[cfg(any(not(target_os = "windows"), test))]
+fn mimalloc_stat_total(value: &Value, metric: &str) -> Option<u64> {
+    match find_mimalloc_stat(value, metric)? {
+        Value::Object(fields) => fields.get("total").and_then(numeric_json_value),
+        value => numeric_json_value(value),
+    }
+}
+
+#[cfg(any(not(target_os = "windows"), test))]
 fn parse_mimalloc_stats_json(stats_json: &str) -> Option<AllocatorMemoryObservation> {
     let value = serde_json::from_str::<Value>(stats_json).ok()?;
     let mut observation = AllocatorMemoryObservation {
@@ -279,6 +287,14 @@ fn parse_mimalloc_stats_json(stats_json: &str) -> Option<AllocatorMemoryObservat
         committed_bytes: mimalloc_stat_current(&value, "committed"),
         page_committed_bytes: mimalloc_stat_current(&value, "page_committed"),
         heap_count: mimalloc_stat_current(&value, "heaps").or_else(|| mimalloc_stat_current(&value, "heap_count")),
+        // Mimalloc statistics schema 6 emits scalar totals; older schemas can use an
+        // object with a total. Neither representation reports live memory.
+        reset_bytes_total: mimalloc_stat_total(&value, "reset"),
+        purged_bytes_total: mimalloc_stat_total(&value, "purged"),
+        commit_calls_total: mimalloc_stat_total(&value, "commit_calls"),
+        reset_calls_total: mimalloc_stat_total(&value, "reset_calls"),
+        purge_calls_total: mimalloc_stat_total(&value, "purge_calls"),
+        arena_purge_passes_total: mimalloc_stat_total(&value, "arena_purges"),
         ..AllocatorMemoryObservation::default()
     };
     if let Some(requested) = find_mimalloc_stat(&value, "malloc_requested") {
@@ -632,6 +648,110 @@ mod tests {
         }
     }
 
+    fn reclaim_stat_totals(observation: rustfs_io_metrics::AllocatorMemoryObservation) -> [Option<u64>; 6] {
+        [
+            observation.reset_bytes_total,
+            observation.purged_bytes_total,
+            observation.commit_calls_total,
+            observation.reset_calls_total,
+            observation.purge_calls_total,
+            observation.arena_purge_passes_total,
+        ]
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_reclaim_totals_match_schema_six() {
+        // Mimalloc 3.5.4 (rustfs-mimalloc 0.7.0) emits count objects and
+        // scalar counter totals in the same JSON document.
+        let parsed = parse_mimalloc_stats_json(
+            r#"{
+                "stat_version": 6,
+                "mimalloc_version": 30504,
+                "process": { "rss_current": 16384 },
+                "reserved": { "total": 65536, "peak": 32768, "current": 16384 },
+                "committed": { "total": 32768, "peak": 16384, "current": 8192 },
+                "reset": 4096,
+                "purged": 8192,
+                "commit_calls": 3,
+                "reset_calls": 4,
+                "purge_calls": 5,
+                "arena_purges": 6
+            }"#,
+        )
+        .expect("schema-six counter totals should parse");
+        assert_eq!(reclaim_stat_totals(parsed), [Some(4096), Some(8192), Some(3), Some(4), Some(5), Some(6)]);
+        assert_eq!(parsed.reserved_bytes, Some(16384));
+        assert_eq!(parsed.committed_bytes, Some(8192));
+        assert_eq!(parsed.malloc_requested_bytes, None);
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_reclaim_totals_keep_legacy_total_semantics() {
+        let parsed = parse_mimalloc_stats_json(
+            r#"{ "wrapped": {
+                "reset": { "total": 0, "current": 999 },
+                "purged": { "total": "8192", "current": 999 },
+                "commit_calls": { "total": 3, "current": 999 },
+                "reset_calls": { "total": 4, "current": 999 },
+                "purge_calls": { "total": 5, "current": 999 },
+                "arena_purges": { "total": 6, "current": 999 }
+            } }"#,
+        )
+        .expect("legacy total objects should parse");
+        assert_eq!(reclaim_stat_totals(parsed), [Some(0), Some(8192), Some(3), Some(4), Some(5), Some(6)]);
+        assert_eq!(parsed.reserved_bytes, None);
+        assert_eq!(parsed.committed_bytes, None);
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_reclaim_zero_does_not_imply_live_memory_availability() {
+        let parsed = parse_mimalloc_stats_json(
+            r#"{
+                "reset": 0, "purged": "0", "commit_calls": 0,
+                "reset_calls": 0, "purge_calls": 0, "arena_purges": 0,
+                "malloc_requested": { "current": 0, "peak": 0, "total": 0 }
+            }"#,
+        )
+        .expect("present zero totals should not disappear");
+        assert_eq!(reclaim_stat_totals(parsed), [Some(0); 6]);
+        assert_eq!(parsed.reserved_bytes, None);
+        assert_eq!(parsed.committed_bytes, None);
+        assert_eq!(parsed.malloc_requested_bytes, None);
+        assert_eq!(parsed.malloc_requested_peak_bytes, None);
+        assert_eq!(parsed.malloc_requested_total_bytes, None);
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_reclaim_totals_preserve_missing_and_invalid() {
+        for invalid in [
+            "null",
+            "-1",
+            "1.5",
+            "true",
+            "\"invalid\"",
+            "[]",
+            r#"{ "current": 123 }"#,
+            r#"{ "total": -1, "current": 123 }"#,
+            r#"{ "total": "18446744073709551616" }"#,
+        ] {
+            let payload = format!(
+                r#"{{
+                    "reserved": {{ "current": 1 }},
+                    "reset": {invalid}, "purged": {invalid}, "commit_calls": {invalid},
+                    "reset_calls": {invalid}, "purge_calls": {invalid}, "arena_purges": {invalid}
+                }}"#
+            );
+            let parsed = parse_mimalloc_stats_json(&payload).expect("reserved stat should remain available");
+            assert_eq!(reclaim_stat_totals(parsed), [None; 6], "invalid counter: {invalid}");
+            assert_eq!(parsed.reserved_bytes, Some(1));
+        }
+        let missing = parse_mimalloc_stats_json(r#"{ "reserved": { "current": 1 } }"#)
+            .expect("reserved stat should parse without counters");
+        assert_eq!(reclaim_stat_totals(missing), [None; 6]);
+        let duplicate = parse_mimalloc_stats_json(r#"{ "reset": { "current": 7 }, "wrapped": { "reset": 99 } }"#);
+        assert_eq!(duplicate, None, "a duplicate must not supply a total missing from the selected statistic");
+    }
+
     #[test]
     fn parse_mimalloc_stats_json_rejects_unrecognized_payload() {
         assert_eq!(parse_mimalloc_stats_json(r#"{ "allocator": "unknown" }"#), None);
@@ -656,7 +776,15 @@ mod tests {
     fn read_allocator_memory_snapshot_uses_mimalloc_stats_json() {
         let snapshot = super::read_allocator_memory_snapshot();
         #[cfg(not(target_os = "windows"))]
-        assert!(snapshot.is_some(), "allocator snapshot should be available on non-Windows");
+        {
+            let snapshot = snapshot.expect("allocator snapshot should be available on non-Windows");
+            assert!(
+                reclaim_stat_totals(snapshot.observation)
+                    .into_iter()
+                    .all(|value| value.is_some()),
+                "the active mimalloc schema should expose all six cumulative statistics",
+            );
+        }
         #[cfg(target_os = "windows")]
         assert!(snapshot.is_none(), "allocator snapshot should be absent without mimalloc");
     }

@@ -64,6 +64,8 @@ use super::storage_api::bucket_usecase::{
     get_validated_store, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
     request_context, validate_list_object_unordered_with_delimiter,
 };
+#[cfg(feature = "diagnostic-read-version-caller")]
+use super::storage_api::diagnostic;
 use crate::app::bucket_list_through as list_through;
 use crate::app::object::shared::mark_on_demand_migration_list_local_only;
 use crate::app::object_data_cache::invalidate_object_data_cache_bucket_after_delete;
@@ -1406,16 +1408,20 @@ where
     MakeFuture: FnOnce(OwnedSemaphorePermit) -> F + Send + 'static,
 {
     let (mutation_permit, in_flight) = admission.acquire(operation).await?;
-    let api_operation = rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context();
-    tokio::spawn(
-        rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(api_operation, async move {
-            let _in_flight = in_flight;
-            make_future(mutation_permit).await
-        })
-        .in_current_span(),
-    )
-    .await
-    .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{operation} task failed: {err}")))?
+    let future = async move {
+        let _in_flight = in_flight;
+        make_future(mutation_permit).await
+    };
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let future = diagnostic::with_captured_read_version_context(diagnostic::ReadVersionContextBoundary::BucketTask, future);
+    #[cfg(not(feature = "diagnostic-read-version-caller"))]
+    let future = rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(
+        rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context(),
+        future,
+    );
+    tokio::spawn(future.in_current_span())
+        .await
+        .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{operation} task failed: {err}")))?
 }
 
 impl DefaultBucketUsecase {
@@ -3393,6 +3399,73 @@ mod tests {
             validate_bucket_encryption_configuration(&sse_config(vec![sse_rule("AES256", None), sse_rule("garbage", None)]))
                 .expect_err("every rule is validated");
         assert_eq!(*second_bad.code(), S3ErrorCode::MalformedXML);
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn diagnostic_bucket_usecase_task_keeps_entry_and_permits_after_waiter_drop() {
+        use super::diagnostic::{ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry};
+        use rustfs_io_metrics::s3_http_metrics::{
+            S3HttpRequestGuard, current_s3_http_operation_context, current_s3_http_operation_name, observe_s3_http_operation,
+            with_s3_http_operation_context,
+        };
+
+        let mut request = S3HttpRequestGuard::new("PUT");
+        let operation = request.in_scope(|| {
+            observe_s3_http_operation(S3Operation::CreateBucket);
+            current_s3_http_operation_context().expect("captured bucket operation")
+        });
+        let admission = Arc::new(BucketOperationAdmission::new(1, 1));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let mut caller = Box::pin(with_s3_http_operation_context(Some(operation), async {
+            with_read_version_entry(ReadVersionEntrySource::TierConfigReload, async {
+                await_bucket_usecase_on_fresh_task_with_admission(
+                    "test bucket operation",
+                    admission.clone(),
+                    |permit| async move {
+                        entered_tx.send(()).expect("caller is present");
+                        release_rx.await.expect("bucket work may finish");
+                        let observed = with_read_version_entry(ReadVersionEntrySource::ConfigRead, async {
+                            (current_s3_http_operation_name(), current_read_version_entry_source())
+                        })
+                        .await;
+                        drop(permit);
+                        finished_tx.send(observed).expect("completion observer is present");
+                        Ok(())
+                    },
+                )
+                .await
+            })
+            .await
+        }));
+        assert!(futures::poll!(caller.as_mut()).is_pending());
+        entered_rx.await.expect("bucket task entered");
+        drop(caller);
+        drop(request);
+        assert_eq!(current_read_version_entry_source(), None);
+        assert_eq!(admission.active.available_permits(), 0);
+        assert_eq!(admission.in_flight.available_permits(), 1);
+        release_tx.send(()).expect("detached bucket task remains alive");
+        assert_eq!(
+            finished_rx.await.expect("bucket task completes"),
+            (Some("s3:CreateBucket"), Some(ReadVersionEntrySource::TierConfigReload))
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while admission.in_flight.available_permits() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed task releases admission");
+        assert_eq!(admission.active.available_permits(), 1);
+        let internal = await_bucket_usecase_on_fresh_task_with_admission("internal test", admission, |_permit| async {
+            Ok((current_s3_http_operation_name(), current_read_version_entry_source()))
+        })
+        .await
+        .expect("unscoped bucket task completes");
+        assert_eq!(internal, (None, None));
     }
 
     #[tokio::test]

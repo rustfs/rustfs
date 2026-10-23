@@ -3516,9 +3516,7 @@ impl ECStore {
         ))
     }
 
-    /// Publish a native scanner replica without allowing stale pool selection
-    /// to race retirement. Failed/canceled membership repair remains permitted.
-    /// A canceled waiter cannot release publication fences from an in-flight write.
+    #[cfg(feature = "test-util")]
     pub async fn save_scanner_pause_backlog_replica(
         self: &Arc<Self>,
         pool_index: usize,
@@ -3526,6 +3524,36 @@ impl ECStore {
         data: Vec<u8>,
         preconditions: crate::storage_api_contracts::object::HTTPPreconditions,
     ) -> Result<ObjectInfo> {
+        let writable_pool_indices = self
+            .scanner_pause_backlog_writable_set_disks()
+            .await
+            .into_iter()
+            .map(|set| set.pool_index)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        self.save_scanner_pause_backlog_replica_for_membership(pool_index, set_index, data, preconditions, writable_pool_indices)
+            .await
+    }
+
+    /// Publish a native scanner replica without allowing stale pool selection
+    /// to race retirement. Failed/canceled membership repair remains permitted.
+    /// A canceled waiter cannot release publication fences from an in-flight write.
+    pub async fn save_scanner_pause_backlog_replica_for_membership(
+        self: &Arc<Self>,
+        pool_index: usize,
+        set_index: usize,
+        data: Vec<u8>,
+        preconditions: crate::storage_api_contracts::object::HTTPPreconditions,
+        writable_pool_indices: Arc<[usize]>,
+    ) -> Result<ObjectInfo> {
+        if !writable_pool_indices.contains(&pool_index) {
+            return Err(Error::InvalidArgument(
+                "scanner-backlog".into(),
+                "membership".into(),
+                "replica is outside the publication cohort".into(),
+            ));
+        }
         let set = self
             .pools
             .get(pool_index)
@@ -3550,6 +3578,9 @@ impl ECStore {
                         .await?,
                 )
             };
+            // Fence every member of the captured publication cohort. After
+            // retirement, a stale fan-out must not stabilize its old record on
+            // still-writable targets and invalidate their native rollback point.
             let capacity_guard = if let Some(guard) = object_guard.as_ref() {
                 guard.add_namespace_lock_fence(&mut opts);
                 opts.no_lock = match store.pools.first().and_then(|pool| pool.disk_set.first()) {
@@ -3557,7 +3588,10 @@ impl ECStore {
                     None => false,
                 };
                 let capacity_guard = store
-                    .acquire_external_decommission_capacity_fence(&[pool_index], DecommissionCapacityAdmission::ScannerBacklog)
+                    .acquire_external_decommission_capacity_fence(
+                        &writable_pool_indices,
+                        DecommissionCapacityAdmission::ScannerBacklog,
+                    )
                     .await?;
                 opts.add_namespace_lock_guard(&capacity_guard);
                 Some(capacity_guard)
@@ -5431,7 +5465,11 @@ impl ECStore {
             if opts.delete_marker && should_check_data_movement_resume_target(opts.src_pool_idx, target_pool_idx) {
                 let source = self
                     .find_data_movement_target_info(bucket, object, opts.src_pool_idx, &opts)
-                    .await?;
+                    .await;
+                #[cfg(test)]
+                let source =
+                    crate::core::pools::decommission_test_wrap_result("delete_marker_source_recheck", bucket, object, 0, source);
+                let source = source.map_err(|err| crate::data_movement::data_movement_source_read_error(bucket, object, err))?;
                 let Some(source) = source else {
                     return Err(StorageError::DataMovementOverwriteErr(
                         bucket.to_owned(),
@@ -5457,20 +5495,44 @@ impl ECStore {
                     .find_data_movement_target_info(bucket, object, target_pool_idx, &target_opts)
                     .await?;
                 if let Some(target) = target {
-                    if is_equivalent_data_movement_delete_marker(&source, &target) {
-                        if let Some(owner) = DecommissionCapacityOwner::from_options(&target_opts) {
-                            self.reconcile_decommission_capacity_after_equivalent_target(owner, target_pool_idx, 0)
-                                .await?;
-                        }
-                        let mut target = target;
-                        target.name = decode_dir_object(object);
-                        return Ok(target);
+                    if !is_equivalent_data_movement_delete_marker(&source, &target) {
+                        return Err(StorageError::DataMovementOverwriteErr(
+                            bucket.to_owned(),
+                            object.to_owned(),
+                            opts.version_id.unwrap_or_default(),
+                        ));
                     }
-                    return Err(StorageError::DataMovementOverwriteErr(
-                        bucket.to_owned(),
-                        object.to_owned(),
-                        opts.version_id.unwrap_or_default(),
-                    ));
+                    let marker_version_id = target_opts
+                        .version_id
+                        .as_deref()
+                        .ok_or_else(|| StorageError::other("data movement marker verification requires an exact version id"))?;
+                    let confirmation = self.pools[target_pool_idx]
+                        .get_disks_by_key(object)
+                        .verify_data_movement_delete_marker_write_quorum(bucket, object, marker_version_id)
+                        .await;
+                    match confirmation {
+                        Ok(()) => {
+                            if let Some(owner) = DecommissionCapacityOwner::from_options(&target_opts) {
+                                self.reconcile_decommission_capacity_after_equivalent_target(owner, target_pool_idx, 0)
+                                    .await?;
+                            }
+                            let mut target = target;
+                            target.name = decode_dir_object(object);
+                            return Ok(target);
+                        }
+                        Err(error)
+                            if matches!(error, StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _))
+                                && target_opts.version_purge_status().is_empty()
+                                && target.version_purge_status.is_empty() => {}
+                        Err(error) => return Err(error),
+                    }
+                    if let Some(owner) = DecommissionCapacityOwner::from_options(&target_opts) {
+                        self.reconcile_decommission_capacity_after_equivalent_target(owner, target_pool_idx, 0)
+                            .await?;
+                    }
+                    // An exact-version read proves only read quorum. Republish
+                    // the same marker so retries restore its write quorum before
+                    // a later latest-version lookup or source cleanup can proceed.
                 }
                 delete_marker_target_opts = Some(target_opts);
             }

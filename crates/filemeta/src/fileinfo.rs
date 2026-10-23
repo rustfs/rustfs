@@ -137,14 +137,17 @@ impl ErasureAlgo {
             _ => ErasureAlgo::Invalid,
         }
     }
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            ErasureAlgo::Invalid => "Invalid",
+            ErasureAlgo::ReedSolomon => ERASURE_ALGORITHM,
+        }
+    }
 }
 
 impl std::fmt::Display for ErasureAlgo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ErasureAlgo::Invalid => write!(f, "Invalid"),
-            ErasureAlgo::ReedSolomon => write!(f, "{ERASURE_ALGORITHM}"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -1511,34 +1514,31 @@ fn parse_restore_expiry_date(value: &str) -> Result<OffsetDateTime> {
 }
 
 pub fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
-    let tokens: Vec<&str> = restore_hdr.splitn(2, ",").collect();
-    let progress_tokens: Vec<&str> = tokens[0].splitn(2, "=").collect();
-    if progress_tokens.len() != 2 {
-        return Err(Error::other(ERR_RESTORE_HDR_MALFORMED));
-    }
-    if progress_tokens[0].trim() != "ongoing-request" {
+    let (progress, expiry_field) = restore_hdr
+        .split_once(',')
+        .map_or((restore_hdr, None), |(progress, expiry)| (progress, Some(expiry)));
+    let (progress_key, progress_value) = progress
+        .split_once('=')
+        .ok_or_else(|| Error::other(ERR_RESTORE_HDR_MALFORMED))?;
+    if progress_key.trim() != "ongoing-request" {
         return Err(Error::other(ERR_RESTORE_HDR_MALFORMED));
     }
 
-    match progress_tokens[1] {
-        "true" | "\"true\"" if tokens.len() == 1 => {
+    match progress_value {
+        "true" | "\"true\"" if expiry_field.is_none() => {
             return Ok(RestoreStatus {
                 is_restore_in_progress: Some(true),
                 ..Default::default()
             });
         }
         "false" | "\"false\"" => {
-            if tokens.len() != 2 {
+            let (expiry_key, expiry_value) = expiry_field
+                .and_then(|field| field.split_once('='))
+                .ok_or_else(|| Error::other(ERR_RESTORE_HDR_MALFORMED))?;
+            if expiry_key.trim() != "expiry-date" {
                 return Err(Error::other(ERR_RESTORE_HDR_MALFORMED));
             }
-            let expiry_tokens: Vec<&str> = tokens[1].splitn(2, "=").collect();
-            if expiry_tokens.len() != 2 {
-                return Err(Error::other(ERR_RESTORE_HDR_MALFORMED));
-            }
-            if expiry_tokens[0].trim() != "expiry-date" {
-                return Err(Error::other(ERR_RESTORE_HDR_MALFORMED));
-            }
-            let expiry = parse_restore_expiry_date(expiry_tokens[1].trim_matches('"'))?;
+            let expiry = parse_restore_expiry_date(expiry_value.trim_matches('"'))?;
             return Ok(RestoreStatus {
                 is_restore_in_progress: Some(false),
                 restore_expiry_date: Some(expiry),
@@ -2901,6 +2901,26 @@ mod tests {
             "ongoing-request=\"false\", expiry-date=\"Fri, 01 Jan 9999 00:00:00 GMT\"".to_string(),
         );
         assert!(is_restored_object_on_disk(&meta));
+    }
+
+    #[test]
+    fn restore_status_preserves_progress_and_field_boundaries() {
+        for header in ["ongoing-request=true", " ongoing-request =\"true\""] {
+            let status = parse_restore_obj_status(header).expect("accepted in-progress field shape");
+            assert_eq!(status.is_restore_in_progress, Some(true));
+            assert_eq!(status.restore_expiry_date, None);
+        }
+        for header in [
+            "",
+            "ongoing-request",
+            "ongoing-request= true",
+            "ongoing-request=\"true\",",
+            "ongoing-request=\"true\", expiry-date=\"2025-01-01T10:20:30Z\"",
+            "ongoing-request=\"false\", expiry-date",
+            "ongoing-request=\"false\", expiry-date=\"2025-01-01T10:20:30Z\"=extra",
+        ] {
+            assert!(parse_restore_obj_status(header).is_err(), "{header:?} must be rejected");
+        }
     }
 
     /// Widening the accepted formats must not weaken malformed-input
