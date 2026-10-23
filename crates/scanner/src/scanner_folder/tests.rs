@@ -2314,6 +2314,44 @@ async fn test_scan_folder_treats_child_removed_before_open_as_empty() {
     assert_eq!(into.size, 0);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn scan_folder_charges_each_enumerated_entry_to_the_disk_budget() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+    let bucket_dir = temp_dir.join("bucket");
+    tokio::fs::create_dir_all(&bucket_dir)
+        .await
+        .expect("failed to create bucket directory");
+    for name in ["one", "two", "three"] {
+        symlink("missing-target", bucket_dir.join(name)).expect("failed to create dangling symlink");
+    }
+
+    scanner.sleeper = SCANNER_SLEEPER.for_disk(&temp_dir);
+    scanner.old_cache.info.name = "bucket".to_string();
+    scanner.new_cache.info.name = "bucket".to_string();
+    scanner.update_cache.info.name = "bucket".to_string();
+
+    let folder = CachedFolder {
+        name: "bucket".to_string(),
+        parent: None,
+        object_heal_prob_div: 1,
+    };
+    let mut into = DataUsageEntry::default();
+    scanner
+        .scan_folder(CancellationToken::new(), folder, &mut into)
+        .await
+        .expect("directory enumeration should complete");
+
+    let disk = temp_dir.to_string_lossy();
+    let status = crate::sleeper::scanner_disk_io_budget_status()
+        .into_iter()
+        .find(|status| status.disk == disk)
+        .expect("scanner disk budget should expose its charge count");
+    assert_eq!(status.charged_ops, 7, "one directory open, three entries, and three target stats");
+}
+
 #[tokio::test]
 #[serial]
 async fn test_scan_folder_missing_bucket_root_still_reports_not_found() {

@@ -15,13 +15,14 @@
 //! Per-disk background I/O budget for the data scanner.
 //!
 //! Each local disk owns two token buckets, one for operations per second and
-//! one for bytes per second. Every scanner directory listing and object
-//! metadata read charges them before it runs; an exhausted bucket delays the
-//! walk until the rate allows the charge again. The budget is a hard ceiling
-//! layered on top of the local-disk foreground-priority admission gate:
-//! admission decides *when* background I/O may start while foreground
-//! requests are active, the budget bounds *how much* background I/O one disk
-//! sees per second even while it is idle. A charge can never bypass the gate.
+//! one for bytes per second. Directory opens, enumerated entries, scanner
+//! metadata/stat operations, and metadata bytes charge the relevant buckets;
+//! an exhausted bucket delays the walk. This paces scanner work on top of the
+//! local-disk foreground-priority admission gate: admission decides *when*
+//! background I/O may start while foreground requests are active, while the
+//! budget slows scanner work even when the disk is idle. Bounded directory
+//! prefetch and the maximum wait mean this is not a strict OS-level IOPS or
+//! bandwidth limit. A charge can never bypass the admission gate.
 //!
 //! A zero or tiny budget still admits one charge per
 //! [`SCANNER_DISK_IO_BUDGET_MAX_WAIT`], so a walk keeps making progress

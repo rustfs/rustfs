@@ -1772,6 +1772,14 @@ impl FolderScanner {
                     }
                     Err(e) => return Err(ScannerError::Io(e)),
                 };
+                // Tokio's ReadDir fetches entries in bounded chunks. Charge
+                // each returned entry before processing it; consuming a
+                // chunk at the configured rate paces the request that fetches
+                // the next one. sleep_folder admits the initial directory read.
+                select! {
+                    _ = ctx.cancelled() => return Err(ScannerError::Other("Operation cancelled".to_string())),
+                    _ = self.sleeper.admit_disk_io(1, 0) => {}
+                }
                 let file_name = entry.file_name().to_string_lossy().to_string();
                 if file_name.is_empty() || file_name == "." || file_name == ".." {
                     continue;
@@ -1845,6 +1853,10 @@ impl FolderScanner {
                 }
 
                 if entry_type.is_symlink() {
+                    select! {
+                        _ = ctx.cancelled() => return Err(ScannerError::Other("Operation cancelled".to_string())),
+                        _ = self.sleeper.admit_disk_io(1, 0) => {}
+                    }
                     let metadata = match tokio::fs::metadata(&file_path).await {
                         Ok(metadata) => metadata,
                         Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -1978,10 +1990,14 @@ impl FolderScanner {
                     continue;
                 }
 
-                // Charge the disk's background I/O budget before the metadata
-                // read. The `xl.meta` size is only measured when bytes are
-                // budgeted, so an uncapped byte axis costs no extra stat.
+                // Charge both the optional size stat and the metadata read.
+                // The stat is needed only when the byte budget can use its
+                // length, and must be admitted before the syscall itself.
                 let budgeted_bytes = if self.sleeper.budgets_disk_io_bytes() {
+                    select! {
+                        _ = ctx.cancelled() => return Err(ScannerError::Other("Operation cancelled".to_string())),
+                        _ = self.sleeper.admit_disk_io(1, 0) => {}
+                    }
                     tokio::fs::metadata(&item.path)
                         .await
                         .map(|metadata| metadata.len())
@@ -1989,7 +2005,10 @@ impl FolderScanner {
                 } else {
                     0
                 };
-                self.sleeper.admit_disk_io(1, budgeted_bytes).await;
+                select! {
+                    _ = ctx.cancelled() => return Err(ScannerError::Other("Operation cancelled".to_string())),
+                    _ = self.sleeper.admit_disk_io(1, budgeted_bytes) => {}
+                }
 
                 let sz = match self
                     .local_disk

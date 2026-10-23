@@ -173,9 +173,9 @@ impl DynamicSleeper {
 
     /// Charge the bound disk's background I/O budget and wait it out.
     ///
-    /// This is a hard ceiling layered on the local-disk foreground-priority
-    /// admission gate: it runs regardless of idle mode or speed preset, and
-    /// it only ever delays, so it can never admit more than the gate allows.
+    /// This pacing applies regardless of idle mode or speed preset and is
+    /// layered on the local-disk foreground-priority admission gate. It is a
+    /// scanner work budget, not a strict OS-level IOPS or bandwidth limit.
     pub async fn admit_disk_io(&self, ops: u64, bytes: u64) {
         if let Some(budget) = self.disk_io_budget.as_ref() {
             budget.admit(ops, bytes).await;
