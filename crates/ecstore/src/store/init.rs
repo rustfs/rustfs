@@ -10501,6 +10501,20 @@ mod tests {
             )
             .await
             .expect("seed data movement source");
+        store.pools[0]
+            .put_object(
+                &bucket,
+                object,
+                &mut PutObjReader::from_vec(b"newer source body".to_vec()),
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(uuid::Uuid::new_v4().to_string()),
+                    mod_time: Some(mod_time + time::Duration::SECOND),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("retain an unmoved newer source version");
         *store.rebalance_meta.write().await = Some(active_rebalance_meta_for_pool(store.pools.len(), 0));
 
         let source_reader = store.pools[0]
@@ -10519,6 +10533,8 @@ mod tests {
             .await
             .expect("read data movement source");
         let source_data_dir = source_reader.object_info.data_dir;
+        assert!(!source_reader.object_info.is_latest, "the copied version is historical on the source");
+        assert_eq!(source_reader.object_info.num_versions, 2);
         crate::data_movement::migrate_object(store.clone(), 0, bucket.clone(), source_reader, None, "test_read_window")
             .await
             .expect("commit data movement target");
@@ -10535,6 +10551,8 @@ mod tests {
             )
             .await
             .expect("read committed data movement target");
+        assert!(target.is_latest, "the target has only the copied historical version");
+        assert_eq!(target.num_versions, 1);
         assert_ne!(source_data_dir, target.data_dir, "the target must use its own data directory");
         assert_eq!(
             rustfs_utils::http::get_consistent_str(&target.user_defined, rustfs_utils::http::SUFFIX_DATA_MOVED),
@@ -10554,6 +10572,27 @@ mod tests {
             .await
             .expect("the equal-time migration window must remain readable");
         assert_eq!(resolved.data_dir, target.data_dir);
+
+        let mut migrated = store
+            .get_object_reader(
+                &bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: Some(version.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a partial target history must not hide the readable historical version");
+        let mut body = Vec::new();
+        migrated
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("read migrated historical body");
+        assert_eq!(body, b"source body");
 
         shutdown.cancel();
     }
