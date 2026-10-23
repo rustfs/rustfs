@@ -93,9 +93,9 @@ fn parse_protocol_uri(uri: String, context: String) -> S3Result<http::Uri> {
         .map_err(|e| s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("invalid URI for {context}: {e}")))
 }
 
-fn conversion_error(operation: &str, error: impl Display) -> s3s::S3Error {
-    s3s::S3Error::with_message(
-        s3s::S3ErrorCode::InternalError,
+fn conversion_error(operation: &str, error: impl Display) -> rustfs_s3_types::S3Error {
+    rustfs_s3_types::S3Error::with_message(
+        rustfs_s3_types::S3ErrorCode::InternalError,
         format!("failed to convert {operation} through the gateway compatibility seam: {error}"),
     )
 }
@@ -394,7 +394,7 @@ impl ProtocolStorageClient {
 
 #[async_trait::async_trait]
 impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageClient {
-    type Error = s3s::S3Error;
+    type Error = rustfs_s3_types::S3Error;
 
     async fn authorize_operation(
         &self,
@@ -480,7 +480,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         match self.fs.get_object(req).await {
             Ok(response) => gateway_s3s_compat::generated::ops::get_object::output_from_s3s(response.output)
                 .map_err(|e| conversion_error("GetObject output", e)),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -532,7 +532,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         match self.fs.put_object(req).await {
             Ok(response) => gateway_s3s_compat::put_object::output_from_s3s(response.output)
                 .map_err(|e| conversion_error("PutObject output", e)),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -567,7 +567,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         match self.fs.delete_object(req).await {
             Ok(response) => gateway_s3s_compat::generated::ops::delete_object::output_from_s3s(response.output)
                 .map_err(|e| conversion_error("DeleteObject output", e)),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -602,7 +602,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         match self.fs.head_object(req).await {
             Ok(response) => gateway_s3s_compat::generated::ops::head_object::output_from_s3s(response.output)
                 .map_err(|e| conversion_error("HeadObject output", e)),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -632,7 +632,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         match self.fs.head_bucket(req).await {
             Ok(response) => gateway_s3s_compat::generated::ops::head_bucket::output_from_s3s(response.output)
                 .map_err(|e| conversion_error("HeadBucket output", e)),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -661,7 +661,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         match self.fs.list_objects_v2(req).await {
             Ok(response) => gateway_s3s_compat::generated::ops::list_objects_v2::output_from_s3s(response.output)
                 .map_err(|e| conversion_error("ListObjectsV2 output", e)),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -695,7 +695,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
 
         match self.fs.list_buckets(req).await {
             Ok(response) => list_buckets_output_from_s3s(response.output).map_err(|e| conversion_error("ListBuckets output", e)),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -719,12 +719,8 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
             s3s::S3Error::with_message(s3s::S3ErrorCode::InvalidRequest, format!("Failed to build ListBucketsInput: {}", e))
         })?;
         let request = session_list_buckets_request(input, session_context, request_headers, secure_transport);
-        self.fs
-            .list_buckets(request)
-            .await
-            .map(|response| response.output)
-            .and_then(|output| list_buckets_output_from_s3s(output).map_err(|e| conversion_error("ListBuckets output", e)))
-            .map_err(Into::into)
+        let response = self.fs.list_buckets(request).await?;
+        list_buckets_output_from_s3s(response.output).map_err(|e| conversion_error("ListBuckets output", e))
     }
 
     /// Every input is a cache or snapshot read: quota reporting never triggers
@@ -811,7 +807,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         match self.fs.create_bucket(req).await {
             Ok(response) => gateway_s3s_compat::generated::ops::create_bucket::output_from_s3s(response.output)
                 .map_err(|e| conversion_error("CreateBucket output", e)),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -865,7 +861,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         match self.fs.get_object(req).await {
             Ok(response) => gateway_s3s_compat::generated::ops::get_object::output_from_s3s(response.output)
                 .map_err(|e| conversion_error("GetObject output", e)),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -908,7 +904,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         match self.fs.copy_object(req).await {
             Ok(response) => gateway_s3s_compat::generated::ops::copy_object::output_from_s3s(response.output)
                 .map_err(|e| conversion_error("CopyObject output", e)),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -943,7 +939,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         match self.fs.delete_bucket(req).await {
             Ok(response) => gateway_s3s_compat::generated::ops::delete_bucket::output_from_s3s(response.output)
                 .map_err(|e| conversion_error("DeleteBucket output", e)),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -984,7 +980,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         match self.fs.create_multipart_upload(req).await {
             Ok(response) => gateway_s3s_compat::generated::ops::create_multipart_upload::output_from_s3s(response.output)
                 .map_err(|e| conversion_error("CreateMultipartUpload output", e)),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -1041,7 +1037,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         match self.fs.upload_part(req).await {
             Ok(response) => gateway_s3s_compat::generated::ops::upload_part::output_from_s3s(response.output)
                 .map_err(|e| conversion_error("UploadPart output", e)),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -1081,7 +1077,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         match self.fs.complete_multipart_upload(req).await {
             Ok(response) => gateway_s3s_compat::generated::ops::complete_multipart_upload::output_from_s3s(response.output)
                 .map_err(|e| conversion_error("CompleteMultipartUpload output", e)),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -1121,7 +1117,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         match self.fs.abort_multipart_upload(req).await {
             Ok(response) => gateway_s3s_compat::generated::ops::abort_multipart_upload::output_from_s3s(response.output)
                 .map_err(|e| conversion_error("AbortMultipartUpload output", e)),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -1173,7 +1169,7 @@ impl rustfs_protocols::common::client::s3::StorageBackend for ProtocolStorageCli
         match self.fs.upload_part_copy(req).await {
             Ok(response) => gateway_s3s_compat::generated::ops::upload_part_copy::output_from_s3s(response.output)
                 .map_err(|e| conversion_error("UploadPartCopy output", e)),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
         }
     }
 }
