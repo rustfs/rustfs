@@ -294,7 +294,7 @@ async fn restore_copyback_stays_pending_before_finalization(multipart: bool) {
     use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration;
     use rustfs_lifecycle::Lifecycle as _;
 
-    let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+    let (dirs, set_disks) = make_local_set_disks(4, 2).await;
     let bucket = "restore-before-finalization-bucket";
     let object = "object.bin";
     let payload = vec![0x5au8; 6 * 1024 * 1024];
@@ -401,6 +401,19 @@ async fn restore_copyback_stays_pending_before_finalization(multipart: bool) {
         .get_object_info(bucket, object, &ObjectOptions::default())
         .await
         .expect("HEAD must remain available before finalization");
+    let pending_data_dir = pending
+        .data_dir
+        .expect("pending copy-back must retain its local data directory");
+    for dir in &dirs {
+        assert!(
+            dir.path()
+                .join(bucket)
+                .join(object)
+                .join(pending_data_dir.to_string())
+                .exists(),
+            "pending copy-back must retain its committed local data directory"
+        );
+    }
     let status = parse_restore_obj_status(
         pending
             .user_defined
@@ -496,6 +509,11 @@ async fn restore_copyback_stays_pending_before_finalization(multipart: bool) {
         .await
         .expect("finalized metadata should be readable");
     assert_eq!(
+        completed.data_dir,
+        Some(pending_data_dir),
+        "finalization must retain the local copy-back data directory"
+    );
+    assert_eq!(
         completed.transitioned_object.status, TRANSITION_COMPLETE,
         "finalization must restore the completed transition state"
     );
@@ -541,6 +559,16 @@ async fn restore_copyback_stays_pending_before_finalization(multipart: bool) {
         .await
         .expect("local restored body should drain");
     assert_eq!(restored, payload, "finalized local copy must preserve every byte");
+    for dir in &dirs {
+        assert!(
+            dir.path()
+                .join(bucket)
+                .join(object)
+                .join(pending_data_dir.to_string())
+                .exists(),
+            "completed restore must retain its local data directory"
+        );
+    }
 }
 
 #[tokio::test]

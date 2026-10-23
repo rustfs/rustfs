@@ -11617,6 +11617,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let actual_fi = actual.fi();
 
         let oi = ObjectInfo::from_file_info(actual_fi, bucket, object, opts.versioned || opts.version_suspended);
+        let mut restore_cleanup_info = oi.clone();
         let restore_result: Result<()> = async {
             crate::services::notification_sys::require_restore_copyback_fleet_capability().await?;
             // The tier reader releases its own lease at EOF, before PUT or
@@ -11697,6 +11698,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     .put_object(bucket, object, &mut p_reader, &ropts)
                     .await
                     .map_err(|err| to_object_err(err, vec![bucket, object]))?;
+                restore_cleanup_info = restored_info.clone();
                 let restored_info = self_.finalize_restore_metadata(bucket, object, &restored_info, &opts).await?;
                 send_event(EventArgs {
                     event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
@@ -11841,6 +11843,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     return Err(err);
                 }
             };
+            restore_cleanup_info = restored_info.clone();
             let restored_info = self_.finalize_restore_metadata(bucket, object, &restored_info, opts).await?;
             send_event(EventArgs {
                 event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
@@ -11854,7 +11857,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
         .await;
         if let Err(primary_error) = restore_result {
-            if let Err(cleanup_error) = self_.update_restore_metadata(bucket, object, &oi, opts).await {
+            if let Err(cleanup_error) = self_
+                .update_restore_metadata(bucket, object, &restore_cleanup_info, opts)
+                .await
+            {
                 warn!(
                     event = EVENT_LIFECYCLE_RESTORE_CLEANUP,
                     component = LOG_COMPONENT_ECSTORE,
@@ -18271,7 +18277,7 @@ mod transition_upload_integrity_tests {
         for disk in disk_stores {
             disk.make_volume(bucket).await.expect("bucket volume should be created");
         }
-        let mut source = PutObjReader::from_vec(b"restore source body".repeat(1024));
+        let mut source = PutObjReader::from_vec(b"restore source body".repeat(64 * 1024));
         set_disks
             .put_object(bucket, object, &mut source, &ObjectOptions::default())
             .await
@@ -18288,7 +18294,7 @@ mod transition_upload_integrity_tests {
             .await
             .expect("pending restore metadata should be installed");
 
-        let mut restored_reader = PutObjReader::from_vec(b"restored body".repeat(1024));
+        let mut restored_reader = PutObjReader::from_vec(b"restored body".repeat(64 * 1024));
         set_disks
             .put_object(
                 bucket,
@@ -18296,6 +18302,7 @@ mod transition_upload_integrity_tests {
                 &mut restored_reader,
                 &ObjectOptions {
                     user_defined: restore_metadata(operation_id, true),
+                    restore_copyback: true,
                     ..Default::default()
                 },
             )
@@ -18315,6 +18322,58 @@ mod transition_upload_integrity_tests {
             },
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_cleanup_reclaims_committed_copyback_data_dir() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-cleanup-copyback-data-dir-bucket";
+        let object = "object.bin";
+        let operation_id = Uuid::new_v4();
+        let restored = write_committed_restore(&set_disks, &disk_stores, bucket, object, operation_id).await;
+        let data_dir = restored
+            .data_dir
+            .expect("committed copy-back must have a local data directory");
+        for temp_dir in &temp_dirs {
+            assert!(
+                temp_dir.path().join(bucket).join(object).join(data_dir.to_string()).exists(),
+                "committed copy-back must retain its local data directory before cleanup"
+            );
+        }
+
+        set_disks
+            .update_restore_metadata(
+                bucket,
+                object,
+                &restored,
+                &ObjectOptions {
+                    user_defined: restore_operation_id_metadata(operation_id),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("matching restore cleanup should remove the failed copy-back");
+
+        for temp_dir in &temp_dirs {
+            assert!(
+                !temp_dir.path().join(bucket).join(object).join(data_dir.to_string()).exists(),
+                "failed copy-back cleanup must reclaim its committed local data directory"
+            );
+        }
+        let cleaned = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("cleaned object metadata should remain readable");
+        assert!(!cleaned.user_defined.contains_key(rustfs_filemeta::metadata_keys::RESTORE));
+        assert!(
+            rustfs_utils::http::metadata_compat::get_consistent_str(
+                cleaned.user_defined.as_ref(),
+                rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_COPYBACK,
+            )
+            .is_none(),
+            "failed copy-back cleanup must remove the local routing marker"
+        );
     }
 
     async fn assert_committed_restore_remains_pending(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, operation_id: Uuid) {

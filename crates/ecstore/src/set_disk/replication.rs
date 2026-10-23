@@ -334,6 +334,12 @@ impl SetDisks {
         if !expected.matches_file_info(&fi, &expected_etag) {
             return Ok(());
         }
+        let copyback_data_dir = rustfs_utils::http::metadata_compat::get_consistent_str(
+            &fi.metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_COPYBACK,
+        )
+        .filter(|value| *value == rustfs_utils::http::metadata_compat::RESTORE_COPYBACK_PROTOCOL_V1)
+        .and_then(|_| fi.data_dir.filter(|data_dir| !data_dir.is_nil()));
         ensure_restore_metadata_lock_held(bucket, object, opts, "restore_cleanup_metadata")?;
         fi.metadata.remove(metadata_keys::RESTORE);
         fi.metadata.remove(metadata_keys::RESTORE_EXPIRY_DAYS);
@@ -371,6 +377,20 @@ impl SetDisks {
         )
         .await?;
         self.invalidate_get_object_metadata_cache(bucket, object).await;
+        if let Some(data_dir) = copyback_data_dir {
+            let cleanup = self
+                .commit_rename_data_dir_and_mark_capacity(
+                    &disks,
+                    bucket,
+                    object,
+                    &data_dir.to_string(),
+                    "",
+                    self.default_write_quorum(),
+                )
+                .await;
+            self.report_old_data_dir_cleanup(bucket, object, &data_dir.to_string(), &cleanup)
+                .await;
+        }
         Ok(())
     }
 }
