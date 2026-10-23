@@ -399,6 +399,7 @@ impl RootHealQuarantine {
 pub(super) struct RootHealInventory {
     pub(super) requests: Vec<HealRequest>,
     pub(super) quarantined_task_ids: HashSet<String>,
+    quarantined_reasons: BTreeMap<String, String>,
     /// Records that can neither be admitted nor quarantined, with the reason.
     /// They are reported, refused for admission, and retained for operator
     /// repair; every other record keeps replaying.
@@ -967,7 +968,7 @@ impl RootHealRecovery {
         Ok(markers)
     }
 
-    async fn inventory_locked(&self, disks: &[DiskStore]) -> Result<RootHealInventory> {
+    async fn inventory_locked(&self, disks: &[DiskStore], persist_quarantine: bool) -> Result<RootHealInventory> {
         let mut intent_ids = HashSet::new();
         let mut terminal_ids = HashSet::new();
         for disk in disks {
@@ -1008,6 +1009,10 @@ impl RootHealRecovery {
         let mut inventory = RootHealInventory {
             requests: Vec::new(),
             quarantined_task_ids: markers.keys().map(|(_, task_id)| task_id.clone()).collect(),
+            quarantined_reasons: markers
+                .iter()
+                .map(|((_, task_id), (_, marker))| (task_id.clone(), marker.reason.clone()))
+                .collect(),
             conflicted,
         };
         // One record's conflict never postpones the others: it is recorded
@@ -1033,14 +1038,18 @@ impl RootHealRecovery {
                             .insert(task_id.clone(), format!("Root heal quarantine source changed {task_id}"));
                         continue;
                     }
+                    inventory.quarantined_reasons.insert(task_id.clone(), marker.1.reason.clone());
                     inventory.quarantined_task_ids.insert(task_id.clone());
                     continue;
                 }
                 match decode_terminal(task_id, &source.bytes) {
                     Ok(_) => continue,
                     Err(error) => {
-                        Self::write_quarantine(&owner, task_id, RootHealRecordKind::Terminal, &source, &error.to_string())
-                            .await?;
+                        if persist_quarantine {
+                            Self::write_quarantine(&owner, task_id, RootHealRecordKind::Terminal, &source, &error.to_string())
+                                .await?;
+                        }
+                        inventory.quarantined_reasons.insert(task_id.clone(), error.to_string());
                         inventory.quarantined_task_ids.insert(task_id.clone());
                         continue;
                     }
@@ -1085,13 +1094,17 @@ impl RootHealRecovery {
                         .insert(task_id.clone(), format!("Root heal quarantine source changed {task_id}"));
                     continue;
                 }
+                inventory.quarantined_reasons.insert(task_id.clone(), marker.1.reason.clone());
                 inventory.quarantined_task_ids.insert(task_id.clone());
                 continue;
             }
             match decode_intent(task_id, &source.bytes) {
                 Ok(intent) => inventory.requests.push(intent.into_request()),
                 Err(error) => {
-                    Self::write_quarantine(&owner, task_id, RootHealRecordKind::Intent, &source, &error.to_string()).await?;
+                    if persist_quarantine {
+                        Self::write_quarantine(&owner, task_id, RootHealRecordKind::Intent, &source, &error.to_string()).await?;
+                    }
+                    inventory.quarantined_reasons.insert(task_id.clone(), error.to_string());
                     inventory.quarantined_task_ids.insert(task_id.clone());
                 }
             }
@@ -1641,7 +1654,36 @@ impl RootHealRecovery {
         for disk in &disks {
             EcstoreDiskAPI::stat_volume(disk.as_ref(), RUSTFS_META_BUCKET).await?;
         }
-        self.inventory_locked(&disks).await
+        self.inventory_locked(&disks, true).await
+    }
+
+    pub(super) async fn diagnostics(&self) -> Result<crate::LocalHealRecoveryDiagnostics> {
+        let _guard = self.mutation.lock().await;
+        let disks = self.disks().await?;
+        for disk in &disks {
+            EcstoreDiskAPI::stat_volume(disk.as_ref(), RUSTFS_META_BUCKET).await?;
+        }
+        let inventory = self.inventory_locked(&disks, false).await?;
+        // Checkpoints have their own persistence locks; their read-only
+        // listing must not hold up root admission or terminal publication.
+        drop(_guard);
+        let mut blocked = inventory.quarantined_reasons;
+        blocked.extend(inventory.conflicted);
+        let root_blocked = blocked
+            .into_iter()
+            .map(|(task_id, reason)| crate::RootHealRecoveryBlock { task_id, reason })
+            .collect();
+        let mut checkpoint_blocked = Vec::new();
+        for disk in &disks {
+            checkpoint_blocked.extend(CheckpointManager::blocked_records(disk).await?);
+        }
+        Ok(crate::LocalHealRecoveryDiagnostics {
+            scope: "local_disks",
+            definitive: true,
+            reason: None,
+            root_blocked,
+            checkpoint_blocked,
+        })
     }
 
     pub(super) async fn pending(&self) -> Result<Vec<HealRequest>> {

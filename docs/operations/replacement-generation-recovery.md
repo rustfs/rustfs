@@ -93,12 +93,34 @@ remaining accepted responsibilities are still replayed. A conflicting task ID
 is refused for new admission, and its status query reports `failed` with the
 same reason until an operator repairs the record.
 
+The authenticated `GET /rustfs/admin/v4/heal/replacement-recovery` response
+includes `localDiagnostics` with `scope: "local_disks"`, `rootBlocked`, and
+`checkpointBlocked`. Root entries identify conflicting or quarantined task IDs
+and their reasons. Checkpoint entries include the task ID, available disk UUID,
+reason, and any recorded block/revalidation times. Legacy or unreadable marker
+contents have an explicit unknown reason; invalid task filenames are reported
+without opening their paths. An inventory failure sets `definitive: false` and
+an explicit reason. These lists describe only the receiving node and do not
+change the cluster's replacement proof. Querying them never admits root work,
+writes quarantine markers, or revalidates, resets or removes checkpoints.
+
 ## Ambiguous legacy delete residue
 
 Delete recovery that finds a legacy residue it cannot classify no longer
 reports request-rate pressure. The heal returns a dedicated storage error that
-is not retried automatically; the object remains readable and the residue is
+is not a recoverable scheduler error; the object remains readable and the residue is
 retained for operator inspection.
+
+Repeated occurrences of that typed error share a node-local log gate across
+storage, task and scheduler layers, keyed by bucket, object, version and
+pool/set scope. The first occurrence is logged as an error; repeats during the
+next 15 minutes are debug events, including when a producer creates a new task
+ID. Every attempt still fails and keeps its outcome counters and durable
+responsibility. Existing disposition backoff and retry pacing are unchanged.
+The gate keeps at most 4096 identities and resets on process restart. At
+capacity it preserves existing suppression windows and demotes further new
+identities, with one aggregate capacity warning per 15 minutes; those failures
+remain visible in task status and counters.
 
 ## Schema 5/6 maintenance migration
 

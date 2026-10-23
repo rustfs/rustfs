@@ -19,6 +19,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncReadExt as _;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::{debug, info, warn};
 
@@ -331,6 +332,64 @@ pub struct CheckpointManager {
 impl CheckpointManager {
     fn blocked_path(task_id: &str) -> std::path::PathBuf {
         Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_BLOCKED_FILE}"))
+    }
+
+    /// Inspect markers only. In particular, listing cannot invoke
+    /// `is_blocked`, whose scheduled revalidation can remove the marker.
+    pub(crate) async fn blocked_records(disk: &DiskStore) -> Result<Vec<crate::BlockedCheckpointRecord>> {
+        let entries = match EcstoreDiskAPI::list_dir(disk.as_ref(), "", RUSTFS_META_BUCKET, BUCKET_META_PREFIX, -1).await {
+            Ok(entries) => entries,
+            Err(crate::heal::DiskError::FileNotFound) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let disk_id = match EcstoreDiskAPI::get_disk_id(disk.as_ref()).await {
+            Ok(id) => id.filter(|id| !id.is_nil()),
+            // Recovery evidence can survive on a not-yet-formatted local root.
+            Err(crate::heal::DiskError::UnformattedDisk) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let suffix = format!("_{RESUME_CHECKPOINT_BLOCKED_FILE}");
+        let mut records = Vec::new();
+        for entry in entries {
+            let Some(task_id) = entry.strip_suffix(&suffix) else {
+                continue;
+            };
+            if validate_resume_task_id(task_id).is_err() {
+                records.push(crate::BlockedCheckpointRecord {
+                    task_id: task_id.to_owned(),
+                    disk_id,
+                    reason: "invalid_checkpoint_task_id".to_owned(),
+                    blocked_at: None,
+                    revalidate_after: None,
+                });
+                continue;
+            }
+            let path = Self::blocked_path(task_id);
+            let reader = match EcstoreDiskAPI::read_file(disk.as_ref(), RUSTFS_META_BUCKET, path_to_str(&path)?).await {
+                Ok(reader) => reader,
+                // A concurrent recovery may have removed a listed marker.
+                Err(crate::heal::DiskError::FileNotFound) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let mut bytes = Vec::new();
+            reader
+                .take(u64::try_from(BLOCKED_CHECKPOINT_MARKER_MAX_BYTES + 1).map_err(Error::other)?)
+                .read_to_end(&mut bytes)
+                .await?;
+            let marker = BlockedCheckpointMarker::decode(&bytes);
+            records.push(crate::BlockedCheckpointRecord {
+                task_id: task_id.to_owned(),
+                disk_id,
+                reason: marker
+                    .as_ref()
+                    .map(|marker| marker.reason.clone())
+                    .unwrap_or_else(|| "legacy_or_unreadable_blocked_marker".to_owned()),
+                blocked_at: marker.as_ref().map(|marker| marker.blocked_at),
+                revalidate_after: marker.as_ref().map(|marker| marker.revalidate_after),
+            });
+        }
+        records.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+        Ok(records)
     }
 
     /// Return whether a checkpoint is isolated after a malformed or

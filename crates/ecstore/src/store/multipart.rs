@@ -169,11 +169,11 @@ fn map_multipart_namespace_lock_error(
 }
 
 fn ensure_multipart_bucket_lifecycle_guard_held(
-    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    guard: Option<&super::BucketIncarnationFenceGuard>,
     bucket: &str,
     object: &str,
 ) -> Result<()> {
-    if guard.is_some_and(rustfs_lock::NamespaceLockGuard::is_lock_lost) {
+    if guard.is_some_and(super::BucketIncarnationFenceGuard::is_lock_lost) {
         return Err(StorageError::NamespaceLockQuorumUnavailable {
             mode: "multipart_bucket_generation",
             bucket: bucket.to_string(),
@@ -416,27 +416,31 @@ impl ECStore {
         &self,
         bucket: &str,
         opts: &ObjectOptions,
-    ) -> Result<(ObjectOptions, Option<rustfs_lock::NamespaceLockGuard>)> {
+    ) -> Result<(ObjectOptions, Option<super::BucketIncarnationFenceGuard>)> {
         let mut opts = opts.clone();
         if is_meta_bucketname(bucket) {
             return Ok((opts, None));
         }
-        if opts.expected_bucket_incarnation_id.is_none() {
-            opts.expected_bucket_incarnation_id = Some(self.bucket_incarnation_id(bucket).await?);
-        }
-        let guard = if opts.bucket_lifecycle_lock_fence.is_some() {
-            None
-        } else {
-            Some(self.acquire_bucket_lifecycle_read_lock(bucket).await?)
+        let expected = match opts.expected_bucket_incarnation_id {
+            Some(expected) => expected,
+            None => {
+                let expected = self.bucket_incarnation_id(bucket).await?;
+                opts.expected_bucket_incarnation_id = Some(expected);
+                expected
+            }
         };
-        if let Some(guard) = guard.as_ref() {
-            opts.add_bucket_lifecycle_lock_guard(guard);
+        if opts.bucket_lifecycle_lock_fence.is_some() {
+            let current = crate::bucket::metadata_sys::get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
+            if current != expected {
+                return Err(StorageError::BucketNotFound(bucket.to_owned()));
+            }
+            return Ok((opts, None));
         }
-        let current = crate::bucket::metadata_sys::get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
-        if opts.expected_bucket_incarnation_id != Some(current) {
-            return Err(StorageError::BucketNotFound(bucket.to_string()));
-        }
-        Ok((opts, guard))
+        let guard = self
+            .acquire_bucket_incarnation_fence_with_options(bucket, expected, Some(&opts))
+            .await?;
+        guard.attach_to_object_options(&mut opts);
+        Ok((opts, Some(guard)))
     }
 
     async fn acquire_list_parts_read_lock(
@@ -864,7 +868,7 @@ impl ECStore {
         object: &str,
         upload_id: &str,
         opts: ObjectOptions,
-        bucket_lifecycle_guard: Option<rustfs_lock::NamespaceLockGuard>,
+        bucket_lifecycle_guard: Option<super::BucketIncarnationFenceGuard>,
     ) -> Result<()> {
         let invalid_upload = || StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned());
         if self.ctx.lock_manager().is_disabled() {

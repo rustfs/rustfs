@@ -17,6 +17,8 @@ use super::*;
 use crate::heal::RUSTFS_META_BUCKET;
 use std::collections::HashSet;
 
+mod blocked_diagnostics;
+
 fn bucket_incarnations() -> &'static std::sync::Mutex<HashMap<String, Option<Uuid>>> {
     static IDS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Option<Uuid>>>> = std::sync::OnceLock::new();
     IDS.get_or_init(Default::default)

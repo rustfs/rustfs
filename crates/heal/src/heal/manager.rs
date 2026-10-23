@@ -1498,6 +1498,15 @@ impl HealManager {
         self.replacement_recovery_blocks.snapshot()
     }
 
+    /// Node-local diagnostic listing. A failed inventory is explicitly
+    /// unknown; listing never repairs records or revalidates checkpoints.
+    pub async fn local_recovery_diagnostics(&self) -> crate::LocalHealRecoveryDiagnostics {
+        self.root_recovery
+            .diagnostics()
+            .await
+            .unwrap_or_else(|_| crate::LocalHealRecoveryDiagnostics::unavailable("local_recovery_inventory_unavailable"))
+    }
+
     #[cfg(test)]
     pub(super) fn replacement_recovery_generation_is_blocked(&self, task_id: &str) -> bool {
         self.replacement_recovery_blocks.is_blocked(task_id)

@@ -1416,6 +1416,7 @@ pub(crate) struct ReplacementRecoveryStatusResponse {
     /// Generations this node's discovery could not verify or resolve, with
     /// reasons. Node-local and additive; it is not part of the peer merge.
     pub local_blocked: Vec<rustfs_heal::ReplacementRecoveryBlock>,
+    pub local_diagnostics: rustfs_heal::LocalHealRecoveryDiagnostics,
     pub cluster: ReplacementRecoveryClusterStatus,
 }
 
@@ -1430,6 +1431,7 @@ pub(crate) struct ReplacementRecoveryClusterStatus {
 fn build_replacement_recovery_status_response(
     local: rustfs_heal::ReplacementRecoverySnapshot,
     local_blocked: Vec<rustfs_heal::ReplacementRecoveryBlock>,
+    local_diagnostics: rustfs_heal::LocalHealRecoveryDiagnostics,
     cluster: ReplacementRecoveryClusterStatus,
 ) -> ReplacementRecoveryStatusResponse {
     ReplacementRecoveryStatusResponse {
@@ -1438,6 +1440,7 @@ fn build_replacement_recovery_status_response(
         scope: "cluster_survivor_disks",
         local,
         local_blocked,
+        local_diagnostics,
         cluster,
     }
 }
@@ -1967,7 +1970,8 @@ impl Operation for ReplacementRecoveryStatusHandler {
         let cluster =
             read_cluster_replacement_recovery_status(local.clone(), notification_system.as_deref(), expected_nodes).await?;
         let local_blocked = rustfs_heal::current_replacement_recovery_blocks();
-        let response = build_replacement_recovery_status_response(local, local_blocked, cluster);
+        let local_diagnostics = rustfs_heal::current_local_heal_recovery_diagnostics().await;
+        let response = build_replacement_recovery_status_response(local, local_blocked, local_diagnostics, cluster);
         let body = encode_replacement_recovery_status(&response)?;
         info!(
             event = EVENT_ADMIN_RESPONSE_EMITTED,
@@ -2478,7 +2482,27 @@ mod tests {
     fn replacement_recovery_status_response_reports_cluster_proof() {
         let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
         let cluster = aggregate_replacement_recovery_cluster_status(vec![local.clone()], Vec::new(), 1, true);
-        let response = build_replacement_recovery_status_response(local, Vec::new(), cluster);
+        let response = build_replacement_recovery_status_response(
+            local,
+            Vec::new(),
+            rustfs_heal::LocalHealRecoveryDiagnostics {
+                scope: "local_disks",
+                definitive: true,
+                reason: None,
+                root_blocked: vec![rustfs_heal::RootHealRecoveryBlock {
+                    task_id: "root-task".to_owned(),
+                    reason: "conflicting owners".to_owned(),
+                }],
+                checkpoint_blocked: vec![rustfs_heal::BlockedCheckpointRecord {
+                    task_id: "checkpoint-task".to_owned(),
+                    disk_id: None,
+                    reason: "digest mismatch".to_owned(),
+                    blocked_at: Some(10),
+                    revalidate_after: Some(3610),
+                }],
+            },
+            cluster,
+        );
         let value = serde_json::to_value(response).expect("replacement status response should serialize");
 
         assert_eq!(value["contractVersion"], 2);
@@ -2487,9 +2511,34 @@ mod tests {
         assert_eq!(value["local"]["definitive"], true);
         assert_eq!(value["local"]["records"][0]["state"], "completed");
         assert_eq!(value["localBlocked"], serde_json::json!([]));
+        assert_eq!(value["localDiagnostics"]["scope"], "local_disks");
+        assert_eq!(value["localDiagnostics"]["rootBlocked"][0]["taskId"], "root-task");
+        assert_eq!(value["localDiagnostics"]["rootBlocked"][0]["reason"], "conflicting owners");
+        assert_eq!(value["localDiagnostics"]["checkpointBlocked"][0]["reason"], "digest mismatch");
+        assert_eq!(value["cluster"]["records"].as_array().expect("cluster records").len(), 1);
         assert_eq!(value["cluster"]["definitive"], true);
         assert!(value["cluster"]["reason"].is_null());
         assert_eq!(value["cluster"]["records"][0]["state"], "completed");
+    }
+
+    #[test]
+    fn replacement_recovery_status_keeps_local_diagnostic_failure_separate_from_cluster_proof() {
+        let local = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local.clone()], Vec::new(), 1, true);
+        let diagnostics = rustfs_heal::LocalHealRecoveryDiagnostics {
+            scope: "local_disks",
+            definitive: false,
+            reason: Some("local_recovery_inventory_unavailable".to_owned()),
+            root_blocked: Vec::new(),
+            checkpoint_blocked: Vec::new(),
+        };
+        let response = build_replacement_recovery_status_response(local, Vec::new(), diagnostics, cluster);
+        let value = serde_json::to_value(response).expect("local diagnostic failure should serialize");
+        assert_eq!(value["localDiagnostics"]["definitive"], false);
+        assert_eq!(value["localDiagnostics"]["reason"], "local_recovery_inventory_unavailable");
+        assert_eq!(value["cluster"]["definitive"], true);
+        assert!(value["cluster"].get("rootBlocked").is_none());
+        assert!(value["cluster"].get("checkpointBlocked").is_none());
     }
 
     #[test]
