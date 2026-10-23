@@ -1941,6 +1941,127 @@ async fn failed_object_heal_rejects_matching_positive_storage_receipt() {
                 | HealObjectDisposition::AuthoritativelyAbsent
         )
     }));
+    assert_eq!(outcome.objects.len(), 1);
+    assert_eq!(outcome.objects[0].identity.bucket_incarnation_id, Some(incarnation));
+}
+
+#[tokio::test]
+async fn object_failure_retains_incarnation_for_inner_and_outer_storage_errors() {
+    for failure in [
+        MockHealObjectOutcome::PermissionDenied,
+        MockHealObjectOutcome::RetryableReadQuorum,
+        MockHealObjectOutcome::RetryableLockTimeout,
+        MockHealObjectOutcome::ErrOther("backend failed"),
+    ] {
+        let incarnation = Uuid::new_v4();
+        let storage = Arc::new(MockStorage {
+            bucket_incarnation_id: Mutex::new(Some(incarnation)),
+            heal_object_outcome: Mutex::new(Some(failure)),
+            ..Default::default()
+        });
+        let mut request = HealRequest::object("bucket-a".to_owned(), "object-a".to_owned(), Some("version-a".to_owned()));
+        request.options.pool_index = Some(2);
+        request.options.set_index = Some(3);
+        let task = HealTask::from_request(request, storage);
+        task.execute()
+            .await
+            .expect_err("the failed storage operation must remain failed");
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.objects.len(), 1);
+        assert_eq!(
+            (outcome.counters.processed, outcome.counters.failed, outcome.counters.attempt_failures),
+            (1, 1, 1)
+        );
+        assert_eq!((outcome.counters.healed, outcome.counters.unchanged, outcome.counters.unknown), (0, 0, 0));
+        let object = &outcome.objects[0];
+        assert_eq!(object.identity.bucket_incarnation_id, Some(incarnation));
+        assert_eq!(object.identity.bucket, "bucket-a");
+        assert_eq!(object.identity.object, "object-a");
+        assert_eq!(object.identity.version_id.as_deref(), Some("version-a"));
+        assert_eq!((object.identity.pool_index, object.identity.set_index), (Some(2), Some(3)));
+        assert!(matches!(object.disposition, HealObjectDisposition::Failed(_)));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn object_abort_keeps_pre_storage_incarnation_after_bucket_recreation() {
+    for cancel in [false, true] {
+        let original = Uuid::new_v4();
+        let storage = Arc::new(MockStorage {
+            bucket_incarnation_id: Mutex::new(Some(original)),
+            block_heal_object: Mutex::new(true),
+            ..Default::default()
+        });
+        let mut request = HealRequest::object("bucket-a".to_owned(), "object-a".to_owned(), None);
+        request.options.timeout = Some(Duration::from_secs(10));
+        let task = HealTask::from_request(request, storage.clone());
+        let execution = task.execute();
+        tokio::pin!(execution);
+        assert!(futures::poll!(&mut execution).is_pending());
+        assert_eq!(storage.heal_object_calls.lock().expect("storage boundary").as_slice(), ["object-a"]);
+        *storage.bucket_incarnation_id.lock().expect("recreated bucket") = Some(Uuid::new_v4());
+        if cancel {
+            task.cancel().await.expect("cancel blocked storage");
+        } else {
+            tokio::time::advance(Duration::from_secs(11)).await;
+        }
+        let result = execution.await;
+        assert!(matches!(
+            (&result, cancel),
+            (Err(Error::TaskCancelled), true) | (Err(Error::TaskTimeout), false)
+        ));
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.objects.len(), 1);
+        assert_eq!(outcome.objects[0].identity.bucket_incarnation_id, Some(original));
+        assert_eq!((outcome.counters.processed, outcome.counters.skipped), (1, 1));
+        assert_eq!((outcome.counters.failed, outcome.counters.healed, outcome.counters.unknown), (0, 0, 0));
+        assert_eq!(
+            outcome.objects[0].disposition,
+            if cancel {
+                HealObjectDisposition::Cancelled
+            } else {
+                HealObjectDisposition::Deferred {
+                    reason: HealDeferredReason::Deadline,
+                    retry_not_before: None,
+                }
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn object_unverified_outcome_keeps_original_incarnation_without_claiming_repair() {
+    let original = Uuid::new_v4();
+    let successor = Uuid::new_v4();
+    let storage = Arc::new(MockStorage {
+        bucket_incarnation_id: Mutex::new(Some(original)),
+        bucket_incarnation_after_object_heal: Mutex::new(Some(successor)),
+        ..Default::default()
+    });
+    let task = HealTask::from_request(HealRequest::object("bucket-a".to_owned(), "object-a".to_owned(), None), storage.clone());
+    task.execute().await.expect("legacy storage keeps its unverified result");
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.objects[0].identity.bucket_incarnation_id, Some(original));
+    assert_eq!(outcome.objects[0].disposition, HealObjectDisposition::Unknown);
+    assert_eq!((outcome.counters.healed, outcome.counters.unknown), (0, 1));
+    assert_eq!(*storage.bucket_incarnation_id.lock().expect("successor"), Some(successor));
+}
+
+#[tokio::test]
+async fn object_dry_run_does_not_adopt_bucket_incarnation() {
+    let storage = Arc::new(MockStorage {
+        bucket_incarnation_id: Mutex::new(Some(Uuid::new_v4())),
+        ..Default::default()
+    });
+    let mut request = HealRequest::object("bucket-a".to_owned(), "object-a".to_owned(), None);
+    request.options.dry_run = true;
+    let task = HealTask::from_request(request, storage);
+    task.execute().await.expect("dry-run observation");
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.objects.len(), 1);
+    assert_eq!(outcome.objects[0].identity.bucket_incarnation_id, None);
+    assert_eq!(outcome.objects[0].disposition, HealObjectDisposition::DryRunObserved);
+    assert_eq!(outcome.counters.healed, 0);
 }
 
 #[tokio::test]
