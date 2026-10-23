@@ -36,19 +36,66 @@ use crate::common::client::s3::StorageBackend;
 use crate::common::session::SessionContext;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::stream::{self, StreamExt};
+use futures_util::stream::{self, Stream, StreamExt};
 use rustfs_credentials::Credentials;
-use s3s::dto::{
+use rustfs_gateway_stream::{ByteStream, PayloadCaps, PayloadRead, PayloadStream, StreamError, TrailingHeaders};
+use rustfs_gateway_types::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
-    CopyObjectInput, CopyObjectOutput, CopyPartResult, CreateBucketOutput, CreateMultipartUploadInput,
-    CreateMultipartUploadOutput, DeleteBucketOutput, DeleteObjectOutput, ETag, GetObjectOutput, HeadBucketOutput,
-    HeadObjectOutput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, Object, ObjectKey, PutObjectInput,
-    PutObjectOutput, StreamingBlob, Timestamp, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
+    CopyObjectInput, CopyObjectOutput, CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
+    DeleteBucketOutput, DeleteObjectOutput, GetObjectOutput, HeadBucketOutput, HeadObjectOutput, ListBucketsOutput,
+    ListObjectsV2Input, ListObjectsV2Output, Object, PutObjectInput, PutObjectOutput, UploadPartCopyInput, UploadPartCopyOutput,
+    UploadPartInput, UploadPartOutput,
 };
+use rustfs_gateway_types::{BucketName, ETag, ObjectKey, Timestamp};
 use std::collections::{HashMap, VecDeque};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use thiserror::Error;
 use tokio::sync::Notify;
+
+const OPAQUE_UPLOAD_ID: &str = "<opaque>";
+
+struct StreamPayload<S> {
+    inner: Pin<Box<S>>,
+}
+
+impl<S> PayloadStream for StreamPayload<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<PayloadRead, StreamError>> {
+        let this = self.get_mut();
+        loop {
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(bytes))) if bytes.is_empty() => continue,
+                Poll::Ready(Some(Ok(bytes))) => return Poll::Ready(Ok(PayloadRead::Chunk(bytes))),
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(StreamError::from(error))),
+                Poll::Ready(None) => {
+                    return Poll::Ready(Ok(PayloadRead::Eof {
+                        trailers: TrailingHeaders::empty(),
+                    }));
+                }
+            }
+        }
+    }
+
+    fn caps(&self) -> PayloadCaps {
+        PayloadCaps::PUSH
+    }
+
+    fn len_hint(&self) -> Option<u64> {
+        None
+    }
+}
+
+fn stream_body<S>(stream: S) -> ByteStream
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    ByteStream::new(Box::pin(StreamPayload { inner: Box::pin(stream) })).expect("unbounded test stream has valid capabilities")
+}
 
 /// Error type returned by DummyBackend. Variants model the backend error
 /// categories that SFTP maps onto wire status codes.
@@ -303,15 +350,20 @@ impl DummyBackend {
         self.inner.lock().expect("lock").upload_bodies.clone()
     }
 
-    async fn record_upload_body(&self, body: &mut Option<StreamingBlob>) -> Result<(), DummyError> {
-        use futures_util::TryStreamExt;
+    async fn record_upload_body(&self, body: &mut Option<ByteStream>) -> Result<(), DummyError> {
         if !self.inner.lock().expect("lock").capture_upload_bodies {
             return Ok(());
         }
         let mut bytes = Vec::new();
         if let Some(mut stream) = body.take() {
-            while let Some(chunk) = stream.try_next().await.map_err(|e| DummyError::Injected(e.to_string()))? {
-                bytes.extend_from_slice(&chunk);
+            loop {
+                match futures_util::future::poll_fn(|cx| Pin::new(&mut stream).poll_read(cx))
+                    .await
+                    .map_err(|e| DummyError::Injected(e.to_string()))?
+                {
+                    PayloadRead::Chunk(chunk) => bytes.extend_from_slice(&chunk),
+                    PayloadRead::Eof { .. } => break,
+                }
             }
         }
         self.inner.lock().expect("lock").upload_bodies.push(bytes);
@@ -431,28 +483,26 @@ impl DummyBackend {
     /// Queue a create_multipart_upload Ok carrying the given upload_id.
     pub fn queue_create_multipart_upload_ok(&self, upload_id: impl Into<String>) {
         let out = CreateMultipartUploadOutput {
-            upload_id: Some(upload_id.into()),
+            upload_id: upload_id.into(),
             ..Default::default()
         };
         self.inner.lock().expect("lock").create_multipart_upload.push_back(Ok(out));
     }
 
     /// Queue an upload_part Ok response carrying the given ETag. The
-    /// string is wrapped in ETag::Strong. Callers that need ETag::Weak
-    /// can queue a custom UploadPartOutput instead of using this helper.
+    /// string is wrapped in a strong ETag.
     pub fn queue_upload_part_ok(&self, e_tag: impl Into<String>) {
         let out = UploadPartOutput {
-            e_tag: Some(ETag::Strong(e_tag.into())),
+            e_tag: ETag::new(e_tag.into()).expect("test ETag"),
             ..Default::default()
         };
         self.inner.lock().expect("lock").upload_part.push_back(Ok(out));
     }
 
-    /// Queue an upload_part Ok response with no ETag. Exercises the
-    /// missing-ETag branch a driver may guard against.
+    /// Queue an upload_part Ok response with the required ETag placeholder.
     pub fn queue_upload_part_ok_without_etag(&self) {
         let out = UploadPartOutput {
-            e_tag: None,
+            e_tag: ETag::default(),
             ..Default::default()
         };
         self.inner.lock().expect("lock").upload_part.push_back(Ok(out));
@@ -466,10 +516,7 @@ impl DummyBackend {
     /// Queue an upload_part_copy Ok response carrying the given ETag.
     pub fn queue_upload_part_copy_ok(&self, e_tag: impl Into<String>) {
         let out = UploadPartCopyOutput {
-            copy_part_result: Some(CopyPartResult {
-                e_tag: Some(ETag::Strong(e_tag.into())),
-                ..Default::default()
-            }),
+            e_tag: ETag::new(e_tag.into()).expect("test ETag"),
             ..Default::default()
         };
         self.inner.lock().expect("lock").upload_part_copy.push_back(Ok(out));
@@ -507,13 +554,13 @@ impl DummyBackend {
         let contents = keys
             .iter()
             .map(|key| Object {
-                key: Some(ObjectKey::from((*key).to_string())),
+                key: ObjectKey::new((*key).to_string()).expect("test object key"),
                 ..Default::default()
             })
             .collect();
         let out = ListObjectsV2Output {
-            contents: Some(contents),
-            is_truncated: Some(false),
+            contents,
+            is_truncated: false,
             ..Default::default()
         };
         self.inner.lock().expect("lock").list_objects_v2.push_back(Ok(out));
@@ -555,7 +602,7 @@ impl DummyBackend {
     pub fn queue_get_object_bytes(&self, payload: Vec<u8>) {
         let output = GetObjectOutput {
             content_length: Some(i64::try_from(payload.len()).expect("test payload length")),
-            body: Some(StreamingBlob::from_bytes(Bytes::from(payload))),
+            body: Some(ByteStream::from_bytes(Bytes::from(payload))),
             ..Default::default()
         };
         self.inner.lock().expect("lock").get_object.push_back(Ok(output));
@@ -566,7 +613,7 @@ impl DummyBackend {
     pub fn queue_get_object_range_bytes(&self, payload: Vec<u8>) {
         let size = payload.len() as i64;
         let body = Bytes::from(payload);
-        let blob = StreamingBlob::wrap(stream::once(async move { Ok::<Bytes, std::io::Error>(body) }));
+        let blob = stream_body(stream::once(async move { Ok::<Bytes, std::io::Error>(body) }));
         let out = GetObjectOutput {
             body: Some(blob),
             content_length: Some(size),
@@ -587,7 +634,7 @@ impl DummyBackend {
         let head = Bytes::from(initial_chunk);
         let body_stream = stream::once(async move { Ok::<Bytes, std::io::Error>(head) })
             .chain(stream::pending::<Result<Bytes, std::io::Error>>());
-        let blob = StreamingBlob::wrap(body_stream);
+        let blob = stream_body(body_stream);
         let out = GetObjectOutput {
             body: Some(blob),
             content_length: Some(reported_content_length),
@@ -711,7 +758,7 @@ impl StorageBackend for DummyBackend {
         self.authorize_operation(
             session,
             &crate::common::gateway::S3Action::ListBucket,
-            &input.bucket,
+            input.bucket.as_str(),
             input.prefix.as_deref(),
         )
         .await
@@ -752,9 +799,9 @@ impl StorageBackend for DummyBackend {
         let (stall, entered, popped) = {
             let mut inner = self.inner.lock().expect("lock");
             inner.put_object_calls.push(PutObjectCall {
-                bucket: input.bucket.to_string(),
-                key: input.key.to_string(),
-                metadata: input.metadata,
+                bucket: input.bucket.as_str().to_owned(),
+                key: input.key.as_str().to_owned(),
+                metadata: (!input.metadata.is_empty()).then(|| input.metadata.into_iter().collect()),
             });
             let stall = inner.stall_put_object;
             let entered = inner.put_object_entered.clone();
@@ -912,9 +959,9 @@ impl StorageBackend for DummyBackend {
         {
             let mut inner = self.inner.lock().expect("lock");
             inner.create_multipart_calls.push(CreateMultipartCall {
-                bucket: input.bucket.to_string(),
-                key: input.key.to_string(),
-                metadata: input.metadata,
+                bucket: input.bucket.as_str().to_owned(),
+                key: input.key.as_str().to_owned(),
+                metadata: (!input.metadata.is_empty()).then(|| input.metadata.into_iter().collect()),
             });
         }
         match self.inner.lock().expect("lock").create_multipart_upload.pop_front() {
@@ -931,11 +978,11 @@ impl StorageBackend for DummyBackend {
         let (stall, entered, popped) = {
             let mut inner = self.inner.lock().expect("lock");
             inner.upload_part_calls.push(UploadPartCall {
-                bucket: input.bucket.to_string(),
-                key: input.key.to_string(),
-                upload_id: input.upload_id,
+                bucket: input.bucket.as_str().to_owned(),
+                key: input.key.as_str().to_owned(),
+                upload_id: OPAQUE_UPLOAD_ID.to_owned(),
                 part_number: input.part_number,
-                content_length: input.content_length,
+                content_length: Some(input.content_length),
             });
             let stall = inner.stall_upload_part;
             let entered = inner.upload_part_entered.clone();
@@ -960,17 +1007,13 @@ impl StorageBackend for DummyBackend {
         input: CompleteMultipartUploadInput,
         _credentials: &Credentials,
     ) -> Result<CompleteMultipartUploadOutput, Self::Error> {
-        let part_count = input
-            .multipart_upload
-            .as_ref()
-            .and_then(|mpu| mpu.parts.as_ref().map(|p| p.len()))
-            .unwrap_or(0);
+        let part_count = input.multipart_upload.parts.len();
         {
             let mut inner = self.inner.lock().expect("lock");
             inner.complete_multipart_calls.push(CompleteCall {
-                bucket: input.bucket.to_string(),
-                key: input.key.to_string(),
-                upload_id: input.upload_id,
+                bucket: input.bucket.as_str().to_owned(),
+                key: input.key.as_str().to_owned(),
+                upload_id: OPAQUE_UPLOAD_ID.to_owned(),
                 part_count,
             });
         }
@@ -988,9 +1031,9 @@ impl StorageBackend for DummyBackend {
         {
             let mut inner = self.inner.lock().expect("lock");
             inner.abort_multipart_calls.push(AbortCall {
-                bucket: input.bucket.to_string(),
-                key: input.key.to_string(),
-                upload_id: input.upload_id,
+                bucket: input.bucket.as_str().to_owned(),
+                key: input.key.as_str().to_owned(),
+                upload_id: OPAQUE_UPLOAD_ID.to_owned(),
             });
         }
         match self.inner.lock().expect("lock").abort_multipart_upload.pop_front() {
@@ -1019,7 +1062,7 @@ mod tests {
     async fn dummy_backend_reports_not_found_by_default() {
         let backend = DummyBackend::new();
         let credentials = Credentials::default();
-        let result = backend.head_object("b", "k", &credentials).await;
+        let result = backend.head_object("bucket", "k", &credentials).await;
         let Err(err) = result else {
             panic!("default head_object must return an error");
         };
@@ -1034,7 +1077,7 @@ mod tests {
         let backend = DummyBackend::new();
         let credentials = Credentials::default();
         backend.queue_head_object_ok(42, None);
-        let out = backend.head_object("b", "k", &credentials).await.expect("queued Ok");
+        let out = backend.head_object("bucket", "k", &credentials).await.expect("queued Ok");
         assert_eq!(out.content_length, Some(42));
     }
 
@@ -1043,15 +1086,14 @@ mod tests {
         let backend = Arc::new(DummyBackend::new());
         let credentials = Credentials::default();
         let input = AbortMultipartUploadInput::builder()
-            .bucket("b".to_string())
-            .key("k".to_string())
-            .upload_id("UP-1".to_string())
-            .build()
-            .expect("build");
+            .bucket(BucketName::new("bucket").expect("bucket"))
+            .key(ObjectKey::new("k").expect("key"))
+            .upload_id(rustfs_gateway_types::UploadIdClaim::from_wire("UP-1"))
+            .build();
         backend.abort_multipart_upload(input, &credentials).await.expect("Ok");
         let calls = backend.abort_multipart_calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].upload_id, "UP-1");
+        assert_eq!(calls[0].upload_id, OPAQUE_UPLOAD_ID);
     }
 
     #[tokio::test]
@@ -1061,10 +1103,9 @@ mod tests {
         let err = backend
             .create_multipart_upload(
                 CreateMultipartUploadInput::builder()
-                    .bucket("b".to_string())
-                    .key("k".to_string())
-                    .build()
-                    .expect("build"),
+                    .bucket(BucketName::new("bucket").expect("bucket"))
+                    .key(ObjectKey::new("k").expect("key"))
+                    .build(),
                 &credentials,
             )
             .await

@@ -688,7 +688,7 @@ mod tests {
     use http_body_util::StreamBody;
     use hyper::body::Frame;
     use rustfs_credentials::Credentials;
-    use s3s::dto::*;
+    use rustfs_gateway_types::dto::*;
     use std::fmt::{Debug, Formatter};
     use std::net::{Ipv4Addr, SocketAddr};
     use std::task::{Context, Poll};

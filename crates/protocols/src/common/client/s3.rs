@@ -14,7 +14,7 @@
 
 use async_trait::async_trait;
 use rustfs_credentials::Credentials;
-use s3s::dto::*;
+use rustfs_gateway_types::dto::*;
 
 use crate::common::gateway::{AuthorizationError, S3Action};
 use crate::common::session::SessionContext;
@@ -71,7 +71,7 @@ pub trait StorageBackend: Send + Sync {
         session: &SessionContext,
         input: &ListObjectsV2Input,
     ) -> Result<(), AuthorizationError> {
-        self.authorize_operation(session, &S3Action::ListBucket, &input.bucket, input.prefix.as_deref())
+        self.authorize_operation(session, &S3Action::ListBucket, input.bucket.as_str(), input.prefix.as_deref())
             .await
     }
 

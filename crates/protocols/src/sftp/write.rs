@@ -30,13 +30,14 @@ use super::state::{CompletedPart, HandleState, MultipartUpload, WritePhase};
 use crate::common::client::s3::StorageBackend;
 use crate::common::gateway::S3Action;
 use bytes::Bytes;
-use futures_util::stream;
 use russh_sftp::protocol::{FileAttributes, Handle, OpenFlags, StatusCode};
-use rustfs_utils::MaskedAccessKey;
-use s3s::dto::{
+use rustfs_gateway_stream::ByteStream;
+use rustfs_gateway_types::dto::{
     AbortMultipartUploadInput, CompleteMultipartUploadInput, CompletedMultipartUpload, CompletedPart as S3CompletedPart,
-    CopySource, CreateMultipartUploadInput, PutObjectInput, StreamingBlob, UploadPartCopyInput, UploadPartInput,
+    CreateMultipartUploadInput, PutObjectInput, UploadPartCopyInput, UploadPartInput,
 };
+use rustfs_gateway_types::{BucketName, ObjectKey, UploadIdClaim};
+use rustfs_utils::MaskedAccessKey;
 
 const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
 const LOG_SUBSYSTEM_SFTP_WRITE: &str = "sftp_write";
@@ -44,6 +45,18 @@ const EVENT_SFTP_WRITE_STATE: &str = "sftp_write_state";
 const EVENT_SFTP_MULTIPART_STATE: &str = "sftp_multipart_state";
 const EVENT_SFTP_ABORT_STATE: &str = "sftp_abort_state";
 const EVENT_SFTP_MULTIPART_COPY_STATE: &str = "sftp_multipart_copy_state";
+
+fn bucket_name(value: &str, operation: &'static str) -> Result<BucketName, SftpError> {
+    BucketName::new(value.to_owned()).map_err(|error| s3_error_to_sftp(operation, error))
+}
+
+fn object_key(value: &str, operation: &'static str) -> Result<ObjectKey, SftpError> {
+    ObjectKey::new(value.to_owned()).map_err(|error| s3_error_to_sftp(operation, error))
+}
+
+fn upload_claim(value: &str) -> UploadIdClaim {
+    UploadIdClaim::from_wire(value.to_owned())
+}
 
 /// Running byte count for a write handle's current phase. Buffering is
 /// part_buffer.len(). Streaming is (parts_done * part_size) +
@@ -369,16 +382,14 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             }
 
             let body = body_bytes.clone();
-            let stream = stream::once(async move { Ok::<Bytes, std::io::Error>(body) });
-            let streaming = StreamingBlob::wrap(stream);
+            let streaming = ByteStream::from_bytes(body);
             let input = PutObjectInput::builder()
-                .bucket(bucket.to_string())
-                .key(key.to_string())
-                .content_length(Some(size))
-                .metadata(sftp_attrs_to_user_metadata(attrs))
-                .body(Some(streaming))
-                .build()
-                .map_err(|e| s3_error_to_sftp("build_put_object", e))?;
+                .bucket(bucket_name(bucket, "build_put_object")?)
+                .key(object_key(key, "build_put_object")?)
+                .content_length(size)
+                .metadata(sftp_attrs_to_user_metadata(attrs).unwrap_or_default().into_iter().collect())
+                .body(streaming)
+                .build();
 
             let outcome = self
                 .run_backend_with_err("put_object", self.storage.put_object(input, self.credentials()))
@@ -430,24 +441,27 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
 
         let part_len = part_bytes.len() as i64;
         let body_bytes = Bytes::from(part_bytes);
-        let body_stream = stream::once(async move { Ok::<Bytes, std::io::Error>(body_bytes) });
-        let streaming = StreamingBlob::wrap(body_stream);
+        let streaming = ByteStream::from_bytes(body_bytes);
 
         let input = UploadPartInput::builder()
-            .bucket(bucket.to_string())
-            .key(key.to_string())
-            .upload_id(upload_id.to_string())
+            .bucket(bucket_name(bucket, "build_upload_part")?)
+            .key(object_key(key, "build_upload_part")?)
+            .upload_id(upload_claim(upload_id))
             .part_number(part_number)
-            .content_length(Some(part_len))
-            .body(Some(streaming))
-            .build()
-            .map_err(|e| s3_error_to_sftp("build_upload_part", e))?;
+            .content_length(part_len)
+            .body(streaming)
+            .build();
 
         let out = self
             .run_backend("upload_part", self.storage.upload_part(input, self.credentials()))
             .await?;
 
-        let e_tag = out.e_tag.ok_or_else(|| {
+        let e_tag = if out.e_tag == rustfs_gateway_types::ETag::default() {
+            None
+        } else {
+            Some(out.e_tag)
+        };
+        let e_tag = e_tag.ok_or_else(|| {
             tracing::warn!(
                 event = EVENT_SFTP_MULTIPART_STATE,
                 component = LOG_COMPONENT_PROTOCOLS,
@@ -517,17 +531,16 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             .is_ok();
 
         let input = CreateMultipartUploadInput::builder()
-            .bucket(bucket.to_string())
-            .key(key.to_string())
-            .metadata(sftp_attrs_to_user_metadata(attrs))
-            .build()
-            .map_err(|e| s3_error_to_sftp("build_create_multipart_upload", e))?;
+            .bucket(bucket_name(bucket, "build_create_multipart_upload")?)
+            .key(object_key(key, "build_create_multipart_upload")?)
+            .metadata(sftp_attrs_to_user_metadata(attrs).unwrap_or_default().into_iter().collect())
+            .build();
 
         let out = self
             .run_backend("create_multipart_upload", self.storage.create_multipart_upload(input, self.credentials()))
             .await?;
 
-        let upload_id = out.upload_id.ok_or_else(|| {
+        let upload_id = if out.upload_id.is_empty() {
             tracing::warn!(
                 event = EVENT_SFTP_MULTIPART_STATE,
                 component = LOG_COMPONENT_PROTOCOLS,
@@ -537,8 +550,10 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                 result = "upload_id_missing",
                 "SFTP multipart upload missing upload_id"
             );
-            SftpError::code(StatusCode::Failure)
-        })?;
+            return Err(SftpError::code(StatusCode::Failure));
+        } else {
+            out.upload_id
+        };
         Ok(MultipartUpload {
             upload_id,
             abort_authorized,
@@ -560,19 +575,18 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         let parts: Vec<S3CompletedPart> = uploaded_parts
             .into_iter()
             .map(|p| S3CompletedPart {
-                part_number: Some(p.part_number),
+                part_number: p.part_number,
                 e_tag: Some(p.e_tag),
                 ..Default::default()
             })
             .collect();
 
         let input = CompleteMultipartUploadInput::builder()
-            .bucket(bucket.to_string())
-            .key(key.to_string())
-            .upload_id(upload_id.to_string())
-            .multipart_upload(Some(CompletedMultipartUpload { parts: Some(parts) }))
-            .build()
-            .map_err(|e| s3_error_to_sftp("build_complete_multipart_upload", e))?;
+            .bucket(bucket_name(bucket, "build_complete_multipart_upload")?)
+            .key(object_key(key, "build_complete_multipart_upload")?)
+            .upload_id(upload_claim(upload_id))
+            .multipart_upload(CompletedMultipartUpload { parts })
+            .build();
 
         let result = self
             .run_backend(
@@ -837,11 +851,10 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         self.authorize(&S3Action::AbortMultipartUpload, bucket, Some(key)).await?;
 
         let input = AbortMultipartUploadInput::builder()
-            .bucket(bucket.to_string())
-            .key(key.to_string())
-            .upload_id(upload_id.to_string())
-            .build()
-            .map_err(|e| s3_error_to_sftp("build_abort_multipart_upload", e))?;
+            .bucket(bucket_name(bucket, "build_abort_multipart_upload")?)
+            .key(object_key(key, "build_abort_multipart_upload")?)
+            .upload_id(upload_claim(upload_id))
+            .build();
 
         self.run_backend("abort_multipart_upload", self.storage.abort_multipart_upload(input, self.credentials()))
             .await?;
@@ -1039,24 +1052,24 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                 self.authorize(&S3Action::UploadPart, dst_bucket, Some(dst_key)).await?;
 
                 let input = UploadPartCopyInput::builder()
-                    .bucket(dst_bucket.to_string())
-                    .key(dst_key.to_string())
-                    .upload_id(mp.upload_id.clone())
+                    .bucket(bucket_name(dst_bucket, "build_upload_part_copy")?)
+                    .key(object_key(dst_key, "build_upload_part_copy")?)
+                    .upload_id(upload_claim(&mp.upload_id))
                     .part_number(part_number)
-                    .copy_source(CopySource::Bucket {
-                        bucket: src_bucket.to_string().into(),
-                        key: src_key.to_string().into(),
-                        version_id: None,
-                    })
-                    .copy_source_range(Some(range))
-                    .build()
-                    .map_err(|e| s3_error_to_sftp("build_upload_part_copy", e))?;
+                    .copy_source(format!("/{src_bucket}/{src_key}"))
+                    .copy_source_range(range)
+                    .build();
 
                 let out = self
                     .run_backend("upload_part_copy", self.storage.upload_part_copy(input, self.credentials()))
                     .await?;
 
-                let e_tag = out.copy_part_result.and_then(|r| r.e_tag).ok_or_else(|| {
+                let e_tag = if out.e_tag == rustfs_gateway_types::ETag::default() {
+                    None
+                } else {
+                    Some(out.e_tag)
+                };
+                let e_tag = e_tag.ok_or_else(|| {
                     tracing::warn!(
                         event = EVENT_SFTP_MULTIPART_COPY_STATE,
                         component = LOG_COMPONENT_PROTOCOLS,
@@ -1110,7 +1123,6 @@ mod tests {
     use crate::common::gateway::with_test_auth_override;
     use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
     use rustfs_credentials::Credentials;
-    use s3s::dto::ETag;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Notify;
@@ -1173,7 +1185,7 @@ mod tests {
     #[test]
     fn tombstone_carries_upload_id_and_authorization() {
         let attrs = FileAttributes::default();
-        let state = build_write_tombstone("b", "k", &attrs, "UP-T1".to_string(), true);
+        let state = build_write_tombstone("bucket", "k", &attrs, "UP-T1".to_string(), true);
         let HandleState::Write {
             bucket,
             key,
@@ -1186,7 +1198,7 @@ mod tests {
         else {
             panic!("tombstone must be HandleState::Write with Failed phase");
         };
-        assert_eq!(bucket, "b");
+        assert_eq!(bucket, "bucket");
         assert_eq!(key, "k");
         assert_eq!(upload_id, "UP-T1");
         assert!(abort_authorized);
@@ -1195,7 +1207,7 @@ mod tests {
     #[test]
     fn tombstone_is_picked_up_by_drop_when_authorized() {
         let attrs = FileAttributes::default();
-        let state = build_write_tombstone("b", "k", &attrs, "UP-T2".to_string(), true);
+        let state = build_write_tombstone("bucket", "k", &attrs, "UP-T2".to_string(), true);
         let HandleState::Write { phase, .. } = state else {
             panic!("tombstone must be HandleState::Write");
         };
@@ -1209,7 +1221,7 @@ mod tests {
         // operators see the orphaned upload_id in the skip log. The
         // bucket lifecycle rule reclaims parts.
         let attrs = FileAttributes::default();
-        let state = build_write_tombstone("b", "k", &attrs, "UP-T3".to_string(), false);
+        let state = build_write_tombstone("bucket", "k", &attrs, "UP-T3".to_string(), false);
         let HandleState::Write { phase, .. } = state else {
             panic!("tombstone must be HandleState::Write");
         };
@@ -1566,7 +1578,7 @@ mod tests {
             next_part_number: S3_MAX_MULTIPART_PARTS + 1,
         };
         let err = driver
-            .write_dispatch_flush_one_part(&mut phase, "b", "k", TEST_PART_SIZE)
+            .write_dispatch_flush_one_part(&mut phase, "bucket", "k", TEST_PART_SIZE)
             .await
             .expect_err("parts-limit breach must return Err");
         assert!(matches!(err.0, StatusCode::Failure));
@@ -1594,7 +1606,7 @@ mod tests {
             next_part_number: S3_MAX_MULTIPART_PARTS + 1,
         };
         let err = driver
-            .write_dispatch_flush_one_part(&mut phase, "b", "k", TEST_PART_SIZE)
+            .write_dispatch_flush_one_part(&mut phase, "bucket", "k", TEST_PART_SIZE)
             .await
             .expect_err("parts-limit breach must return Err even when abort_authorized=false");
         assert!(matches!(err.0, StatusCode::Failure));
@@ -1619,10 +1631,12 @@ mod tests {
             uploaded_parts: Vec::new(),
             next_part_number: 1,
         };
-        let err =
-            with_test_auth_override(|_, _, _| true, driver.write_dispatch_flush_one_part(&mut phase, "b", "k", TEST_PART_SIZE))
-                .await
-                .expect_err("upload_part failure must propagate as Err");
+        let err = with_test_auth_override(
+            |_, _, _| true,
+            driver.write_dispatch_flush_one_part(&mut phase, "bucket", "k", TEST_PART_SIZE),
+        )
+        .await
+        .expect_err("upload_part failure must propagate as Err");
         assert!(matches!(err.0, StatusCode::Failure));
         let WritePhase::Failed {
             upload_id,
@@ -1653,7 +1667,7 @@ mod tests {
         // Pre-populate the handle map so the tombstone lands under the
         // same id we query afterwards.
         let handle_id = driver
-            .allocate_handle(write_handle("b", "k", WritePhase::Buffering { part_buffer: Vec::new() }))
+            .allocate_handle(write_handle("bucket", "k", WritePhase::Buffering { part_buffer: Vec::new() }))
             .expect("allocate");
 
         // The test owns the phase local so we can observe the
@@ -1665,7 +1679,7 @@ mod tests {
 
         with_test_auth_override(
             |_, _, _| true,
-            driver.write_dispatch_begin_streaming(&handle_id, &mut phase, "b", "k", &FileAttributes::empty()),
+            driver.write_dispatch_begin_streaming(&handle_id, &mut phase, "bucket", "k", &FileAttributes::empty()),
         )
         .await
         .expect("begin_streaming must succeed on queued Create Ok");
@@ -1705,7 +1719,7 @@ mod tests {
         backend.queue_create_multipart_upload_ok("UP-ALLOW");
         let driver = build_driver(backend, TEST_PART_SIZE);
 
-        let mp = with_test_auth_override(|_, _, _| true, driver.start_multipart_upload("b", "k", &FileAttributes::empty()))
+        let mp = with_test_auth_override(|_, _, _| true, driver.start_multipart_upload("bucket", "k", &FileAttributes::empty()))
             .await
             .expect("start_multipart_upload must succeed on Allow");
         assert_eq!(mp.upload_id, "UP-ALLOW");
@@ -1728,7 +1742,7 @@ mod tests {
             mtime: Some(1_777_992_333),
         };
 
-        with_test_auth_override(|_, _, _| true, driver.start_multipart_upload("b", "k", &attrs))
+        with_test_auth_override(|_, _, _| true, driver.start_multipart_upload("bucket", "k", &attrs))
             .await
             .expect("start_multipart_upload must succeed");
 
@@ -1747,7 +1761,7 @@ mod tests {
         backend.queue_create_multipart_upload_ok("UP-NO-ATTRS");
         let driver = build_driver(backend.clone(), TEST_PART_SIZE);
 
-        with_test_auth_override(|_, _, _| true, driver.start_multipart_upload("b", "k", &FileAttributes::empty()))
+        with_test_auth_override(|_, _, _| true, driver.start_multipart_upload("bucket", "k", &FileAttributes::empty()))
             .await
             .expect("start_multipart_upload must succeed");
 
@@ -1766,7 +1780,7 @@ mod tests {
         // a WORM-shaped IAM policy a principal can meet in production.
         let mp = with_test_auth_override(
             |action, _bucket, _object| !matches!(action, S3Action::AbortMultipartUpload),
-            driver.start_multipart_upload("b", "k", &FileAttributes::empty()),
+            driver.start_multipart_upload("bucket", "k", &FileAttributes::empty()),
         )
         .await
         .expect("Create Allow must succeed even when Abort is Deny");
@@ -1788,7 +1802,7 @@ mod tests {
 
         let err = with_test_auth_override(
             |action, _, _| !matches!(action, S3Action::CreateMultipartUpload),
-            driver.start_multipart_upload("b", "k", &FileAttributes::empty()),
+            driver.start_multipart_upload("bucket", "k", &FileAttributes::empty()),
         )
         .await
         .expect_err("Deny on CreateMultipartUpload must fail fast");
@@ -1825,7 +1839,7 @@ mod tests {
 
         let complete_calls = backend.complete_multipart_calls();
         assert_eq!(complete_calls.len(), 1);
-        assert_eq!(complete_calls[0].upload_id, "UP-COPY");
+        assert_eq!(complete_calls[0].upload_id, "<opaque>");
         assert_eq!(complete_calls[0].part_count, 1);
         assert!(backend.abort_multipart_calls().is_empty(), "successful multipart copy must not abort");
     }
@@ -1838,8 +1852,11 @@ mod tests {
         backend.queue_upload_part_ok_without_etag();
         let driver = build_driver(backend.clone(), TEST_PART_SIZE);
 
-        let result =
-            with_test_auth_override(|_, _, _| true, driver.upload_multipart_bytes("b", "k", "UP-NO-ETAG", 1, vec![0u8; 8])).await;
+        let result = with_test_auth_override(
+            |_, _, _| true,
+            driver.upload_multipart_bytes("bucket", "k", "UP-NO-ETAG", 1, vec![0u8; 8]),
+        )
+        .await;
         let Err(err) = result else {
             panic!("missing ETag must not silently succeed");
         };
@@ -1853,18 +1870,15 @@ mod tests {
         let driver = build_driver(backend.clone(), TEST_PART_SIZE);
 
         let completed =
-            with_test_auth_override(|_, _, _| true, driver.upload_multipart_bytes("b", "k", "UP-OK", 1, vec![0u8; 8]))
+            with_test_auth_override(|_, _, _| true, driver.upload_multipart_bytes("bucket", "k", "UP-OK", 1, vec![0u8; 8]))
                 .await
                 .expect("upload_part Ok must succeed");
         assert_eq!(completed.part_number, 1);
-        let ETag::Strong(etag) = completed.e_tag else {
-            panic!("DummyBackend queued a Strong ETag");
-        };
-        assert_eq!(etag, "etag-part-1");
+        assert_eq!(completed.e_tag.opaque_tag(), "etag-part-1");
 
         let calls = backend.upload_part_calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].upload_id, "UP-OK");
+        assert_eq!(calls[0].upload_id, "<opaque>");
         assert_eq!(calls[0].part_number, 1);
         assert_eq!(calls[0].content_length, Some(8));
     }
@@ -1881,7 +1895,7 @@ mod tests {
         // override is needed. The returned Err propagates up.
         let err = driver
             .close_streaming(
-                "b",
+                "bucket",
                 "k",
                 "UP-CAP-DENY".to_string(),
                 false,
@@ -1906,7 +1920,7 @@ mod tests {
         let err = with_test_auth_override(
             |_, _, _| true,
             driver.close_streaming(
-                "b",
+                "bucket",
                 "k",
                 "UP-CAP-ALLOW".to_string(),
                 true,
@@ -1920,7 +1934,7 @@ mod tests {
         assert!(matches!(err.0, StatusCode::Failure));
         let calls = backend.abort_multipart_calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].upload_id, "UP-CAP-ALLOW");
+        assert_eq!(calls[0].upload_id, "<opaque>");
     }
 
     #[tokio::test]
@@ -1932,7 +1946,7 @@ mod tests {
 
         with_test_auth_override(
             |_, _, _| true,
-            driver.close_streaming("b", "k", "UP-COMPLETE-OK".to_string(), true, vec![0u8; 16], Vec::new(), 1),
+            driver.close_streaming("bucket", "k", "UP-COMPLETE-OK".to_string(), true, vec![0u8; 16], Vec::new(), 1),
         )
         .await
         .expect("close_streaming must return Ok on Complete success");
@@ -1949,14 +1963,14 @@ mod tests {
 
         let err = with_test_auth_override(
             |_, _, _| true,
-            driver.close_streaming("b", "k", "UP-COMPLETE-ERR".to_string(), true, vec![0u8; 16], Vec::new(), 1),
+            driver.close_streaming("bucket", "k", "UP-COMPLETE-ERR".to_string(), true, vec![0u8; 16], Vec::new(), 1),
         )
         .await
         .expect_err("Complete failure must propagate");
         assert!(matches!(err.0, StatusCode::Failure));
         let aborts = backend.abort_multipart_calls();
         assert_eq!(aborts.len(), 1, "Complete failure must trigger one abort");
-        assert_eq!(aborts[0].upload_id, "UP-COMPLETE-ERR");
+        assert_eq!(aborts[0].upload_id, "<opaque>");
     }
 
     #[tokio::test]
@@ -1967,14 +1981,14 @@ mod tests {
 
         let err = with_test_auth_override(
             |_, _, _| true,
-            driver.close_streaming("b", "k", "UP-TAIL-ERR".to_string(), true, vec![0u8; 16], Vec::new(), 1),
+            driver.close_streaming("bucket", "k", "UP-TAIL-ERR".to_string(), true, vec![0u8; 16], Vec::new(), 1),
         )
         .await
         .expect_err("trailing UploadPart failure must propagate");
         assert!(matches!(err.0, StatusCode::Failure));
         let aborts = backend.abort_multipart_calls();
         assert_eq!(aborts.len(), 1, "trailing UploadPart failure must trigger one abort");
-        assert_eq!(aborts[0].upload_id, "UP-TAIL-ERR");
+        assert_eq!(aborts[0].upload_id, "<opaque>");
         assert!(
             backend.complete_multipart_calls().is_empty(),
             "Complete must not be called when the tail UploadPart failed"
@@ -1998,7 +2012,7 @@ mod tests {
         };
 
         driver
-            .commit_write("b", "k", &attrs, b"hello".to_vec())
+            .commit_write("bucket", "k", &attrs, b"hello".to_vec())
             .await
             .expect("commit_write must succeed");
 
@@ -2018,7 +2032,7 @@ mod tests {
         let driver = build_driver(backend.clone(), TEST_PART_SIZE);
 
         driver
-            .commit_write("b", "k", &FileAttributes::empty(), b"hello".to_vec())
+            .commit_write("bucket", "k", &FileAttributes::empty(), b"hello".to_vec())
             .await
             .expect("commit_write must succeed");
 
@@ -2177,7 +2191,7 @@ mod tests {
 
         let err = with_test_auth_override(
             |action, _, _| !matches!(action, S3Action::AbortMultipartUpload),
-            driver.abort_upload_with_auth("b", "k", "UP-ABORT-DENY"),
+            driver.abort_upload_with_auth("bucket", "k", "UP-ABORT-DENY"),
         )
         .await
         .expect_err("Deny on abort must fail before reaching the backend");
@@ -2198,7 +2212,7 @@ mod tests {
 
         let mut driver = build_driver(backend.clone(), TEST_PART_SIZE);
         let handle_id = driver
-            .allocate_handle(write_handle("b", "k", WritePhase::Buffering { part_buffer: Vec::new() }))
+            .allocate_handle(write_handle("bucket", "k", WritePhase::Buffering { part_buffer: Vec::new() }))
             .expect("allocate");
         let mut state = driver.handles.remove(&handle_id).expect("remove");
 
@@ -2251,9 +2265,9 @@ mod tests {
         let aborts = backend.abort_multipart_calls();
         assert_eq!(aborts.len(), 1, "Drop must fire exactly one abort for the surviving tombstone");
         let AbortCall { bucket, key, upload_id } = &aborts[0];
-        assert_eq!(bucket, "b");
+        assert_eq!(bucket, "bucket");
         assert_eq!(key, "k");
-        assert_eq!(upload_id, "UP-CANCEL");
+        assert_eq!(upload_id, "<opaque>");
     }
 
     // --- compliance matrix cross-reference tests ---
@@ -2284,7 +2298,7 @@ mod tests {
         // mapped to the wrong status" (Ok(Err) with non-Failure).
         let outcome = tokio::time::timeout(
             Duration::from_secs(10),
-            driver.commit_write("b", "k", &FileAttributes::default(), b"hello".to_vec()),
+            driver.commit_write("bucket", "k", &FileAttributes::default(), b"hello".to_vec()),
         )
         .await;
 
@@ -2312,7 +2326,7 @@ mod tests {
         let credentials = Credentials::default();
 
         let result = driver
-            .run_backend_with_err("head_object", driver.storage.head_object("b", "k", &credentials))
+            .run_backend_with_err("head_object", driver.storage.head_object("bucket", "k", &credentials))
             .await;
 
         match result {
@@ -2338,7 +2352,7 @@ mod tests {
         let driver = build_driver(backend.clone(), TEST_PART_SIZE);
 
         driver
-            .commit_write("b", "k", &FileAttributes::default(), b"hello".to_vec())
+            .commit_write("bucket", "k", &FileAttributes::default(), b"hello".to_vec())
             .await
             .expect("commit_write must succeed once a retry returns Ok");
         assert_eq!(
@@ -2361,7 +2375,7 @@ mod tests {
         let driver = build_driver(backend.clone(), TEST_PART_SIZE);
 
         let err = driver
-            .commit_write("b", "k", &FileAttributes::default(), b"hello".to_vec())
+            .commit_write("bucket", "k", &FileAttributes::default(), b"hello".to_vec())
             .await
             .expect_err("commit_write must surface the final retryable error after the cap");
         assert!(matches!(err.0, StatusCode::Failure));
@@ -2389,7 +2403,7 @@ mod tests {
         let driver = build_driver(backend.clone(), TEST_PART_SIZE);
 
         let err = driver
-            .commit_write("b", "k", &FileAttributes::default(), b"hello".to_vec())
+            .commit_write("bucket", "k", &FileAttributes::default(), b"hello".to_vec())
             .await
             .expect_err("commit_write must surface AccessDenied without retrying");
         assert!(matches!(err.0, StatusCode::PermissionDenied));

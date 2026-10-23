@@ -139,7 +139,7 @@ bytes = { workspace = true, features = ["serde"] }
 
 # S3 API dependencies
 rustfs-s3-types = { workspace = true }
-s3s = { workspace = true, features = ["minio"] }
+rustfs-gateway-stream = { workspace = true }
 
 # FTPS specific dependencies (optional)
 libunftp = { workspace = true, optional = true, features = ["experimental"] }
