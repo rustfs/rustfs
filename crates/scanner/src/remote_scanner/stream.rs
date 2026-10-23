@@ -16,10 +16,10 @@
 use crate::RUSTFS_META_BUCKET;
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig};
 use crate::scanner_io::{
-    DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerCheckpointPersistContext, ScannerCheckpointPersistResult,
-    ScannerDiskScanOptions, ScannerDiskScanOutcome, ScannerIODisk, acquire_scanner_cache_locks, cache_root_entry_info,
-    current_cache_root_or_prepare_with_generation, log_saved_partial_bucket_cache, persist_scanner_checkpoint,
-    scanner_set_disk_inventory,
+    DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerBucketPlanDigests, ScannerCheckpointPersistContext,
+    ScannerCheckpointPersistResult, ScannerDiskScanOptions, ScannerDiskScanOutcome, ScannerIODisk, acquire_scanner_cache_locks,
+    cache_root_entry_info, current_cache_root_or_prepare_with_generation, log_saved_partial_bucket_cache,
+    persist_scanner_checkpoint, scanner_set_disk_inventory,
 };
 use crate::storage_api::owner::NS_SCANNER_PROTOCOL_VERSION;
 use crate::{
@@ -216,8 +216,7 @@ pub(crate) struct RemoteScannerScanSpec<'a> {
     pub(crate) server_epoch: Uuid,
     pub(crate) session_id: Uuid,
     pub(crate) session_sequence: u64,
-    pub(crate) scan_plan_digest: DataUsageScanPlanDigest,
-    pub(crate) checkpoint_plan_digest: DataUsageScanPlanDigest,
+    pub(crate) plans: ScannerBucketPlanDigests,
     pub(crate) tier_registry_generation: u64,
     pub(crate) skip_healing: bool,
     pub(crate) scan_mode: HealScanMode,
@@ -1012,12 +1011,13 @@ pub(crate) async fn scan_remote_bucket(
         server_epoch,
         session_id,
         session_sequence,
-        scan_plan_digest,
-        checkpoint_plan_digest,
+        plans,
         tier_registry_generation,
         skip_healing,
         scan_mode,
     } = spec;
+    let scan_plan_digest = plans.reuse;
+    let checkpoint_plan_digest = plans.coverage;
     let expected_source = cache_source_for_disk(disk).map_err(|err| {
         RemoteScannerFailure::transport(StorageError::other(format!("failed to resolve remote namespace scanner source: {err}")))
     })?;

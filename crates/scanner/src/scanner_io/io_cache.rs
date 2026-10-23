@@ -855,9 +855,13 @@ impl ScannerIOCache for SetDisks {
                     let bucket_dirty_generation = dirty_usage_buckets_clone.get(&bucket.name).copied();
                     // The reuse plan a complete cache is current under, and the
                     // coverage plan a sweep is started and resumed under.
-                    let bucket_scan_plan_digest = scanner_bucket_cache_digest(bucket_work_digest, bucket_dirty_generation);
-                    let bucket_checkpoint_plan_digest =
-                        scanner_bucket_cache_digest(bucket_checkpoint_work_digest, bucket_dirty_generation);
+                    let bucket_plans = ScannerBucketPlanDigests::from_work_plans(
+                        bucket_work_digest,
+                        bucket_checkpoint_work_digest,
+                        bucket_dirty_generation,
+                    );
+                    let bucket_scan_plan_digest = bucket_plans.reuse;
+                    let bucket_checkpoint_plan_digest = bucket_plans.coverage;
 
                     if let Some(server_epoch) = remote_server_epoch {
                         let request_sequence = remote_session_sequence;
@@ -886,8 +890,7 @@ impl ScannerIOCache for SetDisks {
                                 server_epoch,
                                 session_id: remote_session_id,
                                 session_sequence: request_sequence,
-                                scan_plan_digest: bucket_scan_plan_digest,
-                                checkpoint_plan_digest: bucket_checkpoint_plan_digest,
+                                plans: bucket_plans,
                                 tier_registry_generation,
                                 skip_healing: healing,
                                 scan_mode,
