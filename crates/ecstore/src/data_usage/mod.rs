@@ -6359,6 +6359,43 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn complete_scanner_cycle_with_carried_bucket_preserves_legacy_quota_floor() {
+        clear_usage_memory_cache_for_test().await;
+        let bucket = "partial-carried-quota";
+        let mut baseline = data_usage_info_for_test(bucket, 2, 100, SystemTime::UNIX_EPOCH + Duration::from_secs(100));
+        baseline.scanner_epoch = Some(7);
+        baseline.scanner_cycle = Some(10);
+        baseline.usage_snapshot_converged = Some(true);
+        replace_bucket_usage_memory_from_info(&baseline).await;
+        record_bucket_object_write_memory(bucket, None, 25).await;
+        record_bucket_object_delete_memory(bucket, 20, true).await;
+        assert_eq!(get_bucket_usage_memory(bucket).await, Some(125));
+        let mutation_time = memory_cache().read().await[bucket].usage_updated_at;
+
+        let mut carried = baseline;
+        carried.last_update = Some(mutation_time + Duration::from_secs(1));
+        carried.scanner_cycle = Some(11);
+        carried.usage_snapshot_converged = Some(false);
+        carried.usage_snapshot_pending_buckets = vec![bucket.to_string()];
+        assert!(carried.usage_snapshot_complete);
+        replace_bucket_usage_memory_from_info(&carried).await;
+        assert_eq!(
+            get_bucket_usage_memory(bucket).await,
+            Some(125),
+            "Complete with a carried certified value must retain positive deltas and the delete hold"
+        );
+
+        let mut reconciled = data_usage_info_for_test(bucket, 2, 105, mutation_time + Duration::from_secs(2));
+        reconciled.scanner_epoch = Some(7);
+        reconciled.scanner_cycle = Some(12);
+        reconciled.usage_snapshot_converged = Some(true);
+        replace_bucket_usage_memory_from_info(&reconciled).await;
+        assert_eq!(get_bucket_usage_memory(bucket).await, Some(105));
+        clear_usage_memory_cache_for_test().await;
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn stale_quota_uses_complete_baseline_plus_positive_deltas() {
         clear_usage_memory_cache_for_test().await;
 

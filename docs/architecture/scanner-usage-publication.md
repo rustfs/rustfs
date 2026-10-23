@@ -126,6 +126,16 @@ is never adopted in place of a full walk of the same cycle, nor the reverse.
 The persisted set-root fast path requires equal execution identities as well as
 the existing source, cycle, leader, tier, and cache-structure checks.
 
+Remote workers receive the reuse plan as `scan_plan_digest` and the independent
+coverage plan as optional `checkpoint_plan_digest`. The v3 capability proof
+authenticates `ns_scanner_checkpoint_coverage` before a coordinator sends the
+new field, and the signed request URL binds the entire MessagePack body by its
+SHA-256 digest. Older coordinators omit the field and retain their reuse-plan
+checkpoint behavior. A peer that lacks the authenticated capability uses the
+existing coordinator-side scan path, because its strict request reader rejects
+unknown fields. Movement, leader, source, incarnation, and tier checks still
+apply to checkpoint admission and persistence.
+
 A set scan also captures its starting cache revisions. When the persisted
 execution differs, replacement requires those revisions to remain unchanged;
 otherwise a slow scan could overwrite a newer completed result. The existing

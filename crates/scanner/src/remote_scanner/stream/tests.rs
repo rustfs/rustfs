@@ -213,6 +213,7 @@ fn test_request(request_id: Uuid) -> RemoteScannerRequestWire {
         next_cycle: 7,
         leader_epoch: 9,
         scan_plan_digest: TEST_PLAN_DIGEST,
+        checkpoint_plan_digest: None,
         skip_healing: true,
         scan_mode: HealScanMode::Deep,
         budget: RemoteScannerBudget {
@@ -221,6 +222,34 @@ fn test_request(request_id: Uuid) -> RemoteScannerRequestWire {
             max_directories: Some(20),
         },
     }
+}
+
+#[test]
+fn request_accepts_additive_checkpoint_coverage_identity() {
+    #[derive(Serialize)]
+    struct ExtendedRequest<'a, T> {
+        #[serde(flatten)]
+        legacy: &'a RemoteScannerRequestWire,
+        checkpoint_plan_digest: T,
+    }
+    let legacy = test_request(Uuid::new_v4());
+    let request = ExtendedRequest {
+        legacy: &legacy,
+        checkpoint_plan_digest: DataUsageScanPlanDigest([23; 32]),
+    };
+    let body = rmp_serde::to_vec_named(&request).expect("extended request body");
+    let decoded =
+        decode_remote_scanner_request(&body).expect("an authenticated extended request must preserve its coverage identity");
+    assert_eq!(decoded.0.checkpoint_plan_digest, Some(DataUsageScanPlanDigest([23; 32])));
+    let malformed = ExtendedRequest {
+        legacy: &legacy,
+        checkpoint_plan_digest: vec![23_u8],
+    };
+    let malformed = rmp_serde::to_vec_named(&malformed).expect("malformed coverage identity body");
+    assert!(
+        decode_remote_scanner_request(&malformed).is_err(),
+        "invalid coverage identities must not default to legacy semantics"
+    );
 }
 
 #[test]
@@ -237,6 +266,17 @@ fn request_round_trip_preserves_scan_inputs_without_cache_data() {
     assert_eq!(decoded.0.next_cycle, 7);
     assert_eq!(decoded.0.leader_epoch, 9);
     assert_eq!(decoded.0.scan_plan_digest, TEST_PLAN_DIGEST);
+    assert_eq!(
+        decoded.0.checkpoint_plan_digest, None,
+        "old coordinators retain reuse-plan checkpoint semantics"
+    );
+    assert!(
+        !serde_json::to_value(&decoded.0)
+            .expect("legacy wire shape")
+            .as_object()
+            .expect("request map")
+            .contains_key("checkpoint_plan_digest")
+    );
     assert!(decoded.0.skip_healing);
     assert_eq!(decoded.0.scan_mode, HealScanMode::Deep);
     assert_eq!(decoded.0.budget.max_objects, Some(10));

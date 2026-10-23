@@ -887,6 +887,7 @@ impl ScannerIOCache for SetDisks {
                                 session_id: remote_session_id,
                                 session_sequence: request_sequence,
                                 scan_plan_digest: bucket_scan_plan_digest,
+                                checkpoint_plan_digest: bucket_checkpoint_plan_digest,
                                 tier_registry_generation,
                                 skip_healing: healing,
                                 scan_mode,

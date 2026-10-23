@@ -96,6 +96,8 @@ pub(super) struct RemoteScannerRequestWire {
     pub(super) next_cycle: u64,
     pub(super) leader_epoch: u64,
     scan_plan_digest: DataUsageScanPlanDigest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint_plan_digest: Option<DataUsageScanPlanDigest>,
     skip_healing: bool,
     scan_mode: HealScanMode,
     budget: RemoteScannerBudget,
@@ -215,6 +217,7 @@ pub(crate) struct RemoteScannerScanSpec<'a> {
     pub(crate) session_id: Uuid,
     pub(crate) session_sequence: u64,
     pub(crate) scan_plan_digest: DataUsageScanPlanDigest,
+    pub(crate) checkpoint_plan_digest: DataUsageScanPlanDigest,
     pub(crate) tier_registry_generation: u64,
     pub(crate) skip_healing: bool,
     pub(crate) scan_mode: HealScanMode,
@@ -669,6 +672,7 @@ async fn scan_and_persist_local_bucket(
         next_cycle,
         leader_epoch,
         scan_plan_digest,
+        checkpoint_plan_digest,
         skip_healing,
         scan_mode,
         ..
@@ -745,9 +749,7 @@ async fn scan_and_persist_local_bucket(
                     "remote namespace scanner checkpoint identity unavailable during admission: {err}"
                 ))
             })?,
-            // One digest travels on the wire: a remote sweep resumes under
-            // the reuse plan it was requested with.
-            checkpoint_plan_digest: None,
+            checkpoint_plan_digest,
         },
     );
     match scan_state {
@@ -903,7 +905,12 @@ async fn scan_and_persist_local_bucket(
         }
     };
     let (cache, partial_result) = match outcome {
-        ScannerDiskScanOutcome::Complete(cache) => (cache, None),
+        ScannerDiskScanOutcome::Complete(mut cache) => {
+            // The folder completes under its coverage plan; finished cache
+            // reuse and the response remain bound to the requested reuse plan.
+            cache.info.scan_plan_digest = Some(scan_plan_digest);
+            (cache, None)
+        }
         ScannerDiskScanOutcome::Partial(cache) => (cache, Some(RemoteScannerFrameResult::Partial)),
         ScannerDiskScanOutcome::NamespaceNotFound(cache) => (cache, Some(RemoteScannerFrameResult::NamespaceNotFound)),
     };
@@ -1006,6 +1013,7 @@ pub(crate) async fn scan_remote_bucket(
         session_id,
         session_sequence,
         scan_plan_digest,
+        checkpoint_plan_digest,
         tier_registry_generation,
         skip_healing,
         scan_mode,
@@ -1024,6 +1032,7 @@ pub(crate) async fn scan_remote_bucket(
         next_cycle,
         leader_epoch,
         scan_plan_digest,
+        checkpoint_plan_digest: Some(checkpoint_plan_digest),
         skip_healing,
         scan_mode,
         budget: RemoteScannerBudget::from_config(budget.remaining_config()),
