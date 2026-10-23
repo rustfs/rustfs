@@ -147,5 +147,6 @@ clap = { workspace = true, features = ["derive", "env"] }
 
 [dev-dependencies]
 aws-smithy-http-client = { workspace = true, default-features = false, features = ["test-util"] }
+rustfs-heal.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
