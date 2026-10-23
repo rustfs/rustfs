@@ -18,7 +18,7 @@ use crate::heal::{
     erasure_healer::target_outcomes_complete,
     outcome::{
         HealAbortReason, HealDeferredReason, HealExecutionOutcome, HealFailureClass, HealObjectDisposition, HealObjectIdentity,
-        HealObjectKind, HealObjectOutcome, HealObjectReceipt, HealTaskOutcome,
+        HealObjectKind, HealObjectOutcome, HealObjectReceipt, HealObjectReceiptExt, HealTaskOutcome,
     },
     progress::HealProgress,
     resume::{
