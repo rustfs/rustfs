@@ -196,6 +196,56 @@ const DECOMMISSION_RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration:
 const DECOMMISSION_SOURCE_CHANGED_EXHAUSTION_LIMIT: usize = 100;
 const DECOMMISSION_TERMINAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 const DECOMMISSION_CANCEL_TARGET_LOCK_MAX_ATTEMPTS: usize = 3;
+/// Relaunch delay after a durable pause. A first pause is relaunched by the
+/// next watchdog pass as before; each further pause on the same cause without
+/// progress holds the relaunch for this base, doubled per repeat.
+const DECOMMISSION_PAUSE_RELAUNCH_BASE: std::time::Duration = std::time::Duration::from_secs(30);
+const DECOMMISSION_PAUSE_RELAUNCH_MAX: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// The pause record after `reason` paused a pool that had counted
+/// `counted_items` items. A pause keeps its exit: the pool is relaunched after
+/// the returned delay, never failed. Only a repeat of the same cause with no
+/// counted item in between grows the delay.
+fn next_decommission_pause_record(
+    previous: Option<&crate::runtime::instance::DecommissionPauseRecord>,
+    reason: &str,
+    counted_items: usize,
+    now: tokio::time::Instant,
+) -> crate::runtime::instance::DecommissionPauseRecord {
+    let repeats = match previous {
+        Some(previous) if previous.reason == reason && previous.counted_items == counted_items => {
+            previous.repeats.saturating_add(1)
+        }
+        _ => 1,
+    };
+    let delay = if repeats < 2 {
+        std::time::Duration::ZERO
+    } else {
+        DECOMMISSION_PAUSE_RELAUNCH_BASE
+            .saturating_mul(1_u32 << (repeats - 2).min(5))
+            .min(DECOMMISSION_PAUSE_RELAUNCH_MAX)
+    };
+    crate::runtime::instance::DecommissionPauseRecord {
+        reason: reason.to_owned(),
+        counted_items,
+        repeats,
+        relaunch_after: now + delay,
+    }
+}
+
+/// Whether the watchdog must not relaunch this pool yet: it is still paused
+/// on the cause of its last recorded pause and that pause's delay has not
+/// run out.
+fn decommission_pause_relaunch_pending(
+    record: Option<&crate::runtime::instance::DecommissionPauseRecord>,
+    info: Option<&PoolDecommissionInfo>,
+    now: tokio::time::Instant,
+) -> bool {
+    record.is_some_and(|record| {
+        now < record.relaunch_after
+            && info.and_then(|info| info.capacity_blocked_reason.as_deref()) == Some(record.reason.as_str())
+    })
+}
 
 fn decommission_capacity_target_gate_retry_exhausted(attempt: usize) -> bool {
     attempt.saturating_add(1) >= DECOMMISSION_CAPACITY_TARGET_GATE_MAX_ATTEMPTS
@@ -5617,9 +5667,9 @@ enum DecommissionEntryAttemptOutcome {
 struct DeferredDecommissionEntry {
     name: String,
     attempts: usize,
-    /// Versions whose progress was already counted. A deferral after the
-    /// copy (source cleanup) has counted every version; the replay must not
-    /// count them again.
+    /// Versions whose progress was already counted. Versions are counted
+    /// only when their entry settles, so a deferred entry has counted none;
+    /// this guards the replay against counting a settled version twice.
     counted_versions: HashSet<(Option<uuid::Uuid>, bool)>,
 }
 
@@ -15750,12 +15800,35 @@ impl ECStore {
             )
             .await?;
         ensure_pool_meta_write_fence(&pool_meta_guard, "decommission capacity pause failed")?;
-        {
+        let counted_items = {
             let mut pool_meta = self.pool_meta.write().await;
             publish_pool_meta_updates(&mut pool_meta, &outcome.committed, &[idx]);
-        }
+            pool_meta
+                .pools
+                .get(idx)
+                .and_then(|pool| pool.decommission.as_ref())
+                .map_or(0, PoolDecommissionInfo::counted_items)
+        };
         ensure_pool_meta_write_fence(&pool_meta_guard, "decommission capacity pause failed")?;
         outcome.disarm();
+        let reason = decommission_pause_reason(err);
+        let now = tokio::time::Instant::now();
+        let record = self
+            .ctx
+            .record_decommission_pause(idx, |previous| next_decommission_pause_record(previous, &reason, counted_items, now));
+        if record.repeats > 1 {
+            warn!(
+                event = EVENT_DECOMMISSION_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                state = "pause_relaunch_backoff",
+                pool_index = idx,
+                repeats = record.repeats,
+                retry_delay_secs = record.relaunch_after.saturating_duration_since(now).as_secs(),
+                reason = %reason,
+                "Decommission paused again on the same cause without progress; backing off its relaunch"
+            );
+        }
         Ok(())
     }
 
@@ -15856,10 +15929,24 @@ impl ECStore {
         rx: &CancellationToken,
         endpoints: &EndpointServerPools,
     ) -> Result<Vec<(usize, DecommissionCancelerGuard)>> {
-        let indices = {
+        let (indices, relaunch_pending) = {
             let pool_meta = self.pool_meta.read().await;
-            resumable_decommission_queue_indices(&pool_meta)
+            let indices = resumable_decommission_queue_indices(&pool_meta);
+            let now = tokio::time::Instant::now();
+            let relaunch_pending = indices.iter().any(|idx| {
+                decommission_pause_relaunch_pending(
+                    self.ctx.decommission_pause(*idx).as_ref(),
+                    pool_meta.pools.get(*idx).and_then(|pool| pool.decommission.as_ref()),
+                    now,
+                )
+            });
+            (indices, relaunch_pending)
         };
+        // A paused pool resumes in queue order; while its backoff runs, no
+        // later pool may start ahead of it.
+        if relaunch_pending {
+            return Ok(Vec::new());
+        }
         let indices = local_decommission_queue_prefix(endpoints, &indices)?;
         self.reserve_decommission_routines(rx, indices.as_slice()).await
     }
@@ -17282,6 +17369,8 @@ impl ECStore {
         let mut decommissioned: usize = 0;
         let mut expired: usize = 0;
         let mut free_version_disposition = DecommissionFreeVersionDisposition::default();
+        // Counted when the entry settles; see the flush before the progress save.
+        let mut pending_counts: Vec<((Option<uuid::Uuid>, bool), usize, bool)> = Vec::with_capacity(fivs.versions.len());
         let mut cleanup_preflight_allowed_missing = Vec::new();
         let mut cleanup_preflight_vanished = Vec::new();
         let mut cleanup_transferred_tier_versions = Vec::new();
@@ -17385,18 +17474,7 @@ impl ECStore {
                     ));
                 }
 
-                if counted_versions.insert((version.version_id, version.deleted)) {
-                    let mut pool_meta = self.pool_meta.write().await;
-                    ensure_decommission_generation(&pool_meta, idx, generation)?;
-                    if let Err(err) = count_decommission_item(&mut pool_meta, idx, 0, !migrated && !consumed) {
-                        return Err(with_decommission_entry_context(
-                            "count_decommission_item",
-                            bucket.as_str(),
-                            entry.name.as_str(),
-                            err,
-                        ));
-                    }
-                }
+                pending_counts.push(((version.version_id, version.deleted), 0, !migrated && !consumed));
 
                 if migrated || consumed {
                     decommissioned += 1;
@@ -17655,18 +17733,7 @@ impl ECStore {
                     continue;
                 }
 
-                if counted_versions.insert((version.version_id, version.deleted)) {
-                    let mut pool_meta = self.pool_meta.write().await;
-                    ensure_decommission_generation(&pool_meta, idx, generation)?;
-                    if let Err(err) = count_decommission_item(&mut pool_meta, idx, 0, failure) {
-                        return Err(with_decommission_entry_context(
-                            "count_decommission_item",
-                            bucket.as_str(),
-                            entry.name.as_str(),
-                            err,
-                        ));
-                    }
-                }
+                pending_counts.push(((version.version_id, version.deleted), 0, failure));
 
                 if !failure {
                     decommissioned += 1;
@@ -18059,18 +18126,7 @@ impl ECStore {
                 continue;
             }
 
-            if counted_versions.insert((version.version_id, version.deleted)) {
-                let mut pool_meta = self.pool_meta.write().await;
-                ensure_decommission_generation(&pool_meta, idx, generation)?;
-                if let Err(err) = count_decommission_item(&mut pool_meta, idx, decommission_item_size(version.size), failure) {
-                    return Err(with_decommission_entry_context(
-                        "count_decommission_item",
-                        bucket.as_str(),
-                        entry.name.as_str(),
-                        err,
-                    ));
-                }
-            }
+            pending_counts.push(((version.version_id, version.deleted), decommission_item_size(version.size), failure));
 
             if failure {
                 break;
@@ -18244,6 +18300,23 @@ impl ECStore {
         let should_save_progress = {
             let mut pool_meta = self.pool_meta.write().await;
             ensure_decommission_generation(&pool_meta, idx, generation)?;
+
+            // Versions are counted once their entry settles: copied and cleaned
+            // up, or retained. An attempt that is retried, deferred or resumed
+            // after a pause or restart recounts nothing it already counted,
+            // because nothing of it was counted (rustfs/backlog#2873).
+            for (version, size, failure) in pending_counts {
+                if counted_versions.insert(version)
+                    && let Err(err) = count_decommission_item(&mut pool_meta, idx, size, failure)
+                {
+                    return Err(with_decommission_entry_context(
+                        "count_decommission_item",
+                        bucket.as_str(),
+                        entry.name.as_str(),
+                        err,
+                    ));
+                }
+            }
 
             if let Err(err) = track_decommission_current_object(&mut pool_meta, idx, bucket.as_str(), entry.name.as_str()) {
                 return Err(with_decommission_entry_context(
@@ -27274,6 +27347,81 @@ mod tests {
         assert_eq!(named(&[&busy, &stale]), Some(stale.to_string()));
         assert_eq!(named(&[&busy, &conflict]), Some(conflict.to_string()));
         assert_eq!(named(&[]), None);
+    }
+
+    /// A copy that lost drive quorum stays the named pause cause when a
+    /// transient contention settles after it (rustfs/backlog#2873, defect F).
+    #[test]
+    fn decommission_deferral_cause_keeps_a_copy_quorum_loss() {
+        let quorum = decommission_copy_quorum_deferral(
+            "delete_marker_copy",
+            "bucket",
+            "object",
+            Error::InsufficientWriteQuorum("bucket".to_owned(), "object".to_owned()),
+        );
+        let busy = decommission_target_gate_busy_error(2);
+        let named = |errors: &[&Error]| {
+            let mut recorded = None;
+            for err in errors {
+                record_decommission_deferral_cause(&mut recorded, err);
+            }
+            recorded.map(|(_, cause)| cause)
+        };
+        assert_eq!(named(&[&quorum, &busy]), Some(quorum.to_string()));
+        assert_eq!(named(&[&busy, &quorum]), Some(quorum.to_string()));
+        let reason = ensure_decommission_deferred_drained("bucket", 0, 1, named(&[&quorum, &busy]).as_deref())
+            .expect_err("a remaining deferral pauses the set")
+            .to_string();
+        assert!(reason.contains("lost drive quorum"), "{reason}");
+    }
+
+    /// A first pause relaunches on the next watchdog pass; only a repeat of
+    /// the same cause without a counted item backs off, and the delay is
+    /// bounded. Progress or a new cause starts over.
+    #[test]
+    fn decommission_pause_relaunch_backs_off_only_on_repeats_without_progress() {
+        let now = tokio::time::Instant::now();
+        let first = next_decommission_pause_record(None, "cause", 7, now);
+        assert_eq!((first.repeats, first.relaunch_after), (1, now));
+
+        let mut record = first;
+        let mut delays = Vec::new();
+        for _ in 0..8 {
+            record = next_decommission_pause_record(Some(&record), "cause", 7, now);
+            delays.push(record.relaunch_after - now);
+        }
+        assert_eq!(delays[0], DECOMMISSION_PAUSE_RELAUNCH_BASE);
+        assert_eq!(delays[1], 2 * DECOMMISSION_PAUSE_RELAUNCH_BASE);
+        assert!(delays.windows(2).all(|pair| pair[0] <= pair[1]), "{delays:?}");
+        assert_eq!(*delays.last().unwrap(), DECOMMISSION_PAUSE_RELAUNCH_MAX);
+
+        let progressed = next_decommission_pause_record(Some(&record), "cause", 8, now);
+        assert_eq!((progressed.repeats, progressed.relaunch_after), (1, now));
+        let other = next_decommission_pause_record(Some(&record), "other cause", 7, now);
+        assert_eq!((other.repeats, other.relaunch_after), (1, now));
+    }
+
+    /// The hold applies only while the pool is still paused on the recorded
+    /// cause and its delay has not run out.
+    #[test]
+    fn decommission_pause_relaunch_hold_requires_the_same_live_pause() {
+        let now = tokio::time::Instant::now();
+        let first = next_decommission_pause_record(None, "cause", 7, now);
+        let repeated = next_decommission_pause_record(Some(&first), "cause", 7, now);
+        let paused = PoolDecommissionInfo {
+            capacity_blocked_reason: Some("cause".to_owned()),
+            ..Default::default()
+        };
+        assert!(decommission_pause_relaunch_pending(Some(&repeated), Some(&paused), now));
+        assert!(!decommission_pause_relaunch_pending(
+            Some(&repeated),
+            Some(&paused),
+            repeated.relaunch_after
+        ));
+        assert!(!decommission_pause_relaunch_pending(Some(&first), Some(&paused), now));
+        let resumed = PoolDecommissionInfo::default();
+        assert!(!decommission_pause_relaunch_pending(Some(&repeated), Some(&resumed), now));
+        assert!(!decommission_pause_relaunch_pending(None, Some(&paused), now));
     }
 
     /// A set that still holds a deferred entry must not report success.

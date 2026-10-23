@@ -735,6 +735,11 @@ async fn restore_delete_rollback_with_namespace_owner(
     {
         Err(DiskError::FileNotFound)
     } else {
+        #[cfg(test)]
+        DELETE_ROLLBACK_BACKUP_RESTORES
+            .lock()
+            .expect("test rollback restore record lock should not be poisoned")
+            .insert(backup_path.clone());
         os::rename_all_with_owner(&backup_path, xl_path, object_dir, publication_root, namespace_owner.clone()).await
     };
     match restored {
@@ -2624,6 +2629,11 @@ static INLINE_BEFORE_FILE_SYNC_ADMISSION: std::sync::LazyLock<std::sync::Mutex<H
 static RENAME_DATA_AFTER_FIRST_PUBLICATION: std::sync::LazyLock<
     std::sync::Mutex<HashMap<RenameDataPublicationHookKey, InlinePreparationHook>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+/// Backups a delete rollback tried to restore, for tests that must prove a
+/// rollback never touched a backup it did not write.
+#[cfg(test)]
+pub(super) static DELETE_ROLLBACK_BACKUP_RESTORES: std::sync::LazyLock<std::sync::Mutex<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 #[cfg(test)]
 static OWNED_FILE_WRITE_BEFORE_OPEN: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, InlinePreparationHook>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
@@ -12895,16 +12905,16 @@ mod test {
     }
 
     #[derive(Clone, Default)]
-    pub(super) struct CapturedLogs {
+    struct CapturedLogs {
         buffer: Arc<Mutex<Vec<u8>>>,
     }
 
-    pub(super) struct CapturedLogWriter {
+    struct CapturedLogWriter {
         buffer: Arc<Mutex<Vec<u8>>>,
     }
 
     impl CapturedLogs {
-        pub(super) fn contents(&self) -> String {
+        fn contents(&self) -> String {
             let buffer = self
                 .buffer
                 .lock()

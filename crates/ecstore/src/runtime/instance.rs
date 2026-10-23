@@ -110,6 +110,18 @@ impl Drop for NamespaceCommitGuard {
     }
 }
 
+/// A durable decommission pause as seen by this instance's worker watchdog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecommissionPauseRecord {
+    pub(crate) reason: String,
+    /// Decommissioned plus failed items when the pool paused.
+    pub(crate) counted_items: usize,
+    /// Consecutive pauses on `reason` without a counted item in between.
+    pub(crate) repeats: u32,
+    /// The watchdog does not relaunch the pool before this instant.
+    pub(crate) relaunch_after: Instant,
+}
+
 /// Runtime state owned by a single `ECStore` instance.
 ///
 /// This is intentionally minimal in the first migration slice; subsequent
@@ -221,6 +233,10 @@ pub struct InstanceContext {
     /// start runs detached from its caller, so this keeps abandoned requests
     /// and their retries from stacking concurrent starts and preflight heals.
     decommission_start_in_flight: AtomicBool,
+    /// The last durable pause of each local decommission, keyed by pool
+    /// index. The worker watchdog backs off relaunching a pool that keeps
+    /// pausing on the same cause without progress.
+    decommission_pauses: std::sync::Mutex<HashMap<usize, DecommissionPauseRecord>>,
     /// Remote scanner publication leases own a read guard until explicit
     /// release or bounded expiry.  Keeping the guard in storage-owned state
     /// makes a remote movement transition wait on the same fence as a local
@@ -295,6 +311,7 @@ impl InstanceContext {
             background_cancel_token: OnceLock::new(),
             data_movement_operation_gate: Arc::new(RwLock::new(())),
             decommission_start_in_flight: AtomicBool::new(false),
+            decommission_pauses: std::sync::Mutex::new(HashMap::new()),
             scanner_publication_leases: Arc::new(Mutex::new(HashMap::new())),
             data_movement_operation_epoch: AtomicU64::new(0),
             data_movement_operation_epoch_exhausted: AtomicBool::new(false),
@@ -378,6 +395,30 @@ impl InstanceContext {
 
     pub(crate) fn decommission_start_running(&self) -> bool {
         self.decommission_start_in_flight.load(Ordering::Acquire)
+    }
+
+    /// Record a durable pause of `pool_index`; `update` derives the new record
+    /// from the previous one.
+    pub(crate) fn record_decommission_pause(
+        &self,
+        pool_index: usize,
+        update: impl FnOnce(Option<&DecommissionPauseRecord>) -> DecommissionPauseRecord,
+    ) -> DecommissionPauseRecord {
+        let mut pauses = self
+            .decommission_pauses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let record = update(pauses.get(&pool_index));
+        pauses.insert(pool_index, record.clone());
+        record
+    }
+
+    pub(crate) fn decommission_pause(&self, pool_index: usize) -> Option<DecommissionPauseRecord> {
+        self.decommission_pauses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&pool_index)
+            .cloned()
     }
 
     pub(crate) async fn install_scanner_publication_lease(

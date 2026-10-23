@@ -2447,6 +2447,254 @@ mod decommission_lock_order_tests {
         });
     }
 
+    /// Seed `object` in pool 0 with three 2 KiB data versions and a newest
+    /// delete marker; returns the data versions oldest first.
+    async fn seed_versioned_entry_with_marker(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+    ) -> Vec<crate::object_api::ObjectInfo> {
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create the versioned bucket");
+        let mut written = Vec::new();
+        for index in 0..3u8 {
+            written.push(
+                store.pools[0]
+                    .put_object(
+                        bucket,
+                        object,
+                        &mut PutObjReader::from_vec(vec![index; 2048]),
+                        &ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("write a source version"),
+            );
+        }
+        store.pools[0]
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write the source delete marker");
+        written
+    }
+
+    /// Fail every target write of `object` after the first, before it
+    /// commits, while `armed` is set.
+    fn fail_target_writes_after_the_first(
+        bucket: &str,
+        object: &'static str,
+        armed: Arc<AtomicBool>,
+    ) -> DecommissionTestFaultGuard {
+        let writes = Arc::new(AtomicUsize::new(0));
+        let bucket = bucket.to_owned();
+        DecommissionTestFaultGuard::install_with_error(
+            Arc::new(move |stage, entry_bucket, entry_object, _, _| {
+                stage == "before_target_commit"
+                    && entry_bucket == bucket
+                    && entry_object == object
+                    && armed.load(Ordering::Acquire)
+                    && writes.fetch_add(1, Ordering::AcqRel) >= 1
+            }),
+            Some(Arc::new(|_, bucket, object| {
+                crate::error::Error::InsufficientWriteQuorum(bucket.to_owned(), object.to_owned())
+            })),
+        )
+    }
+
+    async fn assert_every_version_readable(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        written: &[crate::object_api::ObjectInfo],
+    ) {
+        for (index, version) in written.iter().enumerate() {
+            let opts = ObjectOptions {
+                versioned: true,
+                version_id: version.version_id.map(|id| id.to_string()),
+                ..Default::default()
+            };
+            let mut reader = store
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                .await
+                .unwrap_or_else(|err| panic!("version {:?} must stay readable: {err:?}", version.version_id));
+            let mut body = Vec::new();
+            reader.stream.read_to_end(&mut body).await.expect("read the version body");
+            assert_eq!(body, vec![index as u8; 2048], "version {:?}", version.version_id);
+        }
+    }
+
+    fn decommission_info(pool_meta: &crate::core::pools::PoolMeta) -> crate::core::pools::PoolDecommissionInfo {
+        pool_meta.pools[0]
+            .decommission
+            .clone()
+            .expect("the decommission state should remain present")
+    }
+
+    /// A partially moved entry pauses the decommission, and the resumed
+    /// routine finds its first versions already on the target. Every version
+    /// is counted exactly once (rustfs/backlog#2873, defect F follow-up).
+    #[test]
+    #[serial_test::serial]
+    fn decommission_counts_each_version_once_across_a_pause_and_resume() {
+        run_large_stack_async_test("decommission-pause-resume-count", || async {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("pause-resume-count");
+            let object = "versioned/03.bin";
+            let written = seed_versioned_entry_with_marker(&store, &bucket, object).await;
+            // Listed after the partially moved entry: its completion saves a
+            // progress checkpoint while that entry's first versions are moved
+            // and its later ones are still deferred.
+            let later = "z/after.bin";
+            store.pools[0]
+                .put_object(
+                    &bucket,
+                    later,
+                    &mut PutObjReader::from_vec(vec![0x7a; 16]),
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write the later entry");
+            let armed = Arc::new(AtomicBool::new(true));
+            let _fault = fail_target_writes_after_the_first(&bucket, object, Arc::clone(&armed));
+            let _checkpoint = crate::core::pools::DecommissionCleanupMutationGuard::install(Arc::new({
+                let store = Arc::clone(&store);
+                let bucket = bucket.clone();
+                move |hook_bucket, hook_object, _| {
+                    let store = Arc::clone(&store);
+                    let due = hook_bucket == bucket && hook_object == later;
+                    Box::pin(async move {
+                        if due {
+                            let stale = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+                            let mut pool_meta = store.pool_meta.write().await;
+                            pool_meta.pools[0].last_update = stale;
+                            if let Some(info) = pool_meta.pools[0].decommission.as_mut() {
+                                info.progress_save_last_at = Some(stale);
+                            }
+                        }
+                    })
+                }
+            }));
+
+            start_transitioned_entry_decommission(&store, &bucket).await;
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the decommission routine task should join")
+                .expect("a paused decommission routine returns without an error");
+            let paused = decommission_info(&*store.pool_meta.read().await);
+            assert!(!paused.complete && !paused.failed, "{paused:?}");
+            assert!(paused.capacity_blocked_reason.is_some(), "{paused:?}");
+            assert_eq!(paused.items_decommission_failed, 0, "{paused:?}");
+
+            armed.store(false, Ordering::Release);
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the resumed routine task should join")
+                .expect("the resumed routine should return");
+            let done = decommission_info(&*store.pool_meta.read().await);
+            assert!(done.complete && !done.failed && done.capacity_blocked_reason.is_none(), "{done:?}");
+            // The routine also moves small system objects; the entry is
+            // counted once, so it adds exactly its four versions and three
+            // 2 KiB data versions to whatever the paused pass counted.
+            assert!(paused.items_decommissioned >= 1, "the later entry was counted: {paused:?}");
+            assert!(paused.bytes_done < 2048, "a deferred entry counts nothing yet: {paused:?}");
+            assert_eq!(done.items_decommissioned, paused.items_decommissioned + 4, "{done:?}");
+            assert_eq!(done.bytes_done, paused.bytes_done + 3 * 2048, "{done:?}");
+            assert_eq!(done.items_decommission_failed, 0, "{done:?}");
+            assert!(exact_versions(&store, 0, &bucket, object).await.is_empty(), "the source is cleaned up");
+            assert_every_version_readable(&store, &bucket, object, &written).await;
+        });
+    }
+
+    /// A target that holds the entry's metadata on fewer drives than its read
+    /// quorum is unreadable. The intact source keeps serving every version,
+    /// and the entry's next pass defers instead of failing.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_half_written_target_never_shadows_the_source() {
+        run_large_stack_async_test("decommission-half-written-target", || async {
+            let (temp_dirs, store, _other_store) =
+                crate::services::rebalance::test_three_pool_stores_with_four_disk_sets_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("half-written-target");
+            let object = "versioned/03.bin";
+            let written = seed_versioned_entry_with_marker(&store, &bucket, object).await;
+            let armed = Arc::new(AtomicBool::new(true));
+            let _fault = fail_target_writes_after_the_first(&bucket, object, Arc::clone(&armed));
+
+            start_transitioned_entry_decommission(&store, &bucket).await;
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the decommission routine task should join")
+                .expect("a paused decommission routine returns without an error");
+            let mut target = None;
+            for pool in [1, 2] {
+                if !exact_versions(&store, pool, &bucket, object).await.is_empty() {
+                    target = Some(pool);
+                }
+            }
+            let target = target.expect("the marker and the newest version reached a target");
+
+            // Leave the target's metadata on two of its four drives: below the
+            // read quorum of EC 3+1, as a write that lost quorum mid-commit.
+            let set_index = store.pools[target].get_disks_by_key(object).set_index;
+            for disk in 0..2 {
+                let meta = temp_dirs[target * 8 + set_index * 4 + disk]
+                    .path()
+                    .join(&bucket)
+                    .join(object)
+                    .join("xl.meta");
+                tokio::fs::remove_file(&meta)
+                    .await
+                    .unwrap_or_else(|err| panic!("remove {}: {err}", meta.display()));
+            }
+            let moved = store.pools[target]
+                .get_object_info(
+                    &bucket,
+                    object,
+                    &ObjectOptions {
+                        versioned: true,
+                        version_id: written[2].version_id.map(|id| id.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(moved.is_err(), "the target copy must be unreadable: {moved:?}");
+            assert_every_version_readable(&store, &bucket, object, &written).await;
+
+            armed.store(false, Ordering::Release);
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the resumed routine task should join")
+                .expect("the resumed routine should return");
+            let info = decommission_info(&*store.pool_meta.read().await);
+            assert!(!info.failed, "a half-written target is not a permanent failure: {info:?}");
+            assert_eq!(info.items_decommission_failed, 0, "{info:?}");
+            if !info.complete {
+                assert_eq!(exact_versions(&store, 0, &bucket, object).await.len(), 4, "the source is retained");
+            }
+            assert_every_version_readable(&store, &bucket, object, &written).await;
+        });
+    }
+
     /// Only a target write is deferred. A source version that cannot be read
     /// keeps its per-object failure, so an unreadable source ends the
     /// decommission as failed instead of pausing and resuming forever.
