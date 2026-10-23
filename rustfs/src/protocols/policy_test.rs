@@ -17,6 +17,7 @@
 use crate::runtime_sources::{AppContext, IamInterface, KmsInterface, ServerContextSlot};
 use crate::storage_api::protocols::client::{BucketOperations, ListObjectsV2Input, MakeBucketOptions};
 use rustfs_credentials::Credentials;
+use rustfs_gateway_types::BucketName;
 use rustfs_iam::{
     store::{
         Store, UserType,
@@ -230,10 +231,9 @@ fn protocol_policy_denials_and_request_conditions() {
             .expect("save bucket deny");
         for session in &sessions {
             let list_input = ListObjectsV2Input::builder()
-                .bucket(bucket.to_owned())
-                .prefix(Some("secret/".into()))
-                .build()
-                .expect("list input");
+                .bucket(BucketName::new(bucket.to_owned()).expect("valid bucket name"))
+                .prefix("secret/".into())
+                .build();
             assert!(
                 matches!(
                     backend.authorize_list_objects(session, &list_input).await,
@@ -289,12 +289,11 @@ fn protocol_policy_denials_and_request_conditions() {
             .await
             .expect("clear bucket policy");
         let list_input = ListObjectsV2Input::builder()
-            .bucket(bucket.to_owned())
-            .prefix(Some("private /+&=照片/".into()))
-            .delimiter(Some("/".into()))
-            .max_keys(Some(2))
-            .build()
-            .expect("conditioned listing input");
+            .bucket(BucketName::new(bucket.to_owned()).expect("valid bucket name"))
+            .prefix("private /+&=照片/".into())
+            .delimiter("/".into())
+            .max_keys(2)
+            .build();
         // Request condition values must come from the same DTO as execution,
         // including percent-encoded prefixes, explicit empty strings and zero.
         for (key, operator, value, input) in [
