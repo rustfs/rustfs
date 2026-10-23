@@ -2777,6 +2777,81 @@ mod tests {
         );
     }
 
+    // Data movement copies a delete marker onto a target that holds no
+    // metadata yet. Rolling back that sub-quorum write removes the marker it
+    // published, and must not report the backup it never wrote as missing:
+    // that NotFound read as the first error of rustfs/backlog#2873 defect F.
+    #[tokio::test(flavor = "current_thread")]
+    async fn delete_recovery_rollback_of_marker_on_missing_object_is_clean() {
+        for applied in [true, false] {
+            let (_temp, disk, _info, _original) = fixture().await;
+            let root = disk.io_get_object_path("recovery", "object").expect("object path");
+            fs::remove_file(root.join(STORAGE_FORMAT_FILE)).await.expect("absent object");
+            let transaction = Uuid::new_v4();
+            let marker = FileInfo {
+                volume: "recovery".to_owned(),
+                name: "object".to_owned(),
+                version_id: Some(Uuid::new_v4()),
+                deleted: true,
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            };
+            disk.delete_version_recoverable(
+                "recovery",
+                "object",
+                marker,
+                true,
+                DeleteOptions {
+                    old_data_dir: Some(transaction),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("prepared marker application");
+            assert!(root.join(STORAGE_FORMAT_FILE).is_file());
+            if !applied {
+                // A drive that prepared the journal but never published.
+                fs::remove_file(root.join(STORAGE_FORMAT_FILE)).await.unwrap();
+            }
+            let observed = disk
+                .inspect_delete_transaction("recovery", "object", transaction)
+                .await
+                .expect("inspect prepared marker");
+            assert_eq!(observed.state, DeleteRecoveryState::NewPrepared);
+            assert!(observed.journal.as_ref().unwrap().original_digest.is_none());
+
+            let logs = crate::disk::local::test::CapturedLogs::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+            let restored = disk
+                .settle_delete_transaction(
+                    "recovery",
+                    "object",
+                    transaction,
+                    observed.fingerprint,
+                    DeleteRecoveryAction::Rollback,
+                )
+                .await
+                .expect("rollback of a marker published on a missing object");
+            drop(guard);
+            assert_eq!(restored.state, DeleteRecoveryState::Absent);
+            assert!(
+                !root.join(STORAGE_FORMAT_FILE).exists(),
+                "rollback removes the uncommitted marker (applied={applied})"
+            );
+            assert!(!root.join(transaction.to_string()).exists());
+            assert!(
+                !logs.contents().contains("reliable_rename failed"),
+                "a backup that was never written is not a rename failure (applied={applied}): {}",
+                logs.contents()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn delete_recovery_preparation_records_existing_decision_before_new_generation() {
         let (_temp, disk, info, original) = fixture().await;

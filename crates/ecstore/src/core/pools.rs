@@ -3486,7 +3486,13 @@ fn resolve_decommission_progress_save_result(result: Result<()>) -> Option<Error
 }
 
 fn resolve_decommission_preflight_heal_result<T>(bucket: &str, result: Result<T>) -> Result<T> {
-    result.map_err(|err| Error::other(format!("decommission preflight heal failed for bucket {bucket}: {err}")))
+    result.map_err(|err| match err {
+        // A peer whose movement gate has a queued writer refuses the bucket
+        // heal instead of waiting; the refusal crosses the disk layer as
+        // `TooManyOpenFiles`. Keep it retryable so the start answers 503.
+        Error::SlowDown | Error::TooManyOpenFiles => Error::SlowDown,
+        err => Error::other(format!("decommission preflight heal failed for bucket {bucket}: {err}")),
+    })
 }
 
 fn resolve_decommission_optional_bucket_config_result<T>(bucket: &str, stage: &str, result: Result<T>) -> Result<Option<T>> {
@@ -3533,6 +3539,47 @@ fn is_decommission_source_cleanup_retryable_error(err: &Error) -> bool {
                 | Error::InsufficientWriteQuorum(_, _)
         )
     })
+}
+
+/// The storage error of a version copy that kept losing drive quorum through
+/// its in-place retries, kept typed so the entry failure policy defers it.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct DecommissionCopyQuorumFailure(#[source] Error);
+
+fn is_decommission_copy_quorum_error(err: &Error) -> bool {
+    if data_movement::is_data_movement_source_read_error(err) {
+        return false;
+    }
+    let err = data_movement::data_movement_stage_source(err).unwrap_or(err);
+    matches!(
+        err,
+        Error::ErasureReadQuorum
+            | Error::ErasureWriteQuorum
+            | Error::InsufficientReadQuorum(_, _)
+            | Error::InsufficientWriteQuorum(_, _)
+    )
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) fn is_decommission_copy_quorum_error_for_test(err: &Error) -> bool {
+    is_decommission_copy_quorum_error(err)
+}
+
+/// A drive quorum failure while copying a version leaves the source intact:
+/// the target write either never committed or is settled by delete and write
+/// recovery, so the entry can be copied again later. It is a property of the
+/// pools' drives at that moment, not of the object, and must not be counted as
+/// a permanent per-object failure.
+fn decommission_copy_quorum_deferral(stage: &str, bucket: &str, object: &str, err: Error) -> Error {
+    data_movement::data_movement_context_error(
+        format!("decommission {stage} lost drive quorum for {bucket}/{object}: {err}"),
+        DecommissionCopyQuorumFailure(err),
+    )
+}
+
+fn is_decommission_copy_quorum_deferral(err: &Error) -> bool {
+    data_movement::data_movement_stage_source_as::<DecommissionCopyQuorumFailure>(err).is_some()
 }
 
 fn resolve_decommission_entry_reload_result(result: Result<()>, bucket: &str, object_name: &str) -> Result<()> {
@@ -5232,6 +5279,7 @@ pub(crate) const DECOMMISSION_SOURCE_CLEANUP_BLOCKED: &str = "source cleanup blo
 fn record_decommission_deferral_cause(recorded: &mut Option<(bool, String)>, err: &Error) {
     let source_cleanup = is_decommission_source_cleanup_retryable_error(err);
     let durable = source_cleanup
+        || is_decommission_copy_quorum_deferral(err)
         || matches!(
             classify_decommission_capacity_failure(err),
             DecommissionCapacityFailure::StaleTargetSelection { .. }
@@ -5595,10 +5643,12 @@ enum DecommissionEntryOutcome {
 /// or version disappeared, or a competing mutation already superseded it): the
 /// entry is done and must not be counted as a failure or escalated. A quorum
 /// failure of the source cleanup is deferred too: the copied source is still
-/// in place and the next attempt cleans it up again. Every other failure stays
+/// in place and the next attempt cleans it up again. So is a version copy that
+/// lost drive quorum through its in-place retries: the source still holds the
+/// version and the next attempt copies it again. Every other failure stays
 /// terminal.
 fn resolve_decommission_entry_failure(err: Error) -> Result<DecommissionEntryOutcome> {
-    if is_decommission_source_cleanup_retryable_error(&err) {
+    if is_decommission_source_cleanup_retryable_error(&err) || is_decommission_copy_quorum_deferral(&err) {
         return Ok(DecommissionEntryOutcome::Deferred(err));
     }
     match classify_decommission_capacity_failure(&err) {
@@ -5659,7 +5709,7 @@ impl Drop for DecommissionTestFaultGuard {
 }
 
 #[cfg(test)]
-fn decommission_test_wrap_result<T>(
+pub(crate) fn decommission_test_wrap_result<T>(
     stage: &'static str,
     bucket: &str,
     object: &str,
@@ -17142,6 +17192,8 @@ impl ECStore {
         };
 
         let mut fivs = load_decommission_entry_exact_versions(&set, &entry, &bucket, "file_info_versions").await?;
+        #[cfg(test)]
+        decommission_test_wrap_result("exact_versions_read", &bucket, &entry.name, entry_attempt, Ok(()))?;
 
         if data_movement::scanner_backlog::is_scanner_pause_backlog(&bucket, &entry.name) {
             let outcome = self
@@ -17436,6 +17488,9 @@ impl ECStore {
             let mut failure = false;
             let mut error = None;
             let mut copy = None;
+            // A source read that keeps losing quorum stays a per-object
+            // failure: only the target write is retried later.
+            let mut source_read_failed = false;
             if version.deleted {
                 let mut version_attempt = 1;
                 let mut target_busy_attempt: usize = 0;
@@ -17569,6 +17624,15 @@ impl ECStore {
                             version_attempt += 1;
                         }
                     }
+                }
+
+                if failure && let Some(err) = error.take_if(|err| is_decommission_copy_quorum_error(err)) {
+                    return Err(decommission_copy_quorum_deferral(
+                        "delete_marker_copy",
+                        bucket.as_str(),
+                        version.name.as_str(),
+                        err,
+                    ));
                 }
 
                 if ignore {
@@ -17706,6 +17770,7 @@ impl ECStore {
                         }
                         Err(err) => {
                             failure = true;
+                            source_read_failed = false;
                             if version_attempt == DECOMMISSION_VERSION_COPY_ATTEMPTS {
                                 error!(
                                     event = EVENT_DECOMMISSION_ENTRY,
@@ -17775,6 +17840,7 @@ impl ECStore {
                         }
 
                         failure = true;
+                        source_read_failed = true;
                         if version_attempt == DECOMMISSION_VERSION_COPY_ATTEMPTS {
                             error!(
                                 event = EVENT_DECOMMISSION_ENTRY,
@@ -17832,6 +17898,16 @@ impl ECStore {
 
                 let migrate_result = self
                     .run_guarded_decommission_side_effect(&rx, &operation_gate, || async {
+                        // Injected before the copy, so a test fault leaves the
+                        // target exactly as a write that never committed would.
+                        #[cfg(test)]
+                        decommission_test_wrap_result(
+                            "before_target_commit",
+                            bucket_name.as_str(),
+                            object_name.as_str(),
+                            version_attempt,
+                            Ok(()),
+                        )?;
                         self.clone()
                             .decommission_object(idx, bucket, rd, expected_bucket_incarnation_id, capacity_owner)
                             .await
@@ -17891,6 +17967,7 @@ impl ECStore {
                     }
 
                     failure = true;
+                    source_read_failed = false;
                     if version_attempt == DECOMMISSION_VERSION_COPY_ATTEMPTS {
                         error!(
                             event = EVENT_DECOMMISSION_ENTRY,
@@ -17948,6 +18025,18 @@ impl ECStore {
 
                 failure = false;
                 break;
+            }
+
+            if failure
+                && !source_read_failed
+                && let Some(err) = error.take_if(|err| is_decommission_copy_quorum_error(err))
+            {
+                return Err(decommission_copy_quorum_deferral(
+                    DECOMMISSION_STAGE_MIGRATE_OBJECT,
+                    bucket.as_str(),
+                    version.name.as_str(),
+                    err,
+                ));
             }
 
             if ignore {
@@ -27358,12 +27447,66 @@ mod tests {
             Error::VersionNotFound("bucket-a".to_string(), "object-a".to_string(), "version-a".to_string()),
         ] {
             assert!(is_decommission_copy_cleanup_safe_error(&missing_target));
+            let wrapped = wrap(missing_target);
             assert!(
-                !is_decommission_copy_cleanup_safe_error(&wrap(missing_target)),
+                !is_decommission_copy_cleanup_safe_error(&wrapped),
                 "a missing target part must never authorize source cleanup"
             );
+            assert!(!is_decommission_copy_quorum_error(&wrapped));
         }
         assert!(is_decommission_target_capacity_error(&wrap(Error::DiskFull)));
+    }
+
+    #[test]
+    fn decommission_copy_quorum_classifier_distinguishes_source_and_target_errors() {
+        for quorum in [
+            Error::ErasureReadQuorum,
+            Error::ErasureWriteQuorum,
+            Error::InsufficientReadQuorum("bucket-a".to_owned(), "object-a".to_owned()),
+            Error::InsufficientWriteQuorum("bucket-a".to_owned(), "object-a".to_owned()),
+        ] {
+            assert!(is_decommission_copy_quorum_error(&quorum));
+            let target = data_movement::data_movement_stage_error_for_test(
+                "decommission_object",
+                "put_object",
+                "bucket-a",
+                "object-a",
+                quorum.clone(),
+            );
+            assert!(is_decommission_copy_quorum_error(&target));
+
+            let source = data_movement::data_movement_source_read_error("bucket-a", "object-a", quorum.clone());
+            assert!(!is_decommission_copy_quorum_error(&source));
+            assert!(!is_decommission_copy_cleanup_safe_error(&source));
+
+            for stage in ["put_object_part", "read_part", "prepare_part"] {
+                let part = data_movement::data_movement_part_stage_error_for_test(
+                    "decommission_object",
+                    stage,
+                    "bucket-a",
+                    "object-a",
+                    1,
+                    quorum.clone(),
+                );
+                assert_eq!(is_decommission_copy_quorum_error(&part), stage == "put_object_part", "{part}");
+                assert!(!is_decommission_copy_cleanup_safe_error(&part));
+                if stage != "put_object_part" {
+                    assert!(data_movement::data_movement_stage_source(&part).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decommission_copy_quorum_deferral_keeps_the_original_error_chain() {
+        let deferred = decommission_copy_quorum_deferral("put_object", "bucket-a", "object-a", Error::ErasureWriteQuorum);
+        assert!(is_decommission_copy_quorum_deferral(&deferred));
+        let failure = data_movement::data_movement_stage_source_as::<DecommissionCopyQuorumFailure>(&deferred)
+            .expect("the deferred error must keep its copy-quorum origin");
+        assert!(matches!(
+            std::error::Error::source(failure).and_then(|source| source.downcast_ref::<Error>()),
+            Some(Error::ErasureWriteQuorum)
+        ));
     }
 
     #[test]
@@ -33548,12 +33691,24 @@ mod pools_tests {
 
     #[test]
     fn test_resolve_decommission_preflight_heal_result_wraps_error_context() {
-        let err = resolve_decommission_preflight_heal_result::<()>("bucket-a", Err(Error::SlowDown))
-            .expect_err("heal failure should carry preflight context");
-        assert!(
-            err.to_string()
-                .contains("decommission preflight heal failed for bucket bucket-a")
-        );
+        for failure in [Error::FaultyDisk, Error::ErasureWriteQuorum] {
+            let err = resolve_decommission_preflight_heal_result::<()>("bucket-a", Err(failure))
+                .expect_err("heal failure should carry preflight context");
+            assert!(
+                err.to_string()
+                    .contains("decommission preflight heal failed for bucket bucket-a")
+            );
+            assert_ne!(err, Error::SlowDown, "non-busy failures must not become a retryable start");
+        }
+    }
+
+    #[test]
+    fn test_resolve_decommission_preflight_heal_result_keeps_busy_gate_retryable() {
+        for busy in [Error::SlowDown, Error::TooManyOpenFiles] {
+            let err = resolve_decommission_preflight_heal_result::<()>("bucket-a", Err(busy))
+                .expect_err("a refused heal must fail the start");
+            assert_eq!(err, Error::SlowDown);
+        }
     }
 
     #[test]

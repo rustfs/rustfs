@@ -1,6 +1,6 @@
 # Object lock contention diagnostics
 
-**Use this when:** an object GET returns `ServiceUnavailable` near the namespace lock acquisition deadline while PUT or Heal is active on the same key.
+**Use this when:** an S3 operation returns `ServiceUnavailable` near the namespace lock acquisition deadline, including multipart session creation or abort, or an object GET overlaps PUT or Heal on the same key.
 
 ## Client-visible acquisition timeouts
 
@@ -8,7 +8,31 @@ The canonical `ApiError` conversion in `rustfs/src/error.rs` retains HTTP 503 an
 
 S3 data-plane catalog publication-lock timeouts use the same conversion, typed lock-failure counter, and generic public message; catalog resource and peer details remain in the internal error source. Catalog failures represented only as strings do not inherit lock retry advice.
 
-This advice does not change the lock acquisition budget or shorten a competing writer's commit tail. It is not added to unrelated disk timeouts, quorum failures, or errors that merely contain timeout text. A 503 near five seconds is insufficient to attribute the request to a namespace lock: disk metadata operations also have a five-second default budget. Correlate the typed lock-failure counters and acquisition events below before changing contention policy.
+When a typed cause is available, the same conversion adds an `x-rustfs-error-cause` response header without changing the S3 code or public message:
+
+| Header value | Meaning |
+| --- | --- |
+| `namespace_lock_timeout` | A typed namespace lock acquisition timeout. Also carries the existing `Retry-After: 1` advice. |
+| `namespace_lock_unavailable` | A different typed lock failure or namespace fence refusal. This includes lock quorum loss and capability/fence refusals; it does not prove a particular peer or disk failed. |
+| `storage_write_quorum` | A typed storage write-quorum failure. This is separate from namespace locking and does not receive lock-timeout retry advice. |
+
+The header is diagnostic, not a retry-safety guarantee. An absent header means the failure was not classified, not that locking or storage is healthy. The classifier uses bounded typed error sources, never elapsed time or error text, and exports no resource names, owners, peer addresses, or quorum counts. It applies only to `ServiceUnavailable` responses; other S3 codes keep their own semantics.
+
+The `Retry-After` advice does not change the lock acquisition budget or shorten a competing writer's commit tail. It is not added to unrelated disk timeouts, quorum failures, or errors that merely contain timeout text. A 503 near five seconds is insufficient to attribute the request to a namespace lock: disk metadata operations also have a five-second default budget. Correlate the typed lock-failure counters and acquisition events below before changing contention policy.
+
+## Multipart session failures near five seconds
+
+`CreateMultipartUpload` and `AbortMultipartUpload` acquire bucket lifecycle and metadata validation locks. Abort also takes an exclusive upload lock, which must wait for active part commits. A healthy disk inventory does not establish lock availability or the quorum result of an individual metadata operation.
+
+The namespace lock acquisition budget is `RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT`, in seconds, with a default of **5**. Set it before process startup; it is cached. `RUSTFS_DRIVE_TIMEOUT_PROFILE=high_latency` controls drive operation budgets and does not change this namespace lock budget. A longer lock budget can permit a longer wait, but does not remove contention or identify the competing owner.
+
+Ordinary PUT and multipart operations share successful bucket-incarnation validation while their owned lifecycle read guards overlap continuously. This avoids a redundant metadata transaction lock and sidecar quorum read on subsequent covered requests. The owning guard registers before asynchronous validation, so cancellation removes its registration; UploadPart's owned commit retains both the actual lock and its registration until the tail drains. Last-owner release and observed lock loss invalidate the memo. Cold validations remain concurrent, and failures retain their original typed errors without being cached or queued for sequential retries.
+
+Object Lock snapshots validate through their own transaction guard even when the memo is warm. Operations borrowing only an outer lifecycle fence retain their authoritative validation path. Disabled locking always validates from disk, because a no-op guard provides no continuous exclusion proof. These rules preserve generation checks across cancellation and bucket recreation; they do not establish the production trigger of an individual five-second response.
+
+Session creation writes metadata through `write_unique_file_info` and the metadata RPC; abort uses metadata checks and quorum deletion. These paths do not use the five-second PUT-file capability probe in `internode_data_transport`. Raising that probe deadline does not change session metadata or lock deadlines.
+
+Capture the response headers, request ID, operation, and the `rustfs_s3_lock_failures_total` counter by `op`, `resource_class`, `mode`, and `reason` during a bounded reproduction. Combine them with acquisition events where available; these events do not yet cover every lifecycle or metadata lock. Do not infer the failing phase from timing alone. Retain HTTP 503 and `ServiceUnavailable` for lock/write-quorum availability failures rather than recoding them as `InternalError` or assuming every failure is request-rate overload. Avoid automatic server-side create retries after uncertain writes: a retry creates a new upload ID and can leave another incomplete session.
 
 ## Capture one acquisition and its competing owners
 

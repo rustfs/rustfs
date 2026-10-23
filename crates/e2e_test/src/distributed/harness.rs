@@ -976,6 +976,21 @@ pub(crate) async fn rebalance_status_json(cluster: &RustFSTestClusterEnvironment
     Ok(serde_json::from_str(&body)?)
 }
 
+/// Mirrors `REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX` in `crates/ecstore/src/services/rebalance`.
+const REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX: &str = "deferred transient rebalance entry failure:";
+
+/// A transient entry failure (for example a write quorum miss on a busy
+/// target) is recorded as `lastError` and retried at the end of the run; the
+/// worker clears it when the pool completes. It is only acceptable while the
+/// pool is still started: a terminal pool keeping it is a real failure.
+fn is_retrying_deferred_rebalance_error(pool: &serde_json::Value, error: &str) -> bool {
+    error.starts_with(REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX)
+        && pool
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|status| status.eq_ignore_ascii_case("started"))
+}
+
 fn validate_rebalance_status<'a>(status: &'a serde_json::Value, expected_id: &str) -> TestResult<&'a [serde_json::Value]> {
     let id = status
         .get("id")
@@ -1003,7 +1018,7 @@ fn validate_rebalance_status<'a>(status: &'a serde_json::Value, expected_id: &st
         if pool
             .get("lastError")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|error| !error.is_empty())
+            .is_some_and(|error| !error.is_empty() && !is_retrying_deferred_rebalance_error(pool, error))
         {
             return Err(format!("rebalance reported lastError: {status}").into());
         }
@@ -1525,4 +1540,24 @@ fn rebalance_complete_accepts_non_participating_pools_but_requires_progress() {
         ]
     });
     assert!(!rebalance_complete(&no_movement, "run-1").unwrap());
+}
+
+#[test]
+fn rebalance_status_tolerates_deferred_entry_error_only_while_started() {
+    let deferred = "deferred transient rebalance entry failure: Storage resources are insufficient for the write operation: b/k";
+    let mut status = serde_json::json!({
+        "id": "run-1",
+        "pools": [{ "id": 0, "status": "Started", "stopping": false, "lastError": deferred, "progress": { "objects": 1, "bytes": 1 } }]
+    });
+    assert!(rebalance_active(&status, "run-1").expect("a retried deferral keeps the run active"));
+
+    status["pools"][0]["status"] = serde_json::json!("Completed");
+    assert!(
+        rebalance_complete(&status, "run-1").is_err(),
+        "a completed pool must have cleared its deferred entry error"
+    );
+
+    status["pools"][0]["status"] = serde_json::json!("Started");
+    status["pools"][0]["lastError"] = serde_json::json!("rebalance entry failed: Storage resources are insufficient");
+    assert!(rebalance_active(&status, "run-1").is_err(), "a non-deferred lastError stays fatal");
 }

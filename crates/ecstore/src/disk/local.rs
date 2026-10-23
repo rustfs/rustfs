@@ -889,7 +889,18 @@ async fn restore_delete_rollback_with_namespace_owner(
     }
 
     let backup_path = rollback_path.join(STORAGE_FORMAT_FILE_BACKUP);
-    match os::rename_all_with_owner(&backup_path, xl_path, object_dir, publication_root, namespace_owner.clone()).await {
+    // A journal that recorded no original metadata never wrote a backup (a
+    // delete marker created on a missing key). Renaming it would only log a
+    // NotFound that reads like the cause of the failed write it undoes.
+    let restored = if recovery_journal
+        .as_ref()
+        .is_some_and(|journal| journal.original_digest.is_none())
+    {
+        Err(DiskError::FileNotFound)
+    } else {
+        os::rename_all_with_owner(&backup_path, xl_path, object_dir, publication_root, namespace_owner.clone()).await
+    };
+    match restored {
         Ok(()) => {}
         Err(DiskError::FileNotFound) if remove_new_metadata => {
             match os::remove_file_with_owner(xl_path, namespace_owner.clone()).await {
@@ -13069,16 +13080,16 @@ mod test {
     }
 
     #[derive(Clone, Default)]
-    struct CapturedLogs {
+    pub(super) struct CapturedLogs {
         buffer: Arc<Mutex<Vec<u8>>>,
     }
 
-    struct CapturedLogWriter {
+    pub(super) struct CapturedLogWriter {
         buffer: Arc<Mutex<Vec<u8>>>,
     }
 
     impl CapturedLogs {
-        fn contents(&self) -> String {
+        pub(super) fn contents(&self) -> String {
             let buffer = self
                 .buffer
                 .lock()
