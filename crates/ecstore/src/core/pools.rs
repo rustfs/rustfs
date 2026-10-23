@@ -3541,6 +3541,39 @@ fn is_decommission_source_cleanup_retryable_error(err: &Error) -> bool {
     })
 }
 
+/// The storage error of a version copy that kept losing drive quorum through
+/// its in-place retries, kept typed so the entry failure policy defers it.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct DecommissionCopyQuorumFailure(Error);
+
+fn is_decommission_copy_quorum_error(err: &Error) -> bool {
+    let err = data_movement::data_movement_stage_source(err).unwrap_or(err);
+    matches!(
+        err,
+        Error::ErasureReadQuorum
+            | Error::ErasureWriteQuorum
+            | Error::InsufficientReadQuorum(_, _)
+            | Error::InsufficientWriteQuorum(_, _)
+    )
+}
+
+/// A drive quorum failure while copying a version leaves the source intact:
+/// the target write either never committed or is settled by delete and write
+/// recovery, so the entry can be copied again later. It is a property of the
+/// pools' drives at that moment, not of the object, and must not be counted as
+/// a permanent per-object failure.
+fn decommission_copy_quorum_deferral(stage: &str, bucket: &str, object: &str, err: Error) -> Error {
+    data_movement::data_movement_context_error(
+        format!("decommission {stage} lost drive quorum for {bucket}/{object}: {err}"),
+        DecommissionCopyQuorumFailure(err),
+    )
+}
+
+fn is_decommission_copy_quorum_deferral(err: &Error) -> bool {
+    data_movement::data_movement_stage_source_as::<DecommissionCopyQuorumFailure>(err).is_some()
+}
+
 fn resolve_decommission_entry_reload_result(result: Result<()>, bucket: &str, object_name: &str) -> Result<()> {
     result.map_err(|err| Error::other(format!("decommission reload_pool_meta failed for {bucket}/{object_name}: {err}")))
 }
@@ -5238,6 +5271,7 @@ pub(crate) const DECOMMISSION_SOURCE_CLEANUP_BLOCKED: &str = "source cleanup blo
 fn record_decommission_deferral_cause(recorded: &mut Option<(bool, String)>, err: &Error) {
     let source_cleanup = is_decommission_source_cleanup_retryable_error(err);
     let durable = source_cleanup
+        || is_decommission_copy_quorum_deferral(err)
         || matches!(
             classify_decommission_capacity_failure(err),
             DecommissionCapacityFailure::StaleTargetSelection { .. }
@@ -5601,10 +5635,12 @@ enum DecommissionEntryOutcome {
 /// or version disappeared, or a competing mutation already superseded it): the
 /// entry is done and must not be counted as a failure or escalated. A quorum
 /// failure of the source cleanup is deferred too: the copied source is still
-/// in place and the next attempt cleans it up again. Every other failure stays
+/// in place and the next attempt cleans it up again. So is a version copy that
+/// lost drive quorum through its in-place retries: the source still holds the
+/// version and the next attempt copies it again. Every other failure stays
 /// terminal.
 fn resolve_decommission_entry_failure(err: Error) -> Result<DecommissionEntryOutcome> {
-    if is_decommission_source_cleanup_retryable_error(&err) {
+    if is_decommission_source_cleanup_retryable_error(&err) || is_decommission_copy_quorum_deferral(&err) {
         return Ok(DecommissionEntryOutcome::Deferred(err));
     }
     match classify_decommission_capacity_failure(&err) {
@@ -17442,6 +17478,9 @@ impl ECStore {
             let mut failure = false;
             let mut error = None;
             let mut copy = None;
+            // A source read that keeps losing quorum stays a per-object
+            // failure: only the target write is retried later.
+            let mut source_read_failed = false;
             if version.deleted {
                 let mut version_attempt = 1;
                 let mut target_busy_attempt: usize = 0;
@@ -17575,6 +17614,15 @@ impl ECStore {
                             version_attempt += 1;
                         }
                     }
+                }
+
+                if failure && let Some(err) = error.take_if(|err| is_decommission_copy_quorum_error(err)) {
+                    return Err(decommission_copy_quorum_deferral(
+                        "delete_marker_copy",
+                        bucket.as_str(),
+                        version.name.as_str(),
+                        err,
+                    ));
                 }
 
                 if ignore {
@@ -17712,6 +17760,7 @@ impl ECStore {
                         }
                         Err(err) => {
                             failure = true;
+                            source_read_failed = false;
                             if version_attempt == DECOMMISSION_VERSION_COPY_ATTEMPTS {
                                 error!(
                                     event = EVENT_DECOMMISSION_ENTRY,
@@ -17781,6 +17830,7 @@ impl ECStore {
                         }
 
                         failure = true;
+                        source_read_failed = true;
                         if version_attempt == DECOMMISSION_VERSION_COPY_ATTEMPTS {
                             error!(
                                 event = EVENT_DECOMMISSION_ENTRY,
@@ -17838,6 +17888,16 @@ impl ECStore {
 
                 let migrate_result = self
                     .run_guarded_decommission_side_effect(&rx, &operation_gate, || async {
+                        // Injected before the copy, so a test fault leaves the
+                        // target exactly as a write that never committed would.
+                        #[cfg(test)]
+                        decommission_test_wrap_result(
+                            "before_target_commit",
+                            bucket_name.as_str(),
+                            object_name.as_str(),
+                            version_attempt,
+                            Ok(()),
+                        )?;
                         self.clone()
                             .decommission_object(idx, bucket, rd, expected_bucket_incarnation_id, capacity_owner)
                             .await
@@ -17897,6 +17957,7 @@ impl ECStore {
                     }
 
                     failure = true;
+                    source_read_failed = false;
                     if version_attempt == DECOMMISSION_VERSION_COPY_ATTEMPTS {
                         error!(
                             event = EVENT_DECOMMISSION_ENTRY,
@@ -17954,6 +18015,18 @@ impl ECStore {
 
                 failure = false;
                 break;
+            }
+
+            if failure
+                && !source_read_failed
+                && let Some(err) = error.take_if(|err| is_decommission_copy_quorum_error(err))
+            {
+                return Err(decommission_copy_quorum_deferral(
+                    DECOMMISSION_STAGE_MIGRATE_OBJECT,
+                    bucket.as_str(),
+                    version.name.as_str(),
+                    err,
+                ));
             }
 
             if ignore {

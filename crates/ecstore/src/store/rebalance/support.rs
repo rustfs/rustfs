@@ -196,11 +196,8 @@ pub(super) fn same_latest_object_info_identity(left: &ObjectInfo, right: &Object
         && left.is_dir == right.is_dir
         && left.restore_ongoing == right.restore_ongoing
         && left.restore_expires == right.restore_expires
-        && left.is_latest == right.is_latest
         && left.content_type == right.content_type
         && left.content_encoding == right.content_encoding
-        && left.num_versions == right.num_versions
-        && left.successor_mod_time == right.successor_mod_time
         && left.inlined == right.inlined
         && left.metadata_only == right.metadata_only
         && left.version_only == right.version_only
@@ -209,6 +206,17 @@ pub(super) fn same_latest_object_info_identity(left: &ObjectInfo, right: &Object
     if !same_read_surface {
         return false;
     }
+
+    // These describe the pool's version list, not the version itself. A
+    // partially moved entry keeps every version on its source and only some
+    // on its target, so copies of one version legitimately disagree here
+    // (rustfs/backlog#2873, defect F). A version id names one version, so an
+    // exact copy of an identified version needs no matching list; a null
+    // version does not, and keeps the full comparison.
+    let same_version_history = left.is_latest == right.is_latest
+        && left.num_versions == right.num_versions
+        && left.successor_mod_time == right.successor_mod_time;
+    let identified_version = left.version_id.is_some_and(|id| !id.is_nil());
 
     let exact_identity = left.storage_class == right.storage_class
         && left.mod_time == right.mod_time
@@ -229,8 +237,16 @@ pub(super) fn same_latest_object_info_identity(left: &ObjectInfo, right: &Object
         && left.version_purge_status == right.version_purge_status
         && left.checksum == right.checksum;
 
-    if exact_identity {
+    if exact_identity && (same_version_history || identified_version) {
         return true;
+    }
+
+    // A copied delete marker carries the target's bucket incarnation fence,
+    // which the source marker does not; data movement already treats that as
+    // the same marker.
+    if left.delete_marker && right.delete_marker {
+        return crate::store::object::is_equivalent_data_movement_delete_marker(left, right)
+            || crate::store::object::is_equivalent_data_movement_delete_marker(right, left);
     }
 
     let left_moved =

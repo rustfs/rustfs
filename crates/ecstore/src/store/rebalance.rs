@@ -2123,6 +2123,144 @@ mod tests {
         assert_eq!(info.data_dir, target.data_dir);
     }
 
+    /// A partially moved entry: the retained source lists every version, the
+    /// target only the ones copied so far (rustfs/backlog#2873, defect F).
+    #[test]
+    fn resolve_latest_object_info_candidates_accepts_a_moved_copy_with_a_shorter_version_list() {
+        let mut source = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        source.data_dir = Some(Uuid::from_u128(1));
+        source.num_versions = 5;
+        source.successor_mod_time = Some(OffsetDateTime::from_unix_timestamp(20).expect("test timestamp should be valid"));
+
+        let mut target = source.clone();
+        target.data_dir = Some(Uuid::from_u128(2));
+        target.num_versions = 4;
+        target.is_latest = !source.is_latest;
+        target.successor_mod_time = None;
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_DATA_MOVED,
+            "true".to_string(),
+        );
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_ACTUAL_SIZE,
+            "0".to_string(),
+        );
+
+        let (info, idx) = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(source),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(target.clone()),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("a version copied by a partially moved entry must stay readable");
+
+        assert_eq!(idx, 1);
+        assert_eq!(info.data_dir, target.data_dir);
+    }
+
+    /// An exact copy of an identified version, such as a delete marker copied
+    /// by a partially moved entry, is the same version whatever each pool's
+    /// version list holds.
+    #[test]
+    fn resolve_latest_object_info_candidates_accepts_an_identified_version_with_a_shorter_version_list() {
+        let source = object_info_with_identity(10, true, Uuid::from_u128(1), None);
+        let mut target = source.clone();
+        target.num_versions = source.num_versions + 3;
+        target.successor_mod_time = Some(OffsetDateTime::from_unix_timestamp(20).expect("test timestamp should be valid"));
+
+        let (info, idx) = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(source),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(target),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("an exact copy of an identified version must resolve");
+
+        assert_eq!(idx, 1);
+        assert!(info.delete_marker);
+    }
+
+    /// The delete marker a partially moved entry copied carries the target's
+    /// bucket incarnation fence and a shorter version list; it is still the
+    /// source's marker, so the latest read answers with that marker.
+    #[test]
+    fn resolve_latest_object_info_candidates_accepts_a_copied_delete_marker_with_its_incarnation_fence() {
+        let mut source = object_info_with_identity(10, true, Uuid::from_u128(1), None);
+        source.num_versions = 4;
+        let mut target = source.clone();
+        target.num_versions = 2;
+        rustfs_utils::http::metadata_compat::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::metadata_compat::SUFFIX_BUCKET_INCARNATION_ID,
+            Uuid::from_u128(2).to_string(),
+        );
+
+        let (info, idx) = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(source),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(target),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("a copied delete marker must resolve as the latest version");
+
+        assert_eq!(idx, 1);
+        assert!(info.delete_marker);
+    }
+
+    /// A null version has no id to prove both pools hold the same version, so
+    /// a differing version list still fails closed.
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_null_version_history_conflict() {
+        let mut left = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        left.version_id = None;
+        let mut right = left.clone();
+        right.num_versions = left.num_versions + 1;
+        assert_equal_time_identity_conflict(left.clone(), right);
+
+        let mut right = left.clone();
+        right.is_latest = !left.is_latest;
+        assert_equal_time_identity_conflict(left.clone(), right);
+
+        let mut right = left.clone();
+        right.successor_mod_time = Some(OffsetDateTime::from_unix_timestamp(20).expect("test timestamp should be valid"));
+        assert_equal_time_identity_conflict(left, right);
+    }
+
     #[test]
     fn resolve_latest_object_info_candidates_rejects_unmarked_data_dir_conflict() {
         let mut left = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));

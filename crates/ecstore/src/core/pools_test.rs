@@ -1901,6 +1901,327 @@ mod decommission_lock_order_tests {
         );
     }
 
+    /// A delete marker copy that keeps losing target drive quorum through its
+    /// in-place retries is deferred and copied again at the end of the round
+    /// (rustfs/backlog#2873, defect F). It is not a permanent per-object
+    /// failure, and the source is removed only after every version committed.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_defers_a_delete_marker_copy_that_lost_target_quorum() {
+        run_large_stack_async_test("decommission-marker-quorum-deferral", || async {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("marker-quorum");
+            let object = "versioned/03.bin";
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        versioning_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create the versioned bucket");
+            let mut written = Vec::new();
+            for index in 0..2u8 {
+                written.push(
+                    store.pools[0]
+                        .put_object(
+                            &bucket,
+                            object,
+                            &mut PutObjReader::from_vec(vec![index; 2048]),
+                            &ObjectOptions {
+                                versioned: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("write a source version"),
+                );
+            }
+            let marker = store.pools[0]
+                .delete_object(
+                    &bucket,
+                    object,
+                    ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write the source delete marker");
+            assert!(marker.delete_marker);
+
+            // Every in-place attempt of the first pass loses quorum; the
+            // deferred replay commits.
+            let failing_calls = crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS;
+            let marker_calls = Arc::new(AtomicUsize::new(0));
+            let source_present_at_marker_commit = Arc::new(StdMutex::new(Vec::new()));
+            let _fault = DecommissionTestFaultGuard::install_with_error(
+                Arc::new({
+                    let marker_calls = Arc::clone(&marker_calls);
+                    let bucket = bucket.clone();
+                    move |stage, entry_bucket, entry_object, _, _| {
+                        stage == "delete_marker_copy"
+                            && entry_bucket == bucket
+                            && entry_object == object
+                            && marker_calls.fetch_add(1, Ordering::AcqRel) < failing_calls
+                    }
+                }),
+                Some(Arc::new(|_, bucket, object| {
+                    crate::error::Error::InsufficientWriteQuorum(bucket.to_owned(), object.to_owned())
+                })),
+            );
+            let cleanup_observer = {
+                let store = Arc::clone(&store);
+                let bucket = bucket.clone();
+                let seen = Arc::clone(&source_present_at_marker_commit);
+                crate::core::pools::DecommissionCleanupMutationGuard::install(Arc::new(move |hook_bucket, hook_object, _| {
+                    let store = Arc::clone(&store);
+                    let bucket = bucket.clone();
+                    let seen = Arc::clone(&seen);
+                    let matches = hook_bucket == bucket && hook_object == object;
+                    Box::pin(async move {
+                        if matches {
+                            // Cleanup only starts once the target holds every version.
+                            let on_targets = exact_versions(&store, 1, &bucket, object).await.len()
+                                + exact_versions(&store, 2, &bucket, object).await.len();
+                            seen.lock().unwrap().push(on_targets);
+                        }
+                    })
+                }))
+            };
+
+            start_transitioned_entry_decommission(&store, &bucket).await;
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the decommission routine task should join")
+                .expect("the decommission routine should return");
+            drop(cleanup_observer);
+
+            assert_eq!(
+                marker_calls.load(Ordering::Acquire),
+                failing_calls + 1,
+                "the first pass exhausts its in-place retries and the replay copies the marker once"
+            );
+            assert_eq!(
+                *source_present_at_marker_commit.lock().unwrap(),
+                vec![3],
+                "the source is cleaned up once, after the target committed all three versions"
+            );
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert_eq!(info.items_decommission_failed, 0, "a lost quorum is not a permanent failure: {info:?}");
+            assert!(
+                info.complete && !info.failed && !info.canceled && info.capacity_blocked_reason.is_none(),
+                "the replayed entry must complete the decommission: {info:?}"
+            );
+            drop(local);
+            assert!(exact_versions(&store, 0, &bucket, object).await.is_empty(), "the source is cleaned up");
+            for version in written.iter().chain(std::iter::once(&marker)) {
+                let found = store
+                    .get_object_info(
+                        &bucket,
+                        object,
+                        &ObjectOptions {
+                            versioned: true,
+                            version_id: version.version_id.map(|id| id.to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                if version.delete_marker {
+                    assert!(found.is_err(), "the marker version stays a delete marker");
+                } else {
+                    assert_eq!(found.expect("every data version stays readable").version_id, version.version_id);
+                }
+            }
+        });
+    }
+
+    /// A partially migrated entry leaves some versions on the target while the
+    /// retained source still holds all of them, so the two pools disagree on
+    /// the version count. A copied version must stay readable from either
+    /// pool instead of failing closed as an identity conflict, and a target
+    /// write that keeps losing quorum pauses the decommission instead of
+    /// counting a permanent failure (rustfs/backlog#2873, defect F).
+    #[test]
+    #[serial_test::serial]
+    fn decommission_partial_entry_keeps_every_version_readable() {
+        run_large_stack_async_test("decommission-partial-entry-readable", || async {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("partial-entry");
+            let object = "versioned/03.bin";
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        versioning_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create the versioned bucket");
+            let mut written = Vec::new();
+            for index in 0..3u8 {
+                written.push(
+                    store.pools[0]
+                        .put_object(
+                            &bucket,
+                            object,
+                            &mut PutObjReader::from_vec(vec![index; 2048]),
+                            &ObjectOptions {
+                                versioned: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("write a source version"),
+                );
+            }
+            store.pools[0]
+                .delete_object(
+                    &bucket,
+                    object,
+                    ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write the source delete marker");
+
+            // The newest data version migrates; every later target write of
+            // this entry loses quorum before it commits, in place and in the
+            // deferred replay.
+            let writes = Arc::new(AtomicUsize::new(0));
+            let _fault = DecommissionTestFaultGuard::install_with_error(
+                Arc::new({
+                    let writes = Arc::clone(&writes);
+                    let bucket = bucket.clone();
+                    move |stage, entry_bucket, entry_object, _, _| {
+                        stage == "before_target_commit"
+                            && entry_bucket == bucket
+                            && entry_object == object
+                            && writes.fetch_add(1, Ordering::AcqRel) >= 1
+                    }
+                }),
+                Some(Arc::new(|_, bucket, object| {
+                    crate::error::Error::InsufficientWriteQuorum(bucket.to_owned(), object.to_owned())
+                })),
+            );
+
+            start_transitioned_entry_decommission(&store, &bucket).await;
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the decommission routine task should join")
+                .expect("a paused decommission routine returns without an error");
+
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert_eq!(info.items_decommission_failed, 0, "a lost quorum is not a permanent failure: {info:?}");
+            assert!(
+                !info.complete && !info.failed && !info.canceled,
+                "the entry must pause the decommission: {info:?}"
+            );
+            let reason = info.capacity_blocked_reason.as_deref().unwrap_or_default();
+            assert!(reason.contains("lost drive quorum"), "{reason}");
+            drop(local);
+
+            assert_eq!(exact_versions(&store, 0, &bucket, object).await.len(), 4, "the source is retained");
+            let on_target =
+                exact_versions(&store, 1, &bucket, object).await.len() + exact_versions(&store, 2, &bucket, object).await.len();
+            assert_eq!(on_target, 2, "the marker and the newest version reached the target");
+
+            for version in &written {
+                let opts = ObjectOptions {
+                    versioned: true,
+                    version_id: version.version_id.map(|id| id.to_string()),
+                    ..Default::default()
+                };
+                let mut reader = store
+                    .get_object_reader(&bucket, object, None, HeaderMap::new(), &opts)
+                    .await
+                    .unwrap_or_else(|err| panic!("version {:?} must stay readable: {err:?}", version.version_id));
+                let mut body = Vec::new();
+                reader.stream.read_to_end(&mut body).await.expect("read the version body");
+                assert_eq!(body.len(), 2048);
+                assert_eq!(reader.object_info.version_id, version.version_id);
+            }
+            // The latest version is the copied delete marker: reads answer
+            // not found, not a cross-pool identity conflict.
+            let latest = store
+                .get_object_reader(
+                    &bucket,
+                    object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .err()
+                .expect("the latest version is a delete marker");
+            assert!(
+                crate::error::is_err_object_not_found(&latest) || crate::error::is_err_version_not_found(&latest),
+                "{latest:?}"
+            );
+        });
+    }
+
+    /// Only a target write is deferred. A source version that cannot be read
+    /// keeps its per-object failure, so an unreadable source ends the
+    /// decommission as failed instead of pausing and resuming forever.
+    #[test]
+    #[serial_test::serial]
+    fn decommission_counts_a_source_read_that_lost_quorum_as_failed() {
+        run_large_stack_async_test("decommission-source-read-quorum", || async {
+            let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("source-read-quorum");
+            let object = "unreadable.bin";
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create the bucket");
+            put_source_object(&store, &bucket, object, vec![0x5a; 2048]).await;
+            let _fault = DecommissionTestFaultGuard::install_with_error(
+                Arc::new({
+                    let bucket = bucket.clone();
+                    move |stage, entry_bucket, entry_object, _, _| {
+                        stage == "object_read" && entry_bucket == bucket && entry_object == object
+                    }
+                }),
+                Some(Arc::new(|_, bucket, object| {
+                    crate::error::Error::InsufficientReadQuorum(bucket.to_owned(), object.to_owned())
+                })),
+            );
+
+            start_transitioned_entry_decommission(&store, &bucket).await;
+            spawn_decommission_routine(&store, 1)
+                .await
+                .expect("the decommission routine task should join")
+                .expect("the decommission routine should return");
+
+            let local = store.pool_meta.read().await;
+            let info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the decommission state should remain present");
+            assert_eq!(info.items_decommission_failed, 1, "{info:?}");
+            assert!(info.failed && info.capacity_blocked_reason.is_none(), "{info:?}");
+            drop(local);
+            assert_eq!(exact_versions(&store, 0, &bucket, object).await.len(), 1, "the source is retained");
+        });
+    }
+
     /// A restored source moves as data; the copy keeps its transition tuple,
     /// so the target owns the remote object and the source cleanup must not
     /// leave a tier free version (rustfs/backlog#2873, defect D).
