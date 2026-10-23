@@ -28,10 +28,12 @@
 //! holds a lifecycle READ lock for the whole commit. Therefore, while at least
 //! one lifecycle read guard on this node has been held continuously, no
 //! lifecycle write lock can have been granted anywhere in the cluster, so the
-//! bucket incarnation cannot have changed. The first fenced PUT in such a
-//! coverage window pays the authoritative disk validation exactly as before;
-//! subsequent PUTs whose guards overlap that window compare against the
-//! memoized value. When the node's last guard drops — or any guard observes
+//! bucket incarnation cannot have changed. Cold PUT and multipart requests
+//! validate from disk independently, preserving their existing failure budgets
+//! and typed errors. Once a validation succeeds, subsequent overlapping guards
+//! reuse its result. Registration belongs to the real guard before validation
+//! can suspend, including when a request is cancelled. When the node's last
+//! guard drops — or any guard observes
 //! `is_lock_lost` — the memo is cleared and the next PUT revalidates from
 //! disk.
 //!
@@ -40,7 +42,9 @@
 //! best-effort peer cache invalidation (which is why the fence read from disk
 //! in the first place) is irrelevant to its correctness.
 
+use crate::error::{Result, StorageError};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use rustfs_lock::NamespaceLockGuard;
@@ -147,17 +151,68 @@ impl BucketFenceRegistry {
     }
 }
 
-/// A held bucket lifecycle read lock plus its registration in the fence
-/// registry. Dropping the guard deregisters it; the memo is cleared when the
-/// last guard for the bucket drops (or a lost lock is observed).
+/// Owns continuous lifecycle coverage and its incarnation validation memo.
+/// Registration is established before validation can suspend, and is released
+/// together with the real namespace guard on cancellation or the last owner.
 pub struct BucketIncarnationFenceGuard {
     inner: Option<NamespaceLockGuard>,
     registry: Arc<BucketFenceRegistry>,
     bucket: String,
-    token: u64,
+    token: Option<u64>,
+    memoized: Option<Uuid>,
 }
 
 impl BucketIncarnationFenceGuard {
+    pub(super) fn new(registry: Arc<BucketFenceRegistry>, bucket: &str, inner: NamespaceLockGuard, cacheable: bool) -> Self {
+        let registration = cacheable.then(|| registry.enter(bucket, LockLossProbe::from_guard(&inner)));
+        let token = registration.as_ref().map(|registration| registration.token);
+        let memoized = registration.and_then(|registration| registration.memoized);
+        Self {
+            inner: Some(inner),
+            registry,
+            bucket: bucket.to_owned(),
+            token,
+            memoized,
+        }
+    }
+
+    /// Snapshot holders validate independently through their held transaction
+    /// guard. Cold reads stay concurrent and preserve each caller's typed error.
+    pub(super) async fn validate<F, Fut>(&mut self, reuse_memo: bool, load: F) -> Result<Uuid>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Uuid>>,
+    {
+        let cacheable = reuse_memo && self.token.is_some();
+        let current = match self.memoized.filter(|_| cacheable) {
+            Some(current) => current,
+            None => {
+                let current = load().await?;
+                self.ensure_held()?;
+                if cacheable {
+                    self.registry.memoize(&self.bucket, current);
+                    self.memoized = Some(current);
+                }
+                current
+            }
+        };
+        self.ensure_held()?;
+        Ok(current)
+    }
+
+    fn ensure_held(&self) -> Result<()> {
+        if self.is_lock_lost() {
+            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "bucket_incarnation_validation",
+                bucket: self.bucket.clone(),
+                object: crate::storage_api_contracts::bucket::BUCKET_LIFECYCLE_LOCK_OBJECT.to_owned(),
+                required: 1,
+                achieved: 0,
+            });
+        }
+        Ok(())
+    }
+
     /// Propagate lifecycle lock loss into the storage commit checks.
     /// The caller still owns this guard until the complete write tail drains.
     pub fn attach_to_object_options(&self, opts: &mut crate::object_api::ObjectOptions) {
@@ -177,46 +232,10 @@ impl BucketIncarnationFenceGuard {
 
 impl Drop for BucketIncarnationFenceGuard {
     fn drop(&mut self) {
-        let lost = self.is_lock_lost();
-        self.registry.exit(&self.bucket, self.token, lost);
-        self.inner.take();
-    }
-}
-
-pub(super) struct FencePieces {
-    pub(super) registry: Arc<BucketFenceRegistry>,
-    pub(super) inner: NamespaceLockGuard,
-}
-
-impl FencePieces {
-    /// Register the freshly acquired read lock and return the memoized
-    /// incarnation for the coverage window, if any.
-    pub(super) fn enter(&self, bucket: &str) -> FenceRegistration {
-        self.registry.enter(bucket, LockLossProbe::from_guard(&self.inner))
-    }
-
-    pub(super) fn memoize(&self, bucket: &str, incarnation: Uuid) {
-        self.registry.memoize(bucket, incarnation)
-    }
-
-    pub(super) fn lock_lost(&self) -> bool {
-        self.inner.is_lock_lost()
-    }
-
-    pub(super) fn into_guard(self, bucket: &str, token: u64) -> BucketIncarnationFenceGuard {
-        BucketIncarnationFenceGuard {
-            inner: Some(self.inner),
-            registry: self.registry,
-            bucket: bucket.to_string(),
-            token,
+        if let Some(token) = self.token {
+            self.registry.exit(&self.bucket, token, self.is_lock_lost());
         }
-    }
-
-    /// Abandon the acquisition (validation failed): deregister and release.
-    pub(super) fn abandon(self, bucket: &str, token: u64) {
-        let lost = self.lock_lost();
-        self.registry.exit(bucket, token, lost);
-        drop(self.inner);
+        self.inner.take();
     }
 }
 
@@ -313,45 +332,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fence_pieces_forwards_distributed_lock_loss_to_registry() {
+    async fn fence_guard_forwards_distributed_lock_loss_to_registry() {
         let registry = Arc::new(BucketFenceRegistry::default());
         let lock = NamespaceLock::new("bucket-fence-test".to_string(), Arc::new(LocalClient::new()));
         let first_guard = lock
             .acquire_guard(&lock_request("first"))
             .await
-            .expect("distributed lock acquisition should not fail")
-            .expect("distributed lock quorum should be reached");
-        let first_pieces = FencePieces {
-            registry: registry.clone(),
-            inner: first_guard,
-        };
-
-        let first = first_pieces.enter("b");
-        assert_eq!(first.memoized, None);
-        first_pieces.memoize("b", uuid(7));
-
-        tokio::time::timeout(Duration::from_secs(2), first_pieces.inner.lock_lost_notified())
+            .expect("acquire first")
+            .expect("quorum");
+        let mut first = BucketIncarnationFenceGuard::new(registry.clone(), "b", first_guard, true);
+        first
+            .validate(true, || async { Ok(uuid(7)) })
             .await
-            .expect("non-renewed distributed guard should lose its lease");
-        assert!(first_pieces.lock_lost(), "test guard should observe lost refresh quorum");
-
+            .expect("seed initial validation");
+        tokio::time::timeout(Duration::from_secs(2), first.namespace_lock_guard().expect("guard").lock_lost_notified())
+            .await
+            .expect("non-renewed guard should lose its lease");
         let second_guard = lock
             .acquire_guard(&lock_request("second"))
             .await
-            .expect("second distributed lock acquisition should not fail")
-            .expect("second distributed lock quorum should be reached");
-        let second_pieces = FencePieces {
-            registry: registry.clone(),
-            inner: second_guard,
-        };
-        let second = second_pieces.enter("b");
-        assert_eq!(
-            second.memoized, None,
-            "a live distributed guard whose signal is lost must block memo reuse"
+            .expect("acquire second")
+            .expect("quorum");
+        let second = BucketIncarnationFenceGuard::new(registry.clone(), "b", second_guard, true);
+        assert!(second.memoized.is_none(), "a live lost guard must prevent memo reuse");
+        assert!(
+            matches!(
+                first.validate(true, || async { Ok(uuid(7)) }).await,
+                Err(StorageError::NamespaceLockQuorumUnavailable { .. })
+            ),
+            "lost guards cannot return cached success"
         );
-
-        second_pieces.abandon("b", second.token);
-        first_pieces.abandon("b", first.token);
+        drop(first);
+        drop(second);
+        assert!(registry.entries.lock().expect("registry").is_empty());
     }
 
     #[tokio::test]
@@ -362,12 +375,7 @@ mod tests {
             .await
             .expect("acquire")
             .expect("quorum");
-        let pieces = FencePieces {
-            registry: Arc::default(),
-            inner,
-        };
-        let registration = pieces.enter("b");
-        let fence = pieces.into_guard("b", registration.token);
+        let fence = BucketIncarnationFenceGuard::new(Arc::default(), "b", inner, true);
         let mut opts = crate::object_api::ObjectOptions::default();
         fence.attach_to_object_options(&mut opts);
         let inherited = opts
@@ -375,13 +383,183 @@ mod tests {
             .as_ref()
             .expect("checkpoint inherits lifecycle guard");
         assert!(!inherited.is_lock_lost());
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            fence.namespace_lock_guard().expect("held guard").lock_lost_notified(),
-        )
-        .await
-        .expect("distributed guard expires");
+        tokio::time::timeout(Duration::from_secs(2), fence.namespace_lock_guard().expect("guard").lock_lost_notified())
+            .await
+            .expect("distributed guard expires");
         assert!(inherited.is_lock_lost(), "the actual pre-rename options must observe lifecycle lock loss");
+    }
+
+    async fn test_fence(
+        registry: Arc<BucketFenceRegistry>,
+        lock: &NamespaceLock,
+        cacheable: bool,
+    ) -> BucketIncarnationFenceGuard {
+        let inner = lock
+            .get_read_lock(ObjectKey::new("b", "lifecycle"), "validation", Duration::from_secs(5))
+            .await
+            .expect("acquire lifecycle read guard");
+        BucketIncarnationFenceGuard::new(registry, "b", inner, cacheable)
+    }
+
+    #[tokio::test]
+    async fn overlapping_validations_reuse_one_success_until_coverage_gap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let registry = Arc::new(BucketFenceRegistry::default());
+        let lock = NamespaceLock::new("memoized-validation".to_owned(), Arc::new(LocalClient::new()));
+        let calls = AtomicUsize::new(0);
+        let mut first = test_fence(registry.clone(), &lock, true).await;
+        first
+            .validate(true, || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(uuid(7))
+            })
+            .await
+            .expect("seed authoritative validation");
+        let mut guards = Vec::new();
+        for _ in 0..32 {
+            guards.push(test_fence(registry.clone(), &lock, true).await);
+        }
+        for guard in &mut guards {
+            assert_eq!(
+                guard
+                    .validate(true, || async {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(uuid(7))
+                    })
+                    .await
+                    .expect("reuse authoritative validation"),
+                uuid(7)
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "32 overlapping guards must reuse the successful authoritative read"
+        );
+        drop(first);
+        drop(guards);
+        assert!(registry.entries.lock().expect("registry").is_empty());
+        let mut fresh = test_fence(registry.clone(), &lock, true).await;
+        assert_eq!(
+            fresh
+                .validate(true, || async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(uuid(8))
+                })
+                .await
+                .expect("validate after coverage gap"),
+            uuid(8)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "coverage gap requires another authoritative read");
+    }
+
+    #[tokio::test]
+    async fn cancelled_validation_deregisters_before_revalidation() {
+        let registry = Arc::new(BucketFenceRegistry::default());
+        let lock = NamespaceLock::new("cancelled-validation".to_owned(), Arc::new(LocalClient::new()));
+        let mut guard = test_fence(registry.clone(), &lock, true).await;
+        let mut cancelled = Box::pin(async move { guard.validate(true, || std::future::pending::<Result<Uuid>>()).await });
+        assert!(futures::poll!(&mut cancelled).is_pending());
+        assert_eq!(registry.entries.lock().expect("registry")["b"].guards.len(), 1);
+        drop(cancelled);
+        assert!(
+            registry.entries.lock().expect("registry").is_empty(),
+            "cancellation must deregister actual coverage"
+        );
+        let mut replacement = test_fence(registry.clone(), &lock, true).await;
+        assert_eq!(
+            replacement
+                .validate(true, || async { Ok(uuid(9)) })
+                .await
+                .expect("fresh authoritative value"),
+            uuid(9)
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_validation_failures_stay_concurrent_and_preserve_typed_errors() {
+        let registry = Arc::new(BucketFenceRegistry::default());
+        let lock = NamespaceLock::new("parallel-validation-errors".to_owned(), Arc::new(LocalClient::new()));
+        let mut first = test_fence(registry.clone(), &lock, true).await;
+        let mut second = test_fence(registry.clone(), &lock, true).await;
+        let entered = std::sync::atomic::AtomicUsize::new(0);
+        let release = tokio::sync::Notify::new();
+        let mut first_read = Box::pin(first.validate(true, || async {
+            entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            release.notified().await;
+            Err(StorageError::Lock(rustfs_lock::LockError::timeout(
+                "first-resource",
+                Duration::from_secs(5),
+            )))
+        }));
+        let mut second_read = Box::pin(second.validate(true, || async {
+            entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            release.notified().await;
+            Err(StorageError::ErasureReadQuorum)
+        }));
+        assert!(futures::poll!(&mut first_read).is_pending());
+        assert!(futures::poll!(&mut second_read).is_pending());
+        assert_eq!(
+            entered.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "cold failures must not queue behind one initializer"
+        );
+        release.notify_waiters();
+        assert!(
+            matches!(first_read.await, Err(StorageError::Lock(rustfs_lock::LockError::Timeout { resource, .. })) if resource == "first-resource")
+        );
+        assert!(matches!(second_read.await, Err(StorageError::ErasureReadQuorum)));
+        assert_eq!(
+            second
+                .validate(true, || async { Ok(uuid(8)) })
+                .await
+                .expect("failed validation is retryable"),
+            uuid(8)
+        );
+        drop(first);
+        drop(second);
+        assert!(registry.entries.lock().expect("registry").is_empty());
+    }
+
+    #[tokio::test]
+    async fn independent_and_disabled_validation_bypass_successful_memo() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let registry = Arc::new(BucketFenceRegistry::default());
+        let lock = NamespaceLock::new("independent-validation".to_owned(), Arc::new(LocalClient::new()));
+        let mut first = test_fence(registry.clone(), &lock, true).await;
+        first
+            .validate(true, || async { Ok(uuid(7)) })
+            .await
+            .expect("seed successful memo");
+        let mut snapshot = test_fence(registry.clone(), &lock, true).await;
+        assert!(
+            snapshot
+                .validate(false, || async { Err(StorageError::ErasureReadQuorum) })
+                .await
+                .is_err(),
+            "an Object Lock snapshot must validate its own transaction guard despite a warm memo"
+        );
+        drop(first);
+        drop(snapshot);
+        let calls = AtomicUsize::new(0);
+        let mut disabled = test_fence(registry.clone(), &lock, false).await;
+        for current in [uuid(8), uuid(9)] {
+            assert_eq!(
+                disabled
+                    .validate(true, || async {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(current)
+                    })
+                    .await
+                    .expect("uncached validation"),
+                current
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            registry.entries.lock().expect("registry").is_empty(),
+            "disabled locking cannot register coverage"
+        );
     }
 
     #[test]

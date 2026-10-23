@@ -1026,8 +1026,9 @@ pub struct ObjectOptions {
     /// fence avoids recursively acquiring the read lock behind a queued writer.
     pub bucket_lifecycle_lock_fence: Option<NamespaceLockFence>,
     /// Retains the actual lifecycle guard for an owned multipart commit. A
-    /// lock-loss fence alone does not keep a cancelled caller's lock alive.
-    pub bucket_lifecycle_lock_owner: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
+    /// lock-loss fence alone does not keep a cancelled caller's lock alive. The
+    /// owner also retains the continuous incarnation-validation coverage.
+    pub bucket_lifecycle_lock_owner: Option<Arc<crate::store::BucketIncarnationFenceGuard>>,
     pub replication_request: bool,
     /// True when the inbound request carried the
     /// `{x-rustfs-,x-minio-}source-proxy-request` header family with the
