@@ -1473,8 +1473,8 @@ fn checkpoint_binary_sha256(path: &Path) -> Result<String, BoxError> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires the pinned 1.0.0-rc.5 release binary"]
 async fn rc5_checkpoint_upgrade_rewinds_signed_progress_without_losing_objects() -> TestResult {
+    use crate::storage_api::upgrade_compatibility::{DiskOption, Endpoint, new_disk};
     use futures::{StreamExt, TryStreamExt, stream};
-    use rustfs_ecstore::api::disk::{DiskOption, endpoint::Endpoint, new_disk};
     use rustfs_heal::heal::CheckpointManager;
 
     const BUCKET: &str = "upgrade-rc5-checkpoint";
