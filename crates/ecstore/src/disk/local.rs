@@ -50,7 +50,7 @@ use crate::diagnostics::get::{
 #[cfg(test)]
 use crate::disk::HEALING_MARKER_PATH;
 use crate::disk::disk_store::{get_drive_walkdir_stall_timeout, get_object_disk_read_timeout};
-use crate::disk::io_admission::{DiskIoPermit, spawn_blocking_with_disk_io_permit};
+use crate::disk::io_admission::{DiskIoPermit, current_resource_unit, spawn_blocking_with_disk_io_permit};
 use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, ConditionalFileUpdate, CurrentDeleteGeneration, DataDirDeleteStatus,
@@ -79,6 +79,7 @@ use metrics::counter;
 #[cfg(target_os = "linux")]
 use metrics::gauge;
 use parking_lot::{Mutex as ParkingLotMutex, RwLock as ParkingLotRwLock};
+use rustfs_concurrency::adaptive::AdaptivePermit;
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
     ValidationMode, get_file_info, read_xl_meta_no_data_sync,
@@ -339,6 +340,7 @@ enum MetadataReadOp {
 }
 
 struct MetadataReadJob {
+    resource_unit: Option<AdaptivePermit>,
     path: PathBuf,
     io_permit: Option<DiskIoPermit>,
     op: MetadataReadOp,
@@ -360,6 +362,7 @@ impl MetadataReadJob {
         if self.is_cancelled() {
             return;
         }
+        let _resource_unit = self.resource_unit;
         let _io_permit = self.io_permit;
         match self.op {
             MetadataReadOp::ReadAll { tx } => {
@@ -419,7 +422,8 @@ impl MetadataReadQueue {
         })
     }
 
-    fn enqueue(self: &Arc<Self>, job: MetadataReadJob) {
+    fn enqueue(self: &Arc<Self>, mut job: MetadataReadJob) {
+        job.resource_unit = current_resource_unit();
         let should_spawn = {
             let mut state = self.state.lock();
             state.jobs.push_back(job);
@@ -8283,6 +8287,7 @@ impl LocalDisk {
         let path = file_path.as_ref().to_path_buf();
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.metadata_read_queue.enqueue(MetadataReadJob {
+            resource_unit: None,
             path,
             io_permit,
             op: MetadataReadOp::ReadMetadataOnly { tx },
@@ -8460,6 +8465,7 @@ impl LocalDisk {
         let path = file_path.as_ref().to_path_buf();
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.metadata_read_queue.enqueue(MetadataReadJob {
+            resource_unit: None,
             path,
             io_permit,
             op: MetadataReadOp::ReadAll { tx },
@@ -25890,6 +25896,46 @@ mod test {
     }
 
     #[tokio::test]
+    async fn metadata_read_job_retains_resource_unit_until_native_completion() {
+        use crate::disk::with_background_resource_unit;
+        use rustfs_concurrency::adaptive::AdaptiveAdmission;
+        use std::num::NonZeroU16;
+
+        let dir = tempfile::tempdir().expect("metadata root");
+        let queue = MetadataReadQueue::new(os::PublicationRoot::new(dir.path()).expect("publication root"));
+        let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        with_background_resource_unit(gate.acquire().await, async {
+            queue.enqueue(MetadataReadJob {
+                resource_unit: None,
+                path: PathBuf::new(),
+                io_permit: None,
+                op: MetadataReadOp::TestCustom {
+                    is_closed: Box::new(|| false),
+                    run: Box::new(move || {
+                        started_tx.send(()).expect("native metadata worker started");
+                        release_rx.blocking_recv().expect("release native metadata work");
+                    }),
+                },
+            });
+            started_rx.await.expect("worker owns queued job");
+        })
+        .await;
+        let held = gate.snapshot().active;
+        release_tx.send(()).expect("release native job after caller scope ends");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while gate.snapshot().active != 0 || queue.state.lock().active_workers != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native metadata job and worker retire");
+        assert_eq!(held, 1, "leaving the caller scope must not release a live metadata job's unit");
+        assert!(gate.try_acquire().is_some());
+    }
+
+    #[tokio::test]
     async fn metadata_read_queue_bounds_concurrency_skips_cancelled_and_recovers_from_panic() {
         let dir = tempfile::tempdir().expect("tempdir should be created");
         let root = os::PublicationRoot::new(dir.path()).expect("publication root should be created");
@@ -25909,6 +25955,7 @@ mod test {
             let entered_tx = entered_tx.clone();
             let release_rx = Arc::clone(&release_rx);
             queue.enqueue(MetadataReadJob {
+                resource_unit: None,
                 path: PathBuf::new(),
                 io_permit: None,
                 op: MetadataReadOp::TestCustom {
@@ -25936,12 +25983,14 @@ mod test {
         let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
         drop(cancelled_rx);
         queue.enqueue(MetadataReadJob {
+            resource_unit: None,
             path: dir.path().join("cancelled-never-opened"),
             io_permit: None,
             op: MetadataReadOp::ReadMetadataOnly { tx: cancelled_tx },
         });
         let executed_cancelled_clone = Arc::clone(&executed_cancelled);
         queue.enqueue(MetadataReadJob {
+            resource_unit: None,
             path: PathBuf::new(),
             io_permit: None,
             op: MetadataReadOp::TestCustom {
@@ -25954,6 +26003,7 @@ mod test {
 
         // Enqueue a panicking job followed by a normal completion job to verify panic respawn.
         queue.enqueue(MetadataReadJob {
+            resource_unit: None,
             path: PathBuf::new(),
             io_permit: None,
             op: MetadataReadOp::TestCustom {
@@ -25965,6 +26015,7 @@ mod test {
         let active_trailing = Arc::clone(&active);
         let max_active_trailing = Arc::clone(&max_active);
         queue.enqueue(MetadataReadJob {
+            resource_unit: None,
             path: PathBuf::new(),
             io_permit: None,
             op: MetadataReadOp::TestCustom {
