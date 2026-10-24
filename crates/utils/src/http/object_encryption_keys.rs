@@ -75,11 +75,22 @@ pub const SUFFIX_OPAQUE_ENCRYPTED_ETAG: &str = "server-side-encryption-opaque-et
 /// an encrypted ETag only when its producer recorded the protected format.
 /// Legacy multipart original-size fields alone do not establish encryption.
 pub fn etag_can_be_listed(metadata: &HashMap<String, String>) -> bool {
-    !metadata.keys().any(|key| {
-        super::is_object_encryption_marker(key)
-            || key.eq_ignore_ascii_case(SSEC_ORIGINAL_SIZE_HEADER)
-            || super::starts_with_ignore_ascii_case(key, RUSTFS_INTERNAL_ENCRYPTION_PREFIX)
-    }) || super::metadata_compat::get_consistent_str(metadata, SUFFIX_OPAQUE_ENCRYPTED_ETAG) == Some("v1")
+    let mut requires_proof = false;
+    let mut protected_format_seen = false;
+    for (key, value) in metadata {
+        if super::metadata_compat::matches_either_internal_key_ignore_ascii_case(key, SUFFIX_OPAQUE_ENCRYPTED_ETAG) {
+            // Every alias must attest the same protected format, even after a valid one.
+            if value != "v1" {
+                return false;
+            }
+            protected_format_seen = true;
+        } else if !requires_proof && !protected_format_seen {
+            requires_proof = super::is_object_encryption_marker(key)
+                || key.eq_ignore_ascii_case(SSEC_ORIGINAL_SIZE_HEADER)
+                || super::starts_with_ignore_ascii_case(key, RUSTFS_INTERNAL_ENCRYPTION_PREFIX);
+        }
+    }
+    !requires_proof || protected_format_seen
 }
 
 /// Stored SSE-C metadata keys and the wire names they replicate under.
@@ -378,6 +389,75 @@ mod tests {
             assert!(etag_can_be_listed(&metadata), "protected encrypted metadata: {key}");
             metadata.insert("x-minio-internal-server-side-encryption-opaque-etag".to_owned(), "unknown".to_owned());
             assert!(!etag_can_be_listed(&metadata), "conflicting format markers: {key}");
+        }
+    }
+
+    #[test]
+    fn listing_proof_checks_conflicting_alias_after_valid_aliases() {
+        let mut metadata = HashMap::from([
+            ("x-rustfs-internal-server-side-encryption-opaque-etag".to_owned(), "v1".to_owned()),
+            ("x-minio-internal-server-side-encryption-opaque-etag".to_owned(), "v1".to_owned()),
+            ("X-RUSTFS-INTERNAL-SERVER-SIDE-ENCRYPTION-OPAQUE-ETAG".to_owned(), "v1".to_owned()),
+        ]);
+        // Updating a value preserves iteration order, so valid proofs precede this alias.
+        let last_alias = metadata.keys().last().expect("three proof aliases").clone();
+        for value in ["unknown", "", "v1"] {
+            *metadata.get_mut(&last_alias).expect("last alias remains present") = value.to_owned();
+            assert_eq!(etag_can_be_listed(&metadata), value == "v1", "last proof: {value}");
+        }
+    }
+
+    #[test]
+    fn reader_listing_and_replication_keep_distinct_encryption_contracts() {
+        for (key, reader_encrypted, stripped, listable) in [
+            ("content-type", false, false, true),
+            (INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER, false, true, true),
+            ("X-Minio-Encryption-Original-Size", false, true, true),
+            (INTERNAL_ENCRYPTION_KEY_HEADER, true, true, false),
+            ("x-rustfs-encryption-unknown", true, true, false),
+            (SSEC_ALGORITHM_HEADER, true, true, false),
+            ("X-Amz-Server-Side-Encryption-Customer-Key", true, true, false),
+            (SSEC_ORIGINAL_SIZE_HEADER, false, true, false),
+            ("x-rustfs-internal-server-side-encryption-sealed-key", false, true, false),
+            ("x-minio-internal-server-side-encryption-opaque-etag", true, true, false),
+            ("x-rustfs-internal-server-side-encryption-opaque-etag", false, true, false),
+            (MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER, true, true, false),
+            ("x-minio-internal-encrypted-multipart-extra", false, false, true),
+        ] {
+            assert_eq!(super::super::is_object_encryption_marker(key), reader_encrypted, "reader: {key}");
+            assert_eq!(is_replication_stripped_encryption_key(key), stripped, "replication: {key}");
+            let metadata = HashMap::from([(key.to_owned(), "legacy-metadata".to_owned())]);
+            assert_eq!(etag_can_be_listed(&metadata), listable, "listing: {key}");
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn fused_listing_guard_agrees_with_two_pass_policy(
+            metadata in proptest::collection::hash_map(
+                proptest::prop_oneof![
+                    proptest::sample::select(vec![
+                        INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER.to_owned(),
+                        "X-Minio-Encryption-Original-Size".to_owned(),
+                        SSEC_ORIGINAL_SIZE_HEADER.to_owned(),
+                        INTERNAL_ENCRYPTION_KEY_HEADER.to_owned(),
+                        "X-Amz-Server-Side-Encryption-Customer-Key".to_owned(),
+                        "x-rustfs-internal-server-side-encryption-opaque-etag".to_owned(),
+                        "x-minio-internal-server-side-encryption-opaque-etag".to_owned(),
+                        "X-RUSTFS-INTERNAL-SERVER-SIDE-ENCRYPTION-OPAQUE-ETAG".to_owned(),
+                    ]),
+                    ".{0,80}",
+                ],
+                proptest::prop_oneof![proptest::sample::select(vec![String::new(), "v1".to_owned(), "unknown".to_owned()]), ".{0,40}"],
+                0..24,
+            )
+        ) {
+            let expected = !metadata.keys().any(|key| {
+                super::super::is_object_encryption_marker(key)
+                    || key.eq_ignore_ascii_case(SSEC_ORIGINAL_SIZE_HEADER)
+                    || super::super::starts_with_ignore_ascii_case(key, RUSTFS_INTERNAL_ENCRYPTION_PREFIX)
+            }) || super::super::metadata_compat::get_consistent_str(&metadata, SUFFIX_OPAQUE_ENCRYPTED_ETAG) == Some("v1");
+            proptest::prop_assert_eq!(etag_can_be_listed(&metadata), expected);
         }
     }
 

@@ -663,8 +663,9 @@ impl PersistentListMetadataObject {
             mod_time: object.mod_time,
             etag: object
                 .etag
-                .clone()
-                .filter(|_| rustfs_utils::http::etag_can_be_listed(&object.user_defined)),
+                .as_ref()
+                .filter(|_| rustfs_utils::http::etag_can_be_listed(&object.user_defined))
+                .cloned(),
             storage_class: object.storage_class.clone(),
         }
     }
