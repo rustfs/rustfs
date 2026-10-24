@@ -456,3 +456,92 @@ async fn scanner_node_admission_compacted_heal_child_preserves_deferral() {
     );
     assert_eq!(gate.snapshot().active, 0);
 }
+
+#[tokio::test]
+#[serial]
+async fn scanner_node_admission_progresses_during_continuous_heal_queue() {
+    let (mut scanner, root) = build_test_scanner().await;
+    let _guard = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    write_test_object_metadata(&root, "bucket", "object").await;
+    for index in 0..65 {
+        tokio::fs::write(root.join("bucket/object").join(format!("part.{index}.integrity.orphan")), b"")
+            .await
+            .expect("sidecars require more than one directory refill");
+    }
+    scanner.is_erasure_mode = true;
+    scanner.budget = ScannerCycleBudget::new_with_progress_tracking(&CancellationToken::new(), Default::default());
+    let visits = super::metadata_visits::observe(&mut scanner);
+    let gate = owner(true);
+    scanner.node_admission = Some(gate.clone());
+    scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest);
+    let heal_stop = CancellationToken::new();
+    let heal_stop_worker = heal_stop.clone();
+    let heal_gate = gate.clone();
+    let heal_completions = Arc::new(AtomicU64::new(0));
+    let completed = heal_completions.clone();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let heals = tokio::spawn(async move {
+        let mut held = heal_gate.acquire().await;
+        started.send(()).expect("scanner waits for the first heal");
+        loop {
+            let next = heal_gate.acquire();
+            tokio::pin!(next);
+            assert!(futures::poll!(&mut next).is_pending());
+            held.complete();
+            completed.fetch_add(1, Ordering::Relaxed);
+            held = tokio::select! {
+                biased;
+                _ = heal_stop_worker.cancelled() => return,
+                permit = &mut next => permit,
+            };
+            tokio::task::yield_now().await;
+        }
+    });
+    ready.await.expect("heal starts before scanner");
+    let (node_tx, mut node_rx) = mpsc::channel::<crate::workload_admission::ScannerNodeRequest>(1);
+    let folder = CachedFolder {
+        name: "bucket".to_string(),
+        parent: None,
+        object_heal_prob_div: 1,
+    };
+    let mut handoffs = 0;
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut totals = DataUsageEntry::default();
+        let scan = crate::workload_admission::with_scanner_node_requests(
+            Some(node_tx),
+            scanner.scan_folder(CancellationToken::new(), folder, &mut totals),
+        );
+        tokio::pin!(scan);
+        loop {
+            tokio::select! {
+                result = &mut scan => break result,
+                Some(request) = node_rx.recv() => {
+                    handoffs += 1;
+                    // This direct folder fixture owns no cache lock. Production
+                    // coordinators release and revalidate their lease here.
+                    let permit = request.owner.acquire().await;
+                    assert_eq!(gate.snapshot().active, 1);
+                    request.respond.send(permit).unwrap_or_else(|_| panic!("real walk still waits"));
+                }
+            }
+        }
+    })
+    .await;
+    heal_stop.cancel();
+    heals.await.expect("continuous heal worker exits");
+    result
+        .expect("scanner must finish while Heal keeps queueing")
+        .expect("real directory scan");
+    assert_eq!(scanner.new_cache.size_recursive("bucket").expect("complete tree").objects, 1);
+    assert!(handoffs > 1, "the walk must yield through multiple shared-node turns");
+    assert_eq!(scanner.budget.entries_visited(), 67, "resumption must not replay directory entries");
+    assert_eq!(
+        visits.load(Ordering::Relaxed),
+        1,
+        "classification must account for the object exactly once"
+    );
+    assert!(heal_completions.load(Ordering::Relaxed) > 0, "Heal must also advance during the walk");
+    assert_eq!(gate.snapshot().active, 0);
+}

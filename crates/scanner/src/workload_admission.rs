@@ -14,13 +14,46 @@
 
 use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 
-use rustfs_concurrency::adaptive::NodeAdmission;
+use rustfs_concurrency::adaptive::{NodeAdmission, NodePermit};
 use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshotProvider, WorkloadClass};
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::ScannerError;
 
 static SCANNER_NODE_ADMISSION: OnceLock<Arc<NodeAdmission>> = OnceLock::new();
+
+tokio::task_local! {
+    static SCANNER_NODE_REQUESTS: ScannerNodeRequestSender;
+}
+
+pub(crate) struct ScannerNodeRequest {
+    pub(crate) owner: Arc<NodeAdmission>,
+    pub(crate) respond: oneshot::Sender<NodePermit>,
+    pub(crate) cancel: CancellationToken,
+}
+
+pub(crate) type ScannerNodeRequestSender = mpsc::Sender<ScannerNodeRequest>;
+pub(crate) type ScannerNodeRequestReceiver = mpsc::Receiver<ScannerNodeRequest>;
+
+/// One suspended operation per walk; disabled admission allocates no channel.
+pub(crate) fn scanner_node_request_channel() -> (Option<ScannerNodeRequestSender>, Option<ScannerNodeRequestReceiver>) {
+    if scanner_node_admission().is_none() {
+        return (None, None);
+    }
+    let (sender, receiver) = mpsc::channel(1);
+    (Some(sender), Some(receiver))
+}
+
+pub(crate) async fn with_scanner_node_requests<F: std::future::Future>(
+    sender: Option<ScannerNodeRequestSender>,
+    operation: F,
+) -> F::Output {
+    match sender {
+        Some(sender) => SCANNER_NODE_REQUESTS.scope(sender, operation).await,
+        None => operation.await,
+    }
+}
 
 #[cfg(test)]
 tokio::task_local! {
@@ -41,9 +74,9 @@ pub(crate) fn scanner_node_admission() -> Option<Arc<NodeAdmission>> {
     SCANNER_NODE_ADMISSION.get().cloned()
 }
 
-/// Scanner callers can already hold a bucket cache lease: try once, never park
-/// under that lock. Keep the operation's error type and cancellation boundary.
-/// Units end before recursion, pacing or checkpoint publication.
+/// Try the fast path first. A scoped coordinator releases the cache lease before
+/// joining the node queue and validates the cache before returning a permit.
+/// Uncoordinated callers defer instead of parking under an unknown lock.
 pub(crate) async fn run_scanner_node_operation<T, E>(
     owner: Option<&Arc<NodeAdmission>>,
     cancel: &CancellationToken,
@@ -55,7 +88,31 @@ pub(crate) async fn run_scanner_node_operation<T, E>(
     if cancel.is_cancelled() {
         return Err(ScannerError::Other("Operation cancelled".to_string()));
     }
-    let permit = owner.try_acquire().ok_or(ScannerError::ResourceDeferred)?;
+    let permit = match owner.try_acquire() {
+        Some(permit) => permit,
+        None => {
+            let sender = SCANNER_NODE_REQUESTS
+                .try_with(Clone::clone)
+                .map_err(|_| ScannerError::ResourceDeferred)?;
+            let acquire = async {
+                let (respond, response) = oneshot::channel();
+                sender
+                    .send(ScannerNodeRequest {
+                        owner: owner.clone(),
+                        respond,
+                        cancel: cancel.clone(),
+                    })
+                    .await
+                    .map_err(|_| ScannerError::ResourceDeferred)?;
+                response.await.map_err(|_| ScannerError::ResourceDeferred)
+            };
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(ScannerError::Other("Operation cancelled".to_string())),
+                permit = acquire => permit?,
+            }
+        }
+    };
     let result = operation.await;
     if result.is_ok() {
         permit.complete();
