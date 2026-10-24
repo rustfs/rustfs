@@ -1003,7 +1003,11 @@ impl PreparedGetObjectReader {
         let guard = cancellation.clone().drop_guard();
         let reader = crate::set_disk::with_get_object_read_cancellation(
             cancellation,
-            crate::set_disk::with_get_object_read_policy(crate::set_disk::GetObjectReadPolicy::CopySource, self.into_reader()),
+            // Keep reader state from multiplying through the task-local scopes.
+            crate::set_disk::with_get_object_read_policy(
+                crate::set_disk::GetObjectReadPolicy::CopySource,
+                Box::pin(self.into_reader()),
+            ),
         )
         .await?;
         Ok((reader, guard))

@@ -652,6 +652,11 @@ impl ECStore {
 
     #[instrument(level = "debug", skip(self, rx))]
     pub async fn init(self: &Arc<Self>, rx: CancellationToken) -> Result<()> {
+        // Keep startup state out of callers and the instrumented wrapper.
+        Box::pin(self.init_inner(rx)).await
+    }
+
+    async fn init_inner(self: &Arc<Self>, rx: CancellationToken) -> Result<()> {
         runtime_sources::ensure_boot_time().await;
 
         let should_persist_pool_meta = self
@@ -7315,8 +7320,8 @@ mod tests {
                 )
                 .await
                 .expect("seed older target metadata on all disks");
-            let source = store.pools[0]
-                .get_disks_by_key(object)
+            let source_set = store.pools[0].get_disks_by_key(object);
+            let mut source = source_set
                 .load_file_info_versions_exact(&bucket, object)
                 .await
                 .expect("read source marker metadata")
@@ -7325,6 +7330,30 @@ mod tests {
                 .into_iter()
                 .find(|version| version.version_id.unwrap_or_default() == marker_id)
                 .expect("find source delete marker");
+            if marker_incarnation.is_none() {
+                // Public writes bind new markers to the current bucket generation.
+                // Seed legacy disk metadata explicitly without weakening admission.
+                rustfs_utils::http::metadata_compat::remove_str(
+                    &mut source.metadata,
+                    rustfs_utils::http::metadata_compat::SUFFIX_BUCKET_INCARNATION_ID,
+                );
+                for disk in source_set.disk_inventory().await.into_iter().flatten() {
+                    disk.write_metadata("", &bucket, object, source.clone())
+                        .await
+                        .expect("seed legacy source marker metadata");
+                }
+                source_set.invalidate_get_object_metadata_cache(&bucket, object).await;
+            }
+            let source = source_set
+                .load_file_info_versions_exact(&bucket, object)
+                .await
+                .expect("reload source marker metadata")
+                .expect("source marker must remain present")
+                .versions
+                .into_iter()
+                .find(|version| version.version_id.unwrap_or_default() == marker_id)
+                .expect("find reloaded source delete marker");
+            assert_eq!(source.delete_marker_incarnation(), marker_incarnation, "source fixture identity");
             let target_set = store.pools[1].get_disks_by_key(object);
             for disk in target_set.disk_inventory().await.into_iter().flatten().take(2) {
                 disk.write_metadata("", &bucket, object, source.clone())
