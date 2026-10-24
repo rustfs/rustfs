@@ -557,9 +557,8 @@ fn body_read_error_code(err: &(dyn std::error::Error + 'static)) -> Option<S3Err
     let mut aws_chunked_error = None;
     let mut incomplete_body = false;
     let digest = error_chain_find(err, |error| {
-        if error.is::<rustfs_rio::Sha256Mismatch>()
-            || matches!(error.downcast_ref::<UploadStreamError>(), Some(UploadStreamError::Sha256Mismatch))
-        {
+        let upload_error = error.downcast_ref::<UploadStreamError>();
+        if matches!(upload_error, Some(UploadStreamError::Sha256Mismatch)) || error.is::<rustfs_rio::Sha256Mismatch>() {
             return Some(S3ErrorCode::Custom(CONTENT_SHA256_MISMATCH_CODE.into()));
         }
         if error.is::<rustfs_rio::ChecksumMismatch>() || error.is::<rustfs_rio::BadDigest>() {
@@ -576,10 +575,7 @@ fn body_read_error_code(err: &(dyn std::error::Error + 'static)) -> Option<S3Err
             aws_chunked_error = Some(chunked.to_s3_error_code());
         }
         incomplete_body |= error.is::<rustfs_rio::IncompleteBody>()
-            || matches!(
-                error.downcast_ref::<UploadStreamError>(),
-                Some(UploadStreamError::LengthMismatch | UploadStreamError::Incomplete)
-            )
+            || matches!(upload_error, Some(UploadStreamError::LengthMismatch | UploadStreamError::Incomplete))
             || is_hyper_body_eof(error);
         None
     });
