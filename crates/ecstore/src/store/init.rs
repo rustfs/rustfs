@@ -428,6 +428,7 @@ impl ECStore {
 
         let mut deployment_id = None;
         let mut pool_meta_bootstrap_authorities = Vec::new();
+        let mut pending_format_disks = Vec::new();
 
         // let (endpoint_pools, _) = EndpointServerPools::create_server_endpoints(address.as_str(), &layouts)?;
 
@@ -553,6 +554,7 @@ impl ECStore {
             // formatted it, `LegacyAdoption` when it verified the migration, and
             // `None` when it merely read a format another node created.
             pool_meta_bootstrap_authorities.push(loaded_format.pool_meta_bootstrap_authority);
+            pending_format_disks.extend(loaded_format.pending_disks);
             let fm = loaded_format.format;
 
             // Format loading succeeded, enable health monitoring on all disks
@@ -627,8 +629,21 @@ impl ECStore {
 
         let wait_sec = 5;
         let mut exit_count = 0;
+        let disk_sets = ec
+            .pools
+            .iter()
+            .flat_map(|pool| pool.disk_set.iter().cloned())
+            .collect::<Vec<_>>();
         loop {
-            if let Err(err) = ec.init(ctx.clone()).await {
+            let initialization = async {
+                ec.init(ctx.clone()).await?;
+                for pending in &pending_format_disks {
+                    pending.finalize(&instance_ctx, &disk_sets).await?;
+                }
+                Ok::<(), Error>(())
+            }
+            .await;
+            if let Err(err) = initialization {
                 error!("init err: {}", err);
                 error!("retry after  {} second", wait_sec);
                 sleep(Duration::from_secs(wait_sec)).await;

@@ -86,6 +86,160 @@ pub async fn connect_load_init_formats(
 pub(crate) struct LoadedFormat {
     pub(crate) format: FormatV3,
     pub(crate) pool_meta_bootstrap_authority: PoolMetaBootstrapAuthority,
+    pub(crate) pending_disks: Vec<PendingFormatDisk>,
+}
+
+pub(crate) struct PendingFormatDisk {
+    disk: DiskStore,
+}
+
+impl PendingFormatDisk {
+    /// Reconcile only after bootstrap metadata has succeeded, before Ready.
+    pub(crate) async fn finalize(
+        &self,
+        instance_ctx: &Arc<InstanceContext>,
+        sets: &[Arc<crate::set_disk::SetDisks>],
+    ) -> Result<()> {
+        let endpoint = self.disk.endpoint();
+        let pool_index = usize::try_from(endpoint.pool_idx).map_err(|_| Error::CorruptedFormat)?;
+        let set_index = usize::try_from(endpoint.set_idx).map_err(|_| Error::CorruptedFormat)?;
+        let disk_index = usize::try_from(endpoint.disk_idx).map_err(|_| Error::CorruptedFormat)?;
+        let set = sets
+            .iter()
+            .find(|set| set.pool_index == pool_index && set.set_index == set_index)
+            .ok_or(Error::CorruptedFormat)?;
+        if set.set_endpoints.get(disk_index) != Some(&endpoint) {
+            return Err(Error::CorruptedFormat);
+        }
+        // Capture current handles, including a reconnect that completed since
+        // format selection. No registry guard is held during format I/O.
+        let registry = instance_ctx.local_disk_map();
+        let receivers = registry.read().await;
+        let receiver = if endpoint.is_local {
+            receivers.get(&endpoint.to_string()).and_then(Clone::clone)
+        } else {
+            None
+        };
+        let selected = set
+            .disks
+            .read()
+            .await
+            .get(disk_index)
+            .cloned()
+            .ok_or(Error::CorruptedFormat)?;
+        if endpoint.is_local && receiver.is_none() {
+            // An earlier successful pass may already have quarantined this
+            // slot before a different slot raced with reconnect and retried.
+            let topology = instance_ctx.local_disk_set_drives();
+            let local_slots = topology.read().await;
+            let local_slot = local_slots
+                .get(pool_index)
+                .and_then(|sets| sets.get(set_index))
+                .and_then(|disks| disks.get(disk_index))
+                .ok_or(Error::CorruptedFormat)?;
+            return if matches!(receivers.get(&endpoint.to_string()), Some(None)) && local_slot.is_none() && selected.is_none() {
+                Ok(())
+            } else {
+                Err(Error::other("format reconciliation receiver changed"))
+            };
+        }
+        drop(receivers);
+        let disk = selected.as_ref().unwrap_or(&self.disk);
+        let observation = load_format_erasure(receiver.as_ref().unwrap_or(disk), false).await;
+        self.publish_observation(instance_ctx, set, selected.as_ref(), receiver.as_ref(), observation)
+            .await
+    }
+
+    async fn publish_observation(
+        &self,
+        instance_ctx: &Arc<InstanceContext>,
+        set: &crate::set_disk::SetDisks,
+        selected: Option<&DiskStore>,
+        receiver: Option<&DiskStore>,
+        observation: disk::error::Result<FormatV3>,
+    ) -> Result<()> {
+        let endpoint = self.disk.endpoint();
+        let pool_index = usize::try_from(endpoint.pool_idx).map_err(|_| Error::CorruptedFormat)?;
+        let set_index = usize::try_from(endpoint.set_idx).map_err(|_| Error::CorruptedFormat)?;
+        let disk_index = usize::try_from(endpoint.disk_idx).map_err(|_| Error::CorruptedFormat)?;
+        if set.pool_index != pool_index || set.set_index != set_index || set.set_endpoints.get(disk_index) != Some(&endpoint) {
+            return Err(Error::CorruptedFormat);
+        }
+        let valid = observation.as_ref().is_ok_and(|format| {
+            set.format.check_other(format).is_ok()
+                && set.format.find_disk_index_by_disk_id(format.erasure.this).ok() == Some((set_index, disk_index))
+        });
+        let disk_id = if valid {
+            Some(observation.map_err(Error::from)?.erasure.this)
+        } else {
+            None
+        };
+        let path = endpoint.to_string();
+        // Local sets must share the registered receiver's health and I/O
+        // admission state, just as Sets::new_with_instance_ctx does.
+        let disk = receiver.unwrap_or_else(|| selected.unwrap_or(&self.disk));
+        if disk.endpoint() != endpoint
+            || endpoint.is_local != receiver.is_some()
+            || receiver.is_some_and(|receiver| receiver.endpoint() != endpoint)
+        {
+            return Err(Error::CorruptedFormat);
+        }
+
+        // All format I/O is complete. Publish under registry -> ID map -> local
+        // topology -> set slot, rechecking handle identity before any mutation.
+        let registry = instance_ctx.local_disk_map();
+        let mut receivers = registry.write().await;
+        let id_map = instance_ctx.local_disk_id_map();
+        let mut ids = id_map.write().await;
+        let topology = instance_ctx.local_disk_set_drives();
+        let mut local_slots = topology.write().await;
+        let mut slots = set.disks.write().await;
+        let slot = slots.get_mut(disk_index).ok_or(Error::CorruptedFormat)?;
+        let unchanged = match (slot.as_ref(), selected) {
+            (None, None) => true,
+            (Some(current), Some(observed)) => Arc::ptr_eq(current, observed),
+            _ => false,
+        };
+        if !unchanged {
+            return Err(Error::other("format reconciliation slot changed"));
+        }
+        if let Some(receiver) = receiver {
+            if !receivers
+                .get(&path)
+                .and_then(Option::as_ref)
+                .is_some_and(|current| Arc::ptr_eq(current, receiver))
+            {
+                return Err(Error::other("format reconciliation receiver changed"));
+            }
+            let local_slot = local_slots
+                .get_mut(pool_index)
+                .and_then(|sets| sets.get_mut(set_index))
+                .and_then(|disks| disks.get_mut(disk_index))
+                .ok_or(Error::CorruptedFormat)?;
+            if !local_slot.as_ref().is_some_and(|current| Arc::ptr_eq(current, receiver)) {
+                return Err(Error::other("format reconciliation local slot changed"));
+            }
+            // Local ID setters only update memory, without filesystem I/O.
+            receiver.set_disk_id_state(disk_id).await?;
+            ids.retain(|_, registered_path| registered_path != &path);
+            if let Some(id) = disk_id {
+                ids.insert(id, path.clone());
+            } else {
+                receivers.insert(path, None);
+                *local_slot = None;
+            }
+        }
+        if receiver.is_none() {
+            disk.set_disk_id_state(disk_id).await?;
+        }
+        if valid {
+            disk.enable_health_check();
+            *slot = Some(disk.clone());
+        } else {
+            *slot = None;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) async fn connect_load_init_formats_with_instance_ctx(
@@ -137,13 +291,15 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
     if matches!(format_quorum, Some(Err(Error::ErasureReadQuorum)))
         && let Some((format, members)) = select_existing_format_read_quorum(&formats, &errs, set_drive_count)
     {
-        retain_format_quorum_members(instance_ctx, disks, &format, &members, set_drive_count).await?;
+        let pending_disks =
+            retain_format_quorum_members(instance_ctx, disks, &format, &members, set_drive_count, Some(&errs)).await?;
         // Loading an existing format grants no authority to initialize pool
         // metadata or migrate formats. The persisted storage classes and each
         // object's EC metadata still determine service and operation quorums.
         return Ok(LoadedFormat {
             format,
             pool_meta_bootstrap_authority: PoolMetaBootstrapAuthority::None,
+            pending_disks,
         });
     }
     let resumable_partial_migration = formats_present > 0
@@ -158,10 +314,11 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
         match try_migrate_format(disks, &formats, set_count, set_drive_count).await {
             Ok(LegacyFormatOutcome::Migrated { format, quorum_members }) => {
                 info!("Migrated format from MinIO config");
-                retain_format_quorum_members(instance_ctx, disks, &format, &quorum_members, set_drive_count).await?;
+                retain_format_quorum_members(instance_ctx, disks, &format, &quorum_members, set_drive_count, None).await?;
                 return Ok(LoadedFormat {
                     format: *format,
                     pool_meta_bootstrap_authority: PoolMetaBootstrapAuthority::LegacyAdoption,
+                    pending_disks: Vec::new(),
                 });
             }
             Ok(LegacyFormatOutcome::Incompatible) => {
@@ -182,6 +339,7 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
             return Ok(LoadedFormat {
                 format: fm,
                 pool_meta_bootstrap_authority: PoolMetaBootstrapAuthority::Fresh,
+                pending_disks: Vec::new(),
             });
         }
     }
@@ -206,11 +364,13 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
         None => select_format_erasure_in_quorum(&formats, 0)?,
     };
     check_format_erasure_value_for_topology(&fm, formats.len(), set_drive_count)?;
-    retain_format_quorum_members(instance_ctx, disks, &fm, &quorum_members, set_drive_count).await?;
+    let pending_disks =
+        retain_format_quorum_members(instance_ctx, disks, &fm, &quorum_members, set_drive_count, Some(&errs)).await?;
 
     Ok(LoadedFormat {
         format: fm,
         pool_meta_bootstrap_authority: verified_legacy_adoption_source(disks, &formats, set_count, set_drive_count).await?,
+        pending_disks,
     })
 }
 
@@ -239,7 +399,8 @@ async fn retain_format_quorum_members(
     format: &FormatV3,
     quorum_members: &[bool],
     set_drive_count: usize,
-) -> Result<()> {
+    observed_errors: Option<&[Option<DiskError>]>,
+) -> Result<Vec<PendingFormatDisk>> {
     if set_drive_count == 0 || quorum_members.len() != disks.len() {
         return Err(Error::CorruptedFormat);
     }
@@ -279,10 +440,31 @@ async fn retain_format_quorum_members(
     let mut local_pool_endpoints = Vec::new();
     let mut selected_local_disk_ids = Vec::new();
     let mut quarantined_endpoints = Vec::new();
+    let mut pending_disks = Vec::new();
+    let registry = instance_ctx.local_disk_map();
+    let receivers = registry.read().await;
     for (index, ((disk, endpoint), belongs_to_quorum)) in disks.iter().zip(&endpoints).zip(quorum_members).enumerate() {
+        let pending = !belongs_to_quorum
+            && matches!(
+                observed_errors.and_then(|errors| errors.get(index)),
+                Some(Some(DiskError::UnformattedDisk))
+            );
+        let receiver = endpoint
+            .as_ref()
+            .filter(|endpoint| endpoint.is_local)
+            .and_then(|endpoint| receivers.get(&endpoint.to_string()))
+            .and_then(Clone::clone);
+        // A first writer may still be publishing this slot's format. Keep its
+        // receiver reachable, but do not count it as a format quorum member.
+        let defer = pending && disk.as_ref().is_some_and(|disk| !disk.is_local() || receiver.is_some());
+        if defer {
+            pending_disks.push(PendingFormatDisk {
+                disk: disk.as_ref().ok_or(Error::CorruptedFormat)?.clone(),
+            });
+        }
         if let Some(endpoint) = endpoint.as_ref().filter(|endpoint| endpoint.is_local) {
             local_pool_endpoints.push(endpoint.to_string());
-            if !belongs_to_quorum {
+            if !belongs_to_quorum && !defer {
                 quarantined_endpoints.push(endpoint.clone());
             }
         }
@@ -302,6 +484,7 @@ async fn retain_format_quorum_members(
             selected_local_disk_ids.push((disk_id, disk.endpoint().to_string()));
         }
     }
+    drop(receivers);
     quarantine_local_disks(instance_ctx, &quarantined_endpoints).await?;
 
     for (disk, disk_id) in disks.iter().zip(member_disk_ids) {
@@ -315,7 +498,7 @@ async fn retain_format_quorum_members(
             *disk = None;
         }
     }
-    Ok(())
+    Ok(pending_disks)
 }
 
 pub fn should_init_erasure_disks(errs: &[Option<DiskError>]) -> bool {
@@ -369,7 +552,7 @@ async fn init_format_erasure(
     write_format_file_all(disks, &fms).await?;
     let format = get_format_erasure_in_quorum(&fms, 0)?;
     let quorum_members = vec![true; disks.len()];
-    retain_format_quorum_members(instance_ctx, disks, &format, &quorum_members, set_drive_count).await?;
+    retain_format_quorum_members(instance_ctx, disks, &format, &quorum_members, set_drive_count, None).await?;
     Ok(format)
 }
 
@@ -974,6 +1157,314 @@ mod tests {
         assert!(errors.iter().all(Option::is_none), "local disk initialization failed: {errors:?}");
 
         (temp_dir, disks)
+    }
+
+    struct PendingFormatFixture {
+        ctx: Arc<InstanceContext>,
+        set: Arc<crate::set_disk::SetDisks>,
+        pending: PendingFormatDisk,
+        receiver: DiskStore,
+        format: FormatV3,
+        _temp: tempfile::TempDir,
+    }
+
+    async fn pending_format_fixture() -> PendingFormatFixture {
+        let (temp, mut disks) = local_disks(4).await;
+        let ctx = Arc::new(InstanceContext::new());
+        let format = FormatV3::new(1, 4);
+        let endpoints = disks.iter().flatten().map(|disk| disk.endpoint()).collect::<Vec<_>>();
+        // Bootstrap receivers are distinct from the subsequently opened set handles.
+        let (receivers, errors) = init_disks(
+            &Endpoints::from(endpoints.clone()),
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await;
+        assert!(errors.iter().all(Option::is_none));
+        record_local_disks(&ctx, receivers.iter().flatten().cloned().collect()).await;
+        *ctx.local_disk_set_drives().write().await = vec![vec![receivers.clone()]];
+        for (index, disk) in disks.iter().enumerate().take(3) {
+            let mut member = format.clone();
+            member.erasure.this = format.erasure.sets[0][index];
+            save_format_file(disk, &Some(member))
+                .await
+                .expect("first three formats should publish");
+        }
+        let receiver = receivers[3].as_ref().expect("pending receiver should exist").clone();
+        let mut last = format.clone();
+        last.erasure.this = format.erasure.sets[0][3];
+        let bootstrap = crate::store::peer::BootstrapLocalTarget::new(ctx.clone());
+        bootstrap
+            .begin_legacy_local_file_write(&receiver, RUSTFS_META_BUCKET, None)
+            .await
+            .expect("pending format writer should be admitted")
+            .write_all("pending-format", last.to_json().expect("format should encode").into_bytes().into())
+            .await
+            .expect("last format temporary file should be durable");
+        let mut loaded = connect_load_init_formats_with_instance_ctx(&ctx, false, &mut disks, 1, 4, None)
+            .await
+            .expect("three existing formats should supply read quorum");
+        assert!(matches!(loaded.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::None));
+        assert_eq!(loaded.pending_disks.len(), 1);
+        assert!(disks[3].is_none(), "unformatted slot must not count as a member");
+        let set = crate::set_disk::SetDisks::new_with_instance_ctx(
+            "pending-format-test".to_string(),
+            Arc::new(tokio::sync::RwLock::new(disks)),
+            4,
+            2,
+            0,
+            0,
+            endpoints,
+            loaded.format,
+            Vec::new(),
+            ctx.clone(),
+        )
+        .await;
+        PendingFormatFixture {
+            ctx,
+            set,
+            pending: loaded.pending_disks.remove(0),
+            receiver,
+            format,
+            _temp: temp,
+        }
+    }
+
+    async fn publish_pending_format(fixture: &PendingFormatFixture) {
+        let bootstrap = crate::store::peer::BootstrapLocalTarget::new(fixture.ctx.clone());
+        // Resolve the endpoint again, just as the writer's next RPC does. A
+        // retained Arc alone would bypass the receiver quarantine regression.
+        let resolved = bootstrap
+            .local_mutation_disk(&fixture.receiver.endpoint().to_string())
+            .await
+            .expect("pending receiver must remain endpoint-addressable");
+        assert!(Arc::ptr_eq(&resolved, &fixture.receiver));
+        bootstrap
+            .begin_legacy_local_rename_file(
+                &fixture.receiver.endpoint().to_string(),
+                (RUSTFS_META_BUCKET, "pending-format"),
+                (RUSTFS_META_BUCKET, FORMAT_CONFIG_FILE),
+                false,
+            )
+            .await
+            .expect("writer's next rename should still be admitted")
+            .commit()
+            .await
+            .expect("writer should complete the last format");
+    }
+
+    #[tokio::test]
+    async fn format_quorum_preserves_pending_bootstrap_receiver_and_restores_completed_slot() {
+        let fixture = pending_format_fixture().await;
+        publish_pending_format(&fixture).await;
+        fixture
+            .pending
+            .finalize(&fixture.ctx, std::slice::from_ref(&fixture.set))
+            .await
+            .expect("completed format should reconcile before Ready");
+        let slots = fixture.set.disks.read().await;
+        assert_eq!(slots.iter().flatten().count(), 4);
+        assert!(Arc::ptr_eq(
+            slots[3].as_ref().expect("restored local member should exist"),
+            &fixture.receiver
+        ));
+        for (index, disk) in slots.iter().enumerate() {
+            let disk = disk.as_ref().expect("all four members should be restored");
+            let loaded = load_format_erasure(disk, false)
+                .await
+                .expect("restored member format should read");
+            assert_eq!(loaded.shared_identity(), fixture.format.shared_identity());
+            assert_eq!(loaded.erasure.this, fixture.format.erasure.sets[0][index]);
+        }
+        let id = fixture.format.erasure.sets[0][3];
+        assert_eq!(
+            slots[3]
+                .as_ref()
+                .expect("last member should exist")
+                .get_disk_id()
+                .await
+                .expect("set disk ID should read"),
+            Some(id)
+        );
+        assert_eq!(fixture.receiver.get_disk_id().await.expect("receiver ID should read"), Some(id));
+        assert_eq!(
+            fixture.ctx.local_disk_id_map().read().await.get(&id),
+            Some(&fixture.receiver.endpoint().to_string())
+        );
+        assert!(Arc::ptr_eq(
+            fixture.ctx.local_disk_set_drives().read().await[0][0][3]
+                .as_ref()
+                .expect("local slot should remain active"),
+            &fixture.receiver
+        ));
+    }
+
+    #[tokio::test]
+    async fn format_quorum_quarantines_still_unformatted_receiver_before_ready() {
+        let fixture = pending_format_fixture().await;
+        fixture
+            .pending
+            .finalize(&fixture.ctx, std::slice::from_ref(&fixture.set))
+            .await
+            .expect("unformatted minority should be isolated without changing quorum");
+        assert!(fixture.ctx.local_disk_map().read().await[&fixture.receiver.endpoint().to_string()].is_none());
+        assert!(fixture.ctx.local_disk_set_drives().read().await[0][0][3].is_none());
+        assert!(fixture.set.disks.read().await[3].is_none());
+        assert_eq!(fixture.set.disks.read().await.iter().flatten().count(), 3);
+        fixture
+            .pending
+            .finalize(&fixture.ctx, std::slice::from_ref(&fixture.set))
+            .await
+            .expect("a later init retry must preserve completed quarantine");
+    }
+
+    #[tokio::test]
+    async fn format_quorum_quarantines_foreign_completed_receiver_before_ready() {
+        let fixture = pending_format_fixture().await;
+        let mut foreign = FormatV3::new(1, 4);
+        foreign.erasure.this = foreign.erasure.sets[0][3];
+        write_format_file(&fixture.receiver, &foreign)
+            .await
+            .expect("foreign format should publish");
+        fixture
+            .pending
+            .finalize(&fixture.ctx, std::slice::from_ref(&fixture.set))
+            .await
+            .expect("foreign minority should be isolated");
+        assert!(fixture.ctx.local_disk_map().read().await[&fixture.receiver.endpoint().to_string()].is_none());
+        assert!(fixture.ctx.local_disk_set_drives().read().await[0][0][3].is_none());
+        assert!(fixture.set.disks.read().await[3].is_none());
+        assert!(
+            !fixture
+                .ctx
+                .local_disk_id_map()
+                .read()
+                .await
+                .contains_key(&foreign.erasure.this)
+        );
+    }
+
+    #[tokio::test]
+    async fn format_quorum_rechecks_replaced_receiver_after_io_and_accepts_current_member_on_retry() {
+        let fixture = pending_format_fixture().await;
+        publish_pending_format(&fixture).await;
+        let observed = load_format_erasure(&fixture.receiver, false)
+            .await
+            .expect("old receiver observation should load");
+        let replacement = new_disk(
+            &fixture.receiver.endpoint(),
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("replacement receiver should open");
+        fixture
+            .ctx
+            .local_disk_map()
+            .write()
+            .await
+            .insert(replacement.endpoint().to_string(), Some(replacement.clone()));
+        fixture.ctx.local_disk_set_drives().write().await[0][0][3] = Some(replacement.clone());
+        *fixture.set.disks.write().await.get_mut(3).expect("last slot should exist") = Some(replacement.clone());
+        assert!(
+            fixture
+                .pending
+                .publish_observation(&fixture.ctx, &fixture.set, None, Some(&fixture.receiver), Ok(observed))
+                .await
+                .is_err(),
+            "stale I/O must not publish over a replacement"
+        );
+        assert!(Arc::ptr_eq(
+            fixture.ctx.local_disk_map().read().await[&replacement.endpoint().to_string()]
+                .as_ref()
+                .expect("replacement must not be quarantined"),
+            &replacement
+        ));
+        fixture
+            .pending
+            .finalize(&fixture.ctx, std::slice::from_ref(&fixture.set))
+            .await
+            .expect("existing init retry should validate the current replacement");
+        assert!(Arc::ptr_eq(
+            fixture.set.disks.read().await[3]
+                .as_ref()
+                .expect("validated slot should exist"),
+            &replacement
+        ));
+        assert_eq!(
+            replacement.get_disk_id().await.expect("replacement ID should read"),
+            Some(fixture.format.erasure.sets[0][3])
+        );
+    }
+
+    #[tokio::test]
+    async fn format_quorum_remote_pending_publication_checks_shared_identity_and_slot() {
+        let ctx = Arc::new(InstanceContext::new());
+        let format = FormatV3::new(1, 4);
+        let mut endpoint = Endpoint::try_from("http://remote-server:9000/data").expect("remote endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(3);
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("remote client should initialize without connecting");
+        let mut endpoints = vec![endpoint.clone(); 4];
+        for (index, endpoint) in endpoints.iter_mut().enumerate() {
+            endpoint.set_disk_index(index);
+        }
+        let set = crate::set_disk::SetDisks::new_with_instance_ctx(
+            "remote-pending-test".to_string(),
+            Arc::new(tokio::sync::RwLock::new(vec![None; 4])),
+            4,
+            2,
+            0,
+            0,
+            endpoints,
+            format.clone(),
+            Vec::new(),
+            ctx.clone(),
+        )
+        .await;
+        let pending = PendingFormatDisk { disk: disk.clone() };
+        let mut wrong_slot = format.clone();
+        wrong_slot.erasure.this = format.erasure.sets[0][2];
+        pending
+            .publish_observation(&ctx, &set, None, None, Ok(wrong_slot))
+            .await
+            .expect("wrong-slot format should remain excluded");
+        assert!(set.disks.read().await[3].is_none());
+        let mut foreign = FormatV3::new(1, 4);
+        foreign.erasure.this = foreign.erasure.sets[0][3];
+        pending
+            .publish_observation(&ctx, &set, None, None, Ok(foreign))
+            .await
+            .expect("foreign remote format should remain excluded");
+        assert!(set.disks.read().await[3].is_none());
+        let mut matching = format.clone();
+        matching.erasure.this = format.erasure.sets[0][3];
+        pending
+            .publish_observation(&ctx, &set, None, None, Ok(matching))
+            .await
+            .expect("exact remote slot should restore");
+        assert!(Arc::ptr_eq(set.disks.read().await[3].as_ref().expect("remote slot should exist"), &disk));
+        assert_eq!(
+            disk.get_disk_id().await.expect("remote ID state should read"),
+            Some(format.erasure.sets[0][3])
+        );
+        assert!(
+            ctx.local_disk_map().read().await.is_empty(),
+            "remote restoration must not register a local receiver"
+        );
     }
 
     async fn two_local_disks_with_missing_third() -> (tempfile::TempDir, Vec<Option<DiskStore>>) {
