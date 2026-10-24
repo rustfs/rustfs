@@ -393,6 +393,10 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
     }
 }
 
+fn is_online_drive_state(state: &str) -> bool {
+    state == DriveState::Ok.to_string() || state == DriveState::Unformatted.to_string()
+}
+
 /// Classify every drive into online / offline / unknown buckets.
 ///
 /// `unknown` holds drives synthesized for a member whose properties RPC could
@@ -412,6 +416,7 @@ fn get_online_offline_disks_stats(disks_info: &[Disk]) -> (BackendDisks, Backend
         unknown_disks.entry(ep.clone()).or_insert(0);
     }
 
+    let mut online_root_disk_count = 0;
     for disk in disks_info {
         let ep = &disk.endpoint;
         let state = &disk.state;
@@ -419,30 +424,28 @@ fn get_online_offline_disks_stats(disks_info: &[Disk]) -> (BackendDisks, Backend
             *unknown_disks.get_mut(ep).expect("endpoint should be in disk map") += 1;
             continue;
         }
-        if *state != DriveState::Ok.to_string() && *state != DriveState::Unformatted.to_string() {
+        if !is_online_drive_state(state) {
             *offline_disks.get_mut(ep).expect("endpoint should be in disk map") += 1;
             continue;
         }
         *online_disks.get_mut(ep).expect("endpoint should be in disk map") += 1;
-    }
-
-    let mut root_disk_count = 0;
-    for di in disks_info {
-        if di.root_disk {
-            root_disk_count += 1;
+        if disk.root_disk {
+            online_root_disk_count += 1;
         }
     }
 
     // When every non-offline, non-unknown drive is a root mount, leave the
     // online tally as-is instead of demoting all of them (matches the prior
     // behavior; the unknown bucket is simply carried through untouched).
-    if disks_info.len() == (root_disk_count + offline_disks.values().sum::<usize>() + unknown_disks.values().sum::<usize>()) {
+    if disks_info.len()
+        == (online_root_disk_count + offline_disks.values().sum::<usize>() + unknown_disks.values().sum::<usize>())
+    {
         return (BackendDisks(online_disks), BackendDisks(offline_disks), BackendDisks(unknown_disks));
     }
 
     for disk in disks_info {
         let ep = &disk.endpoint;
-        if disk.root_disk {
+        if disk.root_disk && is_online_drive_state(&disk.state) {
             *offline_disks.get_mut(ep).expect("endpoint should be in disk map") += 1;
             *online_disks.get_mut(ep).expect("endpoint should be in disk map") -= 1;
         }
@@ -828,6 +831,35 @@ mod tests {
         assert_eq!(online.sum(), 2, "the two healthy drives are online");
         assert_eq!(offline.sum(), 1, "only the confirmed-offline drive is offline");
         assert_eq!(unknown.sum(), 1, "the unreachable member's drive is unknown, not offline");
+        assert_eq!(
+            online.sum() + offline.sum() + unknown.sum(),
+            disks.len(),
+            "online + offline + unknown must equal the total drive count"
+        );
+    }
+
+    #[test]
+    fn disk_stats_only_demote_online_root_disks() {
+        let mut offline_root = disk_with_state("http://n3:9000/data", ITEM_OFFLINE);
+        offline_root.root_disk = true;
+        let mut unknown_root = disk_with_state("http://n4:9000/data", ITEM_UNKNOWN);
+        unknown_root.root_disk = true;
+        let mut online_root = disk_with_state("http://n5:9000/data", "ok");
+        online_root.root_disk = true;
+
+        let disks = vec![
+            disk_with_state("http://n1:9000/data", "ok"),
+            disk_with_state("http://n2:9000/data", "ok"),
+            offline_root,
+            unknown_root,
+            online_root,
+        ];
+
+        let (online, offline, unknown) = get_online_offline_disks_stats(&disks);
+
+        assert_eq!(online.sum(), 2, "only the two non-root online drives remain online");
+        assert_eq!(offline.sum(), 2, "the offline root drive and demoted online root drive are offline");
+        assert_eq!(unknown.sum(), 1, "the unknown root drive stays in unknown without underflowing online");
         assert_eq!(
             online.sum() + offline.sum() + unknown.sum(),
             disks.len(),

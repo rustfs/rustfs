@@ -115,6 +115,31 @@ use uuid::Uuid;
 // Bound outstanding filesystem jobs and metadata buffers per disk request.
 const PART_METADATA_READ_CONCURRENCY: usize = 8;
 
+// Keep independent forward transactions bounded without reordering aliases,
+// parent/child keys, rollback, or legacy operations.
+const DELETE_VERSION_PREPARE_CONCURRENCY: usize = 8;
+
+fn delete_version_batch_concurrency(versions: &[FileInfoVersions], opts: &DeleteOptions) -> usize {
+    if !cfg!(target_os = "linux") || !opts.recoverable_delete || opts.undo_write || opts.undo_delete || versions.len() < 2 {
+        return 1;
+    }
+    let mut names = HashSet::with_capacity(versions.len());
+    for version in versions {
+        let name = version.name.as_str();
+        if name.split('/').any(|segment| matches!(segment, "" | "." | "..")) || !names.insert(name) {
+            return 1;
+        }
+    }
+    for name in &names {
+        for (separator, _) in name.match_indices('/') {
+            if names.contains(&name[..separator]) {
+                return 1;
+            }
+        }
+    }
+    DELETE_VERSION_PREPARE_CONCURRENCY
+}
+
 /// The fresh health path uses a synchronous capacity syscall. Keep the permit
 /// inside the blocking closure so cancelling its async caller cannot admit a
 /// second probe while the first syscall is still running.
@@ -7113,23 +7138,29 @@ impl LocalDisk {
         opts: DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Vec<Option<Error>> {
-        let mut errs = Vec::with_capacity(versions.len());
-        for _ in 0..versions.len() {
-            errs.push(None);
+        let concurrency = delete_version_batch_concurrency(&versions, &opts);
+        let mut errors = vec![None; versions.len()];
+        let mut pending = stream::iter(
+            versions
+                .into_iter()
+                .enumerate()
+                .map(|(index, version): (usize, FileInfoVersions)| {
+                    let owner = namespace_owner.clone();
+                    let options = &opts;
+                    async move {
+                        let error = self
+                            .delete_versions_internal(volume, &version.name, &version.versions, options, owner)
+                            .await
+                            .err();
+                        (index, error)
+                    }
+                }),
+        )
+        .buffer_unordered(concurrency);
+        while let Some((index, error)) = pending.next().await {
+            errors[index] = error;
         }
-
-        for (i, ver) in versions.iter().enumerate() {
-            if let Err(e) = self
-                .delete_versions_internal(volume, ver.name.as_str(), &ver.versions, &opts, namespace_owner.clone())
-                .await
-            {
-                errs[i] = Some(e);
-            } else {
-                errs[i] = None;
-            }
-        }
-
-        errs
+        errors
     }
 
     pub(crate) async fn delete_versions_guarded_with_namespace_owner(
