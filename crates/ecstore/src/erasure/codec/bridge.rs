@@ -15,6 +15,7 @@
 use crate::erasure::codec::workspace::RustfsCodecDecodeWorkspace;
 use crate::erasure::coding::Erasure;
 use rustfs_erasure_codec::galois_8::ReedSolomon;
+use smallvec::SmallVec;
 use std::io;
 use std::sync::{Arc, OnceLock};
 
@@ -213,7 +214,7 @@ impl RustfsCodecDecodeEngine {
         // All slots must be present here: the verification path reconstructs
         // missing parity alongside data (see `reconstruct_into`), so a `None`
         // slot is an internal invariant violation, not a degraded-read state.
-        let mut shard_refs = Vec::with_capacity(self.data_shards + self.parity_shards);
+        let mut shard_refs: SmallVec<[&[u8]; 16]> = SmallVec::with_capacity(self.data_shards + self.parity_shards);
         for (index, shard) in shards.iter().enumerate() {
             let shard = shard.as_ref().ok_or_else(|| {
                 io::Error::new(
@@ -421,6 +422,30 @@ mod tests {
     {
         let mut workspace = engine.prepare_workspace(4)?;
         engine.reconstruct_into(shards, &mut workspace).map(|_| ())
+    }
+
+    #[test]
+    fn reconstruct_verifies_sources_across_descriptor_boundary() {
+        let data = (0..1025)
+            .map(|index| u8::try_from((index * 29 + 17) % 251).expect("bounded byte"))
+            .collect::<Vec<_>>();
+        for (data_shards, parity_shards) in [(8, 8), (9, 8)] {
+            let erasure = Erasure::new(data_shards, parity_shards, 2048);
+            let expected = encoded_shards(&erasure, &data);
+            let engine = RustfsCodecDecodeEngine::new(&erasure).expect("decode engine");
+            let mut shards = expected.clone();
+            shards[0] = None;
+            shards[data_shards] = None;
+            reconstruct_with(&engine, &mut shards).expect("restore missing data and parity");
+            assert_eq!(shards, expected, "every restored byte must match at width {}", shards.len());
+
+            let mut corrupt = expected.clone();
+            corrupt[0] = None;
+            corrupt[data_shards] = None;
+            corrupt[data_shards + 1].as_mut().expect("surplus parity present")[0] ^= 1;
+            let error = reconstruct_with(&engine, &mut corrupt).expect_err("corrupt surplus source must fail closed");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
     }
 
     #[test]
