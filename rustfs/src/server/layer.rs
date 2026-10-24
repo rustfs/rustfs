@@ -19,6 +19,7 @@ use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::server::cors;
 use crate::server::hybrid::{HybridBody, is_grpc_request};
+use crate::server::rate_limit::virtual_host_bucket;
 use crate::server::{
     ADMIN_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HealthProbe, MINIO_ADMIN_PREFIX,
     MINIO_ADMIN_V3_PREFIX, MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_CLUSTER_READ_PATH, MINIO_HEALTH_LIVE_PATH,
@@ -2079,12 +2080,24 @@ fn is_object_attributes_request<B>(req: &HttpRequest<B>) -> bool {
 #[derive(Clone)]
 pub struct ConditionalCorsLayer {
     cors_origins: Option<String>,
+    /// Port-stripped `RUSTFS_SERVER_DOMAINS` hosts, used to resolve the bucket
+    /// of virtual-hosted-style requests. Empty when virtual hosting is off.
+    vh_domain_hosts: Arc<[String]>,
 }
 
 impl ConditionalCorsLayer {
     pub fn new() -> Self {
         let cors_origins = get_env_opt_str(rustfs_config::ENV_CORS_ALLOWED_ORIGINS).filter(|s| !s.is_empty());
-        Self { cors_origins }
+        Self {
+            cors_origins,
+            vh_domain_hosts: Arc::default(),
+        }
+    }
+
+    /// Resolve bucket-level CORS for virtual-hosted-style requests on these domains.
+    pub fn with_vh_domain_hosts(mut self, vh_domain_hosts: Arc<[String]>) -> Self {
+        self.vh_domain_hosts = vh_domain_hosts;
+        self
     }
 
     /// Exact paths that should be excluded from being treated as S3 paths.
@@ -2171,6 +2184,7 @@ impl<S> Layer<S> for ConditionalCorsLayer {
         ConditionalCorsService {
             inner,
             cors_origins: Arc::new(self.cors_origins.clone()),
+            vh_domain_hosts: self.vh_domain_hosts.clone(),
         }
     }
 }
@@ -2180,6 +2194,7 @@ impl<S> Layer<S> for ConditionalCorsLayer {
 pub struct ConditionalCorsService<S> {
     inner: S,
     cors_origins: Arc<Option<String>>,
+    vh_domain_hosts: Arc<[String]>,
 }
 
 async fn resolve_s3_options_cors_headers(bucket: &str, request_headers: &HeaderMap) -> Option<HeaderMap> {
@@ -2233,8 +2248,11 @@ where
         let method = req.method().clone();
         let request_headers = req.headers().clone();
         let cors_origins = self.cors_origins.clone();
+        // A virtual-hosted-style request carries its bucket in the host, so its
+        // path is the object key (or `/` for a bucket-level request).
+        let vh_bucket = virtual_host_bucket(&req, &self.vh_domain_hosts).map(str::to_owned);
         let is_s3 = ConditionalCorsLayer::is_s3_path(&path);
-        let is_root = path == "/";
+        let is_root = path == "/" && vh_bucket.is_none();
 
         if is_options {
             let has_acrm = request_headers.contains_key(cors::request::ACCESS_CONTROL_REQUEST_METHOD);
@@ -2254,6 +2272,7 @@ where
                         .expect("valid response body");
                     let cors_layer = ConditionalCorsLayer {
                         cors_origins: (*cors_origins).clone(),
+                        vh_domain_hosts: Arc::default(),
                     };
                     cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
                     Ok(response)
@@ -2261,8 +2280,8 @@ where
             }
 
             if is_s3 {
-                let path_trimmed = path.trim_start_matches('/');
-                let bucket = path_trimmed.split('/').next().unwrap_or("").to_string();
+                let bucket =
+                    vh_bucket.unwrap_or_else(|| path.trim_start_matches('/').split('/').next().unwrap_or("").to_string());
 
                 return Box::pin(async move {
                     if !has_acrm || !request_headers.contains_key(cors::standard::ORIGIN) {
@@ -2274,6 +2293,7 @@ where
 
                     let cors_layer = ConditionalCorsLayer {
                         cors_origins: (*cors_origins).clone(),
+                        vh_domain_hosts: Arc::default(),
                     };
 
                     if let Some(cors_headers) = resolve_s3_options_cors_headers(&bucket, &request_headers).await {
@@ -2310,6 +2330,7 @@ where
                     .expect("valid response body");
                 let cors_layer = ConditionalCorsLayer {
                     cors_origins: (*cors_origins).clone(),
+                    vh_domain_hosts: Arc::default(),
                 };
                 cors_layer.apply_cors_headers(&request_headers_clone, response.headers_mut());
                 Ok(response)
@@ -2326,11 +2347,14 @@ where
             {
                 let cors_layer = ConditionalCorsLayer {
                     cors_origins: (*cors_origins).clone(),
+                    vh_domain_hosts: Arc::default(),
                 };
 
                 if is_s3 {
-                    let bucket = path.trim_start_matches('/').split('/').next().unwrap_or("");
-                    if path == "/" {
+                    let bucket = vh_bucket
+                        .as_deref()
+                        .unwrap_or_else(|| path.trim_start_matches('/').split('/').next().unwrap_or(""));
+                    if is_root {
                         cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
                     } else if !bucket.is_empty() {
                         match apply_cors_headers(bucket, &method, &request_headers).await {
@@ -5171,7 +5195,10 @@ mod tests {
 
     #[test]
     fn test_generic_cors_layer_omits_headers_without_configured_origins() {
-        let cors = ConditionalCorsLayer { cors_origins: None };
+        let cors = ConditionalCorsLayer {
+            cors_origins: None,
+            vh_domain_hosts: Arc::default(),
+        };
         let mut req_headers = HeaderMap::new();
         req_headers.insert("origin", "https://example.com".parse().unwrap());
 
@@ -5189,6 +5216,7 @@ mod tests {
     fn test_generic_cors_layer_respects_configured_origins() {
         let cors = ConditionalCorsLayer {
             cors_origins: Some("https://allowed.com".to_string()),
+            vh_domain_hosts: Arc::default(),
         };
 
         let mut req_headers = HeaderMap::new();
@@ -5218,6 +5246,7 @@ mod tests {
     fn test_generic_cors_layer_wildcard_does_not_allow_credentials() {
         let cors = ConditionalCorsLayer {
             cors_origins: Some("*".to_string()),
+            vh_domain_hosts: Arc::default(),
         };
 
         let mut req_headers = HeaderMap::new();
@@ -5261,6 +5290,7 @@ mod tests {
     async fn conditional_cors_passthrough_without_origin() {
         let layer = ConditionalCorsLayer {
             cors_origins: Some("*".to_string()),
+            vh_domain_hosts: Arc::default(),
         };
         let mut service = layer.layer(CorsOkService);
         let request = Request::builder()
@@ -5279,6 +5309,7 @@ mod tests {
     async fn conditional_cors_applies_origin_headers() {
         let layer = ConditionalCorsLayer {
             cors_origins: Some("*".to_string()),
+            vh_domain_hosts: Arc::default(),
         };
         let mut service = layer.layer(CorsOkService);
         let request = Request::builder()
