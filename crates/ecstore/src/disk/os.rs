@@ -413,6 +413,7 @@ pub(crate) mod windows_rename_test_hooks {
 
     pub(crate) fn run_before_source_write(path: &Path) {
         if let Some(hook) = BEFORE_SOURCE_WRITE.lock().remove(path) {
+            let _pause = super::enter_blocking_test_hook();
             hook();
         }
     }
@@ -423,6 +424,7 @@ pub(crate) mod windows_rename_test_hooks {
 
     pub(crate) fn run_before_publication(path: &Path) {
         if let Some(hook) = BEFORE_PUBLICATION.lock().remove(path) {
+            let _pause = super::enter_blocking_test_hook();
             hook();
         }
     }
@@ -433,6 +435,7 @@ pub(crate) mod windows_rename_test_hooks {
 
     pub(crate) fn run_before_rename_retry(path: &Path) {
         if let Some(hook) = BEFORE_RENAME_RETRY.lock().remove(path) {
+            let _pause = super::enter_blocking_test_hook();
             hook();
         }
     }
@@ -480,6 +483,7 @@ pub(crate) mod prepare_rename_test_hooks {
     pub(crate) fn run_after_component_opened(path: &Path) {
         let hook = AFTER_COMPONENT_OPENED.lock().get_mut(path).and_then(VecDeque::pop_front);
         if let Some(hook) = hook {
+            let _pause = super::enter_blocking_test_hook();
             hook();
         }
     }
@@ -512,16 +516,7 @@ pub(crate) fn fsync_directory_handle_std(dir: &Path, opened: Option<&std::fs::Fi
 
 /// Async wrapper around [`fsync_dir_std`]; runs the blocking Unix fsync off the runtime.
 pub async fn fsync_dir(dir: impl AsRef<Path>) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        let dir = dir.as_ref().to_path_buf();
-        fsync_spawn_blocking(move || fsync_dir_std(dir)).await?
-    }
-
-    #[cfg(not(unix))]
-    {
-        fsync_dir_std(dir)
-    }
+    fsync_dir_with_owner(dir.as_ref(), None).await
 }
 
 const ENV_DST_DIR_FSYNC_GROUP_COMMIT_ENABLE: &str = "RUSTFS_EXPERIMENTAL_DST_DIR_FSYNC_GROUP_COMMIT_ENABLE";
@@ -1598,14 +1593,7 @@ pub(super) fn is_isolated_io_thread() -> bool {
     FSYNC_ON_CURRENT_RUNTIME.get()
 }
 
-/// Spawn a blocking task on the fsync-dedicated runtime if configured,
-/// otherwise fall back to the main tokio blocking pool.
-fn fsync_spawn_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> tokio::task::JoinHandle<T> {
-    let resource_unit = super::io_admission::current_resource_unit();
-    let f = move || {
-        let _resource_unit = resource_unit;
-        f()
-    };
+fn fsync_spawn_worker<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> tokio::task::JoinHandle<T> {
     if FSYNC_ON_CURRENT_RUNTIME.get() {
         return tokio::task::spawn_blocking(f);
     }
@@ -1613,6 +1601,16 @@ fn fsync_spawn_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'stati
         Some(rt) => rt.spawn_blocking(f),
         None => tokio::task::spawn_blocking(f),
     }
+}
+
+/// Spawn a blocking task on the fsync-dedicated runtime if configured,
+/// otherwise fall back to the main tokio blocking pool.
+fn fsync_spawn_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> tokio::task::JoinHandle<T> {
+    let resource_unit = super::io_admission::current_resource_unit();
+    fsync_spawn_worker(move || {
+        let _resource_unit = resource_unit;
+        f()
+    })
 }
 static DISK_VOLUME_MUTATION_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<RwLock<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -1654,8 +1652,30 @@ pub(crate) fn disk_file_sync_limiter(root: &Path) -> Arc<Semaphore> {
     limiter
 }
 
-const MAX_NAMESPACE_WORKERS_PER_DISK: usize = 2;
+// Keep one warm draining worker per disk/lane and spin briefly in user space
+// before exiting `spawn_blocking` so back-to-back stages of `PUT` and `DELETE`
+// on the same drive do not thrash Tokio's `BlockingPool` (`futex_wake`/`futex_wait`).
+const MAX_NAMESPACE_WORKERS_PER_DISK: usize = 1;
+const WORKER_IDLE_SPIN_ITERS: usize = 256;
 const FALLBACK_NAMESPACE_QUEUE_SHARDS: usize = 8;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiskBlockingLane {
+    Foreground,
+    Isolated,
+    Fsync,
+}
+
+impl DiskBlockingLane {
+    #[inline]
+    const fn index(self) -> usize {
+        match self {
+            Self::Foreground => 0,
+            Self::Isolated => 1,
+            Self::Fsync => 2,
+        }
+    }
+}
 
 #[derive(Default)]
 struct DiskBlockingQueueState {
@@ -1666,12 +1686,12 @@ struct DiskBlockingQueueState {
 }
 
 pub(crate) struct DiskBlockingQueue {
-    lanes: [Mutex<DiskBlockingQueueState>; 2],
+    lanes: [Mutex<DiskBlockingQueueState>; 3],
 }
 
 struct DiskBlockingWorkerGuard {
     queue: Arc<DiskBlockingQueue>,
-    isolated: bool,
+    lane: DiskBlockingLane,
     disarmed: bool,
 }
 
@@ -1685,7 +1705,7 @@ impl Drop for DiskBlockingWorkerGuard {
             return;
         }
         let should_respawn = {
-            let mut state = self.queue.lane(self.isolated).lock();
+            let mut state = self.queue.lane(self.lane).lock();
             state.active_workers = state.active_workers.saturating_sub(1);
             let max_workers = self.queue.effective_max_workers(&state);
             if !state.jobs.is_empty() && state.active_workers < max_workers {
@@ -1696,7 +1716,7 @@ impl Drop for DiskBlockingWorkerGuard {
             }
         };
         if should_respawn {
-            DiskBlockingQueue::spawn_worker(Arc::clone(&self.queue), self.isolated);
+            DiskBlockingQueue::spawn_worker(Arc::clone(&self.queue), self.lane);
         }
     }
 }
@@ -1709,8 +1729,8 @@ impl DiskBlockingQueue {
     }
 
     #[inline]
-    fn lane(&self, isolated: bool) -> &Mutex<DiskBlockingQueueState> {
-        &self.lanes[usize::from(isolated)]
+    fn lane(&self, lane: DiskBlockingLane) -> &Mutex<DiskBlockingQueueState> {
+        &self.lanes[lane.index()]
     }
 
     #[inline]
@@ -1726,10 +1746,9 @@ impl DiskBlockingQueue {
         }
     }
 
-    fn enqueue(self: &Arc<Self>, job: Box<dyn FnOnce() + Send>) {
-        let isolated = is_isolated_io_thread();
+    fn enqueue_on_lane(self: &Arc<Self>, lane: DiskBlockingLane, job: Box<dyn FnOnce() + Send>) {
         let should_spawn = {
-            let mut state = self.lane(isolated).lock();
+            let mut state = self.lane(lane).lock();
             state.jobs.push_back(job);
             if state.active_workers < self.effective_max_workers(&state) {
                 state.active_workers += 1;
@@ -1739,38 +1758,90 @@ impl DiskBlockingQueue {
             }
         };
         if should_spawn {
-            Self::spawn_worker(Arc::clone(self), isolated);
+            Self::spawn_worker(Arc::clone(self), lane);
         }
     }
 
-    fn spawn_worker(queue: Arc<Self>, isolated: bool) {
-        drop(tokio::task::spawn_blocking(move || {
+    #[inline]
+    fn foreground_lane() -> DiskBlockingLane {
+        if is_isolated_io_thread() {
+            DiskBlockingLane::Isolated
+        } else {
+            DiskBlockingLane::Foreground
+        }
+    }
+
+    #[inline]
+    fn fsync_lane() -> DiskBlockingLane {
+        if is_isolated_io_thread() {
+            DiskBlockingLane::Isolated
+        } else {
+            DiskBlockingLane::Fsync
+        }
+    }
+
+    fn spawn_worker(queue: Arc<Self>, lane: DiskBlockingLane) {
+        let worker = move || {
             #[cfg(any(test, feature = "test-util"))]
             CURRENT_DISK_BLOCKING_QUEUE.with(|slot| {
-                *slot.borrow_mut() = Some((Arc::clone(&queue), isolated));
+                *slot.borrow_mut() = Some((Arc::clone(&queue), lane));
             });
             let mut guard = DiskBlockingWorkerGuard {
                 queue: Arc::clone(&queue),
-                isolated,
+                lane,
                 disarmed: false,
             };
             loop {
-                let Some(job) = ({
-                    let mut state = queue.lane(isolated).lock();
-                    match state.jobs.pop_front() {
-                        Some(job) => Some(job),
-                        None => {
-                            state.active_workers = state.active_workers.saturating_sub(1);
-                            guard.disarmed = true;
-                            None
+                let job = {
+                    let mut state = queue.lane(lane).lock();
+                    if state.active_workers > queue.effective_max_workers(&state) {
+                        state.active_workers -= 1;
+                        guard.disarmed = true;
+                        return;
+                    }
+                    state.jobs.pop_front()
+                };
+                if let Some(job) = job {
+                    job();
+                    continue;
+                }
+                for i in 0..WORKER_IDLE_SPIN_ITERS {
+                    {
+                        let state = queue.lane(lane).lock();
+                        if !state.jobs.is_empty() || state.active_workers > queue.effective_max_workers(&state) {
+                            break;
                         }
+                    }
+                    if i & 15 == 15 {
+                        std::thread::yield_now();
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                }
+                let Some(job) = ({
+                    let mut state = queue.lane(lane).lock();
+                    if state.active_workers > queue.effective_max_workers(&state) {
+                        state.active_workers -= 1;
+                        guard.disarmed = true;
+                        None
+                    } else if let Some(job) = state.jobs.pop_front() {
+                        Some(job)
+                    } else {
+                        state.active_workers = state.active_workers.saturating_sub(1);
+                        guard.disarmed = true;
+                        None
                     }
                 }) else {
                     return;
                 };
                 job();
             }
-        }));
+        };
+        if lane == DiskBlockingLane::Fsync {
+            drop(fsync_spawn_worker(worker));
+        } else {
+            drop(tokio::task::spawn_blocking(worker));
+        }
     }
 
     #[cfg(test)]
@@ -1781,39 +1852,59 @@ impl DiskBlockingQueue {
         self.run_cancellable(move |_| operation()).await
     }
 
-    async fn run_cancellable<T: Send + 'static>(
+    async fn run_on_lane<T: Send + 'static>(
         self: &Arc<Self>,
+        lane: DiskBlockingLane,
+        label: &'static str,
         operation: impl FnOnce(&dyn Fn() -> bool) -> io::Result<T> + Send + 'static,
     ) -> io::Result<T> {
         let (tx, rx) = oneshot::channel();
         let resource_unit = super::io_admission::current_resource_unit();
-        self.enqueue(Box::new(move || {
-            // Retain each producer separately, never on the shared worker.
-            let _resource_unit = resource_unit;
-            let result = operation(&|| tx.is_closed());
-            let _ = tx.send(result);
-        }));
-        rx.await
-            .map_err(|err| io::Error::other(format!("blocking namespace operation failed: {err}")))?
+        self.enqueue_on_lane(
+            lane,
+            Box::new(move || {
+                // Retain each producer separately, never on the shared worker.
+                let _resource_unit = resource_unit;
+                let result = operation(&|| tx.is_closed());
+                let _ = tx.send(result);
+            }),
+        );
+        rx.await.map_err(|err| io::Error::other(format!("{label}: {err}")))?
+    }
+
+    pub(crate) async fn run_cancellable<T: Send + 'static>(
+        self: &Arc<Self>,
+        operation: impl FnOnce(&dyn Fn() -> bool) -> io::Result<T> + Send + 'static,
+    ) -> io::Result<T> {
+        self.run_on_lane(Self::foreground_lane(), "blocking namespace operation failed", operation)
+            .await
+    }
+
+    pub(crate) async fn run_fsync_cancellable<T: Send + 'static>(
+        self: &Arc<Self>,
+        operation: impl FnOnce(&dyn Fn() -> bool) -> io::Result<T> + Send + 'static,
+    ) -> io::Result<T> {
+        self.run_on_lane(Self::fsync_lane(), "blocking namespace file sync operation failed", operation)
+            .await
     }
 }
 
 #[cfg(any(test, feature = "test-util"))]
 thread_local! {
-    static CURRENT_DISK_BLOCKING_QUEUE: std::cell::RefCell<Option<(Arc<DiskBlockingQueue>, bool)>> =
+    static CURRENT_DISK_BLOCKING_QUEUE: std::cell::RefCell<Option<(Arc<DiskBlockingQueue>, DiskBlockingLane)>> =
         const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) struct BlockingTestHookGuard {
-    queue: Option<(Arc<DiskBlockingQueue>, bool)>,
+    queue: Option<(Arc<DiskBlockingQueue>, DiskBlockingLane)>,
 }
 
 #[cfg(any(test, feature = "test-util"))]
 impl Drop for BlockingTestHookGuard {
     fn drop(&mut self) {
-        if let Some((queue, isolated)) = self.queue.take() {
-            let mut state = queue.lane(isolated).lock();
+        if let Some((queue, lane)) = self.queue.take() {
+            let mut state = queue.lane(lane).lock();
             state.paused_workers = state.paused_workers.saturating_sub(1);
         }
     }
@@ -1822,9 +1913,9 @@ impl Drop for BlockingTestHookGuard {
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) fn enter_blocking_test_hook() -> BlockingTestHookGuard {
     let queue = CURRENT_DISK_BLOCKING_QUEUE.with(|slot| slot.borrow().clone());
-    if let Some((ref queue, isolated)) = queue {
+    if let Some((ref queue, lane)) = queue {
         let should_spawn = {
-            let mut state = queue.lane(isolated).lock();
+            let mut state = queue.lane(lane).lock();
             state.paused_workers = state.paused_workers.saturating_add(1);
             if !state.jobs.is_empty() && state.active_workers < queue.effective_max_workers(&state) {
                 state.active_workers += 1;
@@ -1834,7 +1925,7 @@ pub(crate) fn enter_blocking_test_hook() -> BlockingTestHookGuard {
             }
         };
         if should_spawn {
-            DiskBlockingQueue::spawn_worker(Arc::clone(queue), isolated);
+            DiskBlockingQueue::spawn_worker(Arc::clone(queue), lane);
         }
     }
     BlockingTestHookGuard { queue }
@@ -2568,20 +2659,19 @@ pub async fn rename_all(
 pub(crate) async fn fsync_dir_with_owner(path: &Path, namespace_owner: Option<Arc<dyn Send + Sync>>) -> io::Result<()> {
     #[cfg(unix)]
     {
-        if namespace_owner.is_none() {
-            return fsync_dir(path).await;
-        }
+        let queue = disk_blocking_queue_for_path(path);
         let path = path.to_path_buf();
-        fsync_spawn_blocking(move || {
-            let _namespace_owner = namespace_owner;
-            fsync_dir_std(path)
-        })
-        .await?
+        queue
+            .run_fsync_cancellable(move |_| {
+                let _namespace_owner = namespace_owner;
+                fsync_dir_std(path)
+            })
+            .await
     }
     #[cfg(not(unix))]
     {
         let _ = namespace_owner;
-        fsync_dir(path).await
+        fsync_dir_std(path)
     }
 }
 
@@ -2590,10 +2680,20 @@ pub(crate) async fn remove_file_with_owner(
     path: impl AsRef<Path>,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> io::Result<()> {
-    if namespace_owner.is_none() {
-        return tokio::fs::remove_file(path).await;
-    }
     let path = path.as_ref().to_path_buf();
+    if namespace_owner.is_none() {
+        let queue = disk_blocking_queue_for_path(&path);
+        return queue
+            .run_cancellable(move |is_cancelled| {
+                if is_cancelled() {
+                    return Err(io::Error::other("blocking namespace operation cancelled"));
+                }
+                #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Remove, &path);
+                std::fs::remove_file(path)
+            })
+            .await;
+    }
     let lease = acquire_namespace_mutation_lease_with_owner(&path, namespace_owner).await;
     run_blocking_namespace_operation(lease, move || {
         #[cfg(all(any(test, feature = "test-util"), not(windows)))]
@@ -2603,13 +2703,76 @@ pub(crate) async fn remove_file_with_owner(
     .await
 }
 
+pub(crate) async fn remove_files_and_fsync_with_owner(
+    dir: &Path,
+    names: &[&str],
+    sync: bool,
+    final_remove: Option<&str>,
+    namespace_owner: Option<Arc<dyn Send + Sync>>,
+) -> io::Result<()> {
+    let mut leased_paths = Vec::with_capacity(names.len());
+    for name in names {
+        let path = dir.join(name);
+        let lease = acquire_namespace_mutation_lease_with_owner(&path, namespace_owner.clone()).await;
+        leased_paths.push((path, lease));
+    }
+    let final_leased = if let Some(name) = final_remove {
+        let path = dir.join(name);
+        let lease = acquire_namespace_mutation_lease_with_owner(&path, namespace_owner.clone()).await;
+        Some((path, lease))
+    } else {
+        None
+    };
+    let dir_buf = dir.to_path_buf();
+    let queue = leased_paths
+        .first()
+        .or(final_leased.as_ref())
+        .map_or_else(|| disk_blocking_queue_for_path(dir), |(_, lease)| Arc::clone(&lease.blocking_queue));
+    queue
+        .run_cancellable(move |_| {
+            let _namespace_owner = namespace_owner;
+            for (path, lease) in leased_paths {
+                let _lease = lease;
+                #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Remove, &path);
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            if sync {
+                fsync_dir_std(&dir_buf)?;
+            }
+            if let Some((path, lease)) = final_leased {
+                let _lease = lease;
+                #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Remove, &path);
+                std::fs::remove_file(&path)?;
+            }
+            Ok(())
+        })
+        .await
+}
+
 /// Retain namespace ownership in the actual filesystem executor after timeout.
 pub(crate) async fn remove_dir_with_owner(
     path: impl AsRef<Path>,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> io::Result<()> {
     if namespace_owner.is_none() {
-        return tokio::fs::remove_dir(path).await;
+        let path = path.as_ref().to_path_buf();
+        let queue = disk_blocking_queue_for_path(&path);
+        return queue
+            .run_cancellable(move |is_cancelled| {
+                if is_cancelled() {
+                    return Err(io::Error::other("blocking namespace operation cancelled"));
+                }
+                #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Remove, &path);
+                std::fs::remove_dir(path)
+            })
+            .await;
     }
     let lease = acquire_namespace_mutation_lease_with_owner(path.as_ref(), namespace_owner).await;
     remove_dir_with_lease(path, lease).await
@@ -3324,16 +3487,14 @@ async fn run_cancellable_blocking_namespace_file_sync_operation_with_global<T: S
         wait_started,
     );
     let disk_permit = admission.disk_permit.clone();
-    let (tx, rx) = oneshot::channel();
-    drop(fsync_spawn_blocking(move || {
-        let _lease = lease;
-        let _disk_permit = disk_permit;
-        let result = operation(&|| tx.is_closed());
-        let _ = tx.send(result);
-    }));
-    let result = rx
-        .await
-        .map_err(|err| io::Error::other(format!("blocking namespace file sync operation failed: {err}")))?;
+    let queue = Arc::clone(&lease.blocking_queue);
+    let result = queue
+        .run_fsync_cancellable(move |is_cancelled| {
+            let _lease = lease;
+            let _disk_permit = disk_permit;
+            operation(is_cancelled)
+        })
+        .await;
     drop(global_permit);
     result
 }
@@ -9170,6 +9331,33 @@ mod tests {
             "active workers exceeded MAX_NAMESPACE_WORKERS_PER_DISK"
         );
 
+        // Verify Foreground and Fsync lanes execute independently without blocking each other.
+        let (fg_entered_tx, fg_entered_rx) = oneshot::channel();
+        let (fg_release_tx, fg_release_rx) = std::sync::mpsc::channel::<()>();
+        let q_fg = Arc::clone(&queue);
+        let fg_handle = tokio::spawn(async move {
+            q_fg.run_cancellable(move |_| {
+                let _ = fg_entered_tx.send(());
+                let _ = fg_release_rx.recv();
+                Ok(())
+            })
+            .await
+        });
+        fg_entered_rx.await.expect("foreground worker entered");
+        let q_fsync = Arc::clone(&queue);
+        q_fsync
+            .run_fsync_cancellable(|is_cancelled| {
+                assert!(!is_cancelled());
+                if FSYNC_RUNTIME.is_some() {
+                    assert_eq!(std::thread::current().name(), Some("rustfs-fsync"));
+                }
+                Ok(())
+            })
+            .await
+            .expect("fsync lane must make progress while foreground lane is blocked");
+        fg_release_tx.send(()).expect("release foreground worker");
+        fg_handle.await.expect("foreground join").expect("foreground ok");
+
         let isolated_rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .max_blocking_threads(1)
@@ -9186,11 +9374,46 @@ mod tests {
                         assert_eq!(std::thread::current().name(), Some("isolated-queue-test"));
                         Ok(())
                     })
+                    .await?;
+                q_iso
+                    .run_fsync_cancellable(|_| {
+                        assert_eq!(std::thread::current().name(), Some("isolated-queue-test"));
+                        Ok(())
+                    })
                     .await
             })
             .await;
         isolated_rt.shutdown_background();
         iso_res.expect("isolated task join").expect("isolated queue run");
+
+        let temp_dir = tempdir().expect("tempdir");
+        let file_a = temp_dir.path().join("a");
+        let file_c = temp_dir.path().join("c");
+        std::fs::write(&file_a, b"a").expect("write a");
+        std::fs::write(&file_c, b"c").expect("write c");
+        remove_files_and_fsync_with_owner(temp_dir.path(), &["a", "missing-b"], true, Some("c"), None)
+            .await
+            .expect("remove_files_and_fsync_with_owner must tolerate missing intermediates and remove final");
+        assert!(!file_a.exists() && !file_c.exists());
+
+        // Missing final_remove must propagate NotFound.
+        let missing_final = remove_files_and_fsync_with_owner(temp_dir.path(), &["missing-a"], false, Some("missing-c"), None)
+            .await
+            .expect_err("missing final file must return an error");
+        assert_eq!(missing_final.kind(), io::ErrorKind::NotFound);
+
+        // Non-NotFound failure on an intermediate entry must abort before final_remove.
+        let blocker_dir = temp_dir.path().join("blocker");
+        let preserved_final = temp_dir.path().join("preserved-final");
+        std::fs::create_dir(&blocker_dir).expect("create directory blocker");
+        std::fs::write(&preserved_final, b"keep").expect("write preserved final");
+        assert!(
+            remove_files_and_fsync_with_owner(temp_dir.path(), &["blocker"], true, Some("preserved-final"), None)
+                .await
+                .is_err(),
+            "directory in place of file must fail intermediate remove_file"
+        );
+        assert!(preserved_final.exists(), "final file must remain when intermediate removal fails");
     }
 }
 
