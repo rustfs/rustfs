@@ -19,6 +19,7 @@
 use super::ECStore;
 use crate::bucket::utils::is_meta_bucketname;
 use crate::disk::{DeleteRecoveryCursor, DiskAPI, DiskStore};
+use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use rustfs_heal_contracts::heal_channel::HealOpts;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
@@ -38,6 +39,7 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_DELETE_RECOVERY: &str = "delete_recovery";
 const EVENT_DELETE_RECOVERY_STATUS: &str = "delete_recovery_status";
 const KEYS_PER_PASS: usize = 16;
+const RECOVERY_CONCURRENCY: usize = 4;
 const INTERVAL: Duration = Duration::from_secs(1);
 const INVENTORY_INTERVAL: Duration = Duration::from_secs(30);
 const DISCOVERY_BUDGET: Duration = Duration::from_secs(5);
@@ -225,23 +227,35 @@ impl DeleteRecoveryHints {
         }
     }
 
-    fn take(&self, limit: usize) -> Vec<DeleteRecoveryTicket> {
+    fn take_available(&self, active: &HashSet<Arc<DeleteRecoveryKey>>) -> Option<DeleteRecoveryTicket> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut tickets = Vec::with_capacity(limit.min(state.pending.len()));
-        while tickets.len() < limit {
-            let Some(ticket) = state.order.pop_front() else { break };
+        let queued = state.order.len();
+        for _ in 0..queued {
+            let ticket = state.order.pop_front()?;
             if let Some(&(generation, slot, _)) = state.pending.get(&ticket.key)
                 && slot == ticket.generation
             {
+                if active.contains(&ticket.key) {
+                    // Preserve a newer hint while this key still owns a slot.
+                    // Other keys can proceed without waiting on its lock.
+                    state.order.push_back(ticket);
+                    continue;
+                }
                 state.pending.remove(&ticket.key);
-                tickets.push(DeleteRecoveryTicket {
+                return Some(DeleteRecoveryTicket {
                     key: ticket.key,
                     generation,
                     admission: None,
                 });
             }
         }
-        tickets
+        None
+    }
+
+    #[cfg(test)]
+    fn take(&self, limit: usize) -> Vec<DeleteRecoveryTicket> {
+        let active = HashSet::new();
+        std::iter::from_fn(|| self.take_available(&active)).take(limit).collect()
     }
 
     fn retry(&self, ticket: DeleteRecoveryTicket) {
@@ -590,47 +604,148 @@ struct RecoveryFailures {
     failed: usize,
 }
 
-async fn recover_hints(store: &Arc<ECStore>, cancel: &CancellationToken) -> RecoveryFailures {
-    let hints = store.ctx.delete_recovery_hints();
-    let deadline = Instant::now() + PASS_START_BUDGET;
-    let mut failures = RecoveryFailures::default();
-    // Remove only the selected generation before awaiting. A concurrent
-    // DELETE can enqueue the same key independently; neither successful
-    // recovery nor retry of this ticket acknowledges that newer hint.
-    let attempts = hints.pending_len().min(KEYS_PER_PASS);
-    for _ in 0..attempts {
-        if Instant::now() >= deadline || cancel.is_cancelled() {
-            break;
-        }
-        // Only the operation about to start leaves the queue. A slow first
-        // key must not turn untouched work into evictable retry entries.
-        let Some(ticket) = hints.take(1).pop() else { break };
-        let key = &ticket.key;
-        let opts = HealOpts {
-            pool: Some(key.pool),
-            set: Some(key.set),
-            ..Default::default()
-        };
-        // The pass deadline limits starting work, not an admitted rollback.
-        // Canonical disk/RPC recovery owns its configured large-shard timeout.
-        let outcome = tokio::select! {
-            _ = cancel.cancelled() => None,
-            result = store.recover_delete_transactions_at_incarnation(
-                &key.bucket, Some(&key.object), key.incarnation, &opts,
-            ) => Some(result),
-        };
-        if !matches!(outcome, Some(Ok(_))) {
-            match outcome {
-                Some(Err(crate::error::StorageError::ErasureReadQuorum)) => failures.pending += 1,
-                Some(Err(crate::error::StorageError::SlowDown)) => failures.blocked += 1,
-                Some(Err(crate::error::StorageError::FileCorrupt)) => failures.corrupt += 1,
-                Some(Err(_)) => failures.failed += 1,
-                _ => {}
-            }
-            hints.retry(ticket);
+struct RecoveryWork<'a> {
+    store: &'a Arc<ECStore>,
+    cancel: &'a CancellationToken,
+    tasks: FuturesUnordered<BoxFuture<'a, (Arc<DeleteRecoveryKey>, RecoveryFailures)>>,
+    active: HashSet<Arc<DeleteRecoveryKey>>,
+    remaining: usize,
+    deadline: Instant,
+}
+
+impl<'a> RecoveryWork<'a> {
+    fn new(store: &'a Arc<ECStore>, cancel: &'a CancellationToken) -> Self {
+        Self {
+            store,
+            cancel,
+            tasks: FuturesUnordered::new(),
+            active: HashSet::with_capacity(RECOVERY_CONCURRENCY),
+            remaining: 0,
+            deadline: Instant::now(),
         }
     }
+
+    fn begin_pass(&mut self) {
+        self.remaining = self.store.ctx.delete_recovery_hints().pending_len().min(KEYS_PER_PASS);
+        self.deadline = Instant::now() + PASS_START_BUDGET;
+    }
+
+    fn admit(&mut self) {
+        while self.remaining > 0
+            && self.active.len() < RECOVERY_CONCURRENCY
+            && Instant::now() < self.deadline
+            && !self.cancel.is_cancelled()
+        {
+            let Some(ticket) = self.store.ctx.delete_recovery_hints().take_available(&self.active) else {
+                break;
+            };
+            self.active.insert(ticket.key.clone());
+            self.remaining -= 1;
+            self.tasks.push(Box::pin(recover_hint(self.store, self.cancel, ticket)));
+        }
+    }
+
+    async fn next(&mut self) -> Option<RecoveryFailures> {
+        let (key, failures) = self.tasks.next().await?;
+        self.active.remove(&key);
+        Some(failures)
+    }
+}
+
+impl RecoveryFailures {
+    fn add(&mut self, other: Self) {
+        self.pending += other.pending;
+        self.blocked += other.blocked;
+        self.corrupt += other.corrupt;
+        self.failed += other.failed;
+    }
+}
+
+async fn recover_hint(
+    store: &Arc<ECStore>,
+    cancel: &CancellationToken,
+    ticket: DeleteRecoveryTicket,
+) -> (Arc<DeleteRecoveryKey>, RecoveryFailures) {
+    let key = ticket.key.clone();
+    let opts = HealOpts {
+        pool: Some(key.pool),
+        set: Some(key.set),
+        ..Default::default()
+    };
+    // The admission budget never truncates an admitted rollback. Canonical
+    // recovery retains its configured deadline and disk/namespace ownership.
+    let outcome = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        result = store.recover_delete_transactions_at_incarnation(
+            &key.bucket, Some(&key.object), key.incarnation, &opts,
+        ) => Some(result),
+    };
+    let mut failures = RecoveryFailures::default();
+    if !matches!(outcome, Some(Ok(_))) {
+        match outcome {
+            Some(Err(crate::error::StorageError::ErasureReadQuorum)) => failures.pending = 1,
+            Some(Err(crate::error::StorageError::SlowDown)) => failures.blocked = 1,
+            Some(Err(crate::error::StorageError::FileCorrupt)) => failures.corrupt = 1,
+            Some(Err(_)) => failures.failed = 1,
+            _ => {}
+        }
+        store.ctx.delete_recovery_hints().retry(ticket);
+    }
+    (key, failures)
+}
+
+#[cfg(test)]
+async fn recover_hints(store: &Arc<ECStore>, cancel: &CancellationToken) -> RecoveryFailures {
+    let mut work = RecoveryWork::new(store, cancel);
+    work.begin_pass();
+    work.admit();
+    let mut failures = RecoveryFailures::default();
+    while let Some(result) = work.next().await {
+        failures.add(result);
+        work.admit();
+    }
     failures
+}
+
+async fn run_recovery(store: &Arc<ECStore>, cancel: &CancellationToken) {
+    let mut interval = tokio::time::interval(INTERVAL);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut previous = RecoveryFailures::default();
+    let mut failures = RecoveryFailures::default();
+    let mut work = RecoveryWork::new(store, cancel);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                // Poll even not-yet-started jobs so each admitted ticket is
+                // returned without acknowledging a newer foreground hint.
+                while work.next().await.is_some() {}
+                return;
+            }
+            _ = interval.tick() => {
+                work.begin_pass();
+                if failures != previous {
+                    tracing::warn!(
+                        event = EVENT_DELETE_RECOVERY_STATUS,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DELETE_RECOVERY,
+                        state = "recovery_retry_changed",
+                        pending = failures.pending,
+                        blocked = failures.blocked,
+                        corrupt = failures.corrupt,
+                        failed = failures.failed,
+                        pending_keys = store.ctx.delete_recovery_hints().pending_len(),
+                        "Delete recovery settlement retry state changed"
+                    );
+                    previous = failures;
+                }
+                failures = RecoveryFailures::default();
+            }
+            Some(result) = work.next(), if !work.tasks.is_empty() => failures.add(result),
+        }
+        work.admit();
+    }
 }
 
 pub(super) fn start_delete_recovery(store: Arc<ECStore>, cancel: CancellationToken) {
@@ -665,36 +780,9 @@ pub(super) fn start_delete_recovery(store: Arc<ECStore>, cancel: CancellationTok
                 }
             }
         };
-        let recovery = async {
-            let mut interval = tokio::time::interval(INTERVAL);
-            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            let mut previous = RecoveryFailures::default();
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return,
-                    _ = interval.tick() => {},
-                }
-                let failures = recover_hints(&store, &cancel).await;
-                if failures != previous {
-                    tracing::warn!(
-                        event = EVENT_DELETE_RECOVERY_STATUS,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_DELETE_RECOVERY,
-                        state = "recovery_retry_changed",
-                        pending = failures.pending,
-                        blocked = failures.blocked,
-                        corrupt = failures.corrupt,
-                        failed = failures.failed,
-                        pending_keys = store.ctx.delete_recovery_hints().pending_len(),
-                        "Delete recovery settlement retry state changed"
-                    );
-                    previous = failures;
-                }
-            }
-        };
-        // Long canonical verification uses its configured deadline while raw
-        // discovery continues to advance bounded, expiring disk cursors.
+        let recovery = run_recovery(&store, &cancel);
+        // Discovery and independent exact keys keep advancing while a slow
+        // rollback retains its configured deadline and ownership fences.
         tokio::join!(discovery, recovery);
     });
 }
@@ -773,6 +861,26 @@ mod tests {
         assert_eq!(tickets.len(), 2);
         hints.retry(tickets.remove(0));
         assert_eq!(hints.take(2).len(), 1, "failed work survives an empty queue");
+    }
+
+    #[test]
+    fn delete_recovery_active_key_preserves_newer_hint_and_yields_to_other_keys() {
+        let hints = DeleteRecoveryHints::with_capacity(4);
+        let original = hints.register(key("active")).expect("original request");
+        let admitted = hints.take(1).pop().expect("admit original generation");
+        let active = HashSet::from([admitted.key.clone()]);
+        let newer = hints.register(key("active")).expect("new foreground generation");
+        hints.register(key("later")).expect("independent key");
+        let later = hints.take_available(&active).expect("skip the active key");
+        assert_eq!(later.key.object, "later");
+        assert!(hints.take_available(&active).is_none(), "a newer generation cannot occupy a second slot");
+        hints.ack(&original);
+        hints.retry(admitted);
+        assert!(hints.is_pending(&key("active")), "old success or cancellation cannot clear newer work");
+        let next = hints
+            .take_available(&HashSet::new())
+            .expect("active key becomes eligible after completion");
+        assert_eq!(next.generation, newer.generation, "retry cannot overwrite the foreground generation");
     }
 
     #[test]
@@ -1088,6 +1196,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_recovery_admission_stays_within_each_tick_budget() {
+        let bucket = "runtime-admission-budget";
+        let (_dirs, store, _disks) = fixture(bucket).await;
+        let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("bucket identity");
+        let hints = store.ctx.delete_recovery_hints();
+        let total = KEYS_PER_PASS * 3;
+        for index in 0..total {
+            hints.register(DeleteRecoveryKey {
+                pool: 0,
+                set: 0,
+                bucket: bucket.to_owned(),
+                object: format!("absent-{index}"),
+                incarnation: Some(incarnation),
+            });
+        }
+        for pass in 1..=3 {
+            let failures = recover_hints(&store, &CancellationToken::new()).await;
+            assert!(failures == RecoveryFailures::default(), "absent exact keys settle successfully");
+            assert_eq!(
+                hints.pending_len(),
+                total - pass * KEYS_PER_PASS,
+                "only the current admission budget may leave the queue"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_cancel_returns_every_unpolled_admission() {
+        let bucket = "runtime-cancel-admission";
+        let (_dirs, store, _disks) = fixture(bucket).await;
+        let hints = store.ctx.delete_recovery_hints();
+        for index in 0..KEYS_PER_PASS {
+            hints.register(key(&format!("queued-{index}")));
+        }
+        let cancel = CancellationToken::new();
+        let mut work = RecoveryWork::new(&store, &cancel);
+        work.begin_pass();
+        work.admit();
+        assert_eq!(work.active.len(), RECOVERY_CONCURRENCY, "admission obeys the concurrency cap");
+        assert_eq!(hints.pending_len(), KEYS_PER_PASS - RECOVERY_CONCURRENCY);
+        let newer = hints.register(key("queued-0")).expect("foreground request during admission");
+        cancel.cancel();
+        while let Some(result) = work.next().await {
+            assert!(result == RecoveryFailures::default(), "cancellation is not a storage failure");
+            work.admit();
+        }
+        assert!(work.active.is_empty());
+        assert_eq!(hints.pending_len(), KEYS_PER_PASS, "every admitted key is retained exactly once");
+        let tickets = hints.take(KEYS_PER_PASS);
+        assert_eq!(
+            tickets
+                .iter()
+                .find(|ticket| ticket.key.object == "queued-0")
+                .expect("newer hint")
+                .generation,
+            newer.generation
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_slow_key_does_not_block_later_batches() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("60"))], async {
+            let bucket = "runtime-independent-keys";
+            let (_dirs, store, disks) = fixture(bucket).await;
+            prepare(&store, &disks, bucket).await;
+            let incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("bucket identity");
+            let lock = store.handle_new_ns_lock(bucket, "slow-key").await.expect("slow key lock");
+            let held = lock
+                .get_write_lock(Duration::from_secs(60))
+                .await
+                .expect("hold only the slow key");
+            let hints = store.ctx.delete_recovery_hints();
+            for object in std::iter::once("slow-key".to_owned())
+                .chain((0..KEYS_PER_PASS * 2).map(|index| format!("healthy-{index}")))
+                .chain(std::iter::once("object".to_owned()))
+            {
+                hints.register(DeleteRecoveryKey {
+                    pool: 0,
+                    set: 0,
+                    bucket: bucket.to_owned(),
+                    object,
+                    incarnation: Some(incarnation),
+                });
+            }
+            let cancel = CancellationToken::new();
+            let worker_store = store.clone();
+            let worker_cancel = cancel.clone();
+            let worker = tokio::spawn(async move { run_recovery(&worker_store, &worker_cancel).await });
+            let started = Instant::now();
+            let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let restored = futures::future::join_all(disks.iter().map(|disk| async move {
+                        disk.read_all(bucket, &format!("object/{STORAGE_FORMAT_FILE}")).await.is_ok()
+                    }))
+                    .await;
+                    if restored.into_iter().all(|restored| restored) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            eprintln!(
+                "healthy rollback behind {} keys completed={} after {:.3}s while the first key stayed locked",
+                KEYS_PER_PASS * 2 + 1,
+                recovered.is_ok(),
+                started.elapsed().as_secs_f64()
+            );
+            cancel.cancel();
+            worker.await.expect("cancel every admitted recovery");
+            drop(held);
+            assert!(recovered.is_ok(), "one locked key must not block healthy work beyond the first batch");
+            let mut reader = store
+                .get_object_reader(bucket, "object", None, http::HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("read recovered source");
+            let mut bytes = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut reader.stream, &mut bytes)
+                .await
+                .expect("read complete source bytes");
+            assert_eq!(bytes, vec![19; 4096], "healthy rollback preserves complete original bytes");
+            for disk in &disks {
+                assert!(
+                    disk.read_all(bucket, &format!("object/{STORAGE_FORMAT_FILE}")).await.is_ok(),
+                    "rollback restores each participant"
+                );
+            }
+            assert!(
+                hints.is_pending(&DeleteRecoveryKey {
+                    pool: 0,
+                    set: 0,
+                    bucket: bucket.to_owned(),
+                    object: "slow-key".to_owned(),
+                    incarnation: Some(incarnation),
+                }),
+                "cancellation retains the slow key for retry"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn delete_recovery_slow_first_key_preserves_unattempted_backpressure() {
         let bucket = "runtime-slow-first";
         let (_dirs, store, _disks) = fixture(bucket).await;
@@ -1108,20 +1358,29 @@ mod tests {
         let worker_store = store.clone();
         let worker = tokio::spawn(async move { recover_hints(&worker_store, &CancellationToken::new()).await });
         for _ in 0..100 {
-            if hints.pending_len() != HINT_CAPACITY {
+            if hints.pending_len() == HINT_CAPACITY - RECOVERY_CONCURRENCY {
                 break;
             }
             tokio::task::yield_now().await;
         }
-        assert_eq!(hints.pending_len(), HINT_CAPACITY - 1, "only the admitted key leaves the queue");
-        assert!(hints.register_discovered(key("newly-discovered")), "one in-flight key releases one slot");
+        assert_eq!(
+            hints.pending_len(),
+            HINT_CAPACITY - RECOVERY_CONCURRENCY,
+            "only admitted keys leave the queue"
+        );
+        for index in 0..RECOVERY_CONCURRENCY {
+            assert!(
+                hints.register_discovered(key(&format!("newly-discovered-{index}"))),
+                "one in-flight key releases one slot"
+            );
+        }
         assert!(!hints.register_discovered(key("must-wait")), "untouched keys must apply backpressure");
         tokio::time::advance(PASS_START_BUDGET + Duration::from_secs(1)).await;
         drop(held);
         worker.await.expect("finish the admitted operation");
         tokio::time::resume();
         let state = hints.state.lock().expect("retained pending work");
-        for index in 1..HINT_CAPACITY {
+        for index in RECOVERY_CONCURRENCY..HINT_CAPACITY {
             let queued = state
                 .pending
                 .iter()
