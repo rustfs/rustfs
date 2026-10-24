@@ -2873,7 +2873,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         };
 
         let metadata_stage_start = stage_metrics_enabled.then(Instant::now);
-        let (snapshot, prepared_object_info) = if let Some(prepared) = take_prepared_get_object_metadata() {
+        let (mut snapshot, prepared_object_info) = if let Some(prepared) = take_prepared_get_object_metadata() {
             (prepared.snapshot, prepared.object_info)
         } else {
             match self
@@ -2903,6 +2903,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 }
             }
         };
+        let verified_inline_body = snapshot.take_verified_inline_body();
         let fi = snapshot.fi();
         let files = snapshot.parts_metadata();
         let disks = snapshot.online_disks();
@@ -3010,6 +3011,42 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     disks.get(index).is_some_and(Option::is_some)
                 })
             {
+                if let Some(body) = verified_inline_body.filter(|body| body.len() == object_size) {
+                    if let Some(inline_prepare_stage_start) = inline_prepare_stage_start.take() {
+                        rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                            GET_OBJECT_PATH_INLINE_DIRECT,
+                            GET_STAGE_INLINE_PREPARE,
+                            object_class.as_str(),
+                            size_bucket,
+                            inline_prepare_stage_start.elapsed().as_secs_f64(),
+                        );
+                    }
+                    if rustfs_io_metrics::get_stage_metrics_enabled() {
+                        rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                            GET_OBJECT_PATH_INLINE_DIRECT,
+                            GET_STAGE_READER_SETUP,
+                            object_class.as_str(),
+                            size_bucket,
+                            0.0,
+                        );
+                        rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                            GET_OBJECT_PATH_INLINE_DIRECT,
+                            GET_STAGE_DECODE,
+                            object_class.as_str(),
+                            size_bucket,
+                            0.0,
+                        );
+                    }
+                    record_get_object_reader_path_observation(GET_OBJECT_PATH_INLINE_DIRECT, object_class, size_bucket);
+                    let reader = GetObjectReader {
+                        stream: Box::new(Cursor::new(body.clone())),
+                        object_info,
+                        buffered_body: Some(body),
+                        body_source: GetObjectBodySource::Unprobed,
+                    };
+                    return Ok(reader);
+                }
+
                 let read_length = inline_erasure_shard_file_offset(
                     0,
                     object_size,
@@ -11061,8 +11098,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         // Use the same full xl.meta read path as GetObject metadata resolution.
         // This avoids HEAD/GetObject metadata visibility skew immediately after
-        // PutObject/CompleteMultipartUpload.
-        let read = self.get_object_fileinfo(bucket, object, opts, true, false);
+        // PutObject/CompleteMultipartUpload. Read-only callers that hold the
+        // shared lock and permit metadata caching can early-stop once write
+        // quorum agrees on the object identity.
+        let allow_early_stop = !opts.no_lock || opts.metadata_cache_safe;
+        let read = self.get_object_fileinfo(bucket, object, opts, true, allow_early_stop);
         #[cfg(feature = "diagnostic-read-version-caller")]
         let read = crate::cluster::rpc::runtime_sources::with_read_version_entry(
             rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::ObjectInfoRead,
@@ -11075,7 +11115,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         );
         let snapshot = read.await.map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
-        let oi = ObjectInfo::from_file_info(snapshot.fi(), bucket, object, opts.versioned || opts.version_suspended);
+        let oi = snapshot.into_object_info(bucket, object, opts.versioned || opts.version_suspended);
 
         Ok(oi)
     }

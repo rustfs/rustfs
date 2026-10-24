@@ -2304,6 +2304,40 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn replacement_recovery_diagnostics_require_authentication() {
+        use s3s::route::S3Route;
+
+        let mut router = super::S3Router::new(false);
+        super::register_heal_route(&mut router).expect("register production Heal routes");
+        for prefix in ["/rustfs/admin", "/minio/admin"] {
+            let path = format!("{prefix}/v4/heal/replacement-recovery");
+            assert!(router.contains_compatible_route(http::Method::GET, &path));
+            let mut req = s3s::S3Request {
+                input: s3s::Body::empty(),
+                method: http::Method::GET,
+                uri: path.parse().expect("replacement diagnostics URI"),
+                headers: http::HeaderMap::new(),
+                extensions: http::Extensions::new(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            };
+            let err = router
+                .check_access(&mut req)
+                .await
+                .expect_err("diagnostics router must require a signature");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+            let err = router
+                .call(req)
+                .await
+                .expect_err("diagnostics handler must authenticate before inspecting local records");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+            assert!(err.to_string().contains("authentication required"));
+        }
+    }
+
     fn replacement_record(task_id: &str) -> rustfs_heal::ReplacementRecoveryRecord {
         rustfs_heal::ReplacementRecoveryRecord {
             task_id: task_id.to_string(),
@@ -2499,6 +2533,7 @@ mod tests {
                     reason: "digest mismatch".to_owned(),
                     blocked_at: Some(10),
                     revalidate_after: Some(3610),
+                    validation: rustfs_heal::CheckpointValidation::default(),
                 }],
             },
             cluster,
@@ -2515,6 +2550,17 @@ mod tests {
         assert_eq!(value["localDiagnostics"]["rootBlocked"][0]["taskId"], "root-task");
         assert_eq!(value["localDiagnostics"]["rootBlocked"][0]["reason"], "conflicting owners");
         assert_eq!(value["localDiagnostics"]["checkpointBlocked"][0]["reason"], "digest mismatch");
+        let validation = &value["localDiagnostics"]["checkpointBlocked"][0]["validation"];
+        assert_eq!(validation["stage"], "read_unavailable");
+        assert!(validation["schemaVersion"].is_null());
+        assert!(validation["signaturePresent"].is_null());
+        assert!(validation["signatureValid"].is_null());
+        assert!(validation["taskIdentityMatches"].is_null());
+        assert!(validation["legacyRewind"].is_null());
+        assert!(validation["readerAccepted"].is_null());
+        assert_eq!(validation["recoveryStatus"], "unknown");
+        assert_eq!(validation["ownerFence"], "unknown");
+        assert_eq!(validation["executionAuthorized"], false);
         assert_eq!(value["cluster"]["records"].as_array().expect("cluster records").len(), 1);
         assert_eq!(value["cluster"]["definitive"], true);
         assert!(value["cluster"]["reason"].is_null());

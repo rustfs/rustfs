@@ -1143,12 +1143,19 @@ impl RemoteDisk {
         let probe = self.data_transport.probe_ns_scanner_capability(NsScannerCapabilityRequest {
             endpoint: self.endpoint.grid_host(),
             supports_tier_registry_generation: true,
+            supports_checkpoint_coverage: true,
         });
         let result = timeout(NS_SCANNER_CAPABILITY_PROBE_TIMEOUT, probe)
             .await
             .map_err(|_| DiskError::other("remote namespace scanner capability probe timed out"))?;
         match result {
-            Ok(response) if response.supports_tier_registry_generation == Some(true) => Ok(Some(response.server_epoch)),
+            // RUSTFS_COMPAT_TODO(ns-scanner-checkpoint-coverage): old strict readers cannot accept the coverage field. Remove after every supported peer authenticates both scanner capabilities.
+            Ok(response)
+                if response.supports_tier_registry_generation == Some(true)
+                    && response.supports_checkpoint_coverage == Some(true) =>
+            {
+                Ok(Some(response.server_epoch))
+            }
             Ok(_) => Ok(None),
             // RUSTFS_COMPAT_TODO(ns-scanner-rpc-v3): old peers and legacy transports lack the authenticated startup-epoch handshake. Remove after every supported peer implements namespace scanner protocol v3.
             Err(DiskError::MethodNotAllowed) => Ok(None),
@@ -5008,6 +5015,7 @@ mod tests {
         calls: Arc<StdMutex<Vec<RecordedTransportCall>>>,
         ns_scanner_probe_status: Arc<StdMutex<Option<u16>>>,
         ns_scanner_generation_support: Arc<StdMutex<Option<bool>>>,
+        ns_scanner_checkpoint_support: Arc<StdMutex<Option<bool>>>,
     }
 
     impl Default for RecordingInternodeDataTransport {
@@ -5016,6 +5024,7 @@ mod tests {
                 calls: Arc::default(),
                 ns_scanner_probe_status: Arc::default(),
                 ns_scanner_generation_support: Arc::new(StdMutex::new(Some(true))),
+                ns_scanner_checkpoint_support: Arc::new(StdMutex::new(Some(true))),
             }
         }
     }
@@ -5266,6 +5275,7 @@ mod tests {
                 calls: Arc::default(),
                 ns_scanner_probe_status: Arc::new(StdMutex::new(Some(status))),
                 ns_scanner_generation_support: Arc::new(StdMutex::new(Some(true))),
+                ns_scanner_checkpoint_support: Arc::new(StdMutex::new(Some(true))),
             }
         }
 
@@ -5274,6 +5284,7 @@ mod tests {
                 calls: Arc::default(),
                 ns_scanner_probe_status: Arc::default(),
                 ns_scanner_generation_support: Arc::new(StdMutex::new(support)),
+                ns_scanner_checkpoint_support: Arc::new(StdMutex::new(Some(true))),
             }
         }
 
@@ -5974,6 +5985,7 @@ mod tests {
                 server_epoch,
                 proof: Vec::new(),
                 supports_tier_registry_generation,
+                supports_checkpoint_coverage: *self.ns_scanner_checkpoint_support.lock().expect("checkpoint capability lock"),
             })
         }
 
@@ -9065,6 +9077,28 @@ mod tests {
                     .await
                     .expect("unsupported namespace scanner response should be classified"),
                 None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_namespace_scanner_falls_back_until_checkpoint_support_is_authenticated() {
+        for support in [None, Some(false)] {
+            let transport = RecordingInternodeDataTransport::default();
+            *transport
+                .ns_scanner_checkpoint_support
+                .lock()
+                .expect("checkpoint capability lock") = support;
+            let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+            assert_eq!(remote_disk.ns_scanner_server_epoch().await.expect("old peer fallback"), None);
+            assert!(matches!(transport.calls().as_slice(), [RecordedTransportCall::NsScannerProbe(_)]));
+            *transport
+                .ns_scanner_checkpoint_support
+                .lock()
+                .expect("checkpoint capability lock") = Some(true);
+            assert_eq!(
+                remote_disk.ns_scanner_server_epoch().await.expect("upgraded peer"),
+                Some(Uuid::from_u128(1))
             );
         }
     }

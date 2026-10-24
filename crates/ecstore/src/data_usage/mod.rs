@@ -176,6 +176,9 @@ static USAGE_CACHE_UPDATING: OnceLock<CacheUpdating> = OnceLock::new();
 static LIVE_BUCKET_USAGE_CACHE: OnceLock<LiveBucketUsageCache> = OnceLock::new();
 static USAGE_MEMORY_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// Compatibility input for snapshot-protocol quota admission and capacity
+/// reporting. Durable quota checks and statistics do not consult this floor.
+///
 /// Best-available persisted usage for `bucket` when no authoritative source
 /// exists yet (issue #5716): after an upgrade from a pre-v2 release the only
 /// persisted usage data is the legacy `.usage.json`, which is demoted to
@@ -228,7 +231,8 @@ struct CachedDataUsageSnapshot {
     loaded_at: tokio::time::Instant,
     /// Pre-discard per-bucket sizes from the same load, retained even when the
     /// snapshot is incomplete and its bucket data is discarded. Consumed only
-    /// by [`lookup_degraded_bucket_usage_baseline`] for quota admission.
+    /// by [`lookup_degraded_bucket_usage_baseline`] for snapshot-protocol
+    /// admission and capacity reporting until their compatibility windows end.
     degraded_baseline: HashMap<String, u64>,
 }
 
@@ -6355,6 +6359,43 @@ mod tests {
         replace_bucket_usage_memory_from_info(&partial).await;
 
         assert_eq!(get_bucket_usage_memory("bucket-a").await, None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn complete_scanner_cycle_with_carried_bucket_preserves_legacy_quota_floor() {
+        clear_usage_memory_cache_for_test().await;
+        let bucket = "partial-carried-quota";
+        let mut baseline = data_usage_info_for_test(bucket, 2, 100, SystemTime::UNIX_EPOCH + Duration::from_secs(100));
+        baseline.scanner_epoch = Some(7);
+        baseline.scanner_cycle = Some(10);
+        baseline.usage_snapshot_converged = Some(true);
+        replace_bucket_usage_memory_from_info(&baseline).await;
+        record_bucket_object_write_memory(bucket, None, 25).await;
+        record_bucket_object_delete_memory(bucket, 20, true).await;
+        assert_eq!(get_bucket_usage_memory(bucket).await, Some(125));
+        let mutation_time = memory_cache().read().await[bucket].usage_updated_at;
+
+        let mut carried = baseline;
+        carried.last_update = Some(mutation_time + Duration::from_secs(1));
+        carried.scanner_cycle = Some(11);
+        carried.usage_snapshot_converged = Some(false);
+        carried.usage_snapshot_pending_buckets = vec![bucket.to_string()];
+        assert!(carried.usage_snapshot_complete);
+        replace_bucket_usage_memory_from_info(&carried).await;
+        assert_eq!(
+            get_bucket_usage_memory(bucket).await,
+            Some(125),
+            "Complete with a carried certified value must retain positive deltas and the delete hold"
+        );
+
+        let mut reconciled = data_usage_info_for_test(bucket, 2, 105, mutation_time + Duration::from_secs(2));
+        reconciled.scanner_epoch = Some(7);
+        reconciled.scanner_cycle = Some(12);
+        reconciled.usage_snapshot_converged = Some(true);
+        replace_bucket_usage_memory_from_info(&reconciled).await;
+        assert_eq!(get_bucket_usage_memory(bucket).await, Some(105));
+        clear_usage_memory_cache_for_test().await;
     }
 
     #[tokio::test]

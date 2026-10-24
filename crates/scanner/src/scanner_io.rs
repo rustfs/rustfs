@@ -1037,6 +1037,25 @@ fn scanner_bucket_cache_digest(
     DataUsageScanPlanDigest(hasher.finalize().into())
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScannerBucketPlanDigests {
+    pub(crate) reuse: DataUsageScanPlanDigest,
+    pub(crate) coverage: DataUsageScanPlanDigest,
+}
+
+impl ScannerBucketPlanDigests {
+    pub(crate) fn from_work_plans(
+        reuse: DataUsageScanPlanDigest,
+        coverage: DataUsageScanPlanDigest,
+        dirty_generation: Option<u64>,
+    ) -> Self {
+        Self {
+            reuse: scanner_bucket_cache_digest(reuse, dirty_generation),
+            coverage: scanner_bucket_cache_digest(coverage, dirty_generation),
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn checkpoint_fixture_bucket_digest(
     scan_plan_digest: DataUsageScanPlanDigest,

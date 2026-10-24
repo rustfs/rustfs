@@ -878,37 +878,39 @@ impl DefaultObjectUsecase {
             }
         }
 
-        let deleted = delete_results
-            .iter()
-            .filter_map(|result| result.delete_object.as_ref().map(|object| (result, object)))
-            .map(|(result, object)| DeletedObject {
-                delete_marker: { if object.delete_marker { Some(true) } else { None } },
-                delete_marker_version_id: delete_marker_response_version_id(
-                    object.delete_marker_version_id,
-                    object.delete_marker && result.version_suspended && result.requested_version_id.is_none(),
-                    result.synthetic_version_id,
-                ),
-                key: Some(object.object_name.clone()),
-                version_id: delete_entry_response_version_id(
-                    object.version_id,
-                    object.delete_marker,
-                    result.requested_version_id,
-                    result.synthetic_version_id,
-                ),
-            })
-            .collect();
-        let deleted_cache_keys = delete_results
-            .iter()
-            .filter_map(|result| result.delete_object.as_ref().map(|deleted| deleted.object_name.clone()))
-            .collect::<Vec<_>>();
-        invalidate_object_data_cache_objects_after_delete_success(&cache_adapter, &bucket, deleted_cache_keys.iter()).await;
+        let deleted = (!delete.quiet.unwrap_or_default()).then(|| {
+            delete_results
+                .iter()
+                .filter_map(|result| result.delete_object.as_ref().map(|object| (result, object)))
+                .map(|(result, object)| DeletedObject {
+                    delete_marker: { if object.delete_marker { Some(true) } else { None } },
+                    delete_marker_version_id: delete_marker_response_version_id(
+                        object.delete_marker_version_id,
+                        object.delete_marker && result.version_suspended && result.requested_version_id.is_none(),
+                        result.synthetic_version_id,
+                    ),
+                    key: Some(object.object_name.clone()),
+                    version_id: delete_entry_response_version_id(
+                        object.version_id,
+                        object.delete_marker,
+                        result.requested_version_id,
+                        result.synthetic_version_id,
+                    ),
+                })
+                .collect()
+        });
+        for result in &delete_results {
+            if let Some(deleted) = &result.delete_object {
+                let _ = invalidate_object_data_cache_after_delete_success(&cache_adapter, &bucket, &deleted.object_name).await;
+            }
+        }
 
         let errors = delete_results
             .iter()
             .filter_map(|v| v.error.clone())
             .collect::<Vec<s3s::dto::Error>>();
         let output = DeleteObjectsOutput {
-            deleted: (!delete.quiet.unwrap_or_default()).then_some(deleted),
+            deleted,
             errors: Some(errors),
             ..Default::default()
         };
@@ -973,25 +975,32 @@ impl DefaultObjectUsecase {
                     // `DeleteMarkerCreated` is a creation event; a delete
                     // marker removed by an explicit version id is a plain
                     // versioned delete (issue #6745).
-                    let event_name = delete_event_name_for_marker(dobj.delete_marker && res.requested_version_id.is_none());
-                    let event_args = EventArgsBuilder::new(
-                        event_name,
-                        notify_bucket.clone(),
-                        convert_ecstore_object_info(ObjectInfo {
-                            name: dobj.object_name.clone(),
-                            bucket: notify_bucket.clone(),
-                            ..Default::default()
-                        }),
-                    )
-                    .version_id(
+                    let creates_delete_marker = dobj.delete_marker && res.requested_version_id.is_none();
+                    let event_name = delete_event_name_for_marker(creates_delete_marker);
+                    let version_id = if creates_delete_marker {
+                        delete_marker_response_version_id(
+                            dobj.delete_marker_version_id,
+                            res.version_suspended,
+                            res.synthetic_version_id,
+                        )
+                    } else {
                         delete_entry_response_version_id(
                             dobj.version_id,
                             dobj.delete_marker,
                             res.requested_version_id,
                             res.synthetic_version_id,
                         )
-                        .unwrap_or_default(),
+                    };
+                    let event_args = EventArgsBuilder::new(
+                        event_name,
+                        notify_bucket.clone(),
+                        rustfs_notify::NotifyObjectInfo {
+                            name: dobj.object_name,
+                            bucket: notify_bucket.clone(),
+                            ..Default::default()
+                        },
                     )
+                    .version_id(version_id.unwrap_or_default())
                     .req_params(req_params.clone())
                     .resp_elements(resp_elements.clone())
                     .host(get_request_host(&req_headers))
@@ -1372,7 +1381,12 @@ impl DefaultObjectUsecase {
         let event_name = delete_event_name_for_marker(delete_marker && version_id_clone.is_none());
 
         helper = helper.event_name(event_name);
-        helper = helper.object(obj_info).version_id(response_version_id.unwrap_or_default());
+        helper = helper
+            .object(ObjectInfo {
+                version_id: version_id.filter(|_| !synthetic_version_id),
+                ..obj_info
+            })
+            .version_id(response_version_id.unwrap_or_default());
 
         let result = Ok(S3Response::new(output));
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
@@ -1399,6 +1413,207 @@ mod tests {
         ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, SourceSelectionCriteria,
     };
     use std::sync::Arc;
+
+    #[test]
+    #[serial_test::serial]
+    fn delete_marker_notifications_preserve_committed_version_identity() {
+        crate::app::gating_test_env::run_large_stack_test("delete-marker-notifications", || async {
+            use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+            let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+            let usecase = DefaultObjectUsecase::with_context(Some(context));
+            let system = rustfs_notify::ensure_live_events();
+            let mut events = system.subscribe_live_events();
+
+            for status in [Some("Enabled"), Some("Suspended"), None] {
+                for (batch_quiet, directory) in [(None, false), (Some(false), false), (Some(true), false), (None, true)] {
+                    if directory && status.is_some() {
+                        continue;
+                    }
+                    let bucket = format!("delete-event-{}", Uuid::new_v4());
+                    store
+                        .make_bucket(
+                            &bucket,
+                            &MakeBucketOptions {
+                                versioning_enabled: status.is_some(),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("create notification fixture bucket");
+                    let keys: &[&str] = if directory {
+                        &["directory/"]
+                    } else if batch_quiet.is_some() {
+                        &["first", "second"]
+                    } else {
+                        &["single"]
+                    };
+                    for key in keys {
+                        store
+                            .put_object(
+                                &bucket,
+                                key,
+                                &mut PutObjReader::from_vec(b"historical payload".to_vec()),
+                                &ObjectOptions {
+                                    versioned: status.is_some(),
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .expect("write notification fixture object");
+                    }
+                    if status == Some("Suspended") {
+                        store
+                            .update_bucket_metadata_config(
+                                &bucket,
+                                crate::app::storage_api::test::bucket::metadata::BUCKET_VERSIONING_CONFIG,
+                                b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>".to_vec(),
+                            )
+                            .await
+                            .expect("suspend fixture versioning");
+                    }
+                    let metadata = store.get_bucket_metadata(&bucket).await.expect("fixture metadata");
+                    crate::app::storage_api::test::set_bucket_metadata(bucket.clone(), (*metadata).clone())
+                        .await
+                        .expect("publish fixture metadata");
+
+                    let mut versions = vec![None; keys.len()];
+                    // First create markers (or delete unversioned data), then remove
+                    // the exact markers. Removing a marker is not marker creation.
+                    for remove_marker in [false, true] {
+                        if remove_marker && status.is_none() {
+                            break;
+                        }
+                        let mut response_versions = vec![None; keys.len()];
+                        if let Some(quiet) = batch_quiet {
+                            let input = DeleteObjectsInput::builder()
+                                .bucket(bucket.clone())
+                                .delete(Delete {
+                                    objects: keys
+                                        .iter()
+                                        .zip(&versions)
+                                        .map(|(key, version_id)| ObjectIdentifier {
+                                            key: (*key).to_string(),
+                                            version_id: version_id.clone(),
+                                            ..Default::default()
+                                        })
+                                        .collect(),
+                                    quiet: Some(quiet),
+                                })
+                                .build()
+                                .expect("batch delete input");
+                            let mut req = build_request(input, Method::POST);
+                            req.extensions.insert(crate::storage::access::ReqInfo {
+                                bucket: Some(bucket.clone()),
+                                cred: Some(rustfs_credentials::Credentials::default()),
+                                is_owner: true,
+                                ..Default::default()
+                            });
+                            let output = Box::pin(usecase.execute_delete_objects(req))
+                                .await
+                                .expect("batch delete")
+                                .output;
+                            assert!(output.errors.as_ref().is_none_or(Vec::is_empty), "{:?}", output.errors);
+                            if quiet {
+                                assert!(output.deleted.is_none(), "quiet mode must still emit notifications");
+                            } else {
+                                let deleted = output.deleted.expect("verbose deleted entries");
+                                assert_eq!(deleted.len(), keys.len());
+                                for (idx, entry) in deleted.into_iter().enumerate() {
+                                    assert_eq!(entry.key.as_deref(), Some(keys[idx]));
+                                    response_versions[idx] = if remove_marker {
+                                        entry.version_id
+                                    } else {
+                                        assert!(entry.version_id.is_none(), "marker creation uses DeleteMarkerVersionId");
+                                        entry.delete_marker_version_id
+                                    };
+                                }
+                            }
+                        } else {
+                            let input = DeleteObjectInput::builder()
+                                .bucket(bucket.clone())
+                                .key(keys[0].to_string())
+                                .version_id(versions[0].clone())
+                                .build()
+                                .expect("single delete input");
+                            let mut req = build_request(input, Method::DELETE);
+                            req.extensions.insert(crate::storage::access::ReqInfo {
+                                bucket: Some(bucket.clone()),
+                                object: Some(keys[0].to_string()),
+                                cred: Some(rustfs_credentials::Credentials::default()),
+                                is_owner: true,
+                                ..Default::default()
+                            });
+                            let output = Box::pin(usecase.execute_delete_object(req))
+                                .await
+                                .expect("single delete")
+                                .output;
+                            assert_eq!(output.delete_marker, Some(status.is_some()));
+                            response_versions[0] = output.version_id;
+                        }
+                        if !remove_marker && status.is_some() {
+                            let listed = store
+                                .clone()
+                                .list_object_versions(&bucket, "", None, None, None, 1000)
+                                .await
+                                .expect("list committed marker identities");
+                            for (idx, key) in keys.iter().enumerate() {
+                                let marker = listed
+                                    .objects
+                                    .iter()
+                                    .find(|obj| obj.name == *key && obj.delete_marker)
+                                    .expect("committed delete marker");
+                                versions[idx] = delete_response_version_id(marker.version_id, false);
+                                assert!(versions[idx].is_some());
+                                assert_eq!(versions[idx].as_deref() == Some("null"), status == Some("Suspended"));
+                            }
+                        }
+                        if batch_quiet != Some(true) {
+                            assert_eq!(response_versions, versions, "S3 response must identify the committed version");
+                        }
+                        let expected_name = if status.is_some() && !remove_marker {
+                            EventName::ObjectRemovedDeleteMarkerCreated
+                        } else {
+                            EventName::ObjectRemovedDelete
+                        };
+                        let encoded_keys = keys
+                            .iter()
+                            .map(|key| url::form_urlencoded::byte_serialize(key.as_bytes()).collect::<String>())
+                            .collect::<Vec<_>>();
+                        let mut remaining = keys.to_vec();
+                        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                            while !remaining.is_empty() {
+                                let event = events.recv().await.expect("live notification stream");
+                                if event.s3.bucket.name != bucket {
+                                    continue;
+                                }
+                                let idx = encoded_keys
+                                    .iter()
+                                    .position(|key| *key == event.s3.object.key)
+                                    .expect("deleted key");
+                                assert_eq!(event.event_name, expected_name);
+                                assert_eq!(event.s3.object.version_id, versions[idx], "status={status:?}, batch={batch_quiet:?}");
+                                let json = serde_json::to_value(&*event).expect("serialize notification");
+                                assert_eq!(
+                                    json.pointer("/s3/object/versionId").and_then(serde_json::Value::as_str),
+                                    versions[idx].as_deref()
+                                );
+                                assert!(json.pointer("/s3/object/size").is_none());
+                                assert!(json.pointer("/s3/object/eTag").is_none());
+                                assert!(json.pointer("/s3/object/userMetadata").is_none());
+                                let pos = remaining.iter().position(|key| *key == keys[idx]).expect("one event per key");
+                                remaining.swap_remove(pos);
+                            }
+                        })
+                        .await
+                        .expect("delete notifications must arrive");
+                    }
+                }
+            }
+        });
+    }
 
     #[test]
     #[serial_test::serial]

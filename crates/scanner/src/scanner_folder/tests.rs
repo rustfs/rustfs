@@ -2321,6 +2321,247 @@ async fn test_scan_folder_treats_child_removed_before_open_as_empty() {
     assert_eq!(into.size, 0);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn scan_folder_charges_each_enumerated_entry_to_the_disk_budget() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+    let bucket_dir = temp_dir.join("bucket");
+    tokio::fs::create_dir_all(&bucket_dir)
+        .await
+        .expect("failed to create bucket directory");
+    for name in ["one", "two", "three"] {
+        symlink("missing-target", bucket_dir.join(name)).expect("failed to create dangling symlink");
+    }
+
+    scanner.sleeper = SCANNER_SLEEPER.for_disk(&temp_dir);
+    scanner.old_cache.info.name = "bucket".to_string();
+    scanner.new_cache.info.name = "bucket".to_string();
+    scanner.update_cache.info.name = "bucket".to_string();
+
+    let folder = CachedFolder {
+        name: "bucket".to_string(),
+        parent: None,
+        object_heal_prob_div: 1,
+    };
+    let mut into = DataUsageEntry::default();
+    scanner
+        .scan_folder(CancellationToken::new(), folder, &mut into)
+        .await
+        .expect("directory enumeration should complete");
+
+    let disk = temp_dir.to_string_lossy();
+    let status = crate::sleeper::scanner_disk_io_budget_status()
+        .into_iter()
+        .find(|status| status.disk == disk)
+        .expect("scanner disk budget should expose its charge count");
+    assert_eq!(status.charged_ops, 7, "one directory open, three entries, and three target stats");
+}
+
+#[tokio::test]
+#[serial]
+async fn scan_folder_budgets_payload_entries_without_metadata_io() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+    let bucket_dir = temp_dir.join("bucket");
+    tokio::fs::create_dir_all(&bucket_dir).await.expect("create bucket");
+    for index in 0..33 {
+        tokio::fs::write(bucket_dir.join(format!("part.{index}")), b"payload")
+            .await
+            .expect("create payload entry");
+    }
+    scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest).for_disk_with_budget_for_tests(
+        &temp_dir,
+        crate::sleeper::ScannerDiskIoBudgetLimits {
+            iops: Some(1_000_000),
+            bytes_per_sec: Some(1_000_000),
+        },
+    );
+    let mut into = DataUsageEntry::default();
+    scanner
+        .scan_folder(
+            CancellationToken::new(),
+            CachedFolder {
+                name: "bucket".to_string(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+            &mut into,
+        )
+        .await
+        .expect("scan payload entries across a directory prefetch boundary");
+
+    let status = crate::sleeper::scanner_disk_io_budget_status()
+        .into_iter()
+        .find(|status| status.disk == temp_dir.to_string_lossy())
+        .expect("bound disk budget");
+    assert_eq!(status.charged_ops, 34, "one directory open and 33 entries, without size stats or reads");
+    assert_eq!(status.charged_bytes, 0);
+    assert_eq!(into.objects, 0);
+    assert_eq!(into.failed_objects, 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn scan_folder_reuses_symlink_size_without_bypassing_disk_validation() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+    let object_dir = temp_dir.join("bucket/object");
+    tokio::fs::create_dir_all(&object_dir).await.expect("create object directory");
+    let metadata = metadata_for_object("bucket", "object");
+    let target = temp_dir.join("metadata-target");
+    tokio::fs::write(&target, &metadata).await.expect("write metadata target");
+    symlink(&target, object_dir.join(STORAGE_FORMAT_FILE)).expect("create metadata symlink");
+    scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest).for_disk_with_budget_for_tests(
+        &temp_dir,
+        crate::sleeper::ScannerDiskIoBudgetLimits {
+            iops: Some(1_000_000),
+            bytes_per_sec: Some(1_000_000),
+        },
+    );
+    let mut into = DataUsageEntry::default();
+    scanner
+        .scan_folder(
+            CancellationToken::new(),
+            CachedFolder {
+                name: "bucket/object".to_string(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+            &mut into,
+        )
+        .await
+        .expect("scan symlinked object metadata");
+
+    let status = crate::sleeper::scanner_disk_io_budget_status()
+        .into_iter()
+        .find(|status| status.disk == temp_dir.to_string_lossy())
+        .expect("bound disk budget");
+    assert_eq!(
+        status.charged_ops, 4,
+        "directory, entry, target stat, and read reservation without a second stat"
+    );
+    assert_eq!(status.charged_bytes, u64::try_from(metadata.len()).expect("metadata length fits u64"));
+    assert_eq!(into.objects, 0, "the disk must continue rejecting symlinked metadata");
+    assert_eq!(into.failed_objects, 1);
+    assert!(
+        scanner
+            .new_cache
+            .info
+            .failed_objects
+            .contains_key(object_dir.join(STORAGE_FORMAT_FILE).to_string_lossy().as_ref())
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn scanner_directory_probe_budget_wait_cancels_without_rate_delay() {
+    let path = std::env::temp_dir().join(format!("scanner-cancel-budget-{}", Uuid::new_v4()));
+    let sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest).for_disk_with_budget_for_tests(
+        &path,
+        crate::sleeper::ScannerDiskIoBudgetLimits {
+            iops: Some(0),
+            bytes_per_sec: None,
+        },
+    );
+    sleeper.admit_disk_io(1, 0).await;
+    let ctx = CancellationToken::new();
+    let cancel = ctx.clone();
+    let task = tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        cancel.cancel();
+    });
+    let started = tokio::time::Instant::now();
+    assert!(
+        contains_erasure_part_file(path.to_string_lossy().as_ref(), &ctx, &sleeper)
+            .await
+            .is_err()
+    );
+    task.await.expect("cancellation task");
+    assert_eq!(
+        started.elapsed(),
+        Duration::ZERO,
+        "cancellation must interrupt the one-second budget wait"
+    );
+
+    assert!(wait_for_scanner_io(&ctx, sleeper.admit_disk_io(1, 0)).await.is_err());
+    let status = crate::sleeper::scanner_disk_io_budget_status()
+        .into_iter()
+        .find(|status| status.disk == path.to_string_lossy())
+        .expect("bound disk budget");
+    assert_eq!(status.charged_ops, 2, "an already cancelled wait must not charge another operation");
+}
+
+#[tokio::test]
+async fn erasure_directory_probe_respects_entry_limit_and_disk_budget() {
+    let temp_dir = tempfile::tempdir().expect("create probe directory");
+    for index in 0..=ERASURE_DATA_DIR_PROBE_ENTRY_LIMIT {
+        tokio::fs::write(temp_dir.path().join(format!("namespace-{index}")), b"")
+            .await
+            .expect("create non-part entry");
+    }
+    let sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest).for_disk_with_budget_for_tests(
+        temp_dir.path(),
+        crate::sleeper::ScannerDiskIoBudgetLimits {
+            iops: Some(1_000_000),
+            bytes_per_sec: None,
+        },
+    );
+    assert!(
+        !contains_erasure_part_file(temp_dir.path().to_string_lossy().as_ref(), &CancellationToken::new(), &sleeper)
+            .await
+            .expect("probe directory without erasure parts")
+    );
+    let status = crate::sleeper::scanner_disk_io_budget_status()
+        .into_iter()
+        .find(|status| status.disk == temp_dir.path().to_string_lossy())
+        .expect("bound disk budget");
+    assert_eq!(
+        status.charged_ops,
+        1 + u64::try_from(ERASURE_DATA_DIR_PROBE_ENTRY_LIMIT).expect("entry limit fits u64"),
+        "one directory open plus at most the bounded probe entries"
+    );
+    assert_eq!(status.charged_bytes, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn scanner_directory_probe_cancels_during_entry_budget_wait() {
+    let temp_dir = tempfile::tempdir().expect("create probe directory");
+    tokio::fs::write(temp_dir.path().join("part.1"), b"shard")
+        .await
+        .expect("create erasure part");
+    let sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest).for_disk_with_budget_for_tests(
+        temp_dir.path(),
+        crate::sleeper::ScannerDiskIoBudgetLimits {
+            iops: Some(0),
+            bytes_per_sec: None,
+        },
+    );
+    let ctx = CancellationToken::new();
+    let cancel = ctx.clone();
+    let disk = temp_dir.path().to_string_lossy().into_owned();
+    let task = tokio::spawn(async move {
+        loop {
+            if crate::sleeper::scanner_disk_io_budget_status()
+                .iter()
+                .any(|status| status.disk == disk && status.charged_ops == 2)
+            {
+                cancel.cancel();
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+    let started = tokio::time::Instant::now();
+    let result = contains_erasure_part_file(temp_dir.path().to_string_lossy().as_ref(), &ctx, &sleeper).await;
+    task.abort();
+    assert!(ctx.is_cancelled(), "probe must reach the entry admission after opening its directory");
+    task.await.expect("entry-wait cancellation task");
+    assert!(result.is_err(), "cancelled probe must not report an erasure part");
+    assert_eq!(started.elapsed(), Duration::ZERO, "entry admission must not wait out its one-second debt");
+}
+
 #[tokio::test]
 #[serial]
 async fn test_scan_folder_missing_bucket_root_still_reports_not_found() {
@@ -2355,20 +2596,21 @@ async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
     let heal_starts_clone = heal_starts.clone();
     let healed_versions = Arc::new(Mutex::new(Vec::new()));
     let healed_versions_clone = healed_versions.clone();
-    let mut heal_rx =
-        rustfs_heal_contracts::heal_channel::init_heal_channel().expect("heal channel should initialize once for scanner tests");
+    let (_commands, mut heal_rx) = rustfs_heal_contracts::heal_channel::init_heal_channels()
+        .expect("heal channels should initialize once for scanner tests");
     let _heal_responder = tokio::spawn(async move {
         while let Some(command) = heal_rx.recv().await {
-            if let rustfs_heal_contracts::heal_channel::HealChannelCommand::Start {
-                request, response_tx, ..
-            } = command
+            let rustfs_heal_contracts::heal_channel::HealReceiptCommand { request, response_tx } = command;
             {
                 heal_starts_clone.fetch_add(1, Ordering::Relaxed);
                 healed_versions_clone
                     .lock()
                     .expect("heal version capture lock should not be poisoned")
                     .push((request.object_prefix, request.object_version_id, request.pool_index, request.set_index));
-                let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
+                let _ = response_tx.send(Ok(rustfs_heal_contracts::heal_channel::HealAdmissionReceipt {
+                    result: HealAdmissionResult::Accepted,
+                    task_id: request.id,
+                }));
             }
         }
     });
@@ -2769,6 +3011,13 @@ async fn test_scan_folder_missing_xl_meta_stops_erasure_data_dir_descent() {
     scanner.new_cache.info.name = "bucket".to_string();
     scanner.update_cache.info.name = "bucket".to_string();
     scanner.is_erasure_mode = true;
+    scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest).for_disk_with_budget_for_tests(
+        &temp_dir,
+        crate::sleeper::ScannerDiskIoBudgetLimits {
+            iops: Some(1_000_000),
+            bytes_per_sec: None,
+        },
+    );
 
     let parent = CancellationToken::new();
     let budget = ScannerCycleBudget::new_with_progress_tracking(
@@ -2791,6 +3040,11 @@ async fn test_scan_folder_missing_xl_meta_stops_erasure_data_dir_descent() {
         .await
         .expect("missing metadata must not make scanner descend into erasure data directories");
 
+    let disk_budget = crate::sleeper::scanner_disk_io_budget_status()
+        .into_iter()
+        .find(|status| status.disk == temp_dir.to_string_lossy())
+        .expect("bound disk budget");
+    assert_eq!(disk_budget.charged_ops, 4, "parent open/entry and part-directory probe open/entry");
     assert_eq!(into.failed_objects, 1);
     assert!(
         scanner

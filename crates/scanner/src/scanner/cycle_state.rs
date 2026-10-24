@@ -25,11 +25,70 @@ use tokio::io::AsyncReadExt as _;
 
 const SCANNER_CYCLE_RECOVERY_SCHEMA_VERSION: u16 = 1;
 const MAX_SCANNER_CYCLE_STATE_BYTES: u64 = 1024 * 1024;
+
+#[cfg(test)]
+pub(super) mod dual_recovery_fault {
+    use super::*;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(in crate::scanner) enum Stage {
+        CounterCommitted,
+        BootstrapCommitted,
+    }
+
+    struct Injection {
+        revision: String,
+        stage: Stage,
+        fired: AtomicBool,
+    }
+
+    static INJECTION: StdMutex<Option<Arc<Injection>>> = StdMutex::new(None);
+    pub(in crate::scanner) struct Guard(Arc<Injection>);
+
+    impl Guard {
+        pub(in crate::scanner) fn fired(&self) -> bool {
+            self.0.fired.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let mut slot = INJECTION.lock().expect("dual recovery fault slot");
+            if slot.as_ref().is_some_and(|current| Arc::ptr_eq(current, &self.0)) {
+                *slot = None;
+            }
+        }
+    }
+
+    pub(in crate::scanner) fn install(revision: String, stage: Stage) -> Guard {
+        let injection = Arc::new(Injection {
+            revision,
+            stage,
+            fired: AtomicBool::new(false),
+        });
+        let mut slot = INJECTION.lock().expect("dual recovery fault slot");
+        assert!(slot.is_none(), "only one dual recovery fault may be installed");
+        *slot = Some(injection.clone());
+        Guard(injection)
+    }
+
+    pub(super) fn check(revision: &str, stage: Stage) -> Result<(), ScannerError> {
+        let mut slot = INJECTION.lock().expect("dual recovery fault slot");
+        if slot
+            .as_ref()
+            .is_some_and(|injection| injection.revision == revision && injection.stage == stage)
+        {
+            let injection = slot.take().expect("matching dual recovery injection");
+            injection.fired.store(true, Ordering::Relaxed);
+            return Err(ScannerError::Io(std::io::Error::other(
+                "injected recovery completion failure after durable commit",
+            )));
+        }
+        Ok(())
+    }
+}
+
 pub(super) const MAX_SCANNER_CYCLE_RECOVERY_RETRIES: u32 = 5;
-/// Longest automatic wait between two leader iterations while a retryable
-/// recovery observation persists. It replaces the former terminal pause: a
-/// fault that outlives the short retry budget keeps retrying at this cadence.
-pub(super) const SCANNER_CYCLE_RECOVERY_BACKOFF_CAP: Duration = Duration::from_secs(10 * 60);
 const SCANNER_CYCLE_RECOVERY_BACKOFF_BASE: Duration = Duration::from_secs(5);
 /// A retryable observation older than this restarts its retry budget so the
 /// visible count and the backoff schedule do not grow without bound.
@@ -507,12 +566,13 @@ pub(super) struct ScannerCycleRecoveryRetry {
 
 /// Bounded exponential backoff for retryable recovery observations: it starts
 /// at the transient retry base (or the configured cycle interval when that is
-/// shorter) and never exceeds [`SCANNER_CYCLE_RECOVERY_BACKOFF_CAP`].
+/// shorter) and never exceeds the current recovery backoff cap.
 pub(super) fn scanner_cycle_recovery_backoff_delay(attempt: u32, cycle_interval: Duration) -> Duration {
     let exponent = attempt.saturating_sub(1).min(31);
     let multiplier = 1u32.checked_shl(exponent).unwrap_or(u32::MAX);
     let base = cycle_interval.clamp(Duration::from_secs(1), SCANNER_CYCLE_RECOVERY_BACKOFF_BASE);
-    base.saturating_mul(multiplier).min(SCANNER_CYCLE_RECOVERY_BACKOFF_CAP)
+    base.saturating_mul(multiplier)
+        .min(crate::runtime_config::scanner_recovery_backoff_cap())
 }
 
 fn reason_with_next_attempt(reason: Option<String>, next_attempt_at_unix_secs: u64, delay: Duration) -> String {
@@ -596,7 +656,7 @@ fn unix_now_secs() -> u64 {
     u64::try_from(Utc::now().timestamp()).unwrap_or(0)
 }
 
-fn sha256_hex(parts: &[&[u8]]) -> String {
+pub(super) fn sha256_hex(parts: &[&[u8]]) -> String {
     let mut hasher = Sha256::new();
     for part in parts {
         hasher.update(part);
@@ -2800,6 +2860,310 @@ fn usage_state_reset_resume_epoch(slots: &[ScannerUsageStateResetSlot]) -> Resul
     }
 }
 
+async fn preserve_dual_recovery_bytes(
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+    path: &str,
+    data: &[u8],
+    publication_epoch: u64,
+    owns_recovery: &(impl Fn() -> bool + Sync),
+) -> Result<(), ScannerError> {
+    let (existing, _) = read_config_with_revision(storeapi.clone(), path)
+        .await
+        .map_err(|err| ScannerError::Other(format!("failed to inspect scanner recovery evidence: {err}")))?;
+    if let Some(existing) = existing {
+        if existing != data {
+            return Err(ScannerError::Other("scanner recovery evidence conflicts with its source".to_string()));
+        }
+    } else {
+        // A lost write response is reconciled below. Evidence is immutable;
+        // neither retries nor another recovery may replace earlier bytes.
+        let _ = save_reset_config(
+            storeapi.clone(),
+            path,
+            data.to_vec(),
+            DataUsageCacheRevision::Missing.preconditions(),
+            publication_epoch,
+            owns_recovery,
+        )
+        .await;
+    }
+    let (persisted, revision) = read_config_with_revision(storeapi.clone(), path)
+        .await
+        .map_err(|err| ScannerError::Other(format!("failed to confirm scanner recovery evidence: {err}")))?;
+    if persisted.as_deref() != Some(data)
+        || !matches!(revision, DataUsageCacheRevision::Etag(_))
+        || !owns_recovery()
+        || scanner_publication_admission_for_epoch(storeapi, publication_epoch)
+            .await
+            .is_none()
+    {
+        return Err(ScannerError::Other(
+            "scanner recovery evidence or ownership could not be confirmed".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn read_dual_recovery_slots(
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+) -> Result<Vec<ScannerUsageStateResetSlot>, ScannerError> {
+    let mut slots = read_usage_state_reset_slots(storeapi.clone()).await?;
+    let (data, revision) = read_config_with_revision(storeapi, DATA_USAGE_RECOVERY_PATH.as_str())
+        .await
+        .map_err(|err| ScannerError::Other(format!("failed to inspect scanner usage recovery marker: {err}")))?;
+    slots.push(ScannerUsageStateResetSlot {
+        path: DATA_USAGE_RECOVERY_PATH.clone(),
+        data,
+        revision,
+    });
+    Ok(slots)
+}
+
+async fn confirm_dual_recovery_sources(
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+    marker: (&[u8], &DataUsageCacheRevision),
+    cycle: (&[u8], &DataUsageCacheRevision),
+    slots: &[ScannerUsageStateResetSlot],
+) -> Result<(), ScannerError> {
+    for (path, expected, revision) in [
+        (DATA_USAGE_BLOOM_RECOVERY_PATH.as_str(), marker.0, marker.1),
+        (DATA_USAGE_BLOOM_NAME_PATH.as_str(), cycle.0, cycle.1),
+    ] {
+        let (data, actual_revision) = read_config_with_revision(storeapi.clone(), path)
+            .await
+            .map_err(|err| ScannerError::Other(format!("failed to verify scanner recovery source: {err}")))?;
+        if data.as_deref() != Some(expected) || &actual_revision != revision {
+            return Err(ScannerError::Other("scanner recovery cycle or marker changed".to_string()));
+        }
+    }
+    let current = read_dual_recovery_slots(storeapi).await?;
+    if current.len() != slots.len()
+        || !current.iter().zip(slots).all(|(current, source)| {
+            current.path == source.path && current.revision == source.revision && current.data == source.data
+        })
+    {
+        return Err(ScannerError::Other("scanner recovery usage slots changed".to_string()));
+    }
+    Ok(())
+}
+
+/// The caller already owns leader.lock. Keep the existing bootstrap format and
+/// full-rebuild path, but preserve revision-bound raw evidence before either
+/// CAS. An interrupted counter write is resumed only from its exact recorded
+/// bytes, never from an unrelated counter that merely has a high enough epoch.
+pub(super) async fn recover_dual_corrupt_scanner_state(
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+    expected_cycle_revision: &DataUsageCacheRevision,
+    owns_recovery: impl Fn() -> bool + Sync,
+) -> Result<Option<(CurrentCycle, u64, DataUsageCacheRevision)>, ScannerError> {
+    let Some(publication_epoch) = scanner_publication_epoch(storeapi.clone()).await else {
+        return Err(ScannerError::Other("scanner dual recovery is blocked by data movement".to_string()));
+    };
+    let (marker_data, marker_revision) = read_cycle_recovery_marker_bytes(storeapi.clone())
+        .await
+        .map_err(|err| ScannerError::Other(format!("failed to inspect scanner dual recovery marker: {err}")))?;
+    let Some(marker_data) = marker_data else {
+        return Ok(None);
+    };
+    let marker: ScannerCycleRecoveryMarker = serde_json::from_slice(&marker_data)
+        .map_err(|err| ScannerError::Other(format!("scanner dual recovery marker is invalid: {err}")))?;
+    if validate_recovery_marker(&marker).is_err() || !marker_schedules_automatic_rebuild(&marker) {
+        return Ok(None);
+    }
+    let (cycle_data, cycle_revision) = read_config_with_revision(storeapi.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .map_err(|err| ScannerError::Other(format!("failed to inspect scanner dual recovery cycle: {err}")))?;
+    if &cycle_revision != expected_cycle_revision || !owns_recovery() {
+        return Err(ScannerError::Other(
+            "scanner dual recovery lost its cycle revision or ownership".to_string(),
+        ));
+    }
+    let Some(cycle_data) = cycle_data else {
+        return Ok(None);
+    };
+    let prefix = format!("{}.dual-recovery/{}", DATA_USAGE_BLOOM_NAME_PATH.as_str(), sha256_hex(&[&marker_data]));
+    let original_cycle_path = format!("{prefix}/cycle.bin");
+    let replacing_corrupt_cycle = marker_matches_revision(&marker, &cycle_revision);
+    let original_cycle = if replacing_corrupt_cycle {
+        cycle_data.clone()
+    } else {
+        let (original, _) = read_config_with_revision(storeapi.clone(), &original_cycle_path)
+            .await
+            .map_err(|err| ScannerError::Other(format!("failed to read interrupted scanner recovery evidence: {err}")))?;
+        let Some(original) = original else {
+            return Ok(None);
+        };
+        original
+    };
+    // A backup or observed epoch cannot prove the lost head's epoch. Only the
+    // current revision's recognized fencing header can authorize this repair.
+    if original_cycle.len() < SCANNER_CYCLE_STATE_HEADER_LEN
+        || u64::try_from(original_cycle.len()).unwrap_or(u64::MAX) > MAX_SCANNER_CYCLE_STATE_BYTES
+        || &original_cycle[8..16] != SCANNER_CYCLE_STATE_MAGIC
+        || decode_scanner_cycle_state(&original_cycle).is_ok()
+    {
+        return Ok(None);
+    }
+    let (next_cycle, head_epoch) = cycle_state_generation_and_epoch(&original_cycle);
+    if head_epoch == 0 || marker.generation != next_cycle || marker.leader_epoch != head_epoch {
+        return Ok(None);
+    }
+    let slots = read_dual_recovery_slots(storeapi.clone()).await?;
+    let mut floor = PersistedUsageFloor {
+        next_cycle,
+        leader_epoch: head_epoch,
+    };
+    let mut corrupt_usage = false;
+    for slot in &slots {
+        let Some(data) = slot.data.as_deref() else {
+            continue;
+        };
+        if slot.path == DATA_USAGE_RECOVERY_PATH.as_str() {
+            let marker = decode_legacy_incomplete_usage_floor_recovery_marker(data)?;
+            if !matches!(slot.revision, DataUsageCacheRevision::Etag(_)) {
+                return Err(ScannerError::Other("scanner usage recovery marker has no revision".to_string()));
+            }
+            floor.leader_epoch = floor.leader_epoch.max(marker.leader_epoch);
+            continue;
+        }
+        match serde_json::from_slice::<DataUsageInfo>(data) {
+            Ok(usage) => {
+                if slot.path != DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str()
+                    && (data_usage_info_has_persisted_baseline_identity(&usage)
+                        || data_usage_info_is_bootstrap_pending(&usage)
+                        || !usage.bucket_sizes.is_empty()
+                        || !usage.buckets_usage.is_empty())
+                {
+                    return Ok(None);
+                }
+                // Round-tripping the current writer's complete shape rejects
+                // fields the permissive reader would silently discard, even
+                // inside bucket entries. The strict legacy reader also accepts
+                // its older explicit-null representation.
+                let current_shape = match (serde_json::from_slice::<serde_json::Value>(data), serde_json::to_value(&usage)) {
+                    (Ok(raw), Ok(current)) => raw == current,
+                    _ => false,
+                };
+                if !current_shape && decode_legacy_usage_wire(data, &usage).is_none() {
+                    return Ok(None);
+                }
+                update_persisted_usage_floor(&mut floor, &usage, &slot.path)?;
+            }
+            Err(err) => match err.classify() {
+                serde_json::error::Category::Syntax | serde_json::error::Category::Eof => corrupt_usage = true,
+                serde_json::error::Category::Data | serde_json::error::Category::Io => return Ok(None),
+            },
+        }
+    }
+    if !corrupt_usage {
+        return Ok(None);
+    }
+    let leader_epoch = floor
+        .leader_epoch
+        .checked_add(1)
+        // Ordinary leadership claim must still advance once more before work.
+        .filter(|epoch| epoch.checked_add(1).is_some_and(|claimed| claimed < u64::MAX))
+        .ok_or_else(|| ScannerError::Other("scanner dual recovery leader epoch is exhausted".to_string()))?;
+    let rebuilt_cycle = CurrentCycle {
+        next: floor.next_cycle,
+        ..Default::default()
+    };
+    let expected_counter = encode_scanner_cycle_state(&rebuilt_cycle, leader_epoch)
+        .map_err(|err| ScannerError::Other(format!("failed to encode scanner dual recovery cycle: {err}")))?;
+    let identities: Vec<_> = slots
+        .iter()
+        .map(|slot| {
+            let revision = match &slot.revision {
+                DataUsageCacheRevision::Missing => None,
+                DataUsageCacheRevision::Etag(etag) => Some(etag.as_str()),
+            };
+            (slot.path.as_str(), revision, slot.data.as_deref().map(|data| sha256_hex(&[data])))
+        })
+        .collect();
+    let identity = serde_json::to_vec(&identities)
+        .map_err(|err| ScannerError::Other(format!("failed to bind scanner recovery evidence: {err}")))?;
+    let attempt_prefix = format!("{prefix}/{}", sha256_hex(&[&identity]));
+    let expected_counter_path = format!("{attempt_prefix}/expected-cycle.bin");
+    if !replacing_corrupt_cycle {
+        let (recorded, _) = read_config_with_revision(storeapi.clone(), &expected_counter_path)
+            .await
+            .map_err(|err| ScannerError::Other(format!("failed to inspect interrupted scanner recovery counter: {err}")))?;
+        if recorded.as_deref() != Some(expected_counter.as_slice()) || cycle_data != expected_counter {
+            return Err(ScannerError::Other(
+                "scanner counter does not match the interrupted recovery intent".to_string(),
+            ));
+        }
+    }
+    preserve_dual_recovery_bytes(storeapi.clone(), &original_cycle_path, &original_cycle, publication_epoch, &owns_recovery)
+        .await?;
+    for (index, slot) in slots.iter().enumerate() {
+        if let Some(data) = &slot.data {
+            preserve_dual_recovery_bytes(
+                storeapi.clone(),
+                &format!("{attempt_prefix}/usage-{index}.bin"),
+                data,
+                publication_epoch,
+                &owns_recovery,
+            )
+            .await?;
+        }
+    }
+    preserve_dual_recovery_bytes(
+        storeapi.clone(),
+        &expected_counter_path,
+        &expected_counter,
+        publication_epoch,
+        &owns_recovery,
+    )
+    .await?;
+    confirm_dual_recovery_sources(storeapi.clone(), (&marker_data, &marker_revision), (&cycle_data, &cycle_revision), &slots)
+        .await?;
+    if replacing_corrupt_cycle {
+        let _ = save_reset_config(
+            storeapi.clone(),
+            DATA_USAGE_BLOOM_NAME_PATH.as_str(),
+            expected_counter.clone(),
+            cycle_revision.preconditions(),
+            publication_epoch,
+            &owns_recovery,
+        )
+        .await;
+    }
+    let (persisted, rebuilt_revision) = read_config_with_revision(storeapi.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .map_err(|err| ScannerError::Other(format!("failed to confirm scanner dual recovery cycle: {err}")))?;
+    if persisted.as_deref() != Some(expected_counter.as_slice()) || !matches!(rebuilt_revision, DataUsageCacheRevision::Etag(_)) {
+        return Err(ScannerError::Other("scanner dual recovery cycle CAS was not confirmed".to_string()));
+    }
+    confirm_dual_recovery_sources(
+        storeapi.clone(),
+        (&marker_data, &marker_revision),
+        (&expected_counter, &rebuilt_revision),
+        &slots,
+    )
+    .await?;
+    #[cfg(test)]
+    dual_recovery_fault::check(&marker.primary_revision, dual_recovery_fault::Stage::CounterCommitted)?;
+    let primary = slots
+        .iter()
+        .find(|slot| slot.path == DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .ok_or_else(|| ScannerError::Other("scanner dual recovery primary slot was not inspected".to_string()))?;
+    publish_scanner_usage_bootstrap_primary(
+        storeapi.clone(),
+        &primary.revision,
+        publication_epoch,
+        Some(leader_epoch),
+        ScannerUsageBootstrapPublishContext::Recovery,
+        &owns_recovery,
+    )
+    .await?;
+    #[cfg(test)]
+    dual_recovery_fault::check(&marker.primary_revision, dual_recovery_fault::Stage::BootstrapCommitted)?;
+    invalidate_admin_data_usage_snapshot_cache().await;
+    invalidate_data_usage_snapshot_cache().await;
+    Ok(Some((rebuilt_cycle, leader_epoch, rebuilt_revision)))
+}
+
 pub async fn reset_scanner_usage_state_for_full_rebuild(
     ctx: CancellationToken,
     storeapi: Arc<ECStore>,
@@ -2978,6 +3342,17 @@ impl LegacyIncompleteUsageFence {
     }
 }
 
+fn decode_legacy_incomplete_usage_floor_recovery_marker(
+    data: &[u8],
+) -> Result<LegacyIncompleteUsageFloorRecoveryMarker, ScannerError> {
+    let marker = serde_json::from_slice::<LegacyIncompleteUsageFloorRecoveryMarker>(data)
+        .map_err(|err| ScannerError::Other(format!("failed to decode scanner usage recovery marker: {err}")))?;
+    if marker.schema_version != 1 || marker.primary_revision.is_empty() || marker.leader_epoch == 0 {
+        return Err(ScannerError::Other("scanner usage recovery marker is invalid".to_string()));
+    }
+    Ok(marker)
+}
+
 async fn read_legacy_incomplete_usage_floor_recovery_marker(
     storeapi: Arc<impl ScannerObjectIO>,
 ) -> Result<Option<(LegacyIncompleteUsageFloorRecoveryMarker, DataUsageCacheRevision)>, ScannerError> {
@@ -2987,11 +3362,7 @@ async fn read_legacy_incomplete_usage_floor_recovery_marker(
     let Some(data) = data else {
         return Ok(None);
     };
-    let marker = serde_json::from_slice::<LegacyIncompleteUsageFloorRecoveryMarker>(&data)
-        .map_err(|err| ScannerError::Other(format!("failed to decode scanner usage recovery marker: {err}")))?;
-    if marker.schema_version != 1 || marker.primary_revision.is_empty() || marker.leader_epoch == 0 {
-        return Err(ScannerError::Other("scanner usage recovery marker is invalid".to_string()));
-    }
+    let marker = decode_legacy_incomplete_usage_floor_recovery_marker(&data)?;
     if !matches!(revision, DataUsageCacheRevision::Etag(_)) {
         return Err(ScannerError::Other("scanner usage recovery marker has no revision".to_string()));
     }

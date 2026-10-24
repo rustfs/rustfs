@@ -774,7 +774,7 @@ impl SetDisks {
         .await;
         #[cfg(not(feature = "diagnostic-read-version-caller"))]
         let metadata_read_result = metadata_read.await;
-        let metadata_read = match metadata_read_result {
+        let mut metadata_read = match metadata_read_result {
             Ok(metadata_read) => metadata_read,
             Err(err) => {
                 let err = StorageError::from(err);
@@ -784,6 +784,7 @@ impl SetDisks {
         };
         let metadata_fanout_complete = metadata_read.is_complete();
         let condition_stopped = metadata_read.condition_stopped;
+        let verified_inline_body = metadata_read.verified_inline_body.take();
         let (mut parts_metadata, errs, metadata_fanout_diagnostics) = metadata_read.into_legacy();
         metadata_fanout_diagnostics.record(metadata_metrics_path);
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
@@ -902,6 +903,7 @@ impl SetDisks {
             GetObjectFileInfo::owned(fi, parts_metadata, op_online_disks)
         };
         snapshot.condition_stopped = condition_stopped;
+        snapshot.set_verified_inline_body(verified_inline_body);
         Ok(snapshot)
     }
 
@@ -916,7 +918,7 @@ impl SetDisks {
             Ok(snapshot) => snapshot,
             Err(e) => return (ObjectInfo::default(), FileInfo::default(), 0, Some(e)),
         };
-        let fi = snapshot.fi().clone();
+        let (fi, _, _) = snapshot.into_owned();
 
         let write_quorum = fi.write_quorum(self.default_write_quorum());
 

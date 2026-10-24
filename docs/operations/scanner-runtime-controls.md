@@ -42,11 +42,12 @@ Bitrot cycle resolution differs because the canonical persistent key belongs to 
 | `heal.bitrot_cycle` | `RUSTFS_SCANNER_BITROT_CYCLE_SECS` | seconds | `2592000` (`DEFAULT_HEAL_BITROT_CYCLE_SECS`, 30 days) | Controls periodic deep bitrot scans. `false`, `off`, `no`, or `disabled` disables periodic deep scans; `0`, `true`, `on`, or `yes` runs deep mode every scanner cycle. |
 | `scanner.idle_mode` | `RUSTFS_SCANNER_IDLE_MODE` | boolean | `true` (`DEFAULT_SCANNER_IDLE_MODE`) | Enables preset scanner sleeps and foreground-read backoff. `false` disables those sleeps; per-disk foreground-priority admission remains active. |
 | `scanner.cache_save_timeout` | `RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS` | seconds | `14` (`DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS`) | Timeout for saving scanner cache; runtime enforces a minimum of `1` and keeps the default persistence budget within the distributed publication lease. |
+| `scanner.recovery_backoff_cap` | `RUSTFS_SCANNER_RECOVERY_BACKOFF_CAP_SECS` | seconds | `600` (`DEFAULT_SCANNER_RECOVERY_BACKOFF_CAP_SECS`) | Caps the wait between automatic startup recovery retries. Must be a positive integer; `0` and malformed values are rejected, so retries never stop. Applies to the next computed retry, not to a wait already in progress. The retry count resets after 24 hours, which bounds a single wait at about one day even with a larger cap. |
 | `scanner.max_concurrent_set_scans` | `RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS` | count | `4` (`DEFAULT_SCANNER_MAX_CONCURRENT_SET_SCANS`) | Caps concurrent set-level scanner tasks. `0` keeps topology-derived concurrency. |
 | `scanner.max_concurrent_disk_scans` | `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` | count | `4` (`DEFAULT_SCANNER_MAX_CONCURRENT_DISK_SCANS`) | Caps concurrent disk bucket walks per set. `0` keeps walker-count-derived concurrency. |
 | `scanner.walkers_per_disk` | `RUSTFS_SCANNER_WALKERS_PER_DISK` | count | `1` (`DEFAULT_SCANNER_WALKERS_PER_DISK`) | Bucket walkers spawned per local disk of a set. The walkers of one disk share its scanner admission, so a peer still sees one scan session per physical disk; remote disks keep one walker. The resulting walker count is what `scanner.max_concurrent_disk_scans` caps, and the disk count stays the floor. Valid range is `1` through `16` (`MAX_SCANNER_WALKERS_PER_DISK`); `1` keeps today's I/O profile and is the right value for rotational media. The `disk_concurrency_budget` log line reports `walkers_per_disk`, `walkers`, the effective `concurrency_limit`, and its `reason` (`available_walkers`, `configured_cap`, or `count_budget`). |
-| `scanner.disk_io_budget_iops` | `RUSTFS_SCANNER_DISK_IO_BUDGET_IOPS` | operations/s | `auto` (`DEFAULT_SCANNER_DISK_IO_BUDGET`) | Per-local-disk ceiling on scanner directory listings and object metadata reads. `auto` picks the media default (`100` on rotational or unknown media, `4000` on flash); `off` removes the cap; a number is an explicit rate. See [Per-disk background I/O budget](#per-disk-background-io-budget). |
-| `scanner.disk_io_budget_bytes_per_sec` | `RUSTFS_SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC` | bytes/s | `auto` (`DEFAULT_SCANNER_DISK_IO_BUDGET`) | Per-local-disk ceiling on the metadata bytes the scanner reads. `auto` picks the media default (`16777216` on rotational or unknown media, `268435456` on flash); `off` removes the cap; a number is an explicit rate. |
+| `scanner.disk_io_budget_iops` | `RUSTFS_SCANNER_DISK_IO_BUDGET_IOPS` | operations/s | `auto` (`DEFAULT_SCANNER_DISK_IO_BUDGET`) | Per-local-disk pacing for scanner directory opens, enumerated entries, symlink target stats, and object metadata reads. `auto` picks the media default (`100` on rotational or unknown media, `4000` on flash); `off` removes the cap; a number is an explicit rate. See [Per-disk background I/O budget](#per-disk-background-io-budget). |
+| `scanner.disk_io_budget_bytes_per_sec` | `RUSTFS_SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC` | bytes/s | `auto` (`DEFAULT_SCANNER_DISK_IO_BUDGET`) | Per-local-disk pacing for the metadata bytes the scanner reads. `auto` picks the media default (`16777216` on rotational or unknown media, `268435456` on flash); `off` removes the cap; a number is an explicit rate. |
 | `scanner.yield_every_n_objects` | `RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS` | objects | `128` (`DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS`) | Controls how often object loops yield to the async runtime. `0` disables this extra yield. |
 | `scanner.alert_excess_versions` | `RUSTFS_SCANNER_ALERT_EXCESS_VERSIONS` | versions | `100` (`DEFAULT_SCANNER_ALERT_EXCESS_VERSIONS`) | Version count threshold for scanner alerts. |
 | `scanner.alert_excess_version_size` | `RUSTFS_SCANNER_ALERT_EXCESS_VERSION_SIZE` | bytes | `1099511627776` (`DEFAULT_SCANNER_ALERT_EXCESS_VERSION_SIZE`) | Retained version byte threshold for scanner alerts. |
@@ -137,7 +138,11 @@ This is logical operation admission, not an OS disk scheduler: foreground and ba
 
 ## Per-disk background I/O budget
 
-The admission gate orders scanner I/O behind foreground requests but does not bound how much background I/O an idle disk sees. `scanner.disk_io_budget_iops` and `scanner.disk_io_budget_bytes_per_sec` add that bound. Each local disk owns one token bucket per axis (`crates/scanner/src/sleeper/io_budget.rs`); every directory listing charges one operation, and every object metadata read charges one operation plus the `xl.meta` size. A charge that exceeds the remaining budget delays that walker until the rate allows it. The budget is layered on top of admission: a budgeted operation still queues behind foreground requests, so the budget can only slow the scanner down and never lets it exceed what admission allows. It applies whether or not `idle_mode` is enabled.
+The admission gate orders scanner I/O behind foreground requests but does not bound how much background I/O an idle disk sees. `scanner.disk_io_budget_iops` and `scanner.disk_io_budget_bytes_per_sec` pace scanner work in addition to that gate. Each local disk owns one token bucket per axis (`crates/scanner/src/sleeper/io_budget.rs`); charges cover directory opens, each enumerated entry, symlink target stats, optional `xl.meta` size stats, and metadata reads. A charge that exceeds the remaining budget delays that walker. Tokio may prefetch a bounded directory chunk, and waits are capped to preserve progress, so these settings pace scanner work rather than enforcing a strict OS-level IOPS or bandwidth ceiling. The budget applies whether or not `idle_mode` is enabled and does not control unrelated host processes.
+
+Only `xl.meta` files enter object metadata accounting. Other payload files consume entry charges without extra size stats or metadata-read charges. An `xl.meta` symlink reuses its resolved target size for the byte charge. Cancellation interrupts folder pacing, budget waits, and directory/stat waits. Filesystem work already dispatched to a blocking worker can still finish.
+
+Erasure data-directory probes for missing `xl.meta` use the same directory-open and entry budget. They retain their 64-entry limit and remain cancellation-aware without adding a preset folder delay per probe.
 
 - Media is detected once per disk path from the backing block device's `rotational` flag on Linux, through partitions, `dm-*`, and software RAID; any spindle in the stack counts as rotational. Undetectable media, including non-Linux hosts and overlay filesystems without a bind-mounted volume, uses the rotational defaults because a spindle is the case that needs protection.
 - `auto` resolves to `100` operations/s and `16 MiB/s` on rotational or unknown media and to `4000` operations/s and `256 MiB/s` on flash. The rotational values leave roughly half of a 7200 rpm spindle's random reads to foreground traffic; the flash values are a few percent of a SATA SSD. The `fastest` speed preset resolves `auto` to no cap; explicit numbers always apply.
@@ -249,7 +254,7 @@ A confirmed periodic save does not prove restart resumability. Adoption still va
 
 ### Cycle recovery on followers
 
-Cycle recovery status is local to each node. A transient cycle-state read failure can exhaust the short retry budget and enter `backoff`; the observation stays retryable, the enabled scanner keeps retrying leadership with an exponential delay capped at ten minutes or sooner when recovery is explicitly woken, and `next_attempt_at_unix_secs` together with `reason` name the next attempt. If the next lock attempt is contended or times out waiting for `leader.lock`, the node records a follower iteration and clears only its unclassified `transient` or `backoff` observation. Normal follower retry cadence resumes without restarting the process.
+Cycle recovery status is local to each node. A transient cycle-state read failure can exhaust the short retry budget and enter `backoff`; the observation stays retryable, the enabled scanner keeps retrying leadership with an exponential delay capped by `scanner.recovery_backoff_cap` (default ten minutes) or sooner when recovery is explicitly woken, and `next_attempt_at_unix_secs` together with `reason` name the next attempt. If the next lock attempt is contended or times out waiting for `leader.lock`, the node records a follower iteration and clears only its unclassified `transient` or `backoff` observation. Normal follower retry cadence resumes without restarting the process.
 
 This clears local retry bookkeeping, not persisted cycle state or recovery markers. Classified recovery states, cleanup-pending resets, and usage-floor failures remain unchanged. Any later leadership claim revalidates durable cycle state before scanning. A healthy follower recovery status does not prove that leader-dispatched scans are progressing; inspect the work counters separately.
 
@@ -295,6 +300,10 @@ When a running scanner leader already holds `leader.lock`, submit a durable asyn
 The async form returns HTTP 202 when a new or replayable intent is accepted. Reusing the same `idempotency_key` is safe for retries of the same operator action; a different payload for the same key is rejected as a conflict. Poll `GET /v3/scanner/usage-state/recovery-intents/{intent_id}` until the intent reaches a terminal state.
 
 A successful reset leaves usage state in `bootstrap-pending` only as a fenced rebuild marker. With the scanner enabled, the leader must treat that marker as pending full-rebuild work: clean-idle backoff must not extend the wait, an empty pause-backlog catch-up ledger must not rate-limit the rebuild, and the next admitted scanner cycle must rebuild full inventory. After a complete observation is durably saved, superseded retries may refresh dirty buckets using its validated coverage; bootstrap remains pending until authoritative publication replaces the marker.
+
+When both the cycle body and usage JSON are corrupt, an enabled scanner can recover under its existing leader lock if the current cycle revision still has a recognized fencing header and a matching strict `blocked`/`corrupt` quarantine marker. It retains the original cycle and usage bytes under `.bloomcycle.bin.dual-recovery/`, records the exact expected replacement counter against the observed revisions, CAS-rebuilds that counter above the surviving epoch and cycle lower bounds, and CAS-publishes the existing `bootstrap-pending` marker. No recovery marker or usage slot is deleted. A restart after the counter commit resumes only when the durable expected counter and all source bindings match exactly; a different valid counter does not authorize completion. A committed bootstrap whose completion response was lost already permits the ordinary full rebuild.
+
+This automatic path does not replace a usable primary or backup floor, interpret an unknown structured usage format as corruption, or recover a future-schema counter or an operator's `cleanup-pending` reset. Backend errors, movement, ownership loss, changed revisions, exhausted counters, and conflicting evidence defer recovery. Completely unreadable fencing headers remain fail-closed: the leader lock and movement lease cannot prove a replacement epoch exceeds a lost historical epoch. Keep the retained bytes for diagnosis and use the current binary's supported recovery surfaces; do not delete the evidence to force startup. Until a complete measured baseline publishes, the pending marker supplies no bucket sizes, so legacy quota admission without a persisted floor remains unavailable.
 
 ## Cleanup With The Scanner Disabled
 
@@ -492,6 +501,38 @@ Each execution has its own pacing latch, with no new global manager or cross-set
 The pacing gate holds neither namespace locks nor I/O/page permits while sleeping. At final page admission, each real permit acquisition gets a fresh, nonblocking pressure decision. Low-pressure work keeps that permit; only a unit that needs a pause releases capacity to wait. A unit that has completed one bounded pause may proceed despite persistent pressure, which supplies minimum maintenance progress without an endless acquire/pause loop. Existing object operations and commit tails are not interrupted because pressure rose. Cancellation and deadlines remain interruptible, and disabling pacing cannot bypass the global, per-set or page-concurrency hard caps. The existing `RUSTFS_HEAL_MAINLINE_THROTTLE_ENABLE=false` setting is the operational opt-out for newly created executions; no additional request override is introduced.
 
 A missing provider, zero pause, or both class thresholds set to zero preserves unpaced execution. Missing counts follow the existing shared pressure interpreter; they are observations, not health, quorum or resource-ownership proof. The current provider exposes node-level workload classes, so this does not claim independent per-set foreground measurements or a hard global resource budget. Runtime waits increment `rustfs_heal_mainline_throttle_total` with `source=admin`, `result=delayed`, and a foreground-pressure or `recovery_window` reason. Real p99/throughput protection requires the separate W20 fixed-load ABBA measurements.
+
+## Live Scanner Heal Completions
+
+Scanner admissions now retain the canonical heal task ID, including merged
+requests. Node-local metrics associate these live candidates with the executor's
+typed terminal result:
+
+| Metric | Meaning |
+|---|---|
+| `rustfs_scanner_heal_pending_tasks` | Canonical tasks awaiting a terminal observation. |
+| `rustfs_scanner_heal_pending_oldest_seconds` | Age of the oldest retained pending candidate; refreshed every five seconds. |
+| `rustfs_scanner_heal_candidate_terminal_total` | Associated candidates, labeled by object `disposition`, expected `scan_mode`, and unresolved `scope`. |
+| `rustfs_scanner_heal_task_terminal_observations_total` | Associated task observations, deduplicated within the bounded recent history. This is not an execution count. |
+| `rustfs_scanner_heal_candidate_unknown_total` | Candidates whose integrity remains unknown, labeled by reason. |
+| `rustfs_scanner_heal_completion_lost_total` | Terminal notifications skipped by a lagging observer. |
+
+These metrics use the configured metrics exporter. A task's `Completed` state
+can include a deferred object; the `disposition` label preserves that distinction.
+`MetadataHealthy`, `Repaired`, and authoritative absence never imply verified
+payload bytes. Even `VerifiedHealthy` cannot certify scanner coverage: the current
+contract does not bind the candidate's content identity and leader epoch. No
+verified-byte or full-bucket coverage counter is advanced here.
+
+The admission buffer, pending map, terminal channel, and recent history each hold
+at most 1,024 entries. Retained identities are capped at 4 KiB; terminal history
+expires after ten minutes and pending observations after one hour. Overflow,
+notification loss, missing identity, and expiry remain unknown. Queue cancellation
+or displacement paths without a terminal snapshot also age out as unknown.
+Process restart clears this diagnostic state; a restarted runtime reinstalls its
+observer. Counts and pending age are not a durable integrity ledger or a cold-range
+completion deadline. Existing periodic traversal and pending retry hints provide
+compensation independently.
 
 ## Pending Heal Hints
 
