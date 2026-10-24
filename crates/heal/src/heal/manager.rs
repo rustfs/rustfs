@@ -506,7 +506,26 @@ impl HealAdmissionTelemetry {
             .max(duration_micros_saturated(observation.start_duration));
         self.max_lock_phase_micros = self
             .max_lock_phase_micros
-            .max(duration_micros_saturated(observation.lock_phase));
+            .max(duration_micros_saturated(observation.lock_timing.phase));
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HealAdmissionLockTiming {
+    phase: Duration,
+    wait: Duration,
+    hold: Duration,
+}
+
+impl HealAdmissionLockTiming {
+    // Called immediately after the outermost active_heals guard is released.
+    fn finish(wait_started: Instant, acquired: Instant) -> Self {
+        let released = Instant::now();
+        Self {
+            phase: released.duration_since(wait_started),
+            wait: acquired.duration_since(wait_started),
+            hold: released.duration_since(acquired),
+        }
     }
 }
 
@@ -518,7 +537,7 @@ struct HealAdmissionObservation {
     force_start: bool,
     displaced: bool,
     start_duration: Duration,
-    lock_phase: Duration,
+    lock_timing: HealAdmissionLockTiming,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -1217,7 +1236,10 @@ impl HealManager {
             "context" => context,
             "force_start" => force_start
         )
-        .record(observation.lock_phase.as_secs_f64());
+        .record(observation.lock_timing.phase.as_secs_f64());
+        // Static keys keep the added observations bounded and avoid per-admission label allocation.
+        histogram!("rustfs_heal_admission_active_lock_wait_seconds").record(observation.lock_timing.wait.as_secs_f64());
+        histogram!("rustfs_heal_admission_active_lock_hold_seconds").record(observation.lock_timing.hold.as_secs_f64());
         lock_admission_telemetry(&self.admission_telemetry).record(observation);
     }
 
@@ -2039,6 +2061,7 @@ impl HealManager {
         // active -> retrying transitions can slip between duplicate checks.
         let lock_phase_start = Instant::now();
         let mut active_heals = self.active_heals.lock().await;
+        let active_lock_acquired = Instant::now();
         if self.cancel_token.is_cancelled() {
             return Err(Error::Other("Heal manager is stopping".to_string()));
         }
@@ -2088,7 +2111,7 @@ impl HealManager {
             drop(retrying_heals);
             drop(queue);
             drop(active_heals);
-            let lock_phase = lock_phase_start.elapsed();
+            let lock_timing = HealAdmissionLockTiming::finish(lock_phase_start, active_lock_acquired);
             Self::record_admission_metric(request.source, admission, "duplicate");
             self.record_admission_observation(HealAdmissionObservation {
                 source,
@@ -2097,7 +2120,7 @@ impl HealManager {
                 force_start,
                 displaced: false,
                 start_duration: admission_start.elapsed(),
-                lock_phase,
+                lock_timing,
             });
             debug!(
                 target: "rustfs::heal::manager",
@@ -2238,7 +2261,7 @@ impl HealManager {
             drop(retrying_heals);
             drop(queue);
             drop(active_heals);
-            let lock_phase = lock_phase_start.elapsed();
+            let lock_timing = HealAdmissionLockTiming::finish(lock_phase_start, active_lock_acquired);
             Self::record_admission_metric(request.source, admission, "duplicate");
             self.record_admission_observation(HealAdmissionObservation {
                 source,
@@ -2247,7 +2270,7 @@ impl HealManager {
                 force_start,
                 displaced: false,
                 start_duration: admission_start.elapsed(),
-                lock_phase,
+                lock_timing,
             });
 
             match admission {
@@ -2294,7 +2317,7 @@ impl HealManager {
             drop(retrying_heals);
             drop(queue);
             drop(active_heals);
-            let lock_phase = lock_phase_start.elapsed();
+            let lock_timing = HealAdmissionLockTiming::finish(lock_phase_start, active_lock_acquired);
             Self::record_admission_metric(request.source, HealAdmissionResult::Dropped(reason), "overlap_rejected");
             self.record_admission_observation(HealAdmissionObservation {
                 source,
@@ -2303,7 +2326,7 @@ impl HealManager {
                 force_start,
                 displaced: false,
                 start_duration: admission_start.elapsed(),
-                lock_phase,
+                lock_timing,
             });
             warn!(
                 target: "rustfs::heal::manager",
@@ -2332,7 +2355,7 @@ impl HealManager {
                 drop(retrying_heals);
                 drop(queue);
                 drop(active_heals);
-                let lock_phase = lock_phase_start.elapsed();
+                let lock_timing = HealAdmissionLockTiming::finish(lock_phase_start, active_lock_acquired);
                 let admission = HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped);
                 Self::record_admission_metric(source, admission, "disposition_cache");
                 self.record_admission_observation(HealAdmissionObservation {
@@ -2342,7 +2365,7 @@ impl HealManager {
                     force_start,
                     displaced: false,
                     start_duration: admission_start.elapsed(),
-                    lock_phase,
+                    lock_timing,
                 });
                 debug!(
                     target: "rustfs::heal::manager",
@@ -2412,7 +2435,7 @@ impl HealManager {
         drop(retrying_heals);
         drop(queue);
         drop(active_heals);
-        let lock_phase = lock_phase_start.elapsed();
+        let lock_timing = HealAdmissionLockTiming::finish(lock_phase_start, active_lock_acquired);
         let displaced = displaced_terminal.is_some();
 
         if let (Some(displaced_task_id), Some(displaced_terminal)) = (displaced_task_id, displaced_terminal) {
@@ -2434,7 +2457,7 @@ impl HealManager {
             force_start,
             displaced,
             start_duration: admission_start.elapsed(),
-            lock_phase,
+            lock_timing,
         });
 
         Ok(HealAdmissionReceipt {
