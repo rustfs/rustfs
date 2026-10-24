@@ -68,6 +68,8 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+#[cfg(feature = "e2e-test-hooks")]
+mod e2e_rpc_delay;
 pub(crate) mod heal;
 
 const LOG_COMPONENT_STORAGE: &str = "storage";

@@ -1103,6 +1103,8 @@ impl NodeService {
     ) -> Result<Response<ReadVersionResponse>, Status> {
         let metrics = global_internode_metrics();
         let read_version_attribution_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+        #[cfg(feature = "e2e-test-hooks")]
+        let request_id = super::e2e_rpc_delay::request_id(&request);
         let request = request.into_inner();
         if read_version_attribution_enabled {
             metrics.record_incoming_request_for_operation_and_backend(
@@ -1146,6 +1148,14 @@ impl NodeService {
                     }));
                 }
             };
+            #[cfg(feature = "e2e-test-hooks")]
+            super::e2e_rpc_delay::disk(
+                super::e2e_rpc_delay::Method::ReadVersion,
+                &request.volume,
+                &request.path,
+                request_id.as_deref(),
+            )
+            .await;
             let disk_read_started = internode_stage_timer(read_version_attribution_enabled);
             match disk
                 .read_version("", &request.volume, &request.path, &request.version_id, &opts)
@@ -1246,6 +1256,8 @@ impl NodeService {
             rustfs_protos::canonical_write_metadata_request_body(request.get_ref()),
             "write_metadata",
         )?;
+        #[cfg(feature = "e2e-test-hooks")]
+        let request_id = super::e2e_rpc_delay::request_id(&request);
         let request = request.into_inner();
         if !request.bucket_incarnation_id.is_empty() {
             let expected = Uuid::from_slice(&request.bucket_incarnation_id)
@@ -1257,6 +1269,14 @@ impl NodeService {
             };
             let value = decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo")
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            #[cfg(feature = "e2e-test-hooks")]
+            super::e2e_rpc_delay::disk(
+                super::e2e_rpc_delay::Method::WriteMetadata,
+                &request.volume,
+                &request.path,
+                request_id.as_deref(),
+            )
+            .await;
             let result = store
                 .write_local_metadata_at_incarnation(&request.disk, (&request.volume, &request.path), value, expected)
                 .await;
@@ -1275,6 +1295,14 @@ impl NodeService {
                     }));
                 }
             };
+            #[cfg(feature = "e2e-test-hooks")]
+            super::e2e_rpc_delay::disk(
+                super::e2e_rpc_delay::Method::WriteMetadata,
+                &request.volume,
+                &request.path,
+                request_id.as_deref(),
+            )
+            .await;
             match disk.write_metadata("", &request.volume, &request.path, file_info).await {
                 Ok(_) => Ok(Response::new(WriteMetadataResponse {
                     success: true,
@@ -1625,6 +1653,8 @@ impl NodeService {
             service_entry_started,
         );
         let before_handler_started = rustfs_io_metrics::put_stage_timer();
+        #[cfg(feature = "e2e-test-hooks")]
+        let request_id = super::e2e_rpc_delay::request_id(&request);
         let request = request.into_inner();
         let target = self.local_mutation_target();
         let bucket_incarnation = if request.bucket_incarnation_id.is_empty() {
@@ -1737,6 +1767,14 @@ impl NodeService {
             rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_REMOTE_SERVICE_BEFORE_HANDLER,
             before_handler_started,
         );
+        #[cfg(feature = "e2e-test-hooks")]
+        super::e2e_rpc_delay::disk(
+            super::e2e_rpc_delay::Method::RenameData,
+            &request.dst_volume,
+            &request.dst_path,
+            request_id.as_deref(),
+        )
+        .await;
         let handler_await_started = rustfs_io_metrics::put_stage_timer();
         let result = target
             .rename_local_data(
@@ -1879,8 +1917,18 @@ impl NodeService {
             rustfs_protos::canonical_rename_part_request_body(request.get_ref()),
             "rename_part",
         )?;
+        #[cfg(feature = "e2e-test-hooks")]
+        let request_id = super::e2e_rpc_delay::request_id(&request);
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
+            #[cfg(feature = "e2e-test-hooks")]
+            super::e2e_rpc_delay::disk(
+                super::e2e_rpc_delay::Method::RenamePart,
+                &request.dst_volume,
+                &request.dst_path,
+                request_id.as_deref(),
+            )
+            .await;
             match disk
                 .rename_part(
                     &request.src_volume,
@@ -2264,6 +2312,8 @@ impl NodeService {
             }
         }
         verify_disk_mutation_digest(&request, rustfs_protos::canonical_delete_request_body(request.get_ref()), "delete")?;
+        #[cfg(feature = "e2e-test-hooks")]
+        let request_id = super::e2e_rpc_delay::request_id(&request);
         let request = request.into_inner();
         if !request.bucket_incarnation_id.is_empty() {
             if !request.scanner_publication_lease_token.is_empty() {
@@ -2278,6 +2328,14 @@ impl NodeService {
             };
             let value = serde_json::from_str::<DeleteOptions>(&request.options)
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            #[cfg(feature = "e2e-test-hooks")]
+            super::e2e_rpc_delay::disk(
+                super::e2e_rpc_delay::Method::Delete,
+                &request.volume,
+                &request.path,
+                request_id.as_deref(),
+            )
+            .await;
             let result = store
                 .delete_local_path_at_incarnation(&request.disk, (&request.volume, &request.path), value, expected)
                 .await;
@@ -2329,6 +2387,14 @@ impl NodeService {
                 } else {
                     None
                 };
+            #[cfg(feature = "e2e-test-hooks")]
+            super::e2e_rpc_delay::disk(
+                super::e2e_rpc_delay::Method::Delete,
+                &request.volume,
+                &request.path,
+                request_id.as_deref(),
+            )
+            .await;
             match disk
                 .delete_with_scanner_publication_lease_and_guard(
                     &request.volume,

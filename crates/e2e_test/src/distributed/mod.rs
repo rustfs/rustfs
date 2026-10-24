@@ -26,6 +26,7 @@ mod expand_decommission_rebalance_test;
 mod extra_test;
 mod harness;
 mod heal_test;
+mod multipart_rpc_delay_test;
 mod object_lock_test;
 mod observability_test;
 mod replication_delete_marker_test;
