@@ -361,6 +361,7 @@ pub(crate) fn build_health_response_parts(
             payload["details"]["storage"]["readQuorum"] = json!(details.read_quorum_ready);
             payload["details"]["storage"]["writeQuorum"] = json!(details.write_quorum_ready);
             payload["details"]["storage"]["unavailableDrives"] = json!(details.unavailable_drives);
+            payload["details"]["storage"]["missingDrives"] = json!(details.missing_drives);
             payload["details"]["poolMetadata"] = json!({
                 "ready": details.pool_metadata_write_ready,
                 "status": if details.pool_metadata_write_ready { "writable" } else { "unavailable" },
@@ -503,6 +504,7 @@ mod tests {
                 assert_eq!(payload["details"]["poolMetadata"]["ready"], metadata_ready);
                 assert_eq!(payload["details"]["storage"]["source"], "local_runtime");
                 assert_eq!(payload["details"]["storage"]["readinessScope"], "read_quorum");
+                assert_eq!(payload["details"]["storage"]["missingDrives"], json!([]));
                 assert!(
                     build_health_response_parts(Method::HEAD, HealthProbe::Readiness, Some(&report), "rustfs", None, None)
                         .payload
@@ -544,12 +546,59 @@ mod tests {
 
     #[test]
     #[serial]
+    fn node_storage_details_report_missing_slots_without_changing_ready_status() {
+        with_var(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false"), || {
+            let mut report = ready_report();
+            report.storage_details = Some(crate::shared_types::StorageReadinessDetails {
+                read_quorum_ready: true,
+                write_quorum_ready: true,
+                pool_metadata_write_ready: true,
+                missing_drives: vec![crate::shared_types::MissingReadinessDrive {
+                    pool_index: 0,
+                    set_index: 1,
+                    disk_index: 3,
+                }],
+                ..Default::default()
+            });
+            let parts = build_health_response_parts(Method::GET, HealthProbe::Readiness, Some(&report), "rustfs", None, None);
+            assert_eq!(
+                parts.status_code,
+                StatusCode::OK,
+                "missing diagnostics must not change quorum-based HTTP readiness"
+            );
+            let payload = parts.payload.expect("detailed readiness GET body");
+            assert_eq!(payload["ready"], true);
+            assert_eq!(payload["details"]["storage"]["readQuorum"], true);
+            assert_eq!(payload["details"]["storage"]["writeQuorum"], true);
+            assert_eq!(payload["details"]["storage"]["unavailableDrives"], json!([]));
+            assert_eq!(
+                payload["details"]["storage"]["missingDrives"],
+                json!([{ "poolIndex": 0, "setIndex": 1, "diskIndex": 3 }])
+            );
+            let missing = &payload["details"]["storage"]["missingDrives"][0];
+            assert!(
+                missing.get("hostOnline").is_none(),
+                "an absent handle does not establish host reachability"
+            );
+            assert!(missing.get("runtimeState").is_none(), "an absent handle has no observed runtime state");
+            assert!(missing.get("endpoint").is_none());
+            assert!(missing.get("path").is_none());
+        });
+    }
+
+    #[test]
+    #[serial]
     fn node_storage_details_do_not_expand_minimal_or_liveness_payloads() {
         let mut report = ready_report();
         report.storage_details = Some(crate::shared_types::StorageReadinessDetails {
             read_quorum_ready: true,
             write_quorum_ready: true,
             pool_metadata_write_ready: true,
+            missing_drives: vec![crate::shared_types::MissingReadinessDrive {
+                pool_index: 0,
+                set_index: 0,
+                disk_index: 3,
+            }],
             ..Default::default()
         });
         with_var(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("true"), || {

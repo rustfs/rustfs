@@ -7,6 +7,8 @@
 
 The hook exists only in builds with `e2e-test-hooks`. Without `RUSTFS_E2E_RPC_DELAY_DIR`, it performs no filesystem access. Each test node uses its own control directory. A bounded, strictly decoded arm selects a non-nil nonce, a finite RPC method set and an exact test resource. It pauses only after authentication and decoding, before the real storage or lock call. Unlock, refresh and mixed-resource lock batches continue normally. Existing production operation budgets, fanout and quorum rules remain active.
 
+Before arming a window or checking recovery, every coordinator must report its own `local_runtime` storage inventory with write quorum, no unavailable or missing drive slots, and ready pool metadata and locks. HTTP 200 alone can supply only read quorum while returning disk handles still reject writes. The harness records these real readiness payloads; it does not retry the old-part completion write to hide a recovery failure.
+
 A short delay with every node healthy tests latency in the selected plane. Peer-loss cases first prove that a remote RPC reached the selected hook, then stop peers and release surviving calls. These are post-entry peer-loss checks: stopping a peer affects both its metadata and lock services, so the final failure cannot be attributed exclusively to one plane.
 
 The erasure write quorum and the lifecycle shared-lock read quorum are different. The harness observes peers actually scheduled by bounded fanout; it must not require an unused client to start or expand production fanout to satisfy a marker count.

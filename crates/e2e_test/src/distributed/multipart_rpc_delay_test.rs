@@ -23,10 +23,9 @@
 //! gaps; these tests do not infer either from logs or request completion.
 
 use super::harness::{
-    DistCluster, DistLayout, TestResult, assert_object_bytes, put_object, s3_probe_client, unique_bucket, wait_for_ready,
-    wait_until,
+    DistCluster, DistLayout, TestResult, assert_object_bytes, put_object, s3_probe_client, unique_bucket, wait_until,
 };
-use crate::common::{admin_request, init_logging, rustfs_binary_path_with_features};
+use crate::common::{admin_request, init_logging, local_http_client, rustfs_binary_path_with_features};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
@@ -414,12 +413,67 @@ impl Run {
         }
         dist.capture_logs_under(&directory.join("logs"))?;
         dist.cluster.start().await?;
-        Ok(Self {
+        let run = Self {
             dist,
             directory,
             keep,
             passed: false,
-        })
+        };
+        run.fully_rejoined("initial", Uuid::new_v4()).await?;
+        Ok(run)
+    }
+
+    /// HTTP 200 supplies read quorum, which is insufficient to arm all remote
+    /// writers or consume an old part with write quorum after a peer restart.
+    /// Use each coordinator's own runtime inventory; an aggregate of peers'
+    /// local storage snapshots cannot establish remote-handle readmission.
+    async fn fully_rejoined(&self, phase: &str, nonce: Uuid) -> TestResult {
+        let http = local_http_client();
+        wait_until(
+            Duration::from_secs(90),
+            || async {
+                let mut ready = true;
+                let mut observations = Vec::with_capacity(4);
+                for node in 0..4 {
+                    match http
+                        .get(format!("{}/health/ready", self.dist.cluster.nodes[node].url))
+                        .timeout(Duration::from_secs(3))
+                        .send()
+                        .await
+                    {
+                        Ok(response) => {
+                            let status = response.status();
+                            let payload: Value = response.json().await?;
+                            let storage = &payload["details"]["storage"];
+                            let node_ready = status.is_success()
+                                && payload["ready"] == true
+                                && storage["source"] == "local_runtime"
+                                && storage["writeQuorum"] == true
+                                && storage["unavailableDrives"].as_array().is_some_and(Vec::is_empty)
+                                && storage["missingDrives"].as_array().is_some_and(Vec::is_empty)
+                                && payload["details"]["poolMetadata"]["ready"] == true
+                                && payload["details"]["lock"]["ready"] == true;
+                            ready &= node_ready;
+                            observations.push(json!({ "node": node, "status": status.as_u16(), "payload": payload }));
+                        }
+                        Err(error) => {
+                            ready = false;
+                            observations.push(json!({ "node": node, "error": "transport", "timed_out": error.is_timeout() }));
+                        }
+                    }
+                }
+                atomic_json(
+                    &self
+                        .directory
+                        .join(format!("readiness.{phase}.{nonce}.{}.json", Uuid::new_v4())),
+                    &json!({ "phase": phase, "all_drives_rejoined": ready, "nodes": observations }),
+                )
+                .await?;
+                Ok(ready)
+            },
+            &format!("all four coordinator runtime disk views rejoined before {phase}"),
+        )
+        .await
     }
 
     fn client(&self, node: usize) -> TestResult<Client> {
@@ -430,6 +484,7 @@ impl Run {
     }
 
     async fn arm(&self, nonce: Uuid, methods: &[&str], scope: Value, bounded: bool) -> TestResult {
+        self.fully_rejoined("before_arm", nonce).await?;
         let arm = json!({ "nonce": nonce, "methods": methods, "scope": scope,
             "delay": if bounded { json!({ "kind": "delay", "milliseconds": 80 }) } else { json!({ "kind": "hold" }) } });
         for node in 1..4 {
@@ -690,7 +745,7 @@ async fn run_matrix(plane: Plane) -> TestResult {
                 run.dist.cluster.start_node_process(node).await?;
             }
             if !killed.is_empty() {
-                wait_for_ready(&run.dist.cluster).await?;
+                run.fully_rejoined("restart", nonce).await?;
             }
             session.verify_and_cleanup(&run, operation, ack).await?;
             run.drained(&session.bucket, nonce).await?;
