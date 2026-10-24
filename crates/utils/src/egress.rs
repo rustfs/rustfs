@@ -587,6 +587,27 @@ mod tests {
     }
 
     #[test]
+    fn validate_outbound_url_preserves_unicode_host_policy() {
+        for (endpoint, expected_host, allowed) in [
+            ("https://bücher.example/webhook", "xn--bcher-kva.example", true),
+            ("https://bu\u{0308}cher.example/webhook", "xn--bcher-kva.example", true),
+            ("https://ｌｏｃａｌｈｏｓｔ/webhook", "localhost", false),
+            ("http://１２７。０。０。１/hook", "127.0.0.1", false),
+        ] {
+            let url = Url::parse(endpoint).expect("Unicode hostname URL should parse");
+            assert_eq!(url.host_str(), Some(expected_host), "{endpoint}");
+            if allowed {
+                validate_outbound_url(&url).expect("public IDN hostname should be allowed");
+            } else {
+                assert!(
+                    matches!(validate_outbound_url(&url), Err(OutboundUrlError::ForbiddenHost { .. })),
+                    "normalized loopback hostname should be rejected: {endpoint}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn private_storage_endpoints_are_allowed_without_relaxing_the_global_guard() {
         for endpoint in [
             "http://10.0.0.1:9000",

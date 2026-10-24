@@ -479,6 +479,8 @@ pub(crate) mod workload {
     }
 
     pub(crate) mod concurrency {
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::concurrency_consumer::ConcurrencyManager;
         pub(crate) use crate::storage::storage_api::concurrency_consumer::get_concurrency_manager;
     }
 }

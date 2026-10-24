@@ -269,7 +269,7 @@ pub(crate) mod rpc_consumer {
         };
         pub(crate) use super::super::{
             DeleteOptions, DiskStore, StorageDiskRpcExt, WalkDirOptions, check_and_record_signed_rpc_nonce,
-            find_local_disk_by_ref, sign_ns_scanner_capability_with_tier_registry_generation, sign_put_file_capability,
+            find_local_disk_by_ref, sign_ns_scanner_capability_with_checkpoint_coverage, sign_put_file_capability,
             verify_put_file_auth_trailer, verify_rpc_signature,
         };
     }
@@ -572,11 +572,13 @@ pub(crate) mod ecstore_rio {
 }
 
 pub(crate) mod ecstore_rpc {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::rpc::verify_ns_scanner_capability_with_checkpoint_coverage;
     pub(crate) use rustfs_ecstore::api::rpc::{
         KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MAX_NETWORK_PROBE_BYTES, MAX_NETWORK_PROBE_DURATION, NetworkPeerProbeClient,
         NetworkPeerProbeError, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client,
         SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, check_and_record_signed_rpc_nonce,
-        decode_heal_bucket_rpc_options, normalize_tonic_rpc_audience, sign_ns_scanner_capability_with_tier_registry_generation,
+        decode_heal_bucket_rpc_options, normalize_tonic_rpc_audience, sign_ns_scanner_capability_with_checkpoint_coverage,
         sign_put_file_capability, sign_tonic_rpc_response_proof, tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers,
         tonic_rpc_auth_failure_reason, verify_put_file_auth_trailer, verify_rpc_signature, verify_tonic_canonical_body_digest,
         verify_tonic_mutation_body_digest, verify_tonic_mutation_body_digest_reject_unsigned,
@@ -2299,15 +2301,17 @@ pub(crate) fn verify_put_file_auth_trailer(
     ecstore_rpc::verify_put_file_auth_trailer(url, method, nonce, trailer)
 }
 
-pub(crate) fn sign_ns_scanner_capability_with_tier_registry_generation(
+pub(crate) fn sign_ns_scanner_capability_with_checkpoint_coverage(
     challenge: uuid::Uuid,
     server_epoch: uuid::Uuid,
     supports_tier_registry_generation: bool,
+    supports_checkpoint_coverage: bool,
 ) -> std::io::Result<Vec<u8>> {
-    ecstore_rpc::sign_ns_scanner_capability_with_tier_registry_generation(
+    ecstore_rpc::sign_ns_scanner_capability_with_checkpoint_coverage(
         challenge,
         server_epoch,
         supports_tier_registry_generation,
+        supports_checkpoint_coverage,
     )
 }
 

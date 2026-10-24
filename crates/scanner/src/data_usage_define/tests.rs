@@ -30,6 +30,7 @@ use tokio::sync::Mutex;
 const TEST_PLAN_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([3; 32]);
 
 mod cache_cost;
+mod save_metrics;
 
 #[test]
 fn scoped_scan_coverage_metadata_preserves_map_compatibility() {
@@ -75,6 +76,8 @@ struct BackupFallbackStore {
     read_delays: [Duration; 2],
     put_attempts: [AtomicUsize; 2],
     main_put_failures: usize,
+    publication_admitted: bool,
+    payloads: Mutex<Vec<(usize, Vec<u8>)>>,
 }
 
 impl BackupFallbackStore {
@@ -90,6 +93,8 @@ impl BackupFallbackStore {
             read_delays: [Duration::ZERO; 2],
             put_attempts: std::array::from_fn(|_| AtomicUsize::new(0)),
             main_put_failures: 0,
+            publication_admitted: true,
+            payloads: Mutex::new(Vec::new()),
         }
     }
 
@@ -105,6 +110,8 @@ impl BackupFallbackStore {
             read_delays: [Duration::ZERO; 2],
             put_attempts: std::array::from_fn(|_| AtomicUsize::new(0)),
             main_put_failures: 0,
+            publication_admitted: true,
+            payloads: Mutex::new(Vec::new()),
         }
     }
 
@@ -393,7 +400,7 @@ impl ObjectIO for BackupFallbackStore {
         &self,
         bucket: &str,
         object: &str,
-        _data: &mut Self::PutObjectReader,
+        data: &mut Self::PutObjectReader,
         opts: &Self::ObjectOptions,
     ) -> StorageResult<Self::ObjectInfo> {
         if bucket != RUSTFS_META_BUCKET {
@@ -411,6 +418,9 @@ impl ObjectIO for BackupFallbackStore {
             .map(str::to_owned);
         let path_index = usize::from(object.ends_with(".bkp"));
         let attempt = self.put_attempts[path_index].fetch_add(1, Ordering::SeqCst);
+        let mut payload = Vec::new();
+        data.stream.read_to_end(&mut payload).await?;
+        self.payloads.lock().await.push((path_index, payload));
         let delay = self.put_delays[path_index];
         if !delay.is_zero() {
             sleep(delay).await;
@@ -442,7 +452,8 @@ impl crate::ScannerConfigObjectDelete for BackupFallbackStore {
     }
 
     async fn scanner_data_usage_publication_admission(&self) -> Option<crate::ScannerDataUsagePublicationAdmission> {
-        Some(crate::ScannerDataUsagePublicationAdmission::unfenced())
+        self.publication_admitted
+            .then(crate::ScannerDataUsagePublicationAdmission::unfenced)
     }
 }
 

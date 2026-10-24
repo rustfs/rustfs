@@ -10501,6 +10501,20 @@ mod tests {
             )
             .await
             .expect("seed data movement source");
+        store.pools[0]
+            .put_object(
+                &bucket,
+                object,
+                &mut PutObjReader::from_vec(b"newer source body".to_vec()),
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(uuid::Uuid::new_v4().to_string()),
+                    mod_time: Some(mod_time + time::Duration::SECOND),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("retain an unmoved newer source version");
         *store.rebalance_meta.write().await = Some(active_rebalance_meta_for_pool(store.pools.len(), 0));
 
         let source_reader = store.pools[0]
@@ -10519,6 +10533,8 @@ mod tests {
             .await
             .expect("read data movement source");
         let source_data_dir = source_reader.object_info.data_dir;
+        assert!(!source_reader.object_info.is_latest, "the copied version is historical on the source");
+        assert_eq!(source_reader.object_info.num_versions, 2);
         crate::data_movement::migrate_object(store.clone(), 0, bucket.clone(), source_reader, None, "test_read_window")
             .await
             .expect("commit data movement target");
@@ -10535,6 +10551,8 @@ mod tests {
             )
             .await
             .expect("read committed data movement target");
+        assert!(target.is_latest, "the target has only the copied historical version");
+        assert_eq!(target.num_versions, 1);
         assert_ne!(source_data_dir, target.data_dir, "the target must use its own data directory");
         assert_eq!(
             rustfs_utils::http::get_consistent_str(&target.user_defined, rustfs_utils::http::SUFFIX_DATA_MOVED),
@@ -10554,6 +10572,27 @@ mod tests {
             .await
             .expect("the equal-time migration window must remain readable");
         assert_eq!(resolved.data_dir, target.data_dir);
+
+        let mut migrated = store
+            .get_object_reader(
+                &bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: Some(version.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a partial target history must not hide the readable historical version");
+        let mut body = Vec::new();
+        migrated
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("read migrated historical body");
+        assert_eq!(body, b"source body");
 
         shutdown.cancel();
     }
@@ -21915,6 +21954,220 @@ mod tests {
             assert_eq!(parts.parts[0].size, 4096);
             shutdown.cancel();
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn bucket_incarnation_fence_cancellation_revalidates_after_coverage_gap() {
+        let temp = tempfile::tempdir().expect("create incarnation cancellation store");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "incarnation-cancel", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("incarnation-cancel-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let expected = store.bucket_incarnation_id(&bucket).await.expect("read incarnation");
+        let metadata_writer = crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_lock_in(&store.ctx, &bucket)
+            .await
+            .expect("hold metadata validation behind writer");
+        let mut cancelled = Box::pin(store.acquire_bucket_incarnation_fence(&bucket, expected));
+        assert!(futures::poll!(&mut cancelled).is_pending(), "validation must wait for metadata writer");
+        let mut lifecycle_writer = Box::pin(store.acquire_bucket_lifecycle_write_lock(&bucket));
+        assert!(
+            futures::poll!(&mut lifecycle_writer).is_pending(),
+            "validation must already own lifecycle coverage"
+        );
+        drop(lifecycle_writer);
+        drop(cancelled);
+        drop(metadata_writer);
+
+        let validated = store
+            .acquire_bucket_incarnation_fence(&bucket, expected)
+            .await
+            .expect("validate after cancellation");
+        drop(validated);
+        let metadata_writer = crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_lock_in(&store.ctx, &bucket)
+            .await
+            .expect("hold validation after real coverage ended");
+        let mut revalidate = Box::pin(store.acquire_bucket_incarnation_fence(&bucket, expected));
+        assert!(
+            futures::poll!(&mut revalidate).is_pending(),
+            "a cancelled registration must not preserve a memo across a coverage gap"
+        );
+        drop(revalidate);
+        drop(metadata_writer);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn multipart_generation_fence_reuses_overlapping_validation() {
+        let temp = tempfile::tempdir().expect("create multipart fence store");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "multipart-fence-reuse", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("multipart-fence-reuse-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let expected = store.bucket_incarnation_id(&bucket).await.expect("read incarnation");
+        let coverage = store
+            .acquire_bucket_incarnation_fence(&bucket, expected)
+            .await
+            .expect("validate continuous coverage");
+        let metadata_writer = crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_lock_in(&store.ctx, &bucket)
+            .await
+            .expect("hold metadata writer during covered session operation");
+        let upload = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.new_multipart_upload(&bucket, "covered.bin", &ObjectOptions::default()),
+        )
+        .await
+        .expect("covered multipart creation must not reacquire the metadata transaction lock")
+        .expect("create upload using authoritative memo");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            store.abort_multipart_upload(&bucket, "covered.bin", &upload.upload_id, &ObjectOptions::default()),
+        )
+        .await
+        .expect("covered abort must not reacquire the metadata transaction lock")
+        .expect("abort the created session");
+        let stale_opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                store.new_multipart_upload(&bucket, "stale.bin", &stale_opts).await,
+                Err(StorageError::BucketNotFound(_))
+            ),
+            "memoized authority must still be compared with each caller's expected incarnation"
+        );
+        let invalid_snapshot = ObjectOptions {
+            object_lock_config_snapshot: Some(Arc::new(crate::object_api::ObjectLockConfigSnapshot::new(
+                crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+            ))),
+            expected_bucket_incarnation_id: Some(expected),
+            ..Default::default()
+        };
+        assert!(
+            store
+                .new_multipart_upload(&bucket, "invalid-snapshot.bin", &invalid_snapshot)
+                .await
+                .is_err(),
+            "a warm memo must not bypass validation of an Object Lock transaction guard"
+        );
+        drop(metadata_writer);
+        drop(coverage);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn multipart_snapshot_bypasses_initializer_queued_behind_metadata_writer() {
+        let temp = tempfile::tempdir().expect("create snapshot validation store");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "multipart-snapshot-fence", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("multipart-snapshot-fence-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let expected = store.bucket_incarnation_id(&bucket).await.expect("read incarnation");
+        let snapshot = store
+            .object_lock_config_snapshot(&bucket)
+            .await
+            .expect("retain metadata snapshot read guard");
+        let mut writer = Box::pin(crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_lock_in(
+            &store.ctx, &bucket,
+        ));
+        assert!(futures::poll!(&mut writer).is_pending(), "writer must queue behind the retained snapshot");
+        let mut ordinary = Box::pin(store.acquire_bucket_incarnation_fence(&bucket, expected));
+        assert!(
+            futures::poll!(&mut ordinary).is_pending(),
+            "ordinary validation must queue behind the metadata writer"
+        );
+        let mut opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(expected),
+            object_lock_config_snapshot: Some(snapshot.clone()),
+            ..Default::default()
+        };
+        let mut uploads = Vec::new();
+        for object in ["owned-snapshot.bin", "borrowed-snapshot.bin"] {
+            if object == "borrowed-snapshot.bin" {
+                snapshot.add_lock_fences(&mut opts);
+            }
+            let upload = tokio::time::timeout(Duration::from_secs(10), store.new_multipart_upload(&bucket, object, &opts))
+                .await
+                .expect("snapshot validation must not join an initializer blocked by its own transaction guard")
+                .expect("create multipart session using held snapshot");
+            uploads.push((object, upload.upload_id));
+        }
+        drop(ordinary);
+        drop(opts);
+        drop(snapshot);
+        let writer_guard = tokio::time::timeout(Duration::from_secs(10), writer)
+            .await
+            .expect("writer resumes after snapshot owners drop")
+            .expect("metadata write guard");
+        drop(writer_guard);
+        for (object, upload_id) in uploads {
+            store
+                .abort_multipart_upload(&bucket, object, &upload_id, &ObjectOptions::default())
+                .await
+                .expect("abort session");
+        }
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn bucket_incarnation_fence_does_not_cache_when_locking_is_disabled() {
+        let temp = tempfile::tempdir().expect("create disabled-lock validation store");
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::with_lock_manager_for_test(Arc::new(
+            rustfs_lock::GlobalLockManager::Disabled(rustfs_lock::DisabledLockManager::new()),
+        )));
+        let (_ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp.path(),
+            "incarnation-disabled-locks",
+            &[(1, 4)],
+            CancellationToken::new(),
+            Some(ctx),
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("incarnation-disabled-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let old = store.bucket_incarnation_id(&bucket).await.expect("read incarnation");
+        let held = store
+            .acquire_bucket_incarnation_fence(&bucket, old)
+            .await
+            .expect("validate with no-op lock");
+        let current = Uuid::new_v4();
+        crate::bucket::metadata::save_bucket_incarnation(store.clone(), &bucket, current)
+            .await
+            .expect("replace authority while no-op guard provides no exclusion");
+        assert!(
+            matches!(
+                store.acquire_bucket_incarnation_fence(&bucket, old).await,
+                Err(StorageError::BucketNotFound(_))
+            ),
+            "a no-op lifecycle guard must not authorize reuse of an obsolete incarnation"
+        );
+        let fresh = store
+            .acquire_bucket_incarnation_fence(&bucket, current)
+            .await
+            .expect("validate replacement from disk");
+        drop(fresh);
+        drop(held);
+        shutdown.cancel();
     }
 
     #[tokio::test]

@@ -181,8 +181,9 @@ fn map_quota_query_error(error: QuotaError, bucket: &str, operation: &str) -> S3
 pub struct BucketQuotaResponse {
     pub bucket: String,
     pub quota: Option<u64>,
-    pub size: u64,
-    /// Current usage size in bytes
+    /// Current usage size in bytes; `null` when no usage is available,
+    /// never reported as zero.
+    pub size: Option<u64>,
     pub quota_type: String,
 }
 
@@ -315,19 +316,15 @@ fn bucket_metadata_from_context() -> Option<Arc<RwLock<BucketMetadataSys>>> {
     current_bucket_metadata_handle()
 }
 
-async fn current_usage_from_context(bucket: &str) -> u64 {
-    let Some(store) = current_object_store_handle() else {
-        return 0;
-    };
+async fn current_usage_from_context(bucket: &str) -> Option<u64> {
+    let store = current_object_store_handle()?;
 
-    match crate::admin::storage_api::data_usage::load_data_usage_from_backend(store).await {
-        Ok(data_usage_info) => data_usage_info
-            .buckets_usage
-            .get(bucket)
-            .map(|bucket_usage| bucket_usage.size)
-            .unwrap_or(0),
-        Err(_) => 0,
-    }
+    crate::admin::storage_api::data_usage::load_data_usage_from_backend(store)
+        .await
+        .ok()?
+        .buckets_usage
+        .get(bucket)
+        .map(|bucket_usage| bucket_usage.size)
 }
 
 pub fn register_quota_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -583,7 +580,7 @@ impl Operation for GetBucketQuotaHandler {
         let response = BucketQuotaResponse {
             bucket,
             quota: quota.quota,
-            size: current_usage.unwrap_or(0),
+            size: current_usage,
             quota_type: rustfs_config::QUOTA_TYPE_HARD.to_string(),
         };
 
@@ -1104,7 +1101,7 @@ mod tests {
         let response = BucketQuotaResponse {
             bucket: "test-bucket".to_string(),
             quota: Some(2147483648),
-            size: 1073741824,
+            size: Some(1073741824),
             quota_type: rustfs_config::QUOTA_TYPE_HARD.to_string(),
         };
 
@@ -1112,5 +1109,18 @@ mod tests {
         assert!(json.contains("test-bucket"));
         assert!(json.contains("2147483648"));
         assert!(json.contains("HARD"));
+    }
+
+    #[test]
+    fn quota_response_reports_unknown_usage_as_null() {
+        let response = BucketQuotaResponse {
+            bucket: "test-bucket".to_string(),
+            quota: Some(2147483648),
+            size: None,
+            quota_type: rustfs_config::QUOTA_TYPE_HARD.to_string(),
+        };
+
+        let json: serde_json::Value = serde_json::to_value(&response).unwrap();
+        assert!(json["size"].is_null(), "unknown usage must not be reported as zero: {json}");
     }
 }

@@ -34,10 +34,13 @@ class UpgradeWorkflowTests(unittest.TestCase):
         self.assertTrue(self.expected)
 
     def run_cases(self, version, failed_test="", fail_tee=False):
-        excluded = ("stable_upgrade_deletes_foreign_reservations_without_losing_live_objects"
-                    if version == "1.0.0-rc.5" else "rc5_rollback_requires_restoring_odm_configuration")
-        expected = self.expected - {excluded}
-        self.assertEqual(len(expected), 7)
+        excluded = ({"stable_upgrade_deletes_foreign_reservations_without_losing_live_objects"}
+                    if version == "1.0.0-rc.5" else {
+                        "rc5_rollback_requires_restoring_odm_configuration",
+                        "rc5_checkpoint_upgrade_rewinds_signed_progress_without_losing_objects",
+                    })
+        expected = self.expected - excluded
+        self.assertEqual(len(expected), 8 if version == "1.0.0-rc.5" else 7)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             commands = root / "commands.jsonl"
@@ -85,7 +88,7 @@ sys.exit(17 if test == os.environ["FAILED_TEST"] else 0)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_early_or_late_failure_does_not_hide_remaining_cases(self):
-        for version, last in (("1.0.0-rc.5", "rc5_rollback_requires_restoring_odm_configuration"),
+        for version, last in (("1.0.0-rc.5", "rc5_checkpoint_upgrade_rewinds_signed_progress_without_losing_objects"),
                               ("1.0.1", "stable_upgrade_deletes_foreign_reservations_without_losing_live_objects")):
             for name in ("direct_upgrade_from_previous_release_preserves_object_contracts", last):
                 with self.subTest(version=version, name=name):

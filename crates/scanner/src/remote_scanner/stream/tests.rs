@@ -213,6 +213,7 @@ fn test_request(request_id: Uuid) -> RemoteScannerRequestWire {
         next_cycle: 7,
         leader_epoch: 9,
         scan_plan_digest: TEST_PLAN_DIGEST,
+        checkpoint_plan_digest: None,
         skip_healing: true,
         scan_mode: HealScanMode::Deep,
         budget: RemoteScannerBudget {
@@ -221,6 +222,34 @@ fn test_request(request_id: Uuid) -> RemoteScannerRequestWire {
             max_directories: Some(20),
         },
     }
+}
+
+#[test]
+fn request_accepts_additive_checkpoint_coverage_identity() {
+    #[derive(Serialize)]
+    struct ExtendedRequest<'a, T> {
+        #[serde(flatten)]
+        legacy: &'a RemoteScannerRequestWire,
+        checkpoint_plan_digest: T,
+    }
+    let legacy = test_request(Uuid::new_v4());
+    let request = ExtendedRequest {
+        legacy: &legacy,
+        checkpoint_plan_digest: DataUsageScanPlanDigest([23; 32]),
+    };
+    let body = rmp_serde::to_vec_named(&request).expect("extended request body");
+    let decoded =
+        decode_remote_scanner_request(&body).expect("an authenticated extended request must preserve its coverage identity");
+    assert_eq!(decoded.0.checkpoint_plan_digest, Some(DataUsageScanPlanDigest([23; 32])));
+    let malformed = ExtendedRequest {
+        legacy: &legacy,
+        checkpoint_plan_digest: vec![23_u8],
+    };
+    let malformed = rmp_serde::to_vec_named(&malformed).expect("malformed coverage identity body");
+    assert!(
+        decode_remote_scanner_request(&malformed).is_err(),
+        "invalid coverage identities must not default to legacy semantics"
+    );
 }
 
 #[test]
@@ -237,11 +266,149 @@ fn request_round_trip_preserves_scan_inputs_without_cache_data() {
     assert_eq!(decoded.0.next_cycle, 7);
     assert_eq!(decoded.0.leader_epoch, 9);
     assert_eq!(decoded.0.scan_plan_digest, TEST_PLAN_DIGEST);
+    assert_eq!(
+        decoded.0.checkpoint_plan_digest, None,
+        "old coordinators retain reuse-plan checkpoint semantics"
+    );
+    assert!(
+        !serde_json::to_value(&decoded.0)
+            .expect("legacy wire shape")
+            .as_object()
+            .expect("request map")
+            .contains_key("checkpoint_plan_digest")
+    );
     assert!(decoded.0.skip_healing);
     assert_eq!(decoded.0.scan_mode, HealScanMode::Deep);
     assert_eq!(decoded.0.budget.max_objects, Some(10));
     assert_eq!(decoded.0.budget.max_directories, Some(20));
     assert!(body.len() < 512);
+}
+
+#[tokio::test]
+async fn remote_sender_preserves_independent_bucket_plan_identities_in_signed_body() {
+    use crate::storage_api::owner::{EcstoreDiskOption, EcstoreEndpoint, ecstore_new_disk};
+    use sha2::Digest as _;
+
+    let _ = rustfs_credentials::set_global_rpc_secret("remote-scanner-sender-test-secret".to_string());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("remote worker listener");
+    let address = listener.local_addr().expect("remote worker listener address");
+    let worker = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("actual sender connection");
+        let mut bytes = Vec::new();
+        let header_end = loop {
+            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                break end + 4;
+            }
+            let mut chunk = [0; 1024];
+            let read = socket.read(&mut chunk).await.expect("sender request headers");
+            assert!(read > 0 && bytes.len() < 16 * 1024, "bounded complete request headers");
+            bytes.extend_from_slice(&chunk[..read]);
+        };
+        let headers = std::str::from_utf8(&bytes[..header_end]).expect("HTTP request headers");
+        let target = headers.split_whitespace().nth(1).expect("request target").to_string();
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().expect("body length"))
+            })
+            .expect("sender must frame the request body");
+        assert!(length <= NS_SCANNER_MAX_REQUEST_BODY_SIZE);
+        while bytes.len() < header_end + length {
+            let mut chunk = [0; 1024];
+            let read = socket.read(&mut chunk).await.expect("sender request body");
+            assert!(read > 0, "sender must deliver the complete body");
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        let body = &bytes[header_end..header_end + length];
+        let digest = hex_simd::encode_to_string(Sha256::digest(body), hex_simd::AsciiCase::Lower);
+        assert!(
+            target
+                .split('&')
+                .any(|part| part == format!("ns_scanner_body_sha256={digest}")),
+            "the signed request URL must bind the actual body"
+        );
+        let request = decode_remote_scanner_request(body).expect("actual sender wire request").0;
+        let auth = FrameAuthenticator::from_rpc_secret(request.request_id).expect("authenticated worker response");
+        let mut response = Vec::new();
+        write_frame(
+            &mut response,
+            &auth,
+            &mut 0,
+            &RemoteScannerFrame::terminal(
+                RemoteScannerProgress::default(),
+                RemoteScannerFrameResult::Complete(Box::new(RemoteScannerComplete {
+                    source: TEST_SOURCE,
+                    scan_plan_digest: request.scan_plan_digest,
+                    usage: test_usage("bucket", 3),
+                    pending_maintenance_work: false,
+                })),
+            ),
+        )
+        .await
+        .expect("authenticated terminal response");
+        socket
+            .write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", response.len()).as_bytes())
+            .await
+            .expect("worker response headers");
+        socket.write_all(&response).await.expect("worker response body");
+        request
+    });
+    let mut endpoint = EcstoreEndpoint::try_from(format!("http://{address}/data/disk1").as_str()).expect("remote endpoint");
+    endpoint.is_local = false;
+    endpoint.set_pool_index(TEST_SOURCE.pool_index);
+    endpoint.set_set_index(TEST_SOURCE.set_index);
+    let disk = ecstore_new_disk(
+        &endpoint,
+        &EcstoreDiskOption {
+            cleanup: false,
+            health_check: false,
+        },
+    )
+    .await
+    .expect("remote disk");
+    let parent = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(
+        &parent,
+        ScannerCycleBudgetConfig {
+            max_objects: Some(7),
+            ..Default::default()
+        },
+    );
+    let reuse = DataUsageScanPlanDigest([11; 32]);
+    let coverage = DataUsageScanPlanDigest([23; 32]);
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        scan_remote_bucket(
+            &disk,
+            parent,
+            budget,
+            RemoteScannerScanSpec {
+                bucket: "bucket",
+                next_cycle: 7,
+                leader_epoch: 9,
+                server_epoch: Uuid::new_v4(),
+                session_id: Uuid::new_v4(),
+                session_sequence: 0,
+                plans: ScannerBucketPlanDigests::from_work_plans(reuse, coverage, None),
+                tier_registry_generation: 0,
+                skip_healing: true,
+                scan_mode: HealScanMode::Deep,
+            },
+        ),
+    )
+    .await
+    .expect("bounded actual sender")
+    .expect("authenticated remote scan");
+    assert!(matches!(outcome, RemoteScannerOutcome::Complete { .. }));
+    let captured = worker.await.expect("capture actual sender request");
+    assert_eq!(captured.scan_plan_digest, reuse);
+    assert_eq!(captured.checkpoint_plan_digest, Some(coverage));
+    assert_eq!(captured.scan_mode, HealScanMode::Deep);
+    assert_eq!(captured.budget.max_objects, Some(7));
 }
 
 #[test]

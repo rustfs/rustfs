@@ -315,6 +315,27 @@ async fn publish_completed_heal(
         aliases.retain(|alias_id, alias| alias_id != task_id && alias.task_id != task_id);
     }
     prune_completed_heal_statuses(&mut retained);
+    drop(retained);
+    drop(aliases);
+    if terminal && rustfs_heal_contracts::completion::has_heal_completion_observers() {
+        // Publish the canonical terminal only after ownership settles. Retrying
+        // attempts and command success are not object completion observations.
+        let outcome = completed.outcome.as_deref();
+        let object = outcome
+            .filter(|outcome| completed.heal_type.is_per_object() && !outcome.objects_truncated && outcome.objects.len() == 1)
+            .and_then(|outcome| outcome.objects.front())
+            .map(|object| crate::heal::outcome::HealObjectReceipt {
+                identity: object.identity.clone(),
+                disposition: object.disposition.clone(),
+            });
+        rustfs_heal_contracts::completion::publish_heal_completion(rustfs_heal_contracts::completion::HealCompletion {
+            task_id: task_id.to_owned(),
+            scan_mode: completed.options.scan_mode,
+            dry_run: completed.options.dry_run,
+            execution: outcome.map(|outcome| outcome.execution),
+            object,
+        });
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -485,7 +506,27 @@ impl HealAdmissionTelemetry {
             .max(duration_micros_saturated(observation.start_duration));
         self.max_lock_phase_micros = self
             .max_lock_phase_micros
-            .max(duration_micros_saturated(observation.lock_phase));
+            .max(duration_micros_saturated(observation.lock_timing.phase));
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HealAdmissionLockTiming {
+    phase: Duration,
+    wait: Duration,
+    hold: Duration,
+}
+
+impl HealAdmissionLockTiming {
+    // Called after the last outer admission guard is released. forceStart's
+    // cancellation gap stays in phase, outside the accumulated guard intervals.
+    fn finish(phase_started: Instant, acquired: Instant, wait: Duration, previous_hold: Duration) -> Self {
+        let released = Instant::now();
+        Self {
+            phase: released.duration_since(phase_started),
+            wait,
+            hold: previous_hold + released.duration_since(acquired),
+        }
     }
 }
 
@@ -497,7 +538,7 @@ struct HealAdmissionObservation {
     force_start: bool,
     displaced: bool,
     start_duration: Duration,
-    lock_phase: Duration,
+    lock_timing: HealAdmissionLockTiming,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -1196,7 +1237,10 @@ impl HealManager {
             "context" => context,
             "force_start" => force_start
         )
-        .record(observation.lock_phase.as_secs_f64());
+        .record(observation.lock_timing.phase.as_secs_f64());
+        // Static keys keep the added observations bounded and avoid per-admission label allocation.
+        histogram!("rustfs_heal_admission_active_lock_wait_seconds").record(observation.lock_timing.wait.as_secs_f64());
+        histogram!("rustfs_heal_admission_active_lock_hold_seconds").record(observation.lock_timing.hold.as_secs_f64());
         lock_admission_telemetry(&self.admission_telemetry).record(observation);
     }
 
@@ -1491,6 +1535,15 @@ impl HealManager {
     /// surface. Entries are node-local and re-evaluated by every discovery pass.
     pub fn replacement_recovery_blocks(&self) -> Vec<ReplacementRecoveryBlock> {
         self.replacement_recovery_blocks.snapshot()
+    }
+
+    /// Node-local diagnostic listing. A failed inventory is explicitly
+    /// unknown; listing never repairs records or revalidates checkpoints.
+    pub async fn local_recovery_diagnostics(&self) -> crate::LocalHealRecoveryDiagnostics {
+        self.root_recovery
+            .diagnostics()
+            .await
+            .unwrap_or_else(|_| crate::LocalHealRecoveryDiagnostics::unavailable("local_recovery_inventory_unavailable"))
     }
 
     #[cfg(test)]
@@ -2009,6 +2062,9 @@ impl HealManager {
         // active -> retrying transitions can slip between duplicate checks.
         let lock_phase_start = Instant::now();
         let mut active_heals = self.active_heals.lock().await;
+        let mut active_lock_acquired = Instant::now();
+        let mut active_lock_wait = active_lock_acquired.duration_since(lock_phase_start);
+        let mut active_lock_hold = Duration::ZERO;
         if self.cancel_token.is_cancelled() {
             return Err(Error::Other("Heal manager is stopping".to_string()));
         }
@@ -2058,7 +2114,8 @@ impl HealManager {
             drop(retrying_heals);
             drop(queue);
             drop(active_heals);
-            let lock_phase = lock_phase_start.elapsed();
+            let lock_timing =
+                HealAdmissionLockTiming::finish(lock_phase_start, active_lock_acquired, active_lock_wait, active_lock_hold);
             Self::record_admission_metric(request.source, admission, "duplicate");
             self.record_admission_observation(HealAdmissionObservation {
                 source,
@@ -2067,7 +2124,7 @@ impl HealManager {
                 force_start,
                 displaced: false,
                 start_duration: admission_start.elapsed(),
-                lock_phase,
+                lock_timing,
             });
             debug!(
                 target: "rustfs::heal::manager",
@@ -2108,6 +2165,7 @@ impl HealManager {
             drop(retrying_heals);
             drop(queue);
             drop(active_heals);
+            active_lock_hold += active_lock_acquired.elapsed();
             for task_id in &overlapping {
                 match self.cancel_task(task_id).await {
                     Ok(_) => info!(
@@ -2125,7 +2183,10 @@ impl HealManager {
                 }
             }
             durable_owners.retain(|owner| !overlapping.contains(&owner.id));
+            let reacquire_start = Instant::now();
             active_heals = self.active_heals.lock().await;
+            active_lock_acquired = Instant::now();
+            active_lock_wait += active_lock_acquired.duration_since(reacquire_start);
             queue = self.heal_queue.lock().await;
             retrying_heals = self.retrying_heals.lock().await;
         }
@@ -2208,7 +2269,8 @@ impl HealManager {
             drop(retrying_heals);
             drop(queue);
             drop(active_heals);
-            let lock_phase = lock_phase_start.elapsed();
+            let lock_timing =
+                HealAdmissionLockTiming::finish(lock_phase_start, active_lock_acquired, active_lock_wait, active_lock_hold);
             Self::record_admission_metric(request.source, admission, "duplicate");
             self.record_admission_observation(HealAdmissionObservation {
                 source,
@@ -2217,7 +2279,7 @@ impl HealManager {
                 force_start,
                 displaced: false,
                 start_duration: admission_start.elapsed(),
-                lock_phase,
+                lock_timing,
             });
 
             match admission {
@@ -2264,7 +2326,8 @@ impl HealManager {
             drop(retrying_heals);
             drop(queue);
             drop(active_heals);
-            let lock_phase = lock_phase_start.elapsed();
+            let lock_timing =
+                HealAdmissionLockTiming::finish(lock_phase_start, active_lock_acquired, active_lock_wait, active_lock_hold);
             Self::record_admission_metric(request.source, HealAdmissionResult::Dropped(reason), "overlap_rejected");
             self.record_admission_observation(HealAdmissionObservation {
                 source,
@@ -2273,7 +2336,7 @@ impl HealManager {
                 force_start,
                 displaced: false,
                 start_duration: admission_start.elapsed(),
-                lock_phase,
+                lock_timing,
             });
             warn!(
                 target: "rustfs::heal::manager",
@@ -2302,7 +2365,8 @@ impl HealManager {
                 drop(retrying_heals);
                 drop(queue);
                 drop(active_heals);
-                let lock_phase = lock_phase_start.elapsed();
+                let lock_timing =
+                    HealAdmissionLockTiming::finish(lock_phase_start, active_lock_acquired, active_lock_wait, active_lock_hold);
                 let admission = HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped);
                 Self::record_admission_metric(source, admission, "disposition_cache");
                 self.record_admission_observation(HealAdmissionObservation {
@@ -2312,7 +2376,7 @@ impl HealManager {
                     force_start,
                     displaced: false,
                     start_duration: admission_start.elapsed(),
-                    lock_phase,
+                    lock_timing,
                 });
                 debug!(
                     target: "rustfs::heal::manager",
@@ -2382,7 +2446,8 @@ impl HealManager {
         drop(retrying_heals);
         drop(queue);
         drop(active_heals);
-        let lock_phase = lock_phase_start.elapsed();
+        let lock_timing =
+            HealAdmissionLockTiming::finish(lock_phase_start, active_lock_acquired, active_lock_wait, active_lock_hold);
         let displaced = displaced_terminal.is_some();
 
         if let (Some(displaced_task_id), Some(displaced_terminal)) = (displaced_task_id, displaced_terminal) {
@@ -2404,7 +2469,7 @@ impl HealManager {
             force_start,
             displaced,
             start_duration: admission_start.elapsed(),
-            lock_phase,
+            lock_timing,
         });
 
         Ok(HealAdmissionReceipt {

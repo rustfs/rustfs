@@ -172,6 +172,7 @@ pub(crate) mod fsync_dir_recorder {
         record_path(&LIMITED, dir, "limited fsync dir recorder");
         let hook = remove_hook(&BEFORE_LIMITED, dir, "limited fsync hook poisoned");
         if let Some(hook) = hook {
+            let _pause = super::enter_blocking_test_hook();
             hook();
         }
     }
@@ -312,6 +313,7 @@ pub(crate) mod prepared_publication_test_hooks {
     pub(crate) fn run(stage: Stage, path: &Path) {
         let hook = BEFORE_PUBLICATION.lock().remove(&(stage, path.to_path_buf()));
         if let Some(hook) = hook {
+            let _pause = super::enter_blocking_test_hook();
             hook();
         }
     }
@@ -607,7 +609,7 @@ pub(crate) fn set_dst_dir_fsync_group_commit_for_test(enabled: bool) -> dst_dir_
     dst_dir_fsync_group_commit_override::set(enabled)
 }
 
-fn dst_dir_fsync_group_commit_enabled() -> bool {
+pub(crate) fn dst_dir_fsync_group_commit_enabled() -> bool {
     #[cfg(test)]
     if let Some(enabled) = dst_dir_fsync_group_commit_override::get() {
         return enabled;
@@ -765,7 +767,13 @@ impl OpenedDstDirFsyncGroup {
 
 struct DstDirFsyncWaiter {
     namespace_owner: Option<Arc<dyn Send + Sync>>,
+    resource_unit: Option<rustfs_concurrency::adaptive::AdaptivePermit>,
     result_tx: oneshot::Sender<SharedDstDirFsyncResult>,
+}
+
+struct DstDirFsyncOwner {
+    _namespace: Option<Arc<dyn Send + Sync>>,
+    _resource: Option<rustfs_concurrency::adaptive::AdaptivePermit>,
 }
 
 #[derive(Clone)]
@@ -857,6 +865,7 @@ impl DstDirFsyncGroupCommit {
         group_state.pending.push_back(DstDirFsyncWaiter {
             result_tx,
             namespace_owner,
+            resource_unit: super::io_admission::current_resource_unit(),
         });
         let start_worker = !group_state.worker_running;
         if start_worker {
@@ -913,7 +922,7 @@ impl DstDirFsyncGroupCommit {
 }
 
 #[cfg(unix)]
-async fn fsync_open_dst_dir_group(group: &DstDirFsyncGroup, namespace_owners: Vec<Arc<dyn Send + Sync>>) -> io::Result<()> {
+async fn fsync_open_dst_dir_group(group: &DstDirFsyncGroup, namespace_owners: Vec<DstDirFsyncOwner>) -> io::Result<()> {
     #[cfg(test)]
     let dir = group.dir.clone();
     let dir_file = group.dir_file.clone();
@@ -936,7 +945,7 @@ async fn fsync_open_dst_dir_group(group: &DstDirFsyncGroup, namespace_owners: Ve
 }
 
 #[cfg(not(unix))]
-async fn fsync_open_dst_dir_group(group: &DstDirFsyncGroup, namespace_owners: Vec<Arc<dyn Send + Sync>>) -> io::Result<()> {
+async fn fsync_open_dst_dir_group(group: &DstDirFsyncGroup, namespace_owners: Vec<DstDirFsyncOwner>) -> io::Result<()> {
     let _namespace_owners = namespace_owners;
     fsync_dir(&group.dir).await
 }
@@ -1003,7 +1012,17 @@ fn run_dst_dir_fsync_group_worker(group: Arc<DstDirFsyncGroup>) -> impl std::fut
 
             #[cfg(test)]
             fsync_dir_recorder::record_grouped(&group.dir, batch.len());
-            let namespace_owners = batch.iter_mut().filter_map(|waiter| waiter.namespace_owner.take()).collect();
+            let namespace_owners = batch
+                .iter_mut()
+                .filter_map(|waiter| {
+                    let namespace = waiter.namespace_owner.take();
+                    let resource = waiter.resource_unit.take();
+                    (namespace.is_some() || resource.is_some()).then_some(DstDirFsyncOwner {
+                        _namespace: namespace,
+                        _resource: resource,
+                    })
+                })
+                .collect();
             let result = fsync_open_dst_dir_group(&group, namespace_owners)
                 .await
                 .map_err(SharedDstDirFsyncError::from_error);
@@ -1062,7 +1081,7 @@ async fn fsync_dst_dir_group_commit_opened(
     }
 
     let dir = dir.to_path_buf();
-    let opened = tokio::task::spawn_blocking(move || {
+    let opened = super::io_admission::spawn_blocking_with_disk_io_permit(None, move || {
         #[cfg(target_os = "linux")]
         if let Some(file) = opened {
             return OpenedDstDirFsyncGroup::from_file(&dir, file);
@@ -1083,6 +1102,35 @@ async fn fsync_dst_dir_group_commit_opened(
         Ok(Err(err)) => Err(err.into_error()),
         Err(_) => Err(io::Error::other("dst dir fsync group worker dropped the waiter")),
     }
+}
+
+pub(crate) fn fsync_commit_directory_limited_std(dir: &Path, guard: &RenameCommitGuard) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        if dir != guard.directories.destination_path {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "sync directory does not match commit guard"));
+        }
+        let file = &guard
+            .directories
+            .destination
+            .get()
+            .ok_or_else(|| io::Error::other("commit directory was not published"))?
+            .file;
+        #[cfg(test)]
+        fsync_dir_recorder::record_limited(dir);
+        fsync_directory_handle_std(dir, Some(file))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = guard;
+        fsync_dir_limited_std(dir)
+    }
+}
+
+pub(crate) fn fsync_dir_limited_std(dir: &Path) -> io::Result<()> {
+    #[cfg(all(test, unix))]
+    fsync_dir_recorder::record_limited(dir);
+    fsync_dir_std(dir)
 }
 
 /// Reuse the published directory without bypassing group commit or sync admission.
@@ -1167,6 +1215,7 @@ type FileFdatasyncGroupKey = (usize, bool);
 
 struct FileFdatasyncWaiter {
     files: Vec<PathBuf>,
+    resource_unit: Option<rustfs_concurrency::adaptive::AdaptivePermit>,
     enqueued_at: Option<Instant>,
     wait_role: &'static str,
     result_tx: oneshot::Sender<SharedFileFdatasyncResult>,
@@ -1237,7 +1286,8 @@ impl FileFdatasyncGroupCommit {
         let (result_tx, result_rx) = oneshot::channel();
         let key = (Arc::as_ptr(&disk_permits) as usize, FSYNC_ON_CURRENT_RUNTIME.get());
         let mut registry = self.inner.lock();
-        registry.groups.retain(|_, group| group.disk_permits.strong_count() > 0);
+        // A retired limiter can still have queued or native work. Its worker
+        // owns the registry entry and returns that budget on completion/cancel.
         if registry.total_waiters >= MAX_FILE_FDATASYNC_WAITERS {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -1277,6 +1327,7 @@ impl FileFdatasyncGroupCommit {
         };
         group_state.pending.push_back(FileFdatasyncWaiter {
             files,
+            resource_unit: super::io_admission::current_resource_unit(),
             enqueued_at: rustfs_io_metrics::put_stage_timer(),
             wait_role,
             result_tx,
@@ -1309,7 +1360,13 @@ impl FileFdatasyncGroupCommit {
     fn remove_idle_group(&self, group: &Arc<FileFdatasyncGroup>) {
         let mut registry = self.inner.lock();
         let group_state = group.inner.lock();
-        if !group_state.worker_running && group_state.pending.is_empty() {
+        if !group_state.worker_running
+            && group_state.pending.is_empty()
+            && registry
+                .groups
+                .get(&group.key)
+                .is_some_and(|registered| Arc::ptr_eq(registered, group))
+        {
             registry.groups.remove(&group.key);
         }
     }
@@ -1329,80 +1386,142 @@ impl FileFdatasyncGroupCommit {
     }
 }
 
-async fn run_file_fdatasync_group_worker(group: Arc<FileFdatasyncGroup>) {
-    loop {
-        #[cfg(test)]
-        file_sync_probe::run_before_group_batch();
-        tokio::task::yield_now().await;
-        let wait = file_fdatasync_group_commit_wait();
-        if !wait.is_zero() {
-            tokio::time::sleep(wait).await;
-        }
-        let (batch, batch_file_count): (Vec<FileFdatasyncWaiter>, usize) = {
-            let mut group_state = group.inner.lock();
-            let batch_file_count = group_state.pending_files;
-            group_state.pending_files = 0;
-            (group_state.pending.drain(..).collect(), batch_file_count)
-        };
-        if batch.is_empty() {
-            let mut group_state = group.inner.lock();
-            group_state.worker_running = false;
-            drop(group_state);
-            FILE_FDATASYNC_GROUP_COMMIT.remove_idle_group(&group);
+struct FileFdatasyncWorkerGuard {
+    group: Arc<FileFdatasyncGroup>,
+    in_flight_waiters: usize,
+    in_flight_files: usize,
+    armed: bool,
+}
+
+impl Drop for FileFdatasyncWorkerGuard {
+    fn drop(&mut self) {
+        if !self.armed {
             return;
         }
-
-        rustfs_io_metrics::record_put_rename_fdatasync_group_outstanding(
-            rustfs_io_metrics::PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_BATCH_WAITERS,
-            batch.len(),
-        );
-        rustfs_io_metrics::record_put_rename_fdatasync_group_outstanding(
-            rustfs_io_metrics::PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_BATCH_FILES,
-            batch_file_count,
-        );
-        for waiter in &batch {
-            if let Some(enqueued_at) = waiter.enqueued_at {
-                rustfs_io_metrics::record_put_rename_fdatasync_group_wait(
-                    waiter.wait_role,
-                    enqueued_at.elapsed().as_secs_f64() * 1000.0,
-                );
+        let pending = {
+            // Same registry -> group order as enqueue and normal completion.
+            let mut registry = FILE_FDATASYNC_GROUP_COMMIT.inner.lock();
+            let mut state = self.group.inner.lock();
+            let pending = std::mem::take(&mut state.pending);
+            let pending_files = std::mem::take(&mut state.pending_files);
+            state.worker_running = false;
+            if registry
+                .groups
+                .get(&self.group.key)
+                .is_some_and(|group| Arc::ptr_eq(group, &self.group))
+            {
+                registry.total_waiters = registry.total_waiters.saturating_sub(pending.len() + self.in_flight_waiters);
+                registry.total_files = registry.total_files.saturating_sub(pending_files + self.in_flight_files);
+                registry.groups.remove(&self.group.key);
             }
-        }
-        let batch_files: Vec<PathBuf> = batch.iter().flat_map(|waiter| waiter.files.iter().cloned()).collect();
-        #[cfg(test)]
-        file_sync_probe::record_group_batch(batch_file_count);
-        rustfs_io_metrics::record_put_rename_fdatasync_batch(
-            rustfs_io_metrics::PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL,
-            batch_file_count,
-        );
-        let result = if let Some(disk_permits) = group.disk_permits.upgrade() {
-            run_file_sync_blocking(disk_permits, move || sync_files(&batch_files))
+            pending
+        };
+        // Queued work never reached the disk; native work retains its own units.
+        // Destructors and notification wakeups run outside the registry locks.
+        drop(pending);
+    }
+}
+
+fn run_file_fdatasync_group_worker(group: Arc<FileFdatasyncGroup>) -> impl std::future::Future<Output = ()> {
+    // Capture before spawning so even an unpolled worker releases its queue.
+    let worker_guard = FileFdatasyncWorkerGuard {
+        group: group.clone(),
+        in_flight_waiters: 0,
+        in_flight_files: 0,
+        armed: true,
+    };
+    async move {
+        let mut worker_guard = worker_guard;
+        loop {
+            #[cfg(test)]
+            file_sync_probe::run_before_group_batch();
+            tokio::task::yield_now().await;
+            let wait = file_fdatasync_group_commit_wait();
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+            let (mut batch, batch_file_count): (Vec<FileFdatasyncWaiter>, usize) = {
+                let mut group_state = group.inner.lock();
+                let batch_file_count = group_state.pending_files;
+                group_state.pending_files = 0;
+                (group_state.pending.drain(..).collect(), batch_file_count)
+            };
+            if batch.is_empty() {
+                let mut group_state = group.inner.lock();
+                worker_guard.armed = false;
+                group_state.worker_running = false;
+                drop(group_state);
+                FILE_FDATASYNC_GROUP_COMMIT.remove_idle_group(&group);
+                return;
+            }
+
+            worker_guard.in_flight_waiters = batch.len();
+            worker_guard.in_flight_files = batch_file_count;
+            rustfs_io_metrics::record_put_rename_fdatasync_group_outstanding(
+                rustfs_io_metrics::PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_BATCH_WAITERS,
+                batch.len(),
+            );
+            rustfs_io_metrics::record_put_rename_fdatasync_group_outstanding(
+                rustfs_io_metrics::PUT_RENAME_FDATASYNC_GROUP_OUTSTANDING_STATE_BATCH_FILES,
+                batch_file_count,
+            );
+            for waiter in &batch {
+                if let Some(enqueued_at) = waiter.enqueued_at {
+                    rustfs_io_metrics::record_put_rename_fdatasync_group_wait(
+                        waiter.wait_role,
+                        enqueued_at.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
+            }
+            // Move each producer's existing path buffer and unit into the physical
+            // batch. No path cloning or separate resource-owner allocation is needed.
+            let batch_files: Vec<_> = batch
+                .iter_mut()
+                .map(|waiter| (std::mem::take(&mut waiter.files), waiter.resource_unit.take()))
+                .collect();
+            #[cfg(test)]
+            file_sync_probe::record_group_batch(batch_file_count);
+            rustfs_io_metrics::record_put_rename_fdatasync_batch(
+                rustfs_io_metrics::PUT_RENAME_FDATASYNC_BATCH_MODE_PARALLEL,
+                batch_file_count,
+            );
+            let result = if let Some(disk_permits) = group.disk_permits.upgrade() {
+                run_file_sync_blocking(disk_permits, move || {
+                    for (files, _resource_unit) in &batch_files {
+                        sync_files(files)?;
+                    }
+                    Ok(())
+                })
                 .await
                 .map_err(SharedFileFdatasyncError::from_error)
-        } else {
-            Err(SharedFileFdatasyncError::from_error(io::Error::other(
-                "file fdatasync group commit limiter dropped",
-            )))
-        };
-        FILE_FDATASYNC_GROUP_COMMIT.complete_batch(batch.len(), batch_file_count);
-
-        let should_stop = {
-            let mut group_state = group.inner.lock();
-            if group_state.pending.is_empty() {
-                group_state.worker_running = false;
-                true
             } else {
-                false
+                Err(SharedFileFdatasyncError::from_error(io::Error::other(
+                    "file fdatasync group commit limiter dropped",
+                )))
+            };
+            FILE_FDATASYNC_GROUP_COMMIT.complete_batch(batch.len(), batch_file_count);
+            worker_guard.in_flight_waiters = 0;
+            worker_guard.in_flight_files = 0;
+
+            let should_stop = {
+                let mut group_state = group.inner.lock();
+                if group_state.pending.is_empty() {
+                    worker_guard.armed = false;
+                    group_state.worker_running = false;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_stop {
+                FILE_FDATASYNC_GROUP_COMMIT.remove_idle_group(&group);
             }
-        };
-        if should_stop {
-            FILE_FDATASYNC_GROUP_COMMIT.remove_idle_group(&group);
-        }
-        for waiter in batch {
-            let _ = waiter.result_tx.send(result.clone());
-        }
-        if should_stop {
-            return;
+            for waiter in batch {
+                let _ = waiter.result_tx.send(result.clone());
+            }
+            if should_stop {
+                return;
+            }
         }
     }
 }
@@ -1490,6 +1609,11 @@ pub(super) fn is_isolated_io_thread() -> bool {
 /// Spawn a blocking task on the fsync-dedicated runtime if configured,
 /// otherwise fall back to the main tokio blocking pool.
 fn fsync_spawn_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> tokio::task::JoinHandle<T> {
+    let resource_unit = super::io_admission::current_resource_unit();
+    let f = move || {
+        let _resource_unit = resource_unit;
+        f()
+    };
     if FSYNC_ON_CURRENT_RUNTIME.get() {
         return tokio::task::spawn_blocking(f);
     }
@@ -1758,6 +1882,233 @@ pub(crate) fn disk_file_sync_limiter(root: &Path) -> Arc<Semaphore> {
     limiter
 }
 
+const MAX_NAMESPACE_WORKERS_PER_DISK: usize = 2;
+const FALLBACK_NAMESPACE_QUEUE_SHARDS: usize = 8;
+
+#[derive(Default)]
+struct DiskBlockingQueueState {
+    jobs: VecDeque<Box<dyn FnOnce() + Send>>,
+    active_workers: usize,
+    #[cfg(any(test, feature = "test-util"))]
+    paused_workers: usize,
+}
+
+pub(crate) struct DiskBlockingQueue {
+    lanes: [Mutex<DiskBlockingQueueState>; 2],
+}
+
+struct DiskBlockingWorkerGuard {
+    queue: Arc<DiskBlockingQueue>,
+    isolated: bool,
+    disarmed: bool,
+}
+
+impl Drop for DiskBlockingWorkerGuard {
+    fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-util"))]
+        CURRENT_DISK_BLOCKING_QUEUE.with(|slot| {
+            let _ = slot.borrow_mut().take();
+        });
+        if self.disarmed {
+            return;
+        }
+        let should_respawn = {
+            let mut state = self.queue.lane(self.isolated).lock();
+            state.active_workers = state.active_workers.saturating_sub(1);
+            let max_workers = self.queue.effective_max_workers(&state);
+            if !state.jobs.is_empty() && state.active_workers < max_workers {
+                state.active_workers += 1;
+                true
+            } else {
+                false
+            }
+        };
+        if should_respawn {
+            DiskBlockingQueue::spawn_worker(Arc::clone(&self.queue), self.isolated);
+        }
+    }
+}
+
+impl DiskBlockingQueue {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            lanes: std::array::from_fn(|_| Mutex::new(DiskBlockingQueueState::default())),
+        })
+    }
+
+    #[inline]
+    fn lane(&self, isolated: bool) -> &Mutex<DiskBlockingQueueState> {
+        &self.lanes[usize::from(isolated)]
+    }
+
+    #[inline]
+    fn effective_max_workers(&self, state: &DiskBlockingQueueState) -> usize {
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            MAX_NAMESPACE_WORKERS_PER_DISK.saturating_add(state.paused_workers)
+        }
+        #[cfg(not(any(test, feature = "test-util")))]
+        {
+            let _ = state;
+            MAX_NAMESPACE_WORKERS_PER_DISK
+        }
+    }
+
+    fn enqueue(self: &Arc<Self>, job: Box<dyn FnOnce() + Send>) {
+        let isolated = is_isolated_io_thread();
+        let should_spawn = {
+            let mut state = self.lane(isolated).lock();
+            state.jobs.push_back(job);
+            if state.active_workers < self.effective_max_workers(&state) {
+                state.active_workers += 1;
+                true
+            } else {
+                false
+            }
+        };
+        if should_spawn {
+            Self::spawn_worker(Arc::clone(self), isolated);
+        }
+    }
+
+    fn spawn_worker(queue: Arc<Self>, isolated: bool) {
+        drop(tokio::task::spawn_blocking(move || {
+            #[cfg(any(test, feature = "test-util"))]
+            CURRENT_DISK_BLOCKING_QUEUE.with(|slot| {
+                *slot.borrow_mut() = Some((Arc::clone(&queue), isolated));
+            });
+            let mut guard = DiskBlockingWorkerGuard {
+                queue: Arc::clone(&queue),
+                isolated,
+                disarmed: false,
+            };
+            loop {
+                let Some(job) = ({
+                    let mut state = queue.lane(isolated).lock();
+                    match state.jobs.pop_front() {
+                        Some(job) => Some(job),
+                        None => {
+                            state.active_workers = state.active_workers.saturating_sub(1);
+                            guard.disarmed = true;
+                            None
+                        }
+                    }
+                }) else {
+                    return;
+                };
+                job();
+            }
+        }));
+    }
+
+    #[cfg(test)]
+    async fn run<T: Send + 'static>(
+        self: &Arc<Self>,
+        operation: impl FnOnce() -> io::Result<T> + Send + 'static,
+    ) -> io::Result<T> {
+        self.run_cancellable(move |_| operation()).await
+    }
+
+    async fn run_cancellable<T: Send + 'static>(
+        self: &Arc<Self>,
+        operation: impl FnOnce(&dyn Fn() -> bool) -> io::Result<T> + Send + 'static,
+    ) -> io::Result<T> {
+        let (tx, rx) = oneshot::channel();
+        let resource_unit = super::io_admission::current_resource_unit();
+        self.enqueue(Box::new(move || {
+            // Retain each producer separately, never on the shared worker.
+            let _resource_unit = resource_unit;
+            let result = operation(&|| tx.is_closed());
+            let _ = tx.send(result);
+        }));
+        rx.await
+            .map_err(|err| io::Error::other(format!("blocking namespace operation failed: {err}")))?
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+thread_local! {
+    static CURRENT_DISK_BLOCKING_QUEUE: std::cell::RefCell<Option<(Arc<DiskBlockingQueue>, bool)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) struct BlockingTestHookGuard {
+    queue: Option<(Arc<DiskBlockingQueue>, bool)>,
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl Drop for BlockingTestHookGuard {
+    fn drop(&mut self) {
+        if let Some((queue, isolated)) = self.queue.take() {
+            let mut state = queue.lane(isolated).lock();
+            state.paused_workers = state.paused_workers.saturating_sub(1);
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) fn enter_blocking_test_hook() -> BlockingTestHookGuard {
+    let queue = CURRENT_DISK_BLOCKING_QUEUE.with(|slot| slot.borrow().clone());
+    if let Some((ref queue, isolated)) = queue {
+        let should_spawn = {
+            let mut state = queue.lane(isolated).lock();
+            state.paused_workers = state.paused_workers.saturating_add(1);
+            if !state.jobs.is_empty() && state.active_workers < queue.effective_max_workers(&state) {
+                state.active_workers += 1;
+                true
+            } else {
+                false
+            }
+        };
+        if should_spawn {
+            DiskBlockingQueue::spawn_worker(Arc::clone(queue), isolated);
+        }
+    }
+    BlockingTestHookGuard { queue }
+}
+
+static DISK_BLOCKING_QUEUES: LazyLock<Mutex<HashMap<PathBuf, Weak<DiskBlockingQueue>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static FALLBACK_BLOCKING_QUEUES: LazyLock<[Arc<DiskBlockingQueue>; FALLBACK_NAMESPACE_QUEUE_SHARDS]> =
+    LazyLock::new(|| std::array::from_fn(|_| DiskBlockingQueue::new()));
+
+pub(crate) fn register_disk_blocking_queue(root: &Path, io_root: &Path) -> Arc<DiskBlockingQueue> {
+    let mut queues = DISK_BLOCKING_QUEUES.lock();
+    queues.retain(|_, q| q.strong_count() > 0);
+    let queue = queues.get(root).and_then(Weak::upgrade).unwrap_or_else(|| {
+        let queue = DiskBlockingQueue::new();
+        queues.insert(root.to_path_buf(), Arc::downgrade(&queue));
+        queue
+    });
+    if io_root != root {
+        queues.insert(io_root.to_path_buf(), Arc::downgrade(&queue));
+    }
+    queue
+}
+
+fn disk_blocking_queue_for_root(root: &Path) -> Arc<DiskBlockingQueue> {
+    register_disk_blocking_queue(root, root)
+}
+
+fn disk_blocking_queue_for_path(path: &Path) -> Arc<DiskBlockingQueue> {
+    {
+        let queues = DISK_BLOCKING_QUEUES.lock();
+        for (root, weak) in queues.iter() {
+            if path.starts_with(root)
+                && let Some(queue) = weak.upgrade()
+            {
+                return queue;
+            }
+        }
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    let idx = usize::try_from(hasher.finish() % (FALLBACK_NAMESPACE_QUEUE_SHARDS as u64)).unwrap_or(0);
+    Arc::clone(&FALLBACK_BLOCKING_QUEUES[idx])
+}
+
 /// Serialize a bucket's local metadata commits with physical bucket removal.
 ///
 /// The key includes the canonical disk root, so independently reconnected
@@ -1829,6 +2180,7 @@ pub(crate) struct NamespaceMutationLease {
     external_guard: Mutex<Option<Arc<dyn Send + Sync>>>,
     // Independent of the quota claim; both survive cancellation of the waiter.
     _namespace_owner: Option<Arc<dyn Send + Sync>>,
+    blocking_queue: Arc<DiskBlockingQueue>,
 }
 
 impl NamespaceMutationLease {
@@ -1845,12 +2197,14 @@ pub(in crate::disk) async fn acquire_namespace_mutation_lease_with_owner(
     path: &Path,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Arc<NamespaceMutationLease> {
+    let blocking_queue = disk_blocking_queue_for_path(path);
     Arc::new(NamespaceMutationLease {
         _namespace_guard: disk_namespace_mutation_lock(path).lock_owned().await,
         _staging_guard: None,
         _volume_guard: None,
         external_guard: Mutex::new(None),
         _namespace_owner: namespace_owner,
+        blocking_queue,
     })
 }
 
@@ -1886,12 +2240,14 @@ pub(crate) async fn acquire_rename_data_mutation_lease_with_owner(
         _ => (destination_lock.lock_owned().await, None),
     };
     let volume_guard = disk_volume_mutation_lock(root, volume).read_owned().await;
+    let blocking_queue = disk_blocking_queue_for_root(root);
     Arc::new(NamespaceMutationLease {
         _namespace_guard: namespace_guard,
         _staging_guard: staging_guard,
         _volume_guard: Some(volume_guard),
         external_guard: Mutex::new(None),
         _namespace_owner: namespace_owner,
+        blocking_queue,
     })
 }
 
@@ -2037,6 +2393,7 @@ pub(crate) mod file_sync_probe {
         ACTIVE_CHANGED.notify_waiters();
         let fail = attempt == FAIL_ON_ATTEMPT.load(Ordering::SeqCst);
         if !fail {
+            let _pause = super::enter_blocking_test_hook();
             let guard = BLOCK_MUTEX.lock().expect("file sync probe blocker poisoned");
             drop(
                 BLOCK_CONDVAR
@@ -2769,35 +3126,61 @@ pub(crate) fn read_destination_file_with_commit_guard(
     }
 }
 
-#[cfg(windows)]
-#[tracing::instrument(level = "debug", skip_all)]
-pub(crate) async fn rename_all_with_prepared_source(
-    prepared_source: PreparedRenameSource,
-    src_file_path: impl AsRef<Path>,
-    dst_file_path: impl AsRef<Path>,
-    base_dir: impl AsRef<Path>,
-    _publication_root: &PublicationRoot,
+fn rename_prepared_source_std(
+    prepared_source: &PreparedRenameSource,
+    src_file_path: &Path,
+    dst_file_path: &Path,
+    base_dir: &Path,
+    publication_root: &PublicationRoot,
     commit_guard: &RenameCommitGuard,
-    lease: Arc<NamespaceMutationLease>,
-) -> Result<()> {
-    let src_file_path = src_file_path.as_ref().to_path_buf();
-    let dst_file_path = dst_file_path.as_ref().to_path_buf();
-    let base_dir = base_dir.as_ref().to_path_buf();
-    let commit_guard = commit_guard.clone();
-    let operation = {
-        let src_file_path = src_file_path.clone();
-        let dst_file_path = dst_file_path.clone();
-        move || rename_prepared_source_with_commit_guard_std(&prepared_source, &src_file_path, &dst_file_path, &commit_guard)
+) -> io::Result<()> {
+    let result = {
+        #[cfg(windows)]
+        {
+            let _ = publication_root;
+            rename_prepared_source_with_commit_guard_std(prepared_source, src_file_path, dst_file_path, commit_guard)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = publication_root;
+            #[cfg(any(test, feature = "test-util"))]
+            prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::PreparedRename, dst_file_path);
+            commit_guard
+                .directories
+                .rename(src_file_path, dst_file_path, Some(prepared_source))
+        }
+        #[cfg(all(not(windows), not(target_os = "linux")))]
+        {
+            let _ = commit_guard;
+            validate_prepared_rename_source(prepared_source, src_file_path)
+                .and_then(|()| prepare_rename_with_retry(src_file_path, dst_file_path, base_dir, publication_root))
+                .and_then(|preparation| {
+                    #[cfg(any(test, feature = "test-util"))]
+                    prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::PreparedRename, dst_file_path);
+                    rename_prepared(src_file_path, dst_file_path, &preparation)
+                })
+        }
     };
-    let result = run_blocking_namespace_operation(lease, operation).await;
     if let Err(err) = &result {
-        warn_reliable_rename_failure(&src_file_path, &dst_file_path, &base_dir, err);
+        warn_reliable_rename_failure(src_file_path, dst_file_path, base_dir, err);
     }
-    result.map_err(to_file_error)?;
+    result
+}
+
+pub(crate) fn rename_prepared_source_on_thread(
+    prepared_source: PreparedRenameSource,
+    src_file_path: &Path,
+    dst_file_path: &Path,
+    base_dir: &Path,
+    publication_root: &PublicationRoot,
+    commit_guard: &RenameCommitGuard,
+) -> Result<()> {
+    rename_prepared_source_std(&prepared_source, src_file_path, dst_file_path, base_dir, publication_root, commit_guard)
+        .map_err(to_file_error)?;
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg_attr(windows, tracing::instrument(level = "debug", skip_all))]
 pub(crate) async fn rename_all_with_prepared_source(
     prepared_source: PreparedRenameSource,
     src_file_path: impl AsRef<Path>,
@@ -2811,41 +3194,20 @@ pub(crate) async fn rename_all_with_prepared_source(
     let src_file_path = src_file_path.as_ref().to_path_buf();
     let dst_file_path = dst_file_path.as_ref().to_path_buf();
     let base_dir = base_dir.as_ref().to_path_buf();
-    #[cfg(not(target_os = "linux"))]
     let publication_root = publication_root.clone();
-    #[cfg(target_os = "linux")]
-    let _ = publication_root;
     let commit_guard = commit_guard.clone();
-    let operation = {
-        let src_file_path = src_file_path.clone();
-        let dst_file_path = dst_file_path.clone();
-        #[cfg(not(target_os = "linux"))]
-        let base_dir = base_dir.clone();
-        move || {
-            #[cfg(target_os = "linux")]
-            {
-                #[cfg(any(test, feature = "test-util"))]
-                prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::PreparedRename, &dst_file_path);
-                commit_guard
-                    .directories
-                    .rename(&src_file_path, &dst_file_path, Some(&prepared_source))
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = commit_guard;
-                validate_prepared_rename_source(&prepared_source, &src_file_path)?;
-                let preparation = prepare_rename_with_retry(&src_file_path, &dst_file_path, &base_dir, &publication_root)?;
-                #[cfg(any(test, feature = "test-util"))]
-                prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::PreparedRename, &dst_file_path);
-                rename_prepared(&src_file_path, &dst_file_path, &preparation)
-            }
-        }
-    };
-    let result = run_blocking_namespace_operation(lease, operation).await;
-    if let Err(err) = &result {
-        warn_reliable_rename_failure(&src_file_path, &dst_file_path, &base_dir, err);
-    }
-    result.map_err(to_file_error)?;
+    run_blocking_namespace_operation(lease, move || {
+        rename_prepared_source_std(
+            &prepared_source,
+            &src_file_path,
+            &dst_file_path,
+            &base_dir,
+            &publication_root,
+            &commit_guard,
+        )
+    })
+    .await
+    .map_err(to_file_error)?;
     Ok(())
 }
 
@@ -3122,12 +3484,20 @@ pub(crate) async fn run_blocking_namespace_operation<T: Send + 'static>(
     lease: Arc<NamespaceMutationLease>,
     operation: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
-    tokio::task::spawn_blocking(move || {
-        let _lease = lease;
-        operation()
-    })
-    .await
-    .map_err(|err| io::Error::other(format!("blocking namespace operation failed: {err}")))?
+    run_cancellable_blocking_namespace_operation(lease, move |_| operation()).await
+}
+
+pub(crate) async fn run_cancellable_blocking_namespace_operation<T: Send + 'static>(
+    lease: Arc<NamespaceMutationLease>,
+    operation: impl FnOnce(&dyn Fn() -> bool) -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    let queue = Arc::clone(&lease.blocking_queue);
+    queue
+        .run_cancellable(move |is_cancelled| {
+            let _lease = lease;
+            operation(is_cancelled)
+        })
+        .await
 }
 
 /// Admit one strict inline commit under the disk sync limit. The caller already
@@ -3164,11 +3534,29 @@ pub(crate) async fn run_blocking_namespace_file_sync_operation<T: Send + 'static
     run_blocking_namespace_file_sync_operation_with_global(lease, admission, &FILE_SYNC_PERMITS, operation).await
 }
 
+pub(crate) async fn run_cancellable_blocking_namespace_file_sync_operation<T: Send + 'static>(
+    lease: Arc<NamespaceMutationLease>,
+    admission: &FileSyncAdmission,
+    operation: impl FnOnce(&dyn Fn() -> bool) -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    run_cancellable_blocking_namespace_file_sync_operation_with_global(lease, admission, &FILE_SYNC_PERMITS, operation).await
+}
+
 async fn run_blocking_namespace_file_sync_operation_with_global<T: Send + 'static>(
     lease: Arc<NamespaceMutationLease>,
     admission: &FileSyncAdmission,
     global_permits: &Semaphore,
     operation: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    run_cancellable_blocking_namespace_file_sync_operation_with_global(lease, admission, global_permits, move |_| operation())
+        .await
+}
+
+async fn run_cancellable_blocking_namespace_file_sync_operation_with_global<T: Send + 'static>(
+    lease: Arc<NamespaceMutationLease>,
+    admission: &FileSyncAdmission,
+    global_permits: &Semaphore,
+    operation: impl FnOnce(&dyn Fn() -> bool) -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
     let wait_started = rustfs_io_metrics::put_stage_timer();
     let global_permit = global_permits
@@ -3180,14 +3568,18 @@ async fn run_blocking_namespace_file_sync_operation_with_global<T: Send + 'stati
         wait_started,
     );
     let disk_permit = admission.disk_permit.clone();
-    let result = fsync_spawn_blocking(move || {
+    let (tx, rx) = oneshot::channel();
+    drop(fsync_spawn_blocking(move || {
         let _lease = lease;
         let _disk_permit = disk_permit;
-        operation()
-    })
-    .await;
+        let result = operation(&|| tx.is_closed());
+        let _ = tx.send(result);
+    }));
+    let result = rx
+        .await
+        .map_err(|err| io::Error::other(format!("blocking namespace file sync operation failed: {err}")))?;
     drop(global_permit);
-    result.map_err(|err| io::Error::other(format!("blocking namespace file sync operation failed: {err}")))?
+    result
 }
 
 pub(crate) async fn fsync_dir_with_namespace_file_sync_limit(
@@ -3198,12 +3590,7 @@ pub(crate) async fn fsync_dir_with_namespace_file_sync_limit(
     #[cfg(unix)]
     {
         let dir = dir.as_ref().to_path_buf();
-        run_blocking_namespace_file_sync_operation(lease, admission, move || {
-            #[cfg(test)]
-            fsync_dir_recorder::record_limited(&dir);
-            fsync_dir_std(dir)
-        })
-        .await
+        run_blocking_namespace_file_sync_operation(lease, admission, move || fsync_dir_limited_std(&dir)).await
     }
 
     #[cfg(not(unix))]
@@ -7764,6 +8151,10 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(dst_dir_fsync_group_commit)]
     async fn grouped_fsync_physical_batch_keeps_all_owners_after_worker_cancellation() {
+        use crate::disk::io_admission::with_background_resource_unit;
+        use rustfs_concurrency::adaptive::AdaptiveAdmission;
+        use std::num::NonZeroU16;
+        let resources: [_; 3] = std::array::from_fn(|_| AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1));
         let temp_dir = tempdir().expect("fixture directory");
         let dir = temp_dir.path().canonicalize().expect("canonical fsync path");
         let first_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
@@ -7772,19 +8163,25 @@ mod tests {
         let second_owner = second_ctx.begin_namespace_commit();
         let first_probe = Arc::downgrade(&first_owner);
         let second_probe = Arc::downgrade(&second_owner);
-        let (first_rx, group) = DST_DIR_FSYNC_GROUP_COMMIT
-            .enqueue_opened(
-                OpenedDstDirFsyncGroup::open(&dir).expect("open first waiter directory"),
-                Some(first_owner),
-            )
-            .expect("queue first real waiter");
+        let (first_rx, group) = with_background_resource_unit(resources[0].acquire().await, async {
+            DST_DIR_FSYNC_GROUP_COMMIT
+                .enqueue_opened(
+                    OpenedDstDirFsyncGroup::open(&dir).expect("open first waiter directory"),
+                    Some(first_owner),
+                )
+                .expect("queue first real waiter")
+        })
+        .await;
         let group = group.expect("first waiter starts the group");
-        let (second_rx, second_worker) = DST_DIR_FSYNC_GROUP_COMMIT
-            .enqueue_opened(
-                OpenedDstDirFsyncGroup::open(&dir).expect("open second waiter directory"),
-                Some(second_owner),
-            )
-            .expect("queue second real waiter");
+        let (second_rx, second_worker) = with_background_resource_unit(resources[1].acquire().await, async {
+            DST_DIR_FSYNC_GROUP_COMMIT
+                .enqueue_opened(
+                    OpenedDstDirFsyncGroup::open(&dir).expect("open second waiter directory"),
+                    Some(second_owner),
+                )
+                .expect("queue second real waiter")
+        })
+        .await;
         assert!(second_worker.is_none(), "same directory must join the same batch");
         assert_eq!(group.inner.lock().pending.len(), 2);
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -7808,12 +8205,15 @@ mod tests {
         let queued_owner = queued_ctx.begin_namespace_commit();
         let queued_probe = Arc::downgrade(&queued_owner);
         let queued_generation = queued_ctx.namespace_commit_generation();
-        let (queued_rx, queued_worker) = DST_DIR_FSYNC_GROUP_COMMIT
-            .enqueue_opened(
-                OpenedDstDirFsyncGroup::open(&dir).expect("open queued waiter directory"),
-                Some(queued_owner),
-            )
-            .expect("queue a waiter after the physical batch was frozen");
+        let (queued_rx, queued_worker) = with_background_resource_unit(resources[2].acquire().await, async {
+            DST_DIR_FSYNC_GROUP_COMMIT
+                .enqueue_opened(
+                    OpenedDstDirFsyncGroup::open(&dir).expect("open queued waiter directory"),
+                    Some(queued_owner),
+                )
+                .expect("queue a waiter after the physical batch was frozen")
+        })
+        .await;
         assert!(queued_worker.is_none());
         assert_eq!(group.inner.lock().pending.len(), 1);
         drop((first_rx, second_rx));
@@ -7828,6 +8228,7 @@ mod tests {
         assert_eq!(DST_DIR_FSYNC_GROUP_COMMIT.counts_for_test(), (0, 0));
         let first_pending = first_ctx.namespace_commits_pending() && first_probe.upgrade().is_some();
         let second_pending = second_ctx.namespace_commits_pending() && second_probe.upgrade().is_some();
+        let retained_resources = resources.each_ref().map(|gate| gate.snapshot().active);
         let generations = (first_ctx.namespace_commit_generation(), second_ctx.namespace_commit_generation());
         drop(release_tx);
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -7842,6 +8243,12 @@ mod tests {
         })
         .await
         .expect("physical fsync must release every batch owner");
+        assert_eq!(
+            retained_resources,
+            [1, 1, 0],
+            "physical batch retains each producer; queued cancellation releases its unit"
+        );
+        assert_eq!(resources.each_ref().map(|gate| gate.snapshot().active), [0; 3]);
         assert!(fsync_dir_recorder::was_fsynced(&dir), "the detached syscall must really execute");
         assert!(
             first_pending && second_pending,
@@ -8822,6 +9229,289 @@ mod tests {
 
         let err = sync_dir_files(&missing).await.expect_err("missing dir must fail");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(file_sync_probe)]
+    async fn resource_grouped_fdatasync_retired_limiter_keeps_its_budget_until_worker_cleanup() {
+        use crate::disk::io_admission::with_background_resource_unit;
+        use rustfs_concurrency::adaptive::AdaptiveAdmission;
+        use std::num::NonZeroU16;
+
+        let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
+        let retired = Arc::new(Semaphore::new(1));
+        let (old_rx, old_group) = with_background_resource_unit(gate.acquire().await, async {
+            FILE_FDATASYNC_GROUP_COMMIT.enqueue(retired.clone(), vec![PathBuf::from("retired")])
+        })
+        .await
+        .expect("enqueue retiring producer");
+        let old_worker = run_file_fdatasync_group_worker(old_group.expect("retiring group"));
+        drop(retired);
+
+        let live = Arc::new(Semaphore::new(1));
+        let (new_rx, new_group) = FILE_FDATASYNC_GROUP_COMMIT
+            .enqueue(live, vec![PathBuf::from("successor")])
+            .expect("enqueue new producer");
+        let new_worker = run_file_fdatasync_group_worker(new_group.expect("new group"));
+        let before_cleanup = FILE_FDATASYNC_GROUP_COMMIT.counts_for_test();
+        drop(old_worker);
+        let after_old = FILE_FDATASYNC_GROUP_COMMIT.counts_for_test();
+        drop(new_worker);
+        let after_both = FILE_FDATASYNC_GROUP_COMMIT.counts_for_test();
+        clear_file_fdatasync_group_commit_for_test();
+        assert!(old_rx.await.is_err());
+        assert!(new_rx.await.is_err());
+        assert_eq!(gate.snapshot().active, 0);
+        assert_eq!(before_cleanup, (2, 2, 2), "retiring queued work still owns a registry budget");
+        assert_eq!(after_old, (1, 1, 1), "old cleanup must return exactly its own budget");
+        assert_eq!(after_both, (0, 0, 0), "no phantom waiters or files after cancellation");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(file_sync_probe)]
+    async fn resource_grouped_fdatasync_unpolled_worker_releases_its_producer() {
+        use crate::disk::io_admission::with_background_resource_unit;
+        use rustfs_concurrency::adaptive::AdaptiveAdmission;
+        use std::num::NonZeroU16;
+
+        let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
+        let limiter = Arc::new(Semaphore::new(1));
+        let (rx, group) = with_background_resource_unit(gate.acquire().await, async {
+            FILE_FDATASYNC_GROUP_COMMIT.enqueue(limiter, vec![PathBuf::from("never-dispatched")])
+        })
+        .await
+        .expect("enqueue producer");
+        let group = group.expect("first producer starts group");
+        let held_before_drop = gate.snapshot().active;
+        drop(run_file_fdatasync_group_worker(group.clone()));
+        let counts = FILE_FDATASYNC_GROUP_COMMIT.counts_for_test();
+        let held_after_drop = gate.snapshot().active;
+        let pending = group.inner.lock().pending.len();
+        let running = group.inner.lock().worker_running;
+        // Also drain a failing implementation before making assertions.
+        drop(std::mem::take(&mut group.inner.lock().pending));
+        clear_file_fdatasync_group_commit_for_test();
+        assert!(rx.await.is_err());
+        assert_eq!((held_before_drop, held_after_drop), (1, 0));
+        assert_eq!(counts, (0, 0, 0));
+        assert_eq!((pending, running), (0, false));
+    }
+
+    #[tokio::test]
+    async fn file_fdatasync_stale_idle_cleanup_preserves_the_successor_group() {
+        let registry = FileFdatasyncGroupCommit::default();
+        let limiter = Arc::new(Semaphore::new(1));
+        let (first_rx, old) = registry
+            .enqueue(limiter.clone(), vec![PathBuf::from("old")])
+            .expect("first group");
+        let old = old.expect("first group starts worker");
+        let first_waiter = old.inner.lock().pending.pop_front().expect("freeze first batch");
+        old.inner.lock().pending_files = 0;
+        registry.complete_batch(1, 1);
+        old.inner.lock().worker_running = false;
+        registry.remove_idle_group(&old);
+        assert_eq!(registry.counts_for_test(), (0, 0, 0));
+        let (mut next_rx, next) = registry
+            .enqueue(limiter, vec![PathBuf::from("new")])
+            .expect("successor group");
+        let next = next.expect("successor starts worker");
+        assert!(!Arc::ptr_eq(&old, &next));
+        // An older worker can resume cleanup after a successor was installed.
+        registry.remove_idle_group(&old);
+        assert_eq!(registry.counts_for_test(), (1, 1, 1));
+        assert!(
+            registry
+                .inner
+                .lock()
+                .groups
+                .get(&next.key)
+                .is_some_and(|group| Arc::ptr_eq(group, &next))
+        );
+        assert!(matches!(next_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+        assert!(next.inner.lock().worker_running);
+        assert_eq!(next.inner.lock().pending.len(), 1);
+        assert!(first_waiter.result_tx.send(Ok(())).is_ok());
+        assert!(first_rx.await.expect("original result").is_ok());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(file_sync_probe)]
+    async fn resource_grouped_fdatasync_keeps_native_producers_and_releases_cancelled_queue() {
+        use crate::disk::io_admission::with_background_resource_unit;
+        use rustfs_concurrency::adaptive::AdaptiveAdmission;
+        use std::num::NonZeroU16;
+
+        let resources: [_; 3] = std::array::from_fn(|_| AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1));
+        let root = tempdir().expect("file sync fixture");
+        let files: [_; 3] = std::array::from_fn(|index| root.path().join(index.to_string()));
+        for file in &files {
+            std::fs::write(file, b"durable payload").expect("write real file");
+        }
+        let _probe = file_sync_probe::set_blocking(root.path());
+        let limiter = Arc::new(Semaphore::new(1));
+        let mut receivers = Vec::new();
+        let mut group = None;
+        for index in 0..2 {
+            let (rx, worker) = with_background_resource_unit(resources[index].acquire().await, async {
+                FILE_FDATASYNC_GROUP_COMMIT.enqueue(limiter.clone(), vec![files[index].clone()])
+            })
+            .await
+            .expect("enqueue producer");
+            receivers.push(rx);
+            if index == 0 {
+                group = worker;
+            } else {
+                assert!(worker.is_none(), "second producer joins the same batch");
+            }
+        }
+        let group = group.expect("first producer starts worker");
+        let worker = tokio::spawn(run_file_fdatasync_group_worker(group.clone()));
+        file_sync_probe::wait_for_active(1).await;
+        let (queued, new_worker) = with_background_resource_unit(resources[2].acquire().await, async {
+            FILE_FDATASYNC_GROUP_COMMIT.enqueue(limiter.clone(), vec![files[2].clone()])
+        })
+        .await
+        .expect("enqueue after batch is frozen");
+        assert!(new_worker.is_none());
+        worker.abort();
+        assert!(worker.await.expect_err("cancel group owner").is_cancelled());
+        let retained = resources.each_ref().map(|gate| gate.snapshot().active);
+        let counts = FILE_FDATASYNC_GROUP_COMMIT.counts_for_test();
+        let (pending, running) = {
+            let state = group.inner.lock();
+            (state.pending.len(), state.worker_running)
+        };
+        // Preserve failure observations, then clean up even the old implementation.
+        let remaining = std::mem::take(&mut group.inner.lock().pending);
+        drop(remaining);
+        clear_file_fdatasync_group_commit_for_test();
+        assert!(queued.await.is_err());
+        file_sync_probe::release();
+        file_sync_probe::wait_for_idle().await;
+        let permit = limiter.acquire().await.expect("native disk permit returned");
+        drop(permit);
+        drop(receivers);
+        assert_eq!(retained, [1, 1, 0], "native owners survive, queued producer is released");
+        assert_eq!(resources.each_ref().map(|gate| gate.snapshot().active), [0; 3]);
+        assert_eq!(counts, (0, 0, 0), "cancelled worker clears its registry budget");
+        assert_eq!((pending, running), (0, false));
+        assert_eq!(file_sync_probe::attempts(), 2, "undispatched third file must not be synced");
+    }
+
+    #[tokio::test]
+    async fn resource_native_dispatch_retains_each_unit_after_caller_cancellation() {
+        use crate::disk::io_admission::with_background_resource_unit;
+        use rustfs_concurrency::adaptive::AdaptiveAdmission;
+        use std::num::NonZeroU16;
+
+        let mut retained = Vec::new();
+        for queued in [false, true] {
+            let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
+            let unit = gate.acquire().await;
+            let (started_tx, started_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            let (finished_tx, finished_rx) = oneshot::channel();
+            let worker = tokio::spawn(with_background_resource_unit(unit, async move {
+                let operation = move || {
+                    started_tx.send(()).expect("native operation entered");
+                    let _ = release_rx.blocking_recv();
+                    let _ = finished_tx.send(());
+                    Ok(())
+                };
+                if queued {
+                    DiskBlockingQueue::new().run(operation).await
+                } else {
+                    fsync_spawn_blocking(operation).await.expect("native operation joined")
+                }
+            }));
+            started_rx.await.expect("native operation started");
+            worker.abort();
+            assert!(worker.await.expect_err("caller cancelled").is_cancelled());
+            retained.push(gate.snapshot().active);
+            // Drain native work before assertions, including in the negative control.
+            release_tx.send(()).expect("release native operation");
+            finished_rx.await.expect("native operation finished");
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while gate.snapshot().active != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("native completion returns the unit");
+        }
+        assert_eq!(retained, [1, 1], "fsync and namespace dispatch must retain their own producer's unit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disk_blocking_queue_bounds_concurrency_and_recovers_from_panic() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let queue = DiskBlockingQueue::new();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(MAX_NAMESPACE_WORKERS_PER_DISK + 1));
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let q = Arc::clone(&queue);
+            let active = Arc::clone(&active);
+            let max_seen = Arc::clone(&max_seen);
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                q.run(move || {
+                    let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_seen.fetch_max(cur, Ordering::SeqCst);
+                    if i < MAX_NAMESPACE_WORKERS_PER_DISK {
+                        barrier.wait();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    if i == 0 {
+                        panic!("simulated worker panic");
+                    }
+                    Ok(i)
+                })
+                .await
+            }));
+        }
+
+        tokio::task::spawn_blocking(move || barrier.wait())
+            .await
+            .expect("barrier join");
+        for (i, handle) in handles.into_iter().enumerate() {
+            let res = handle.await.expect("task join");
+            if i == 0 {
+                assert!(res.is_err(), "panicking worker must surface an error to its caller");
+            } else {
+                assert_eq!(res.expect("queued job must succeed after worker panic"), i);
+            }
+        }
+        assert!(
+            max_seen.load(Ordering::SeqCst) <= MAX_NAMESPACE_WORKERS_PER_DISK,
+            "active workers exceeded MAX_NAMESPACE_WORKERS_PER_DISK"
+        );
+
+        let isolated_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .thread_name("isolated-queue-test")
+            .on_thread_start(use_current_runtime_for_fsync)
+            .enable_all()
+            .build()
+            .expect("isolated runtime");
+        let q_iso = Arc::clone(&queue);
+        let iso_res = isolated_rt
+            .spawn(async move {
+                q_iso
+                    .run(|| {
+                        assert_eq!(std::thread::current().name(), Some("isolated-queue-test"));
+                        Ok(())
+                    })
+                    .await
+            })
+            .await;
+        isolated_rt.shutdown_background();
+        iso_res.expect("isolated task join").expect("isolated queue run");
     }
 }
 

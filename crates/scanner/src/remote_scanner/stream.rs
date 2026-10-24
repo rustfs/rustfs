@@ -16,10 +16,10 @@
 use crate::RUSTFS_META_BUCKET;
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig};
 use crate::scanner_io::{
-    DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerCheckpointPersistContext, ScannerCheckpointPersistResult,
-    ScannerDiskScanOptions, ScannerDiskScanOutcome, ScannerIODisk, acquire_scanner_cache_locks, cache_root_entry_info,
-    current_cache_root_or_prepare_with_generation, log_saved_partial_bucket_cache, persist_scanner_checkpoint,
-    scanner_set_disk_inventory,
+    DataUsageCacheReuseOptions, DataUsageCacheScanState, ScannerBucketPlanDigests, ScannerCheckpointPersistContext,
+    ScannerCheckpointPersistResult, ScannerDiskScanOptions, ScannerDiskScanOutcome, ScannerIODisk, acquire_scanner_cache_locks,
+    cache_root_entry_info, current_cache_root_or_prepare_with_generation, log_saved_partial_bucket_cache,
+    persist_scanner_checkpoint, scanner_set_disk_inventory,
 };
 use crate::storage_api::owner::NS_SCANNER_PROTOCOL_VERSION;
 use crate::{
@@ -96,6 +96,8 @@ pub(super) struct RemoteScannerRequestWire {
     pub(super) next_cycle: u64,
     pub(super) leader_epoch: u64,
     scan_plan_digest: DataUsageScanPlanDigest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint_plan_digest: Option<DataUsageScanPlanDigest>,
     skip_healing: bool,
     scan_mode: HealScanMode,
     budget: RemoteScannerBudget,
@@ -214,7 +216,7 @@ pub(crate) struct RemoteScannerScanSpec<'a> {
     pub(crate) server_epoch: Uuid,
     pub(crate) session_id: Uuid,
     pub(crate) session_sequence: u64,
-    pub(crate) scan_plan_digest: DataUsageScanPlanDigest,
+    pub(crate) plans: ScannerBucketPlanDigests,
     pub(crate) tier_registry_generation: u64,
     pub(crate) skip_healing: bool,
     pub(crate) scan_mode: HealScanMode,
@@ -669,6 +671,7 @@ async fn scan_and_persist_local_bucket(
         next_cycle,
         leader_epoch,
         scan_plan_digest,
+        checkpoint_plan_digest,
         skip_healing,
         scan_mode,
         ..
@@ -745,9 +748,7 @@ async fn scan_and_persist_local_bucket(
                     "remote namespace scanner checkpoint identity unavailable during admission: {err}"
                 ))
             })?,
-            // One digest travels on the wire: a remote sweep resumes under
-            // the reuse plan it was requested with.
-            checkpoint_plan_digest: None,
+            checkpoint_plan_digest,
         },
     );
     match scan_state {
@@ -903,7 +904,12 @@ async fn scan_and_persist_local_bucket(
         }
     };
     let (cache, partial_result) = match outcome {
-        ScannerDiskScanOutcome::Complete(cache) => (cache, None),
+        ScannerDiskScanOutcome::Complete(mut cache) => {
+            // The folder completes under its coverage plan; finished cache
+            // reuse and the response remain bound to the requested reuse plan.
+            cache.info.scan_plan_digest = Some(scan_plan_digest);
+            (cache, None)
+        }
         ScannerDiskScanOutcome::Partial(cache) => (cache, Some(RemoteScannerFrameResult::Partial)),
         ScannerDiskScanOutcome::NamespaceNotFound(cache) => (cache, Some(RemoteScannerFrameResult::NamespaceNotFound)),
     };
@@ -1005,11 +1011,13 @@ pub(crate) async fn scan_remote_bucket(
         server_epoch,
         session_id,
         session_sequence,
-        scan_plan_digest,
+        plans,
         tier_registry_generation,
         skip_healing,
         scan_mode,
     } = spec;
+    let scan_plan_digest = plans.reuse;
+    let checkpoint_plan_digest = plans.coverage;
     let expected_source = cache_source_for_disk(disk).map_err(|err| {
         RemoteScannerFailure::transport(StorageError::other(format!("failed to resolve remote namespace scanner source: {err}")))
     })?;
@@ -1024,6 +1032,7 @@ pub(crate) async fn scan_remote_bucket(
         next_cycle,
         leader_epoch,
         scan_plan_digest,
+        checkpoint_plan_digest: Some(checkpoint_plan_digest),
         skip_healing,
         scan_mode,
         budget: RemoteScannerBudget::from_config(budget.remaining_config()),

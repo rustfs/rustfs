@@ -31,6 +31,9 @@
 
 use std::sync::OnceLock;
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
+pub(crate) mod live;
+
 // ============================================================================
 // Environment variable constants
 // ============================================================================

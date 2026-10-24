@@ -53,6 +53,7 @@ struct ScannerStatusResponse {
     data_movement_pause: ScannerDataMovementPauseStatus,
     pause_backlog: rustfs_scanner::ScannerPauseBacklogStatus,
     catch_up_estimate: ScannerCatchUpEstimate,
+    heal_observation: rustfs_scanner::ScannerHealObservationStatus,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,8 +130,10 @@ fn scanner_catch_up_estimate(
     backlog: &rustfs_scanner::ScannerPauseBacklogStatus,
     metrics: &ScannerMetricsReport,
 ) -> ScannerCatchUpEstimate {
+    // A confirmed missing ledger is empty; a failed read does not establish that.
+    let backlog_observed = backlog.error.is_none() && (backlog.durable || backlog.persistence_state == "missing");
     ScannerCatchUpEstimate {
-        estimated: pause.paused || backlog.phase != rustfs_scanner::ScannerPauseBacklogPhase::Idle,
+        estimated: !backlog_observed || pause.paused || backlog.phase != rustfs_scanner::ScannerPauseBacklogPhase::Idle,
         movement_work_items: pause.movement_backlog_work_items.max(backlog.movement_work_items),
         dirty_usage_buckets: metrics.usage_freshness.dirty_pending_buckets.max(backlog.dirty_usage_buckets),
         discovered_expiry_items: metrics
@@ -145,7 +148,7 @@ fn scanner_catch_up_estimate(
             .saturating_add(metrics.lifecycle_transition.compensation_pending)
             .saturating_add(metrics.lifecycle_transition.compensation_running)
             .max(backlog.discovered_transition_items),
-        undiscovered_ilm_items_known: !pause.paused && !backlog.pending_full_scan,
+        undiscovered_ilm_items_known: backlog_observed && !pause.paused && !backlog.pending_full_scan,
         usage_baseline_unix_secs: metrics.usage_freshness.last_durable_success_unix_secs,
     }
 }
@@ -228,6 +231,7 @@ fn scanner_status_response(
         data_movement_pause,
         pause_backlog,
         catch_up_estimate,
+        heal_observation: rustfs_scanner::scanner_heal_observation_status(),
     }
 }
 
@@ -825,7 +829,10 @@ mod tests {
             rustfs_scanner::scanner_runtime_config_status(),
             rustfs_scanner::ScannerCycleScheduleStatus::default(),
             ScannerDataMovementPauseStatus::default(),
-            rustfs_scanner::ScannerPauseBacklogStatus::default(),
+            rustfs_scanner::ScannerPauseBacklogStatus {
+                persistence_state: "missing".to_string(),
+                ..Default::default()
+            },
         );
 
         let encoded = serde_json::to_value(response).expect("scanner status should serialize");
@@ -853,6 +860,61 @@ mod tests {
         assert!(encoded["bitrot"]["bitrot_start_cycle"].is_u64());
         assert!(encoded["bitrot"]["bitrot_start_unix_secs"].is_u64());
         assert!(encoded["disk_io_budget"].is_array());
+        assert_eq!(encoded["metrics"]["usage_publication"]["class"], "unknown");
+        assert!(encoded["metrics"]["usage_publication"]["pending_bucket_count"].is_null());
+        assert_eq!(encoded["heal_observation"]["integrity_state"], "unknown");
+    }
+
+    #[test]
+    fn scanner_status_serializes_snapshot_pending_and_terminal_unknown_separately() {
+        use rustfs_scanner_metrics::metrics::{
+            ScannerUsagePublicationClass, ScannerUsagePublicationOutcome, ScannerUsagePublicationStatus,
+        };
+
+        let mut response = scanner_status_response(
+            true,
+            ScannerMetricsReport {
+                usage_publication: ScannerUsagePublicationStatus {
+                    scanner_epoch: Some(8),
+                    cycle: Some(12),
+                    class: ScannerUsagePublicationClass::CompletePending,
+                    outcome: ScannerUsagePublicationOutcome::PriorCycleDurable,
+                    pending_bucket_count: Some(7),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            rustfs_scanner::scanner_runtime_config_status(),
+            rustfs_scanner::ScannerCycleScheduleStatus::default(),
+            ScannerDataMovementPauseStatus::default(),
+            rustfs_scanner::ScannerPauseBacklogStatus::default(),
+        );
+        response.heal_observation = rustfs_scanner::ScannerHealObservationStatus {
+            state: "active",
+            retained_pending_tasks: Some(0),
+            terminal_task_observations_total: Some(1),
+            terminal_candidates: vec![rustfs_scanner::ScannerHealTerminalObservation {
+                execution: "completed",
+                disposition: "deferred",
+                scope: "content_and_leader_unknown",
+                scan_mode: "deep",
+                count: 1,
+            }],
+            unknown_candidates: vec![rustfs_scanner::ScannerHealUnknownObservation {
+                reason: "content_and_leader_unknown",
+                count: 1,
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(response).expect("serialize scanner status");
+        assert_eq!(json["metrics"]["usage_publication"]["cycle"], 12);
+        assert_eq!(json["metrics"]["usage_publication"]["pending_bucket_count"], 7);
+        assert_eq!(json["metrics"]["usage_publication"]["class"], "complete_pending");
+        assert_eq!(json["heal_observation"]["retained_pending_tasks"], 0);
+        assert_eq!(json["heal_observation"]["terminal_candidates"][0]["execution"], "completed");
+        assert_eq!(json["heal_observation"]["terminal_candidates"][0]["disposition"], "deferred");
+        assert_eq!(json["heal_observation"]["unknown_candidates"][0]["count"], 1);
+        assert_eq!(json["heal_observation"]["integrity_state"], "unknown");
     }
 
     #[test]
@@ -866,6 +928,70 @@ mod tests {
             vec![rustfs_scanner::ScannerPauseBacklogAlertReason::PersistenceUnavailable]
         );
         assert_eq!(backlog.error.as_deref(), Some("storage layer not initialized"));
+
+        let scanner = scanner_status_response(
+            true,
+            ScannerMetricsReport::default(),
+            rustfs_scanner::scanner_runtime_config_status(),
+            rustfs_scanner::ScannerCycleScheduleStatus::default(),
+            ScannerDataMovementPauseStatus::default(),
+            backlog.clone(),
+        );
+        let ilm = ilm_expiry_status_response(
+            true,
+            ScannerMetricsReport::default(),
+            rustfs_scanner::scanner_runtime_config_status(),
+            rustfs_scanner::ScannerCycleScheduleStatus::default(),
+            ScannerDataMovementPauseStatus::default(),
+            backlog,
+        );
+        for encoded in [
+            serde_json::to_value(scanner).expect("scanner status should serialize"),
+            serde_json::to_value(ilm).expect("ILM status should serialize"),
+        ] {
+            assert_eq!(encoded["catch_up_estimate"]["estimated"], true);
+            assert_eq!(encoded["catch_up_estimate"]["undiscovered_ilm_items_known"], false);
+        }
+    }
+
+    #[test]
+    fn scanner_catch_up_estimate_requires_an_observed_pause_ledger() {
+        for (state, durable, error, observed) in [
+            ("missing", false, None, true),
+            ("healthy", true, None, true),
+            ("membership_repair_pending", true, None, true),
+            ("committed_pending_stabilization", true, None, true),
+            ("rolled_back_partial_commit", true, None, true),
+            ("rolled_forward_partial_commit", true, None, true),
+            ("", false, None, false),
+            ("unavailable", false, Some("no readable ledger"), false),
+            ("degraded", false, Some("ledger claim failed"), false),
+            ("degraded", true, Some("ledger update failed"), false),
+        ] {
+            let backlog = rustfs_scanner::ScannerPauseBacklogStatus {
+                persistence_state: state.to_string(),
+                durable,
+                error: error.map(str::to_string),
+                discovered_expiry_items: 5,
+                ..Default::default()
+            };
+            let metrics = ScannerMetricsReport {
+                lifecycle_expiry: ScannerLifecycleExpirySnapshot {
+                    current_queued: 7,
+                    current_active: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let estimate = scanner_catch_up_estimate(&ScannerDataMovementPauseStatus::default(), &backlog, &metrics);
+
+            assert_eq!(estimate.estimated, !observed, "ledger state {state:?}, durable={durable}");
+            assert_eq!(
+                estimate.undiscovered_ilm_items_known, observed,
+                "ledger state {state:?}, durable={durable}"
+            );
+            assert_eq!(estimate.discovered_expiry_items, 9, "keep the independently observed queue count");
+        }
     }
 
     #[test]

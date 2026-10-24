@@ -117,7 +117,13 @@ pub(crate) fn convert_ecstore_object_info(object: StorageObjectInfo) -> NotifyOb
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
-        version_id: object.version_id.map(|version_id| version_id.to_string()),
+        version_id: object.version_id.map(|version_id| {
+            if version_id.is_nil() {
+                rustfs_filemeta::NULL_VERSION_ID.to_owned()
+            } else {
+                version_id.to_string()
+            }
+        }),
         mod_time: object.mod_time.and_then(offset_date_time_to_timestamp),
         restore_expires: object.restore_expires.and_then(offset_date_time_to_timestamp),
         storage_class: object.storage_class,
@@ -128,4 +134,26 @@ pub(crate) fn convert_ecstore_object_info(object: StorageObjectInfo) -> NotifyOb
 pub(crate) fn offset_date_time_to_timestamp(value: time::OffsetDateTime) -> Option<Timestamp> {
     let nanosecond = value.nanosecond().try_into().ok()?;
     Timestamp::new(value.unix_timestamp(), nanosecond).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn notify_object_version_id_preserves_absent_null_and_uuid() {
+        let version = Uuid::new_v4();
+        for (stored, expected) in [
+            (None, None),
+            (Some(Uuid::nil()), Some("null".to_string())),
+            (Some(version), Some(version.to_string())),
+        ] {
+            let object = convert_ecstore_object_info(StorageObjectInfo {
+                version_id: stored,
+                ..Default::default()
+            });
+            assert_eq!(object.version_id, expected);
+        }
+    }
 }

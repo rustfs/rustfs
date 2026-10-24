@@ -257,18 +257,19 @@ impl HealTask {
                         return self.complete_absent_object(bucket, object, &e).await;
                     }
 
-                    error!(
-                        target: "rustfs::heal::task",
+                    demote_to_debug_when!(
+                        !self.should_log_failure(&e),
+                        error, target: "rustfs::heal::task", {
                         event = EVENT_HEAL_OBJECT_RESULT,
                         component = LOG_COMPONENT_HEAL,
                         subsystem = LOG_SUBSYSTEM_OBJECT,
+                        result = "failed",
                         task_id = %self.id,
                         bucket,
                         object,
-                        result = "failed",
                         error = %e,
                         "Heal object operation failed"
-                    );
+                    });
 
                     {
                         let mut progress = self.progress.write().await;
@@ -357,18 +358,19 @@ impl HealTask {
                     return self.complete_absent_object(bucket, object, &e).await;
                 }
 
-                error!(
-                    target: "rustfs::heal::task",
+                demote_to_debug_when!(
+                    !self.should_log_failure(&e),
+                    error, target: "rustfs::heal::task", {
                     event = EVENT_HEAL_OBJECT_RESULT,
                     component = LOG_COMPONENT_HEAL,
                     subsystem = LOG_SUBSYSTEM_OBJECT,
+                    result = "failed",
                     task_id = %self.id,
                     bucket,
                     object,
-                    result = "failed",
                     error = %e,
                     "Heal object operation failed"
-                );
+                });
 
                 {
                     let mut progress = self.progress.write().await;

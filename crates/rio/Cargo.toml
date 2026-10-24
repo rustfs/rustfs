@@ -91,6 +91,8 @@ xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
 hex-simd.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
+tokio-rustls.workspace = true
 temp-env = { workspace = true, features = ["async_closure"] }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-test = { workspace = true }

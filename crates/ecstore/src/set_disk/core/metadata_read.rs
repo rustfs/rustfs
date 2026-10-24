@@ -67,6 +67,7 @@ pub(in crate::set_disk) struct MetadataReadResult {
     pub(in crate::set_disk) slots: Vec<MetadataDiskObservation>,
     pub(in crate::set_disk) diagnostics: MetadataFanoutDiagnostics,
     pub(in crate::set_disk) condition_stopped: bool,
+    pub(in crate::set_disk) verified_inline_body: Option<bytes::Bytes>,
 }
 
 impl MetadataReadResult {
@@ -634,7 +635,7 @@ pub(in crate::set_disk) async fn data_read_early_stop_inline_body_miss_reason(
     parts_metadata: &[FileInfo],
     disks: &[Option<DiskStore>],
 ) -> Option<&'static str> {
-    inline_body_miss_reason_from_observations(
+    verify_inline_body_from_observations(
         bucket,
         object,
         candidate,
@@ -645,17 +646,18 @@ pub(in crate::set_disk) async fn data_read_early_stop_inline_body_miss_reason(
         disks,
     )
     .await
+    .err()
 }
 
-async fn inline_body_miss_reason_from_observations<'a>(
+async fn verify_inline_body_from_observations<'a>(
     bucket: &str,
     object: &str,
     candidate: &FileInfo,
     observations: impl IntoIterator<Item = (usize, Option<&'a FileInfo>)>,
     disks: &[Option<DiskStore>],
-) -> Option<&'static str> {
+) -> Result<bytes::Bytes, &'static str> {
     if let Some(reason) = data_read_early_stop_inline_candidate_miss_reason(candidate) {
-        return Some(reason);
+        return Err(reason);
     }
 
     let Ok(erasure) = coding::Erasure::try_new_with_options(
@@ -664,21 +666,21 @@ async fn inline_body_miss_reason_from_observations<'a>(
         candidate.erasure.block_size,
         candidate.uses_legacy_checksum,
     ) else {
-        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY);
+        return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_GEOMETRY);
     };
     let data_files =
         match collect_inline_data_shard_fileinfos_from_observations(observations, candidate, erasure.data_shards, |index| {
             disks.get(index).is_some_and(Option::is_some)
         }) {
             Ok(data_files) => data_files,
-            Err(reason) => return Some(reason),
+            Err(reason) => return Err(reason),
         };
 
     let Some(part) = candidate.parts.first() else {
-        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE);
+        return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_PART_SHAPE);
     };
     let Ok(object_size) = usize::try_from(candidate.size) else {
-        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
+        return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
     };
     let checksum_info = candidate.erasure.get_checksum_info(part.number);
     let checksum_algo = if candidate.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
@@ -698,14 +700,14 @@ async fn inline_body_miss_reason_from_observations<'a>(
     let Ok(mut readers) =
         build_inline_bitrot_readers_from_refs(&data_files, bucket, object, read_length, shard_size, &checksum_algo, false).await
     else {
-        return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
+        return Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY);
     };
 
     #[cfg(test)]
     crate::set_disk::disk_call_counters::record(object, crate::set_disk::disk_call_counters::KIND_BODY_DECODE, 0);
     match try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, object_size).await {
-        Some(body) if body.len() == object_size => None,
-        _ => Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY),
+        Some(body) if body.len() == object_size => Ok(body),
+        _ => Err(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_BODY_VERIFY),
     }
 }
 
@@ -1148,6 +1150,7 @@ impl SetDisks {
             slots,
             diagnostics,
             condition_stopped: false,
+            verified_inline_body: None,
         })
     }
 
@@ -1368,6 +1371,7 @@ impl SetDisks {
                                 ),
                             )
                     });
+                let mut verified_inline_body = None;
                 let should_return_early = if condition_stopped {
                     true
                 } else if force_full_wait {
@@ -1377,7 +1381,7 @@ impl SetDisks {
                         Some(_candidate) if non_inline_candidate_eligible == Some(true) => {
                             accumulator.candidate_has_read_reserve()
                         }
-                        Some(candidate) => match inline_body_miss_reason_from_observations(
+                        Some(candidate) => match verify_inline_body_from_observations(
                             bucket.as_ref(),
                             object.as_ref(),
                             candidate,
@@ -1386,8 +1390,11 @@ impl SetDisks {
                         )
                         .await
                         {
-                            None => true,
-                            Some(reason) => {
+                            Ok(body) => {
+                                verified_inline_body = Some(body);
+                                true
+                            }
+                            Err(reason) => {
                                 final_miss_reason_override = Some(reason);
                                 if bounded_fanout
                                     && reason == GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_MISSING_SHARD
@@ -1445,6 +1452,7 @@ impl SetDisks {
                         slots,
                         diagnostics,
                         condition_stopped,
+                        verified_inline_body,
                     });
                 }
             }
@@ -1527,6 +1535,7 @@ impl SetDisks {
             slots,
             diagnostics,
             condition_stopped: false,
+            verified_inline_body: None,
         })
     }
 

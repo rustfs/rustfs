@@ -939,6 +939,7 @@ struct OwnedGetObjectFileInfo {
     fi: FileInfo,
     parts_metadata: Vec<FileInfo>,
     online_disks: Vec<Option<DiskStore>>,
+    verified_inline_body: Option<Bytes>,
 }
 
 enum LateMetadataFanout {
@@ -955,6 +956,7 @@ impl GetObjectFileInfo {
                 fi,
                 parts_metadata,
                 online_disks,
+                verified_inline_body: None,
             }),
             shared: None,
             condition_stopped: false,
@@ -1015,6 +1017,27 @@ impl GetObjectFileInfo {
 
     fn has_late_metadata_fanout(&self) -> bool {
         self.late_metadata_fanout.is_some()
+    }
+
+    fn set_verified_inline_body(&mut self, body: Option<Bytes>) {
+        if let Some(owned) = self.owned.as_mut() {
+            owned.verified_inline_body = body;
+        }
+    }
+
+    fn take_verified_inline_body(&mut self) -> Option<Bytes> {
+        self.owned.as_mut().and_then(|owned| owned.verified_inline_body.take())
+    }
+
+    fn into_object_info(self, bucket: &str, object: &str, versioned: bool) -> ObjectInfo {
+        match (self.owned, self.shared) {
+            (Some(snapshot), None) => ObjectInfo::from_owned_file_info(snapshot.fi, bucket, object, versioned),
+            (None, Some(entry)) => match Arc::try_unwrap(entry) {
+                Ok(entry) => ObjectInfo::from_owned_file_info(entry.fi, bucket, object, versioned),
+                Err(entry) => ObjectInfo::from_file_info(&entry.fi, bucket, object, versioned),
+            },
+            _ => unreachable!("GET metadata snapshot representation must be exclusive"),
+        }
     }
 
     fn into_owned(self) -> (FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>) {
@@ -2206,7 +2229,7 @@ mod prepared_get_object_metadata_tests {
         let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
         rustfs_io_metrics::set_get_stage_metrics_enabled(true);
 
-        let (restored, object_size, calls_total) = metrics::with_local_recorder(&recorder, || {
+        let (restored, object_size, calls_total, body_decodes) = metrics::with_local_recorder(&recorder, || {
             runtime.block_on(async {
                 let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
                 let opts = ObjectOptions {
@@ -2260,7 +2283,12 @@ mod prepared_get_object_metadata_tests {
                             .await
                             .expect("inline GET body should stream");
 
-                        (restored, object_size, calls.total(disk_call_counters::KIND_READ_VERSION))
+                        (
+                            restored,
+                            object_size,
+                            calls.total(disk_call_counters::KIND_READ_VERSION),
+                            calls.total(disk_call_counters::KIND_BODY_DECODE),
+                        )
                     },
                 )
                 .await
@@ -2273,6 +2301,10 @@ mod prepared_get_object_metadata_tests {
         assert_eq!(
             calls_total, 4,
             "default production inline GET should schedule the initial bounded quorum plus one hedge"
+        );
+        assert_eq!(
+            body_decodes, 1,
+            "cold inline early-stop GET must reuse the quorum-verified inline body instead of decoding shards twice"
         );
         assert_eq!(
             recorder.histogram_values(
@@ -2298,6 +2330,124 @@ mod prepared_get_object_metadata_tests {
             vec![1.0],
             "default production GET should record the aborted slow parity metadata task"
         );
+    }
+
+    #[test]
+    #[serial_test::serial(body_cache_hook)]
+    fn get_object_info_uses_early_stop_for_locked_or_cache_safe_reads_and_full_wait_for_unlocked() {
+        use crate::storage_api_contracts::object::ObjectOperations;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime should build");
+        let bucket = "get-object-info-early-stop-bucket";
+        let object = object_with_initial_data_shards(bucket, "get-object-info-early-stop-object");
+        let payload = b"head object early-stop payload".repeat(128);
+
+        runtime.block_on(async {
+            let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+            let write_opts = ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            };
+
+            set_disks
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+            let mut put_reader = PutObjReader::from_vec(payload.clone());
+            set_disks
+                .put_object(bucket, &object, &mut put_reader, &write_opts)
+                .await
+                .expect("inline object should be written");
+
+            temp_env::async_with_vars(
+                [
+                    ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", None::<&str>),
+                    ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", None::<&str>),
+                    ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", None::<&str>),
+                ],
+                async {
+                    let slow_parity_disk = bounded_initial_parity_disk_index(bucket, &object);
+                    let barrier =
+                        rename_fanout_barrier::arm(&object, slow_parity_disk, rename_fanout_barrier::PHASE_READ_VERSION);
+                    let calls = disk_call_counters::observe(&object);
+                    let set_disks_for_head = Arc::clone(&set_disks);
+                    let object_for_head = object.clone();
+                    let head_opts = ObjectOptions {
+                        no_lock: true,
+                        metadata_cache_safe: true,
+                        ..Default::default()
+                    };
+                    let mut head_task =
+                        tokio::spawn(
+                            async move { set_disks_for_head.get_object_info(bucket, &object_for_head, &head_opts).await },
+                        );
+
+                    tokio::time::timeout(READ_VERSION_BARRIER_GUARD, barrier.wait_until_paused())
+                        .await
+                        .expect("cache-safe HEAD should pause a slow parity metadata read");
+                    let info = tokio::time::timeout(READ_VERSION_BARRIER_GUARD, &mut head_task)
+                        .await
+                        .expect("cache-safe HEAD should return before the paused parity metadata response")
+                        .expect("HEAD task should not panic")
+                        .expect("HEAD should succeed");
+                    assert_eq!(info.size, payload.len() as i64);
+                    assert_eq!(
+                        calls.total(disk_call_counters::KIND_READ_VERSION),
+                        4,
+                        "cache-safe HEAD should schedule bounded quorum plus one hedge"
+                    );
+                    assert_eq!(
+                        calls.total(disk_call_counters::KIND_BODY_DECODE),
+                        1,
+                        "early-stop HEAD verifies inline quorum once"
+                    );
+
+                    // Second cache-safe HEAD should hit the QuorumSelected metadata cache entry (0 new disk reads).
+                    let cached_info = set_disks
+                        .get_object_info(bucket, &object, &ObjectOptions::default())
+                        .await
+                        .expect("cached HEAD with default locked options should succeed");
+                    assert_eq!(cached_info.size, payload.len() as i64);
+                    assert_eq!(
+                        calls.total(disk_call_counters::KIND_READ_VERSION),
+                        4,
+                        "repeat locked HEAD must hit the QuorumSelected metadata cache entry"
+                    );
+
+                    // Release the slow parity barrier so full-wait can complete all 4 disks.
+                    barrier.release();
+
+                    // Unlocked internal preflight (no_lock=true, metadata_cache_safe=false) must bypass cache and full-wait.
+                    let unlocked_info = set_disks
+                        .get_object_info(
+                            bucket,
+                            &object,
+                            &ObjectOptions {
+                                no_lock: true,
+                                metadata_cache_safe: false,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("unlocked preflight get_object_info should succeed");
+                    assert_eq!(unlocked_info.size, payload.len() as i64);
+                    assert_eq!(
+                        calls.total(disk_call_counters::KIND_READ_VERSION),
+                        8,
+                        "unlocked preflight get_object_info must query all 4 disks"
+                    );
+                    assert_eq!(
+                        calls.total(disk_call_counters::KIND_BODY_DECODE),
+                        1,
+                        "unlocked preflight full-wait must not run early-stop inline body decode"
+                    );
+                },
+            )
+            .await;
+        });
     }
 
     #[test]
@@ -2635,8 +2785,8 @@ impl SetDisks {
     }
 }
 
-/// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
-/// Defaults to 30 seconds if not set or invalid
+/// Get the namespace lock acquisition budget from
+/// `RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT` (seconds, default 5).
 /// Lock acquisition timeout. Cached: this is consulted on every object
 /// lock acquisition and `std::env::var` takes a process-global lock. In test
 /// builds the env var is read directly so `temp_env` overrides take effect.

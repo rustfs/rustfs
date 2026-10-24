@@ -196,6 +196,17 @@ impl BatchDeleteIndex {
             return None;
         }
 
+        // Small marker-only histories are cheaper to remove by header and
+        // shift than to allocate the batch bitmap and summary cache.
+        if metadata.versions.len() < 128
+            && metadata
+                .versions
+                .iter()
+                .all(|version| version.header.version_type == VersionType::Delete)
+        {
+            return None;
+        }
+
         let mut by_version = HashMap::with_capacity(metadata.versions.len());
         for (index, version) in metadata.versions.iter().enumerate() {
             let id = version.header.version_id?;
@@ -204,9 +215,9 @@ impl BatchDeleteIndex {
             }
         }
         if requests.iter().any(|request| {
-            by_version
-                .get(&request.version_id.unwrap_or_default())
-                .is_some_and(|index| metadata.versions[*index].header.version_type != VersionType::Object)
+            by_version.get(&request.version_id.unwrap_or_default()).is_some_and(|index| {
+                !matches!(metadata.versions[*index].header.version_type, VersionType::Object | VersionType::Delete)
+            })
         }) {
             return None;
         }
@@ -224,15 +235,27 @@ impl BatchDeleteIndex {
             return Some(summary);
         }
         let version = &versions[index];
-        let summary = FileMetaVersion::inspect_v2_object_slice(&version.meta).ok()?;
-        // Transition/restore state is time-sensitive and may require a free
-        // version. Preserve the canonical mutation path for those records.
-        if summary.transition_complete || Some(summary.version_id.unwrap_or_default()) != version.header.version_id {
-            return None;
-        }
-        let summary = IndexedDataDir {
-            data_dir: summary.data_dir,
-            physical: summary.physical_data_dir.is_some(),
+        let summary = if version.header.version_type == VersionType::Delete {
+            if version.header.free_version() {
+                return None;
+            }
+            // Like the scalar explicit-marker removal, use the header without
+            // decoding its body. Markers own no object payload directories.
+            IndexedDataDir {
+                data_dir: None,
+                physical: false,
+            }
+        } else {
+            let summary = FileMetaVersion::inspect_v2_object_slice(&version.meta).ok()?;
+            // Transition/restore state is time-sensitive and may require a free
+            // version. Preserve the canonical mutation path for those records.
+            if summary.transition_complete || Some(summary.version_id.unwrap_or_default()) != version.header.version_id {
+                return None;
+            }
+            IndexedDataDir {
+                data_dir: summary.data_dir,
+                physical: summary.physical_data_dir.is_some(),
+            }
         };
         self.summaries[index] = Some(summary);
         Some(summary)
@@ -683,6 +706,187 @@ mod tests {
         let mut indexed = original.clone();
         assert_eq!(indexed.delete_versions(requests), expected);
         assert_eq!(indexed, scalar, "results, retained metadata, and inline bytes must agree");
+    }
+
+    fn indexed_marker_fixture(inline_mode: u8, markers_only: bool) -> (FileMeta, Vec<FileInfo>) {
+        let mut metadata = FileMeta::new();
+        let mut requests = Vec::with_capacity(256);
+        for id in 0_u128..256 {
+            let version = Uuid::from_u128(id);
+            let mut info = make_plain_file_info(version, Uuid::from_u128(10_000 + id % 7));
+            info.mod_time = Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_700_000_000 + i64::try_from(id).expect("id")));
+            if markers_only || id % 2 == 0 {
+                info = FileInfo {
+                    deleted: true,
+                    version_id: info.version_id,
+                    mod_time: info.mod_time,
+                    ..Default::default()
+                };
+            } else if inline_mode == 2 || (inline_mode == 1 && id % 3 != 2) {
+                info.data = Some(Bytes::from_static(b"mixed marker payload"));
+                info.set_inline_data();
+            }
+            metadata.add_version(info).expect("seed mixed marker graph");
+            requests.push(FileInfo {
+                version_id: Some(version),
+                ..Default::default()
+            });
+        }
+        (metadata, requests)
+    }
+
+    #[test]
+    fn indexed_marker_batches_match_scalar_for_mixed_null_duplicate_and_missing_versions() {
+        for inline_mode in 0..3 {
+            for markers_only in [false, true] {
+                let (original, requests) = indexed_marker_fixture(inline_mode, markers_only);
+                assert!(BatchDeleteIndex::new(&original, &requests).is_some());
+                let mut reverse = requests.clone();
+                reverse.reverse();
+                let alternating: Vec<_> = requests.iter().step_by(2).cloned().collect();
+                let mut duplicate_and_missing = requests.clone();
+                duplicate_and_missing.extend_from_slice(&requests[..64]);
+                duplicate_and_missing.push(FileInfo {
+                    version_id: Some(Uuid::from_u128(999)),
+                    ..Default::default()
+                });
+                let mut null_request = requests.clone();
+                null_request[0].version_id = None;
+                for selected in [
+                    &requests,
+                    &reverse,
+                    &alternating,
+                    &duplicate_and_missing,
+                    &null_request,
+                    &requests[..32],
+                ] {
+                    assert_indexed_matches_scalar(&original, selected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_mixed_marker_batches_decode_each_data_version_once() {
+        use super::super::version::V2_OBJECT_SCAN_COUNT;
+
+        let (mut original, requests) = indexed_marker_fixture(0, false);
+        for version in &mut original.versions {
+            if version.header.version_type == VersionType::Object {
+                let mut decoded = version.parse_version_meta().expect("object body");
+                decoded.object.as_mut().expect("object").data_dir =
+                    Some(Uuid::from_u128(10_000 + version.header.version_id.expect("version ID").as_u128()));
+                *version = decoded.try_into().expect("unique physical directory");
+            }
+        }
+        let data_versions = original
+            .versions
+            .iter()
+            .filter(|version| version.header.version_type == VersionType::Object)
+            .count();
+        let mut scalar = original.clone();
+        V2_OBJECT_SCAN_COUNT.with(|count| count.set(0));
+        let expected = scalar.delete_versions_with_index(&requests, None).expect("scalar batch");
+        let scalar_scans = V2_OBJECT_SCAN_COUNT.with(std::cell::Cell::get);
+        let mut indexed = original;
+        V2_OBJECT_SCAN_COUNT.with(|count| count.set(0));
+        let actual = indexed.delete_versions(&requests).expect("indexed batch");
+        let indexed_scans = V2_OBJECT_SCAN_COUNT.with(std::cell::Cell::get);
+        assert_eq!(actual, expected);
+        assert_eq!(indexed, scalar);
+        assert_eq!(scalar_scans, data_versions * (data_versions + 1) / 2);
+        assert_eq!(indexed_scans, data_versions);
+        println!("V2 scans for mixed history: scalar={scalar_scans}, indexed={indexed_scans}");
+    }
+
+    #[test]
+    fn indexed_marker_batches_keep_small_histories_on_the_scalar_path() {
+        for size in [8, 32, 64, 127, 128] {
+            let (mut metadata, _) = indexed_marker_fixture(0, true);
+            metadata.versions.truncate(size);
+            let requests: Vec<_> = metadata
+                .versions
+                .iter()
+                .map(|version| FileInfo {
+                    version_id: version.header.version_id,
+                    ..Default::default()
+                })
+                .collect();
+            assert_eq!(BatchDeleteIndex::new(&metadata, &requests).is_some(), size >= 128);
+            assert_indexed_matches_scalar(&metadata, &requests);
+        }
+    }
+
+    #[test]
+    fn indexed_marker_batches_preserve_scalar_corruption_and_partial_fallback_semantics() {
+        let (original, requests) = indexed_marker_fixture(0, false);
+        let mut corrupt_marker = original.clone();
+        corrupt_marker
+            .versions
+            .iter_mut()
+            .find(|version| version.header.version_id == requests[8].version_id)
+            .expect("marker")
+            .meta = vec![0xc1];
+        assert_indexed_matches_scalar(&corrupt_marker, &requests);
+
+        let marker_index = original
+            .versions
+            .iter()
+            .position(|version| version.header.version_id == requests[8].version_id)
+            .expect("marker index");
+        let object_body = original
+            .versions
+            .iter()
+            .find(|version| version.header.version_id == requests[9].version_id)
+            .expect("object body")
+            .meta
+            .clone();
+        let mut mismatched_body = original.clone();
+        mismatched_body.versions[marker_index].meta = object_body;
+        assert_indexed_matches_scalar(&mismatched_body, &requests);
+
+        let mut corrupt_object = original.clone();
+        corrupt_object
+            .versions
+            .iter_mut()
+            .find(|version| version.header.version_id == requests[9].version_id)
+            .expect("object")
+            .meta = vec![0xc1];
+        assert_indexed_matches_scalar(&corrupt_object, &requests);
+
+        let mut invalid_request = requests.clone();
+        invalid_request[8].parts = vec![ObjectPartInfo::default(); 2];
+        assert!(invalid_request[8].validate_for_delete_operation().is_err());
+        assert_indexed_matches_scalar(&original, &invalid_request);
+
+        let mut free_marker = original;
+        let version = free_marker
+            .versions
+            .iter_mut()
+            .find(|version| version.header.version_id == requests[8].version_id)
+            .expect("marker");
+        let mut decoded = version.parse_version_meta().expect("decode marker");
+        insert_bytes(
+            &mut decoded.delete_marker.as_mut().expect("marker body").meta_sys,
+            rustfs_utils::http::SUFFIX_FREE_VERSION,
+            Vec::new(),
+        );
+        *version = decoded.try_into().expect("encode free version");
+        assert!(version.header.free_version());
+        let mut index = BatchDeleteIndex::new(&free_marker, &requests).expect("eligible headers");
+        assert!(matches!(
+            index
+                .delete(&free_marker.versions, &requests[0], false)
+                .expect("first marker"),
+            IndexedDelete::Applied(None)
+        ));
+        assert!(matches!(
+            index
+                .delete(&free_marker.versions, &requests[8], false)
+                .expect("free marker fallback"),
+            IndexedDelete::Fallback
+        ));
+        assert_indexed_matches_scalar(&free_marker, &requests);
     }
 
     #[test]
