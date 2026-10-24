@@ -14,7 +14,7 @@
 
 use crate::common::{
     RustFSTestClusterEnvironment, RustFSTestEnvironment, admin_request, init_logging, replication_fast_env, rustfs_binary_path,
-    signed_request,
+    signal_process, signed_request,
 };
 use crate::fake_s3_target::{BucketMode, FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, Operation as FakeTargetOperation};
 use crate::on_demand_migration::common::{ODM_SERVER_ENV, OdmTestEnv, SeedObject, fake_source_client};
@@ -1369,6 +1369,353 @@ async fn rc5_rollback_requires_restoring_odm_configuration() -> TestResult {
         read_object(&env.client, bucket, "source-only", None).await?.1,
         b"source read after recovery"
     );
+    Ok(())
+}
+
+struct Rc5CheckpointCapture {
+    disk: PathBuf,
+    path: PathBuf,
+    task_id: String,
+    bytes: Vec<u8>,
+}
+
+async fn capture_rc5_checkpoint(drives: &[PathBuf], writer_pid: u32) -> Result<Rc5CheckpointCapture, BoxError> {
+    let has_signed_progress = |value: &Value| {
+        value["schema_version"].as_u64() == Some(6)
+            && value["successful_objects"].as_u64().is_some_and(|count| count > 0)
+            && value["processed_objects"]
+                .as_array()
+                .is_some_and(|objects| !objects.is_empty())
+            && value["integrity_digest"].as_str().is_some_and(|digest| !digest.is_empty())
+    };
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            for drive in drives {
+                let mut entries = match tokio::fs::read_dir(drive.join(".rustfs.sys/buckets")).await {
+                    Ok(entries) => entries,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                while let Some(entry) = entries.next_entry().await? {
+                    if !entry.file_name().to_string_lossy().ends_with("_ahm_checkpoint.json") {
+                        continue;
+                    }
+                    let metadata = entry.metadata().await?;
+                    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+                        return Err("the old checkpoint is not a bounded regular file".into());
+                    }
+                    let bytes = match tokio::fs::read(entry.path()).await {
+                        Ok(bytes) => bytes,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error.into()),
+                    };
+                    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+                        continue;
+                    };
+                    if !has_signed_progress(&value) {
+                        continue;
+                    }
+
+                    // Freeze only this fixture's writer before copying its actual
+                    // bytes. The environment's normal stop path kills a stopped child.
+                    signal_process(writer_pid, "STOP")?;
+                    let bytes = tokio::fs::read(entry.path()).await?;
+                    let value: Value = serde_json::from_slice(&bytes)?;
+                    if !has_signed_progress(&value) {
+                        return Err("the stopped rc.5 writer did not retain signed checkpoint progress".into());
+                    }
+                    let task_id = value["task_id"].as_str().ok_or("the old checkpoint has no task id")?;
+                    uuid::Uuid::parse_str(task_id)?;
+                    if entry.file_name() != std::ffi::OsStr::new(&format!("{task_id}_ahm_checkpoint.json")) {
+                        return Err("the old checkpoint task id does not match its filename".into());
+                    }
+                    return Ok(Rc5CheckpointCapture {
+                        disk: drive.clone(),
+                        path: entry.path(),
+                        task_id: task_id.to_owned(),
+                        bytes,
+                    });
+                }
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| "rc.5 did not produce a signed checkpoint with progress within 60 seconds")?
+}
+
+fn rc5_checkpoint_object(index: usize) -> (String, Vec<u8>) {
+    (
+        format!("object-{index:05}.bin"),
+        format!("rc.5 checkpoint upgrade object {index:05}\n")
+            .repeat(256)
+            .into_bytes(),
+    )
+}
+
+fn checkpoint_binary_sha256(path: &Path) -> Result<String, BoxError> {
+    use sha2::Digest;
+    use std::io::Read;
+
+    let mut input = std::fs::File::open(path)?;
+    let mut digest = sha2::Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(hex_simd::encode_to_string(digest.finalize(), hex_simd::AsciiCase::Lower))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the pinned 1.0.0-rc.5 release binary"]
+async fn rc5_checkpoint_upgrade_rewinds_signed_progress_without_losing_objects() -> TestResult {
+    use crate::storage_api::upgrade_compatibility::{DiskOption, Endpoint, new_disk};
+    use futures::{StreamExt, TryStreamExt, stream};
+    use rustfs_heal::heal::CheckpointManager;
+
+    const BUCKET: &str = "upgrade-rc5-checkpoint";
+    const OBJECTS: usize = 1600;
+
+    init_logging();
+    let previous_binary = source_binary()?;
+    assert_eq!(binary_source_revision(&previous_binary).await?, RC5_COMMIT);
+    let current_binary = rustfs_binary_path();
+    let evidence_dir = std::env::var_os(G09_EVIDENCE_DIR_ENV)
+        .map(|root| PathBuf::from(root).join(format!("rc5-checkpoint-upgrade-{}", uuid::Uuid::new_v4())));
+    if let Some(directory) = &evidence_dir {
+        std::fs::create_dir_all(directory)?;
+    }
+
+    // Declare the server after its extra drives so error unwinding stops it
+    // before the fixture directories are removed.
+    let fixture = tempfile::TempDir::new()?;
+    let extra_drives = (0..3)
+        .map(|index| {
+            let path = fixture.path().join(format!("drive-{index}"));
+            std::fs::create_dir(&path)?;
+            Ok(path.to_str().ok_or("fixture drive path is not UTF-8")?.to_owned())
+        })
+        .collect::<Result<Vec<_>, BoxError>>()?;
+    let mut env = RustFSTestEnvironment::new().await?;
+    let log_path = evidence_dir.as_deref().unwrap_or(fixture.path()).join("server.log");
+    env.capture_log_path = Some(log_path.to_str().ok_or("fixture log path is not UTF-8")?.to_owned());
+    let server_env = [
+        ("RUSTFS_UNSAFE_BYPASS_DISK_CHECK", "true"),
+        ("RUSTFS_DURABILITY_MODE", "strict"),
+        ("RUSTFS_NEW_BUCKET_DURABILITY_MODE", "strict"),
+        ("RUST_LOG", "warn,rustfs::heal=debug"),
+    ];
+    env.start_rustfs_server_from_binary(&previous_binary, extra_drives.iter().map(String::as_str).collect(), &server_env)
+        .await?;
+    env.create_test_bucket(BUCKET).await?;
+    let (status, durability) = admin_request(
+        &env.url,
+        Method::GET,
+        &format!("/rustfs/admin/v3/bucket-durability/{BUCKET}"),
+        None,
+        &env.access_key,
+        &env.secret_key,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "old bucket durability: {durability}");
+    assert_eq!(serde_json::from_str::<Value>(&durability)?["mode"], "strict");
+
+    let old_client = env.create_s3_client();
+    let manifest = stream::iter(0..OBJECTS)
+        .map(|index| {
+            let client = old_client.clone();
+            async move {
+                let (key, body) = rc5_checkpoint_object(index);
+                let entry = serde_json::json!({
+                    "bucket": BUCKET,
+                    "key": key,
+                    "length": body.len(),
+                    "sha256": rustfs_utils::hex_sha256(&body, str::to_owned),
+                });
+                client
+                    .put_object()
+                    .bucket(BUCKET)
+                    .key(&key)
+                    .body(ByteStream::from(body))
+                    .send()
+                    .await?;
+                Ok::<_, BoxError>(entry)
+            }
+        })
+        .buffered(4)
+        .try_collect::<Vec<_>>()
+        .await?;
+    let drives = extra_drives
+        .iter()
+        .map(PathBuf::from)
+        .chain(std::iter::once(PathBuf::from(&env.temp_dir)))
+        .collect::<Vec<_>>();
+    let writer_pid = env.process.as_ref().ok_or("rc.5 writer is not running")?.id();
+    let start_heal = async {
+        let (status, body) = tokio::time::timeout(
+            Duration::from_secs(15),
+            admin_request(
+                &env.url,
+                Method::POST,
+                "/rustfs/admin/v3/heal/",
+                Some(
+                    serde_json::json!({
+                        "recursive": true, "dryRun": false, "remove": false, "recreate": false,
+                        "scanMode": 2, "updateParity": false, "nolock": false, "pool": 0, "set": 0,
+                    })
+                    .to_string(),
+                ),
+                &env.access_key,
+                &env.secret_key,
+            ),
+        )
+        .await??;
+        if status != StatusCode::OK {
+            return Err(format!("rc.5 root heal was not accepted: {status} {body}").into());
+        }
+        Ok::<_, BoxError>(body)
+    };
+    let (capture, heal_start) = tokio::try_join!(capture_rc5_checkpoint(&drives, writer_pid), start_heal)?;
+    env.stop_server();
+    assert_eq!(
+        std::fs::read(&capture.path)?,
+        capture.bytes,
+        "stopping the old writer must preserve captured bytes"
+    );
+    let checkpoint_dir = capture.disk.join(".rustfs.sys/buckets");
+    let resume_path = checkpoint_dir.join(format!("{}_ahm_resume_state.json", capture.task_id));
+    let resume_bytes = std::fs::read(&resume_path)?;
+    let old_checkpoint: Value = serde_json::from_slice(&capture.bytes)?;
+    if let Some(directory) = &evidence_dir {
+        std::fs::write(directory.join("checkpoint.rc5.json"), &capture.bytes)?;
+        std::fs::write(directory.join("resume.rc5.json"), &resume_bytes)?;
+        std::fs::write(directory.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)?;
+        std::fs::write(
+            directory.join("source.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "kind": "old-release-checkpoint-reader-upgrade",
+                "scope": "schema-6 reader authentication, safe rewind and object reads; not full G09 qualification",
+                "writer_revision": RC5_COMMIT,
+                "writer_binary_sha256": checkpoint_binary_sha256(&previous_binary)?,
+                "candidate_revision": current_source_revision()?,
+                "candidate_binary_sha256": checkpoint_binary_sha256(&current_binary)?,
+                "layout": "one process and four logical drives; not physical fault qualification",
+                "task_id": capture.task_id,
+                "checkpoint_sha256": rustfs_utils::hex_sha256(&capture.bytes, str::to_owned),
+                "resume_sha256": rustfs_utils::hex_sha256(&resume_bytes, str::to_owned),
+                "acknowledged_objects": manifest.len(),
+                "bucket_durability": serde_json::from_str::<Value>(&durability)?,
+                "heal_start": serde_json::from_str::<Value>(&heal_start)?,
+            }))?,
+        )?;
+    }
+
+    let blocked_path = checkpoint_dir.join(format!("{}_ahm_checkpoint.blocked", capture.task_id));
+    assert!(!blocked_path.try_exists()?, "the original checkpoint must not already be blocked");
+    let disk_options = DiskOption {
+        cleanup: false,
+        health_check: false,
+    };
+    // Reopen with the same member order passed to the old writer.
+    let disk_index = drives
+        .iter()
+        .position(|drive| drive == &capture.disk)
+        .ok_or("captured disk is not a fixture member")?;
+    let mut endpoint = Endpoint::try_from(capture.disk.to_str().ok_or("captured drive path is not UTF-8")?)?;
+    endpoint.set_pool_index(0);
+    endpoint.set_set_index(0);
+    endpoint.set_disk_index(disk_index);
+    let disk = new_disk(&endpoint, &disk_options).await?;
+    let manager = CheckpointManager::load_from_disk(disk.clone(), &capture.task_id).await?;
+    let rewound = manager.get_checkpoint().await;
+    assert_eq!(rewound.schema_version, 7);
+    assert_eq!(rewound.task_id, capture.task_id);
+    assert_eq!((rewound.current_bucket_index, rewound.current_object_index), (0, 0));
+    assert!(rewound.processed_objects.is_empty() && rewound.failed_objects.is_empty() && rewound.skipped_objects.is_empty());
+    assert_eq!(rewound.successful_objects, 0);
+    assert_eq!(rewound.failed_object_count, 0);
+    assert_eq!(rewound.skipped_object_count, 0);
+    assert_eq!(rewound.processed_bytes, 0);
+    assert_eq!((rewound.total_objects, rewound.total_bytes), (0, 0));
+    assert!(rewound.baseline_generation.is_none() && !rewound.baseline_known && !rewound.counter_unknown);
+    assert!(!blocked_path.try_exists()?, "an authentic old checkpoint must not be quarantined");
+    assert_eq!(
+        std::fs::read(&capture.path)?,
+        capture.bytes,
+        "the reader must not rewrite the old checkpoint"
+    );
+    assert_eq!(std::fs::read(&resume_path)?, resume_bytes, "the reader must not take over the old task");
+    drop(manager);
+    drop(disk);
+
+    // A separate copy with one digest byte changed proves that successful
+    // rewind above did not bypass authentication of the original wire bytes.
+    let corrupt_root = fixture.path().join("corrupt-reader-control");
+    let corrupt_metadata = corrupt_root.join(".rustfs.sys/buckets");
+    std::fs::create_dir_all(&corrupt_metadata)?;
+    let mut corrupted = capture.bytes.clone();
+    let digest = old_checkpoint["integrity_digest"]
+        .as_str()
+        .ok_or("old checkpoint digest is not a string")?;
+    let offset = corrupted
+        .windows(digest.len())
+        .position(|bytes| bytes == digest.as_bytes())
+        .ok_or("the digest is absent from the captured bytes")?;
+    corrupted[offset] = if corrupted[offset] == b'A' { b'B' } else { b'A' };
+    let corrupt_path = corrupt_metadata.join(format!("{}_ahm_checkpoint.json", capture.task_id));
+    std::fs::write(&corrupt_path, &corrupted)?;
+    let endpoint = Endpoint::try_from(corrupt_root.to_str().ok_or("control disk path is not UTF-8")?)?;
+    let corrupt_disk = new_disk(&endpoint, &disk_options).await?;
+    let Err(error) = CheckpointManager::load_from_disk(corrupt_disk.clone(), &capture.task_id).await else {
+        return Err("the current checkpoint reader accepted a corrupted signature".into());
+    };
+    assert!(matches!(error, rustfs_heal::Error::InvalidCheckpoint(ref reason) if reason.contains("digest")));
+    let corrupt_blocked = corrupt_metadata.join(format!("{}_ahm_checkpoint.blocked", capture.task_id));
+    assert!(corrupt_blocked.try_exists()?, "the corrupted copy must retain a blocked marker");
+    assert_eq!(std::fs::read(&corrupt_path)?, corrupted, "quarantine must preserve the invalid bytes");
+    if let Some(directory) = &evidence_dir {
+        std::fs::write(directory.join("checkpoint.corrupted.json"), &corrupted)?;
+        std::fs::copy(&corrupt_blocked, directory.join("checkpoint.corrupted.blocked"))?;
+    }
+    drop(corrupt_disk);
+
+    env.restart_server_preserving_data(extra_drives.iter().map(String::as_str).collect(), &server_env)
+        .await?;
+    let current_client = env.create_s3_client();
+    stream::iter(0..OBJECTS)
+        .map(|index| {
+            let client = current_client.clone();
+            async move {
+                let (key, expected) = rc5_checkpoint_object(index);
+                let (_, actual) = read_object(&client, BUCKET, &key, None).await?;
+                assert_eq!(actual, expected, "old object {key} changed during the upgrade");
+                Ok::<_, BoxError>(())
+            }
+        })
+        .buffer_unordered(4)
+        .try_collect::<Vec<_>>()
+        .await?;
+    env.stop_server();
+    if let Some(directory) = &evidence_dir {
+        std::fs::write(
+            directory.join("result.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "status": "passed",
+                "scope": "old-release checkpoint reader and object-data upgrade only",
+                "authenticated_original_bytes": true,
+                "original_checkpoint_unchanged_after_read": true,
+                "old_successful_objects": old_checkpoint["successful_objects"],
+                "rewound_schema": rewound.schema_version,
+                "rewound_successful_objects": rewound.successful_objects,
+                "corrupt_digest_rejected_and_retained": true,
+                "verified_objects": OBJECTS,
+            }))?,
+        )?;
+    }
     Ok(())
 }
 
