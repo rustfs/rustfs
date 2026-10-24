@@ -595,7 +595,7 @@ async fn reserve_sharded(context: QuotaContext, old_size: u64, new_size: u64) ->
         let allow_create = shard_may_be_created(&allocator, data.shard_index, bootstrap);
         let shard_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &data.shard_object).await?;
         let shard_guard = Arc::new(shard_lock.get_write_lock(get_lock_acquire_timeout()).await?);
-        let mut shard = load_current_shard_locked(
+        let (mut shard, shard_created) = load_current_shard_locked(
             Arc::clone(&store),
             &data.shard_object,
             bucket_incarnation,
@@ -640,7 +640,7 @@ async fn reserve_sharded(context: QuotaContext, old_size: u64, new_size: u64) ->
             });
         }
         let shard_was_empty = shard.grants.is_empty() && shard.reservations.is_empty() && shard.accounted_usage == 0;
-        if shard_was_empty {
+        if shard_created || shard_was_empty {
             fence_namespace_mutations(&store, RUSTFS_META_BUCKET, &data.shard_object, None).await?;
             save_shard_locked(Arc::clone(&store), &data.shard_object, &shard, &shard_guard).await?;
         }
@@ -1510,18 +1510,18 @@ async fn load_current_shard_locked(
     shard_index: u16,
     allow_create: bool,
     allocator: &QuotaAllocatorLedger,
-) -> Result<QuotaShardLedger> {
-    let mut shard = match load_shard_locked(Arc::clone(&store), object).await {
-        Ok(shard) if shard.matches(bucket_incarnation, quota_revision, shard_index) => shard,
+) -> Result<(QuotaShardLedger, bool)> {
+    let (mut shard, created) = match load_shard_locked(Arc::clone(&store), object).await {
+        Ok(shard) if shard.matches(bucket_incarnation, quota_revision, shard_index) => (shard, false),
         Ok(_) => return Err(StorageError::PartMissingOrCorrupt),
         Err(StorageError::ConfigNotFound) if allow_create => {
-            QuotaShardLedger::new(bucket_incarnation, quota_revision, shard_index)
+            (QuotaShardLedger::new(bucket_incarnation, quota_revision, shard_index), true)
         }
         Err(StorageError::ConfigNotFound) => return Err(StorageError::PartMissingOrCorrupt),
         Err(err) => return Err(err),
     };
     shard.adopt_grants(allocator)?;
-    Ok(shard)
+    Ok((shard, created))
 }
 
 async fn save_allocator_locked(
@@ -1646,7 +1646,7 @@ async fn reap_sharded_reservations(
     .await?;
     let shard_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &data.shard_object).await?;
     let shard_guard = shard_lock.get_write_lock(get_lock_acquire_timeout()).await?;
-    let shard = load_current_shard_locked(
+    let (shard, _) = load_current_shard_locked(
         Arc::clone(&store),
         &data.shard_object,
         bucket_incarnation,
@@ -1709,7 +1709,7 @@ async fn reap_sharded_reservations(
     .await?;
     let shard_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &data.shard_object).await?;
     let shard_guard = Arc::new(shard_lock.get_write_lock(get_lock_acquire_timeout()).await?);
-    let mut shard = load_current_shard_locked(
+    let (mut shard, _) = load_current_shard_locked(
         Arc::clone(&store),
         &data.shard_object,
         bucket_incarnation,
@@ -1774,7 +1774,7 @@ async fn mark_commit_started_sharded(data: &ShardedReservationData) -> Result<()
         let allocator = load_allocator_locked(Arc::clone(&store), &data.allocator_object).await?;
         let shard_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &data.shard_object).await?;
         let shard_guard = Arc::new(shard_lock.get_write_lock(get_lock_acquire_timeout()).await?);
-        let mut shard = load_current_shard_locked(
+        let (mut shard, _) = load_current_shard_locked(
             Arc::clone(&store),
             &data.shard_object,
             data.bucket_incarnation,
@@ -1819,7 +1819,7 @@ async fn settle_sharded(data: &ShardedReservationData, committed: bool) -> Resul
         let allocator = load_allocator_locked(Arc::clone(&store), &data.allocator_object).await?;
         let shard_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &data.shard_object).await?;
         let shard_guard = Arc::new(shard_lock.get_write_lock(get_lock_acquire_timeout()).await?);
-        let mut shard = load_current_shard_locked(
+        let (mut shard, _) = load_current_shard_locked(
             Arc::clone(&store),
             &data.shard_object,
             data.bucket_incarnation,
@@ -2534,5 +2534,71 @@ mod tests {
                 .size,
             1
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sharded_reservation_persists_a_populated_lazy_shard_before_refill() {
+        use crate::object_api::PutObjReader;
+        use crate::storage_api_contracts::object::ObjectIO;
+
+        let (_directories, store) = metadata_sys::test_support::isolated_store_over_temp_disks().await;
+        metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        crate::services::notification_sys::install_cross_pool_fence_fleet_proof_for_test();
+        let bucket = format!("quota-populated-bootstrap-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create quota bucket");
+
+        let mut seed_shard = None;
+        let mut seed_name = None;
+        let mut candidate_name = None;
+        let mut bootstrap_name = None;
+        for index in 0..10_000 {
+            let object = format!("quota-populated-object-{index}");
+            let object_shard = shard_index(&object);
+            if seed_shard.is_none() {
+                seed_shard = Some(object_shard);
+                seed_name = Some(object);
+            } else if Some(object_shard) == seed_shard && candidate_name.is_none() {
+                candidate_name = Some(object);
+            } else if Some(object_shard) != seed_shard && bootstrap_name.is_none() {
+                bootstrap_name = Some(object);
+            }
+            if candidate_name.is_some() && bootstrap_name.is_some() {
+                break;
+            }
+        }
+        let seed_name = seed_name.expect("find a seeded shard");
+        let candidate_name = candidate_name.expect("find a second object in the seeded shard");
+        let bootstrap_name = bootstrap_name.expect("find an empty bootstrap shard");
+
+        let mut seed = PutObjReader::from_vec(vec![1]);
+        store
+            .put_object(&bucket, &seed_name, &mut seed, &ObjectOptions::default())
+            .await
+            .expect("seed existing usage before enabling v2");
+        store
+            .update_bucket_metadata_config(
+                &bucket,
+                "quota.json",
+                serde_json::to_vec(&super::super::BucketQuota::new_sharded(100_000)).expect("serialize v2 quota"),
+            )
+            .await
+            .expect("enable v2 quota");
+
+        let mut bootstrap = PutObjReader::from_vec(vec![2]);
+        store
+            .put_object(&bucket, &bootstrap_name, &mut bootstrap, &ObjectOptions::default())
+            .await
+            .expect("bootstrap an empty shard");
+
+        let mut candidate = PutObjReader::from_vec(vec![3]);
+        let result = store
+            .put_object(&bucket, &candidate_name, &mut candidate, &ObjectOptions::default())
+            .await
+            .expect("a populated shard must persist before refill and accept its first growth");
+        assert_eq!(result.size, 1);
     }
 }
