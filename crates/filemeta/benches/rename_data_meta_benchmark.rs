@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use bytes::Bytes;
-use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, SamplingMode, criterion_group, criterion_main};
 use rustfs_filemeta::{ErasureAlgo, FileInfo, FileMeta, ObjectPartInfo};
 use std::hint::black_box;
 use std::time::Duration;
@@ -119,6 +119,8 @@ fn bench_rename_data_meta_path(c: &mut Criterion) {
 
 fn bench_delete_version_batches(c: &mut Criterion) {
     let mut group = c.benchmark_group("delete_version_batch");
+    // Keep iteration counts and fixture batches independent of sample position.
+    group.sampling_mode(SamplingMode::Flat);
     for (kind, inline_size) in [
         ("physical", None),
         ("inline-64", Some(64_usize)),
@@ -168,11 +170,18 @@ fn bench_delete_version_batches(c: &mut Criterion) {
                     ..Default::default()
                 })
                 .collect();
+            // Large histories use one fixture per timing interval in both implementations.
+            // Tiny histories amortize the timer over a fixed batch instead.
+            let batch_size = if versions < 128 {
+                BatchSize::NumIterations(32)
+            } else {
+                BatchSize::PerIteration
+            };
             group.bench_with_input(BenchmarkId::new(format!("{kind}-r{requested}"), versions), &versions, |b, _| {
                 b.iter_batched(
                     || meta.clone(),
                     |mut metadata| black_box(metadata.delete_versions(black_box(&requests)).expect("delete batch")),
-                    BatchSize::LargeInput,
+                    batch_size,
                 )
             });
         }
