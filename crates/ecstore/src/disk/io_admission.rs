@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use metrics::{counter, gauge, histogram};
 use rustfs_concurrency::adaptive::AdaptivePermit;
+use rustfs_concurrency::adaptive::permit_set::AdaptivePermitSet;
 use rustfs_rio::ChunkReader;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::Notify;
@@ -36,7 +37,41 @@ const BACKGROUND_MAX_WAIT: Duration = Duration::from_millis(100);
 
 tokio::task_local! {
     static DISK_IO_CONTEXT: DiskIoContext;
-    static RESOURCE_IO_UNIT: AdaptivePermit;
+    static RESOURCE_IO_UNIT: ResourceIoUnit;
+}
+
+/// Native I/O retains the physical subset selected before storage work. A
+/// layered disk may touch several leaves; unrelated devices stay outside it.
+#[derive(Debug)]
+pub(crate) enum ResourceIoUnit {
+    Single(AdaptivePermit),
+    Set(AdaptivePermitSet),
+}
+
+impl Clone for ResourceIoUnit {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Single(unit) => Self::Single(unit.clone()),
+            Self::Set(units) => Self::Set(units.clone()),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_resource_units(count: usize) -> (ResourceIoUnit, Vec<Arc<rustfs_concurrency::adaptive::AdaptiveAdmission>>) {
+    use rustfs_concurrency::adaptive::{AdaptiveAdmission, permit_set::AdaptivePermitSetOwner};
+    use std::num::NonZeroU16;
+
+    assert!((1..=2).contains(&count), "test single and layered disks");
+    let gates: Vec<_> = (0..count).map(|_| AdaptiveAdmission::new(NonZeroU16::MIN, 1)).collect();
+    let mut admitted: Vec<_> = gates.iter().map(|gate| gate.try_acquire().expect("test resource")).collect();
+    let unit = if count == 1 {
+        ResourceIoUnit::Single(admitted.pop().expect("single resource"))
+    } else {
+        let owner = AdaptivePermitSetOwner::new(NonZeroU16::MIN, gates.clone()).expect("layered resource");
+        ResourceIoUnit::Set(owner.capture(&admitted.iter().collect::<Vec<_>>()).expect("admitted subset"))
+    };
+    (unit, gates)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,7 +86,7 @@ pub(crate) struct DiskIoContext {
     pub(crate) cancellation: CancellationToken,
     pub(crate) admission: Option<Arc<DiskIoAdmission>>,
     pub(crate) permit: Option<DiskIoPermit>,
-    pub(crate) resource_unit: Option<AdaptivePermit>,
+    pub(crate) resource_unit: Option<ResourceIoUnit>,
 }
 
 /// Mark disk I/O issued by `future` as background work for local-disk admission.
@@ -78,10 +113,18 @@ pub async fn with_background_disk_io<F: Future>(cancellation: CancellationToken,
 /// of a stalled native operation. Escaping buffers need their own memory leases.
 #[doc(hidden)]
 pub async fn with_background_resource_unit<F: Future>(unit: AdaptivePermit, future: F) -> F::Output {
-    RESOURCE_IO_UNIT.scope(unit, future).await
+    RESOURCE_IO_UNIT.scope(ResourceIoUnit::Single(unit), future).await
 }
 
-pub(crate) fn current_resource_unit() -> Option<AdaptivePermit> {
+/// Retain only the previously admitted physical leaves touched by this I/O.
+/// Capture the subset before storage locks. Do not pass the complete parent
+/// operation's resource set to a native job that touches only some of its disks.
+#[doc(hidden)]
+pub async fn with_background_resource_set<F: Future>(units: AdaptivePermitSet, future: F) -> F::Output {
+    RESOURCE_IO_UNIT.scope(ResourceIoUnit::Set(units), future).await
+}
+
+pub(crate) fn current_resource_unit() -> Option<ResourceIoUnit> {
     RESOURCE_IO_UNIT.try_with(Clone::clone).ok().or_else(|| {
         DISK_IO_CONTEXT
             .try_with(|context| context.resource_unit.clone())
@@ -93,9 +136,9 @@ pub(crate) fn current_resource_unit() -> Option<AdaptivePermit> {
 /// Transfer only resource ownership into an existing spawned task. Disk
 /// classification/permits are not inherited: changing those can introduce a
 /// wait behind a disk permit still held by the parent.
-pub(crate) async fn with_optional_resource_unit<F: Future>(unit: Option<AdaptivePermit>, future: F) -> F::Output {
+pub(crate) async fn with_optional_resource_unit<F: Future>(unit: Option<ResourceIoUnit>, future: F) -> F::Output {
     match unit {
-        Some(unit) => with_background_resource_unit(unit, future).await,
+        Some(unit) => RESOURCE_IO_UNIT.scope(unit, future).await,
         None => future.await,
     }
 }
@@ -233,7 +276,7 @@ impl DiskIoAdmission {
         self.foreground_with_resource(current_resource_unit())
     }
 
-    fn foreground_with_resource(self: &Arc<Self>, resource_unit: Option<AdaptivePermit>) -> DiskIoPermit {
+    fn foreground_with_resource(self: &Arc<Self>, resource_unit: Option<ResourceIoUnit>) -> DiskIoPermit {
         self.foreground_active.fetch_add(1, Ordering::AcqRel);
         if self.background_waiters.load(Ordering::Acquire) > 0 {
             self.record_state();
@@ -254,7 +297,7 @@ impl DiskIoAdmission {
     async fn background_with_resource(
         self: &Arc<Self>,
         cancellation: &CancellationToken,
-        resource_unit: Option<AdaptivePermit>,
+        resource_unit: Option<ResourceIoUnit>,
     ) -> std::io::Result<DiskIoPermit> {
         let started_at = Instant::now();
         let ticket = {
@@ -429,7 +472,7 @@ impl DiskIoPermit {
 struct DiskIoPermitLease {
     admission: Arc<DiskIoAdmission>,
     class: DiskIoClass,
-    resource_unit: Option<AdaptivePermit>,
+    resource_unit: Option<ResourceIoUnit>,
 }
 
 pub(crate) fn spawn_blocking_with_disk_io_permit<T, F>(
@@ -594,6 +637,63 @@ mod tests {
     use rustfs_concurrency::adaptive::AdaptiveAdmission;
     use std::num::NonZeroU16;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn physical_subset_survives_native_cancellation_without_retaining_unrelated_disks() {
+        use rustfs_concurrency::adaptive::permit_set::AdaptivePermitSetOwner;
+
+        for disk_permit in [false, true] {
+            let maximum = NonZeroU16::new(1).expect("one physical unit");
+            let first = AdaptiveAdmission::new(maximum, 1);
+            let second = AdaptiveAdmission::new(maximum, 1);
+            let unrelated = AdaptiveAdmission::new(maximum, 1);
+            let owner = AdaptivePermitSetOwner::new(maximum, vec![first.clone(), second.clone()]).expect("layered disk");
+            let a = first.try_acquire().expect("first backing device");
+            let b = second.try_acquire().expect("second backing device");
+            let healthy = unrelated.try_acquire().expect("another disk in the parent operation");
+            let subset = owner.capture(&[&a, &b]).expect("capture before storage work");
+            drop((a, b, owner));
+            let disk = DiskIoAdmission::new("physical-subset-native");
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _healthy = healthy;
+                with_background_resource_set(subset, async {
+                    let permit = if disk_permit {
+                        Some(disk.background(&CancellationToken::new()).await.expect("logical disk permit"))
+                    } else {
+                        None
+                    };
+                    spawn_blocking_with_disk_io_permit(permit, move || {
+                        started_tx.send(()).expect("native I/O started");
+                        release_rx.blocking_recv().expect("release native I/O");
+                    })
+                    .await
+                    .expect("native I/O completed");
+                })
+                .await;
+            });
+            started_rx.await.expect("native worker retains subset");
+            task.abort();
+            assert!(task.await.expect_err("cancel async waiter").is_cancelled());
+            let active = [first.snapshot().active, second.snapshot().active, unrelated.snapshot().active];
+            let healthy_available = unrelated.try_acquire().is_some();
+            first.set_limit(0);
+            second.set_limit(0);
+            release_tx.send(()).expect("finish native work");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while first.snapshot().active != 0 || second.snapshot().active != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("both backing devices are returned after native completion");
+            assert_eq!(active, [1, 1, 0], "only the native I/O's physical subset remains charged");
+            assert!(healthy_available, "cancellation frees the independent disk immediately");
+            assert!(first.try_acquire().is_none());
+            assert!(second.try_acquire().is_none(), "old completions cannot reopen shrunken owners");
+        }
+    }
 
     #[tokio::test]
     async fn resource_unit_outlives_cancelled_scope_until_native_io_finishes() {

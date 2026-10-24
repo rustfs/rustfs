@@ -759,13 +759,13 @@ impl OpenedDstDirFsyncGroup {
 
 struct DstDirFsyncWaiter {
     namespace_owner: Option<Arc<dyn Send + Sync>>,
-    resource_unit: Option<rustfs_concurrency::adaptive::AdaptivePermit>,
+    resource_unit: Option<super::io_admission::ResourceIoUnit>,
     result_tx: oneshot::Sender<SharedDstDirFsyncResult>,
 }
 
 struct DstDirFsyncOwner {
     _namespace: Option<Arc<dyn Send + Sync>>,
-    _resource: Option<rustfs_concurrency::adaptive::AdaptivePermit>,
+    _resource: Option<super::io_admission::ResourceIoUnit>,
 }
 
 #[derive(Clone)]
@@ -1207,7 +1207,7 @@ type FileFdatasyncGroupKey = (usize, bool);
 
 struct FileFdatasyncWaiter {
     files: Vec<PathBuf>,
-    resource_unit: Option<rustfs_concurrency::adaptive::AdaptivePermit>,
+    resource_unit: Option<super::io_admission::ResourceIoUnit>,
     enqueued_at: Option<Instant>,
     wait_role: &'static str,
     result_tx: oneshot::Sender<SharedFileFdatasyncResult>,
@@ -9079,46 +9079,49 @@ mod tests {
 
     #[tokio::test]
     async fn resource_native_dispatch_retains_each_unit_after_caller_cancellation() {
-        use crate::disk::io_admission::with_background_resource_unit;
-        use rustfs_concurrency::adaptive::AdaptiveAdmission;
-        use std::num::NonZeroU16;
+        use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
 
         let mut retained = Vec::new();
-        for queued in [false, true] {
-            let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
-            let unit = gate.acquire().await;
-            let (started_tx, started_rx) = oneshot::channel();
-            let (release_tx, release_rx) = oneshot::channel();
-            let (finished_tx, finished_rx) = oneshot::channel();
-            let worker = tokio::spawn(with_background_resource_unit(unit, async move {
-                let operation = move || {
-                    started_tx.send(()).expect("native operation entered");
-                    let _ = release_rx.blocking_recv();
-                    let _ = finished_tx.send(());
-                    Ok(())
-                };
-                if queued {
-                    DiskBlockingQueue::new().run(operation).await
-                } else {
-                    fsync_spawn_blocking(operation).await.expect("native operation joined")
-                }
-            }));
-            started_rx.await.expect("native operation started");
-            worker.abort();
-            assert!(worker.await.expect_err("caller cancelled").is_cancelled());
-            retained.push(gate.snapshot().active);
-            // Drain native work before assertions, including in the negative control.
-            release_tx.send(()).expect("release native operation");
-            finished_rx.await.expect("native operation finished");
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while gate.snapshot().active != 0 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("native completion returns the unit");
+        for physical_count in [1, 2] {
+            for queued in [false, true] {
+                let (unit, gates) = test_resource_units(physical_count);
+                let (started_tx, started_rx) = oneshot::channel();
+                let (release_tx, release_rx) = oneshot::channel();
+                let (finished_tx, finished_rx) = oneshot::channel();
+                let worker = tokio::spawn(with_optional_resource_unit(Some(unit), async move {
+                    let operation = move || {
+                        started_tx.send(()).expect("native operation entered");
+                        let _ = release_rx.blocking_recv();
+                        let _ = finished_tx.send(());
+                        Ok(())
+                    };
+                    if queued {
+                        DiskBlockingQueue::new().run(operation).await
+                    } else {
+                        fsync_spawn_blocking(operation).await.expect("native operation joined")
+                    }
+                }));
+                started_rx.await.expect("native operation started");
+                worker.abort();
+                assert!(worker.await.expect_err("caller cancelled").is_cancelled());
+                retained.push(gates.iter().map(|gate| gate.snapshot().active).collect::<Vec<_>>());
+                // Drain native work before assertions, including in the negative control.
+                release_tx.send(()).expect("release native operation");
+                finished_rx.await.expect("native operation finished");
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while gates.iter().any(|gate| gate.snapshot().active != 0) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("native completion returns the unit");
+            }
         }
-        assert_eq!(retained, [1, 1], "fsync and namespace dispatch must retain their own producer's unit");
+        assert_eq!(
+            retained,
+            [vec![1], vec![1], vec![1, 1], vec![1, 1]],
+            "fsync and namespace dispatch must retain their own producer's unit"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

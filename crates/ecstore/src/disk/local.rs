@@ -54,6 +54,7 @@ use crate::diagnostics::get::{
 #[cfg(test)]
 use crate::disk::HEALING_MARKER_PATH;
 use crate::disk::disk_store::{get_drive_walkdir_stall_timeout, get_object_disk_read_timeout};
+use crate::disk::io_admission::ResourceIoUnit;
 use crate::disk::io_admission::{DiskIoPermit, current_resource_unit, spawn_blocking_with_disk_io_permit};
 use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
@@ -83,7 +84,6 @@ use metrics::counter;
 #[cfg(target_os = "linux")]
 use metrics::gauge;
 use parking_lot::{Mutex as ParkingLotMutex, RwLock as ParkingLotRwLock};
-use rustfs_concurrency::adaptive::AdaptivePermit;
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
     ValidationMode, get_file_info, read_xl_meta_no_data_sync,
@@ -344,7 +344,7 @@ enum MetadataReadOp {
 }
 
 struct MetadataReadJob {
-    resource_unit: Option<AdaptivePermit>,
+    resource_unit: Option<ResourceIoUnit>,
     path: PathBuf,
     io_permit: Option<DiskIoPermit>,
     op: MetadataReadOp,
@@ -25984,42 +25984,46 @@ mod test {
 
     #[tokio::test]
     async fn metadata_read_job_retains_resource_unit_until_native_completion() {
-        use crate::disk::with_background_resource_unit;
-        use rustfs_concurrency::adaptive::AdaptiveAdmission;
-        use std::num::NonZeroU16;
+        use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
 
-        let dir = tempfile::tempdir().expect("metadata root");
-        let queue = MetadataReadQueue::new(os::PublicationRoot::new(dir.path()).expect("publication root"));
-        let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        with_background_resource_unit(gate.acquire().await, async {
-            queue.enqueue(MetadataReadJob {
-                resource_unit: None,
-                path: PathBuf::new(),
-                io_permit: None,
-                op: MetadataReadOp::TestCustom {
-                    is_closed: Box::new(|| false),
-                    run: Box::new(move || {
-                        started_tx.send(()).expect("native metadata worker started");
-                        release_rx.blocking_recv().expect("release native metadata work");
-                    }),
-                },
-            });
-            started_rx.await.expect("worker owns queued job");
-        })
-        .await;
-        let held = gate.snapshot().active;
-        release_tx.send(()).expect("release native job after caller scope ends");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while gate.snapshot().active != 0 || queue.state.lock().active_workers != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("native metadata job and worker retire");
-        assert_eq!(held, 1, "leaving the caller scope must not release a live metadata job's unit");
-        assert!(gate.try_acquire().is_some());
+        for physical_count in [1, 2] {
+            let dir = tempfile::tempdir().expect("metadata root");
+            let queue = MetadataReadQueue::new(os::PublicationRoot::new(dir.path()).expect("publication root"));
+            let (unit, gates) = test_resource_units(physical_count);
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            with_optional_resource_unit(Some(unit), async {
+                queue.enqueue(MetadataReadJob {
+                    resource_unit: None,
+                    path: PathBuf::new(),
+                    io_permit: None,
+                    op: MetadataReadOp::TestCustom {
+                        is_closed: Box::new(|| false),
+                        run: Box::new(move || {
+                            started_tx.send(()).expect("native metadata worker started");
+                            release_rx.blocking_recv().expect("release native metadata work");
+                        }),
+                    },
+                });
+                started_rx.await.expect("worker owns queued job");
+            })
+            .await;
+            let held: Vec<_> = gates.iter().map(|gate| gate.snapshot().active).collect();
+            release_tx.send(()).expect("release native job after caller scope ends");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while gates.iter().any(|gate| gate.snapshot().active != 0) || queue.state.lock().active_workers != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("native metadata job and worker retire");
+            assert_eq!(
+                held,
+                vec![1; physical_count],
+                "leaving the caller scope must not release a live metadata job's unit"
+            );
+            assert!(gates.iter().all(|gate| gate.try_acquire().is_some()));
+        }
     }
 
     #[tokio::test]

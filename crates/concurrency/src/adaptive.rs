@@ -10,6 +10,10 @@ use std::time::Duration;
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::Instant;
 
+pub mod permit_set;
+
+const MAX_PERMIT_REFERENCES: usize = usize::MAX / 2;
+
 /// A resource owner publishes a capacity; running units retain their permits
 /// after a reduction. Lease slots are reserved once, with no per-unit Arc
 /// allocation. Tokio wait queues may lazily initialize platform mutex storage
@@ -61,10 +65,12 @@ pub struct AdaptivePermit {
 
 impl Clone for AdaptivePermit {
     fn clone(&self) -> Self {
-        // Every slot reference owns a strong owner reference. Clone the Arc
-        // first, so its overflow protection also bounds the slot refcount.
+        // Subset carriers can retain slot references through a shared owner,
+        // so the slot count needs its own bound in addition to Arc's guard.
         let owner = Arc::clone(&self.owner);
-        owner.slots[self.slot / 64].references[self.slot % 64].fetch_add(1, Ordering::Relaxed);
+        if owner.slots[self.slot / 64].references[self.slot % 64].fetch_add(1, Ordering::Relaxed) >= MAX_PERMIT_REFERENCES {
+            std::process::abort();
+        }
         Self { owner, slot: self.slot }
     }
 }
@@ -466,6 +472,21 @@ impl AdaptiveAdmission {
         self.slots[slot / 64].free.fetch_or(1_u64 << (slot % 64), Ordering::Release);
     }
 
+    fn release_reference(&self, slot: usize) {
+        self.release_reference_with(slot, || {});
+    }
+
+    fn release_reference_with(&self, slot: usize, before_release: impl FnOnce()) {
+        if self.slots[slot / 64].references[slot % 64].fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        before_release();
+        // Publish the free slot before exposing another admission capacity.
+        self.release_slot(slot);
+        self.state.fetch_sub(1, Ordering::AcqRel);
+        self.changed.notify_one();
+    }
+
     /// Wait for capacity. The future owns no permit until it returns; dropping
     /// a pending future leaves capacity untouched. Wrap in the caller's existing
     /// cancellation/deadline select before acquiring any storage commit locks.
@@ -493,13 +514,7 @@ impl AdaptiveAdmission {
 
 impl Drop for AdaptivePermit {
     fn drop(&mut self) {
-        if self.owner.slots[self.slot / 64].references[self.slot % 64].fetch_sub(1, Ordering::AcqRel) != 1 {
-            return;
-        }
-        // Publish the free slot before exposing another admission capacity.
-        self.owner.release_slot(self.slot);
-        self.owner.state.fetch_sub(1, Ordering::AcqRel);
-        self.owner.changed.notify_one();
+        self.owner.release_reference(self.slot);
     }
 }
 
