@@ -439,10 +439,10 @@ The OTLP exporter records these node-local histograms for completed manager admi
 | Metric | Meaning |
 |---|---|
 | `rustfs_heal_admission_lock_phase_seconds` | Existing total from immediately before waiting for `active_heals` until immediately after releasing it, with the existing source/result/context labels. |
-| `rustfs_heal_admission_active_lock_wait_seconds` | Time waiting to acquire the outermost `active_heals` mutex. |
-| `rustfs_heal_admission_active_lock_hold_seconds` | Time from acquiring `active_heals` through its release, including waits for the nested queue and retrying mutexes. |
+| `rustfs_heal_admission_active_lock_wait_seconds` | Sum of waits to acquire the outermost admission `active_heals` guard, including forceStart reacquisition. |
+| `rustfs_heal_admission_active_lock_hold_seconds` | Sum of the outer admission guard's actual held intervals, including waits for the nested queue and retrying mutexes. |
 
-The two new histograms aggregate all observed admission sources and results without per-request labels. Their wait and hold samples partition the existing phase; recording happens after all three guards are released. They measure manager admission ownership, not namespace/object-lock waiting during repair. The status field `maxLockPhaseMicros` remains a manager-lifetime maximum, not a p95 sample. Keep same-window histogram counts and bucket resolution when deriving percentiles; missing observations do not mean zero latency. These metrics do not establish performance acceptance by themselves.
+The two new histograms aggregate all observed admission sources and results without per-request labels. An ordinary uninterrupted admission partitions the phase into wait and hold. Admin forceStart releases these guards while cancelling overlaps, then reacquires them: the cancellation gap is included only in the original total phase, and the second acquisition contributes to wait. Cancellation subroutine work is outside these outer admission guard intervals. Recording happens after all three guards are released. They measure manager admission ownership, not namespace/object-lock waiting during repair. The status field `maxLockPhaseMicros` remains a manager-lifetime maximum, not a p95 sample. Keep same-window histogram counts and bucket resolution when deriving percentiles; missing observations do not mean zero latency. These metrics do not establish performance acceptance by themselves.
 
 ## Heal runtime controls
 

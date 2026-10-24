@@ -518,13 +518,14 @@ struct HealAdmissionLockTiming {
 }
 
 impl HealAdmissionLockTiming {
-    // Called immediately after the outermost active_heals guard is released.
-    fn finish(wait_started: Instant, acquired: Instant) -> Self {
+    // Called after the last outer admission guard is released. forceStart's
+    // cancellation gap stays in phase, outside the accumulated guard intervals.
+    fn finish(phase_started: Instant, acquired: Instant, wait: Duration, previous_hold: Duration) -> Self {
         let released = Instant::now();
         Self {
-            phase: released.duration_since(wait_started),
-            wait: acquired.duration_since(wait_started),
-            hold: released.duration_since(acquired),
+            phase: released.duration_since(phase_started),
+            wait,
+            hold: previous_hold + released.duration_since(acquired),
         }
     }
 }
@@ -2061,7 +2062,9 @@ impl HealManager {
         // active -> retrying transitions can slip between duplicate checks.
         let lock_phase_start = Instant::now();
         let mut active_heals = self.active_heals.lock().await;
-        let active_lock_acquired = Instant::now();
+        let mut active_lock_acquired = Instant::now();
+        let mut active_lock_wait = active_lock_acquired.duration_since(lock_phase_start);
+        let mut active_lock_hold = Duration::ZERO;
         if self.cancel_token.is_cancelled() {
             return Err(Error::Other("Heal manager is stopping".to_string()));
         }
@@ -2111,7 +2114,8 @@ impl HealManager {
             drop(retrying_heals);
             drop(queue);
             drop(active_heals);
-            let lock_timing = HealAdmissionLockTiming::finish(lock_phase_start, active_lock_acquired);
+            let lock_timing =
+                HealAdmissionLockTiming::finish(lock_phase_start, active_lock_acquired, active_lock_wait, active_lock_hold);
             Self::record_admission_metric(request.source, admission, "duplicate");
             self.record_admission_observation(HealAdmissionObservation {
                 source,
@@ -2161,6 +2165,7 @@ impl HealManager {
             drop(retrying_heals);
             drop(queue);
             drop(active_heals);
+            active_lock_hold += active_lock_acquired.elapsed();
             for task_id in &overlapping {
                 match self.cancel_task(task_id).await {
                     Ok(_) => info!(
@@ -2178,7 +2183,10 @@ impl HealManager {
                 }
             }
             durable_owners.retain(|owner| !overlapping.contains(&owner.id));
+            let reacquire_start = Instant::now();
             active_heals = self.active_heals.lock().await;
+            active_lock_acquired = Instant::now();
+            active_lock_wait += active_lock_acquired.duration_since(reacquire_start);
             queue = self.heal_queue.lock().await;
             retrying_heals = self.retrying_heals.lock().await;
         }
@@ -2261,7 +2269,8 @@ impl HealManager {
             drop(retrying_heals);
             drop(queue);
             drop(active_heals);
-            let lock_timing = HealAdmissionLockTiming::finish(lock_phase_start, active_lock_acquired);
+            let lock_timing =
+                HealAdmissionLockTiming::finish(lock_phase_start, active_lock_acquired, active_lock_wait, active_lock_hold);
             Self::record_admission_metric(request.source, admission, "duplicate");
             self.record_admission_observation(HealAdmissionObservation {
                 source,
@@ -2317,7 +2326,8 @@ impl HealManager {
             drop(retrying_heals);
             drop(queue);
             drop(active_heals);
-            let lock_timing = HealAdmissionLockTiming::finish(lock_phase_start, active_lock_acquired);
+            let lock_timing =
+                HealAdmissionLockTiming::finish(lock_phase_start, active_lock_acquired, active_lock_wait, active_lock_hold);
             Self::record_admission_metric(request.source, HealAdmissionResult::Dropped(reason), "overlap_rejected");
             self.record_admission_observation(HealAdmissionObservation {
                 source,
@@ -2355,7 +2365,8 @@ impl HealManager {
                 drop(retrying_heals);
                 drop(queue);
                 drop(active_heals);
-                let lock_timing = HealAdmissionLockTiming::finish(lock_phase_start, active_lock_acquired);
+                let lock_timing =
+                    HealAdmissionLockTiming::finish(lock_phase_start, active_lock_acquired, active_lock_wait, active_lock_hold);
                 let admission = HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped);
                 Self::record_admission_metric(source, admission, "disposition_cache");
                 self.record_admission_observation(HealAdmissionObservation {
@@ -2435,7 +2446,8 @@ impl HealManager {
         drop(retrying_heals);
         drop(queue);
         drop(active_heals);
-        let lock_timing = HealAdmissionLockTiming::finish(lock_phase_start, active_lock_acquired);
+        let lock_timing =
+            HealAdmissionLockTiming::finish(lock_phase_start, active_lock_acquired, active_lock_wait, active_lock_hold);
         let displaced = displaced_terminal.is_some();
 
         if let (Some(displaced_task_id), Some(displaced_terminal)) = (displaced_task_id, displaced_terminal) {

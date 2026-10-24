@@ -81,7 +81,7 @@ async fn recorded<F: Future>(recorder: &AdmissionRecorder, future: F) -> F::Outp
     futures::future::poll_fn(|cx| metrics::with_local_recorder(recorder, || future.as_mut().poll(cx))).await
 }
 
-fn assert_partition(recorder: &AdmissionRecorder, minimum_wait: Duration, minimum_hold: Duration) {
+fn timing_samples(recorder: &AdmissionRecorder) -> (f64, f64, f64) {
     let samples = recorder.samples.lock().expect("admission samples");
     let sample = |name| {
         let values: Vec<_> = samples
@@ -92,7 +92,11 @@ fn assert_partition(recorder: &AdmissionRecorder, minimum_wait: Duration, minimu
         assert_eq!(values.len(), 1, "exactly one {name} observation per receipt");
         values[0]
     };
-    let (phase, wait, hold) = (sample(PHASE), sample(WAIT), sample(HOLD));
+    (sample(PHASE), sample(WAIT), sample(HOLD))
+}
+
+fn assert_partition(recorder: &AdmissionRecorder, minimum_wait: Duration, minimum_hold: Duration) {
+    let (phase, wait, hold) = timing_samples(recorder);
     assert!(wait >= minimum_wait.as_secs_f64(), "initial active-lock contention belongs to wait");
     assert!(hold >= minimum_hold.as_secs_f64(), "nested-lock contention belongs to active-lock hold");
     assert!(
@@ -134,4 +138,76 @@ async fn admission_timing_includes_queue_wait_while_active_lock_is_held() {
     assert_eq!(admission.await.expect("admit after queue lock release"), HealAdmissionResult::Accepted);
     assert!(manager.active_heals.try_lock().is_ok(), "receipt must release active ownership");
     assert_partition(&recorder, Duration::ZERO, minimum_hold);
+}
+
+#[tokio::test]
+async fn admission_timing_force_start_excludes_cancel_gap_and_sums_reacquisition() {
+    let manager = Arc::new(manager_with_policy(HealOverlapPolicy::Merge));
+    let old_id = insert_active_task(&manager, admin_prefix_request("bucket-a", "logs/")).await;
+    let recorder = AdmissionRecorder::new(&manager);
+    let mut replacement = admin_prefix_request("bucket-a", "logs/");
+    replacement.force_start = true;
+    let queue = manager.heal_queue.lock().await;
+    let admission = recorded(&recorder, manager.submit_heal_request_with_receipt(replacement));
+    tokio::pin!(admission);
+    assert!(futures::poll!(&mut admission).is_pending());
+    assert!(
+        manager.active_heals.try_lock().is_err(),
+        "initial interval owns active while waiting for queue"
+    );
+    let first_held_at = Instant::now();
+    let aliases = manager.task_aliases.lock().await;
+    let first_hold = first_held_at.elapsed();
+    drop(queue);
+    assert!(
+        futures::poll!(&mut admission).is_pending(),
+        "cancellation must wait for canonical alias lookup"
+    );
+    assert!(manager.active_heals.try_lock().is_ok());
+    assert!(manager.heal_queue.try_lock().is_ok());
+    assert!(manager.retrying_heals.try_lock().is_ok());
+    let unlocked_at = Instant::now();
+
+    // Queue cancellation first, then a real competing owner. Tokio's FIFO
+    // mutex hands that owner the lock before forceStart can reacquire it.
+    let active = manager.active_heals.lock().await;
+    let cancellation_gap = unlocked_at.elapsed();
+    drop(aliases);
+    assert!(futures::poll!(&mut admission).is_pending(), "cancellation is queued for active");
+    let next_active = manager.active_heals.lock();
+    tokio::pin!(next_active);
+    assert!(futures::poll!(&mut next_active).is_pending());
+    drop(active);
+    assert!(
+        futures::poll!(&mut admission).is_pending(),
+        "forceStart must queue behind the competing owner"
+    );
+    let active = next_active.await;
+    assert!(
+        manager.completed_heals.lock().await.contains_key(&old_id),
+        "cancellation finished before reacquisition"
+    );
+    let reacquiring_at = Instant::now();
+    let queue = manager.heal_queue.lock().await;
+    assert!(manager.retrying_heals.try_lock().is_ok());
+    let second_wait = reacquiring_at.elapsed();
+    drop(active);
+    assert!(futures::poll!(&mut admission).is_pending(), "reacquired active waits for queue");
+    assert!(manager.active_heals.try_lock().is_err());
+    let second_held_at = Instant::now();
+    assert!(recorder.samples.lock().expect("samples").is_empty());
+    let second_hold = second_held_at.elapsed();
+    drop(queue);
+    assert!(admission.await.expect("force-start receipt").result.is_admitted());
+
+    let (phase, wait, hold) = timing_samples(&recorder);
+    assert!(wait >= second_wait.as_secs_f64(), "second acquisition contention must be counted as wait");
+    assert!(
+        hold >= (first_hold + second_hold).as_secs_f64(),
+        "both actual held intervals must be counted"
+    );
+    assert!(
+        phase - (wait + hold) >= cancellation_gap.as_secs_f64(),
+        "the unlocked cancellation gap belongs only to the unchanged total phase"
+    );
 }
