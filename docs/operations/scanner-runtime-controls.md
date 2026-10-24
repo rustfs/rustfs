@@ -325,6 +325,7 @@ RustFS uses a `global_pause` policy while pool decommission or rebalance can hid
 | `pause_backlog.persistence_state` | `degraded` when the `.scanner-pause-backlog.json` ledger cannot be claimed or updated; `error` carries the reason. Scanner cycles keep running untracked behind the data-movement fence, and the ledger claim is retried on each scheduler wake at most every five minutes. `unavailable` means no scanner runtime on this node has attempted a claim. |
 | `pause_backlog.phase` | `idle`, `paused`, `catching_up`, or `retry_exhausted`. The ledger returns to `idle` only after one successful full namespace scan and zero known dirty-usage, expiry, and transition queues. |
 | `membership_repair_pending` | A rejoining decommission source is being re-seeded from the last committed surviving-set ledger before a new full-membership commit is allowed. |
+| `rolled_forward_partial_commit` | Interleaved writers left no surviving commit and different stable fields; the next writer claim, or decommission retirement of the ledger, stabilizes the unique newest stable ledger. |
 | `pause_backlog.thresholds` | Exact pause-duration, deferred-cycle, backlog-size, rate, and failure limits used by the running binary. |
 | `pause_backlog.alert_reasons` | Exceeded thresholds, exhausted counters or retries, replica degradation, and persistence failures. |
 

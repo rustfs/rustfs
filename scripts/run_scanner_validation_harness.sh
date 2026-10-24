@@ -48,7 +48,7 @@ Optional:
   --workload-label        Free-form workload label written to metadata.
   --metrics-endpoints     Optional comma-separated RustFS endpoints for
                           per-endpoint background-heal status and
-                          /metrics?types=1&by-host=true&n=1 capture.
+                          /realtime?types=1&by-host=true&n=1 capture.
   --samples               Number of scanner status samples (default: 30).
   --interval-secs         Seconds between samples (default: 60).
   --out-dir               Output directory (default: target/bench/scanner-validation-<timestamp>).
@@ -254,7 +254,7 @@ background_heal_status_url() {
 }
 
 metrics_url() {
-  printf '%s/rustfs/admin/v3/metrics?types=1&by-host=true&n=1\n' "${1%/}"
+  printf '%s/rustfs/admin/v3/realtime?types=1&by-host=true&n=1\n' "${1%/}"
 }
 
 endpoint_label() {

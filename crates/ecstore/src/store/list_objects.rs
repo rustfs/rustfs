@@ -388,7 +388,9 @@ fn should_purge_empty_directory_listing(
     incl_deleted: bool,
     result: &ListObjectsInfo,
 ) -> bool {
+    // list_path rejects leading slashes, so an empty result cannot justify cleanup.
     !prefix.is_empty()
+        && !prefix.starts_with(SLASH_SEPARATOR)
         && prefix.ends_with(SLASH_SEPARATOR)
         && marker.is_none()
         && max_keys > 0
@@ -10054,6 +10056,18 @@ mod test {
             ..Default::default()
         };
         assert!(!should_purge_empty_directory_listing("ghost/", None, 1, false, &truncated));
+    }
+
+    #[test]
+    fn empty_directory_listing_does_not_purge_rejected_leading_slash_prefixes() {
+        let empty = ListObjectsInfo::default();
+        for prefix in ["/", "//", "/ghost/"] {
+            assert!(
+                !should_purge_empty_directory_listing(prefix, None, 1000, false, &empty),
+                "rejected prefix {prefix:?} must not initiate orphan cleanup"
+            );
+        }
+        assert!(should_purge_empty_directory_listing("ghost/", None, 1000, false, &empty));
     }
 
     #[test]

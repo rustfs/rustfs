@@ -128,6 +128,62 @@ Adapter responsibilities:
    Preserve data and artifacts for diagnosis. An adapter may restore previous
    settings but must not delete arbitrary paths or stop unrelated deployments.
 
+#### Linux service control
+
+`scripts/scanner_service.py` supplies node-local `start`, `status`, `resize`
+and `stop` operations for an adapter on Linux with Python 3.11+, systemd 255+
+and cgroup v2. Run it as the benchmark user with noninteractive sudo access.
+It is a service primitive, not a complete deployment or measurement adapter.
+The caller still owns topology, data isolation, readiness, load, fault actions,
+the independent oracle and metric provenance.
+
+Before starting any node, retain its immutable JSON plan on the controller and
+node. Use a new UUID for each node/service and a private, user-owned directory
+(mode `0700`). Provision a verified executable and a separate environment file
+(mode `0600`) inside it. Keep credentials out of the plan, arguments and archived
+artifacts. The plan has exactly these fields; replace the example digest with
+the actual binary SHA-256:
+
+```json
+{
+  "run_id": "20718acd-9e81-4697-a0b5-8ac3207f6aef",
+  "root": "/srv/rustfs-bench/run",
+  "binary": "/srv/rustfs-bench/run/rustfs",
+  "binary_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "environment_file": "/srv/rustfs-bench/run/private.env",
+  "args": ["/data/isolated-benchmark"],
+  "runtime_seconds": 10800,
+  "cpu_percent": 200,
+  "memory_bytes": 4294967296
+}
+```
+
+```bash
+python3 scripts/scanner_service.py start node-plan.json
+python3 scripts/scanner_service.py status node-plan.json
+python3 scripts/scanner_service.py resize node-plan.json --cpu-percent 100 --memory-bytes 3221225472
+python3 scripts/scanner_service.py stop node-plan.json
+```
+
+The plan determines the transient unit's name and ownership identity. Recovery
+uses that same plan after SSH loss, including when the start response was lost.
+An existing service is never restarted by `start`; reconcile with `status` or
+`stop`. Stop every planned node after partial preparation, including nodes that
+never started. Stop is idempotent and does not delete binaries, data or evidence;
+retain the private root and plan until cleanup completes. File locking serializes
+controllers, and operations reject a unit with a different plan, user or root.
+Inputs must remain immutable while starting; this is not a sandbox against a
+compromised benchmark user or privileged host administrator.
+
+The finite `runtime_seconds` limit is enforced by systemd independently of SSH.
+Choose it to cover preparation, the entire required measurement and the oracle;
+expiration fails the cell and must not shorten its required duration. The unit
+does not restart automatically. Shutdown targets the whole cgroup, allows 30
+seconds for termination, then kills remaining processes, including descendants
+that changed sessions. Resize reports the kernel CPU/memory limits and rejects
+a changed PID or mismatched limits. Applying limits alone does not demonstrate
+RustFS adaptation or pass the resource hot-shrink gate.
+
 The `measure` response echoes the observed `evidence`, `fixed`, `build`,
 `data_dir`, and `background`, plus `sample_count` (1..3600), `elapsed_seconds`,
 and `metrics`. All metrics must be finite nonnegative numbers: `p99_ms`,
@@ -145,6 +201,19 @@ request samples, counter reset checks, profiler captures, and per-node telemetry
 in the cell artifact directory; aggregate values alone do not establish their
 measurement provenance. Missing production instrumentation is a pending gate,
 not permission to report a fabricated zero.
+
+For usage-cache saves, `encode_bytes` uses the window delta of
+`rustfs_scanner_cache_serialized_bytes_total`. `save_bytes` uses the sum of
+`rustfs_scanner_cache_save_payload_bytes_total` deltas for `cache="main"` and
+`cache="backup"`.
+The latter counts each full encoded payload submitted to the save interface
+after publication admission, including retries, failed writes, and timeouts.
+A rejected admission, skipped backup, or read-after-error reconciliation adds
+no save bytes. These are submitted application bytes: a failed attempt may
+consume only part of its body, and lower-layer retries, erasure parity, metadata,
+and physical disk writes are outside this counter. Keep the same definition on
+both builds; retain disk counters separately. Neither counter measures cache
+clone allocations, and an absent series is not a measured zero.
 
 Each comparison records a `w22` section with clone, encode, and save bytes per
 walked object, clone/encode and save/encode byte ratios, and candidate changes.
@@ -183,6 +252,14 @@ The nightly heal workflow clones **`rustfs/auto-testing`** separately and invoke
 entry point. If an adapter uses it, record and verify the external checkout's
 owner and full commit before use. The current workflow clones the default branch,
 so its contents must not be attributed to a RustFS source SHA.
+
+#### Heal Object Lock Wait
+
+`rustfs_heal_object_lock_wait_seconds` measures namespace acquisition in the set-local heal paths. Timing starts when the acquisition future is first polled, after namespace construction and existing diagnostic setup, and stops when acquisition returns or the pending future is dropped. It excludes repair work and lock hold time. Observation returns the original guard and error; it does not change release points, timeouts or retries.
+
+The fixed labels are `op` (`heal_object`, `read_repair_data`, `read_repair_commit`, `heal_object_dir`, `check_abandoned_parts`), `mode` (`read`, `write`) and `result` (`acquired`, `failed`, `cancelled`, `disabled`). The ordinary outer heal lock and explicit-version helper both use `heal_object`; these count actual acquisitions, not logical repair tasks. `no_lock` and errors constructing a namespace produce no acquisition sample. No bucket, key, version or owner is a label, and the metric does not require object-lock diagnostic logging.
+
+Keep acquired and failed completed-attempt distributions, cancellation counts, and disabled-lock observations distinguishable in W11 evidence. A cancelled sample is elapsed wait before cancellation, not a completed acquisition; a disabled guard does not establish real contention. Do not discard failed waits to improve a percentile, infer task-attempt counts from acquisitions, or substitute admission mutex timing for this metric. Window differences and histogram resolution still need independent verification; this instrument alone does not supply exact scalar percentiles or complete SSD acceptance.
 
 #### Evidence Gates
 

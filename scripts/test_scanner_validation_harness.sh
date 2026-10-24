@@ -72,11 +72,16 @@ JSON
   exit 0
 fi
 
-if [[ "$url" == *"/rustfs/admin/v3/metrics?types=1&by-host=true&n=1" ]]; then
+if [[ "$url" == *"/rustfs/admin/v3/realtime?types=1&by-host=true&n=1" ]]; then
   cat <<'JSON'
 {"node":"node-a","metrics":{"scanner":{"maintenanceControl":{"primaryControl":"active"}}}}
 JSON
   exit 0
+fi
+
+if [[ "$url" != *"/rustfs/admin/v3/scanner/status" ]]; then
+  printf 'unexpected admin URL: %s\n' "$url" >&2
+  exit 1
 fi
 
 cat <<'JSON'
@@ -248,8 +253,8 @@ fi
 grep -q -- 'http://127.0.0.1:9000/rustfs/admin/v3/scanner/status' "$awscurl_log"
 grep -q -- 'http://node-a:9000/rustfs/admin/v3/background-heal/status' "$awscurl_log"
 grep -q -- 'http://node-b:9000/rustfs/admin/v3/background-heal/status' "$awscurl_log"
-grep -q -- 'http://node-a:9000/rustfs/admin/v3/metrics?types=1&by-host=true&n=1' "$awscurl_log"
-grep -q -- 'http://node-b:9000/rustfs/admin/v3/metrics?types=1&by-host=true&n=1' "$awscurl_log"
+grep -q -- 'http://node-a:9000/rustfs/admin/v3/realtime?types=1&by-host=true&n=1' "$awscurl_log"
+grep -q -- 'http://node-b:9000/rustfs/admin/v3/realtime?types=1&by-host=true&n=1' "$awscurl_log"
 
 missing_pid_out="$TMP_DIR/out-missing-pid"
 RUSTFS_SECRET_KEY=rustfsadmin MC_LOG="$mc_log" AWSCURL_LOG="$awscurl_log" PATH="$BIN_DIR:$PATH" "$SCRIPT" \
@@ -313,4 +318,5 @@ fi
 
 grep -q -- 'unknown arg: --secret-key' "$secret_arg_log"
 
+"$ROOT_DIR/scripts/python_bin.sh" "$ROOT_DIR/scripts/test_scanner_service.py"
 "$ROOT_DIR/scripts/python_bin.sh" "$ROOT_DIR/scripts/test_scanner_abba.py"
