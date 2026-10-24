@@ -24505,7 +24505,20 @@ mod delete_objects_lock_gating_tests {
         for disk in &disks {
             disk.make_volume(bucket).await.expect("create fixture volume");
         }
-        put_plain_object(&set, bucket, object).await;
+        // This fixture inspects a specific drive and then takes it offline.
+        // A quorum ACK alone does not mean that drive's rename has completed.
+        let mut reader = PutObjReader::from_vec(vec![3u8; 1024]);
+        set.put_object(
+            bucket,
+            object,
+            &mut reader,
+            &ObjectOptions {
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("fixture rename fan-out should finish before injecting a drive fault");
         let disk_info = disks[0]
             .read_version(bucket, bucket, object, "", &crate::disk::ReadOptions::default())
             .await
