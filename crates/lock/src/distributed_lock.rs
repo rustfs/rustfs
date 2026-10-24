@@ -968,6 +968,8 @@ impl DistributedLock {
     /// Collects all individual lock_ids from successful clients and creates an aggregate lock_id.
     /// Returns the LockResponse with aggregate lock_id and individual lock mappings.
     async fn acquire_lock_quorum_once(&self, request: &LockRequest) -> Result<LockAcquireQuorumResult> {
+        let voter_count =
+            u32::try_from(self.clients.len().max(1)).map_err(|_| LockError::internal("lock voter count exceeds u32"))?;
         let required_quorum = self.required_quorum(request.lock_type);
         let attempt_started = Instant::now();
         let mut pending = JoinSet::new();
@@ -987,6 +989,12 @@ impl DistributedLock {
         let mut last_hard_failure_kind = None;
         let mut hard_failures = 0usize;
         let start = Instant::now();
+        // A silent prefix must not hide healthy voters later in the list.
+        // Spread additional hedges across the existing attempt budget; fast
+        // quorums still use only the initial quorum-plus-spare requests.
+        let hedge_interval = request.acquire_timeout / voter_count;
+        let hedge_timer = tokio::time::sleep(hedge_interval);
+        tokio::pin!(hedge_timer);
 
         while !pending.is_empty() {
             let remaining = request.acquire_timeout.saturating_sub(start.elapsed());
@@ -1009,7 +1017,20 @@ impl DistributedLock {
                 ));
             }
 
-            let join_result = match tokio::time::timeout(remaining, pending.join_next()).await {
+            let next_result = tokio::select! {
+                result = tokio::time::timeout(remaining, pending.join_next()) => result,
+                _ = &mut hedge_timer, if next_client_index < self.clients.len() => {
+                    if start.elapsed() < request.acquire_timeout {
+                        let target_in_flight = pending.len().saturating_add(1);
+                        self.spawn_lock_requests_until(
+                            &mut pending, request, &mut next_client_index, target_in_flight,
+                        );
+                    }
+                    hedge_timer.set(tokio::time::sleep(hedge_interval));
+                    continue;
+                }
+            };
+            let join_result = match next_result {
                 Ok(Some(join_result)) => join_result,
                 Ok(None) => break,
                 Err(_) => {
@@ -1243,7 +1264,8 @@ fn record_lock_held_release(lock_type: LockType) {
 mod tests {
     use super::{
         DEFERRED_UNLOCK_BACKOFF, DistributedLock, LOCK_ACQUIRE_ATTEMPT_TIMEOUT, LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF,
-        LockAcquireFailureKind, LockLostSignal, UNLOCK_RETRY_ATTEMPTS, is_remote_lock_rpc_failure, should_warn_lock_failure,
+        LOCK_ACQUIRE_SPARE_HEDGES, LockAcquireFailureKind, LockLostSignal, UNLOCK_RETRY_ATTEMPTS, is_remote_lock_rpc_failure,
+        should_warn_lock_failure,
     };
     use crate::{LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats, LockType, ObjectKey, client::LockClient};
     use rand::{SeedableRng as _, TryRng, rngs::StdRng};
@@ -1310,6 +1332,7 @@ mod tests {
     /// increments a counter and returns per the configured outcome.
     #[derive(Debug)]
     struct RefreshCountingClient {
+        acquire_calls: AtomicUsize,
         refresh_calls: Arc<AtomicUsize>,
         outcome: RefreshOutcome,
         active: tokio::sync::Mutex<std::collections::HashSet<LockId>>,
@@ -1318,6 +1341,7 @@ mod tests {
     impl RefreshCountingClient {
         fn new(outcome: RefreshOutcome, counter: Arc<AtomicUsize>) -> Arc<Self> {
             Arc::new(Self {
+                acquire_calls: AtomicUsize::new(0),
                 refresh_calls: counter,
                 outcome,
                 active: tokio::sync::Mutex::new(std::collections::HashSet::new()),
@@ -1328,6 +1352,7 @@ mod tests {
     #[async_trait::async_trait]
     impl LockClient for RefreshCountingClient {
         async fn acquire_lock(&self, request: &LockRequest) -> crate::Result<LockResponse> {
+            self.acquire_calls.fetch_add(1, Ordering::SeqCst);
             self.active.lock().await.insert(request.lock_id.clone());
             let info = LockInfo {
                 id: request.lock_id.clone(),
@@ -1388,6 +1413,27 @@ mod tests {
             counters.push(counter);
         }
         (clients, counters)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fast_read_quorum_keeps_initial_fanout_bound() {
+        let peers: Vec<_> = (0..8)
+            .map(|_| RefreshCountingClient::new(RefreshOutcome::Alive, Arc::new(AtomicUsize::new(0))))
+            .collect();
+        let clients = peers.iter().cloned().map(|peer| peer as Arc<dyn LockClient>).collect();
+        let lock = DistributedLock::new("fast-fanout".to_string(), clients, 5);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Shared, "owner")
+            .with_acquire_timeout(Duration::from_secs(1));
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("fast quorum")
+            .expect("admitted guard");
+        tokio::task::yield_now().await;
+        let calls: usize = peers.iter().map(|peer| peer.acquire_calls.load(Ordering::SeqCst)).sum();
+        assert!(calls >= 4, "four votes must be acquired");
+        assert!(calls <= 4 + LOCK_ACQUIRE_SPARE_HEDGES, "fast success must not fan out to the whole fleet");
+        drop(guard);
     }
 
     // A1 -- heartbeat broadcasts refresh every interval; a live lock stays refreshed (#899 keepalive).

@@ -34,7 +34,7 @@ use rustfs_signer::sign_v4;
 use s3s::Body;
 use serde_json;
 use std::fs as stdfs;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::net::{Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -1313,7 +1313,10 @@ impl RustFSTestClusterEnvironment {
     pub async fn with_topology(topology: ClusterTopology) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         topology.validate()?;
 
-        let temp_dir = format!("/tmp/rustfs_cluster_test_{}", Uuid::new_v4());
+        let temp_dir = std::env::temp_dir()
+            .join(format!("rustfs_cluster_test_{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
         fs::create_dir_all(&temp_dir).await?;
 
         // Map every node to its owning pool index.
@@ -1490,6 +1493,29 @@ impl RustFSTestClusterEnvironment {
         // listener from the direct IPv4 server and S3 client address.
         let listen = SocketAddr::from((Ipv6Addr::LOCALHOST, target.port()));
         let proxy = crate::fault_proxy::FaultProxy::start_on(listen, target).await?;
+        self.volume_proxy_addresses[node_idx] = Some(proxy.local_addr());
+        Ok(proxy)
+    }
+
+    /// Route internode traffic through a method-aware HTTP proxy.
+    pub(crate) async fn start_rpc_proxy_for_node(
+        &mut self,
+        node_idx: usize,
+    ) -> io::Result<crate::rpc_fault_proxy::RpcFaultProxy> {
+        self.ensure_node_index(node_idx)
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        if self.volume_proxy_addresses[node_idx].is_some() {
+            return Err(io::Error::new(
+                ErrorKind::AlreadyExists,
+                format!("a volume proxy is already configured for node {node_idx}"),
+            ));
+        }
+        let target = self.nodes[node_idx]
+            .address
+            .parse::<SocketAddr>()
+            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))?;
+        let listen = SocketAddr::from((Ipv6Addr::LOCALHOST, target.port()));
+        let proxy = crate::rpc_fault_proxy::RpcFaultProxy::start_on(listen, target).await?;
         self.volume_proxy_addresses[node_idx] = Some(proxy.local_addr());
         Ok(proxy)
     }
@@ -2608,6 +2634,22 @@ mod tests {
         );
 
         proxy.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cluster_data_dirs_use_os_temporary_directory() {
+        let cluster = RustFSTestClusterEnvironment::new(1).await.expect("allocate isolated cluster");
+        let root = PathBuf::from(&cluster.temp_dir);
+        assert!(
+            root.starts_with(std::env::temp_dir()),
+            "cluster must honor the selected temporary filesystem"
+        );
+        for node in &cluster.nodes {
+            assert!(Path::new(&node.data_dir).starts_with(&root));
+            assert!(node.data_dirs.iter().all(|drive| Path::new(drive).starts_with(&root)));
+        }
+        drop(cluster);
+        assert!(!root.exists(), "dropping the fixture must remove its owned directories");
     }
 
     #[test]
