@@ -114,7 +114,9 @@ type Http3CoreService = tower::util::BoxCloneService<
 #[cfg(feature = "http3")]
 type Http3ExternalService = tower::util::BoxCloneService<
     HttpRequest<http3::RequestBody>,
-    Response<tower_http::body::UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
+    Response<
+        super::layer::ForegroundResponseBody<tower_http::body::UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
+    >,
     Box<dyn std::error::Error + Send + Sync>,
 >;
 use tracing::{Level, Span, debug, error, info, instrument, trace, warn};
@@ -2123,14 +2125,16 @@ impl<A, B> PathDispatchService<A, B> {
     }
 }
 
-impl<A, B> Service<HttpRequest<Incoming>> for PathDispatchService<A, B>
+impl<A, B, ExternalBody, InternodeBody> Service<HttpRequest<Incoming>> for PathDispatchService<A, B>
 where
-    A: Service<HttpRequest<Incoming>> + Clone + Send + 'static,
+    A: Service<HttpRequest<Incoming>, Response = Response<ExternalBody>> + Clone + Send + 'static,
     A::Future: Send + 'static,
-    B: Service<HttpRequest<Incoming>, Response = A::Response, Error = A::Error> + Clone + Send + 'static,
+    B: Service<HttpRequest<Incoming>, Response = Response<InternodeBody>, Error = A::Error> + Clone + Send + 'static,
     B::Future: Send + 'static,
+    ExternalBody: 'static,
+    InternodeBody: 'static,
 {
-    type Response = A::Response;
+    type Response = Response<http_body_util::Either<ExternalBody, InternodeBody>>;
     type Error = A::Error;
     type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
@@ -2143,9 +2147,17 @@ where
 
     fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
         if Self::is_internode_path(req.uri().path()) {
-            Box::pin(self.internode.call(req))
+            let future = self.internode.call(req);
+            Box::pin(async move {
+                let (parts, body) = future.await?.into_parts();
+                Ok(Response::from_parts(parts, http_body_util::Either::Right(body)))
+            })
         } else {
-            Box::pin(self.external.call(req))
+            let future = self.external.call(req);
+            Box::pin(async move {
+                let (parts, body) = future.await?.into_parts();
+                Ok(Response::from_parts(parts, http_body_util::Either::Left(body)))
+            })
         }
     }
 }
@@ -2854,7 +2866,11 @@ mod tests {
     >;
     type RateLimitTestStack = tower::util::BoxCloneService<
         HttpRequest<s3s::Body>,
-        Response<tower_http::body::UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
+        Response<
+            super::super::layer::ForegroundResponseBody<
+                tower_http::body::UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>,
+            >,
+        >,
         Box<dyn std::error::Error + Send + Sync>,
     >;
 
@@ -5026,6 +5042,66 @@ mod tests {
         ));
         assert!(!PathDispatchService::<MarkerService, MarkerService>::is_internode_path("/rustfs/rpcx"));
         let _ = service;
+    }
+
+    #[tokio::test]
+    async fn path_dispatch_preserves_distinct_response_bodies() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("route listener");
+        let address = listener.local_addr().expect("route address");
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("route connection");
+                let external = tower::service_fn(|_: HttpRequest<Incoming>| async {
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .header("x-lane", "external")
+                            .body(Full::new(Bytes::from_static(b"external body")))
+                            .expect("external response"),
+                    )
+                });
+                let internode = tower::service_fn(|_: HttpRequest<Incoming>| async {
+                    let frames =
+                        futures::stream::iter([Ok::<_, Infallible>(http_body::Frame::data(Bytes::from_static(b"rpc body")))]);
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(201)
+                            .header("x-lane", "internode")
+                            .body(http_body_util::StreamBody::new(frames))
+                            .expect("internode response"),
+                    )
+                });
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(stream),
+                        TowerToHyperService::new(PathDispatchService::new(external, internode)),
+                    )
+                    .await
+                    .expect("route connection completion");
+            }
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("route client");
+        for (path, status, lane, body) in [
+            ("/bucket/object", 200, "external", "external body"),
+            ("/rustfs/rpc/example", 201, "internode", "rpc body"),
+        ] {
+            let response = client
+                .get(format!("http://{address}{path}"))
+                .header(http::header::CONNECTION, "close")
+                .send()
+                .await
+                .expect("route response");
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(response.headers()["x-lane"], lane);
+            assert_eq!(response.bytes().await.expect("route body"), body.as_bytes());
+        }
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("bounded route shutdown")
+            .expect("route server");
     }
 
     // backlog#806-35: in-flight gauge must be adjusted exactly once per request.
