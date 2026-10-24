@@ -16,7 +16,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::{
     SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_CRC, SUFFIX_INLINE_DATA, SUFFIX_PART_CHECKSUMS, SUFFIX_TRANSITION_STATUS,
-    SUFFIX_TRANSITIONED_VERSION_ID, get_consistent_str, has_internal_suffix, insert_str, is_internal_key,
+    SUFFIX_TRANSITIONED_VERSION_ID, etag_can_be_listed, get_consistent_str, has_internal_suffix, insert_str, is_internal_key,
     strip_internal_prefix_preserving_case,
 };
 use rustfs_utils::path::{clean, path_join_buf};
@@ -157,5 +157,44 @@ fn bench_path_hotpaths(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_hash_hotpaths, bench_metadata_compat_hotpaths, bench_path_hotpaths);
+fn bench_listing_encryption_metadata(c: &mut Criterion) {
+    let mut group = c.benchmark_group("listing_encryption_metadata");
+    for fields in [8, 64] {
+        let plain: HashMap<String, String> = (0..fields)
+            .map(|index| (format!("x-amz-meta-field-{index}"), "value".to_owned()))
+            .collect();
+        for shape in [
+            "plain",
+            "legacy_multipart",
+            "legacy_encrypted",
+            "protected_encrypted",
+            "conflicting_proof",
+        ] {
+            let mut metadata = plain.clone();
+            if shape == "legacy_multipart" {
+                metadata.insert("x-rustfs-encryption-original-size".to_owned(), "10485760".to_owned());
+            } else if shape != "plain" {
+                metadata.insert("x-amz-server-side-encryption-customer-algorithm".to_owned(), "AES256".to_owned());
+                if shape != "legacy_encrypted" {
+                    insert_str(&mut metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());
+                }
+                if shape == "conflicting_proof" {
+                    metadata.insert("X-MINIO-INTERNAL-SERVER-SIDE-ENCRYPTION-OPAQUE-ETAG".to_owned(), "unknown".to_owned());
+                }
+            }
+            group.bench_with_input(BenchmarkId::new(shape, fields), &metadata, |b, metadata| {
+                b.iter(|| black_box(etag_can_be_listed(black_box(metadata))));
+            });
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_hash_hotpaths,
+    bench_metadata_compat_hotpaths,
+    bench_path_hotpaths,
+    bench_listing_encryption_metadata
+);
 criterion_main!(benches);

@@ -87,6 +87,80 @@ pub struct AdaptiveAdmissionSnapshot {
     pub active: u32,
 }
 
+/// Node scheduling capacity, separate from physical I/O and buffer ownership.
+/// Its non-cloneable units end with the async operation; a native tail must
+/// retain its own physical-resource unit, never this scheduling unit.
+pub struct NodeAdmission {
+    capacity: Arc<AdaptiveAdmission>,
+    completed: AtomicU64,
+}
+
+/// One async operation's scheduling unit. Dropping a cancelled or failed
+/// operation releases capacity without claiming completed work.
+#[must_use = "retain the unit until the async operation ends"]
+pub struct NodePermit {
+    _capacity: AdaptivePermit,
+    owner: Arc<NodeAdmission>,
+}
+
+impl NodeAdmission {
+    /// Construct one node owner with no capacity until a resource sample arrives.
+    pub fn new(maximum: NonZeroU16) -> Arc<Self> {
+        Arc::new(Self {
+            capacity: AdaptiveAdmission::new(maximum, 0),
+            completed: AtomicU64::new(0),
+        })
+    }
+
+    /// Publish feedback with this owner's actual completed-work counter.
+    pub fn update(&self, controller: &mut FeedbackController, observation: Option<FeedbackObservation>) -> FeedbackDecision {
+        let observation = observation.map(|mut observation| {
+            observation.completed_units = self.completed();
+            observation
+        });
+        controller.update(&self.capacity, observation)
+    }
+
+    /// Current leased scheduling cap and held async units.
+    pub fn snapshot(&self) -> AdaptiveAdmissionSnapshot {
+        self.capacity.snapshot()
+    }
+
+    /// Completed operations, or unknown after the counter exhausts its range.
+    pub fn completed(&self) -> Option<u64> {
+        let value = self.completed.load(Ordering::Acquire);
+        (value != u64::MAX).then_some(value)
+    }
+
+    /// Try without waiting, including when the caller already owns a lock.
+    pub fn try_acquire(self: &Arc<Self>) -> Option<NodePermit> {
+        self.capacity.try_acquire().map(|capacity| NodePermit {
+            _capacity: capacity,
+            owner: self.clone(),
+        })
+    }
+
+    /// Wait in FIFO order. Callers must provide a deadline/cancellation and
+    /// acquire before storage locks, not while retaining another node unit.
+    pub async fn acquire(self: &Arc<Self>) -> NodePermit {
+        NodePermit {
+            _capacity: self.capacity.acquire().await,
+            owner: self.clone(),
+        }
+    }
+}
+
+impl NodePermit {
+    /// Count a completed operation exactly once, then release its node unit.
+    /// This counter is scheduling progress, not an authoritative heal receipt.
+    pub fn complete(self) {
+        let _ = self
+            .owner
+            .completed
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| value.checked_add(1));
+    }
+}
+
 /// Confidence-qualified pressure for one complete sampling window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourcePressure {
@@ -432,6 +506,57 @@ impl Drop for AdaptivePermit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn node_progress_requires_explicit_completion_and_never_wraps() {
+        let node = NodeAdmission::new(NonZeroU16::new(2).expect("two slots"));
+        node.capacity.set_limit(2);
+        drop(node.acquire().await);
+        assert_eq!(node.completed(), Some(0), "cancellation is not progress");
+        node.acquire().await.complete();
+        assert_eq!(node.completed(), Some(1));
+        node.completed.store(u64::MAX - 1, Ordering::Release);
+        node.acquire().await.complete();
+        node.acquire().await.complete();
+        assert_eq!(node.completed(), None, "exhausted progress stays unknown");
+        assert_eq!(node.snapshot().active, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_node_work_does_not_reserve_capacity_for_unrelated_native_tail() {
+        let node = NodeAdmission::new(NonZeroU16::new(1).expect("one slot"));
+        node.capacity.set_limit(1);
+        let physical = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one disk unit"), 1);
+        let scheduling = node.acquire().await;
+        let native_tail = physical.acquire().await;
+        drop(scheduling);
+        assert_eq!(node.completed(), Some(0));
+        assert!(node.try_acquire().is_some(), "healthy resources can still be scheduled");
+        assert!(physical.try_acquire().is_none(), "the stalled disk remains charged");
+        drop(native_tail);
+        assert!(physical.try_acquire().is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn node_feedback_expires_without_revoking_held_work_or_fabricating_progress() {
+        let node = NodeAdmission::new(NonZeroU16::new(2).expect("two slots"));
+        let mut controller = FeedbackController::new();
+        let input = FeedbackObservation {
+            generation: 1,
+            max_concurrency: 2,
+            pressure: ResourcePressure::Stable,
+            completed_units: Some(99),
+        };
+        node.update(&mut controller, Some(input));
+        let held = node.acquire().await;
+        assert_eq!(node.completed(), Some(0));
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert_eq!(node.snapshot(), AdaptiveAdmissionSnapshot { limit: 0, active: 1 });
+        assert!(node.try_acquire().is_none());
+        held.complete();
+        assert_eq!(node.completed(), Some(1));
+        assert_eq!(node.snapshot().active, 0);
+    }
 
     #[tokio::test]
     async fn shared_unit_stays_admitted_until_native_worker_releases_its_last_clone() {

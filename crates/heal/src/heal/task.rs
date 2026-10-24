@@ -949,7 +949,7 @@ impl HealTask {
     }
 
     fn should_return_typed_heal_error(err: &Error) -> bool {
-        matches!(err, Error::Storage(_) | Error::Disk(_))
+        matches!(err, Error::Storage(_) | Error::Disk(_) | Error::TransientSkip { .. })
     }
 
     async fn skip_data_usage_cache_heal_error(&self, bucket: &str, object: &str, err: &Error) -> bool {

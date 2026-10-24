@@ -466,7 +466,7 @@ mod tests {
     use super::{
         ListObjectVersionsInfo, ListObjectVersionsParams, ListObjectsV2Info, build_list_buckets_output,
         build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output,
-        parse_list_object_versions_params, parse_list_objects_v2_params,
+        parse_list_object_versions_params, parse_list_objects_v2_params, to_s3s_etag,
     };
     use crate::storage::s3_api::common::rustfs_owner;
     use crate::storage::storage_api::s3_api_consumer::bucket::StorageObjectInfo as ObjectInfo;
@@ -736,6 +736,7 @@ mod tests {
             std::collections::HashMap::from([("x-amz-server-side-encryption".to_owned(), "aws:kms".to_owned())]),
             protected_metadata,
             std::collections::HashMap::new(),
+            std::collections::HashMap::from([("x-rustfs-encryption-original-size".to_owned(), "42".to_owned())]),
         ]
         .into_iter()
         .enumerate()
@@ -764,9 +765,9 @@ mod tests {
         let v1 = build_list_objects_output(v2.clone(), None);
         for listing in [&v1.contents, &v2.contents] {
             let entries = listing.as_ref().expect("listed objects");
-            assert_eq!(entries.len(), 4);
+            assert_eq!(entries.len(), 5);
             for (index, entry) in entries.iter().enumerate() {
-                assert_eq!(entry.e_tag.is_some(), index >= 2);
+                assert_eq!(entry.e_tag, (index >= 2).then(|| to_s3s_etag("0123456789abcdef0123456789abcdef")));
                 assert_eq!(entry.key.as_deref(), Some(format!("object-{index}").as_str()));
                 assert_eq!(entry.size, Some(42));
             }
@@ -787,9 +788,9 @@ mod tests {
             None,
         );
         let versions = versions.versions.expect("listed versions");
-        assert_eq!(versions.len(), 4);
+        assert_eq!(versions.len(), 5);
         for (index, entry) in versions.iter().enumerate() {
-            assert_eq!(entry.e_tag.is_some(), index >= 2);
+            assert_eq!(entry.e_tag, (index >= 2).then(|| to_s3s_etag("0123456789abcdef0123456789abcdef")));
             assert_eq!(entry.size, Some(42));
         }
     }
