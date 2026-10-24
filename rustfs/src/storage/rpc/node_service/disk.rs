@@ -6957,43 +6957,53 @@ mod legacy_artifact_tests {
         assert_ordinary_delete_recovery_rollback(&fixture).await;
     }
 
+    fn apply_guarded_ordinary_delete_version(
+        fixture: &OrdinaryDeleteRecoveryFixture,
+    ) -> impl std::future::Future<Output = ()> + '_ {
+        // Construct the request future before polling it, so this leaf does
+        // not retain its RPC temporaries while creating or rolling back the fixture.
+        Box::pin(async move {
+            use crate::storage::storage_api::ecstore_disk::{CurrentDeleteGeneration, GuardedFileInfoVersions};
+            use std::time::Duration;
+
+            let group = FileInfoVersions {
+                volume: fixture.bucket.to_owned(),
+                name: fixture.object.clone(),
+                versions: vec![fixture.fi.clone()],
+                ..Default::default()
+            };
+            let payload = GuardedDeleteVersionsPayload {
+                versions: vec![GuardedFileInfoVersions {
+                    expected_current: CurrentDeleteGeneration::from_file_info(&fixture.fi).expect("actual current generation"),
+                    group,
+                }],
+                opts: fixture.opts.clone(),
+            };
+            payload.validate().expect("valid guarded ordinary request");
+            let mut request = Request::new(GuardedDeleteVersionsRequest {
+                disk: fixture.disk_ref.clone(),
+                volume: fixture.bucket.to_owned(),
+                probe_only: false,
+                payload: rmp_serde::to_vec_named(&payload).expect("named guarded request").into(),
+            });
+            let body = rustfs_protos::canonical_guarded_delete_versions_request_body(request.get_ref())
+                .expect("canonical guarded request");
+            sign_legacy_rpc_request(&mut request, &body, "GuardedDeleteVersions");
+            verify_legacy_rpc_request(&request, "GuardedDeleteVersions").expect("real guarded HMAC and replay scope");
+            let response = tokio::time::timeout(Duration::from_secs(30), fixture.service.handle_guarded_delete_versions(request))
+                .await
+                .expect("bounded guarded publication")
+                .expect("authenticated guarded response")
+                .into_inner();
+            assert_bulk_results(&response, &[None]);
+        })
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn artifact_delete_recovery_guarded_receiver_applies_and_rolls_back_real_ordinary_version() {
-        use crate::storage::storage_api::ecstore_disk::{CurrentDeleteGeneration, GuardedFileInfoVersions};
-        use std::time::Duration;
-
         let fixture = ordinary_delete_recovery_fixture("guarded").await;
-        let group = FileInfoVersions {
-            volume: fixture.bucket.to_owned(),
-            name: fixture.object.clone(),
-            versions: vec![fixture.fi.clone()],
-            ..Default::default()
-        };
-        let payload = GuardedDeleteVersionsPayload {
-            versions: vec![GuardedFileInfoVersions {
-                expected_current: CurrentDeleteGeneration::from_file_info(&fixture.fi).expect("actual current generation"),
-                group,
-            }],
-            opts: fixture.opts.clone(),
-        };
-        payload.validate().expect("valid guarded ordinary request");
-        let mut request = Request::new(GuardedDeleteVersionsRequest {
-            disk: fixture.disk_ref.clone(),
-            volume: fixture.bucket.to_owned(),
-            probe_only: false,
-            payload: rmp_serde::to_vec_named(&payload).expect("named guarded request").into(),
-        });
-        let body =
-            rustfs_protos::canonical_guarded_delete_versions_request_body(request.get_ref()).expect("canonical guarded request");
-        sign_legacy_rpc_request(&mut request, &body, "GuardedDeleteVersions");
-        verify_legacy_rpc_request(&request, "GuardedDeleteVersions").expect("real guarded HMAC and replay scope");
-        let response = tokio::time::timeout(Duration::from_secs(30), fixture.service.handle_guarded_delete_versions(request))
-            .await
-            .expect("bounded guarded publication")
-            .expect("authenticated guarded response")
-            .into_inner();
-        assert_bulk_results(&response, &[None]);
+        apply_guarded_ordinary_delete_version(&fixture).await;
         assert_ordinary_delete_recovery_rollback(&fixture).await;
     }
 
