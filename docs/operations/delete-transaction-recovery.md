@@ -82,6 +82,16 @@ Returning drives and queue overflow request discovery again, and a low-frequency
 bounded reconciliation scan covers records written through remote participants.
 Discovery advances by pages and retries failed sources separately, rather than
 rescanning every healthy bucket on each maintenance tick.
+
+Settlement uses a rolling window of at most four distinct keys, admitting at
+most sixteen attempts per maintenance tick. A slow shard verification or
+exact-key lock does not hold up other keys or later admission windows. A newer
+hint for an active key remains queued until that key's attempt completes.
+Cancellation retries admitted generations without clearing newer hints. Queue
+overflow remains covered by durable discovery, including after a restart.
+These limits bound background work, not the canonical rollback deadline or
+its durability checks.
+
 Corrupt record contents remain discoverable by their physical key; exact-key
 inspection rejects them without hiding later records. Unsafe paths, symlinks,
 and structural filesystem errors still stop that discovery scope.
