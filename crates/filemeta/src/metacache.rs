@@ -139,14 +139,13 @@ impl MetaCacheEntry {
             return idx.is_none() || idx.unwrap() == self.name.len() - separator.len();
         }
 
-        let ext = self.name.trim_start_matches(dir);
+        // Strip `dir` exactly once: a repeated strip would treat `a/a/b` as a
+        // direct child of `a/`.
+        let Some(ext) = self.name.strip_prefix(dir) else {
+            return false;
+        };
 
-        if ext.len() != self.name.len() {
-            let idx = ext.find(separator);
-            return idx.is_none() || idx.unwrap() == ext.len() - separator.len();
-        }
-
-        false
+        ext.find(separator).is_none_or(|idx| idx == ext.len() - separator.len())
     }
 
     pub fn is_object(&self) -> bool {
@@ -921,12 +920,23 @@ impl MetaCacheEntriesSorted {
         entries
     }
 
+    /// Drop every entry whose name is at or before `marker`.
+    ///
+    /// Entries are sorted by name, so this keeps the suffix starting at the
+    /// first name strictly after the marker; when no such entry exists the
+    /// page is empty. The split index is taken over the raw slots so that
+    /// `None` placeholders cannot shift it.
     pub fn forward_past(&mut self, marker: Option<String>) {
-        if let Some(val) = marker
-            && let Some(idx) = self.o.0.iter().flatten().position(|v| v.name > val)
-        {
-            self.o.0 = self.o.0.split_off(idx);
-        }
+        let Some(val) = marker else {
+            return;
+        };
+        let idx = self
+            .o
+            .0
+            .iter()
+            .position(|v| v.as_ref().is_some_and(|v| v.name > val))
+            .unwrap_or(self.o.0.len());
+        self.o.0 = self.o.0.split_off(idx);
     }
 }
 
@@ -1442,6 +1452,58 @@ mod tests {
     };
     use tokio::sync::{Notify, oneshot};
     use uuid::Uuid;
+
+    fn named_entry(name: &str) -> MetaCacheEntry {
+        MetaCacheEntry {
+            name: name.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn is_in_dir_strips_the_directory_prefix_once() {
+        assert!(named_entry("a/b").is_in_dir("a/", "/"));
+        assert!(named_entry("a/b/").is_in_dir("a/", "/"));
+        assert!(named_entry("a/").is_in_dir("a/", "/"));
+        // `a/a/b` lives in `a/a/`, not directly in `a/`.
+        assert!(!named_entry("a/a/b").is_in_dir("a/", "/"));
+        assert!(!named_entry("b/c").is_in_dir("a/", "/"));
+        assert!(named_entry("top").is_in_dir("", "/"));
+        assert!(named_entry("top/").is_in_dir("", "/"));
+        assert!(!named_entry("top/leaf").is_in_dir("", "/"));
+    }
+
+    #[test]
+    fn forward_past_drops_every_entry_at_or_before_the_marker() {
+        let sorted = |names: &[&str]| MetaCacheEntriesSorted {
+            o: MetaCacheEntries(names.iter().map(|name| Some(named_entry(name))).collect()),
+            ..Default::default()
+        };
+
+        let mut entries = sorted(&["a", "b", "c"]);
+        entries.forward_past(Some("b".to_owned()));
+        assert_eq!(entries.entries().iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["c"]);
+
+        let mut entries = sorted(&["a", "b"]);
+        entries.forward_past(Some("b".to_owned()));
+        assert!(entries.entries().is_empty(), "nothing sorts after the marker");
+
+        let mut entries = sorted(&["a", "b"]);
+        entries.forward_past(Some("z".to_owned()));
+        assert!(entries.entries().is_empty(), "a marker past every entry empties the page");
+
+        let mut entries = sorted(&["a", "b"]);
+        entries.forward_past(None);
+        assert_eq!(entries.entries().len(), 2, "no marker keeps the page intact");
+
+        // A `None` slot before the split point must not shift the retained suffix.
+        let mut entries = MetaCacheEntriesSorted {
+            o: MetaCacheEntries(vec![None, Some(named_entry("a")), Some(named_entry("b")), Some(named_entry("c"))]),
+            ..Default::default()
+        };
+        entries.forward_past(Some("a".to_owned()));
+        assert_eq!(entries.entries().iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["b", "c"]);
+    }
 
     #[tokio::test]
     async fn test_writer() {
