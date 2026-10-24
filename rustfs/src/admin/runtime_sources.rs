@@ -15,6 +15,7 @@
 use crate::admin::storage_api::runtime_sources::{
     DailyAllTierStats, ECStore, NotificationSys, ScannerMetricsReport, StorageClassConfig, TierConfigMgr,
 };
+use crate::app::RequestEnvelope;
 pub(crate) use crate::app::admin_usecase::{
     AdminPoolStatus, DefaultAdminUsecase, QueryPoolStatusRequest, QueryServerInfoRequest,
 };
@@ -75,6 +76,13 @@ pub(crate) fn object_store_from_req<B>(req: &s3s::S3Request<B>) -> Option<Arc<EC
 
 pub(crate) fn app_context_from_req<B>(req: &s3s::S3Request<B>) -> Option<Arc<AppContext>> {
     app_context_from_extensions(&req.extensions)
+}
+
+pub(crate) fn app_context_from_envelope(envelope: &RequestEnvelope) -> Option<Arc<AppContext>> {
+    match envelope.server_context() {
+        Some(slot) => slot.installed_app_context(),
+        None => current_app_context(),
+    }
 }
 
 /// Resolve an application context from request extensions.
@@ -157,10 +165,11 @@ pub(crate) fn publish_storage_class_config(config: StorageClassConfig) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppContext, IamInterface, KmsInterface, ServerContextSlot, app_context_from_extensions, app_context_from_req,
-        current_app_context, object_store_from_extensions, publish_test_app_context,
+        AppContext, IamInterface, KmsInterface, ServerContextSlot, app_context_from_envelope, app_context_from_extensions,
+        app_context_from_req, current_app_context, object_store_from_extensions, publish_test_app_context,
     };
     use crate::admin::router::{Operation, S3Router};
+    use crate::app::RequestEnvelope;
     use hyper::{Method, StatusCode};
     use matchit::Params;
     use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
@@ -224,6 +233,10 @@ mod tests {
         }
     }
 
+    fn envelope(extensions: http::Extensions) -> RequestEnvelope {
+        RequestEnvelope::from_s3s(&request(extensions))
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn request_with_empty_slot_never_uses_ambient_context() {
@@ -265,6 +278,34 @@ mod tests {
         let resolved = app_context_from_extensions(&extensions).expect("legacy request must use ambient context");
         assert!(Arc::ptr_eq(&resolved, &ambient));
         assert!(object_store_from_extensions(&extensions).is_some());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn envelope_context_lookup_preserves_slot_isolation_and_absent_slot_fallback() {
+        let ambient = ambient_context().await;
+
+        let empty_slot = ServerContextSlot::new();
+        let mut empty_extensions = http::Extensions::new();
+        empty_extensions.insert(empty_slot);
+        assert!(
+            app_context_from_envelope(&envelope(empty_extensions)).is_none(),
+            "an installed-but-empty slot must not fall back to another server's ambient context"
+        );
+
+        let installed = distinct_context(&ambient);
+        let installed_slot = ServerContextSlot::new();
+        assert!(installed_slot.install(installed.clone()));
+        let mut installed_extensions = http::Extensions::new();
+        installed_extensions.insert(installed_slot);
+        let resolved = app_context_from_envelope(&envelope(installed_extensions))
+            .expect("an installed slot must resolve its own context even while IAM is unready");
+        assert!(Arc::ptr_eq(&resolved, &installed));
+        assert!(!Arc::ptr_eq(&resolved, &ambient));
+
+        let fallback = app_context_from_envelope(&envelope(http::Extensions::new()))
+            .expect("an envelope with no server slot keeps the legacy ambient fallback");
+        assert!(Arc::ptr_eq(&fallback, &ambient));
     }
 
     struct ContextDependentAdminRoute;

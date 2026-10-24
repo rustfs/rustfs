@@ -27,6 +27,7 @@ use super::storage_api::error::StorageError;
 use super::storage_api::runtime::PeerRestClient;
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
+use crate::admin::operation::{AdminRequest, Operation as OwnedOperation};
 use crate::admin::runtime_sources::{
     ServerContextSlot, app_context_from_req, current_boot_time, current_bucket_monitor_handle, current_deployment_id,
     current_notification_system, current_object_store_handle, current_region, current_replication_pool_handle,
@@ -3410,16 +3411,39 @@ impl Operation for AdminOperation {
     }
 }
 
+/// Converts the legacy router request and response at the edge while owned
+/// admin operations use only RustFS request and body types.
+pub(crate) struct LegacyAdminAdapter(pub(crate) &'static dyn OwnedOperation);
+
+#[async_trait::async_trait]
+impl Operation for LegacyAdminAdapter {
+    async fn call(
+        &self,
+        req: S3Request<Body>,
+        params: Params<'_, '_>,
+    ) -> rustfs_s3_types::S3Result<S3Response<(StatusCode, Body)>> {
+        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+        let request = AdminRequest::new(envelope, req.input.into());
+        let (status, headers, body) = self.0.call(request, params).await?.into_parts();
+        Ok(S3Response::with_headers((status, body.into()), headers))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::operation::{AdminRequest, AdminResponse, Operation as OwnedOperation};
+    use crate::auth::constant_time_eq;
+    use bytes::Bytes;
     use http::HeaderMap;
     use http::Method;
     use http::Uri;
     use rustfs_gateway_types::persistence::{
         PersistedReplicationDestination, PersistedReplicationRule, PersistedReplicationStatus,
     };
+    use rustfs_s3_types::{Body as OwnedBody, S3Error as OwnedS3Error, S3ErrorCode as OwnedS3ErrorCode};
     use s3s::S3Request;
+    use std::io;
     use std::net::{IpAddr, SocketAddr};
     use time::macros::datetime;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3498,6 +3522,66 @@ mod tests {
         }
     }
 
+    struct IdentityOperation;
+
+    #[async_trait::async_trait]
+    impl OwnedOperation for IdentityOperation {
+        async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> rustfs_s3_types::S3Result<AdminResponse> {
+            let credentials = req
+                .credentials()
+                .ok_or_else(|| OwnedS3Error::with_message(OwnedS3ErrorCode::AccessDenied, "owned admin identity is required"))?;
+            let identity_matches = credentials.access_key() == "AKIAOWNED"
+                && constant_time_eq(credentials.secret_key(), "owned-secret")
+                && credentials
+                    .session_token()
+                    .is_some_and(|token| constant_time_eq(token, "owned-session"));
+            if !identity_matches {
+                return Err(OwnedS3Error::with_message(
+                    OwnedS3ErrorCode::AccessDenied,
+                    "owned admin identity is invalid",
+                ));
+            }
+            if req.method() != Method::GET
+                || req.uri().path() != "/__owned_admin/identity"
+                || req.headers().get("x-owned-probe").and_then(|value| value.to_str().ok()) != Some("present")
+                || req.region() != Some("us-east-2")
+                || req.service() != Some("s3")
+                || params.get("kind") != Some("identity")
+            {
+                return Err(OwnedS3Error::with_message(
+                    OwnedS3ErrorCode::InvalidRequest,
+                    "owned admin request facts changed at the router edge",
+                ));
+            }
+            Ok(AdminResponse::new(StatusCode::NO_CONTENT, OwnedBody::empty()))
+        }
+    }
+
+    struct EchoOperation;
+
+    #[async_trait::async_trait]
+    impl OwnedOperation for EchoOperation {
+        async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> rustfs_s3_types::S3Result<AdminResponse> {
+            let mut headers = HeaderMap::new();
+            headers.append("x-owned-repeat", HeaderValue::from_static("first"));
+            headers.append("x-owned-repeat", HeaderValue::from_static("second"));
+            Ok(AdminResponse::with_headers(StatusCode::IM_A_TEAPOT, req.into_body(), headers))
+        }
+    }
+
+    static IDENTITY_OPERATION: IdentityOperation = IdentityOperation;
+    static IDENTITY_ADAPTER: LegacyAdminAdapter = LegacyAdminAdapter(&IDENTITY_OPERATION);
+    static ECHO_OPERATION: EchoOperation = EchoOperation;
+    static ECHO_ADAPTER: LegacyAdminAdapter = LegacyAdminAdapter(&ECHO_OPERATION);
+
+    fn owned_router(path: &str, adapter: &'static LegacyAdminAdapter) -> S3Router<AdminOperation> {
+        let mut router = S3Router::new(false);
+        router
+            .insert(Method::GET, path, AdminOperation(adapter))
+            .expect("owned test route should register");
+        router
+    }
+
     fn router_request(method: Method, uri: &'static str) -> S3Request<Body> {
         S3Request {
             input: Body::empty(),
@@ -3510,6 +3594,86 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_admin_adapter_rejects_missing_identity_and_preserves_supplied_identity() {
+        let router = owned_router("/__owned_admin/{kind}", &IDENTITY_ADAPTER);
+
+        let error = router
+            .call(router_request(Method::GET, "/__owned_admin/identity"))
+            .await
+            .expect_err("missing credentials must stay denied");
+        assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+
+        let mut request = router_request(Method::GET, "/__owned_admin/identity");
+        request.headers.insert("x-owned-probe", HeaderValue::from_static("present"));
+        request
+            .headers
+            .insert("x-amz-security-token", HeaderValue::from_static("owned-session"));
+        request.credentials = Some(s3s::auth::Credentials {
+            access_key: "AKIAOWNED".to_owned(),
+            secret_key: "owned-secret".into(),
+        });
+        request.region = Some("us-east-2".parse().expect("valid region"));
+        request.service = Some("s3".to_owned());
+
+        let response = router
+            .call(request)
+            .await
+            .expect("supplied identity must reach the owned operation");
+        assert_eq!(response.status, Some(StatusCode::NO_CONTENT));
+    }
+
+    #[tokio::test]
+    async fn legacy_admin_adapter_preserves_status_repeated_headers_raw_body_and_size_hint() {
+        let router = owned_router("/__owned_admin/echo", &ECHO_ADAPTER);
+        let raw = Bytes::from_static(&[0x00, 0x7f, 0x80, 0xff]);
+        let mut request = router_request(Method::GET, "/__owned_admin/echo");
+        request.input = Body::from(raw.clone());
+
+        let response = router
+            .call(request)
+            .await
+            .expect("owned response should cross the router edge");
+
+        assert_eq!(response.status, Some(StatusCode::IM_A_TEAPOT));
+        assert_eq!(http_body::Body::size_hint(&response.output).exact(), Some(raw.len() as u64));
+        let repeated = response
+            .headers
+            .get_all("x-owned-repeat")
+            .iter()
+            .map(|value| value.to_str().expect("static header"))
+            .collect::<Vec<_>>();
+        assert_eq!(repeated, ["first", "second"]);
+        assert_eq!(
+            http_body_util::BodyExt::collect(response.output)
+                .await
+                .expect("raw body should read")
+                .to_bytes(),
+            raw
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_admin_adapter_preserves_body_errors() {
+        let router = owned_router("/__owned_admin/echo", &ECHO_ADAPTER);
+        let stream = futures::stream::iter(vec![
+            Ok::<Bytes, io::Error>(Bytes::from_static(b"before-error")),
+            Err(io::Error::other("owned body sentinel")),
+        ]);
+        let mut request = router_request(Method::GET, "/__owned_admin/echo");
+        request.input = OwnedBody::from_stream(stream).into();
+
+        let response = router
+            .call(request)
+            .await
+            .expect("owned response should cross the router edge");
+        let error = http_body_util::BodyExt::collect(response.output)
+            .await
+            .expect_err("the body error must remain observable");
+
+        assert!(error.to_string().contains("owned body sentinel"), "{error}");
     }
 
     #[test]

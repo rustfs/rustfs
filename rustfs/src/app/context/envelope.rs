@@ -34,7 +34,7 @@ use crate::app::storage_api::context::{
     TableDataPlaneListAccess, TableDataPlanePublicationGuards,
 };
 use crate::auth::{VerifiedPresignedRequest, VerifiedSigV4Request};
-use crate::shared_types::RemoteAddr;
+use crate::shared_types::{NativeTlsTransport, RemoteAddr};
 use http::{Extensions, HeaderMap, Method, Uri};
 use rustfs_trusted_proxies::ClientInfo;
 use std::fmt;
@@ -119,6 +119,7 @@ pub struct RequestEnvelope {
     // Attached by the connection and request layers in `server/`.
     remote_addr: Option<SocketAddr>,
     client_info: Option<ClientInfo>,
+    native_tls_transport: Option<bool>,
     request_context: Option<RequestContext>,
     server_context: Option<Arc<ServerContextSlot>>,
     body_read_control: Option<BodyReadControl>,
@@ -158,6 +159,7 @@ impl RequestEnvelope {
             service: head.service,
             remote_addr: extensions.remove::<Option<RemoteAddr>>().flatten().map(|addr| addr.0),
             client_info: extensions.remove(),
+            native_tls_transport: extensions.remove::<NativeTlsTransport>().map(|transport| transport.0),
             request_context: extensions.remove(),
             server_context: extensions.remove(),
             body_read_control: extensions.remove(),
@@ -186,6 +188,17 @@ impl RequestEnvelope {
         &self.uri
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "URI-mutating admin handlers move to the envelope in later T1.12 slices"
+        )
+    )]
+    pub(crate) fn uri_mut(&mut self) -> &mut Uri {
+        &mut self.uri
+    }
+
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
     }
@@ -211,6 +224,14 @@ impl RequestEnvelope {
 
     pub fn client_info(&self) -> Option<&ClientInfo> {
         self.client_info.as_ref()
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the TLS admin handler moves to the envelope in a later T1.12 slice")
+    )]
+    pub(crate) fn native_tls_transport(&self) -> Option<bool> {
+        self.native_tls_transport
     }
 
     pub fn request_context(&self) -> Option<&RequestContext> {
@@ -258,6 +279,14 @@ impl RequestEnvelope {
 
     pub(crate) fn req_info(&self) -> Option<&ReqInfo> {
         self.req_info.as_ref()
+    }
+
+    pub(crate) fn req_info_mut(&mut self) -> Option<&mut ReqInfo> {
+        self.req_info.as_mut()
+    }
+
+    pub(crate) fn install_req_info(&mut self, req_info: ReqInfo) -> Option<ReqInfo> {
+        self.req_info.replace(req_info)
     }
 
     pub(crate) fn bucket_generation(&self) -> Option<&BucketGenerationGuard> {
