@@ -152,10 +152,10 @@ async fn four_node_tls_large_and_range_gets_preserve_bytes() -> TestResult {
     })?;
     dist.cluster.enable_tls(&tls_directory).await?;
     let report_path = std::env::var_os("RUSTFS_INTERNODE_ACCEPTANCE_REPORT").map(PathBuf::from);
-    if let Some(path) = &report_path {
-        if path.exists() || path.with_extension("pids.json").exists() {
-            return Err("acceptance report paths must be unused".into());
-        }
+    if let Some(path) = &report_path
+        && (path.exists() || path.with_extension("pids.json").exists())
+    {
+        return Err("acceptance report paths must be unused".into());
     }
     let log_directory = report_path
         .as_ref()
