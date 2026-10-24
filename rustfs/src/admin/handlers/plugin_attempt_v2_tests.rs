@@ -212,158 +212,155 @@ impl Fixture {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn delegation_v2_persists_and_vends_with_real_parent_intersection() {
-    Box::pin(async {
-        temp_env::async_with_vars(
-            [
-                ("RUSTFS_PLUGIN_BROKERS", Some(r#"{"cross-broker":"runner"}"#)),
-                ("RUSTFS_SKIP_BACKGROUND_TASK", Some("1")),
-            ],
-            async {
-                let fixture = Fixture::new().await;
-                let now = now().expect("clock");
-                let legacy = json!({"deployment":"runner","bucket":"photos","input_prefix":"input/",
+    temp_env::async_with_vars(
+        [
+            ("RUSTFS_PLUGIN_BROKERS", Some(r#"{"cross-broker":"runner"}"#)),
+            ("RUSTFS_SKIP_BACKGROUND_TASK", Some("1")),
+        ],
+        async {
+            let fixture = Fixture::new().await;
+            let now = now().expect("clock");
+            let legacy = json!({"deployment":"runner","bucket":"photos","input_prefix":"input/",
             "output_prefix":"output/","expires_at_unix_seconds":now+3600});
-                let v1 = fixture
-                    .iam
-                    .create_plugin_delegation(PARENT, serde_json::from_value(legacy.clone()).expect("v1"), now)
-                    .await
-                    .expect("persist legacy delegation");
-                assert_eq!(v1.version, 1);
-                assert_eq!(serde_json::to_value(&v1.restrictions).expect("v1 wire"), legacy);
-                let mut v2 = legacy;
-                v2["version"] = json!(2);
-                v2["output_bucket"] = json!("artifacts");
-                let record = fixture
-                    .iam
-                    .create_plugin_delegation(PARENT, serde_json::from_value(v2.clone()).expect("v2"), now)
-                    .await
-                    .expect("persist v2 delegation");
-                assert_eq!(record.version, 2);
-                let loaded = fixture
+            let v1 = fixture
+                .iam
+                .create_plugin_delegation(PARENT, serde_json::from_value(legacy.clone()).expect("v1"), now)
+                .await
+                .expect("persist legacy delegation");
+            assert_eq!(v1.version, 1);
+            assert_eq!(serde_json::to_value(&v1.restrictions).expect("v1 wire"), legacy);
+            let mut v2 = legacy;
+            v2["version"] = json!(2);
+            v2["output_bucket"] = json!("artifacts");
+            let record = fixture
+                .iam
+                .create_plugin_delegation(PARENT, serde_json::from_value(v2.clone()).expect("v2"), now)
+                .await
+                .expect("persist v2 delegation");
+            assert_eq!(record.version, 2);
+            let loaded = fixture
+                .iam
+                .read_active_plugin_delegation(PARENT, &record.id, now)
+                .await
+                .expect("strict stored v2");
+            assert!(loaded == record, "same persisted v2 identity");
+            assert_eq!(serde_json::to_value(&loaded.restrictions).expect("v2 wire"), v2);
+            // The record envelope and restriction profile cannot disagree on a persisted read.
+            let path = format!("config/iam/plugin-delegations/v1/{}/record.json", record.id);
+            let mut corrupt = serde_json::to_value(&record).expect("record JSON");
+            corrupt["version"] = json!(1);
+            ObjectStore::new(fixture.store.clone())
+                .save_iam_config(corrupt, &path)
+                .await
+                .expect("inject incompatible stored version");
+            assert!(
+                fixture
                     .iam
                     .read_active_plugin_delegation(PARENT, &record.id, now)
                     .await
-                    .expect("strict stored v2");
-                assert!(loaded == record, "same persisted v2 identity");
-                assert_eq!(serde_json::to_value(&loaded.restrictions).expect("v2 wire"), v2);
-                // The record envelope and restriction profile cannot disagree on a persisted read.
-                let path = format!("config/iam/plugin-delegations/v1/{}/record.json", record.id);
-                let mut corrupt = serde_json::to_value(&record).expect("record JSON");
-                corrupt["version"] = json!(1);
-                ObjectStore::new(fixture.store.clone())
-                    .save_iam_config(corrupt, &path)
-                    .await
-                    .expect("inject incompatible stored version");
-                assert!(
-                    fixture
-                        .iam
-                        .read_active_plugin_delegation(PARENT, &record.id, now)
-                        .await
-                        .is_err(),
-                    "mixed v1/v2 stored profiles fail closed"
-                );
-                ObjectStore::new(fixture.store.clone())
-                    .save_iam_config(&record, &path)
-                    .await
-                    .expect("restore exact stored record");
-                let run = uuid::Uuid::new_v4();
-                let attempt = uuid::Uuid::new_v4();
-                let prefix = format!("output/74656e616e74/{run}/{attempt}/");
-                let body = json!({"tenant":"tenant","run_id":run,"attempt_id":attempt,"revision":record.revision,
+                    .is_err(),
+                "mixed v1/v2 stored profiles fail closed"
+            );
+            ObjectStore::new(fixture.store.clone())
+                .save_iam_config(&record, &path)
+                .await
+                .expect("restore exact stored record");
+            let run = uuid::Uuid::new_v4();
+            let attempt = uuid::Uuid::new_v4();
+            let prefix = format!("output/74656e616e74/{run}/{attempt}/");
+            let body = json!({"tenant":"tenant","run_id":run,"attempt_id":attempt,"revision":record.revision,
             "deployment":"runner","input_bucket":"photos","input_key":"input/photo.png","input_version":fixture.input_version,
             "output_bucket":"artifacts","output_prefix":prefix,"ttl_seconds":60});
-                let loaded_v1 = fixture
-                    .iam
-                    .read_active_plugin_delegation(PARENT, &v1.id, now)
-                    .await
-                    .expect("read legacy record");
-                assert!(loaded_v1 == v1, "legacy persistent identity");
-                let mut legacy_body = body.clone();
-                legacy_body["revision"] = json!(v1.revision);
-                legacy_body["output_bucket"] = json!("photos");
-                let legacy_response = fixture.issue(&v1, &legacy_body).await.expect("legacy same-bucket issuance");
-                assert_eq!(legacy_response.output.0, StatusCode::OK);
-                let mut wrong = body.clone();
-                wrong["output_bucket"] = json!("third");
-                match fixture.issue(&record, &wrong).await {
-                    Err(error) => assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied),
-                    Ok(_) => panic!("A03_CROSS_BUCKET_OUTPUT_BOUND"),
-                }
-                let response = fixture.issue(&record, &body).await.expect("actual v2 issuance");
-                assert_eq!(response.output.0, StatusCode::OK);
-                assert_eq!(response.headers[http::header::CACHE_CONTROL], "no-store");
-                let issued: Value = serde_json::from_slice(&response.output.1.collect().await.expect("issued body").to_bytes())
-                    .expect("issued JSON");
-                let (credential, root) = check_key_valid_with_context(
-                    issued["session_token"].as_str().expect("token"),
-                    issued["access_key_id"].as_str().expect("access key"),
-                    Some(fixture.context.as_ref()),
-                )
+            let loaded_v1 = fixture
+                .iam
+                .read_active_plugin_delegation(PARENT, &v1.id, now)
                 .await
-                .expect("persisted actual temporary identity");
-                assert!(!root && credential.is_temp());
-                let output = format!("{prefix}image.png");
-                for (action, bucket, object, version, expected) in [
-                    (
-                        S3Action::GetObjectVersionAction,
-                        "photos",
-                        "input/photo.png",
-                        Some(fixture.input_version.as_str()),
-                        true,
-                    ),
-                    (
-                        S3Action::GetObjectVersionAction,
-                        "photos",
-                        "input/photo.png",
-                        Some("wrong-version"),
-                        false,
-                    ),
-                    (S3Action::GetObjectAction, "photos", "input/photo.png", None, false),
-                    (S3Action::PutObjectAction, "artifacts", output.as_str(), None, true),
-                    (S3Action::PutObjectAction, "photos", output.as_str(), None, false),
-                    (S3Action::PutObjectAction, "third", output.as_str(), None, false),
-                    (S3Action::PutObjectAction, "artifacts", "output/other/image.png", None, false),
-                ] {
-                    assert_eq!(
-                        fixture.allowed(&credential, action, bucket, object, version).await,
-                        expected,
-                        "A03_CROSS_BUCKET_PARENT_INTERSECTION: bucket={bucket} object={object}"
-                    );
-                }
-                fixture.policy(PARENT, Fixture::parent_policy(true, true)).await;
-                assert!(
-                    !fixture
-                        .allowed(&credential, S3Action::PutObjectAction, "artifacts", &output, None)
-                        .await,
-                    "explicit parent Deny remains effective"
+                .expect("read legacy record");
+            assert!(loaded_v1 == v1, "legacy persistent identity");
+            let mut legacy_body = body.clone();
+            legacy_body["revision"] = json!(v1.revision);
+            legacy_body["output_bucket"] = json!("photos");
+            let legacy_response = fixture.issue(&v1, &legacy_body).await.expect("legacy same-bucket issuance");
+            assert_eq!(legacy_response.output.0, StatusCode::OK);
+            let mut wrong = body.clone();
+            wrong["output_bucket"] = json!("third");
+            match fixture.issue(&record, &wrong).await {
+                Err(error) => assert_eq!(error.code(), &s3s::S3ErrorCode::AccessDenied),
+                Ok(_) => panic!("A03_CROSS_BUCKET_OUTPUT_BOUND"),
+            }
+            let response = fixture.issue(&record, &body).await.expect("actual v2 issuance");
+            assert_eq!(response.output.0, StatusCode::OK);
+            assert_eq!(response.headers[http::header::CACHE_CONTROL], "no-store");
+            let issued: Value =
+                serde_json::from_slice(&response.output.1.collect().await.expect("issued body").to_bytes()).expect("issued JSON");
+            let (credential, root) = check_key_valid_with_context(
+                issued["session_token"].as_str().expect("token"),
+                issued["access_key_id"].as_str().expect("access key"),
+                Some(fixture.context.as_ref()),
+            )
+            .await
+            .expect("persisted actual temporary identity");
+            assert!(!root && credential.is_temp());
+            let output = format!("{prefix}image.png");
+            for (action, bucket, object, version, expected) in [
+                (
+                    S3Action::GetObjectVersionAction,
+                    "photos",
+                    "input/photo.png",
+                    Some(fixture.input_version.as_str()),
+                    true,
+                ),
+                (
+                    S3Action::GetObjectVersionAction,
+                    "photos",
+                    "input/photo.png",
+                    Some("wrong-version"),
+                    false,
+                ),
+                (S3Action::GetObjectAction, "photos", "input/photo.png", None, false),
+                (S3Action::PutObjectAction, "artifacts", output.as_str(), None, true),
+                (S3Action::PutObjectAction, "photos", output.as_str(), None, false),
+                (S3Action::PutObjectAction, "third", output.as_str(), None, false),
+                (S3Action::PutObjectAction, "artifacts", "output/other/image.png", None, false),
+            ] {
+                assert_eq!(
+                    fixture.allowed(&credential, action, bucket, object, version).await,
+                    expected,
+                    "A03_CROSS_BUCKET_PARENT_INTERSECTION: bucket={bucket} object={object}"
                 );
-                fixture.policy(PARENT, Fixture::parent_policy(false, false)).await;
-                assert!(
-                    !fixture
-                        .allowed(&credential, S3Action::PutObjectAction, "artifacts", &output, None)
-                        .await,
-                    "removing parent output permission remains effective"
-                );
-                assert!(
-                    fixture
-                        .allowed(
-                            &credential,
-                            S3Action::GetObjectVersionAction,
-                            "photos",
-                            "input/photo.png",
-                            Some(&fixture.input_version)
-                        )
-                        .await
-                );
+            }
+            fixture.policy(PARENT, Fixture::parent_policy(true, true)).await;
+            assert!(
+                !fixture
+                    .allowed(&credential, S3Action::PutObjectAction, "artifacts", &output, None)
+                    .await,
+                "explicit parent Deny remains effective"
+            );
+            fixture.policy(PARENT, Fixture::parent_policy(false, false)).await;
+            assert!(
+                !fixture
+                    .allowed(&credential, S3Action::PutObjectAction, "artifacts", &output, None)
+                    .await,
+                "removing parent output permission remains effective"
+            );
+            assert!(
                 fixture
-                    .iam
-                    .revoke_plugin_delegation(PARENT, &record.id)
+                    .allowed(
+                        &credential,
+                        S3Action::GetObjectVersionAction,
+                        "photos",
+                        "input/photo.png",
+                        Some(&fixture.input_version)
+                    )
                     .await
-                    .expect("revoke v2");
-                assert!(fixture.issue(&record, &body).await.is_err(), "revoked v2 cannot issue again");
-            },
-        )
-        .await;
-    })
-    .await
+            );
+            fixture
+                .iam
+                .revoke_plugin_delegation(PARENT, &record.id)
+                .await
+                .expect("revoke v2");
+            assert!(fixture.issue(&record, &body).await.is_err(), "revoked v2 cannot issue again");
+        },
+    )
+    .await;
 }

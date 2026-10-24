@@ -10612,7 +10612,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self, opts))]
     async fn delete_object(&self, bucket: &str, object: &str, mut opts: ObjectOptions) -> Result<ObjectInfo> {
-        let (admitted, _lifecycle) = self.prepare_public_delete(bucket, Some(object), &opts).await?;
+        let (admitted, _lifecycle) = Box::pin(self.prepare_public_delete(bucket, Some(object), &opts)).await?;
         opts = admitted;
         let _scope_outcome_guard = opts
             .scanner_publication_commit_scope

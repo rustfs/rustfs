@@ -2315,9 +2315,10 @@ impl LocalDiskWrapper {
         let permit = self.io_admission.foreground();
         let cleanup_enabled = cleanup_runtime::enabled()?;
         let guarded = external_guard.is_some();
+        // Keep the mutation state out of the nested admission futures.
         with_disk_io_permit(
             Some(permit.clone()),
-            self.track_disk_health_with_deadline(
+            Box::pin(self.track_disk_health_with_deadline(
                 action.operation().name(),
                 |_permit| async {
                     let owner = self.disk.begin_legacy_file_write(volume, permit).await?;
@@ -2343,7 +2344,7 @@ impl LocalDiskWrapper {
                 },
                 DiskMetricMutation::Delete,
                 deadline,
-            ),
+            )),
         )
         .await
     }

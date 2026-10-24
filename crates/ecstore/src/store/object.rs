@@ -530,114 +530,118 @@ async fn delete_prefix_with_tier_delete_journal(
     opts: &ObjectOptions,
     tier_journal_api: Option<&Arc<ECStore>>,
 ) -> Result<()> {
-    let Some(api) = tier_journal_api else {
-        return store.delete_prefix(bucket, object, opts).await;
-    };
-    let PreparedPrefixTierDelete {
-        dispatch,
-        chunk_parent_active,
-        chunk_parent_fleet_proof,
-        _leases,
-    } = prepare_prefix_tier_delete_journal_entries(api, bucket, object, opts).await?;
-    let Some(dispatch) = dispatch else {
-        // There is no new remote-cleanup candidate. Keep compatibility-path
-        // tier leases and, for a chunked final pass, the matching parent fleet
-        // proof alive until local deletion and parent completion both commit.
-        let _tier_leases = _leases;
-        let mut operation_opts = opts.clone();
-        // `tier_delete_journal_api` means a v6 dispatch authorization must be
-        // present at every destructive phase.  With no v6 candidate, clear
-        // that marker so ordinary objects use the local path and legacy
-        // transitioned metadata retains its FreeVersion fallback.
-        operation_opts.tier_delete_journal_api = None;
-        operation_opts.tier_delete_dispatch_authorization = None;
-        let parent_fleet_proof = if chunk_parent_active {
-            Some(
-                chunk_parent_fleet_proof
-                    .as_ref()
-                    .filter(|proof| tier_delete_journal_fleet_proof_matches(proof))
-                    .ok_or_else(|| Error::other("tier delete chunk parent fleet proof changed before final deletion"))?,
-            )
-        } else {
-            None
+    // Prefix planning must not inflate the ordinary single-object delete frame.
+    Box::pin(async move {
+        let Some(api) = tier_journal_api else {
+            return store.delete_prefix(bucket, object, opts).await;
         };
-        store.delete_prefix(bucket, object, &operation_opts).await?;
-        if let Some(parent_fleet_proof) = parent_fleet_proof {
-            #[cfg(all(test, feature = "test-util"))]
-            crate::bucket::lifecycle::tier_delete_journal::tier_delete_chunk_test_pause(
-                crate::bucket::lifecycle::tier_delete_journal::TierDeleteChunkTestStage::FinalLocalDeletionCompleted,
-            )
-            .await;
-            let bucket_incarnation = opts.expected_bucket_incarnation_id.ok_or(StorageError::PreconditionFailed)?;
-            let bucket_fence = opts
-                .bucket_lifecycle_lock_fence
-                .as_ref()
-                .ok_or_else(|| Error::other("tier delete dispatch requires a bucket lifecycle write fence"))?;
-            if !Box::pin(complete_tier_delete_chunk_parent(
-                Arc::clone(api),
-                bucket,
-                bucket_incarnation,
-                object,
-                bucket_fence,
-                parent_fleet_proof,
-            ))
-            .await?
-            {
-                return Err(Error::other("tier delete chunk parent disappeared after final local deletion"));
-            }
-        }
-        return Ok(());
-    };
-    let bucket_incarnation = opts.expected_bucket_incarnation_id.ok_or(StorageError::PreconditionFailed)?;
-    let bucket_fence = opts
-        .bucket_lifecycle_lock_fence
-        .as_ref()
-        .ok_or_else(|| Error::other("tier delete dispatch requires a bucket lifecycle write fence"))?;
-    let active = dispatch.consume(bucket, bucket_incarnation, object)?;
-    let mut operation_opts = opts.clone();
-    operation_opts.tier_delete_dispatch_authorization = Some(active.authorization());
-
-    #[cfg(all(test, feature = "test-util"))]
-    pause_prefix_delete_after_journal_prepare(bucket, object).await;
-
-    // Keep every backend generation lease until the whole local operation has
-    // either committed its journal set or returned an ambiguous mutation.
-    let _tier_leases = _leases;
-    if active.predecessor_replay_required() || active.is_chunked() {
-        replay_authorized_tier_delete_sources(store, bucket, object, &active, &operation_opts).await?;
-        #[cfg(all(test, feature = "test-util"))]
-        if active.is_chunked() {
-            crate::bucket::lifecycle::tier_delete_journal::tier_delete_chunk_test_pause(
-                crate::bucket::lifecycle::tier_delete_journal::TierDeleteChunkTestStage::LocalReplayCompleted,
-            )
-            .await;
-        }
-        complete_tier_delete_dispatch(Arc::clone(api), &active, bucket_fence).await?;
-        if active.is_chunked() {
-            return Err(Error::other("tier delete chunk completed; retry the next durable batch"));
-        }
-        return Err(Error::other("authorized tier delete predecessor completed; retry the successor dispatch"));
-    }
-    let result = store.delete_prefix(bucket, object, &operation_opts).await;
-    match result {
-        Ok(()) => {
-            if let Err(err) = complete_tier_delete_dispatch(Arc::clone(api), &active, bucket_fence).await {
-                warn!(
-                    event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+        let PreparedPrefixTierDelete {
+            dispatch,
+            chunk_parent_active,
+            chunk_parent_fleet_proof,
+            _leases,
+        } = prepare_prefix_tier_delete_journal_entries(api, bucket, object, opts).await?;
+        let Some(dispatch) = dispatch else {
+            // There is no new remote-cleanup candidate. Keep compatibility-path
+            // tier leases and, for a chunked final pass, the matching parent fleet
+            // proof alive until local deletion and parent completion both commit.
+            let _tier_leases = _leases;
+            let mut operation_opts = opts.clone();
+            // `tier_delete_journal_api` means a v6 dispatch authorization must be
+            // present at every destructive phase.  With no v6 candidate, clear
+            // that marker so ordinary objects use the local path and legacy
+            // transitioned metadata retains its FreeVersion fallback.
+            operation_opts.tier_delete_journal_api = None;
+            operation_opts.tier_delete_dispatch_authorization = None;
+            let parent_fleet_proof = if chunk_parent_active {
+                Some(
+                    chunk_parent_fleet_proof
+                        .as_ref()
+                        .filter(|proof| tier_delete_journal_fleet_proof_matches(proof))
+                        .ok_or_else(|| Error::other("tier delete chunk parent fleet proof changed before final deletion"))?,
+                )
+            } else {
+                None
+            };
+            store.delete_prefix(bucket, object, &operation_opts).await?;
+            if let Some(parent_fleet_proof) = parent_fleet_proof {
+                #[cfg(all(test, feature = "test-util"))]
+                crate::bucket::lifecycle::tier_delete_journal::tier_delete_chunk_test_pause(
+                    crate::bucket::lifecycle::tier_delete_journal::TierDeleteChunkTestStage::FinalLocalDeletionCompleted,
+                )
+                .await;
+                let bucket_incarnation = opts.expected_bucket_incarnation_id.ok_or(StorageError::PreconditionFailed)?;
+                let bucket_fence = opts
+                    .bucket_lifecycle_lock_fence
+                    .as_ref()
+                    .ok_or_else(|| Error::other("tier delete dispatch requires a bucket lifecycle write fence"))?;
+                if !Box::pin(complete_tier_delete_chunk_parent(
+                    Arc::clone(api),
                     bucket,
-                    prefix = object,
-                    error = ?err,
-                    "Prefix deletion committed with durable tier cleanup pending"
-                );
+                    bucket_incarnation,
+                    object,
+                    bucket_fence,
+                    parent_fleet_proof,
+                ))
+                .await?
+                {
+                    return Err(Error::other("tier delete chunk parent disappeared after final local deletion"));
+                }
             }
-            Ok(())
+            return Ok(());
+        };
+        let bucket_incarnation = opts.expected_bucket_incarnation_id.ok_or(StorageError::PreconditionFailed)?;
+        let bucket_fence = opts
+            .bucket_lifecycle_lock_fence
+            .as_ref()
+            .ok_or_else(|| Error::other("tier delete dispatch requires a bucket lifecycle write fence"))?;
+        let active = dispatch.consume(bucket, bucket_incarnation, object)?;
+        let mut operation_opts = opts.clone();
+        operation_opts.tier_delete_dispatch_authorization = Some(active.authorization());
+
+        #[cfg(all(test, feature = "test-util"))]
+        pause_prefix_delete_after_journal_prepare(bucket, object).await;
+
+        // Keep every backend generation lease until the whole local operation has
+        // either committed its journal set or returned an ambiguous mutation.
+        let _tier_leases = _leases;
+        if active.predecessor_replay_required() || active.is_chunked() {
+            replay_authorized_tier_delete_sources(store, bucket, object, &active, &operation_opts).await?;
+            #[cfg(all(test, feature = "test-util"))]
+            if active.is_chunked() {
+                crate::bucket::lifecycle::tier_delete_journal::tier_delete_chunk_test_pause(
+                    crate::bucket::lifecycle::tier_delete_journal::TierDeleteChunkTestStage::LocalReplayCompleted,
+                )
+                .await;
+            }
+            complete_tier_delete_dispatch(Arc::clone(api), &active, bucket_fence).await?;
+            if active.is_chunked() {
+                return Err(Error::other("tier delete chunk completed; retry the next durable batch"));
+            }
+            return Err(Error::other("authorized tier delete predecessor completed; retry the successor dispatch"));
         }
-        // Once DispatchAuthorized exists, every failure is mutation-ambiguous.
-        // Recovery decides from physical proof; never abort the journals here.
-        Err(err) => Err(err),
-    }
+        let result = store.delete_prefix(bucket, object, &operation_opts).await;
+        match result {
+            Ok(()) => {
+                if let Err(err) = complete_tier_delete_dispatch(Arc::clone(api), &active, bucket_fence).await {
+                    warn!(
+                        event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        bucket,
+                        prefix = object,
+                        error = ?err,
+                        "Prefix deletion committed with durable tier cleanup pending"
+                    );
+                }
+                Ok(())
+            }
+            // Once DispatchAuthorized exists, every failure is mutation-ambiguous.
+            // Recovery decides from physical proof; never abort the journals here.
+            Err(err) => Err(err),
+        }
+    })
+    .await
 }
 
 async fn replay_authorized_tier_delete_sources(
@@ -814,73 +818,77 @@ async fn delete_recursive_prefix_with_tier_delete_journal(
     opts: &ObjectOptions,
     tier_journal_api: Option<&Arc<ECStore>>,
 ) -> Result<()> {
-    // Prefix deletes cover multiple object keys; an exact lock on the prefix
-    // string would not protect child objects.
-    if !is_meta_bucketname(bucket) {
-        let state = opts
-            .object_lock_config_snapshot
-            .as_deref()
-            .ok_or_else(|| Error::other("recursive delete is missing its Object Lock configuration snapshot"))?
-            .state();
-        ensure_recursive_force_delete_allowed_for_state(bucket, state)?;
-        let bypass_governance = opts
-            .object_lock_delete
-            .as_ref()
-            .is_some_and(|delete_opts| delete_opts.bypass_governance);
-        for pool in &store.pools {
-            for set in &pool.disk_set {
-                let mut marker = None;
-                let mut version_marker = None;
-                loop {
+    Box::pin(async move {
+        // Prefix deletes cover multiple object keys; an exact lock on the prefix
+        // string would not protect child objects.
+        if !is_meta_bucketname(bucket) {
+            let state = opts
+                .object_lock_config_snapshot
+                .as_deref()
+                .ok_or_else(|| Error::other("recursive delete is missing its Object Lock configuration snapshot"))?
+                .state();
+            ensure_recursive_force_delete_allowed_for_state(bucket, state)?;
+            let bypass_governance = opts
+                .object_lock_delete
+                .as_ref()
+                .is_some_and(|delete_opts| delete_opts.bypass_governance);
+            for pool in &store.pools {
+                for set in &pool.disk_set {
+                    let mut marker = None;
+                    let mut version_marker = None;
+                    loop {
+                        let page = set
+                            .clone()
+                            .inner_list_object_versions_for_recursive_delete(
+                                bucket,
+                                object,
+                                marker.clone(),
+                                version_marker.clone(),
+                                RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE,
+                            )
+                            .await?;
+                        for object_info in &page.objects {
+                            if check_object_lock_for_deletion_with_state(state, object_info, bypass_governance)?.is_some() {
+                                return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object_info.name.clone()));
+                            }
+                        }
+                        if !page.is_truncated {
+                            break;
+                        }
+                        let next_marker = page
+                            .next_marker
+                            .ok_or_else(|| Error::other("recursive delete version scan did not return a continuation marker"))?;
+                        if marker.as_ref() == Some(&next_marker) && version_marker == page.next_version_idmarker {
+                            return Err(Error::other("recursive delete version scan did not advance"));
+                        }
+                        marker = Some(next_marker);
+                        version_marker = page.next_version_idmarker;
+                    }
+                }
+            }
+        }
+        // A trailing slash selects a directory, not the object at its parent key.
+        // Raw filesystem recursion would also remove that object's metadata and
+        // data. Preserve it by purging the selected keys individually when they
+        // share this physical directory. The bucket write lock covers both scans.
+        if object.ends_with('/') && !is_meta_bucketname(bucket) {
+            let parent = object.strip_suffix('/').unwrap_or(object);
+            for pool in &store.pools {
+                for set in &pool.disk_set {
                     let page = set
                         .clone()
-                        .inner_list_object_versions_for_recursive_delete(
-                            bucket,
-                            object,
-                            marker.clone(),
-                            version_marker.clone(),
-                            RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE,
-                        )
+                        .inner_list_object_versions_for_recursive_delete(bucket, parent, None, None, 1)
                         .await?;
-                    for object_info in &page.objects {
-                        if check_object_lock_for_deletion_with_state(state, object_info, bypass_governance)?.is_some() {
-                            return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object_info.name.clone()));
-                        }
+                    if page.objects.iter().any(|info| info.name == parent) {
+                        return delete_directory_keys_with_tier_delete_journal(store, bucket, object, opts, tier_journal_api)
+                            .await;
                     }
-                    if !page.is_truncated {
-                        break;
-                    }
-                    let next_marker = page
-                        .next_marker
-                        .ok_or_else(|| Error::other("recursive delete version scan did not return a continuation marker"))?;
-                    if marker.as_ref() == Some(&next_marker) && version_marker == page.next_version_idmarker {
-                        return Err(Error::other("recursive delete version scan did not advance"));
-                    }
-                    marker = Some(next_marker);
-                    version_marker = page.next_version_idmarker;
                 }
             }
         }
-    }
-    // A trailing slash selects a directory, not the object at its parent key.
-    // Raw filesystem recursion would also remove that object's metadata and
-    // data. Preserve it by purging the selected keys individually when they
-    // share this physical directory. The bucket write lock covers both scans.
-    if object.ends_with('/') && !is_meta_bucketname(bucket) {
-        let parent = object.strip_suffix('/').unwrap_or(object);
-        for pool in &store.pools {
-            for set in &pool.disk_set {
-                let page = set
-                    .clone()
-                    .inner_list_object_versions_for_recursive_delete(bucket, parent, None, None, 1)
-                    .await?;
-                if page.objects.iter().any(|info| info.name == parent) {
-                    return delete_directory_keys_with_tier_delete_journal(store, bucket, object, opts, tier_journal_api).await;
-                }
-            }
-        }
-    }
-    delete_prefix_with_tier_delete_journal(store, bucket, object, opts, tier_journal_api).await
+        delete_prefix_with_tier_delete_journal(store, bucket, object, opts, tier_journal_api).await
+    })
+    .await
 }
 
 async fn delete_directory_keys_with_tier_delete_journal(
@@ -4768,7 +4776,8 @@ impl ECStore {
         data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
-        let (object, opts) = self.prepare_put_object(bucket, object, opts).await?;
+        // Preparation otherwise propagates through every instrumented PUT layer.
+        let (object, opts) = Box::pin(self.prepare_put_object(bucket, object, opts)).await?;
         let idx = self
             .select_put_object_pool_idx(bucket, object.as_str(), data.size(), &opts)
             .await?;
@@ -5291,14 +5300,14 @@ impl ECStore {
             .await
     }
 
-    async fn handle_delete_object_with_journal_owned(
-        &self,
-        bucket: &str,
-        object: &str,
+    fn handle_delete_object_with_journal_owned<'a>(
+        &'a self,
+        bucket: &'a str,
+        object: &'a str,
         opts: ObjectOptions,
         tier_journal_api: Option<Arc<ECStore>>,
         lifecycle_owner: Option<rustfs_lock::NamespaceLockGuard>,
-    ) -> Result<ObjectInfo> {
+    ) -> impl Future<Output = Result<ObjectInfo>> + Send + 'a {
         Box::pin(async move {
             let mut opts = opts;
             let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
@@ -5308,7 +5317,6 @@ impl ECStore {
             enqueue_recorded_tier_free_versions(self, receipt_sink).await;
             result
         })
-        .await
     }
 
     fn handle_delete_object_with_journal_inner_boxed<'a>(
@@ -9753,6 +9761,23 @@ mod tests {
             "unified delete handler future must remain stack-bounded; measured {unified_future_size} bytes"
         );
         drop(unified_future);
+
+        let opts = ObjectOptions::default();
+        let prefix_future = delete_prefix_with_tier_delete_journal(&store, "bucket", "prefix/", &opts, None);
+        let prefix_future_size = std::mem::size_of_val(&prefix_future);
+        assert!(
+            prefix_future_size <= 4 * 1024,
+            "prefix delete future must remain stack-bounded; measured {prefix_future_size} bytes"
+        );
+        drop(prefix_future);
+
+        let recursive_future = delete_recursive_prefix_with_tier_delete_journal(&store, "bucket", "prefix/", &opts, None);
+        let recursive_future_size = std::mem::size_of_val(&recursive_future);
+        assert!(
+            recursive_future_size <= 4 * 1024,
+            "recursive prefix delete future must remain stack-bounded; measured {recursive_future_size} bytes"
+        );
+        drop(recursive_future);
 
         let batch_future =
             store.handle_delete_objects_with_journal_and_accounting("bucket", Vec::new(), ObjectOptions::default(), None);
