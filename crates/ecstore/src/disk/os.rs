@@ -1701,16 +1701,38 @@ pub(crate) struct DiskBlockingQueue {
 struct DiskBlockingWorkerGuard {
     queue: Arc<DiskBlockingQueue>,
     lane: DiskBlockingLane,
+    started: bool,
     disarmed: bool,
 }
 
 impl Drop for DiskBlockingWorkerGuard {
     fn drop(&mut self) {
         #[cfg(any(test, feature = "test-util"))]
-        CURRENT_DISK_BLOCKING_QUEUE.with(|slot| {
-            let _ = slot.borrow_mut().take();
-        });
+        if self.started {
+            CURRENT_DISK_BLOCKING_QUEUE.with(|slot| {
+                let _ = slot.borrow_mut().take();
+            });
+        }
         if self.disarmed {
+            return;
+        }
+        if !self.started {
+            let cancelled = {
+                let mut state = self.queue.lane(self.lane).state.lock();
+                state.active_workers = state.active_workers.saturating_sub(1);
+                if state.active_workers == 0 {
+                    self.queue
+                        .lane(self.lane)
+                        .ready
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    Some(std::mem::take(&mut state.jobs))
+                } else {
+                    None
+                }
+            };
+            // Queued jobs may own namespace leases and references to this queue.
+            // Drop them after unlocking when no executor can start the work.
+            drop(cancelled);
             return;
         }
         let should_respawn = {
@@ -1791,16 +1813,21 @@ impl DiskBlockingQueue {
     }
 
     fn spawn_worker(queue: Arc<Self>, lane: DiskBlockingLane) {
+        // Own the guard before submission: Tokio can reject a task without
+        // ever invoking its closure while the runtime is shutting down.
+        let guard = DiskBlockingWorkerGuard {
+            queue: Arc::clone(&queue),
+            lane,
+            started: false,
+            disarmed: false,
+        };
         let worker = move || {
+            let mut guard = guard;
             #[cfg(any(test, feature = "test-util"))]
             CURRENT_DISK_BLOCKING_QUEUE.with(|slot| {
                 *slot.borrow_mut() = Some((Arc::clone(&queue), lane));
             });
-            let mut guard = DiskBlockingWorkerGuard {
-                queue: Arc::clone(&queue),
-                lane,
-                disarmed: false,
-            };
+            guard.started = true;
             let mut remaining_jobs = MAX_BLOCKING_JOBS_PER_WORKER;
             loop {
                 let job = {
@@ -9371,6 +9398,103 @@ mod tests {
             assert!(!root.path().join("receipt").exists());
             assert!(!root.path().join("intermediate").exists());
         }
+    }
+
+    #[tokio::test]
+    async fn disk_blocking_queue_rejected_worker_releases_jobs_and_resources() {
+        use crate::disk::io_admission::with_background_resource_unit;
+        use rustfs_concurrency::adaptive::AdaptiveAdmission;
+        use std::num::NonZeroU16;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle().clone();
+        runtime.shutdown_background();
+        let queue = DiskBlockingQueue::new();
+        let owner = Arc::clone(&queue);
+        let ran = Arc::new(AtomicBool::new(false));
+        let operation_ran = Arc::clone(&ran);
+        let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
+        let mut operation = std::pin::pin!(queue.run_cancellable(move |_| {
+            let _owner = owner;
+            operation_ran.store(true, Ordering::Relaxed);
+            Ok(())
+        }));
+        let result = with_background_resource_unit(gate.acquire().await, async {
+            let _entered = handle.enter();
+            futures::FutureExt::now_or_never(&mut operation)
+        })
+        .await;
+        assert!(result.expect("rejected worker must complete its waiter").is_err());
+        assert!(!ran.load(Ordering::Relaxed), "rejected work must not execute");
+        assert_eq!(gate.snapshot().active, 0, "unstarted work must release its producer");
+        {
+            let state = queue.lane(DiskBlockingLane::Foreground).state.lock();
+            assert_eq!(state.active_workers, 0);
+            assert!(state.jobs.is_empty());
+        }
+        assert_eq!(queue.run(|| Ok(7)).await.expect("queue reusable on a live runtime"), 7);
+    }
+
+    #[tokio::test]
+    async fn disk_blocking_queue_shutdown_during_batch_releases_pending_owners() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let queue = DiskBlockingQueue::new();
+        let weak = Arc::downgrade(&queue);
+        let completed = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&completed);
+        let queued = Arc::clone(&queue);
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        runtime
+            .spawn(async move {
+                let first_count = Arc::clone(&count);
+                queued.enqueue_on_lane(
+                    DiskBlockingLane::Foreground,
+                    Box::new(move || {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.blocking_recv();
+                        first_count.fetch_add(1, Ordering::Relaxed);
+                    }),
+                );
+                for _ in 0..256 {
+                    let owner = Arc::clone(&queued);
+                    let count = Arc::clone(&count);
+                    queued.enqueue_on_lane(
+                        DiskBlockingLane::Foreground,
+                        Box::new(move || {
+                            let _owner = owner;
+                            count.fetch_add(1, Ordering::Relaxed);
+                        }),
+                    );
+                }
+            })
+            .await
+            .expect("all jobs queued");
+        started_rx.await.expect("first worker started");
+        drop(queue);
+        runtime.shutdown_background();
+        release_tx.send(()).expect("release started work");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unstarted successor must release queued self-owning jobs");
+        assert_eq!(
+            completed.load(Ordering::Relaxed),
+            64,
+            "shutdown may finish only the already-started batch"
+        );
     }
 
     #[tokio::test]
