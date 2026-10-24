@@ -39,14 +39,15 @@ pub struct MakeBucketOptions {
     pub no_lock: bool,
 }
 
-/// Match the plugin runner's fixed artifact-store prefix encoding.
+/// Validate a relative artifact namespace with nonempty components and one trailing slash.
 pub fn valid_artifact_base_prefix(prefix: &str) -> bool {
-    prefix.ends_with('/')
-        && prefix.len() <= 1024
-        && prefix
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte))
-        && !prefix.split('/').any(|part| matches!(part, "." | ".."))
+    prefix.strip_suffix('/').is_some_and(|base| {
+        prefix.len() <= 1024
+            && prefix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte))
+            && base.split('/').all(|part| !part.is_empty() && !matches!(part, "." | ".."))
+    })
 }
 
 /// Operation to perform on a bucket during site replication delete.
@@ -131,10 +132,25 @@ mod tests {
 
     #[test]
     fn artifact_prefix_matches_runner_encoding() {
-        for prefix in ["outputs/", "artifacts/v1._-/", "/", "nested//"] {
+        for prefix in ["outputs/", "artifacts/v1._-/", "nested/", "nested/level/"] {
             assert!(valid_artifact_base_prefix(prefix), "ARTIFACT_PREFIX_VALID: {prefix}");
         }
-        for prefix in ["", "outputs", "../", "a/./", "a/../", "空/", "a b/", "a%2f/"] {
+        for prefix in [
+            "",
+            "outputs",
+            "/",
+            "//",
+            "/nested/",
+            "nested//",
+            "nested//level/",
+            "nested/level//",
+            "../",
+            "a/./",
+            "a/../",
+            "空/",
+            "a b/",
+            "a%2f/",
+        ] {
             assert!(!valid_artifact_base_prefix(prefix), "ARTIFACT_PREFIX_INVALID: {prefix}");
         }
         assert!(!valid_artifact_base_prefix(&format!("{}/", "a".repeat(1024))));
