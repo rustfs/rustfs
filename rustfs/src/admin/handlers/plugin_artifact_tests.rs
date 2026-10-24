@@ -1054,7 +1054,7 @@ async fn artifact_writes_handler_confirms_both_records_on_first_and_exact_retry(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn artifact_writes_upload_part_copy_rejects_real_managed_staging_and_preserves_it() {
-    use crate::admin::storage_api::s3::{CopySource, S3 as _, S3Access, UploadPartCopyInput};
+    use crate::admin::storage_api::s3::{CopySource, S3 as _, UploadPartCopyInput};
     use crate::storage::storage_api::contract::{
         bucket::BUCKET_LIFECYCLE_LOCK_OBJECT, multipart::MultipartOperations as _, namespace::NamespaceLocking as _,
     };
@@ -1191,7 +1191,7 @@ async fn artifact_writes_upload_part_copy_rejects_real_managed_staging_and_prese
         snapshot
     };
     let mut managed_request = copy_request(BUCKET, &key, &upload.upload_id);
-    S3Access::upload_part_copy(&fs, &mut managed_request)
+    s3::S3Access::upload_part_copy(&fs, &mut managed_request)
         .await
         .expect("real source/destination authorization captures both generation guards");
     let mut source_options = StorageObjectOptions::default();
@@ -1233,7 +1233,7 @@ async fn artifact_writes_upload_part_copy_rejects_real_managed_staging_and_prese
         .await
         .expect("ordinary MPU");
     let mut control_request = copy_request(ordinary, "destination.bin", &control.upload_id);
-    S3Access::upload_part_copy(&fs, &mut control_request)
+    s3::S3Access::upload_part_copy(&fs, &mut control_request)
         .await
         .expect("ordinary copy uses the same real authorization/generation middleware");
     let copied = Box::pin(fs.upload_part_copy(control_request))
