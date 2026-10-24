@@ -29,10 +29,14 @@ use tokio::task::JoinHandle;
 
 const DEADLINE: Duration = Duration::from_secs(45);
 
-async fn fixture() -> TestResult<(RustFSTestClusterEnvironment, Vec<RpcFaultProxy>, Vec<Client>, String)> {
-    let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
+async fn fixture(
+    drives_per_node: usize,
+    storage_class: &str,
+) -> TestResult<(RustFSTestClusterEnvironment, Vec<RpcFaultProxy>, Vec<Client>, String)> {
+    let mut cluster =
+        RustFSTestClusterEnvironment::with_topology(ClusterTopology::single_pool_multidrive(4, drives_per_node)).await?;
     for (name, value) in [
-        ("RUSTFS_STORAGE_CLASS_STANDARD", "EC:2"),
+        ("RUSTFS_STORAGE_CLASS_STANDARD", storage_class),
         ("RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT", "5"),
         ("RUSTFS_OBJECT_LOCK_RPC_TIMEOUT_MS", "3000"),
         ("RUSTFS_DRIVE_METADATA_TIMEOUT_SECS", "2"),
@@ -190,13 +194,14 @@ fn upload_scope(upload_id: &str) -> TestResult<String> {
 async fn with_paused_peers<T: Send + 'static>(
     proxies: &[RpcFaultProxy],
     methods: &[&'static str],
-    unavailable: usize,
+    limits: &[usize],
     scope: &str,
     request: impl std::future::Future<Output = T> + Send + 'static,
 ) -> TestResult<T> {
-    let pauses: Vec<_> = proxies[1..=unavailable]
+    let pauses: Vec<_> = proxies[1..=limits.len()]
         .iter()
-        .map(|proxy| proxy.pause(methods, usize::MAX, Some(scope)))
+        .zip(limits)
+        .map(|(proxy, limit)| proxy.pause(methods, *limit, Some(scope)))
         .collect::<Result<_, _>>()?;
     let task = tokio::spawn(request);
     wait_for_faults(&pauses).await?;
@@ -229,13 +234,30 @@ fn quorum_outcome<T: std::fmt::Debug, E: std::fmt::Debug + ProvideErrorMetadata>
     }
 }
 
-async fn phase_quorum_matrix(proxies: &[RpcFaultProxy], clients: &[Client], bucket: &str, locks: bool) -> TestResult {
+async fn phase_quorum_matrix(
+    proxies: &[RpcFaultProxy],
+    clients: &[Client],
+    bucket: &str,
+    locks: bool,
+    drives_per_node: usize,
+) -> TestResult {
     for phase in ["create", "part", "complete", "abort"] {
         // Ordinary Create holds only the shared bucket lifecycle fence.
         // Four-node read quorum is two; commit/write quorum is three.
         let unavailable_at_quorum = if locks && phase == "create" { 2 } else { 1 };
         for unavailable in [unavailable_at_quorum, unavailable_at_quorum + 1] {
             let key = format!("{locks}-{phase}-{unavailable}");
+            let mut limits = vec![usize::MAX; unavailable];
+            // EC12+4: one peer contributes four shards; one packet on the
+            // second peer moves exactly twelve available shards to eleven.
+            if !locks && drives_per_node == 4 && unavailable > 1 {
+                limits[unavailable - 1] = 1;
+            }
+            let available_votes = if locks {
+                4 - unavailable
+            } else {
+                4 * drives_per_node - limits.iter().map(|limit| drives_per_node.min(*limit)).sum::<usize>()
+            };
             let methods: &[&'static str] = if locks {
                 &["Lock", "LockBatch"]
             } else {
@@ -247,11 +269,10 @@ async fn phase_quorum_matrix(proxies: &[RpcFaultProxy], clients: &[Client], buck
                     _ => unreachable!(),
                 }
             };
-            eprintln!("MPU quorum acceptance: phase={phase}, lock_fault={locks}, unavailable={unavailable}");
+            eprintln!("MPU quorum acceptance: phase={phase}, lock_fault={locks}, available_votes={available_votes}");
             if phase == "create" {
                 let request = clients[0].create_multipart_upload().bucket(bucket).key(&key);
-                let result =
-                    with_paused_peers(proxies, methods, unavailable, bucket, async move { request.send().await }).await?;
+                let result = with_paused_peers(proxies, methods, &limits, bucket, async move { request.send().await }).await?;
                 if let Some(upload) = quorum_outcome(result, unavailable == unavailable_at_quorum, locks)? {
                     abort(&clients[0], bucket, &key, upload.upload_id().ok_or("missing upload ID")?).await?;
                 }
@@ -285,7 +306,7 @@ async fn phase_quorum_matrix(proxies: &[RpcFaultProxy], clients: &[Client], buck
                             .part_number(1)
                             .body(ByteStream::from(body.clone()));
                         let result =
-                            with_paused_peers(proxies, methods, unavailable, &scope, async move { request.send().await }).await?;
+                            with_paused_peers(proxies, methods, &limits, &scope, async move { request.send().await }).await?;
                         if let Some(part) = quorum_outcome(result, unavailable == unavailable_at_quorum, locks)? {
                             clients[0]
                                 .complete_multipart_upload()
@@ -327,7 +348,7 @@ async fn phase_quorum_matrix(proxies: &[RpcFaultProxy], clients: &[Client], buck
                                     .build(),
                             );
                         let result =
-                            with_paused_peers(proxies, methods, unavailable, &scope, async move { request.send().await }).await?;
+                            with_paused_peers(proxies, methods, &limits, &scope, async move { request.send().await }).await?;
                         if quorum_outcome(result, unavailable == unavailable_at_quorum, locks)?.is_some() {
                             for reader in clients {
                                 assert_object_bytes(reader, bucket, &key, &body).await?;
@@ -341,7 +362,7 @@ async fn phase_quorum_matrix(proxies: &[RpcFaultProxy], clients: &[Client], buck
                             .key(&key)
                             .upload_id(upload_id);
                         let result =
-                            with_paused_peers(proxies, methods, unavailable, &scope, async move { request.send().await }).await?;
+                            with_paused_peers(proxies, methods, &limits, &scope, async move { request.send().await }).await?;
                         quorum_outcome(result, unavailable == unavailable_at_quorum, locks)?;
                     }
                     _ => unreachable!(),
@@ -380,19 +401,32 @@ async fn phase_quorum_matrix(proxies: &[RpcFaultProxy], clients: &[Client], buck
 
 #[tokio::test]
 async fn metadata_delay_preserves_write_quorum_and_rejects_quorum_minus_one() -> TestResult {
-    let (_cluster, proxies, clients, bucket) = fixture().await?;
-    phase_quorum_matrix(&proxies, &clients, &bucket, false).await
+    let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
+    phase_quorum_matrix(&proxies, &clients, &bucket, false, 1).await
 }
 
 #[tokio::test]
 async fn lock_delay_preserves_admission_quorum_and_reports_timeout() -> TestResult {
-    let (_cluster, proxies, clients, bucket) = fixture().await?;
-    phase_quorum_matrix(&proxies, &clients, &bucket, true).await
+    let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
+    phase_quorum_matrix(&proxies, &clients, &bucket, true, 1).await
+}
+
+#[tokio::test]
+async fn sixteen_shard_multipart_metadata_requires_twelve_votes() -> TestResult {
+    let (cluster, proxies, clients, bucket) = fixture(4, "EC:4").await?;
+    let storage = cluster_admin_ok(&cluster, http::Method::GET, "/rustfs/admin/v3/storageinfo", None).await?;
+    let storage: serde_json::Value = serde_json::from_str(&storage)?;
+    let storage: rustfs_madmin::StorageInfo = serde_json::from_value(storage["info"].clone())?;
+    assert_eq!(storage.disks.len(), 16);
+    assert_eq!(storage.backend.total_sets, vec![1]);
+    assert_eq!(storage.backend.drives_per_set, vec![16]);
+    assert_eq!(storage.backend.standard_sc_parity, Some(4));
+    phase_quorum_matrix(&proxies, &clients, &bucket, false, 4).await
 }
 
 #[tokio::test]
 async fn cancelled_metadata_wait_releases_fence_for_bucket_recreation() -> TestResult {
-    let (_cluster, proxies, clients, bucket) = fixture().await?;
+    let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
     let pauses: Vec<_> = proxies[1..]
         .iter()
         .map(|proxy| proxy.pause(&["WriteMetadata"], usize::MAX, Some(&bucket)))
@@ -518,7 +552,7 @@ async fn resume_at_rpc<T: Send + 'static>(
 
 #[tokio::test]
 async fn each_multipart_phase_resumes_after_metadata_and_lock_delays() -> TestResult {
-    let (_cluster, proxies, clients, bucket) = fixture().await?;
+    let (_cluster, proxies, clients, bucket) = fixture(1, "EC:2").await?;
     for locks in [false, true] {
         let key = format!("phase-{locks}");
         let client = clients[0].clone();
