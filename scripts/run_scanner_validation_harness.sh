@@ -25,6 +25,7 @@ JQ_BIN="jq"
 SKIP_HOST_TELEMETRY=false
 RUSTFS_PID=""
 TELEMETRY_PIDS=()
+TELEMETRY_NAMES=()
 
 usage() {
   cat <<'USAGE'
@@ -209,39 +210,54 @@ first_rustfs_pid() {
 
 start_host_telemetry() {
   TELEMETRY_PIDS=()
+  TELEMETRY_NAMES=()
 
   if [[ "$SKIP_HOST_TELEMETRY" == "true" || "$INTERVAL_SECS" == "0" ]]; then
     return
   fi
 
+  printf 'collector\texit_status\n' >"$OUT_DIR/host-telemetry-status.tsv"
   local pid
   pid="$(first_rustfs_pid)"
 
   if [[ -n "$pid" ]] && command -v pidstat >/dev/null 2>&1; then
     pidstat -p "$pid" "$INTERVAL_SECS" "$SAMPLES" >"$OUT_DIR/pidstat.txt" 2>&1 &
     TELEMETRY_PIDS+=("$!")
+    TELEMETRY_NAMES+=("pidstat")
   fi
 
   if command -v iostat >/dev/null 2>&1; then
-    iostat -xz "$INTERVAL_SECS" "$SAMPLES" >"$OUT_DIR/iostat.txt" 2>&1 &
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      iostat -d -w "$INTERVAL_SECS" -c "$SAMPLES" >"$OUT_DIR/iostat.txt" 2>&1 &
+    else
+      iostat -xz "$INTERVAL_SECS" "$SAMPLES" >"$OUT_DIR/iostat.txt" 2>&1 &
+    fi
     TELEMETRY_PIDS+=("$!")
+    TELEMETRY_NAMES+=("iostat")
   fi
 
   if command -v mpstat >/dev/null 2>&1; then
     mpstat "$INTERVAL_SECS" "$SAMPLES" >"$OUT_DIR/mpstat.txt" 2>&1 &
     TELEMETRY_PIDS+=("$!")
+    TELEMETRY_NAMES+=("mpstat")
   fi
 }
 
 wait_host_telemetry() {
-  local pid
+  local index status
 
   if [[ ${#TELEMETRY_PIDS[@]} -eq 0 ]]; then
     return
   fi
 
-  for pid in "${TELEMETRY_PIDS[@]}"; do
-    wait "$pid" || true
+  for index in "${!TELEMETRY_PIDS[@]}"; do
+    if wait "${TELEMETRY_PIDS[$index]}"; then
+      status=0
+    else
+      status=$?
+      printf 'WARN: host telemetry collector %s exited with status %s\n' "${TELEMETRY_NAMES[$index]}" "$status" >&2
+    fi
+    printf '%s\t%s\n' "${TELEMETRY_NAMES[$index]}" "$status" >>"$OUT_DIR/host-telemetry-status.tsv"
   done
 }
 

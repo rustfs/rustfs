@@ -550,6 +550,8 @@ scripts/run_scanner_validation_harness.sh \
 
 For ad hoc per-node snapshots outside the harness window, use the by-host `awscurl` loop in [Reading Distributed Metrics](scanner-runtime-controls.md#reading-distributed-metrics); the metrics endpoint reports only the node that handles the request.
 
+Host collectors are optional. Check `host-telemetry-status.tsv` before using their output: each started collector records its exit status, and a failure emits a warning while scanner status collection remains available. A missing collector row is not a zero measurement. On macOS the harness uses `iostat -d -w <interval> -c <samples>`; Linux retains `iostat -xz <interval> <samples>`. These are host/device aggregates, not RustFS process I/O or filesystem syscall counts. The initial iostat report may cover time since boot; do not treat it as an aligned workload interval. `fs_usage` still requires the appropriate macOS privileges. Without it, report filesystem-event counts as unavailable and keep CPU/progress observations separate from production-burst attribution.
+
 ### Bucket metrics freshness validation
 
 Use the harness around a post-start bucket creation workload to cover the timing where scanner startup sees no buckets, a bucket is created afterwards, and the first metrics collection must not confuse a cold usage cache with real zero usage:

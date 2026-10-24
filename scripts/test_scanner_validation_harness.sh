@@ -133,9 +133,15 @@ cat >"$BIN_DIR/pidof" <<'STUB'
 exit 1
 STUB
 
+cat >"$BIN_DIR/uname" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "${TEST_UNAME:-Linux}"
+STUB
+
 cat >"$BIN_DIR/iostat" <<'STUB'
 #!/usr/bin/env bash
-printf 'iostat sample\n'
+printf 'iostat args: %s\n' "$*"
+exit "${IOSTAT_EXIT_CODE:-0}"
 STUB
 
 cat >"$BIN_DIR/mpstat" <<'STUB'
@@ -184,7 +190,7 @@ printf 'unexpected jq args: %s\n' "$*" >&2
 exit 1
 STUB
 
-chmod +x "$BIN_DIR/mc" "$BIN_DIR/awscurl" "$BIN_DIR/pidof" "$BIN_DIR/iostat" "$BIN_DIR/mpstat" "$BIN_DIR/jq"
+chmod +x "$BIN_DIR/uname" "$BIN_DIR/mc" "$BIN_DIR/awscurl" "$BIN_DIR/pidof" "$BIN_DIR/iostat" "$BIN_DIR/mpstat" "$BIN_DIR/jq"
 
 mc_log="$TMP_DIR/mc.log"
 awscurl_log="$TMP_DIR/awscurl.log"
@@ -270,6 +276,30 @@ RUSTFS_SECRET_KEY=rustfsadmin MC_LOG="$mc_log" AWSCURL_LOG="$awscurl_log" PATH="
 test -s "$missing_pid_out/status/scanner-status.1."*.json
 test -s "$missing_pid_out/iostat.txt"
 test -s "$missing_pid_out/mpstat.txt"
+
+grep -q 'iostat args: -xz 1 1' "$missing_pid_out/iostat.txt"
+
+for platform in Darwin Linux; do
+  platform_out="$TMP_DIR/out-$platform"
+  TEST_UNAME="$platform" RUSTFS_SECRET_KEY=rustfsadmin MC_LOG="$mc_log" AWSCURL_LOG="$awscurl_log" \
+    PATH="$BIN_DIR:$PATH" "$SCRIPT" --alias rustfs-local --endpoint http://127.0.0.1:9000 \
+    --access-key rustfsadmin --samples 1 --interval-secs 1 --out-dir "$platform_out"
+  if [[ "$platform" == Darwin ]]; then
+    grep -q 'iostat args: -d -w 1 -c 1' "$platform_out/iostat.txt"
+  else
+    grep -q 'iostat args: -xz 1 1' "$platform_out/iostat.txt"
+  fi
+  grep -q $'iostat\t0' "$platform_out/host-telemetry-status.tsv"
+done
+
+failed_collector_out="$TMP_DIR/out-failed-collector"
+IOSTAT_EXIT_CODE=7 RUSTFS_SECRET_KEY=rustfsadmin MC_LOG="$mc_log" AWSCURL_LOG="$awscurl_log" \
+  PATH="$BIN_DIR:$PATH" "$SCRIPT" --alias rustfs-local --endpoint http://127.0.0.1:9000 \
+  --access-key rustfsadmin --samples 1 --interval-secs 1 --out-dir "$failed_collector_out" \
+  2>"$TMP_DIR/collector-warning.txt"
+grep -q $'iostat\t7' "$failed_collector_out/host-telemetry-status.tsv"
+grep -q 'host telemetry collector iostat exited with status 7' "$TMP_DIR/collector-warning.txt"
+test -s "$failed_collector_out/scanner-summary.csv"
 
 missing_args_log="$TMP_DIR/missing-args.log"
 if PATH="$BIN_DIR:$PATH" "$SCRIPT" --alias rustfs-local >"$missing_args_log" 2>&1; then
