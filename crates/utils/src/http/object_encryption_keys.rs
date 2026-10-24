@@ -73,9 +73,13 @@ pub const SUFFIX_OPAQUE_ENCRYPTED_ETAG: &str = "server-side-encryption-opaque-et
 
 /// Old encrypted objects can carry a plaintext MD5. Keyless listings expose
 /// an encrypted ETag only when its producer recorded the protected format.
+/// Legacy multipart original-size fields alone do not establish encryption.
 pub fn etag_can_be_listed(metadata: &HashMap<String, String>) -> bool {
-    !metadata.keys().any(|key| is_replication_stripped_encryption_key(key))
-        || super::metadata_compat::get_consistent_str(metadata, SUFFIX_OPAQUE_ENCRYPTED_ETAG) == Some("v1")
+    !metadata.keys().any(|key| {
+        super::is_object_encryption_marker(key)
+            || key.eq_ignore_ascii_case(SSEC_ORIGINAL_SIZE_HEADER)
+            || super::starts_with_ignore_ascii_case(key, RUSTFS_INTERNAL_ENCRYPTION_PREFIX)
+    }) || super::metadata_compat::get_consistent_str(metadata, SUFFIX_OPAQUE_ENCRYPTED_ETAG) == Some("v1")
 }
 
 /// Stored SSE-C metadata keys and the wire names they replicate under.
@@ -315,18 +319,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn keyless_listings_preserve_legacy_plaintext_multipart_etags() {
+        // beta.1 CompleteMultipartUpload persisted this size field even without SSE.
+        for key in [
+            INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER,
+            "X-Rustfs-Encryption-Original-Size",
+            "x-minio-encryption-original-size",
+            "X-MINIO-ENCRYPTION-ORIGINAL-SIZE",
+        ] {
+            for value in ["10485760", "", "invalid"] {
+                let metadata = HashMap::from([
+                    (key.to_owned(), value.to_owned()),
+                    ("etag".to_owned(), "1b8a77dff5845270a8d81d86a28f38ea-2".to_owned()),
+                    ("x-rustfs-internal-actual-size".to_owned(), "10485760".to_owned()),
+                    ("x-minio-internal-actual-size".to_owned(), "10485760".to_owned()),
+                ]);
+                assert!(etag_can_be_listed(&metadata), "plaintext size field: {key}={value}");
+                assert!(is_replication_stripped_encryption_key(key), "replication must still strip {key}");
+            }
+        }
+        let both_sizes = HashMap::from([
+            (INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER.to_owned(), "10485760".to_owned()),
+            ("x-minio-encryption-original-size".to_owned(), "10485760".to_owned()),
+        ]);
+        assert!(etag_can_be_listed(&both_sizes));
+    }
+
+    #[test]
     fn keyless_listings_hide_unproven_encrypted_etags() {
         assert!(etag_can_be_listed(&HashMap::from([("content-type".to_owned(), "text/plain".to_owned())])));
         for key in [
             SSEC_ALGORITHM_HEADER,
+            SSEC_ORIGINAL_SIZE_HEADER,
+            "X-Amz-Server-Side-Encryption-Customer-Original-Size",
             INTERNAL_ENCRYPTION_KEY_HEADER,
+            INTERNAL_ENCRYPTION_IV_HEADER,
+            "x-minio-encryption-iv",
+            "x-rustfs-encryption-unknown",
             MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
             MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER,
+            MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER,
             "X-AMZ-SERVER-SIDE-ENCRYPTION",
+            "x-amz-server-side-encryption-aws-kms-key-id",
             "x-rustfs-internal-server-side-encryption-sealed-key",
+            "X-RUSTFS-INTERNAL-SERVER-SIDE-ENCRYPTION-UNKNOWN",
         ] {
-            let mut metadata = HashMap::from([(key.to_owned(), "encryption-metadata".to_owned())]);
+            let mut metadata = HashMap::from([
+                (key.to_owned(), "encryption-metadata".to_owned()),
+                (INTERNAL_ENCRYPTION_ORIGINAL_SIZE_HEADER.to_owned(), "10485760".to_owned()),
+                ("x-minio-encryption-original-size".to_owned(), "10485760".to_owned()),
+            ]);
             assert!(!etag_can_be_listed(&metadata), "legacy encrypted metadata: {key}");
+            super::super::metadata_compat::insert_str(&mut metadata, SUFFIX_OPAQUE_ENCRYPTED_ETAG, String::new());
+            assert!(!etag_can_be_listed(&metadata), "empty producer format: {key}");
             super::super::metadata_compat::insert_str(&mut metadata, SUFFIX_OPAQUE_ENCRYPTED_ETAG, "unknown".to_owned());
             assert!(!etag_can_be_listed(&metadata), "unknown producer format: {key}");
             super::super::metadata_compat::insert_str(&mut metadata, SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());

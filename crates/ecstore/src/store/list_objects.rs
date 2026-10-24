@@ -452,8 +452,9 @@ const MAX_LIST_OBJECTS_METADATA_FAST_STALENESS_MS: u64 = 60_000;
 const LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY: &str = "walker_key_only";
 const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY: &str = "persistent_key_only";
 const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION: &str = "persistent-key-only";
-const PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION: u8 = 3;
-const PERSISTENT_KEY_ONLY_INDEX_HEADER: &str = "# rustfs-listobjects-key-only-v3";
+// Rebuild older snapshots that may have discarded plaintext multipart ETags.
+const PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION: u8 = 4;
+const PERSISTENT_KEY_ONLY_INDEX_HEADER: &str = "# rustfs-listobjects-key-only-v4";
 const PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER: &str = "# bucket=";
 const PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER: &str = "# generation=";
 const PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER: &str = "# checkpoint_high_water_mark=";
@@ -9401,6 +9402,27 @@ mod test {
     }
 
     #[test]
+    fn persistent_listing_preserves_legacy_plaintext_multipart_etag() {
+        let object = ObjectInfo {
+            name: "legacy-plain-multipart".to_owned(),
+            size: 10_485_760,
+            etag: Some("1b8a77dff5845270a8d81d86a28f38ea-2".to_owned()),
+            user_defined: Arc::new(HashMap::from([
+                ("x-rustfs-encryption-original-size".to_owned(), "10485760".to_owned()),
+                ("x-rustfs-internal-actual-size".to_owned(), "10485760".to_owned()),
+                ("x-minio-internal-actual-size".to_owned(), "10485760".to_owned()),
+            ])),
+            ..Default::default()
+        };
+        let snapshot = PersistentListMetadataObject::from_object_info(&object);
+        let restored = parse_persistent_list_metadata_object(&encode_persistent_list_metadata_object(&snapshot))
+            .expect("parse legacy plaintext snapshot")
+            .to_object_info("bucket");
+        assert_eq!(restored.etag, object.etag);
+        assert_eq!(restored.size, object.size);
+    }
+
+    #[test]
     fn persistent_key_only_index_parses_legacy_keys_and_metadata_snapshots() {
         let object = PersistentListMetadataObject {
             name: "object-b".to_string(),
@@ -9903,6 +9925,22 @@ mod test {
             ListObjectsIndexProviderState::persistent_key_only(Some(PathBuf::from("/tmp/persistent-key-only.index")), None);
 
         assert_eq!(legacy.format_version, 0);
+        assert!(!persistent_key_only_index_matches_provider(&legacy, "bucket", &provider));
+    }
+
+    #[test]
+    fn persistent_listing_rebuilds_v3_snapshot_with_discarded_plaintext_etag() {
+        let legacy = parse_persistent_key_only_index(
+            "# rustfs-listobjects-key-only-v3\n\
+             # bucket=bucket\n\
+             # generation=generation-old\n\
+             # checkpoint_high_water_mark=42\n\
+             # object\tbGVnYWN5\t10485760\t-\t-\tU1RBTkRBUkQ=\n",
+        );
+        assert_eq!(legacy.objects.len(), 1);
+        assert!(legacy.objects[0].etag.is_none());
+        let provider =
+            ListObjectsIndexProviderState::persistent_key_only(Some(PathBuf::from("/tmp/persistent-key-only.index")), None);
         assert!(!persistent_key_only_index_matches_provider(&legacy, "bucket", &provider));
     }
 
