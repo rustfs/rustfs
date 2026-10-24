@@ -533,7 +533,7 @@ mod tests {
 
     #[tokio::test]
     async fn foreground_policy_uses_real_storage_admission_observations() {
-        use crate::storage::concurrency::ConcurrencyManager;
+        use crate::storage_api::workload::concurrency::ConcurrencyManager;
         let manager = ConcurrencyManager::with_put_admission_for_test(true, 1, Duration::from_secs(30));
         let now = Instant::now();
         let mut policy = Policy::default();
