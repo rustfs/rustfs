@@ -51,12 +51,12 @@ mod tests {
     use crate::app::storage_api::s3::Credentials as S3sCredentials;
     use crate::auth::{VerifiedPresignedRequest, VerifiedSigV4Request};
     use crate::runtime_sources::ServerContextSlot;
-    use crate::shared_types::RemoteAddr;
+    use crate::shared_types::{NativeTlsTransport, RemoteAddr};
     use crate::storage::access::envelope_payloads;
     use crate::storage::access::{PostObjectRequestMarker, ReqInfo, TableDataPlanePublicationGuards};
     use crate::storage::request_context::RequestContext;
     use http::{Extensions, HeaderMap, HeaderValue, Method};
-    use rustfs_trusted_proxies::ClientInfo;
+    use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
     use std::fmt::Debug;
     use std::net::{IpAddr, SocketAddr};
     use std::sync::Arc;
@@ -107,6 +107,7 @@ mod tests {
         let mut extensions = Extensions::new();
         extensions.insert(Some(RemoteAddr(SocketAddr::from(PEER))));
         extensions.insert(ClientInfo::direct(SocketAddr::new(IpAddr::from(CLIENT), 443)));
+        extensions.insert(NativeTlsTransport(true));
         extensions.insert(request_context());
         extensions.insert(Arc::clone(server_context));
         extensions.insert(BodyReadControl::default());
@@ -138,6 +139,7 @@ mod tests {
     fn assert_every_named_payload_absent(envelope: &RequestEnvelope) {
         assert_eq!(envelope.remote_addr(), None, "remote_addr");
         assert!(envelope.client_info().is_none(), "client_info");
+        assert_eq!(envelope.native_tls_transport(), None, "native_tls_transport");
         assert!(envelope.request_context().is_none(), "request_context");
         assert!(envelope.server_context().is_none(), "server_context");
         assert!(envelope.body_read_control().is_none(), "body_read_control");
@@ -183,6 +185,7 @@ mod tests {
 
         assert_eq!(envelope.remote_addr(), Some(SocketAddr::from(PEER)));
         assert_eq!(envelope.client_info().map(|info| info.real_ip), Some(IpAddr::from(CLIENT)));
+        assert_eq!(envelope.native_tls_transport(), Some(true));
         assert_eq!(envelope.request_context().map(|context| context.request_id.as_str()), Some(REQUEST_ID));
         assert!(
             envelope
@@ -287,6 +290,103 @@ mod tests {
         let envelope = RequestEnvelope::from_s3s(&req);
 
         assert_eq!(envelope.credentials().and_then(RequestCredentials::session_token), Some("query-token"));
+    }
+
+    #[test]
+    fn envelope_uri_can_be_replaced_and_restored_without_changing_other_request_facts() {
+        let mut req = request(Extensions::new());
+        req.uri = "/bucket/original?versionId=v1".parse().expect("static URI");
+        req.headers.insert("x-envelope-probe", HeaderValue::from_static("present"));
+        let mut envelope = RequestEnvelope::from_s3s(&req);
+        let original = envelope.uri().clone();
+
+        *envelope.uri_mut() = "/bucket/prefix-target?versionId=v2".parse().expect("static URI");
+        assert_eq!(envelope.uri().path(), "/bucket/prefix-target");
+        assert_eq!(envelope.uri().query(), Some("versionId=v2"));
+        assert_eq!(
+            envelope
+                .headers()
+                .get("x-envelope-probe")
+                .and_then(|value| value.to_str().ok()),
+            Some("present")
+        );
+
+        *envelope.uri_mut() = original.clone();
+        assert_eq!(envelope.uri(), &original);
+    }
+
+    #[test]
+    fn envelope_req_info_install_mutate_replace_and_restore_preserves_scope_boundaries() {
+        let mut envelope = RequestEnvelope::from_s3s(&request(Extensions::new()));
+        assert!(envelope.req_info_mut().is_none(), "missing ReqInfo must not be created implicitly");
+
+        let previous = envelope.install_req_info(ReqInfo {
+            is_owner: true,
+            bucket: Some("first-bucket".to_owned()),
+            object: Some("first-object".to_owned()),
+            version_id: Some("first-version".to_owned()),
+            ..ReqInfo::default()
+        });
+        assert!(previous.is_none());
+        let installed = envelope.req_info_mut().expect("installed ReqInfo");
+        installed.object = Some("mutated-object".to_owned());
+        assert_eq!(envelope.req_info().and_then(|info| info.object.as_deref()), Some("mutated-object"));
+
+        let first = envelope
+            .install_req_info(ReqInfo {
+                bucket: Some("second-bucket".to_owned()),
+                ..ReqInfo::default()
+            })
+            .expect("replacement returns the previous authorization scope");
+        assert!(first.is_owner);
+        assert_eq!(first.bucket.as_deref(), Some("first-bucket"));
+        assert_eq!(first.object.as_deref(), Some("mutated-object"));
+        assert_eq!(first.version_id.as_deref(), Some("first-version"));
+        let second = envelope.req_info().expect("replacement ReqInfo");
+        assert!(!second.is_owner, "owner state must not leak across replacement");
+        assert_eq!(second.bucket.as_deref(), Some("second-bucket"));
+        assert_eq!(second.object, None, "object scope must not leak across replacement");
+        assert_eq!(second.version_id, None, "version scope must not leak across replacement");
+
+        let replaced = envelope.install_req_info(first).expect("second scope should be returned");
+        assert_eq!(replaced.bucket.as_deref(), Some("second-bucket"));
+        assert_eq!(envelope.req_info().and_then(|info| info.object.as_deref()), Some("mutated-object"));
+    }
+
+    fn envelope_with_transport_claim(native_tls: Option<bool>, forwarded_proto: &str) -> RequestEnvelope {
+        let peer = SocketAddr::from(PEER);
+        let mut extensions = Extensions::new();
+        extensions.insert(ClientInfo::from_trusted_proxy(
+            IpAddr::from(CLIENT),
+            Some("example.test".to_owned()),
+            Some(forwarded_proto.to_owned()),
+            peer.ip(),
+            1,
+            ValidationMode::Lenient,
+            Vec::new(),
+        ));
+        if let Some(native_tls) = native_tls {
+            extensions.insert(NativeTlsTransport(native_tls));
+        }
+        let mut req = request(extensions);
+        req.uri = "https://example.test/bucket/key".parse().expect("static URI");
+        req.headers
+            .insert("x-forwarded-proto", HeaderValue::from_str(forwarded_proto).expect("static protocol"));
+        RequestEnvelope::from_s3s(&req)
+    }
+
+    #[test]
+    fn envelope_native_tls_proof_comes_only_from_the_listener_marker() {
+        let absent = envelope_with_transport_claim(None, "https");
+        assert_eq!(absent.native_tls_transport(), None);
+
+        let plaintext = envelope_with_transport_claim(Some(false), "https");
+        assert_eq!(plaintext.native_tls_transport(), Some(false));
+        assert!(plaintext.residual_extensions().get::<NativeTlsTransport>().is_none());
+
+        let native_tls = envelope_with_transport_claim(Some(true), "http");
+        assert_eq!(native_tls.native_tls_transport(), Some(true));
+        assert!(native_tls.residual_extensions().get::<NativeTlsTransport>().is_none());
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub(crate) mod access_key_identity;
 mod auth;
 pub mod console;
 pub mod handlers;
+pub(crate) mod operation;
 mod plugin_contract;
 pub(crate) mod replication_metrics_wire;
 // Contract inventory is validated by tests before later runtime integration.

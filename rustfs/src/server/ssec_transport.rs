@@ -49,6 +49,7 @@ use std::task::{Context, Poll};
 use tower::{Layer, Service};
 use tracing::warn;
 
+use crate::shared_types::NativeTlsTransport;
 use crate::storage_api::server::layer::request_context::RequestContext;
 
 /// Opt in to refusing SSE-C on a plaintext transport. Default `false` for this
@@ -62,10 +63,6 @@ pub(crate) const METRIC_SSEC_PLAINTEXT_REQUESTS_TOTAL: &str = "rustfs_ssec_plain
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>;
-
-/// Set only by the listener stack; proxy protocol assertions do not establish this marker.
-#[derive(Clone, Copy)]
-pub(crate) struct NativeTlsTransport(pub(crate) bool);
 
 /// Every header that carries, or announces, a customer-provided key: the
 /// object's own triple and the copy-source triple that CopyObject and

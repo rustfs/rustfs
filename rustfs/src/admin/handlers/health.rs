@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use super::profile::{TriggerProfileCPU, TriggerProfileMemory};
-use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::app_context_from_req;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, LegacyAdminAdapter, S3Router};
+use crate::admin::runtime_sources::app_context_from_envelope;
 use crate::server::{
     HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, build_health_response_parts,
     collect_probe_readiness, probe_from_path,
@@ -24,20 +25,21 @@ use crate::server::{
     HealthPayloadContext, HealthProbe, HealthReadinessSource, MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_CLUSTER_READ_PATH,
     MINIO_HEALTH_READY_PATH, build_component_details, build_health_payload, health_check_state, readiness_source_for_probe,
 };
-use http::{HeaderMap, HeaderValue};
+use http::{HeaderMap, HeaderValue, header::CONTENT_TYPE};
 use hyper::{Method, StatusCode};
 use matchit::Params;
-use rustfs_s3_types::S3Result;
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Request, S3Response};
+use rustfs_s3_types::{Body, S3Result};
+
+static HEALTH_CHECK_HANDLER: HealthCheckHandler = HealthCheckHandler {};
+static HEALTH_CHECK_ADAPTER: LegacyAdminAdapter = LegacyAdminAdapter(&HEALTH_CHECK_HANDLER);
 
 pub fn register_health_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     if rustfs_utils::get_env_bool(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, rustfs_config::DEFAULT_HEALTH_ENDPOINT_ENABLE) {
         // Health check endpoint for monitoring and orchestration
-        r.insert(Method::GET, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
-        r.insert(Method::HEAD, HEALTH_PREFIX, AdminOperation(&HealthCheckHandler {}))?;
-        r.insert(Method::GET, HEALTH_READY_PATH, AdminOperation(&HealthCheckHandler {}))?;
-        r.insert(Method::HEAD, HEALTH_READY_PATH, AdminOperation(&HealthCheckHandler {}))?;
+        r.insert(Method::GET, HEALTH_PREFIX, AdminOperation(&HEALTH_CHECK_ADAPTER))?;
+        r.insert(Method::HEAD, HEALTH_PREFIX, AdminOperation(&HEALTH_CHECK_ADAPTER))?;
+        r.insert(Method::GET, HEALTH_READY_PATH, AdminOperation(&HEALTH_CHECK_ADAPTER))?;
+        r.insert(Method::HEAD, HEALTH_READY_PATH, AdminOperation(&HEALTH_CHECK_ADAPTER))?;
     }
 
     // Profiling routes are controlled separately and must not be affected by health endpoint toggles.
@@ -52,23 +54,23 @@ pub struct HealthCheckHandler {}
 
 #[async_trait::async_trait]
 impl Operation for HealthCheckHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let object_traffic_health = app_context_from_req(&req).map(|context| context.object_traffic_health());
-        // Extract the original HTTP Method (encapsulated by s3s into S3Request)
-        let method = req.method;
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let object_traffic_health = app_context_from_envelope(req.envelope()).map(|context| context.object_traffic_health());
+        let method = req.method().clone();
 
         // Only GET and HEAD are allowed
         if method != Method::GET && method != Method::HEAD {
             // 405 Method Not Allowed
             let mut headers = HeaderMap::new();
             headers.insert(http::header::ALLOW, HeaderValue::from_static("GET, HEAD"));
-            return Ok(S3Response::with_headers(
-                (StatusCode::METHOD_NOT_ALLOWED, Body::from("Method Not Allowed".to_string())),
+            return Ok(AdminResponse::with_headers(
+                StatusCode::METHOD_NOT_ALLOWED,
+                Body::from("Method Not Allowed".to_string()),
                 headers,
             ));
         }
 
-        let probe = probe_from_path(req.uri.path());
+        let probe = probe_from_path(req.uri().path());
         let readiness_report = collect_probe_readiness(probe, object_traffic_health.as_deref()).await;
 
         let response_parts =
@@ -79,9 +81,9 @@ impl Operation for HealthCheckHandler {
 
         let response = if let Some(payload) = response_parts.payload {
             let body_str = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
-            S3Response::with_headers((response_parts.status_code, Body::from(body_str)), headers)
+            AdminResponse::with_headers(response_parts.status_code, Body::from(body_str), headers)
         } else {
-            S3Response::with_headers((response_parts.status_code, Body::empty()), headers)
+            AdminResponse::with_headers(response_parts.status_code, Body::empty(), headers)
         };
 
         Ok(response)
@@ -91,8 +93,82 @@ impl Operation for HealthCheckHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt as _;
+    use s3s::route::S3Route as _;
     use serial_test::serial;
     use temp_env::with_var;
+
+    fn health_request(method: Method) -> s3s::S3Request<s3s::Body> {
+        s3s::S3Request {
+            input: s3s::Body::empty(),
+            method,
+            uri: HEALTH_PREFIX.parse().expect("health URI"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    async fn call_real_health_handler(method: Method) -> s3s::S3Response<s3s::Body> {
+        let mut router = S3Router::new(false);
+        router
+            .insert(method.clone(), HEALTH_PREFIX, AdminOperation(&HEALTH_CHECK_ADAPTER))
+            .expect("health route should register");
+        router
+            .call(health_request(method))
+            .await
+            .expect("health handler should return a response")
+    }
+
+    #[tokio::test]
+    async fn real_health_handler_get_and_head_preserve_wire_branches() {
+        let get = call_real_health_handler(Method::GET).await;
+        assert_eq!(get.status, Some(StatusCode::OK));
+        assert_eq!(
+            get.headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        let payload: serde_json::Value =
+            serde_json::from_slice(&get.output.collect().await.expect("GET body should read").to_bytes())
+                .expect("GET health response should be JSON");
+        assert_eq!(payload["status"], "ok");
+
+        let head = call_real_health_handler(Method::HEAD).await;
+        assert_eq!(head.status, Some(StatusCode::OK));
+        assert_eq!(
+            head.headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        assert!(
+            head.output
+                .collect()
+                .await
+                .expect("HEAD body should read")
+                .to_bytes()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn real_health_handler_rejects_unsupported_methods_with_allow_header() {
+        let response = call_real_health_handler(Method::POST).await;
+
+        assert_eq!(response.status, Some(StatusCode::METHOD_NOT_ALLOWED));
+        assert_eq!(
+            response
+                .headers
+                .get(http::header::ALLOW)
+                .and_then(|value| value.to_str().ok()),
+            Some("GET, HEAD")
+        );
+        assert_eq!(
+            response.output.collect().await.expect("error body should read").to_bytes(),
+            bytes::Bytes::from_static(b"Method Not Allowed")
+        );
+    }
 
     #[test]
     fn test_readiness_state_ready() {
