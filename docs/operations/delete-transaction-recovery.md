@@ -220,9 +220,19 @@ S3 objects, localhost ports, labeled isolated volumes, and a non-root server.
 It stops only its own containers and keeps JSON results and logs in the chosen
 artifact directory. Production builds must not enable `e2e-test-hooks`. The `release-batch-crash`
 case accepts a normal release binary: it observes persisted preparation before
-SIGKILL, verifies automatic mixed inline/external recovery without a new DELETE
+SIGKILL in one round and persisted commit receipts in another, verifies automatic
+mixed inline/external recovery without a new DELETE
 or administrator request, and checks that a second clean restart is stable.
 This case does not pin an individual instruction or transaction phase.
+
+Physical settlement permits directory-only remnants that ordinary non-force
+bucket removal safely prunes. It rejects retained payloads, backup or transaction
+records, unknown files, and symbolic links. Final cleanup deletes only surviving
+objects before requiring ordinary bucket removal. An interrupted proof GC can
+also leave an empty transaction directory beside another drive's receipt.
+Recovery retires only that exact empty leaf before republishing a replay
+witness; a nonempty directory, including an empty nested prefix, remains
+protected. No recursive removal grants transaction authority.
 
 Run the preactivation/prepare/apply/decision process-stop cases, interrupted restore,
 returning and untouched peers, both generation orderings, version/retention

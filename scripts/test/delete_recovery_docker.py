@@ -19,7 +19,7 @@ Logical disks share the Docker host filesystem; this tests process/RPC failure
 and namespace safety, not independent hardware failure or power-loss durability.
 """
 from pathlib import Path
-import base64, hashlib, ipaddress, json, os, subprocess, tempfile, threading, time, uuid, xml.etree.ElementTree as ET
+import base64, hashlib, inspect, ipaddress, json, os, subprocess, tempfile, threading, time, uuid, xml.etree.ElementTree as ET
 from urllib.parse import quote
 ROOT = None
 PREFIX = None
@@ -35,6 +35,12 @@ def run(*args, check=True, **kwargs):
 
 def docker(*args, check=True):
     return run('docker', *args, check=check)
+
+def has_retained_content(root):
+    """Empty directory trees are pruned by non-force bucket removal."""
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        return True
+    return any(path.is_symlink() or not path.is_dir() for path in root.rglob('*'))
 
 class S3:
 
@@ -1308,6 +1314,10 @@ def release_batch_crash():
                     raise AssertionError('the selected durable evidence must be observed in a live batch before the crash')
                 time.sleep(0.02)
             assert thread.is_alive(), 'the observed batch must still be active before SIGKILL'
+            (ROOT / f'release-batch-crash-{iteration}-observation.json').write_text(json.dumps({
+                'observed_phase': phase, 'observed_before_kill': observation,
+                'request_active_before_kill': True,
+            }, indent=2))
             cluster.kill(0)
             thread.join(10)
             assert not thread.is_alive(), 'the interrupted client must finish'
@@ -1318,14 +1328,16 @@ def release_batch_crash():
                     if item.tag.rsplit('}', 1)[-1] == 'Deleted':
                         acknowledged.update(child.text for child in item if child.tag.rsplit('}', 1)[-1] == 'Key')
             physical_probe = (
-                "from pathlib import Path\nimport json\n"
+                "from pathlib import Path\nimport json\n" + inspect.getsource(has_retained_content) +
                 f"bucket={bucket!r};keys={list(payloads) + list(confirmed)!r}\n"
+                "record_names={'xl.meta.bkp','delete-prepared','delete-target','delete-quorum-committed','delete-commit-finished','xl.meta.delete-marker.rollback'}\n"
                 "result=[]\nfor d in Path('/data').glob('d*'):\n"
                 " root=d/bucket\n"
                 " result.append({'prepared':len(list(root.rglob('delete-prepared'))),"
                 "'receipts':len(list(root.rglob('delete-quorum-committed'))),"
+                "'records':sum(p.name in record_names or p.name.startswith(('reserve-delete-data.','recovery-delete-data.','delete-data.')) for p in root.rglob('*')),"
                 "'live':[key for key in keys if (root/key/'xl.meta').is_file()],"
-                "'residue':[key for key in keys if (root/key).exists() and not (root/key/'xl.meta').is_file()]})\n"
+                "'residue':[key for key in keys if not (root/key/'xl.meta').is_file() and has_retained_content(root/key)]})\n"
                 "print(json.dumps(result))"
             )
 
@@ -1333,7 +1345,7 @@ def release_batch_crash():
                 deadline = time.monotonic() + 90
                 while True:
                     drives = [drive for node in cluster.inspect_data(physical_probe) for drive in node]
-                    if all(not drive['prepared'] and not drive['receipts'] and not drive['residue'] for drive in drives):
+                    if all(not drive['records'] and not drive['residue'] for drive in drives):
                         live = set(drives[0]['live'])
                         if all(set(drive['live']) == live for drive in drives):
                             return live
@@ -1361,13 +1373,15 @@ def release_batch_crash():
             for key in present:
                 assert client.get(bucket, key) == payloads[key], 'a second recovery must preserve complete bytes'
                 assert client.last_headers.get('etag') == etags[key], 'a second recovery must preserve the original ETag'
-            client.batch_delete(bucket, list(payloads))
+            if present:
+                client.batch_delete(bucket, sorted(present))
             assert client.list(bucket) == []
             client.delete_bucket(bucket)
             rounds.append({'observed_phase': phase, 'observed_before_kill': observation,
                            'acknowledged': len(acknowledged), 'present': len(present),
                            'absent': len(payloads) + len(confirmed) - len(present),
                            'complete_bytes_and_etags_verified': len(present), 'second_restart_stable': True})
+            (ROOT / 'release-batch-crash-progress.json').write_text(json.dumps(rounds, indent=2))
         finally:
             cluster.remove()
     return {'case': 'release-batch-crash', 'status': 'passed', 'rounds': rounds,

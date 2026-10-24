@@ -11,6 +11,26 @@ import delete_recovery_perf as perf
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_only_empty_directory_trees_are_not_payload_residue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "key"
+            (root / "transaction").mkdir(parents=True)
+            self.assertFalse(perf.harness.has_retained_content(root))
+            proof = root / "transaction" / "xl.meta.bkp"
+            proof.write_bytes(b"backup")
+            self.assertTrue(perf.harness.has_retained_content(root))
+            proof.unlink()
+            payload = root / "unknown-entry"
+            payload.write_bytes(b"payload")
+            self.assertTrue(perf.harness.has_retained_content(root))
+
+    def test_symlinks_cannot_be_mistaken_for_empty_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "key"
+            root.mkdir()
+            (root / "link").symlink_to(Path(directory) / "missing-target")
+            self.assertTrue(perf.harness.has_retained_content(root))
+
     def test_clean_restart_rejects_forced_exit_or_oom(self):
         for state in ({"ExitCode": 137, "OOMKilled": False}, {"ExitCode": 0, "OOMKilled": True}):
             cluster = perf.harness.Cluster.__new__(perf.harness.Cluster)

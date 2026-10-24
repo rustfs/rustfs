@@ -9,6 +9,7 @@ include concurrent work; they are not an additive wall-clock decomposition.
 
 import argparse
 import hashlib
+import inspect
 import json
 from pathlib import Path
 import random
@@ -150,12 +151,12 @@ def measure(cluster, case, count, size, batch, repeat):
         raise ValueError("the process-age bound no longer protects the rolling operation window")
     assert client.list(bucket) == []
     leftovers = cluster.inspect_data(
-        "from pathlib import Path\nimport json\n"
+        "from pathlib import Path\nimport json\n" + inspect.getsource(harness.has_retained_content) +
         f"keys={keys!r};bucket={bucket!r}\n"
         "print(json.dumps([str(d / bucket / key) for d in Path('/data').glob('d*') "
-        "for key in keys if (d / bucket / key).exists()]))"
+        "for key in keys if has_retained_content(d / bucket / key)]))"
     )
-    assert all(not node for node in leftovers), "all requested object directories must converge physically"
+    assert all(not node for node in leftovers), "requested keys must retain no payload, metadata, proof, or non-directory entries"
     client.delete_bucket(bucket)
     return {
         "case": case, "repeat": repeat, "objects": count, "object_bytes": size,

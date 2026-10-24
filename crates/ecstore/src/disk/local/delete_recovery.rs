@@ -1262,6 +1262,17 @@ impl LocalDisk {
         self.delete_recovery_barrier(volume, object, transaction, "PREACTIVATION")
             .await?;
         match fs::symlink_metadata(&destination).await {
+            Ok(metadata) if metadata.is_dir() => {
+                // Proof GC may persist before its final rmdir. Only an empty
+                // leaf can be retired; nested prefixes and new evidence fail
+                // closed under the same namespace ownership as publication.
+                match os::remove_dir_with_owner(&destination, owner.clone()).await {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                    Err(err) if is_dir_not_empty_error(&err) => return Err(DiskError::OutdatedXLMeta),
+                    Err(err) => return Err(to_file_error(err).into()),
+                }
+            }
             Ok(_) => return Err(DiskError::OutdatedXLMeta),
             Err(err) if err.kind() == ErrorKind::NotFound => {}
             Err(err) => return Err(to_file_error(err).into()),
@@ -4185,6 +4196,51 @@ mod tests {
         assert_eq!(witness.deleted_versions, authority.deleted_versions);
         assert_eq!(witness.bucket_incarnation, authority.bucket_incarnation);
         assert!(witness.original_digest.is_none() && witness.target_digest.is_none() && witness.data_dirs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_activation_preserves_occupied_transaction_directory() {
+        let (_source_temp, source, _, _) = fixture().await;
+        let transaction = Uuid::new_v4();
+        let applied = apply(&source, transaction).await;
+        let mut witness = source
+            .settle_delete_transaction(
+                "recovery",
+                "object",
+                transaction,
+                applied.fingerprint,
+                DeleteRecoveryAction::PublishCommit,
+            )
+            .await
+            .unwrap()
+            .journal
+            .unwrap();
+        witness.original_digest = None;
+        witness.target_digest = None;
+        witness.data_dirs.clear();
+        for nested in [false, true] {
+            let (_peer_temp, peer, _, _) = fixture().await;
+            let root = peer.io_get_object_path("recovery", "object").unwrap();
+            fs::remove_file(root.join(STORAGE_FORMAT_FILE)).await.unwrap();
+            let retained = root.join(transaction.to_string());
+            fs::create_dir(&retained).await.unwrap();
+            if nested {
+                fs::create_dir(retained.join("prefix-child")).await.unwrap();
+            } else {
+                fs::write(retained.join("unknown-file"), b"retained").await.unwrap();
+            }
+            assert!(matches!(
+                peer.activate_delete_preparation(&witness, None, None, None).await,
+                Err(DiskError::OutdatedXLMeta)
+            ));
+            assert!(!retained.join(PREPARED).exists());
+            if nested {
+                assert!(retained.join("prefix-child").is_dir());
+            } else {
+                assert_eq!(fs::read(retained.join("unknown-file")).await.unwrap(), b"retained");
+            }
+            assert!(!root.join(STORAGE_FORMAT_FILE).exists());
+        }
     }
 
     #[tokio::test]
