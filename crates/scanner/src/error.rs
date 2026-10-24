@@ -48,6 +48,10 @@ pub enum ScannerError {
     #[error("Remote namespace scanner disk is already active")]
     RemoteDiskBusy,
 
+    /// Node resource pressure deferred work before its first storage poll.
+    #[error("Scanner node resource admission deferred")]
+    ResourceDeferred,
+
     /// Partial data usage cache produced before the scanner stopped.
     #[error("Scanner stopped with partial data usage cache")]
     PartialCache(Box<DataUsageCache>),

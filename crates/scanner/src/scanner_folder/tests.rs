@@ -31,6 +31,7 @@ pub(super) mod checkpoint_fixture;
 pub(super) mod enumeration_restart;
 mod incremental_enumeration;
 mod metadata_visits;
+mod node_admission;
 
 /// Reset the process-global alert cooldown map; test-only.
 fn reset_alert_cooldowns() {
@@ -364,6 +365,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         failed_object_paths_seen: HashSet::new(),
         resolved_failed_object_paths: HashSet::new(),
         sleeper: SCANNER_SLEEPER.clone(),
+        node_admission: None,
         disks: Vec::new(),
         disks_quorum: 0,
         updates: None,

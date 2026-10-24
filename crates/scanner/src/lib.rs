@@ -123,7 +123,7 @@ pub use storage_api::scan::{
     SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE,
     SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES,
 };
-pub use workload_admission::set_scanner_workload_admission_snapshot_provider;
+pub use workload_admission::{set_scanner_node_admission, set_scanner_workload_admission_snapshot_provider};
 
 static SCANNER_ACTIVE_WORK_UNITS: AtomicU64 = AtomicU64::new(0);
 static SCANNER_RUNTIME_INSTANCES: AtomicU64 = AtomicU64::new(0);
