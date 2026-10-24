@@ -413,13 +413,19 @@ impl LocalDisk {
         dst_path: &str,
         state: &mut RenameDataState,
     ) -> Result<RenameDataResp> {
+        super::pool_meta_native::reject_raw_path(&self.root, src_volume, src_path).inspect_err(|_| {
+            state.preflight_rejection = Some(LocalRenamePreflightRejection(()));
+        })?;
+        super::pool_meta_native::reject_noncanonical_object(&self.root, dst_volume, dst_path).inspect_err(|_| {
+            state.preflight_rejection = Some(LocalRenamePreflightRejection(()));
+        })?;
         crate::hp_guard!("LocalDisk::rename_data");
         #[cfg(feature = "e2e-test-hooks")]
         if fi.is_healing() {
             wait_for_heal_commit_test_barrier(&self.root, dst_volume, dst_path).await?;
         }
         let mut fi = fi;
-        let pool_meta_condition = if super::pool_meta_native::is_object(dst_volume, dst_path) {
+        let pool_meta_condition = if super::pool_meta_native::is_object(&self.root, dst_volume, dst_path) {
             Some(super::pool_meta_native::PoolMetaNativeCasCondition::take(&mut fi).inspect_err(|_| {
                 state.preflight_rejection = Some(LocalRenamePreflightRejection(()));
             })?)

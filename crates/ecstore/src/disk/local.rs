@@ -6990,7 +6990,7 @@ impl LocalDisk {
         fi: FileInfo,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
-        pool_meta_native::reject_raw_path(volume, path)?;
+        pool_meta_native::reject_raw_path(&self.root, volume, path)?;
         crate::hp_guard!("LocalDisk::write_metadata");
         fi.validate_for_metadata_read()?;
         let p = self.io_get_object_path(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str())?;
@@ -7174,6 +7174,7 @@ impl LocalDisk {
         mut fi: FileInfo,
         mutation: DeleteVersionMutation,
     ) -> Result<()> {
+        pool_meta_native::reject_noncanonical_object(&self.root, volume, path)?;
         let DeleteVersionMutation {
             force_del_marker,
             opts,
@@ -7226,7 +7227,7 @@ impl LocalDisk {
             let volume_guard = os::disk_volume_mutation_lock(&self.root, volume).read_owned().await;
             namespace_owner = Some(Arc::new((namespace_owner, volume_guard)));
         }
-        if pool_meta_native::is_object(volume, path) {
+        if pool_meta_native::is_object(&self.root, volume, path) {
             self.check_pool_meta_undo(&mut fi, &opts, &file_path).await?;
         }
         if opts.old_data_dir.is_some() && opts.undo_write {
@@ -7751,7 +7752,7 @@ impl LocalDisk {
         opt: DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
-        if pool_meta_native::reject_raw_path(volume, path).is_err() {
+        if pool_meta_native::reject_raw_path(&self.root, volume, path).is_err() {
             let owner = self.pool_meta_cleanup_owner(volume, path, &opt, namespace_owner).await?;
             return self
                 .delete_unleased_with_namespace_owner(volume, path, &opt, owner, None)
@@ -8583,6 +8584,7 @@ impl LocalDisk {
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         expected_current: Option<&CurrentDeleteGeneration>,
     ) -> Result<()> {
+        pool_meta_native::reject_noncanonical_object(&self.root, volume, path)?;
         let volume_dir = self.io_get_bucket_path(volume)?;
         let object_path = self.get_object_path(volume, path)?;
         let mut namespace_owner: Option<Arc<dyn Send + Sync>> =
@@ -8596,7 +8598,7 @@ impl LocalDisk {
             .parent()
             .ok_or_else(|| DiskError::other("missing object metadata parent"))?;
 
-        if pool_meta_native::is_object(volume, path) {
+        if pool_meta_native::is_object(&self.root, volume, path) {
             let [fi] = fis else {
                 return Err(DiskError::ConditionalDeleteConflict);
             };
@@ -9210,7 +9212,7 @@ impl LocalDisk {
 
     // write_all_public for trail
     async fn write_all_public(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
-        pool_meta_native::reject_raw_path(volume, path)?;
+        pool_meta_native::reject_raw_path(&self.root, volume, path)?;
         if volume == RUSTFS_META_BUCKET && path == super::FORMAT_CONFIG_FILE {
             let mut format_info = self.format_info.write().await;
             format_info.data.clone_from(&data);
@@ -11331,7 +11333,7 @@ impl DiskAPI for LocalDisk {
         expected: Option<Bytes>,
         replacement: Option<Bytes>,
     ) -> Result<ConditionalFileUpdate> {
-        pool_meta_native::reject_raw_path(volume, path)?;
+        pool_meta_native::reject_raw_path(&self.root, volume, path)?;
         #[cfg(unix)]
         {
             use rustix::fs::{FlockOperation, flock};
@@ -11888,6 +11890,8 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
+        pool_meta_native::reject_raw_path(&self.root, src_volume, src_path)?;
+        pool_meta_native::reject_raw_path(&self.root, dst_volume, dst_path)?;
         let src_volume_dir = self.io_get_bucket_path(src_volume)?;
         let dst_volume_dir = self.io_get_bucket_path(dst_volume)?;
         if !skip_access_checks(src_volume) {
@@ -12068,8 +12072,8 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
-        pool_meta_native::reject_raw_path(src_volume, src_path)?;
-        pool_meta_native::reject_raw_path(dst_volume, dst_path)?;
+        pool_meta_native::reject_raw_path(&self.root, src_volume, src_path)?;
+        pool_meta_native::reject_raw_path(&self.root, dst_volume, dst_path)?;
         crate::hp_guard!("LocalDisk::rename_file");
         let src_volume_dir = self.io_get_bucket_path(src_volume)?;
         let dst_volume_dir = self.io_get_bucket_path(dst_volume)?;
@@ -12147,7 +12151,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, _file_size: i64) -> Result<FileWriter> {
-        pool_meta_native::reject_raw_path(volume, path)?;
+        pool_meta_native::reject_raw_path(&self.root, volume, path)?;
         crate::hp_guard!("LocalDisk::create_file");
         if !origvolume.is_empty() {
             let origvolume_dir = self.io_get_bucket_path(origvolume)?;
@@ -12191,7 +12195,7 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     // async fn append_file(&self, volume: &str, path: &str, mut r: DuplexStream) -> Result<File> {
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
-        pool_meta_native::reject_raw_path(volume, path)?;
+        pool_meta_native::reject_raw_path(&self.root, volume, path)?;
         self.io_backend.open_write(volume, path, WriteMode::Append).await
     }
 
@@ -12511,7 +12515,7 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
         for path in paths {
-            pool_meta_native::reject_raw_path(volume, path)?;
+            pool_meta_native::reject_raw_path(&self.root, volume, path)?;
         }
         let volume_dir = self.io_get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
@@ -12680,7 +12684,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
-        pool_meta_native::reject_raw_path(volume, path)?;
+        pool_meta_native::reject_raw_path(&self.root, volume, path)?;
         let object_path = self.get_object_path(volume, path)?;
         if let Some(condition) = &opts.transition_reconcile {
             if !fi.metadata.is_empty() || opts.no_persistence || opts.replace_user_metadata {

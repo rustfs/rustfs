@@ -152,17 +152,65 @@ impl PoolMetaNativeCasCondition {
     }
 }
 
-pub(super) fn is_object(volume: &str, path: &str) -> bool {
-    volume == RUSTFS_META_BUCKET && clean(&path.replace('\\', "/")).trim_matches('/') == OBJECT
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProtectedPathKind {
+    Object,
+    Descendant,
 }
 
-pub(super) fn reject_raw_path(volume: &str, path: &str) -> Result<()> {
-    if volume == RUSTFS_META_BUCKET {
-        let normalized = clean(&path.replace('\\', "/"));
-        let normalized = normalized.trim_matches('/');
-        if normalized == OBJECT || normalized.starts_with("pool.bin/") {
-            return Err(DiskError::ConditionalDeleteConflict);
-        }
+fn protected_path_kind(root: &Path, volume: &str, path: &str) -> Option<ProtectedPathKind> {
+    if volume == RUSTFS_META_BUCKET && path == OBJECT {
+        return Some(ProtectedPathKind::Object);
+    }
+    let mut volume_parts = volume.split('/');
+    let starts_with_object = volume_parts
+        .next()
+        .is_some_and(|part| part.eq_ignore_ascii_case(RUSTFS_META_BUCKET))
+        && volume_parts.next().is_some_and(|part| part.eq_ignore_ascii_case(OBJECT));
+    if !volume.eq_ignore_ascii_case(RUSTFS_META_BUCKET)
+        && !starts_with_object
+        && !volume.contains('\\')
+        && volume.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+    {
+        // Object containment prevents a canonical other volume from reaching
+        // pool.bin. Ordinary buckets and multipart volumes need no allocation.
+        return None;
+    }
+    let root = normalize_path_components(root);
+    let (_, object_path) = build_local_disk_object_path(&root, volume, path);
+    let object_path = normalize_path_components(object_path);
+    let mut components = object_path.strip_prefix(&root).ok()?.components();
+    if !components
+        .next()?
+        .as_os_str()
+        .to_str()?
+        .eq_ignore_ascii_case(RUSTFS_META_BUCKET)
+        || !components.next()?.as_os_str().to_str()?.eq_ignore_ascii_case(OBJECT)
+    {
+        return None;
+    }
+    Some(if components.next().is_none() {
+        ProtectedPathKind::Object
+    } else {
+        ProtectedPathKind::Descendant
+    })
+}
+
+pub(super) fn is_object(root: &Path, volume: &str, path: &str) -> bool {
+    protected_path_kind(root, volume, path) == Some(ProtectedPathKind::Object)
+}
+
+pub(super) fn reject_noncanonical_object(root: &Path, volume: &str, path: &str) -> Result<()> {
+    if protected_path_kind(root, volume, path).is_some() && (volume != RUSTFS_META_BUCKET || path != OBJECT) {
+        // All conditional pool.bin mutators must share the canonical lease key.
+        return Err(DiskError::ConditionalDeleteConflict);
+    }
+    Ok(())
+}
+
+pub(super) fn reject_raw_path(root: &Path, volume: &str, path: &str) -> Result<()> {
+    if protected_path_kind(root, volume, path).is_some() {
+        return Err(DiskError::ConditionalDeleteConflict);
     }
     Ok(())
 }
@@ -299,7 +347,7 @@ impl LocalDisk {
         opts: &DeleteOptions,
         owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<Option<Arc<dyn Send + Sync>>> {
-        if reject_raw_path(volume, path).is_ok() {
+        if reject_raw_path(&self.root, volume, path).is_ok() {
             return Ok(owner);
         }
         let normalized = clean(&path.replace('\\', "/"));
@@ -578,6 +626,7 @@ impl LocalDisk {
 mod tests {
     use super::super::test::{ensure_test_volume, test_file_info, test_meta};
     use super::*;
+    use crate::disk::RUSTFS_META_MULTIPART_BUCKET;
 
     fn inline_info(etag: &str, timestamp: i64) -> FileInfo {
         let mut fi = test_file_info(OBJECT, Uuid::nil(), Some(Uuid::new_v4()), Some(Bytes::from_static(b"metadata")));
@@ -1680,6 +1729,236 @@ mod tests {
                 .expect("restored metadata"),
             parent_bytes
         );
+    }
+
+    async fn protected_object_aliases(disk: &LocalDisk) -> Vec<(String, String)> {
+        let object = disk.root.join(RUSTFS_META_BUCKET).join(OBJECT);
+        let mut aliases = vec![
+            (format!("{RUSTFS_META_BUCKET}/."), OBJECT.to_string()),
+            (format!("{RUSTFS_META_BUCKET}/"), OBJECT.to_string()),
+            (format!("{RUSTFS_META_BUCKET}/{OBJECT}"), String::new()),
+            (RUSTFS_META_BUCKET.to_string(), format!("./{OBJECT}")),
+            (RUSTFS_META_BUCKET.to_string(), format!("{OBJECT}/.")),
+            (String::new(), format!("{RUSTFS_META_BUCKET}/{OBJECT}")),
+            (object.to_str().expect("UTF-8 object path").to_string(), String::new()),
+        ];
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let head = fs::metadata(object.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("canonical head metadata");
+            for (volume, path) in [
+                (RUSTFS_META_BUCKET.to_ascii_uppercase(), OBJECT.to_string()),
+                (RUSTFS_META_BUCKET.to_string(), OBJECT.to_ascii_uppercase()),
+                (RUSTFS_META_BUCKET.to_ascii_uppercase(), OBJECT.to_ascii_uppercase()),
+            ] {
+                let alias = disk.root.join(&volume).join(&path).join(STORAGE_FORMAT_FILE);
+                if let Ok(metadata) = fs::metadata(alias).await
+                    && metadata.dev() == head.dev()
+                    && metadata.ino() == head.ino()
+                {
+                    aliases.push((volume, path));
+                }
+            }
+        }
+        aliases
+    }
+
+    #[tokio::test]
+    async fn pool_meta_native_rename_part_rejects_protected_paths_without_changing_head_or_receipt() {
+        let (dir, disk, _, _, _) = replacement().await;
+        ensure_test_volume(&disk, RUSTFS_META_MULTIPART_BUCKET).await;
+        let head = disk
+            .get_object_path(RUSTFS_META_BUCKET, OBJECT)
+            .expect("canonical pool metadata path")
+            .join(STORAGE_FORMAT_FILE);
+        let head_bytes = fs::read(&head).await.expect("committed pool metadata");
+        let source_path = "rename-part-source/part.1";
+        let destination_path = "rename-part-destination/part.1";
+        let source_bytes = Bytes::from_static(b"staged multipart data");
+        let destination_bytes = Bytes::from_static(b"existing destination data");
+        disk.write_all(RUSTFS_META_TMP_BUCKET, source_path, source_bytes.clone())
+            .await
+            .expect("staged source");
+        disk.write_all(RUSTFS_META_TMP_BUCKET, destination_path, destination_bytes.clone())
+            .await
+            .expect("staged destination");
+        let source = dir.path().join(RUSTFS_META_TMP_BUCKET).join(source_path);
+        let destination = dir.path().join(RUSTFS_META_TMP_BUCKET).join(destination_path);
+        #[cfg(unix)]
+        let expected_receipt = disk
+            .pool_meta_durable_head
+            .lock()
+            .as_ref()
+            .expect("normal native publication should seed a warm receipt")
+            .identity
+            .clone();
+        #[cfg(unix)]
+        let assert_warm_receipt = || {
+            let receipt = disk.pool_meta_durable_head.lock();
+            let receipt = receipt.as_ref().expect("raw rejection must retain the warm receipt");
+            assert_eq!(receipt.identity, expected_receipt);
+            assert!(receipt.physical.matches_current(&disk.publication_root, &head));
+        };
+
+        let mut protected_paths = protected_object_aliases(&disk).await;
+        protected_paths.push((RUSTFS_META_BUCKET.to_string(), OBJECT.to_string()));
+        for (protected_volume, protected_object) in protected_paths {
+            let protected_path = if protected_object.is_empty() {
+                STORAGE_FORMAT_FILE.to_string()
+            } else {
+                format!("{protected_object}/{STORAGE_FORMAT_FILE}")
+            };
+            for (src_volume, src_path, dst_volume, dst_path) in [
+                (RUSTFS_META_TMP_BUCKET, source_path, protected_volume.as_str(), protected_path.as_str()),
+                (
+                    protected_volume.as_str(),
+                    protected_path.as_str(),
+                    RUSTFS_META_TMP_BUCKET,
+                    destination_path,
+                ),
+            ] {
+                assert!(matches!(
+                    disk.rename_part(src_volume, src_path, dst_volume, dst_path, Bytes::from_static(b"part metadata"))
+                        .await,
+                    Err(DiskError::ConditionalDeleteConflict)
+                ));
+                assert_eq!(fs::read(&head).await.expect("rejected rename must retain the head"), head_bytes);
+                assert_eq!(fs::read(&source).await.expect("rejected rename must retain the source"), source_bytes);
+                assert_eq!(
+                    fs::read(&destination)
+                        .await
+                        .expect("rejected rename must retain the destination"),
+                    destination_bytes
+                );
+                #[cfg(unix)]
+                assert_warm_receipt();
+            }
+        }
+
+        disk.rename_part(
+            RUSTFS_META_TMP_BUCKET,
+            source_path,
+            RUSTFS_META_MULTIPART_BUCKET,
+            "upload/part.1",
+            Bytes::from_static(b"part metadata"),
+        )
+        .await
+        .expect("ordinary multipart rename must still publish its part and metadata");
+        let part = dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join("upload/part.1");
+        assert_eq!(fs::read(&part).await.expect("published part"), source_bytes);
+        assert_eq!(
+            fs::read(part.with_extension("1.meta"))
+                .await
+                .expect("published part metadata"),
+            b"part metadata"
+        );
+        assert!(!fs::try_exists(&source).await.expect("renamed source lookup"));
+        assert_eq!(fs::read(&head).await.expect("ordinary rename must retain the head"), head_bytes);
+        assert_eq!(fs::read(&destination).await.expect("unrelated destination"), destination_bytes);
+        #[cfg(unix)]
+        {
+            assert_warm_receipt();
+            let (_, _, backup) = advance_receipt_fixture(&disk, 12, false, false).await;
+            assert_eq!(
+                os::take_pool_meta_backup_sync_count(&backup),
+                0,
+                "the original receipt must remain usable"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_meta_native_conditional_mutators_reject_aliases_before_touching_bytes_or_receipt() {
+        let (dir, disk, _, current, attempt) = replacement().await;
+        let object = disk
+            .get_object_path(RUSTFS_META_BUCKET, OBJECT)
+            .expect("canonical pool metadata path");
+        let head = object.join(STORAGE_FORMAT_FILE);
+        let head_bytes = fs::read(&head).await.expect("committed head");
+        let backup = object.join(attempt.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+        let backup_bytes = fs::read(&backup).await.expect("owned predecessor");
+        let stage = dir.path().join(RUSTFS_META_TMP_BUCKET).join("alias-staging/sentinel");
+        disk.write_all(RUSTFS_META_TMP_BUCKET, "alias-staging/sentinel", Bytes::from_static(b"staging sentinel"))
+            .await
+            .expect("native staging sentinel");
+        let mut next = inline_info("conditional-alias", 12);
+        PoolMetaNativeCasCondition {
+            attempt_id: Uuid::new_v4(),
+            parent: Some(
+                PoolMetaNativeFileIdentity::from_file_info(&decode(&head_bytes).expect("current FI")).expect("current identity"),
+            ),
+            parent_raw_sha256: None,
+        }
+        .insert_into(&mut next.metadata)
+        .expect("valid conditional write metadata");
+        let undo = DeleteOptions {
+            undo_write: true,
+            old_data_dir: Some(attempt),
+            ..Default::default()
+        };
+        #[cfg(unix)]
+        let expected_receipt = disk
+            .pool_meta_durable_head
+            .lock()
+            .as_ref()
+            .expect("warm receipt")
+            .identity
+            .clone();
+        for (volume, path) in protected_object_aliases(&disk).await {
+            assert!(
+                is_object(&disk.root, &volume, &path),
+                "the alias must classify as the protected logical object"
+            );
+            let observed = disk
+                .rename_data_observed(RUSTFS_META_TMP_BUCKET, "alias-staging", &next, &volume, &path, None)
+                .await;
+            assert!(
+                observed.rejected_before_publication(),
+                "alias rejection must remain a definite no-mutation preflight"
+            );
+            assert!(matches!(observed.result, Err(DiskError::ConditionalDeleteConflict)));
+            assert!(matches!(
+                disk.rename_data(&volume, &path, next.clone(), RUSTFS_META_TMP_BUCKET, "alias-destination")
+                    .await,
+                Err(DiskError::ConditionalDeleteConflict)
+            ));
+            assert!(matches!(
+                disk.undo_write_with_namespace_owner(&volume, &path, current.clone(), undo.clone(), None)
+                    .await,
+                Err(DiskError::ConditionalDeleteConflict)
+            ));
+            assert!(matches!(
+                disk.delete_versions_guarded_internal(&volume, &path, std::slice::from_ref(&current), &undo, None, None)
+                    .await,
+                Err(DiskError::ConditionalDeleteConflict)
+            ));
+            assert_eq!(fs::read(&head).await.expect("unchanged head"), head_bytes);
+            assert_eq!(fs::read(&backup).await.expect("unchanged predecessor"), backup_bytes);
+            assert_eq!(fs::read(&stage).await.expect("unchanged staging sentinel"), b"staging sentinel");
+            assert!(
+                !fs::try_exists(dir.path().join(RUSTFS_META_TMP_BUCKET).join("alias-destination"))
+                    .await
+                    .expect("rejected destination lookup")
+            );
+            #[cfg(unix)]
+            {
+                let receipt = disk.pool_meta_durable_head.lock();
+                let receipt = receipt.as_ref().expect("alias rejection must not consume a receipt");
+                assert_eq!(receipt.identity, expected_receipt);
+                assert!(receipt.physical.matches_current(&disk.publication_root, &head));
+            }
+        }
+        #[cfg(unix)]
+        {
+            let (_, _, backup) = advance_receipt_fixture(&disk, 12, false, false).await;
+            assert_eq!(
+                os::take_pool_meta_backup_sync_count(&backup),
+                0,
+                "canonical native CAS must still reuse its warm receipt"
+            );
+        }
     }
 
     #[tokio::test]
