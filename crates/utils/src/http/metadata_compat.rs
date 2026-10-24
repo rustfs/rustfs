@@ -353,7 +353,7 @@ pub fn insert_str(map: &mut HashMap<String, String>, suffix: &str, value: String
 }
 
 #[inline]
-fn matches_either_internal_key_ignore_ascii_case(key: &str, suffix: &str) -> bool {
+pub(super) fn matches_either_internal_key_ignore_ascii_case(key: &str, suffix: &str) -> bool {
     let key_bytes = key.as_bytes();
     let suffix_bytes = suffix.as_bytes();
     let prefix_matched = if key_bytes.len() == RUSTFS_INTERNAL_PREFIX.len() + suffix_bytes.len() {

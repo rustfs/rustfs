@@ -16,6 +16,7 @@ use crate::{Error, Result};
 use async_trait::async_trait;
 use base64_simd::URL_SAFE_NO_PAD;
 use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
+use rustfs_concurrency::adaptive::NodeAdmission;
 use rustfs_heal_contracts::heal_channel::{DriveState, HealOpts, HealScanMode};
 use rustfs_madmin::heal_commands::HealResultItem;
 use serde::{Deserialize, Serialize};
@@ -748,14 +749,51 @@ pub trait HealStorageAPI: Send + Sync {
     }
 }
 
+// Scheduling precedes the operation's first poll and therefore its namespace
+// locks. No-lock callers may already own a namespace lock: never park them.
+async fn run_background_object<T>(
+    admission: Option<&Arc<NodeAdmission>>,
+    opts: &HealOpts,
+    completed: impl FnOnce(&T) -> bool,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let Some(admission) = admission else {
+        return operation.await;
+    };
+    let permit = if opts.no_lock {
+        admission.try_acquire()
+    } else {
+        tokio::time::timeout(std::time::Duration::from_millis(250), admission.acquire())
+            .await
+            .ok()
+    }
+    .ok_or_else(|| Error::transient_skip("node resource admission deferred"))?;
+    let result = operation.await;
+    if !opts.dry_run && result.as_ref().is_ok_and(completed) {
+        permit.complete();
+    }
+    result
+}
+
 /// ECStore Heal storage layer implementation
 pub struct ECStoreHealStorage {
     ecstore: Arc<ECStore>,
+    admission: Option<Arc<NodeAdmission>>,
 }
 
 impl ECStoreHealStorage {
     pub fn new(ecstore: Arc<ECStore>) -> Self {
-        Self { ecstore }
+        Self {
+            ecstore,
+            admission: None,
+        }
+    }
+
+    /// Attach the process owner's scheduling gate. Physical I/O and memory
+    /// ownership remain separate; the existing storage locks are unchanged.
+    pub fn with_admission(mut self, admission: Option<Arc<NodeAdmission>>) -> Self {
+        self.admission = admission;
+        self
     }
 
     fn adapt_object_heal_result(
@@ -1039,14 +1077,22 @@ impl HealStorageAPI for ECStoreHealStorage {
         expected: Uuid,
         opts: &HealOpts,
     ) -> Result<HealStorageObjectResult> {
-        let result = self
-            .ecstore
-            .heal_object_at_incarnation(bucket, object, version_id.unwrap_or_default(), expected, opts)
-            .await
-            .map_err(|error| incarnation_storage_error(bucket, expected, error))?;
-        Ok(self
-            .object_result_with_receipt(bucket, object, version_id, opts, result, Some(expected))
-            .await)
+        run_background_object(
+            self.admission.as_ref(),
+            opts,
+            |result: &HealStorageObjectResult| result.error.is_none(),
+            async {
+                let result = self
+                    .ecstore
+                    .heal_object_at_incarnation(bucket, object, version_id.unwrap_or_default(), expected, opts)
+                    .await
+                    .map_err(|error| incarnation_storage_error(bucket, expected, error))?;
+                Ok(self
+                    .object_result_with_receipt(bucket, object, version_id, opts, result, Some(expected))
+                    .await)
+            },
+        )
+        .await
     }
 
     async fn heal_mrf_object_at_incarnation(
@@ -1057,14 +1103,22 @@ impl HealStorageAPI for ECStoreHealStorage {
         expected: Uuid,
         opts: &HealOpts,
     ) -> Result<HealStorageObjectResult> {
-        let result = self
-            .ecstore
-            .heal_mrf_object_at_incarnation(bucket, object, version_id.unwrap_or_default(), expected, opts)
-            .await
-            .map_err(|error| incarnation_storage_error(bucket, expected, error))?;
-        Ok(self
-            .object_result_with_receipt(bucket, object, version_id, opts, result, Some(expected))
-            .await)
+        run_background_object(
+            self.admission.as_ref(),
+            opts,
+            |result: &HealStorageObjectResult| result.error.is_none(),
+            async {
+                let result = self
+                    .ecstore
+                    .heal_mrf_object_at_incarnation(bucket, object, version_id.unwrap_or_default(), expected, opts)
+                    .await
+                    .map_err(|error| incarnation_storage_error(bucket, expected, error))?;
+                Ok(self
+                    .object_result_with_receipt(bucket, object, version_id, opts, result, Some(expected))
+                    .await)
+            },
+        )
+        .await
     }
 
     async fn get_object_meta(&self, bucket: &str, object: &str) -> Result<Option<HealObjectInfo>> {
@@ -1491,30 +1545,38 @@ impl HealStorageAPI for ECStoreHealStorage {
         version_id: Option<&str>,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
-        debug!(
-            target: "rustfs::heal::storage",
-            event = EVENT_HEAL_STORAGE_REPAIR_OP,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_STORAGE,
-            operation = "heal_object",
-            bucket,
-            object,
-            version_id = ?version_id,
-            scan_mode = %opts.scan_mode.as_str(),
-            dry_run = opts.dry_run,
-            state = "started",
-            "Heal storage repair started"
-        );
-
-        let version_id_str = version_id.unwrap_or("");
-
-        Self::adapt_object_heal_result(
-            bucket,
-            object,
-            version_id,
+        run_background_object(
+            self.admission.as_ref(),
             opts,
-            self.ecstore.heal_object(bucket, object, version_id_str, opts).await,
+            |result: &(HealResultItem, Option<Error>)| result.1.is_none(),
+            async {
+                debug!(
+                    target: "rustfs::heal::storage",
+                    event = EVENT_HEAL_STORAGE_REPAIR_OP,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_STORAGE,
+                    operation = "heal_object",
+                    bucket,
+                    object,
+                    version_id = ?version_id,
+                    scan_mode = %opts.scan_mode.as_str(),
+                    dry_run = opts.dry_run,
+                    state = "started",
+                    "Heal storage repair started"
+                );
+
+                let version_id_str = version_id.unwrap_or("");
+
+                Self::adapt_object_heal_result(
+                    bucket,
+                    object,
+                    version_id,
+                    opts,
+                    self.ecstore.heal_object(bucket, object, version_id_str, opts).await,
+                )
+            },
         )
+        .await
     }
 
     async fn heal_object_with_receipt(
@@ -1524,14 +1586,22 @@ impl HealStorageAPI for ECStoreHealStorage {
         version_id: Option<&str>,
         opts: &HealOpts,
     ) -> Result<HealStorageObjectResult> {
-        let result = self
-            .ecstore
-            .heal_object_with_proof(bucket, object, version_id.unwrap_or(""), opts)
-            .await
-            .map_err(Error::Storage)?;
-        Ok(self
-            .object_result_with_receipt(bucket, object, version_id, opts, result, None)
-            .await)
+        run_background_object(
+            self.admission.as_ref(),
+            opts,
+            |result: &HealStorageObjectResult| result.error.is_none(),
+            async {
+                let result = self
+                    .ecstore
+                    .heal_object_with_proof(bucket, object, version_id.unwrap_or(""), opts)
+                    .await
+                    .map_err(Error::Storage)?;
+                Ok(self
+                    .object_result_with_receipt(bucket, object, version_id, opts, result, None)
+                    .await)
+            },
+        )
+        .await
     }
 
     async fn recover_delete_transactions(
@@ -2138,7 +2208,165 @@ mod tests {
         decode_disk_walk_token, decode_heal_token, encode_disk_walk_token, encode_heal_token, is_transient_object_exists_error,
         next_heal_listing_token, replacement_resume_conflict_for_other_tasks,
     };
+    use rustfs_concurrency::adaptive::{FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure};
     use std::collections::HashSet;
+    use std::{num::NonZeroU16, sync::Arc, time::Duration};
+
+    fn admission(open: bool) -> Arc<NodeAdmission> {
+        let gate = NodeAdmission::new(NonZeroU16::new(1).expect("one slot"));
+        gate.update(
+            &mut FeedbackController::new(),
+            open.then_some(FeedbackObservation {
+                generation: 1,
+                max_concurrency: 1,
+                pressure: ResourcePressure::Unknown,
+                completed_units: None,
+            }),
+        );
+        gate
+    }
+
+    #[tokio::test]
+    async fn object_admission_is_wired_to_all_four_real_storage_entry_points() {
+        use super::{ECStoreHealStorage, Error, HealOpts, HealStorageAPI};
+        let root = tempfile::tempdir().expect("owned storage fixture");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(root.path())
+            .build()
+            .await;
+        let gate = admission(false);
+        let storage = ECStoreHealStorage::new(env.ecstore.clone()).with_admission(Some(gate.clone()));
+        let opts = HealOpts {
+            no_lock: true,
+            ..Default::default()
+        };
+        let expected = uuid::Uuid::new_v4();
+        let results = [
+            storage.heal_object("missing-bucket", "object", None, &opts).await.map(|_| ()),
+            storage
+                .heal_object_with_receipt("missing-bucket", "object", None, &opts)
+                .await
+                .map(|_| ()),
+            storage
+                .heal_object_at_incarnation("missing-bucket", "object", None, expected, &opts)
+                .await
+                .map(|_| ()),
+            storage
+                .heal_mrf_object_at_incarnation("missing-bucket", "object", None, expected, &opts)
+                .await
+                .map(|_| ()),
+        ];
+        for result in results {
+            assert!(
+                matches!(result, Err(Error::TransientSkip { .. })),
+                "closed admission precedes even bucket validation: {result:?}"
+            );
+        }
+        assert_eq!(gate.completed(), Some(0));
+        assert_eq!(gate.snapshot().active, 0);
+        let ungated = ECStoreHealStorage::new(env.ecstore.clone());
+        let (item, error) = ungated
+            .heal_object("missing-bucket", "object", None, &opts)
+            .await
+            .expect("the real backend returns the inspected drives with its embedded quorum error");
+        assert!(matches!(error, Some(Error::Storage(StorageError::ErasureReadQuorum))));
+        assert_eq!(
+            (item.bucket.as_str(), item.object.as_str(), item.disk_count),
+            ("missing-bucket", "object", 4)
+        );
+        assert_eq!(item.before.drives.len(), 4);
+        assert!(item.before.drives.iter().all(|drive| drive.state == "missing"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn object_admission_defers_before_polling_storage_and_keeps_a_typed_transient() {
+        let gate = admission(false);
+        let polled = std::cell::Cell::new(false);
+        let began = tokio::time::Instant::now();
+        let result = super::run_background_object(Some(&gate), &super::HealOpts::default(), |_: &()| true, async {
+            polled.set(true);
+            Ok(())
+        })
+        .await;
+        assert!(matches!(result, Err(super::Error::TransientSkip { .. })));
+        assert!(!polled.get(), "no locks or storage mutation before admission");
+        assert_eq!(began.elapsed(), Duration::from_millis(250));
+        assert_eq!(gate.completed(), Some(0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn object_admission_never_parks_a_caller_that_already_owns_the_namespace_lock() {
+        let gate = admission(false);
+        let opts = super::HealOpts {
+            no_lock: true,
+            ..Default::default()
+        };
+        let began = tokio::time::Instant::now();
+        let result =
+            super::run_background_object(Some(&gate), &opts, |_: &()| true, async { panic!("storage must remain unpolled") })
+                .await;
+        assert!(matches!(result, Err(super::Error::TransientSkip { .. })));
+        assert_eq!(began.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn object_admission_returns_capacity_on_cancel_and_preserves_backend_errors() {
+        use std::task::{Context, Poll, Waker};
+        let gate = admission(true);
+        let opts = super::HealOpts::default();
+        let future = super::run_background_object(Some(&gate), &opts, |_: &()| true, std::future::pending());
+        let mut future = Box::pin(future);
+        assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+        assert_eq!(gate.snapshot().active, 1);
+        drop(future);
+        assert_eq!(gate.snapshot().active, 0);
+        assert_eq!(gate.completed(), Some(0));
+        let result =
+            super::run_background_object(Some(&gate), &opts, |_: &()| true, async { Err(super::Error::TaskCancelled) }).await;
+        assert!(matches!(result, Err(super::Error::TaskCancelled)));
+        assert_eq!(gate.completed(), Some(0));
+        assert_eq!(gate.snapshot().active, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn object_admission_applies_to_queued_read_repair_before_storage_poll() {
+        let gate = admission(false);
+        let opts = super::HealOpts {
+            read_repair: true,
+            ..Default::default()
+        };
+        let result = super::run_background_object(Some(&gate), &opts, |_: &()| true, async {
+            panic!("queued read repair must not bypass the closed node gate");
+        })
+        .await;
+        assert!(matches!(result, Err(super::Error::TransientSkip { .. })));
+        assert_eq!(gate.completed(), Some(0));
+        assert_eq!(gate.snapshot().active, 0);
+    }
+
+    #[tokio::test]
+    async fn object_admission_counts_only_successful_non_dry_runs() {
+        let gate = admission(true);
+        for (dry_run, successful, expected) in [(true, true, 0), (false, false, 0), (false, true, 1)] {
+            let opts = super::HealOpts {
+                dry_run,
+                ..Default::default()
+            };
+            assert_eq!(
+                super::run_background_object(Some(&gate), &opts, |ok: &bool| *ok, async { Ok(successful) })
+                    .await
+                    .expect("operation"),
+                successful
+            );
+            assert_eq!(gate.completed(), Some(expected));
+            assert_eq!(gate.snapshot().active, 0);
+        }
+        gate.update(&mut FeedbackController::new(), None);
+        assert_eq!(gate.completed(), Some(1));
+        super::run_background_object(None, &super::HealOpts::default(), |_: &()| true, async { Ok(()) })
+            .await
+            .expect("default path stays available");
+    }
 
     #[test]
     fn legacy_ambiguity_storage_adapter_suppresses_repeated_errors_without_erasing_them() {
