@@ -255,9 +255,29 @@ async fn unknown_source_deleted_bucket_probe_rotation_keeps_count_and_byte_budge
     assert_eq!(manager.get_queue_length().await, 0);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test]
 #[serial]
-async fn unknown_source_deleted_bucket_replay_probes_recreation_without_rebinding() {
+fn unknown_source_deleted_bucket_replay_probes_recreation_without_rebinding() {
+    // Match the bounded stack used by other deep real-storage heal fixtures.
+    const STACK_SIZE: usize = 8 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("mrf-unknown-source-replay".to_owned())
+        .stack_size(STACK_SIZE)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(STACK_SIZE)
+                .enable_all()
+                .build()
+                .expect("MRF replay test runtime");
+            runtime.block_on(check_unknown_source_deleted_bucket_replay());
+        })
+        .expect("MRF replay test thread")
+        .join()
+        .expect("MRF replay test must finish");
+}
+
+async fn check_unknown_source_deleted_bucket_replay() {
     let env = rustfs_test_utils::TestECStoreEnv::builder()
         .prefix("rustfs_mrf_unknown_deleted_bucket")
         .build()
