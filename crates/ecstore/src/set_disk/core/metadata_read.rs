@@ -1082,6 +1082,8 @@ impl SetDisks {
                     let response_start = observe.then(Instant::now);
                     let result = if let Some(disk) = disk {
                         Self::record_read_version_call(&object, disk_index);
+                        #[cfg(test)]
+                        Self::read_version_fanout_barrier(&object, disk_index).await;
                         if let Some(delay) = slowtail_fault.as_ref().and_then(|fault| fault.delay_for_disk(disk_index)) {
                             Self::record_metadata_slowtail_fault(&object, disk_index);
                             tokio::time::sleep(delay).await;
