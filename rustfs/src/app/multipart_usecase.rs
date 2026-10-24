@@ -131,6 +131,33 @@ use tracing::{instrument, warn};
 use urlencoding::encode;
 use uuid::Uuid;
 
+fn normalize_copy_source_version_id(version_id: Option<&str>) -> S3Result<Option<String>> {
+    match version_id {
+        Some(v) => {
+            let trimmed = v.trim();
+            if trimmed.eq_ignore_ascii_case("null") {
+                Ok(Some(Uuid::nil().to_string()))
+            } else if Uuid::parse_str(trimmed).is_ok() {
+                Ok(Some(trimmed.to_string()))
+            } else {
+                Err(s3_error!(InvalidArgument, "Invalid version id specified in copy source"))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+fn format_copy_source_version_id(version_id: Option<Uuid>, src_versioned: bool, src_version_suspended: bool) -> Option<String> {
+    if src_versioned || src_version_suspended {
+        Some(match version_id {
+            Some(vid) if vid != Uuid::nil() => vid.to_string(),
+            _ => "null".to_string(),
+        })
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 fn merge_part_encryption_metadata(
     metadata: &HashMap<String, String>,
@@ -1672,7 +1699,7 @@ impl DefaultMultipartUsecase {
             ..
         } = req.input;
 
-        let (src_bucket, src_key, src_version_id) = match copy_source {
+        let (src_bucket, src_key, raw_src_version_id) = match copy_source {
             CopySource::AccessPoint { .. } => return Err(s3_error!(NotImplemented)),
             CopySource::Outpost { .. } => return Err(s3_error!(NotImplemented)),
             CopySource::Bucket {
@@ -1681,6 +1708,7 @@ impl DefaultMultipartUsecase {
                 version_id,
             } => (src_bucket.to_string(), src_key.to_string(), version_id.map(|v| v.to_string())),
         };
+        let src_version_id = normalize_copy_source_version_id(raw_src_version_id.as_deref())?;
 
         let rs = if let Some(range_str) = copy_source_range {
             Some(parse_copy_source_range(&range_str)?)
@@ -1754,8 +1782,12 @@ impl DefaultMultipartUsecase {
         }
         .validate_multipart_ssec(&mp_info.user_defined)?;
 
+        let src_versioned = BucketVersioningSys::prefix_enabled(&src_bucket, &src_key).await;
+        let src_version_suspended = BucketVersioningSys::prefix_suspended(&src_bucket, &src_key).await;
         let mut src_opts = copy_src_opts(&src_bucket, &src_key, &req.headers).map_err(ApiError::from)?;
         src_opts.version_id = src_version_id.clone();
+        src_opts.versioned = src_versioned;
+        src_opts.version_suspended = src_version_suspended;
 
         let h = build_ssec_read_headers(
             copy_source_sse_customer_algorithm.as_ref(),
@@ -1799,13 +1831,7 @@ impl DefaultMultipartUsecase {
         // read resolves its material inside the object layer, which carries no request identity.
         authorize_sse_kms_object_read(copy_principal.as_ref(), &src_info.user_defined).await?;
 
-        let resolved_src_version_id = src_info.version_id.map(|version_id| {
-            if version_id == Uuid::nil() {
-                "null".to_string()
-            } else {
-                version_id.to_string()
-            }
-        });
+        let resolved_src_version_id = format_copy_source_version_id(src_info.version_id, src_versioned, src_version_suspended);
 
         if let Some(if_match) = copy_source_if_match {
             if let Some(ref etag) = src_info.etag {
@@ -3980,5 +4006,26 @@ mod tests {
             .expect_err("full foreground write admission should reject before body ingest");
         assert_eq!(err.code(), &S3ErrorCode::SlowDown);
         drop(held);
+    }
+
+    #[test]
+    fn upload_part_copy_normalizes_and_formats_source_version_id() {
+        assert_eq!(normalize_copy_source_version_id(None).expect("missing version id"), None);
+        assert_eq!(
+            normalize_copy_source_version_id(Some(" null ")).expect("null version id"),
+            Some(Uuid::nil().to_string())
+        );
+        let valid = Uuid::new_v4();
+        assert_eq!(
+            normalize_copy_source_version_id(Some(&format!(" {valid} "))).expect("valid uuid"),
+            Some(valid.to_string())
+        );
+        let err = normalize_copy_source_version_id(Some("not-a-uuid")).expect_err("invalid uuid should fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+
+        assert_eq!(format_copy_source_version_id(Some(Uuid::nil()), false, false), None);
+        assert_eq!(format_copy_source_version_id(None, true, false), Some("null".to_string()));
+        assert_eq!(format_copy_source_version_id(Some(Uuid::nil()), false, true), Some("null".to_string()));
+        assert_eq!(format_copy_source_version_id(Some(valid), true, false), Some(valid.to_string()));
     }
 }
