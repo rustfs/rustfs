@@ -76,6 +76,8 @@ pub mod allocator_reclaim;
 pub mod app;
 pub mod auth;
 pub mod auth_keystone;
+#[cfg(any(target_os = "linux", all(test, unix)))]
+mod background_admission;
 pub(crate) mod bitrot_selftest;
 pub mod capacity;
 pub mod cgroup_resources;

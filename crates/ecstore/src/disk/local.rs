@@ -531,6 +531,7 @@ async fn write_delete_rollback_files(
 ) -> Result<()> {
     let backup_dir = object_dir.join(rollback_dir.to_string());
     let mut entries = Vec::with_capacity(files.len());
+    // Publication and cleanup both acquire FINISHED before the quorum receipt.
     for &(name, data) in files {
         let path = backup_dir.join(name);
         let lease = os::acquire_namespace_mutation_lease_with_owner(&path, namespace_owner.clone()).await;
@@ -8144,7 +8145,7 @@ impl LocalDisk {
         &self,
         io_permit: Option<DiskIoPermit>,
         path: PathBuf,
-        read_fn: fn(std::io::Result<std::fs::File>) -> T,
+        read_fn: impl FnOnce(std::io::Result<std::fs::File>) -> T + Send + 'static,
     ) -> Result<T> {
         let root = self.publication_root.clone();
         self.blocking_queue
@@ -25832,16 +25833,18 @@ mod test {
         let dir = tempfile::tempdir().expect("metadata root");
         let endpoint = Endpoint::try_from(dir.path().to_string_lossy().as_ref()).expect("endpoint should parse");
         let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let path = dir.path().join("metadata");
+        fs::write(&path, b"metadata").await.expect("write metadata fixture");
         let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         with_background_resource_unit(gate.acquire().await, async {
-            let mut job = std::pin::pin!(disk.blocking_queue.run_cancellable(move |_| {
+            let mut read = std::pin::pin!(disk.run_metadata_read(None, path, move |opened| {
+                let _file = opened.expect("metadata file opened");
                 started_tx.send(()).expect("native metadata worker started");
                 release_rx.blocking_recv().expect("release native metadata work");
-                Ok(())
             }));
-            assert!(futures::FutureExt::now_or_never(&mut job).is_none());
+            assert!(futures::FutureExt::now_or_never(&mut read).is_none());
             started_rx.await.expect("worker owns queued job");
         })
         .await;
@@ -25853,7 +25856,7 @@ mod test {
             }
         })
         .await
-        .expect("native metadata job and worker retire");
+        .expect("native metadata job returns its resource unit");
         assert_eq!(held, 1, "leaving the caller scope must not release a live metadata job's unit");
         assert!(gate.try_acquire().is_some());
     }

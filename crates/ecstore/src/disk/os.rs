@@ -2711,6 +2711,8 @@ pub(crate) async fn remove_files_and_fsync_with_owner(
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> io::Result<()> {
     let mut leased_paths = Vec::with_capacity(names.len());
+    // Follow caller order, keeping FINISHED before the final quorum receipt
+    // to match rollback publication's overlapping namespace leases.
     for name in names {
         let path = dir.join(name);
         let lease = acquire_namespace_mutation_lease_with_owner(&path, namespace_owner.clone()).await;
@@ -9245,7 +9247,7 @@ mod tests {
         use std::num::NonZeroU16;
 
         let mut retained = Vec::new();
-        for queued in [false, true] {
+        for lane in [None, Some(DiskBlockingLane::Foreground), Some(DiskBlockingLane::Fsync)] {
             let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
             let unit = gate.acquire().await;
             let (started_tx, started_rx) = oneshot::channel();
@@ -9258,10 +9260,13 @@ mod tests {
                     let _ = finished_tx.send(());
                     Ok(())
                 };
-                if queued {
-                    DiskBlockingQueue::new().run(operation).await
-                } else {
-                    fsync_spawn_blocking(operation).await.expect("native operation joined")
+                match lane {
+                    Some(lane) => {
+                        DiskBlockingQueue::new()
+                            .run_on_lane(lane, "native operation failed", move |_| operation())
+                            .await
+                    }
+                    None => fsync_spawn_blocking(operation).await.expect("native operation joined"),
                 }
             }));
             started_rx.await.expect("native operation started");
@@ -9279,7 +9284,47 @@ mod tests {
             .await
             .expect("native completion returns the unit");
         }
-        assert_eq!(retained, [1, 1], "fsync and namespace dispatch must retain their own producer's unit");
+        assert_eq!(retained, [1, 1, 1], "fsync and both queue lanes must retain their own producer's unit");
+    }
+
+    #[tokio::test]
+    async fn resource_disk_queue_releases_completed_producer_while_worker_is_busy() {
+        use crate::disk::io_admission::with_background_resource_unit;
+        use rustfs_concurrency::adaptive::AdaptiveAdmission;
+        use std::num::NonZeroU16;
+
+        for lane in [DiskBlockingLane::Foreground, DiskBlockingLane::Fsync] {
+            let queue = DiskBlockingQueue::new();
+            let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
+            let (first_started_tx, first_started_rx) = oneshot::channel();
+            let (first_release_tx, first_release_rx) = oneshot::channel();
+            let first_queue = Arc::clone(&queue);
+            let first = tokio::spawn(with_background_resource_unit(gate.acquire().await, async move {
+                first_queue
+                    .run_on_lane(lane, "first operation failed", move |_| {
+                        let _ = first_started_tx.send(());
+                        let _ = first_release_rx.blocking_recv();
+                        Ok(())
+                    })
+                    .await
+            }));
+            first_started_rx.await.expect("first producer started");
+            let (second_started_tx, second_started_rx) = oneshot::channel();
+            let (second_release_tx, second_release_rx) = oneshot::channel();
+            let mut second = std::pin::pin!(queue.run_on_lane(lane, "second operation failed", move |_| {
+                let _ = second_started_tx.send(());
+                let _ = second_release_rx.blocking_recv();
+                Ok(())
+            }));
+            assert!(futures::FutureExt::now_or_never(&mut second).is_none());
+            first_release_tx.send(()).expect("release first producer");
+            first.await.expect("first producer joined").expect("first producer completed");
+            second_started_rx.await.expect("worker started unrelated producer");
+            let retained = gate.snapshot().active;
+            second_release_tx.send(()).expect("release second producer");
+            second.await.expect("second producer completed");
+            assert_eq!(retained, 0, "shared worker must not retain a completed producer's unit");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
