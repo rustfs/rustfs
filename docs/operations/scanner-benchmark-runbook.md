@@ -274,6 +274,67 @@ entry point. If an adapter uses it, record and verify the external checkout's
 owner and full commit before use. The current workflow clones the default branch,
 so its contents must not be attributed to a RustFS source SHA.
 
+#### Independent version oracle
+
+`scripts/scanner_version_oracle.py` supplies the read-only S3 oracle portion of
+an adapter. Stop workload mutations first. Prepare an inventory independently
+from deterministic payloads and acknowledged PUT/DELETE receipts; do not derive
+the expected keys, bytes or hashes from the listing being checked. Its JSON
+contains `buckets` (the complete owned bucket scope, including empty buckets)
+and `versions` with these fields per retained version:
+
+| Field | Meaning |
+|---|---|
+| `bucket`, `key` | Owned bucket and exact object key. |
+| `generation` | Stable logical generation from the workload plan, such as `1`, `2`, or `delete-3`. Unique per key. |
+| `version_id` | Actual server ID from the write receipt, including literal `null` for an unversioned/null version. Unique per key. |
+| `is_latest`, `delete_marker` | Boolean expected final state. Exactly one latest entry per key. |
+| `bytes`, `sha256` | Independently computed full payload length and SHA-256. Delete markers use `0` and JSON `null`. |
+
+The comparable canonical digest sorts by bucket, key and logical generation,
+then hashes compact, key-sorted UTF-8 JSON of those records without `version_id`.
+Server-assigned IDs differ across isolated legs. They are still checked exactly
+against every endpoint's listing and version GET, and bound in a separate
+`version_bindings_sha256` receipt. Removing an overwritten null version or a
+permanently deleted version from the expected inventory must follow the actual
+planned mutation and its receipt, not an observed omission.
+
+```bash
+python3 scripts/scanner_version_oracle.py expected-inventory.json \
+  --endpoint node-a=http://192.0.2.10:9000 \
+  --endpoint node-b=http://192.0.2.11:9000 \
+  --output new-oracle-evidence.json
+```
+
+The CLI needs boto3, reads credentials through the AWS credential provider chain,
+uses path-style SigV4 requests and disables SDK retries. It never writes S3 data.
+For Python workload seeding with pooled S3 connections, use botocore 1.43.77 or
+newer: older versions can retain a zero-length PUT's response state and misparse
+the next PUT, causing a read timeout even with valid server response framing.
+See the [upstream fix](https://github.com/boto/botocore/pull/3784).
+Record the exact SDK and transitive dependency versions, package hashes and
+effective checksum settings, and use the same client environment for both legs.
+Retain failures from older clients; do not hide them with retries or a larger
+timeout. A client fix does not establish that server-side 503s are resolved.
+
+Every endpoint gets independently paginated version and current-object listings,
+full streamed GETs for every data version and every current live object, and
+explicit/current delete-marker checks. A hidden old version, extra key, wrong
+latest flag, corrupt/truncated body, unexpected error or changing namespace
+fails the oracle. Expected delete-marker GET responses follow the
+[S3 GET contract](https://docs.aws.amazon.com/boto3/latest/reference/services/s3/client/get_object.html);
+a 503 is never treated as a deleted object.
+
+The evidence file retains observed version records and per-endpoint summaries.
+`actual.objects` counts current live keys, `actual.versions` includes data
+versions and delete markers, and `actual.bytes` sums all retained data-version
+bytes once. The stdout summary can feed the adapter's `oracle` response after
+checking the exit code; retain the full evidence file separately. Output must
+be a new file, and failure never produces a passing response. Workers and queued
+GETs are bounded (`--workers`, default 8, maximum 64); each body is read in 1 MiB
+chunks. This checks S3-visible content and versions, not every on-disk erasure
+fragment, and does not replace the seeded repair or performance gates.
+
 #### Histogram Window Evidence
 
 Use `scripts/scanner_otlp_window.py` to subtract two cumulative explicit-histogram or monotonic integer-counter snapshots before deriving window evidence. It reads OTLP JSON, or binary OTLP with `--format protobuf` when `opentelemetry-proto` is installed in the active Python environment. Pin and record that dependency in the adapter environment. Keep each original export and its source-node association; output includes the SHA-256 of both inputs.
