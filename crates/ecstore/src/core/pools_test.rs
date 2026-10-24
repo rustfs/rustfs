@@ -2585,9 +2585,13 @@ mod decommission_lock_order_tests {
     #[serial_test::serial]
     fn decommission_counts_each_version_once_across_a_pause_and_resume() {
         run_large_stack_async_test("decommission-pause-resume-count", || async {
-            // One bucket at a time, so the system buckets settle before the
-            // test bucket and leave a stable baseline.
-            temp_env::async_with_vars([("RUSTFS_DECOMMISSION_BUCKET_CONCURRENCY", Some("1"))], async {
+            // Serialize this accounting fixture so the deferred entry precedes
+            // the later checkpoint, regardless of worker scheduling.
+            let env = [
+                ("RUSTFS_DECOMMISSION_BUCKET_CONCURRENCY", Some("1")),
+                ("RUSTFS_DECOMMISSION_ENTRY_CONCURRENCY", Some("1")),
+            ];
+            temp_env::async_with_vars(env, async {
                 let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
                 let bucket = test_bucket("pause-resume-count");
                 let object = "versioned/03.bin";
@@ -2595,11 +2599,15 @@ mod decommission_lock_order_tests {
                 // Listed after the partially moved entry: its completion saves
                 // a progress checkpoint while that entry's first versions are
                 // moved and its later ones are still deferred.
-                let later = "z/after.bin";
+                let source_set = store.pools[0].get_disks_by_key(object).set_index;
+                let later = (0..1024)
+                    .map(|index| format!("z/after-{index:04}.bin"))
+                    .find(|key| store.pools[0].get_disks_by_key(key).set_index == source_set)
+                    .expect("a later key in the same source set");
                 store.pools[0]
                     .put_object(
                         &bucket,
-                        later,
+                        &later,
                         &mut PutObjReader::from_vec(vec![0x7a; 16]),
                         &ObjectOptions {
                             versioned: true,
@@ -2626,10 +2634,11 @@ mod decommission_lock_order_tests {
                             }
                             if stage == "exact_versions_read" {
                                 let mut baseline = baseline.lock().expect("baseline lock");
-                                if baseline.is_none()
-                                    && let Ok(pool_meta) = store.pool_meta.try_read()
-                                    && let Some(info) = pool_meta.pools[0].decommission.as_ref()
-                                {
+                                if baseline.is_none() {
+                                    // This synchronous fault hook must not miss
+                                    // the baseline when metadata is briefly busy.
+                                    let pool_meta = tokio::task::block_in_place(|| store.pool_meta.blocking_read());
+                                    let info = pool_meta.pools[0].decommission.as_ref().expect("active decommission");
                                     *baseline = Some((entry_object.to_owned(), info.items_decommissioned, info.bytes_done));
                                 }
                                 return false;
@@ -2799,7 +2808,17 @@ mod decommission_lock_order_tests {
     #[test]
     #[serial_test::serial]
     fn decommission_relaunch_backs_off_while_a_retained_entry_is_relisted() {
-        run_large_stack_async_test("decommission-retained-backoff", || async {
+        assert_retained_entry_relaunch_backoff(false);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decommission_full_count_ledger_preserves_failure_and_relaunch_backoff() {
+        assert_retained_entry_relaunch_backoff(true);
+    }
+
+    fn assert_retained_entry_relaunch_backoff(full_ledger: bool) {
+        run_large_stack_async_test("decommission-retained-backoff", move || async move {
             let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
             let bucket = test_bucket("retained-backoff");
             let object = "versioned/03.bin";
@@ -2836,6 +2855,17 @@ mod decommission_lock_order_tests {
             );
 
             start_transitioned_entry_decommission(&store, &bucket).await;
+            if full_ledger {
+                let generation = decommission_info(&*store.pool_meta.read().await)
+                    .start_time
+                    .expect("generation");
+                store.ctx.with_decommission_count_ledger(0, generation, |ledger| {
+                    for index in 0..2048 {
+                        ledger.admit("retained-ledger-fixture", &format!("key-{index}"), (None, false), false);
+                    }
+                    assert!(!ledger.admit("retained-ledger-fixture", "overflow", (None, false), false));
+                });
+            }
             let pause_round = |round: u32| {
                 let store = Arc::clone(&store);
                 async move {

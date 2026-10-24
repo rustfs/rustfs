@@ -18339,6 +18339,7 @@ impl ECStore {
             // after a pause recounted nothing, because nothing of it was
             // counted. A retained entry is relisted by every resumed pass; the
             // ledger counts its versions once per process (rustfs/backlog#2873).
+            let had_failure = pending_counts.iter().any(|(_, _, failed)| *failed);
             let admitted = self.ctx.with_decommission_count_ledger(idx, generation, |ledger| {
                 if source_cleaned {
                     ledger.record_cleaned_entry();
@@ -18359,6 +18360,20 @@ impl ECStore {
                         err,
                     ));
                 }
+            }
+
+            // Failure presence also selects the terminal state. A full
+            // diagnostic ledger may undercount versions, but cannot erase the
+            // last evidence that this generation encountered a failed entry.
+            if had_failure
+                && pool_meta.pools[idx]
+                    .decommission
+                    .as_ref()
+                    .is_some_and(|info| info.items_decommission_failed == 0)
+            {
+                count_decommission_item(&mut pool_meta, idx, 0, true).map_err(|err| {
+                    with_decommission_entry_context("count_decommission_failure", bucket.as_str(), entry.name.as_str(), err)
+                })?;
             }
 
             if let Err(err) = track_decommission_current_object(&mut pool_meta, idx, bucket.as_str(), entry.name.as_str()) {

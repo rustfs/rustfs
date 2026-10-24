@@ -134,20 +134,46 @@ pub(crate) struct DecommissionCountLedger {
     generation: Option<time::OffsetDateTime>,
     /// (bucket, object, version id, delete marker) of retained versions.
     retained: HashSet<(String, String, Option<uuid::Uuid>, bool)>,
+    retained_key_bytes: usize,
     /// Entries whose source was cleaned up. Only moving an entry off the pool
     /// advances it; a relisted retained entry cannot.
     cleaned_entries: u64,
 }
 
 impl DecommissionCountLedger {
+    const MAX_RETAINED_VERSIONS: usize = 1024;
+    const MAX_RETAINED_KEY_BYTES: usize = 1024 * 1024;
+
     /// Whether this version is counted now: a retained version once, and a
     /// cleaned-up version unless it was already counted while retained.
+    /// When the retained ledger is full, omit that progress count until source
+    /// cleanup. This bounds diagnostic memory without evicting deduplication
+    /// evidence or blocking data movement.
     pub(crate) fn admit(&mut self, bucket: &str, object: &str, version: (Option<uuid::Uuid>, bool), cleaned: bool) -> bool {
-        let key = (bucket.to_owned(), object.to_owned(), version.0, version.1);
+        let key_bytes = bucket.len().saturating_add(object.len());
         if cleaned {
-            !self.retained.remove(&key)
+            // Most successful entries never needed retained-version tracking.
+            if self.retained.is_empty() || key_bytes > Self::MAX_RETAINED_KEY_BYTES {
+                return true;
+            }
+            let key = (bucket.to_owned(), object.to_owned(), version.0, version.1);
+            if self.retained.remove(&key) {
+                self.retained_key_bytes -= key_bytes;
+                return false;
+            }
+            return true;
+        }
+        if self.retained.len() >= Self::MAX_RETAINED_VERSIONS
+            || key_bytes > Self::MAX_RETAINED_KEY_BYTES.saturating_sub(self.retained_key_bytes)
+        {
+            return false;
+        }
+        let key = (bucket.to_owned(), object.to_owned(), version.0, version.1);
+        if self.retained.insert(key) {
+            self.retained_key_bytes += key_bytes;
+            true
         } else {
-            self.retained.insert(key)
+            false
         }
     }
 
@@ -1022,6 +1048,38 @@ pub fn bootstrap_ctx() -> Arc<InstanceContext> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decommission_count_ledger_bounds_retained_entries() {
+        let mut ledger = super::DecommissionCountLedger::default();
+        for index in 0..1024 {
+            assert!(ledger.admit("bucket", &format!("key-{index}"), (None, false), false));
+        }
+        assert!(!ledger.admit("bucket", "overflow", (None, false), false));
+        assert_eq!(ledger.retained.len(), 1024);
+        // An uncounted retained version can still be counted after cleanup.
+        assert!(ledger.admit("bucket", "overflow", (None, false), true));
+        assert!(!ledger.admit("bucket", "key-0", (None, false), true));
+        assert!(ledger.admit("bucket", "next", (None, false), false));
+        assert!(!ledger.admit("bucket", "next", (None, false), false));
+        assert_eq!(ledger.retained.len(), 1024);
+    }
+
+    #[test]
+    fn decommission_count_ledger_bounds_retained_key_bytes() {
+        let mut ledger = super::DecommissionCountLedger::default();
+        let bucket = "b".repeat(63);
+        let object_prefix = "x".repeat(1020);
+        let mut admitted = 0;
+        for index in 0..1024 {
+            admitted += usize::from(ledger.admit(&bucket, &format!("{object_prefix}{index:04}"), (None, false), false));
+        }
+        assert!(admitted > 0 && admitted < 1024);
+        assert!(ledger.retained.iter().map(|(b, o, _, _)| b.len() + o.len()).sum::<usize>() <= 1024 * 1024);
+        // Removal releases the byte reservation as well as the entry slot.
+        assert!(!ledger.admit(&bucket, &format!("{object_prefix}0000"), (None, false), true));
+        assert!(ledger.admit(&bucket, &format!("{object_prefix}1024"), (None, false), false));
+    }
 
     #[test]
     fn namespace_commit_guards_are_instance_local_and_count_until_last_owner() {
