@@ -12,9 +12,56 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 
+use rustfs_concurrency::adaptive::NodeAdmission;
 use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshotProvider, WorkloadClass};
+use tokio_util::sync::CancellationToken;
+
+use crate::ScannerError;
+
+static SCANNER_NODE_ADMISSION: OnceLock<Arc<NodeAdmission>> = OnceLock::new();
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TEST_SCANNER_NODE_ADMISSION: Arc<NodeAdmission>;
+}
+
+/// Install the heal manager's node owner before starting scanner workers.
+/// Refuse replacement: existing scans must not outlive an independently renewed owner.
+pub fn set_scanner_node_admission(owner: Arc<NodeAdmission>) -> bool {
+    SCANNER_NODE_ADMISSION.set(owner).is_ok()
+}
+
+pub(crate) fn scanner_node_admission() -> Option<Arc<NodeAdmission>> {
+    #[cfg(test)]
+    if let Ok(owner) = TEST_SCANNER_NODE_ADMISSION.try_with(Arc::clone) {
+        return Some(owner);
+    }
+    SCANNER_NODE_ADMISSION.get().cloned()
+}
+
+/// Scanner callers can already hold a bucket cache lease: try once, never park
+/// under that lock. Keep the operation's error type and cancellation boundary.
+/// Units end before recursion, pacing or checkpoint publication.
+pub(crate) async fn run_scanner_node_operation<T, E>(
+    owner: Option<&Arc<NodeAdmission>>,
+    cancel: &CancellationToken,
+    operation: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<Result<T, E>, ScannerError> {
+    let Some(owner) = owner else {
+        return Ok(operation.await);
+    };
+    if cancel.is_cancelled() {
+        return Err(ScannerError::Other("Operation cancelled".to_string()));
+    }
+    let permit = owner.try_acquire().ok_or(ScannerError::ResourceDeferred)?;
+    let result = operation.await;
+    if result.is_ok() {
+        permit.complete();
+    }
+    Ok(result)
+}
 
 type WorkloadSnapshotProviderRef = Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync>;
 
