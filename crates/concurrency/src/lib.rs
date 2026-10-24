@@ -39,6 +39,7 @@ pub use rustfs_io_core::OperationProgress;
 pub mod adaptive;
 mod backpressure;
 mod deadlock;
+pub mod foreground;
 mod queue;
 pub mod workers;
 pub mod workload;
