@@ -254,7 +254,7 @@ background_heal_status_url() {
 }
 
 metrics_url() {
-  printf '%s/rustfs/admin/v3/metrics?types=1&by-host=true&n=1\n' "${1%/}"
+  printf '%s/rustfs/admin/v3/realtime?types=1&by-host=true&n=1\n' "${1%/}"
 }
 
 endpoint_label() {
