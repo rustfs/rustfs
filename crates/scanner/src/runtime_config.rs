@@ -64,8 +64,17 @@ static SCANNER_DEFAULT_CYCLE_SECS: AtomicU64 = AtomicU64::new(NO_DEFAULT_CYCLE_O
 static SCANNER_RUNTIME_CONFIG_GENERATION: AtomicU64 = AtomicU64::new(0);
 static SCANNER_RUNTIME_CONFIG_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 
-static SCANNER_RUNTIME_CONFIG: LazyLock<RwLock<ScannerRuntimeConfig>> =
-    LazyLock::new(|| RwLock::new(lookup_scanner_runtime_config(None).unwrap_or_default()));
+struct ScannerRuntimeConfigState {
+    config: ScannerRuntimeConfig,
+    applied: bool,
+}
+
+static SCANNER_RUNTIME_CONFIG: LazyLock<RwLock<ScannerRuntimeConfigState>> = LazyLock::new(|| {
+    RwLock::new(ScannerRuntimeConfigState {
+        config: lookup_scanner_runtime_config(None).unwrap_or_default(),
+        applied: false,
+    })
+});
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -848,23 +857,30 @@ pub(crate) fn lookup_scanner_runtime_config(
     })
 }
 
-fn apply_resolved_runtime_config(config: ScannerRuntimeConfig) {
+fn apply_resolved_runtime_config(config: ScannerRuntimeConfig) -> bool {
+    let Ok(mut state) = SCANNER_RUNTIME_CONFIG.write() else {
+        return false;
+    };
+    if state.applied && state.config == config {
+        return false;
+    }
+    // Lock order: runtime configuration -> sleeper parameters / disk-budget registry.
     SCANNER_SLEEPER.update_from_runtime_config(config.delay, config.max_wait, config.idle_mode, config.yield_every_n_objects);
     SCANNER_SLEEPER.update_disk_io_budget(ScannerDiskIoBudgetConfig {
         iops: config.disk_io_budget_iops,
         bytes_per_sec: config.disk_io_budget_bytes_per_sec,
         speed: config.speed,
     });
-    if let Ok(mut guard) = SCANNER_RUNTIME_CONFIG.write() {
-        rustfs_scanner_metrics::metrics::global_metrics().record_scanner_cycle_config(
-            config.cycle_interval,
-            config.bitrot_cycle,
-            config.cycle_budget.max_duration,
-            config.cycle_budget.max_objects,
-            config.cycle_budget.max_directories,
-        );
-        *guard = config;
-    }
+    rustfs_scanner_metrics::metrics::global_metrics().record_scanner_cycle_config(
+        config.cycle_interval,
+        config.bitrot_cycle,
+        config.cycle_budget.max_duration,
+        config.cycle_budget.max_objects,
+        config.cycle_budget.max_directories,
+    );
+    state.config = config;
+    state.applied = true;
+    true
 }
 
 fn current_server_config() -> Option<ServerConfig> {
@@ -898,9 +914,10 @@ pub fn validate_scanner_runtime_config(config: &ServerConfig) -> Result<(), Scan
 pub fn apply_scanner_runtime_config(config: &ServerConfig) -> Result<(), ScannerRuntimeConfigError> {
     validate_scanner_runtime_config(config)?;
     let resolved = lookup_scanner_runtime_config(Some(config))?;
-    apply_resolved_runtime_config(resolved);
-    SCANNER_RUNTIME_CONFIG_GENERATION.fetch_add(1, Ordering::AcqRel);
-    SCANNER_RUNTIME_CONFIG_NOTIFY.notify_one();
+    if apply_resolved_runtime_config(resolved) {
+        SCANNER_RUNTIME_CONFIG_GENERATION.fetch_add(1, Ordering::AcqRel);
+        SCANNER_RUNTIME_CONFIG_NOTIFY.notify_one();
+    }
     Ok(())
 }
 
@@ -927,7 +944,10 @@ pub(crate) fn refresh_scanner_runtime_config_for_tests() {
 }
 
 pub(crate) fn current_scanner_runtime_config() -> ScannerRuntimeConfig {
-    SCANNER_RUNTIME_CONFIG.read().map(|guard| guard.clone()).unwrap_or_default()
+    SCANNER_RUNTIME_CONFIG
+        .read()
+        .map(|state| state.config.clone())
+        .unwrap_or_default()
 }
 
 pub fn scanner_runtime_config_status() -> ScannerRuntimeConfigStatus {
@@ -1022,10 +1042,6 @@ pub fn scanner_runtime_config_status() -> ScannerRuntimeConfigStatus {
 
 pub(crate) fn scanner_cycle_interval() -> Duration {
     current_scanner_runtime_config().cycle_interval
-}
-
-pub(crate) fn scanner_start_delay() -> Option<Duration> {
-    current_scanner_runtime_config().start_delay
 }
 
 pub(crate) fn scanner_bitrot_cycle() -> Option<Duration> {
@@ -1170,6 +1186,40 @@ mod tests {
         assert_eq!(report.cycle_max_objects, 0);
         assert_eq!(report.cycle_max_directories, 0);
         super::refresh_scanner_runtime_config_for_tests();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn first_runtime_config_application_publishes_default_equal_values() {
+        let config = lookup_scanner_runtime_config(None).expect("initial resolved configuration");
+        {
+            let mut state = super::SCANNER_RUNTIME_CONFIG.write().expect("runtime config state");
+            state.config = config.clone();
+            state.applied = false;
+        }
+        let metrics = rustfs_scanner_metrics::metrics::global_metrics();
+        metrics.record_scanner_cycle_config(Duration::ZERO, None, None, None, None);
+        assert!(super::apply_resolved_runtime_config(config.clone()));
+        assert_eq!(metrics.report().await.cycle_interval_seconds, config.cycle_interval.as_secs_f64());
+        metrics.record_scanner_cycle_timeout(true, Duration::from_secs(17));
+        assert!(!super::apply_resolved_runtime_config(config));
+        let unchanged = metrics.report().await;
+        assert_eq!(unchanged.cycle_last_progress_age, 17);
+        assert!(unchanged.leader_lease_without_progress);
+    }
+
+    #[test]
+    #[serial]
+    fn repeated_runtime_config_application_does_not_reconfigure_or_notify() {
+        let config = server_config_with_scanner(&[]);
+        super::apply_scanner_runtime_config(&config).expect("initial configuration should apply");
+        let generation = super::scanner_runtime_config_generation();
+        let resolved = super::current_scanner_runtime_config();
+        for _ in 0..1000 {
+            assert!(!super::apply_resolved_runtime_config(resolved.clone()));
+        }
+        super::apply_scanner_runtime_config(&config).expect("unchanged configuration should be accepted");
+        assert_eq!(super::scanner_runtime_config_generation(), generation);
     }
 
     #[test]

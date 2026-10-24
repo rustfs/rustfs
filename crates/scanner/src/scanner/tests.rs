@@ -17,6 +17,8 @@ use super::heal_info::{
     reset_bitrot_cadence_anchor_for_test, resolve_background_heal_info, scanner_bitrot_start_for_cycle,
 };
 use super::*;
+
+mod startup_gate;
 use crate::EcstoreResult;
 use crate::storage_api::owner::{
     WriteCommitGuard, WriteCompletion, ecstore_hold_namespace_commit, ecstore_namespace_commits_pending,
@@ -906,6 +908,7 @@ struct MemoryConfigStore {
     #[cfg(feature = "diagnostic-read-version-caller")]
     pending_diagnostic_write: AtomicBool,
     objects: Mutex<HashMap<String, Vec<u8>>>,
+    bucket_list_calls: AtomicUsize,
     revisions: Mutex<HashMap<String, u64>>,
     insert_after_gets: Mutex<HashMap<String, Vec<u8>>>,
     read_errors: Mutex<HashMap<String, EcstoreError>>,
@@ -1173,7 +1176,15 @@ fn test_randomized_cycle_delay_bounds_extreme_interval() {
 
 #[test]
 fn test_initial_scanner_delay_uses_configured_start_delay() {
-    let delay = initial_scanner_delay_for(Some(120));
+    let delay = initial_scanner_delay_for_startup(
+        &ScannerRuntimeConfig {
+            start_delay: Some(Duration::from_secs(120)),
+            ..Default::default()
+        },
+        false,
+        true,
+        false,
+    );
     assert!(delay >= Duration::from_secs(108));
     assert!(delay <= Duration::from_secs(132));
 }
@@ -1185,7 +1196,7 @@ fn test_initial_scanner_delay_bounds_warm_startup_without_changing_cycle() {
         for (cycle, startup) in [(1, 1), (30, 30), (60, 60), (21600, 60)] {
             with_var(ENV_SCANNER_CYCLE, Some(cycle.to_string().as_str()), || {
                 crate::runtime_config::refresh_scanner_runtime_config_for_tests();
-                let delay = initial_scanner_delay_for_startup(None, false, true, false);
+                let delay = initial_scanner_delay_for_startup(&resolve_scanner_runtime_config(), false, true, false);
                 let expected = Duration::from_secs(startup);
                 assert!(delay >= expected.mul_f64(0.9), "cycle {cycle}: {delay:?}");
                 assert!(delay <= expected.mul_f64(1.1), "cycle {cycle}: {delay:?}");
@@ -1198,20 +1209,44 @@ fn test_initial_scanner_delay_bounds_warm_startup_without_changing_cycle() {
 
 #[test]
 fn test_initial_scanner_delay_skips_for_cold_usage_cache_with_buckets() {
-    let delay = initial_scanner_delay_for_startup(Some(120), true, true, false);
+    let delay = initial_scanner_delay_for_startup(
+        &ScannerRuntimeConfig {
+            start_delay: Some(Duration::from_secs(120)),
+            ..Default::default()
+        },
+        true,
+        true,
+        false,
+    );
     assert_eq!(delay, Duration::ZERO);
 }
 
 #[test]
 fn test_initial_scanner_delay_keeps_configured_delay_for_warm_usage_cache_no_replication() {
-    let delay = initial_scanner_delay_for_startup(Some(120), false, true, false);
+    let delay = initial_scanner_delay_for_startup(
+        &ScannerRuntimeConfig {
+            start_delay: Some(Duration::from_secs(120)),
+            ..Default::default()
+        },
+        false,
+        true,
+        false,
+    );
     assert!(delay >= Duration::from_secs(108));
     assert!(delay <= Duration::from_secs(132));
 }
 
 #[test]
 fn test_initial_scanner_delay_skips_for_cold_usage_cache_without_buckets() {
-    let delay = initial_scanner_delay_for_startup(Some(120), true, false, false);
+    let delay = initial_scanner_delay_for_startup(
+        &ScannerRuntimeConfig {
+            start_delay: Some(Duration::from_secs(120)),
+            ..Default::default()
+        },
+        true,
+        false,
+        false,
+    );
     assert_eq!(delay, Duration::ZERO);
 }
 
@@ -1219,14 +1254,30 @@ fn test_initial_scanner_delay_skips_for_cold_usage_cache_without_buckets() {
 fn test_initial_scanner_delay_skips_for_active_replication_warm_cache() {
     // Warm cache + active replication rules → skip startup delay so that FAILED-status objects
     // from a crash are healed on the first cycle, not after a 27-33 min sleep.
-    let delay = initial_scanner_delay_for_startup(Some(120), false, true, true);
+    let delay = initial_scanner_delay_for_startup(
+        &ScannerRuntimeConfig {
+            start_delay: Some(Duration::from_secs(120)),
+            ..Default::default()
+        },
+        false,
+        true,
+        true,
+    );
     assert_eq!(delay, Duration::ZERO);
 }
 
 #[test]
 fn test_initial_scanner_delay_keeps_delay_for_replication_without_buckets() {
     // Active replication but no buckets → no objects to scan, keep normal delay.
-    let delay = initial_scanner_delay_for_startup(Some(120), false, false, true);
+    let delay = initial_scanner_delay_for_startup(
+        &ScannerRuntimeConfig {
+            start_delay: Some(Duration::from_secs(120)),
+            ..Default::default()
+        },
+        false,
+        false,
+        true,
+    );
     assert!(delay >= Duration::from_secs(108));
     assert!(delay <= Duration::from_secs(132));
 }
@@ -10100,6 +10151,8 @@ async fn test_wait_for_next_scanner_cycle_wakes_for_repeated_dirty_bucket() {
 #[serial]
 async fn test_wait_for_next_scanner_cycle_reschedules_for_runtime_config() {
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    let config = startup_gate::startup_config(&[("alert_excess_versions", "1000")]);
+    crate::runtime_config::apply_scanner_runtime_config(&config).expect("initial scanner config should apply");
     let observed_generation = crate::runtime_config::scanner_runtime_config_generation();
     let ctx = CancellationToken::new();
     let mut wait = Box::pin(wait_for_next_scanner_cycle(
@@ -10112,9 +10165,8 @@ async fn test_wait_for_next_scanner_cycle_reschedules_for_runtime_config() {
     ));
     assert!(matches!(futures::poll!(&mut wait), Poll::Pending));
 
-    let mut config = rustfs_config::server_config::Config::new();
-    config.set_defaults();
-    crate::runtime_config::apply_scanner_runtime_config(&config).expect("default scanner config should apply");
+    let config = startup_gate::startup_config(&[("alert_excess_versions", "1001")]);
+    crate::runtime_config::apply_scanner_runtime_config(&config).expect("changed scanner config should apply");
     let reason = tokio::time::timeout(Duration::from_secs(1), wait)
         .await
         .expect("runtime config should wake scanner before timer");
