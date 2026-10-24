@@ -172,6 +172,7 @@ pub(crate) mod fsync_dir_recorder {
         record_path(&LIMITED, dir, "limited fsync dir recorder");
         let hook = remove_hook(&BEFORE_LIMITED, dir, "limited fsync hook poisoned");
         if let Some(hook) = hook {
+            let _pause = super::enter_blocking_test_hook();
             hook();
         }
     }
@@ -304,6 +305,7 @@ pub(crate) mod prepared_publication_test_hooks {
     pub(crate) fn run(stage: Stage, path: &Path) {
         let hook = BEFORE_PUBLICATION.lock().remove(&(stage, path.to_path_buf()));
         if let Some(hook) = hook {
+            let _pause = super::enter_blocking_test_hook();
             hook();
         }
     }
@@ -599,7 +601,7 @@ pub(crate) fn set_dst_dir_fsync_group_commit_for_test(enabled: bool) -> dst_dir_
     dst_dir_fsync_group_commit_override::set(enabled)
 }
 
-fn dst_dir_fsync_group_commit_enabled() -> bool {
+pub(crate) fn dst_dir_fsync_group_commit_enabled() -> bool {
     #[cfg(test)]
     if let Some(enabled) = dst_dir_fsync_group_commit_override::get() {
         return enabled;
@@ -1077,6 +1079,35 @@ async fn fsync_dst_dir_group_commit_opened(
     }
 }
 
+pub(crate) fn fsync_commit_directory_limited_std(dir: &Path, guard: &RenameCommitGuard) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        if dir != guard.directories.destination_path {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "sync directory does not match commit guard"));
+        }
+        let file = &guard
+            .directories
+            .destination
+            .get()
+            .ok_or_else(|| io::Error::other("commit directory was not published"))?
+            .file;
+        #[cfg(test)]
+        fsync_dir_recorder::record_limited(dir);
+        fsync_directory_handle_std(dir, Some(file))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = guard;
+        fsync_dir_limited_std(dir)
+    }
+}
+
+pub(crate) fn fsync_dir_limited_std(dir: &Path) -> io::Result<()> {
+    #[cfg(all(test, unix))]
+    fsync_dir_recorder::record_limited(dir);
+    fsync_dir_std(dir)
+}
+
 /// Reuse the published directory without bypassing group commit or sync admission.
 pub(crate) async fn fsync_commit_directory(
     dir: &Path,
@@ -1530,6 +1561,230 @@ pub(crate) fn disk_file_sync_limiter(root: &Path) -> Arc<Semaphore> {
     limiter
 }
 
+const MAX_NAMESPACE_WORKERS_PER_DISK: usize = 2;
+const FALLBACK_NAMESPACE_QUEUE_SHARDS: usize = 8;
+
+#[derive(Default)]
+struct DiskBlockingQueueState {
+    jobs: VecDeque<Box<dyn FnOnce() + Send>>,
+    active_workers: usize,
+    #[cfg(any(test, feature = "test-util"))]
+    paused_workers: usize,
+}
+
+pub(crate) struct DiskBlockingQueue {
+    lanes: [Mutex<DiskBlockingQueueState>; 2],
+}
+
+struct DiskBlockingWorkerGuard {
+    queue: Arc<DiskBlockingQueue>,
+    isolated: bool,
+    disarmed: bool,
+}
+
+impl Drop for DiskBlockingWorkerGuard {
+    fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-util"))]
+        CURRENT_DISK_BLOCKING_QUEUE.with(|slot| {
+            let _ = slot.borrow_mut().take();
+        });
+        if self.disarmed {
+            return;
+        }
+        let should_respawn = {
+            let mut state = self.queue.lane(self.isolated).lock();
+            state.active_workers = state.active_workers.saturating_sub(1);
+            let max_workers = self.queue.effective_max_workers(&state);
+            if !state.jobs.is_empty() && state.active_workers < max_workers {
+                state.active_workers += 1;
+                true
+            } else {
+                false
+            }
+        };
+        if should_respawn {
+            DiskBlockingQueue::spawn_worker(Arc::clone(&self.queue), self.isolated);
+        }
+    }
+}
+
+impl DiskBlockingQueue {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            lanes: std::array::from_fn(|_| Mutex::new(DiskBlockingQueueState::default())),
+        })
+    }
+
+    #[inline]
+    fn lane(&self, isolated: bool) -> &Mutex<DiskBlockingQueueState> {
+        &self.lanes[usize::from(isolated)]
+    }
+
+    #[inline]
+    fn effective_max_workers(&self, state: &DiskBlockingQueueState) -> usize {
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            MAX_NAMESPACE_WORKERS_PER_DISK.saturating_add(state.paused_workers)
+        }
+        #[cfg(not(any(test, feature = "test-util")))]
+        {
+            let _ = state;
+            MAX_NAMESPACE_WORKERS_PER_DISK
+        }
+    }
+
+    fn enqueue(self: &Arc<Self>, job: Box<dyn FnOnce() + Send>) {
+        let isolated = is_isolated_io_thread();
+        let should_spawn = {
+            let mut state = self.lane(isolated).lock();
+            state.jobs.push_back(job);
+            if state.active_workers < self.effective_max_workers(&state) {
+                state.active_workers += 1;
+                true
+            } else {
+                false
+            }
+        };
+        if should_spawn {
+            Self::spawn_worker(Arc::clone(self), isolated);
+        }
+    }
+
+    fn spawn_worker(queue: Arc<Self>, isolated: bool) {
+        drop(tokio::task::spawn_blocking(move || {
+            #[cfg(any(test, feature = "test-util"))]
+            CURRENT_DISK_BLOCKING_QUEUE.with(|slot| {
+                *slot.borrow_mut() = Some((Arc::clone(&queue), isolated));
+            });
+            let mut guard = DiskBlockingWorkerGuard {
+                queue: Arc::clone(&queue),
+                isolated,
+                disarmed: false,
+            };
+            loop {
+                let Some(job) = ({
+                    let mut state = queue.lane(isolated).lock();
+                    match state.jobs.pop_front() {
+                        Some(job) => Some(job),
+                        None => {
+                            state.active_workers = state.active_workers.saturating_sub(1);
+                            guard.disarmed = true;
+                            None
+                        }
+                    }
+                }) else {
+                    return;
+                };
+                job();
+            }
+        }));
+    }
+
+    #[cfg(test)]
+    async fn run<T: Send + 'static>(
+        self: &Arc<Self>,
+        operation: impl FnOnce() -> io::Result<T> + Send + 'static,
+    ) -> io::Result<T> {
+        self.run_cancellable(move |_| operation()).await
+    }
+
+    async fn run_cancellable<T: Send + 'static>(
+        self: &Arc<Self>,
+        operation: impl FnOnce(&dyn Fn() -> bool) -> io::Result<T> + Send + 'static,
+    ) -> io::Result<T> {
+        let (tx, rx) = oneshot::channel();
+        self.enqueue(Box::new(move || {
+            let result = operation(&|| tx.is_closed());
+            let _ = tx.send(result);
+        }));
+        rx.await
+            .map_err(|err| io::Error::other(format!("blocking namespace operation failed: {err}")))?
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+thread_local! {
+    static CURRENT_DISK_BLOCKING_QUEUE: std::cell::RefCell<Option<(Arc<DiskBlockingQueue>, bool)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) struct BlockingTestHookGuard {
+    queue: Option<(Arc<DiskBlockingQueue>, bool)>,
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl Drop for BlockingTestHookGuard {
+    fn drop(&mut self) {
+        if let Some((queue, isolated)) = self.queue.take() {
+            let mut state = queue.lane(isolated).lock();
+            state.paused_workers = state.paused_workers.saturating_sub(1);
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) fn enter_blocking_test_hook() -> BlockingTestHookGuard {
+    let queue = CURRENT_DISK_BLOCKING_QUEUE.with(|slot| slot.borrow().clone());
+    if let Some((ref queue, isolated)) = queue {
+        let should_spawn = {
+            let mut state = queue.lane(isolated).lock();
+            state.paused_workers = state.paused_workers.saturating_add(1);
+            if !state.jobs.is_empty() && state.active_workers < queue.effective_max_workers(&state) {
+                state.active_workers += 1;
+                true
+            } else {
+                false
+            }
+        };
+        if should_spawn {
+            DiskBlockingQueue::spawn_worker(Arc::clone(queue), isolated);
+        }
+    }
+    BlockingTestHookGuard { queue }
+}
+
+static DISK_BLOCKING_QUEUES: LazyLock<Mutex<HashMap<PathBuf, Weak<DiskBlockingQueue>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static FALLBACK_BLOCKING_QUEUES: LazyLock<[Arc<DiskBlockingQueue>; FALLBACK_NAMESPACE_QUEUE_SHARDS]> =
+    LazyLock::new(|| std::array::from_fn(|_| DiskBlockingQueue::new()));
+
+pub(crate) fn register_disk_blocking_queue(root: &Path, io_root: &Path) -> Arc<DiskBlockingQueue> {
+    let mut queues = DISK_BLOCKING_QUEUES.lock();
+    queues.retain(|_, q| q.strong_count() > 0);
+    let queue = queues.get(root).and_then(Weak::upgrade).unwrap_or_else(|| {
+        let queue = DiskBlockingQueue::new();
+        queues.insert(root.to_path_buf(), Arc::downgrade(&queue));
+        queue
+    });
+    if io_root != root {
+        queues.insert(io_root.to_path_buf(), Arc::downgrade(&queue));
+    }
+    queue
+}
+
+fn disk_blocking_queue_for_root(root: &Path) -> Arc<DiskBlockingQueue> {
+    register_disk_blocking_queue(root, root)
+}
+
+fn disk_blocking_queue_for_path(path: &Path) -> Arc<DiskBlockingQueue> {
+    {
+        let queues = DISK_BLOCKING_QUEUES.lock();
+        for (root, weak) in queues.iter() {
+            if path.starts_with(root)
+                && let Some(queue) = weak.upgrade()
+            {
+                return queue;
+            }
+        }
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    let idx = usize::try_from(hasher.finish() % (FALLBACK_NAMESPACE_QUEUE_SHARDS as u64)).unwrap_or(0);
+    Arc::clone(&FALLBACK_BLOCKING_QUEUES[idx])
+}
+
 /// Serialize a bucket's local metadata commits with physical bucket removal.
 ///
 /// The key includes the canonical disk root, so independently reconnected
@@ -1601,6 +1856,7 @@ pub(crate) struct NamespaceMutationLease {
     external_guard: Mutex<Option<Arc<dyn Send + Sync>>>,
     // Independent of the quota claim; both survive cancellation of the waiter.
     _namespace_owner: Option<Arc<dyn Send + Sync>>,
+    blocking_queue: Arc<DiskBlockingQueue>,
 }
 
 impl NamespaceMutationLease {
@@ -1617,12 +1873,14 @@ pub(in crate::disk) async fn acquire_namespace_mutation_lease_with_owner(
     path: &Path,
     namespace_owner: Option<Arc<dyn Send + Sync>>,
 ) -> Arc<NamespaceMutationLease> {
+    let blocking_queue = disk_blocking_queue_for_path(path);
     Arc::new(NamespaceMutationLease {
         _namespace_guard: disk_namespace_mutation_lock(path).lock_owned().await,
         _staging_guard: None,
         _volume_guard: None,
         external_guard: Mutex::new(None),
         _namespace_owner: namespace_owner,
+        blocking_queue,
     })
 }
 
@@ -1658,12 +1916,14 @@ pub(crate) async fn acquire_rename_data_mutation_lease_with_owner(
         _ => (destination_lock.lock_owned().await, None),
     };
     let volume_guard = disk_volume_mutation_lock(root, volume).read_owned().await;
+    let blocking_queue = disk_blocking_queue_for_root(root);
     Arc::new(NamespaceMutationLease {
         _namespace_guard: namespace_guard,
         _staging_guard: staging_guard,
         _volume_guard: Some(volume_guard),
         external_guard: Mutex::new(None),
         _namespace_owner: namespace_owner,
+        blocking_queue,
     })
 }
 
@@ -1809,6 +2069,7 @@ pub(crate) mod file_sync_probe {
         ACTIVE_CHANGED.notify_waiters();
         let fail = attempt == FAIL_ON_ATTEMPT.load(Ordering::SeqCst);
         if !fail {
+            let _pause = super::enter_blocking_test_hook();
             let guard = BLOCK_MUTEX.lock().expect("file sync probe blocker poisoned");
             drop(
                 BLOCK_CONDVAR
@@ -2530,35 +2791,61 @@ pub(crate) fn read_destination_file_with_commit_guard(
     }
 }
 
-#[cfg(windows)]
-#[tracing::instrument(level = "debug", skip_all)]
-pub(crate) async fn rename_all_with_prepared_source(
-    prepared_source: PreparedRenameSource,
-    src_file_path: impl AsRef<Path>,
-    dst_file_path: impl AsRef<Path>,
-    base_dir: impl AsRef<Path>,
-    _publication_root: &PublicationRoot,
+fn rename_prepared_source_std(
+    prepared_source: &PreparedRenameSource,
+    src_file_path: &Path,
+    dst_file_path: &Path,
+    base_dir: &Path,
+    publication_root: &PublicationRoot,
     commit_guard: &RenameCommitGuard,
-    lease: Arc<NamespaceMutationLease>,
-) -> Result<()> {
-    let src_file_path = src_file_path.as_ref().to_path_buf();
-    let dst_file_path = dst_file_path.as_ref().to_path_buf();
-    let base_dir = base_dir.as_ref().to_path_buf();
-    let commit_guard = commit_guard.clone();
-    let operation = {
-        let src_file_path = src_file_path.clone();
-        let dst_file_path = dst_file_path.clone();
-        move || rename_prepared_source_with_commit_guard_std(&prepared_source, &src_file_path, &dst_file_path, &commit_guard)
+) -> io::Result<()> {
+    let result = {
+        #[cfg(windows)]
+        {
+            let _ = publication_root;
+            rename_prepared_source_with_commit_guard_std(prepared_source, src_file_path, dst_file_path, commit_guard)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = publication_root;
+            #[cfg(any(test, feature = "test-util"))]
+            prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::PreparedRename, dst_file_path);
+            commit_guard
+                .directories
+                .rename(src_file_path, dst_file_path, Some(prepared_source))
+        }
+        #[cfg(all(not(windows), not(target_os = "linux")))]
+        {
+            let _ = commit_guard;
+            validate_prepared_rename_source(prepared_source, src_file_path)
+                .and_then(|()| prepare_rename_with_retry(src_file_path, dst_file_path, base_dir, publication_root))
+                .and_then(|preparation| {
+                    #[cfg(any(test, feature = "test-util"))]
+                    prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::PreparedRename, dst_file_path);
+                    rename_prepared(src_file_path, dst_file_path, &preparation)
+                })
+        }
     };
-    let result = run_blocking_namespace_operation(lease, operation).await;
     if let Err(err) = &result {
-        warn_reliable_rename_failure(&src_file_path, &dst_file_path, &base_dir, err);
+        warn_reliable_rename_failure(src_file_path, dst_file_path, base_dir, err);
     }
-    result.map_err(to_file_error)?;
+    result
+}
+
+pub(crate) fn rename_prepared_source_on_thread(
+    prepared_source: PreparedRenameSource,
+    src_file_path: &Path,
+    dst_file_path: &Path,
+    base_dir: &Path,
+    publication_root: &PublicationRoot,
+    commit_guard: &RenameCommitGuard,
+) -> Result<()> {
+    rename_prepared_source_std(&prepared_source, src_file_path, dst_file_path, base_dir, publication_root, commit_guard)
+        .map_err(to_file_error)?;
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg_attr(windows, tracing::instrument(level = "debug", skip_all))]
 pub(crate) async fn rename_all_with_prepared_source(
     prepared_source: PreparedRenameSource,
     src_file_path: impl AsRef<Path>,
@@ -2571,41 +2858,20 @@ pub(crate) async fn rename_all_with_prepared_source(
     let src_file_path = src_file_path.as_ref().to_path_buf();
     let dst_file_path = dst_file_path.as_ref().to_path_buf();
     let base_dir = base_dir.as_ref().to_path_buf();
-    #[cfg(not(target_os = "linux"))]
     let publication_root = publication_root.clone();
-    #[cfg(target_os = "linux")]
-    let _ = publication_root;
     let commit_guard = commit_guard.clone();
-    let operation = {
-        let src_file_path = src_file_path.clone();
-        let dst_file_path = dst_file_path.clone();
-        #[cfg(not(target_os = "linux"))]
-        let base_dir = base_dir.clone();
-        move || {
-            #[cfg(target_os = "linux")]
-            {
-                #[cfg(any(test, feature = "test-util"))]
-                prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::PreparedRename, &dst_file_path);
-                commit_guard
-                    .directories
-                    .rename(&src_file_path, &dst_file_path, Some(&prepared_source))
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = commit_guard;
-                validate_prepared_rename_source(&prepared_source, &src_file_path)?;
-                let preparation = prepare_rename_with_retry(&src_file_path, &dst_file_path, &base_dir, &publication_root)?;
-                #[cfg(any(test, feature = "test-util"))]
-                prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::PreparedRename, &dst_file_path);
-                rename_prepared(&src_file_path, &dst_file_path, &preparation)
-            }
-        }
-    };
-    let result = run_blocking_namespace_operation(lease, operation).await;
-    if let Err(err) = &result {
-        warn_reliable_rename_failure(&src_file_path, &dst_file_path, &base_dir, err);
-    }
-    result.map_err(to_file_error)?;
+    run_blocking_namespace_operation(lease, move || {
+        rename_prepared_source_std(
+            &prepared_source,
+            &src_file_path,
+            &dst_file_path,
+            &base_dir,
+            &publication_root,
+            &commit_guard,
+        )
+    })
+    .await
+    .map_err(to_file_error)?;
     Ok(())
 }
 
@@ -2878,12 +3144,20 @@ pub(crate) async fn run_blocking_namespace_operation<T: Send + 'static>(
     lease: Arc<NamespaceMutationLease>,
     operation: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
-    tokio::task::spawn_blocking(move || {
-        let _lease = lease;
-        operation()
-    })
-    .await
-    .map_err(|err| io::Error::other(format!("blocking namespace operation failed: {err}")))?
+    run_cancellable_blocking_namespace_operation(lease, move |_| operation()).await
+}
+
+pub(crate) async fn run_cancellable_blocking_namespace_operation<T: Send + 'static>(
+    lease: Arc<NamespaceMutationLease>,
+    operation: impl FnOnce(&dyn Fn() -> bool) -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    let queue = Arc::clone(&lease.blocking_queue);
+    queue
+        .run_cancellable(move |is_cancelled| {
+            let _lease = lease;
+            operation(is_cancelled)
+        })
+        .await
 }
 
 /// Admit one strict inline commit under the disk sync limit. The caller already
@@ -2920,11 +3194,29 @@ pub(crate) async fn run_blocking_namespace_file_sync_operation<T: Send + 'static
     run_blocking_namespace_file_sync_operation_with_global(lease, admission, &FILE_SYNC_PERMITS, operation).await
 }
 
+pub(crate) async fn run_cancellable_blocking_namespace_file_sync_operation<T: Send + 'static>(
+    lease: Arc<NamespaceMutationLease>,
+    admission: &FileSyncAdmission,
+    operation: impl FnOnce(&dyn Fn() -> bool) -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    run_cancellable_blocking_namespace_file_sync_operation_with_global(lease, admission, &FILE_SYNC_PERMITS, operation).await
+}
+
 async fn run_blocking_namespace_file_sync_operation_with_global<T: Send + 'static>(
     lease: Arc<NamespaceMutationLease>,
     admission: &FileSyncAdmission,
     global_permits: &Semaphore,
     operation: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    run_cancellable_blocking_namespace_file_sync_operation_with_global(lease, admission, global_permits, move |_| operation())
+        .await
+}
+
+async fn run_cancellable_blocking_namespace_file_sync_operation_with_global<T: Send + 'static>(
+    lease: Arc<NamespaceMutationLease>,
+    admission: &FileSyncAdmission,
+    global_permits: &Semaphore,
+    operation: impl FnOnce(&dyn Fn() -> bool) -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
     let wait_started = rustfs_io_metrics::put_stage_timer();
     let global_permit = global_permits
@@ -2936,14 +3228,18 @@ async fn run_blocking_namespace_file_sync_operation_with_global<T: Send + 'stati
         wait_started,
     );
     let disk_permit = admission.disk_permit.clone();
-    let result = fsync_spawn_blocking(move || {
+    let (tx, rx) = oneshot::channel();
+    drop(fsync_spawn_blocking(move || {
         let _lease = lease;
         let _disk_permit = disk_permit;
-        operation()
-    })
-    .await;
+        let result = operation(&|| tx.is_closed());
+        let _ = tx.send(result);
+    }));
+    let result = rx
+        .await
+        .map_err(|err| io::Error::other(format!("blocking namespace file sync operation failed: {err}")))?;
     drop(global_permit);
-    result.map_err(|err| io::Error::other(format!("blocking namespace file sync operation failed: {err}")))?
+    result
 }
 
 pub(crate) async fn fsync_dir_with_namespace_file_sync_limit(
@@ -2954,12 +3250,7 @@ pub(crate) async fn fsync_dir_with_namespace_file_sync_limit(
     #[cfg(unix)]
     {
         let dir = dir.as_ref().to_path_buf();
-        run_blocking_namespace_file_sync_operation(lease, admission, move || {
-            #[cfg(test)]
-            fsync_dir_recorder::record_limited(&dir);
-            fsync_dir_std(dir)
-        })
-        .await
+        run_blocking_namespace_file_sync_operation(lease, admission, move || fsync_dir_limited_std(&dir)).await
     }
 
     #[cfg(not(unix))]
@@ -8501,6 +8792,78 @@ mod tests {
 
         let err = sync_dir_files(&missing).await.expect_err("missing dir must fail");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disk_blocking_queue_bounds_concurrency_and_recovers_from_panic() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let queue = DiskBlockingQueue::new();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(MAX_NAMESPACE_WORKERS_PER_DISK + 1));
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let q = Arc::clone(&queue);
+            let active = Arc::clone(&active);
+            let max_seen = Arc::clone(&max_seen);
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                q.run(move || {
+                    let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_seen.fetch_max(cur, Ordering::SeqCst);
+                    if i < MAX_NAMESPACE_WORKERS_PER_DISK {
+                        barrier.wait();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    if i == 0 {
+                        panic!("simulated worker panic");
+                    }
+                    Ok(i)
+                })
+                .await
+            }));
+        }
+
+        tokio::task::spawn_blocking(move || barrier.wait())
+            .await
+            .expect("barrier join");
+        for (i, handle) in handles.into_iter().enumerate() {
+            let res = handle.await.expect("task join");
+            if i == 0 {
+                assert!(res.is_err(), "panicking worker must surface an error to its caller");
+            } else {
+                assert_eq!(res.expect("queued job must succeed after worker panic"), i);
+            }
+        }
+        assert!(
+            max_seen.load(Ordering::SeqCst) <= MAX_NAMESPACE_WORKERS_PER_DISK,
+            "active workers exceeded MAX_NAMESPACE_WORKERS_PER_DISK"
+        );
+
+        let isolated_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .thread_name("isolated-queue-test")
+            .on_thread_start(use_current_runtime_for_fsync)
+            .enable_all()
+            .build()
+            .expect("isolated runtime");
+        let q_iso = Arc::clone(&queue);
+        let iso_res = isolated_rt
+            .spawn(async move {
+                q_iso
+                    .run(|| {
+                        assert_eq!(std::thread::current().name(), Some("isolated-queue-test"));
+                        Ok(())
+                    })
+                    .await
+            })
+            .await;
+        isolated_rt.shutdown_background();
+        iso_res.expect("isolated task join").expect("isolated queue run");
     }
 }
 

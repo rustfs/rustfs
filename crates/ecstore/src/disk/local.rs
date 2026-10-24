@@ -3003,12 +3003,27 @@ async fn remove_dst_base_before_commit(
 }
 
 #[cfg(test)]
+fn has_inline_commit_test_failpoints(dst_path: &str) -> bool {
+    RENAME_DATA_REMOVE_DST_BASE_BEFORE_COMMIT
+        .lock()
+        .expect("test failpoint lock should not be poisoned")
+        .as_ref()
+        .is_some_and(|(target_path, _)| target_path == dst_path)
+        || RENAME_DATA_REMOVE_STAGED_META_BEFORE_COMMIT
+            .lock()
+            .expect("test failpoint lock should not be poisoned")
+            .as_deref()
+            == Some(dst_path)
+}
+
+#[cfg(test)]
 fn run_inline_preparation_before_backup(dst_path: &str) {
     let hook = INLINE_PREPARATION_BEFORE_BACKUP
         .lock()
         .expect("test preparation hook lock should not be poisoned")
         .remove(dst_path);
     if let Some(hook) = hook {
+        let _pause = os::enter_blocking_test_hook();
         hook();
     }
 }
@@ -3053,6 +3068,7 @@ fn run_destination_commit_directory_preparation(path: &Path) {
         .expect("test destination preparation hook lock should not be poisoned")
         .remove(path);
     if let Some(hook) = hook {
+        let _pause = os::enter_blocking_test_hook();
         hook();
     }
 }
@@ -3122,6 +3138,11 @@ async fn remove_dst_base_before_commit(
     _mutation_lease: Arc<os::NamespaceMutationLease>,
 ) -> Result<os::RenameCommitGuard> {
     Ok(guard)
+}
+
+#[cfg(not(test))]
+fn has_inline_commit_test_failpoints(_dst_path: &str) -> bool {
+    false
 }
 
 #[cfg(not(test))]
@@ -5759,6 +5780,7 @@ pub struct LocalDisk {
     exit_signal: Option<tokio::sync::broadcast::Sender<()>>,
     io_backend: Arc<dyn LocalIoBackend>,
     file_sync_permits: Arc<Semaphore>,
+    _blocking_queue: Arc<os::DiskBlockingQueue>,
     metadata_read_queue: Arc<MetadataReadQueue>,
     snapshot_leases: Arc<ParkingLotMutex<SnapshotLeaseRegistry>>,
 }
@@ -6246,6 +6268,7 @@ impl LocalDisk {
             exit_signal: None,
             io_backend: build_local_io_backend(io_root.clone()).await,
             file_sync_permits: os::disk_file_sync_limiter(&root),
+            _blocking_queue: os::register_disk_blocking_queue(&root, &io_root),
             metadata_read_queue,
             snapshot_leases: Arc::new(ParkingLotMutex::new(SnapshotLeaseRegistry::default())),
         };
@@ -6723,7 +6746,11 @@ impl LocalDisk {
     }
 
     fn io_get_object_path(&self, bucket: &str, key: &str) -> Result<PathBuf> {
-        self.local_disk_object_path(self.io_root(), bucket, key)
+        Ok(self.io_get_bucket_and_object_path(bucket, key)?.1)
+    }
+
+    fn io_get_bucket_and_object_path(&self, bucket: &str, key: &str) -> Result<(PathBuf, PathBuf)> {
+        self.local_disk_bucket_and_object_path(self.io_root(), bucket, key)
     }
 
     /// Only for operations that open through PublicationRoot or a commit guard:
@@ -6763,7 +6790,47 @@ impl LocalDisk {
         self.local_disk_bucket_path(self.io_root(), bucket)
     }
 
-    fn local_disk_object_path(&self, root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    fn stat_volume_linux(&self, volume: &str) -> Result<Option<Metadata>> {
+        use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
+        use rustix::io::Errno;
+
+        let bucket_path = normalize_path_components(build_local_disk_bucket_path(self.io_root(), volume));
+        let Ok(relative) = bucket_path.strip_prefix(self.io_root()) else {
+            return Err(DiskError::InvalidPath);
+        };
+        if relative.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        match openat2(
+            &self.mount_lease,
+            relative,
+            OFlags::PATH | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+        ) {
+            Ok(fd) => std::fs::File::from(fd)
+                .metadata()
+                .map(Some)
+                .map_err(|e| to_volume_error(e).into()),
+            Err(Errno::NOSYS) => Ok(None),
+            Err(Errno::LOOP | Errno::XDEV) => Err(DiskError::InvalidPath),
+            Err(Errno::NOENT) => {
+                if let Some(parent) = relative.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+                    match validate_existing_local_disk_prefix_at(&self.mount_lease, parent) {
+                        Ok(()) => {}
+                        Err(LocalDiskPathValidationAtError::Unsupported) => return Ok(None),
+                        Err(LocalDiskPathValidationAtError::InvalidPath) => return Err(DiskError::InvalidPath),
+                        Err(LocalDiskPathValidationAtError::Io(err)) => return Err(to_file_error(err).into()),
+                    }
+                }
+                Err(DiskError::VolumeNotFound)
+            }
+            Err(err) => Err(to_volume_error(std::io::Error::from(err)).into()),
+        }
+    }
+
+    fn local_disk_bucket_and_object_path(&self, root: &Path, bucket: &str, key: &str) -> Result<(PathBuf, PathBuf)> {
         let (bucket_path, path) = build_local_disk_object_path(root, bucket, key);
         #[cfg(target_os = "linux")]
         {
@@ -6773,7 +6840,7 @@ impl LocalDisk {
         {
             check_local_disk_valid_object_path(root, &bucket_path, &path)?;
         }
-        Ok(path)
+        Ok((bucket_path, path))
     }
 
     fn local_disk_bucket_path(&self, root: &Path, bucket: &str) -> Result<PathBuf> {
@@ -7581,13 +7648,13 @@ impl LocalDisk {
         immediate_purge: bool,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
-        // if recursive {
-        //     remove_all_std(delete_path).map_err(to_volume_error)?;
-        // } else {
-        //     remove_std(delete_path).map_err(to_file_error)?;
-        // }
-
-        // return Ok(());
+        #[cfg(unix)]
+        if !immediate_purge
+            && !delete_path.to_string_lossy().ends_with(SLASH_SEPARATOR)
+            && os::rename_source_is_missing(delete_path, &self.publication_root)
+        {
+            return Ok(());
+        }
 
         // TODO(backlog): make disk space checks and trash cleanup event-driven instead of poll-based
 
@@ -8099,7 +8166,10 @@ impl LocalDisk {
                 }
             }
 
-            if let Some(dir_path) = delete_path.parent() {
+            if let Some(dir_path) = delete_path
+                .parent()
+                .filter(|parent| *parent != base_path.as_path() && parent.starts_with(base_path))
+            {
                 self.delete_file_with_namespace_owner(
                     base_path,
                     &PathBuf::from(dir_path),
@@ -12351,8 +12421,19 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo> {
-        let volume_dir = self.io_get_bucket_path(volume)?;
-        let meta = lstat(&volume_dir).await.map_err(to_volume_error)?;
+        #[cfg(target_os = "linux")]
+        let meta = match self.stat_volume_linux(volume)? {
+            Some(meta) => meta,
+            None => {
+                let volume_dir = self.io_get_bucket_path(volume)?;
+                lstat(&volume_dir).await.map_err(to_volume_error)?
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let meta = {
+            let volume_dir = self.io_get_bucket_path(volume)?;
+            lstat(&volume_dir).await.map_err(to_volume_error)?
+        };
 
         let modtime = match meta.modified() {
             Ok(md) => Some(OffsetDateTime::from(md)),
@@ -19374,6 +19455,24 @@ mod test {
             !dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE).exists(),
             "failed fresh inline commit must remove published metadata"
         );
+
+        #[cfg(unix)]
+        {
+            let _mode = durability_mode_override::set(DurabilityMode::Strict);
+            let _group_commit = os::set_dst_dir_fsync_group_commit_for_test(false);
+            let dst_parent = disk.get_object_path(bucket, object).expect("dst object path should resolve");
+            os::fsync_dir_recorder::set_failure(&dst_parent, ErrorKind::Other);
+            let fi = test_file_info(object, Uuid::new_v4(), None, Some(Bytes::from_static(b"inline-fsync-fail")));
+            let err = disk
+                .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, fi, bucket, object)
+                .await
+                .expect_err("dst-parent fsync failure must reject fresh inline commit");
+            assert!(matches!(err, DiskError::Io(ref io_err) if io_err.kind() == ErrorKind::Other));
+            assert!(
+                !dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE).exists(),
+                "dst-parent fsync failure must roll back published metadata"
+            );
+        }
     }
 
     #[tokio::test]
@@ -26165,6 +26264,13 @@ mod test {
             .expect("non-force delete should remove empty remnants through the held mount lease");
 
         assert!(!root.path().join(bucket).exists(), "empty bucket should be removed");
+
+        let outside = tempfile::tempdir().expect("outside dir");
+        std::os::unix::fs::symlink(outside.path(), root.path().join("symlink-bucket")).expect("symlink bucket");
+        assert!(
+            matches!(disk.stat_volume("symlink-bucket").await, Err(DiskError::InvalidPath)),
+            "stat_volume must reject symlinked volume directories"
+        );
     }
 
     #[tokio::test]

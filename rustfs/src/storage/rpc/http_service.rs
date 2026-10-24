@@ -690,12 +690,24 @@ async fn handle_read_file(req: Request<Incoming>) -> Response<Body> {
         INTERNODE_OPERATION_READ_FILE_STREAM,
         INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
     );
-    let stream = read_file_body_stream(file, query.length, INTERNODE_OPERATION_READ_FILE_STREAM);
+    read_file_response(file, query.length)
+}
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .body(Body::from(StreamingBlob::wrap(stream)))
-        .expect("failed to build read file stream response")
+fn read_file_response<R>(reader: R, length: usize) -> Response<Body>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + Sync + 'static,
+{
+    let stream = read_file_body_stream(reader, length, INTERNODE_OPERATION_READ_FILE_STREAM);
+    let mut response = Response::new(Body::from(StreamingBlob::wrap(stream)));
+    if length != 0 {
+        // Bounded shard readers stop at the requested byte count. Exact framing
+        // lets HTTP/1.1 reuse the connection without waiting for a chunked EOF.
+        // Zero means read to EOF, not an empty response.
+        response
+            .headers_mut()
+            .insert(http::header::CONTENT_LENGTH, HeaderValue::from(length));
+    }
+    response
 }
 
 fn read_file_body_stream<R>(
@@ -3263,6 +3275,33 @@ mod tests {
         }
 
         assert_eq!(out, b"hello");
+    }
+
+    #[tokio::test]
+    async fn read_file_response_frames_bounded_reads_and_preserves_unbounded_reads() {
+        for (length, expected_header, expected_body) in
+            [(5, Some("5"), b"hello".as_slice()), (0, None, b"hello world".as_slice())]
+        {
+            let response = super::read_file_response(std::io::Cursor::new(b"hello world".to_vec()), length);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(http::header::CONTENT_LENGTH)
+                    .map(|value| value.to_str().expect("ASCII length")),
+                expected_header
+            );
+            let body = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .expect("read response body")
+                .to_bytes();
+            assert_eq!(body, expected_body);
+        }
+    }
+
+    #[test]
+    fn read_file_response_does_not_hide_a_short_reader_by_shrinking_the_length() {
+        let response = super::read_file_response(std::io::Cursor::new(b"short".to_vec()), 10);
+        assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "10");
     }
 
     #[test]

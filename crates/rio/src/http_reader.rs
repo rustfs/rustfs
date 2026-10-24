@@ -404,7 +404,21 @@ enum InternodeHttpProxyMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InternodeHttpProtocol {
+    Http1,
+    Auto,
+}
+
+fn parse_internode_http_protocol(value: Option<&str>) -> InternodeHttpProtocol {
+    match value {
+        Some(value) if value.trim().eq_ignore_ascii_case("auto") => InternodeHttpProtocol::Auto,
+        _ => InternodeHttpProtocol::Http1,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct InternodeHttpClientTuning {
+    protocol: InternodeHttpProtocol,
     profile: InternodeHttpTuningProfile,
     pool_max_idle_per_host: Option<usize>,
     pool_idle_timeout_secs: Option<u64>,
@@ -430,18 +444,21 @@ impl InternodeHttpClientTuning {
     fn from_env() -> Self {
         let profile =
             parse_internode_http_tuning_profile(get_env_opt_str(rustfs_config::ENV_INTERNODE_HTTP_TUNING_PROFILE).as_deref());
-        Self::from_values(
-            profile,
-            get_env_opt_usize(rustfs_config::ENV_INTERNODE_HTTP_POOL_MAX_IDLE_PER_HOST),
-            get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP_POOL_IDLE_TIMEOUT_SECS),
-            get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP2_INITIAL_STREAM_WINDOW_SIZE),
-            get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE),
-            get_env_bool(
-                rustfs_config::ENV_INTERNODE_HTTP2_ADAPTIVE_WINDOW,
-                profile.default_http2_adaptive_window(),
-            ),
-            get_env_opt_str(rustfs_config::ENV_INTERNODE_HTTP_PROXY).as_deref(),
-        )
+        Self {
+            protocol: parse_internode_http_protocol(get_env_opt_str(rustfs_config::ENV_INTERNODE_HTTP_PROTOCOL).as_deref()),
+            ..Self::from_values(
+                profile,
+                get_env_opt_usize(rustfs_config::ENV_INTERNODE_HTTP_POOL_MAX_IDLE_PER_HOST),
+                get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP_POOL_IDLE_TIMEOUT_SECS),
+                get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP2_INITIAL_STREAM_WINDOW_SIZE),
+                get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE),
+                get_env_bool(
+                    rustfs_config::ENV_INTERNODE_HTTP2_ADAPTIVE_WINDOW,
+                    profile.default_http2_adaptive_window(),
+                ),
+                get_env_opt_str(rustfs_config::ENV_INTERNODE_HTTP_PROXY).as_deref(),
+            )
+        }
     }
 
     fn from_values(
@@ -458,6 +475,7 @@ impl InternodeHttpClientTuning {
         let h2_tuning_explicit =
             stream_window_size.is_some() || connection_window_size.is_some() || profile != InternodeHttpTuningProfile::Legacy;
         Self {
+            protocol: InternodeHttpProtocol::Http1,
             profile,
             pool_max_idle_per_host: pool_max_idle_per_host.or_else(|| profile.default_pool_max_idle_per_host()),
             pool_idle_timeout_secs: pool_idle_timeout_secs.or_else(|| profile.default_pool_idle_timeout_secs()),
@@ -544,12 +562,17 @@ fn clamp_http2_window(value: Option<u64>) -> Option<u32> {
 ///
 /// IMPORTANT (backlog#805-C3): the HTTP/2 window settings only
 /// take effect when the internode connection actually negotiates HTTP/2, which
-/// happens via TLS-ALPN. Over plaintext internode transport the connection is
-/// HTTP/1.1 and every `http2_*` knob here is silently inert. Enable internode
-/// TLS to use them.
+/// requires both the `auto` protocol policy and TLS-ALPN. With the default
+/// `http1` policy or plaintext transport, the HTTP/2 window settings are inert.
 /// `should_warn_h2_inert` emits a one-time warning when explicitly-configured
 /// h2 tuning is observed to be inert on a live connection.
 fn apply_http_client_tuning(mut builder: reqwest::ClientBuilder, tuning: InternodeHttpClientTuning) -> reqwest::ClientBuilder {
+    // A paused shard response must not consume receive credit needed by another
+    // shard on the same peer. HTTP/1.1 isolates active bodies while retaining
+    // idle connection reuse and TLS session support.
+    if tuning.protocol == InternodeHttpProtocol::Http1 {
+        builder = builder.http1_only();
+    }
     if let Some(pool_max_idle_per_host) = tuning.pool_max_idle_per_host {
         builder = builder.pool_max_idle_per_host(pool_max_idle_per_host);
     }
@@ -1635,20 +1658,30 @@ static H2_INERT_WARNED: AtomicBool = AtomicBool::new(false);
 /// explicitly configured h2 tuning, and we have not warned before. HTTP/2 for
 /// internode is negotiated via TLS-ALPN; over plaintext the connection is
 /// HTTP/1.1 and the h2 window knobs are silently ignored.
-fn should_warn_h2_inert(negotiated_is_http2: bool, h2_tuning_explicit: bool, already_warned: bool) -> bool {
-    !negotiated_is_http2 && h2_tuning_explicit && !already_warned
+fn should_warn_h2_inert(
+    protocol: InternodeHttpProtocol,
+    negotiated_is_http2: bool,
+    h2_tuning_explicit: bool,
+    already_warned: bool,
+) -> bool {
+    protocol == InternodeHttpProtocol::Auto && !negotiated_is_http2 && h2_tuning_explicit && !already_warned
 }
 
 /// Emit a single process-lifetime warning if explicitly-configured HTTP/2
-/// tuning is inert because the observed internode connection negotiated a
-/// non-HTTP/2 protocol (i.e. HTTP/1.1 over plaintext). See backlog#805-C3.
+/// tuning is inert under the `auto` policy because the observed internode
+/// connection negotiated HTTP/1.1. The default `http1` policy deliberately
+/// disables HTTP/2, so it does not need a warning. See backlog#805-C3.
 fn maybe_warn_h2_inert(negotiated_version: Version) {
     let negotiated_is_http2 = negotiated_version == Version::HTTP_2;
     let tuning = internode_http_client_tuning();
-    if should_warn_h2_inert(negotiated_is_http2, tuning.h2_tuning_explicit, H2_INERT_WARNED.load(Ordering::Relaxed))
-        && H2_INERT_WARNED
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
+    if should_warn_h2_inert(
+        tuning.protocol,
+        negotiated_is_http2,
+        tuning.h2_tuning_explicit,
+        H2_INERT_WARNED.load(Ordering::Relaxed),
+    ) && H2_INERT_WARNED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
     {
         warn!(
             "internode connection negotiated HTTP/1.1 while HTTP/2 tuning is configured; the HTTP/2 window settings apply only over internode TLS (h2 is negotiated via ALPN) — enable internode TLS to use them."
@@ -3567,17 +3600,18 @@ mod tests {
 
     #[test]
     fn should_warn_h2_inert_truth_table() {
+        assert!(!should_warn_h2_inert(InternodeHttpProtocol::Http1, false, true, false));
         // HTTP/1.1 + explicit tuning + not yet warned -> warn.
-        assert!(should_warn_h2_inert(false, true, false));
+        assert!(should_warn_h2_inert(InternodeHttpProtocol::Auto, false, true, false));
         // Negotiated HTTP/2 -> tuning is actually active, never warn.
-        assert!(!should_warn_h2_inert(true, true, false));
+        assert!(!should_warn_h2_inert(InternodeHttpProtocol::Auto, true, true, false));
         // No explicit tuning -> nothing to warn about.
-        assert!(!should_warn_h2_inert(false, false, false));
+        assert!(!should_warn_h2_inert(InternodeHttpProtocol::Auto, false, false, false));
         // Already warned -> never warn again (Once semantics).
-        assert!(!should_warn_h2_inert(false, true, true));
+        assert!(!should_warn_h2_inert(InternodeHttpProtocol::Auto, false, true, true));
         // HTTP/2 and already warned combinations stay false too.
-        assert!(!should_warn_h2_inert(true, false, false));
-        assert!(!should_warn_h2_inert(true, true, true));
+        assert!(!should_warn_h2_inert(InternodeHttpProtocol::Auto, true, false, false));
+        assert!(!should_warn_h2_inert(InternodeHttpProtocol::Auto, true, true, true));
     }
 
     #[test]
@@ -3617,3 +3651,6 @@ mod tests {
         assert!(balanced.h2_tuning_explicit);
     }
 }
+
+#[cfg(test)]
+mod protocol_tests;
