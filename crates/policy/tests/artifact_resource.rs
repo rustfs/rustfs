@@ -140,8 +140,8 @@ fn artifact_resource_single_object_does_not_authorize_attempt_seal() {
 fn artifact_bucket_create_resource_requires_exact_bucket_authority() {
     let action = "admin:CreatePluginArtifactBucket";
     let scoped = json!({"Effect":"Allow","Action":action,"Resource":"arn:aws:s3:::artifacts"});
-    assert!(allowed(json!([scoped.clone()]), action, "artifacts", ""));
-    assert!(!allowed(json!([scoped.clone()]), action, "another", ""), "ARTIFACT_CREATE_RESOURCE");
+    assert!(allowed(json!([scoped]), action, "artifacts", ""));
+    assert!(!allowed(json!([scoped]), action, "another", ""), "ARTIFACT_CREATE_RESOURCE");
     assert!(!allowed(
         json!([{"Effect":"Allow","Action":action,"Resource":"arn:aws:s3:::artifacts/*"}]),
         action,
@@ -149,12 +149,7 @@ fn artifact_bucket_create_resource_requires_exact_bucket_authority() {
         ""
     ));
     assert!(!allowed(json!([{"Effect":"Allow","Action":action}]), action, "artifacts", ""));
-    assert!(!allowed(
-        json!([scoped.clone(), {"Effect":"Deny","Action":"admin:*"}]),
-        action,
-        "artifacts",
-        ""
-    ));
+    assert!(!allowed(json!([scoped, {"Effect":"Deny","Action":"admin:*"}]), action, "artifacts", ""));
     assert!(!allowed(
         json!([scoped, {"Effect":"Deny","Action":action,"Resource":"arn:aws:s3:::artifacts"}]),
         action,
@@ -170,8 +165,8 @@ fn artifact_bucket_create_resource_requires_exact_bucket_authority() {
 fn artifact_bucket_inspect_resource_requires_independent_bucket_authority() {
     let action = "admin:GetPluginArtifactBucket";
     let scoped = json!({"Effect":"Allow","Action":action,"Resource":"arn:aws:s3:::artifacts"});
-    assert!(allowed(json!([scoped.clone()]), action, "artifacts", ""));
-    assert!(!allowed(json!([scoped.clone()]), action, "another", ""), "ARTIFACT_INSPECT_RESOURCE");
+    assert!(allowed(json!([scoped]), action, "artifacts", ""));
+    assert!(!allowed(json!([scoped]), action, "another", ""), "ARTIFACT_INSPECT_RESOURCE");
     for grant in [
         json!({"Effect":"Allow","Action":action}),
         json!({"Effect":"Allow","Action":action,"Resource":"arn:aws:s3:::artifacts/*"}),
@@ -219,9 +214,9 @@ fn artifact_writes_seal_requires_independent_explicit_attempt_authority() {
     assert_eq!(Action::try_from(wire).expect("writes seal action"), action);
     assert_eq!(serde_json::to_value(action).expect("writes seal wire form"), json!(wire));
     let grant = json!({"Effect":"Allow", "Action":wire, "Resource":"arn:aws:s3:::artifacts/out/attempt-a"});
-    assert!(allowed(json!([grant.clone()]), wire, "artifacts", "out/attempt-a/"));
-    assert!(!allowed(json!([grant.clone()]), wire, "another", "out/attempt-a/"));
-    assert!(!allowed(json!([grant.clone()]), wire, "artifacts", "out/attempt-b/"));
+    assert!(allowed(json!([grant]), wire, "artifacts", "out/attempt-a/"));
+    assert!(!allowed(json!([grant]), wire, "another", "out/attempt-a/"));
+    assert!(!allowed(json!([grant]), wire, "artifacts", "out/attempt-b/"));
     for resource in [None, Some("arn:aws:s3:::artifacts/out/attempt-a/object")] {
         let mut unscoped = json!({"Effect":"Allow", "Action":wire});
         if let Some(resource) = resource {
@@ -263,7 +258,7 @@ fn artifact_inventory_resource_requires_independent_authority() {
     let action = Action::try_from(wire).expect("A03I3A_INVENTORY_ACTION_REGISTERED");
     assert_eq!(serde_json::to_value(action).expect("inventory wire action"), json!(wire));
     let grant = json!({"Effect":"Allow","Action":wire,"Resource":"arn:aws:s3:::artifacts/out/attempt-a"});
-    assert!(allowed(json!([grant.clone()]), wire, "artifacts", "out/attempt-a/"));
+    assert!(allowed(json!([grant]), wire, "artifacts", "out/attempt-a/"));
     for (bucket, prefix) in [("another", "out/attempt-a/"), ("artifacts", "out/attempt-b/")] {
         assert!(!allowed(json!([grant.clone()]), wire, bucket, prefix));
     }
