@@ -140,7 +140,10 @@ fn normalize_copy_source_version_id(version_id: Option<&str>) -> S3Result<Option
             } else if Uuid::parse_str(trimmed).is_ok() {
                 Ok(Some(trimmed.to_string()))
             } else {
-                Err(s3_error!(InvalidArgument, "Invalid version id specified in copy source"))
+                Err(S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "Invalid version id specified in copy source",
+                ))
             }
         }
         None => Ok(None),
