@@ -2589,20 +2589,21 @@ async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
     let heal_starts_clone = heal_starts.clone();
     let healed_versions = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
     let healed_versions_clone = healed_versions.clone();
-    let mut heal_rx =
-        rustfs_heal_contracts::heal_channel::init_heal_channel().expect("heal channel should initialize once for scanner tests");
+    let (_commands, mut heal_rx) = rustfs_heal_contracts::heal_channel::init_heal_channels()
+        .expect("heal channels should initialize once for scanner tests");
     let _heal_responder = tokio::spawn(async move {
         while let Some(command) = heal_rx.recv().await {
-            if let rustfs_heal_contracts::heal_channel::HealChannelCommand::Start {
-                request, response_tx, ..
-            } = command
+            let rustfs_heal_contracts::heal_channel::HealReceiptCommand { request, response_tx } = command;
             {
                 heal_starts_clone.fetch_add(1, Ordering::Relaxed);
                 healed_versions_clone
                     .lock()
                     .expect("heal version capture lock should not be poisoned")
                     .push(request.object_version_id);
-                let _ = response_tx.send(Ok(HealAdmissionResult::Accepted));
+                let _ = response_tx.send(Ok(rustfs_heal_contracts::heal_channel::HealAdmissionReceipt {
+                    result: HealAdmissionResult::Accepted,
+                    task_id: request.id,
+                }));
             }
         }
     });

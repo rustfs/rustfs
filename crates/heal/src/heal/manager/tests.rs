@@ -30,6 +30,7 @@ pub(super) mod admin_overlap;
 mod root_recovery;
 use uuid::Uuid;
 mod auto_scan;
+mod completion;
 mod disposition;
 mod legacy_ambiguity_logging;
 mod running_mainline;

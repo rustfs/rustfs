@@ -502,6 +502,38 @@ The pacing gate holds neither namespace locks nor I/O/page permits while sleepin
 
 A missing provider, zero pause, or both class thresholds set to zero preserves unpaced execution. Missing counts follow the existing shared pressure interpreter; they are observations, not health, quorum or resource-ownership proof. The current provider exposes node-level workload classes, so this does not claim independent per-set foreground measurements or a hard global resource budget. Runtime waits increment `rustfs_heal_mainline_throttle_total` with `source=admin`, `result=delayed`, and a foreground-pressure or `recovery_window` reason. Real p99/throughput protection requires the separate W20 fixed-load ABBA measurements.
 
+## Live Scanner Heal Completions
+
+Scanner admissions now retain the canonical heal task ID, including merged
+requests. Node-local metrics associate these live candidates with the executor's
+typed terminal result:
+
+| Metric | Meaning |
+|---|---|
+| `rustfs_scanner_heal_pending_tasks` | Canonical tasks awaiting a terminal observation. |
+| `rustfs_scanner_heal_pending_oldest_seconds` | Age of the oldest retained pending candidate; refreshed every five seconds. |
+| `rustfs_scanner_heal_candidate_terminal_total` | Associated candidates, labeled by object `disposition`, expected `scan_mode`, and unresolved `scope`. |
+| `rustfs_scanner_heal_task_terminal_observations_total` | Associated task observations, deduplicated within the bounded recent history. This is not an execution count. |
+| `rustfs_scanner_heal_candidate_unknown_total` | Candidates whose integrity remains unknown, labeled by reason. |
+| `rustfs_scanner_heal_completion_lost_total` | Terminal notifications skipped by a lagging observer. |
+
+These metrics use the configured metrics exporter. A task's `Completed` state
+can include a deferred object; the `disposition` label preserves that distinction.
+`MetadataHealthy`, `Repaired`, and authoritative absence never imply verified
+payload bytes. Even `VerifiedHealthy` cannot certify scanner coverage: the current
+contract does not bind the candidate's content identity and leader epoch. No
+verified-byte or full-bucket coverage counter is advanced here.
+
+The admission buffer, pending map, terminal channel, and recent history each hold
+at most 1,024 entries. Retained identities are capped at 4 KiB; terminal history
+expires after ten minutes and pending observations after one hour. Overflow,
+notification loss, missing identity, and expiry remain unknown. Queue cancellation
+or displacement paths without a terminal snapshot also age out as unknown.
+Process restart clears this diagnostic state; a restarted runtime reinstalls its
+observer. Counts and pending age are not a durable integrity ledger or a cold-range
+completion deadline. Existing periodic traversal and pending retry hints provide
+compensation independently.
+
 ## Pending Heal Hints
 
 The scanner's persisted pending-heal cache is a best-effort retry backstop, bounded to 10,000 hints per bucket and a 24-hour age limit. These limits do not authorize garbage collection of committed durable repair obligations. A durable owner must retain its independent replay record until verified object completion or an equivalent durable successor permits removal.

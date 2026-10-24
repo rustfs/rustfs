@@ -1210,6 +1210,38 @@ fn select_scanner_pause_backlog_commit(
         valid.push(committed.clone());
     }
 
+    if valid.is_empty()
+        && replicas
+            .iter()
+            .any(|replica| matches!(replica.state, ScannerPauseBacklogReplicaState::Missing))
+    {
+        // A partial expansion commit can replace the old commit records while
+        // retaining their stable ledger on every old member. Adding another
+        // pool then breaks global stable consensus because its replicas are
+        // missing. An advertised old membership whose every member still has
+        // that exact stable ledger remains a rollback proof. A missing old
+        // member or a merely proposed generation cannot satisfy this proof.
+        for committed in replicas.iter().filter_map(|replica| match &replica.state {
+            ScannerPauseBacklogReplicaState::Valid(record) => record.committed.as_ref(),
+            _ => None,
+        }) {
+            if !valid.contains(committed)
+                && committed.replicas.iter().all(|id| {
+                    current_ids.contains(id)
+                        && replicas_by_id.get(id).is_some_and(|replica| {
+                            matches!(
+                                &replica.state,
+                                ScannerPauseBacklogReplicaState::Valid(record)
+                                    if record.stable.as_ref() == Some(&committed.ledger)
+                            )
+                        })
+                })
+            {
+                valid.push(committed.clone());
+            }
+        }
+    }
+
     let Some(max_membership_len) = valid.iter().map(|committed| committed.replicas.len()).max() else {
         return Ok(None);
     };
@@ -3030,6 +3062,80 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn native_writer_recovers_partial_expansion_before_another_pool_is_added() {
+        run_native_retirement_test(async || {
+            use crate::storage_api::owner::NativeScannerPauseBacklogWriteFault;
+
+            let (root, store, original) = native_expanded_backlog_store(1, false).await;
+            let fault =
+                NativeScannerPauseBacklogWriteFault::fail_before_write(Arc::clone(&store.pools[0].disk_set[0]), "publish", 2);
+            let now = unix_now().saturating_add(60);
+            let error = ScannerPauseBacklogController::claim(Arc::clone(&store), now)
+                .await
+                .err()
+                .expect("the new membership commit must be interrupted");
+            assert!(error.contains("injected native scanner backlog publish"), "{error}");
+            drop(fault);
+            let partial = load_scanner_pause_backlog(Arc::clone(&store))
+                .await
+                .expect("old rollback state");
+            assert_eq!(partial.ledger, original);
+            assert!(partial.authoritative_commit.is_none());
+            store
+                .pool_meta_write_status()
+                .await
+                .expect("persist pool metadata before restart");
+            shutdown_native_retirement_store(store).await;
+
+            // The operator can expand again before a replacement scanner gets
+            // to repair the interrupted commit. The fourth pool has no ledger.
+            let expanded = super::super::tests::setup_scanner_cycle_store_at_path_with_layout_and_disk_preinit(
+                root.path(),
+                false,
+                4,
+                2,
+                NATIVE_RETIREMENT_DRIVES_PER_SET,
+                false,
+            )
+            .await;
+            let recovered = load_scanner_pause_backlog(Arc::clone(&expanded))
+                .await
+                .expect("new missing members must not hide the old stable membership proof");
+            assert_eq!(recovered.ledger, original);
+            assert_eq!(recovered.replica_count, 8);
+            assert!(!recovered.all_current_replicas_stable());
+            let expected = claim_scanner_pause_backlog_writer(&original, now + 1).expect("recover the unfinished attempt");
+            let controller = ScannerPauseBacklogController::claim(Arc::clone(&expanded), now + 1)
+                .await
+                .expect("seed the new pool and stabilize the complete membership");
+            assert_current_native_writer_ledger(&expanded, &expected).await;
+            assert_eq!(expected.dirty_usage_buckets, original.dirty_usage_buckets);
+            assert_eq!(expected.consecutive_failures, original.consecutive_failures + 1);
+            drop(controller);
+
+            let (source, _) = native_replica_bytes(&expanded.pools[0].disk_set[0]).await;
+            expanded
+                .prepare_scanner_pause_backlog_retirement_for_test(0, source.len() * 2)
+                .await
+                .expect("activate retirement after recovering the ledger");
+            for set in 0..2 {
+                expanded
+                    .retire_scanner_pause_backlog_for_test(0, set)
+                    .await
+                    .expect("retire the old pool safely");
+                assert_native_source_missing(&expanded, set).await;
+            }
+            let surviving = load_scanner_pause_backlog(Arc::clone(&expanded))
+                .await
+                .expect("surviving ledger");
+            assert_eq!(surviving.ledger, expected);
+            assert!(surviving.all_current_replicas_stable());
+            shutdown_native_retirement_store(expanded).await;
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn native_writer_expansion_stabilization_failure_recovers_after_restart() {
         run_native_retirement_test(async || {
             for old_pool_count in [1, 2] {
@@ -4044,6 +4150,81 @@ mod tests {
             Some(stable.clone()),
             Some(ScannerPauseBacklogCommitRecord::new(committed.clone(), replicas.to_vec())),
         )
+    }
+
+    #[test]
+    fn new_missing_pool_does_not_erase_a_stable_old_membership() {
+        let old = durable_ledger(100);
+        let next = claim_scanner_pause_backlog_writer(&old, 110).expect("next writer");
+        let first = replica_id(0, 0);
+        let second = replica_id(1, 0);
+        let added = replica_id(2, 0);
+        let old_record = replica_record_for_members(&old, &old, &[first]);
+        let partial = replica_record_for_members(&old, &next, &[first, second]);
+        let loaded = crash_reload_replicas(vec![
+            decoded_replica(first, &partial),
+            decoded_replica(second, &old_record),
+            ScannerPauseBacklogReplica {
+                id: added,
+                revision: Some(DataUsageCacheRevision::Missing),
+                state: ScannerPauseBacklogReplicaState::Missing,
+            },
+        ]);
+        assert_eq!(loaded.ledger, old, "the unacknowledged next generation must not win");
+        assert_eq!(
+            loaded
+                .authoritative_commit
+                .as_ref()
+                .expect("old stable membership proof")
+                .replicas,
+            vec![first]
+        );
+        assert!(!loaded.all_current_replicas_stable());
+    }
+
+    #[test]
+    fn stable_membership_recovery_still_requires_every_old_member() {
+        let old = durable_ledger(100);
+        let first = replica_id(0, 0);
+        let second = replica_id(1, 0);
+        let record = replica_record_for_members(&old, &old, &[first, second]);
+        let replicas = vec![
+            decoded_replica(first, &record),
+            ScannerPauseBacklogReplica {
+                id: second,
+                revision: Some(DataUsageCacheRevision::Missing),
+                state: ScannerPauseBacklogReplicaState::Missing,
+            },
+        ];
+        assert!(
+            select_scanner_pause_backlog_replicas(replicas).is_err(),
+            "a lost old member is not an unseeded new pool"
+        );
+    }
+
+    #[test]
+    fn stable_membership_recovery_rejects_competing_rollback_proofs() {
+        let first = replica_id(0, 0);
+        let second = replica_id(1, 0);
+        let first_ledger = durable_ledger(100);
+        let second_ledger = durable_ledger(101);
+        let next = claim_scanner_pause_backlog_writer(&first_ledger, 110).expect("unacknowledged claim");
+        let second_next = claim_scanner_pause_backlog_writer(&second_ledger, 111).expect("competing unacknowledged claim");
+        let records = vec![
+            decoded_replica(first, &replica_record_for_members(&first_ledger, &next, &[first, second])),
+            decoded_replica(second, &replica_record_for_members(&second_ledger, &second_next, &[first, second])),
+            decoded_replica(replica_id(2, 0), &replica_record_for_members(&first_ledger, &first_ledger, &[first])),
+            decoded_replica(replica_id(3, 0), &replica_record_for_members(&second_ledger, &second_ledger, &[second])),
+            ScannerPauseBacklogReplica {
+                id: replica_id(4, 0),
+                revision: Some(DataUsageCacheRevision::Missing),
+                state: ScannerPauseBacklogReplicaState::Missing,
+            },
+        ];
+        assert!(
+            select_scanner_pause_backlog_replicas(records).is_err(),
+            "a new pool cannot reconcile divergent rollback proofs"
+        );
     }
 
     #[test]
