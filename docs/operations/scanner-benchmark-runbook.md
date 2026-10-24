@@ -288,6 +288,15 @@ python3 scripts/scanner_version_oracle.py expected-inventory.json \
 
 The CLI needs boto3, reads credentials through the AWS credential provider chain,
 uses path-style SigV4 requests and disables SDK retries. It never writes S3 data.
+For Python workload seeding with pooled S3 connections, use botocore 1.43.77 or
+newer: older versions can retain a zero-length PUT's response state and misparse
+the next PUT, causing a read timeout even with valid server response framing.
+See the [upstream fix](https://github.com/boto/botocore/pull/3784).
+Record the exact SDK and transitive dependency versions, package hashes and
+effective checksum settings, and use the same client environment for both legs.
+Retain failures from older clients; do not hide them with retries or a larger
+timeout. A client fix does not establish that server-side 503s are resolved.
+
 Every endpoint gets independently paginated version and current-object listings,
 full streamed GETs for every data version and every current live object, and
 explicit/current delete-marker checks. A hidden old version, extra key, wrong
