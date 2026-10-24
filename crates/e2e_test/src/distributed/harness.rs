@@ -347,7 +347,7 @@ fn relocate_pool_storage(cluster: &mut RustFSTestClusterEnvironment, node_idx: u
     Ok(pool_run_root)
 }
 
-fn configure_node_logs(cluster: &mut RustFSTestClusterEnvironment, capture_dir: Option<&Path>) -> TestResult {
+pub(super) fn configure_node_logs(cluster: &mut RustFSTestClusterEnvironment, capture_dir: Option<&Path>) -> TestResult {
     if let Some(directory) = capture_dir {
         std::fs::create_dir_all(directory)?;
         for node_idx in 0..cluster.nodes.len() {
