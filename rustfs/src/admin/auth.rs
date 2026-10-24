@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::app::RequestEnvelope;
 use crate::auth::get_condition_values;
 use crate::server::RemoteAddr;
 use http::HeaderMap;
@@ -260,20 +261,26 @@ pub async fn authenticate_request(
     uri: &Uri,
     credentials: &s3s::auth::Credentials,
 ) -> S3Result<(Credentials, bool)> {
-    use crate::auth::{check_key_valid, get_session_token};
+    use crate::auth::get_session_token;
 
     // Extract session token from request
     let session_token = get_session_token(uri, headers).unwrap_or_default();
 
+    authenticate_request_facts(&credentials.access_key, session_token).await
+}
+
+async fn authenticate_request_facts(access_key: &str, session_token: &str) -> S3Result<(Credentials, bool)> {
+    use crate::auth::check_key_valid;
+
     // Log authentication attempt for debugging
     debug!(
         "authenticate_request: processing authentication - access_key={}, has_session_token={}",
-        credentials.access_key,
+        access_key,
         !session_token.is_empty()
     );
 
     // Validate credentials using the core authentication function
-    let result = check_key_valid(session_token, &credentials.access_key).await;
+    let result = check_key_valid(session_token, access_key).await;
 
     match &result {
         Ok((cred, is_owner)) => {
@@ -283,11 +290,7 @@ pub async fn authenticate_request(
             );
         }
         Err(e) => {
-            tracing::warn!(
-                "authenticate_request: authentication failed - access_key={}, error={}",
-                credentials.access_key,
-                e
-            );
+            tracing::warn!("authenticate_request: authentication failed - access_key={}, error={}", access_key, e);
         }
     }
 
@@ -309,6 +312,19 @@ pub async fn authorize_admin_request(req: &S3Request<Body>, actions: Vec<Action>
 
     let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
     validate_admin_request(&req.headers, &cred, owner, false, actions, remote_addr).await?;
+
+    Ok(cred)
+}
+
+/// Full admin gate over RustFS-owned request facts.
+pub async fn authorize_admin_envelope(req: &RequestEnvelope, actions: Vec<Action>) -> S3Result<Credentials> {
+    let Some(input_cred) = req.credentials() else {
+        return Err(s3_error!(InvalidRequest, "get cred failed"));
+    };
+
+    let (cred, owner) =
+        authenticate_request_facts(input_cred.access_key(), input_cred.session_token().unwrap_or_default()).await?;
+    validate_admin_request(req.headers(), &cred, owner, false, actions, req.remote_addr()).await?;
 
     Ok(cred)
 }
@@ -611,6 +627,27 @@ mod tests {
         let err = authorize_admin_request(&req, vec![admin_action()])
             .await
             .expect_err("a request without credentials must be rejected");
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("get cred failed"));
+    }
+
+    #[tokio::test]
+    async fn authorize_admin_envelope_without_credentials_is_rejected() {
+        let envelope = crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: http::Method::GET,
+                uri: Uri::from_static("/rustfs/admin/v3/usage/bucket"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        );
+
+        let err = authorize_admin_envelope(&envelope, vec![admin_action()])
+            .await
+            .expect_err("an envelope without credentials must be rejected");
         assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
         assert_eq!(err.message(), Some("get cred failed"));
     }
