@@ -14276,9 +14276,14 @@ mod tests {
 
         crate::store::init_local_disks(endpoint_pools.clone()).await.unwrap();
 
-        let ecstore = ECStore::new("127.0.0.1:0".parse().unwrap(), endpoint_pools, CancellationToken::new())
-            .await
-            .unwrap();
+        // Tests start the recovery loop they observe. An automatic startup loop
+        // would race that loop for the same unconsumed worker queue.
+        let ecstore = temp_env::async_with_vars(
+            [(super::ENV_TIER_FREE_VERSION_RECOVERY_ENABLED, Some("false"))],
+            ECStore::new("127.0.0.1:0".parse().unwrap(), endpoint_pools, CancellationToken::new()),
+        )
+        .await
+        .unwrap();
 
         let buckets = ecstore
             .list_bucket(&BucketOptions {
@@ -14850,7 +14855,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn tier_free_version_recovery_loop_observes_tier_configuration_changes() {
+        let automatic_recovery_started = super::TIER_FREE_VERSION_RECOVERY_STARTED.get().copied();
         let (disk_paths, ecstore) = setup_test_env().await;
+        assert_eq!(
+            super::TIER_FREE_VERSION_RECOVERY_STARTED.get().copied(),
+            automatic_recovery_started,
+            "fixture must not start an unowned automatic recovery loop"
+        );
         let manager = ecstore.tier_config_mgr();
         let saved_tiers = std::mem::take(&mut manager.write().await.tiers);
         let runtime_state = install_unconsumed_runtime_expiry_worker(&ecstore, 1).await;
