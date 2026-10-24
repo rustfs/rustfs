@@ -252,6 +252,12 @@ pub struct S3HttpRequestGuard {
 }
 
 impl S3HttpRequestGuard {
+    /// First typed external operation seen so far, including after a pending
+    /// service poll. This does not finish or transfer HTTP outcome accounting.
+    pub fn operation(&self) -> Option<S3Operation> {
+        S3Operation::ALL.get(self.operation).copied()
+    }
+
     pub fn is_active() -> bool {
         CURRENT_OPERATION.try_with(|_| ()).is_ok()
     }
