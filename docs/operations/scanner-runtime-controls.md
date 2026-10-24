@@ -175,6 +175,29 @@ The request must be authenticated with an admin identity that has `ServerInfoAdm
 | `data_movement_pause` | Global-pause policy, current movement reason, operation epoch, start time, duration, and estimated movement work items. |
 | `pause_backlog` | Replicated durable pause ledger, post-pause catch-up phase, rate window, retry state, thresholds, and active alert reasons. |
 | `catch_up_estimate` | Movement work plus current dirty-usage and already discovered lifecycle queues. |
+| `heal_observation` | This process's bounded canonical heal observations, including retained pending tasks, typed terminals, and unknown integrity. |
+
+`metrics.usage_publication` describes one local publication attempt with its own
+`scanner_epoch` and `cycle`, even after `metrics.current_cycle` returns to zero.
+Its `class` distinguishes `progress_only`, `observational`, `complete_pending`,
+`complete_converged`, and `unknown`; `outcome` retains the persistence result.
+`pending_bucket_count` comes from the confirmed authoritative snapshot. It is
+null for progress-only, observational, failed, or unverified publication, and
+zero only for a confirmed converged snapshot. The live dirty-usage count can
+change independently after publication.
+
+An existing same-cycle snapshot may differ from the current retry. Its pending
+count comes from the existing target bytes, never the retry's count. A cached
+baseline or companion alone cannot confirm the current target; without an
+actual target read, confirmed write, or existing root readback proof, the class
+remains unknown. `snapshot_updated_at_unix_secs` is the snapshot's timestamp;
+`observed_at_unix_secs` is when this process recorded the observation.
+
+Starting another attempt replaces this record with running/unknown. Loss of
+leadership, stopping, reset, or restart clears it, and a late old attempt cannot
+restore it. These are local observations, not a restart-surviving or cluster-wide
+history. Publication convergence does not certify cycle completion, heal task
+completion, or verified object content.
 
 Example fields to inspect:
 
@@ -538,6 +561,26 @@ can include a deferred object; the `disposition` label preserves that distinctio
 payload bytes. Even `VerifiedHealthy` cannot certify scanner coverage: the current
 contract does not bind the candidate's content identity and leader epoch. No
 verified-byte or full-bucket coverage counter is advanced here.
+
+The scanner status response also exposes `heal_observation` without requiring
+a metrics exporter. Reading status does not start an observer. `state` is
+`not_started`, `active`, or `stopped`; unavailable pending counts are null.
+`retained_pending_tasks` counts canonical IDs in the existing bounded map,
+while `retained_pending_candidates` counts their associated discoveries.
+`queued_admissions` samples the local admission channel and is not an atomic
+cluster backlog. `terminal_task_observations_total` keeps the same bounded
+deduplication semantics as the exporter counter.
+
+`terminal_candidates` preserves execution, object disposition, scan mode, and
+unresolved scope. `unknown_candidates` includes admission rejection, overflow,
+loss, expiry, and missing terminal proof. These categories overlap: a completed
+task with a repaired or verified-healthy object can still have unknown scanner
+integrity. `integrity_state` therefore remains `unknown`, including when retained
+pending is zero. `lost_completion_notifications` counts skipped messages, not
+objects. Counts belong to the named local observer `generation`; runtime
+reinstallation starts a new generation and process restart clears it. Usage
+reset and scanner cycle changes do not clear pending heal observations, because
+canonical tasks can outlive a scanner cycle.
 
 The admission buffer, pending map, terminal channel, and recent history each hold
 at most 1,024 entries. Retained identities are capped at 4 KiB; terminal history

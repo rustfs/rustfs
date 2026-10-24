@@ -189,12 +189,11 @@ impl LegacyReedSolomonEncoder {
                 .is_some_and(|bytes| bytes <= LEGACY_REED_SOLOMON_CACHE_MAX_LOGICAL_SHARD_BYTES_PER_WORKSPACE)
     }
 
-    fn encode(&self, shards: SmallVec<[&mut [u8]; 16]>) -> io::Result<()> {
-        let mut shards_vec: Vec<&mut [u8]> = shards.into_vec();
-        if shards_vec.is_empty() {
+    fn encode(&self, mut shards: SmallVec<[&mut [u8]; 16]>) -> io::Result<()> {
+        if shards.is_empty() {
             return Ok(());
         }
-        let shard_len = shards_vec[0].len();
+        let shard_len = shards[0].len();
         let cached_encoder = self
             .encoder_cache
             .write()
@@ -214,7 +213,7 @@ impl LegacyReedSolomonEncoder {
                     .map_err(|e| io::Error::other(format!("Failed to create SIMD encoder: {e:?}")))?,
             }
         };
-        for (i, shard) in shards_vec.iter().enumerate().take(self.data_shards) {
+        for (i, shard) in shards.iter().enumerate().take(self.data_shards) {
             encoder
                 .add_original_shard(shard)
                 .map_err(|e| io::Error::other(format!("Failed to add shard {i}: {e:?}")))?;
@@ -223,8 +222,8 @@ impl LegacyReedSolomonEncoder {
             .encode()
             .map_err(|e| io::Error::other(format!("SIMD encoding failed: {e:?}")))?;
         for (i, recovery_shard) in result.recovery_iter().enumerate() {
-            if i + self.data_shards < shards_vec.len() {
-                shards_vec[i + self.data_shards].copy_from_slice(recovery_shard);
+            if i + self.data_shards < shards.len() {
+                shards[i + self.data_shards].copy_from_slice(recovery_shard);
             }
         }
         drop(result);
@@ -393,14 +392,13 @@ impl ReedSolomonEncoder {
     }
 
     /// Encode data shards with parity.
-    pub fn encode(&self, shards: SmallVec<[&mut [u8]; 16]>) -> io::Result<()> {
-        let mut shards_vec: Vec<&mut [u8]> = shards.into_vec();
-        if shards_vec.is_empty() {
+    pub fn encode(&self, mut shards: SmallVec<[&mut [u8]; 16]>) -> io::Result<()> {
+        if shards.is_empty() {
             return Ok(());
         }
 
         if let Some(ref rs) = self.encoder {
-            rs.encode(&mut shards_vec)
+            rs.encode(shards.as_mut_slice())
                 .map_err(|e| io::Error::other(format!("Reed-Solomon encode failed: {e:?}")))
         } else {
             Ok(())
@@ -1010,7 +1008,7 @@ impl Erasure {
             return Ok(true);
         }
 
-        let mut shard_refs = Vec::with_capacity(expected_shards);
+        let mut shard_refs: SmallVec<[&[u8]; 16]> = SmallVec::with_capacity(expected_shards);
         let mut shard_len = None;
         for (index, shard) in shards.iter().enumerate() {
             let shard = shard
@@ -1207,6 +1205,53 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::ReadBuf;
+
+    #[test]
+    fn encode_preserves_codec_bytes_across_descriptor_boundary() {
+        let data = (0..1025)
+            .map(|index| u8::try_from((index * 29 + 17) % 251).expect("bounded byte"))
+            .collect::<Vec<_>>();
+        for uses_legacy in [false, true] {
+            for (data_shards, parity_shards) in [(4, 2), (8, 8), (9, 8)] {
+                let erasure = Erasure::new_with_options(data_shards, parity_shards, 2048, uses_legacy);
+                let shards = erasure.encode_data(&data).expect("encode boundary layout");
+                let joined = shards
+                    .iter()
+                    .take(data_shards)
+                    .flat_map(|shard| shard.iter().copied())
+                    .collect::<Vec<_>>();
+                assert_eq!(&joined[..data.len()], &data);
+                assert!(joined[data.len()..].iter().all(|byte| *byte == 0));
+                if uses_legacy {
+                    let mut reference = reed_solomon_simd::ReedSolomonEncoder::new(data_shards, parity_shards, shards[0].len())
+                        .expect("independent legacy encoder");
+                    for shard in shards.iter().take(data_shards) {
+                        reference.add_original_shard(shard).expect("add original shard");
+                    }
+                    let result = reference.encode().expect("independent legacy parity");
+                    for (index, parity) in result.recovery_iter().enumerate() {
+                        assert_eq!(shards[data_shards + index].as_ref(), parity, "legacy parity {index}");
+                    }
+                } else {
+                    let reference = ReedSolomon::new(data_shards, parity_shards).expect("independent modern codec");
+                    let refs = shards.iter().map(Bytes::as_ref).collect::<Vec<_>>();
+                    assert!(reference.verify(&refs).expect("verify independently generated parity"));
+                }
+                let mut optional = optional_shards(&shards);
+                assert!(
+                    erasure
+                        .verify_data_and_parity(&optional)
+                        .expect("verify complete boundary layout")
+                );
+                optional[data_shards].as_mut().expect("parity present")[0] ^= 1;
+                assert!(
+                    !erasure
+                        .verify_data_and_parity(&optional)
+                        .expect("detect corrupt boundary parity")
+                );
+            }
+        }
+    }
 
     fn erasure_with_invalid_dimensions(data_shards: usize, parity_shards: usize, block_size: usize) -> Erasure {
         Erasure {

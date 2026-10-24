@@ -15,7 +15,7 @@
 use crate::disk::cleanup_runtime;
 use crate::disk::io_admission::{
     AdmissionReader, BoxedChunkReader, DiskIoAdmission, DiskIoClass, DiskIoContext, current_disk_io_context,
-    with_disk_io_context, with_disk_io_permit,
+    current_resource_unit, with_disk_io_context, with_disk_io_permit, with_optional_resource_unit,
 };
 use crate::disk::{
     CheckPartsResp, DataDirDeleteStatus, DeleteOptions, DiskAPI, DiskError, DiskInfo, DiskInfoOptions, DiskLocation, Endpoint,
@@ -449,10 +449,10 @@ where
     if external_guard.is_none() {
         return operation().await;
     }
-    tokio::spawn(async move {
+    tokio::spawn(with_optional_resource_unit(current_resource_unit(), async move {
         let _external_guard = external_guard;
         operation().await
-    })
+    }))
     .await
     .map_err(|_| Error::other("owned mutation task failed"))?
 }
@@ -1648,6 +1648,7 @@ impl LocalDiskWrapper {
             cancellation: CancellationToken::new(),
             admission: None,
             permit: None,
+            resource_unit: current_resource_unit(),
         })
     }
 
@@ -3842,32 +3843,49 @@ mod tests {
 
     #[tokio::test]
     async fn owned_mutation_keeps_publication_guard_after_waiter_cancellation() {
+        use rustfs_concurrency::adaptive::AdaptiveAdmission;
+        use std::num::NonZeroU16;
+
+        let resources = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one resource unit"), 1);
+        let resource_unit = resources.acquire().await;
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let guard: Arc<dyn Send + Sync> = Arc::new(DropProbe(Arc::clone(&drops)));
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
 
-        let waiter = tokio::spawn(run_owned_mutation(Some(guard), move || async move {
-            started_tx.send(()).expect("mutation should signal start");
-            release_rx.await.expect("mutation should be released");
-            finished_tx.send(()).expect("mutation should signal completion");
-            Ok::<_, Error>(())
-        }));
+        let waiter = tokio::spawn(crate::disk::with_background_resource_unit(
+            resource_unit,
+            run_owned_mutation(Some(guard), move || async move {
+                let inherited = current_resource_unit().is_some();
+                assert!(current_disk_io_context().is_none(), "preserve the owned task's original disk policy");
+                started_tx.send(inherited).expect("mutation should signal start");
+                release_rx.await.expect("mutation should be released");
+                finished_tx.send(()).expect("mutation should signal completion");
+                Ok::<_, Error>(())
+            }),
+        ));
 
-        started_rx.await.expect("mutation owner should start");
+        let inherited = started_rx.await.expect("mutation owner should start");
         waiter.abort();
+        assert!(waiter.await.expect_err("caller was cancelled").is_cancelled());
+        let held_after_cancel = resources.snapshot().active;
         assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         release_tx.send(()).expect("mutation owner should still be alive");
         finished_rx.await.expect("mutation owner should finish");
         tokio::time::timeout(Duration::from_secs(1), async {
-            while drops.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            while drops.load(std::sync::atomic::Ordering::SeqCst) == 0 || resources.snapshot().active != 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("publication guard should be released after mutation completion");
+        assert!(inherited, "owned mutation must retain its resource unit");
+        assert_eq!(
+            held_after_cancel, 1,
+            "cancelling the waiter must not release a live mutation's resource unit"
+        );
     }
 
     struct PendingWriter;
