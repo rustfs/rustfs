@@ -1656,6 +1656,8 @@ pub(crate) fn disk_file_sync_limiter(root: &Path) -> Arc<Semaphore> {
 // before exiting `spawn_blocking` so back-to-back stages of `PUT` and `DELETE`
 // on the same drive do not thrash Tokio's `BlockingPool` (`futex_wake`/`futex_wait`).
 const MAX_NAMESPACE_WORKERS_PER_DISK: usize = 1;
+// Return busy workers to the shared pool so other disks can acquire a slot.
+const MAX_BLOCKING_JOBS_PER_WORKER: usize = 64;
 const WORKER_IDLE_SPIN_ITERS: usize = 256;
 const FALLBACK_NAMESPACE_QUEUE_SHARDS: usize = 8;
 
@@ -1799,6 +1801,7 @@ impl DiskBlockingQueue {
                 lane,
                 disarmed: false,
             };
+            let mut remaining_jobs = MAX_BLOCKING_JOBS_PER_WORKER;
             loop {
                 let job = {
                     let mut state = queue.lane(lane).state.lock();
@@ -1816,6 +1819,10 @@ impl DiskBlockingQueue {
                 };
                 if let Some(job) = job {
                     job();
+                    remaining_jobs -= 1;
+                    if remaining_jobs == 0 {
+                        return;
+                    }
                     continue;
                 }
                 for i in 0..WORKER_IDLE_SPIN_ITERS {
@@ -1849,6 +1856,10 @@ impl DiskBlockingQueue {
                     return;
                 };
                 job();
+                remaining_jobs -= 1;
+                if remaining_jobs == 0 {
+                    return;
+                }
             }
         };
         if lane == DiskBlockingLane::Fsync {
@@ -9360,6 +9371,62 @@ mod tests {
             assert!(!root.path().join("receipt").exists());
             assert!(!root.path().join("intermediate").exists());
         }
+    }
+
+    #[tokio::test]
+    async fn disk_blocking_queue_yields_to_other_disks_in_shared_pool() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("constrained blocking pool");
+        let result = runtime
+            .spawn(async {
+                let hot = DiskBlockingQueue::new();
+                let cold = DiskBlockingQueue::new();
+                let completed = Arc::new(AtomicUsize::new(0));
+                let (started_tx, started_rx) = oneshot::channel();
+                let (release_tx, release_rx) = oneshot::channel();
+                let first_completed = Arc::clone(&completed);
+                hot.enqueue_on_lane(
+                    DiskBlockingLane::Foreground,
+                    Box::new(move || {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.blocking_recv();
+                        first_completed.fetch_add(1, Ordering::Relaxed);
+                    }),
+                );
+                started_rx.await.expect("hot worker occupies the only blocking thread");
+                let (done_tx, done_rx) = oneshot::channel();
+                let mut done_tx = Some(done_tx);
+                for index in 0..256 {
+                    let completed = Arc::clone(&completed);
+                    let done = if index == 255 { done_tx.take() } else { None };
+                    hot.enqueue_on_lane(
+                        DiskBlockingLane::Foreground,
+                        Box::new(move || {
+                            completed.fetch_add(1, Ordering::Relaxed);
+                            if let Some(done) = done {
+                                let _ = done.send(());
+                            }
+                        }),
+                    );
+                }
+                let observed = Arc::clone(&completed);
+                let mut cold_job = std::pin::pin!(cold.run(move || Ok(observed.load(Ordering::Relaxed))));
+                assert!(futures::FutureExt::now_or_never(&mut cold_job).is_none());
+                release_tx.send(()).expect("release the hot worker");
+                let before_cold = cold_job.await.expect("cold disk makes progress");
+                done_rx.await.expect("hot disk still completes every queued operation");
+                (before_cold, completed.load(Ordering::Relaxed))
+            })
+            .await;
+        runtime.shutdown_background();
+        let (before_cold, completed) = result.expect("fairness task joined");
+        assert!(before_cold <= 64, "cold disk must run after one bounded hot-disk batch: {before_cold}");
+        assert_eq!(completed, 257, "yielding must not discard hot-disk jobs");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
