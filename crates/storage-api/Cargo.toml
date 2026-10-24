@@ -43,6 +43,9 @@ serde = { workspace = true, features = ["derive"] }
 time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
 uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
 
+[target.'cfg(windows)'.dependencies]
+rustfs-utils = { workspace = true, default-features = false, features = ["path"] }
+
 [dev-dependencies]
 insta = { workspace = true, features = ["yaml", "json"] }
 serde_json = { workspace = true, features = ["raw_value"] }

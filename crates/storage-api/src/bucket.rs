@@ -39,14 +39,28 @@ pub struct MakeBucketOptions {
     pub no_lock: bool,
 }
 
-/// Validate a relative artifact namespace with nonempty components and one trailing slash.
+// The shortest object suffix has a nonempty hex tenant (2 bytes), two
+// hyphenated UUIDs (36 each), three separators, and a one-byte object name.
+const MIN_ARTIFACT_OBJECT_SUFFIX_BYTES: usize = 2 + 2 * 36 + 3 + 1;
+
+/// Validate a relative artifact namespace with room for at least one object.
+/// Longer tenant IDs and object names still need full-key validation.
 pub fn valid_artifact_base_prefix(prefix: &str) -> bool {
     prefix.strip_suffix('/').is_some_and(|base| {
-        prefix.len() <= 1024
+        prefix.len() <= 1024 - MIN_ARTIFACT_OBJECT_SUFFIX_BYTES
             && prefix
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte))
-            && base.split('/').all(|part| !part.is_empty() && !matches!(part, "." | ".."))
+            && base.split('/').all(|part| {
+                if part.is_empty() || part.len() > 255 || matches!(part, "." | "..") {
+                    return false;
+                }
+                #[cfg(windows)]
+                if rustfs_utils::check_windows_file_name(part).is_err() {
+                    return false;
+                }
+                true
+            })
     })
 }
 
@@ -157,6 +171,38 @@ mod tests {
         let legacy = serde_json::json!({"lock_enabled":false,"versioning_enabled":false,"force_create":false,"created_at":null,"no_lock":false});
         let options: MakeBucketOptions = serde_json::from_value(legacy).expect("decode legacy creation options");
         assert_eq!(options.artifact_base_prefix, None, "ARTIFACT_LEGACY_CREATION");
+    }
+
+    #[test]
+    fn artifact_prefix_components_fit_on_disk() {
+        assert!(valid_artifact_base_prefix(&format!("{}/", "a".repeat(255))));
+        assert!(!valid_artifact_base_prefix(&format!("{}/", "a".repeat(256))));
+        assert!(!valid_artifact_base_prefix(&format!("outputs/{}/nested/", "a".repeat(256))));
+    }
+
+    #[test]
+    fn artifact_prefix_leaves_room_for_the_shortest_object() {
+        for (last_segment_bytes, valid) in [(177, true), (178, false)] {
+            let prefix = format!(
+                "{}/{}/{}/{}/",
+                "a".repeat(255),
+                "b".repeat(255),
+                "c".repeat(255),
+                "d".repeat(last_segment_bytes)
+            );
+            assert_eq!(prefix.len(), if valid { 946 } else { 947 });
+            assert_eq!(valid_artifact_base_prefix(&prefix), valid, "ARTIFACT_PREFIX_OBJECT_BUDGET");
+        }
+    }
+
+    #[test]
+    fn artifact_prefix_preserves_host_file_name_rules() {
+        for prefix in ["NUL/", "con.txt/", "nested/COM1/", "bad./"] {
+            assert_eq!(valid_artifact_base_prefix(prefix), !cfg!(windows), "ARTIFACT_PREFIX_HOST_NAME: {prefix}");
+        }
+        for prefix in ["normal/", "nul-name/", "v1.0/"] {
+            assert!(valid_artifact_base_prefix(prefix), "ARTIFACT_PREFIX_HOST_VALID: {prefix}");
+        }
     }
 
     #[test]

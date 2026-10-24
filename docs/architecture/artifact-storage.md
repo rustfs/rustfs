@@ -671,6 +671,14 @@ The controller needs an explicit `admin:CreatePluginArtifactBucket` Allow on
 original-user, built-in IAM, request-instance and body/deadline checks apply.
 Unknown fields and invalid bucket names or base prefixes are rejected.
 
+The base prefix is relative, uses only ASCII letters, digits, `/`, `.`, `_`
+and `-`, and ends with exactly one `/`. Components must be nonempty, cannot be
+`.` or `..`, and are limited to 255 bytes each. The prefix is at most 946 bytes,
+leaving 78 bytes for the shortest encoded tenant, two UUIDs, separators and a
+nonempty object name. Each complete object key is still validated; longer tenant
+IDs and object names need more space. On Windows, the existing reserved-name and
+trailing-dot restrictions also apply to each component.
+
 The storage helper requires a supported configured topology (local storage or
 Unix distributed URL endpoints) and enabled namespace locking. It invokes the
 existing creation transaction with an

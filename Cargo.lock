@@ -10694,6 +10694,7 @@ dependencies = [
  "hotpath",
  "insta",
  "rustfs-filemeta",
+ "rustfs-utils",
  "serde",
  "serde_json",
  "time",
